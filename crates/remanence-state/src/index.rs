@@ -6,9 +6,10 @@ use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use remanence_parity::{
-    BootstrapObjectRepresentation, CommittedBundle, CommittedBundleKind, CommittedState,
+    CommittedBundle, CommittedBundleKind, CommittedState, ObjectRecoveryRepresentation,
     ParityConfig, ParityScheme, TapeFileEntry, TapeFileKind,
 };
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,11 +18,83 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::audit::{AuditActor, AuditEvent, AuditRecord};
+use crate::checkpoint::{TerminalFinalizationProgress, TerminalFinalizationTrigger};
 use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 18;
+
+const STRUCTURAL_U64_COLUMNS: &[(&str, &str)] = &[
+    ("tapes", "highest_protected_ordinal"),
+    ("tapes", "total_committed_ordinals"),
+    ("tapes", "last_committed_tape_file"),
+    ("tapes", "written_extent_lba"),
+    ("tape_files", "tape_file_number"),
+    ("tape_files", "block_count"),
+    ("tape_files", "physical_start_hint"),
+    ("tape_files", "first_parity_data_ordinal"),
+    ("tape_files", "epoch_id"),
+    ("tape_files", "protected_ordinal_start"),
+    ("tape_files", "protected_ordinal_end_exclusive"),
+    ("object_copies", "tape_file_number"),
+    ("object_copies", "first_body_lba"),
+    ("object_copies", "first_parity_data_ordinal"),
+    ("object_copies", "protected_until_ordinal"),
+    ("object_copies", "metadata_frame_len"),
+    ("object_files", "size_bytes"),
+    ("object_files", "first_chunk_lba"),
+    ("object_files", "chunk_count"),
+];
+
+/// Canonical SQLite representation of a tape-structural unsigned integer.
+///
+/// SQLite has no unsigned integer storage class. Fixed-width big-endian bytes
+/// preserve the complete `u64` domain and compare in unsigned numeric order.
+/// Keeping the bytes in one adapter also makes every bind and read use the
+/// same canonical representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SqliteU64([u8; 8]);
+
+impl SqliteU64 {
+    const ZERO: Self = Self([0; 8]);
+
+    const fn new(value: u64) -> Self {
+        Self(value.to_be_bytes())
+    }
+
+    const fn get(self) -> u64 {
+        u64::from_be_bytes(self.0)
+    }
+}
+
+impl From<u64> for SqliteU64 {
+    fn from(value: u64) -> Self {
+        Self::new(value)
+    }
+}
+
+impl ToSql for SqliteU64 {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(ValueRef::Blob(&self.0)))
+    }
+}
+
+impl FromSql for SqliteU64 {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let bytes = match value {
+            ValueRef::Blob(bytes) => bytes,
+            _ => return Err(FromSqlError::InvalidType),
+        };
+        let bytes: [u8; 8] = bytes
+            .try_into()
+            .map_err(|_| FromSqlError::InvalidBlobSize {
+                expected_size: 8,
+                blob_size: bytes.len(),
+            })?;
+        Ok(Self(bytes))
+    }
+}
 
 /// Digest algorithm emitted by the current catalog writers.
 pub const DIGEST_ALGORITHM_SHA256: &str = "sha256";
@@ -105,6 +178,123 @@ pub struct TapePoolProjectionInput {
     pub content_class: Option<String>,
     /// Row creation timestamp. Uses current UTC when omitted.
     pub created_at_utc: Option<String>,
+}
+
+/// Pool assignment observed under the catalog's per-tape serialization point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TapeAssignmentSnapshot {
+    /// Physical tape identity.
+    pub tape_uuid: Vec<u8>,
+    /// Current assigned pool, if any.
+    pub pool_id: Option<String>,
+    /// Monotonic generation changed by every effective assignment or clear.
+    pub assignment_generation: u64,
+}
+
+/// Coarse catalog outcome for a terminal-finalization projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalFinalizationOutcome {
+    /// The five-component close is still resumable from its projected progress.
+    InProgress,
+    /// The complete tail is reconciled and ordinary sealed authority is established.
+    Finalized,
+    /// The tape is final but has typed degraded replica evidence.
+    FinalizedDegraded,
+    /// Completion or repair requires explicit recovery before ordinary use.
+    RecoveryRequired,
+}
+
+impl TerminalFinalizationOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Finalized => "finalized",
+            Self::FinalizedDegraded => "finalized_degraded",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StateError> {
+        match value {
+            "in_progress" => Ok(Self::InProgress),
+            "finalized" => Ok(Self::Finalized),
+            "finalized_degraded" => Ok(Self::FinalizedDegraded),
+            "recovery_required" => Ok(Self::RecoveryRequired),
+            other => Err(StateError::IndexCorrupt(format!(
+                "unknown terminal finalization outcome {other:?}"
+            ))),
+        }
+    }
+}
+
+/// State-store input for one monotonic terminal-finalization projection update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalFinalizationProjectionInput {
+    /// Physical tape identity.
+    pub tape_uuid: [u8; 16],
+    /// Trigger that permanently closed Object admission.
+    pub trigger: TerminalFinalizationTrigger,
+    /// Durable operation identity for an operator close-out.
+    pub operation_id: Option<Uuid>,
+    /// Current barrier-proved component boundary.
+    pub progress: TerminalFinalizationProgress,
+    /// Canonical final-scope edition digest.
+    pub edition_digest: [u8; 32],
+    /// Digest of the immutable five-component layout.
+    pub layout_digest: [u8; 32],
+    /// Current coarse finalization outcome.
+    pub outcome: TerminalFinalizationOutcome,
+    /// Projection timestamp; current UTC when omitted.
+    pub updated_at_utc: Option<String>,
+}
+
+/// Durable catalog view of terminal finalization for one tape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalFinalizationProjection {
+    /// Trigger that permanently closed Object admission.
+    pub trigger: TerminalFinalizationTrigger,
+    /// Durable operation identity for an operator close-out.
+    pub operation_id: Option<Uuid>,
+    /// Current barrier-proved component boundary.
+    pub progress: TerminalFinalizationProgress,
+    /// Canonical final-scope edition digest.
+    pub edition_digest: [u8; 32],
+    /// Digest of the immutable five-component layout.
+    pub layout_digest: [u8; 32],
+    /// Derived count of complete replica files; never an authority state.
+    pub completed_replicas: u8,
+    /// Current coarse finalization outcome.
+    pub outcome: TerminalFinalizationOutcome,
+}
+
+/// Result of reserving an idempotency scope for a state-changing operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdempotencyRegistration {
+    /// Original operation bound to this actor/kind/key scope.
+    pub operation_id: Uuid,
+    /// True only when this call created the scope.
+    pub newly_registered: bool,
+}
+
+/// Exact durable binding for one actor/operation-kind/idempotency-key scope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdempotencyScopeRecord {
+    /// Authenticated actor fingerprint that owns the scope.
+    pub actor_fingerprint: String,
+    /// State-changing operation kind within the actor's namespace.
+    pub operation_kind: String,
+    /// Client-supplied idempotency key.
+    pub idempotency_key: Uuid,
+    /// Original canonical request fingerprint.
+    pub request_fingerprint: Vec<u8>,
+    /// Original operation bound to this scope.
+    pub operation_id: Uuid,
+    /// Terminal operation state, once known.
+    pub terminal_state: Option<String>,
+    /// Canonical terminal response fingerprint, once known.
+    pub response_fingerprint: Option<Vec<u8>>,
+    /// Last projection timestamp.
+    pub updated_at_utc: String,
 }
 
 /// Metadata needed to register a blank or ready tape in the catalog.
@@ -720,7 +910,7 @@ pub struct NativeObjectCopyRecord {
     /// Tape UUID containing this copy.
     pub tape_uuid: Vec<u8>,
     /// Filemark-delimited tape-file number.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// First object-local body LBA containing payload data.
     pub first_body_lba: u64,
     /// First parity data ordinal, if known.
@@ -808,7 +998,7 @@ pub struct NativeObjectCopyProjectionInput {
     /// Tape UUID containing this copy.
     pub tape_uuid: [u8; 16],
     /// Filemark-delimited tape-file number.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// First object-local body LBA containing payload data.
     pub first_body_lba: u64,
     /// First parity data ordinal, if known.
@@ -893,6 +1083,8 @@ pub struct TapeRecord {
     pub kind: String,
     /// Current tape-pool assignment, if any.
     pub pool_id: Option<String>,
+    /// Monotonic pool-assignment generation.
+    pub assignment_generation: u64,
     /// Dominant native body format derived from cataloged objects on this tape.
     pub body_format: Option<String>,
     /// Fixed block size when known.
@@ -915,6 +1107,8 @@ pub struct TapeRecord {
     /// rollup over object commits. Absent when no barrier has proved one;
     /// absent is never zero.
     pub written_extent_lba: Option<u64>,
+    /// Durable terminal-finalization state, when Object admission is closed.
+    pub terminal_finalization: Option<TerminalFinalizationProjection>,
     /// Projection state.
     pub state: String,
     /// Last projection update timestamp.
@@ -948,7 +1142,7 @@ pub struct TapeFileRecord {
     /// Remanence tape UUID.
     pub tape_uuid: Vec<u8>,
     /// Filemark-delimited tape-file number.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Tape-file kind string.
     pub kind: String,
     /// Number of fixed-size blocks in this tape file.
@@ -1530,11 +1724,8 @@ impl CatalogIndex {
         total_committed_ordinals: u64,
     ) -> Result<TapeJournalIndexReport, StateError> {
         let updated_at = now_utc()?;
-        let last_committed_tape_file = entries
-            .iter()
-            .map(|entry| entry.tape_file_number)
-            .max()
-            .map(i64::from);
+        let last_committed_tape_file = entries.iter().map(|entry| entry.tape_file_number).max();
+        let last_committed_tape_file = last_committed_tape_file.map(SqliteU64::new);
         let tx = self
             .conn
             .transaction()
@@ -1550,8 +1741,8 @@ impl CatalogIndex {
                  where tape_uuid = ?1",
                 params![
                     tape_uuid.to_vec(),
-                    u64_to_i64(highest_protected_ordinal, "highest_protected_ordinal")?,
-                    u64_to_i64(total_committed_ordinals, "total_committed_ordinals")?,
+                    SqliteU64::new(highest_protected_ordinal),
+                    SqliteU64::new(total_committed_ordinals),
                     last_committed_tape_file,
                     updated_at,
                 ],
@@ -1702,7 +1893,10 @@ impl CatalogIndex {
                    highest_protected_ordinal, total_committed_ordinals,
                    last_committed_tape_file, state, updated_at_utc
                  )
-                 values(?1, ?2, 'cleaning', 0, 'unverified', 0, 0, null, 'ready', ?3)",
+                 values(
+                   ?1, ?2, 'cleaning', 0, 'unverified',
+                   X'0000000000000000', X'0000000000000000', null, 'ready', ?3
+                 )",
                 params![tape_uuid.as_bytes().as_slice(), voltag, updated_at],
             )
             .map_err(|err| sqlite_error("register inventory cleaning cartridge", err))?;
@@ -3110,8 +3304,8 @@ impl CatalogIndex {
                 checkpoint_object_bundle(record, projection_index, projection)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let checkpoint_bundle = checkpoint_control_bundle(record, projections)?;
-        validate_checkpoint_record_bundle_shape(record, &object_bundles, &checkpoint_bundle)?;
+        let barrier_bundle = record.barrier_bundle.as_ref();
+        validate_checkpoint_record_bundle_shape(record, &object_bundles, barrier_bundle)?;
 
         let updated_at = now_utc()?;
         let tx = self
@@ -3119,7 +3313,7 @@ impl CatalogIndex {
             .transaction()
             .map_err(|err| sqlite_error("begin checkpoint batch projection", err))?;
         let replay_plan =
-            inspect_checkpoint_projection_tx(&tx, record, &object_bundles, &checkpoint_bundle)?;
+            inspect_checkpoint_projection_tx(&tx, record, &object_bundles, barrier_bundle)?;
         if replay_plan == CheckpointReplayPlan::AlreadyProjected {
             // The record's tape files are already projected, but the
             // written-extent column is monotonic-max over barrier-proved
@@ -3167,21 +3361,23 @@ impl CatalogIndex {
             )?;
             project_committed_tape_file_bundle_tx(&tx, &tape_input, bundle, updated_at.as_str())?;
         }
-        let tape_input = TapeJournalIndexInput {
-            tape_uuid: record.tape_uuid,
-            block_size: record.block_size,
-            scheme: record.scheme.clone(),
-            journal_offset_bytes: 0,
-        };
-        if replay_plan == CheckpointReplayPlan::StrictAppend {
-            validate_checkpoint_control_extension_tx(&tx, &tape_input, &checkpoint_bundle)?;
+        if let Some(barrier_bundle) = barrier_bundle {
+            let tape_input = TapeJournalIndexInput {
+                tape_uuid: record.tape_uuid,
+                block_size: record.block_size,
+                scheme: record.scheme.clone(),
+                journal_offset_bytes: 0,
+            };
+            if replay_plan == CheckpointReplayPlan::StrictAppend {
+                validate_checkpoint_sidecar_extension_tx(&tx, &tape_input, barrier_bundle)?;
+            }
+            project_committed_tape_file_bundle_tx(
+                &tx,
+                &tape_input,
+                barrier_bundle,
+                updated_at.as_str(),
+            )?;
         }
-        project_committed_tape_file_bundle_tx(
-            &tx,
-            &tape_input,
-            &checkpoint_bundle,
-            updated_at.as_str(),
-        )?;
         // The written extent is the max barrier-proved eod_lba over the
         // volume's checkpoint records — a measurement taken after the
         // barrier, so trailing sidecars, parity maps and checkpoint files
@@ -3211,59 +3407,118 @@ impl CatalogIndex {
         &mut self,
         record: &crate::checkpoint::CheckpointJournalRecord,
     ) -> Result<(), StateError> {
-        let bundle = record.checkpoint_bundle.as_ref().ok_or_else(|| {
-            StateError::IndexCorrupt("terminal checkpoint has no Finish bundle".to_string())
+        self.project_structured_terminal_checkpoint_record(record)
+    }
+
+    fn project_structured_terminal_checkpoint_record(
+        &mut self,
+        record: &crate::checkpoint::CheckpointJournalRecord,
+    ) -> Result<(), StateError> {
+        let finalization = record.terminal_finalization.as_ref().ok_or_else(|| {
+            StateError::IndexCorrupt(
+                "structured terminal checkpoint has no finalization authority".to_string(),
+            )
         })?;
-        remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
+        finalization
+            .validate_for_tape(record.tape_uuid)
+            .map_err(|error| StateError::IndexCorrupt(error.to_string()))?;
+        let expected_next_tape_file_number = finalization.layout.components[4]
+            .tape_file_number
+            .checked_add(1)
+            .ok_or_else(|| {
+                StateError::IndexCorrupt(
+                    "structured terminal checkpoint next tape-file number overflows u64"
+                        .to_string(),
+                )
+            })?;
+        if finalization.progress != TerminalFinalizationProgress::AfterReplicaC
+            || finalization.layout.partition != record.eod_partition
+            || finalization.layout.block_size != record.block_size
+            || finalization.layout.expected_eod_lba != record.eod_lba
+            || record.scheme.is_some() != finalization.terminal_prefix.is_some()
+        {
+            return Err(StateError::IndexCorrupt(
+                "structured terminal checkpoint completion geometry is inconsistent".to_string(),
+            ));
+        }
+        let bundle = record.barrier_bundle.as_ref().ok_or_else(|| {
+            StateError::IndexCorrupt(
+                "structured terminal checkpoint has no replica-C bundle".to_string(),
+            )
+        })?;
+        remanence_parity::validate_committed_bundle_shape(bundle).map_err(|error| {
             StateError::IndexCorrupt(format!(
-                "terminal checkpoint has invalid Finish bundle: {err}"
+                "structured terminal checkpoint has invalid replica-C bundle: {error}"
             ))
         })?;
-        if bundle.kind != CommittedBundleKind::Finish {
+        if bundle.kind != CommittedBundleKind::TerminalComponent {
             return Err(StateError::IndexCorrupt(format!(
-                "terminal checkpoint uses {:?} bundle kind",
+                "structured terminal checkpoint uses {:?} bundle kind",
                 bundle.kind
             )));
         }
+        let [entry] = bundle.entries.as_slice() else {
+            return Err(StateError::IndexCorrupt(
+                "structured terminal checkpoint must name exactly replica C".to_string(),
+            ));
+        };
+        let replica_c = finalization.layout.components[4];
+        if replica_c.kind != crate::checkpoint::TerminalFinalizationComponentKind::TapeIndexReplica
+            || replica_c.ordinal != 3
+            || entry.kind != TapeFileKind::TapeIndexReplica
+            || entry.tape_file_number != replica_c.tape_file_number
+            || entry.block_count != replica_c.record_count
+            || entry.physical_start_hint != Some(replica_c.start_lba)
+            || entry.canonical_metadata_hash != Some(finalization.edition_digest)
+            || record.next_tape_file_number != expected_next_tape_file_number
+        {
+            return Err(StateError::IndexCorrupt(
+                "structured terminal checkpoint does not bind final replica C".to_string(),
+            ));
+        }
         let tape = self.get_tape(&record.tape_uuid)?.ok_or_else(|| {
             StateError::IndexCorrupt(format!(
-                "terminal checkpoint names unknown tape {}",
+                "structured terminal checkpoint names unknown tape {}",
                 hex_uuid(record.tape_uuid)
             ))
         })?;
-        if tape.block_size != Some(u64::from(record.block_size)) {
-            return Err(StateError::IndexCorrupt(format!(
-                "terminal checkpoint block size {} conflicts with tape geometry {:?}",
-                record.block_size, tape.block_size
-            )));
-        }
         let expected_scheme_id = record
             .scheme
             .as_ref()
             .map(|scheme| scheme.id.as_str().to_string());
-        if tape.scheme_id != expected_scheme_id
-            || record.scheme.as_ref().is_some_and(|scheme| {
-                tape.data_blocks_per_stripe != Some(u32::from(scheme.data_blocks_per_stripe))
-                    || tape.parity_blocks_per_stripe
-                        != Some(u32::from(scheme.parity_blocks_per_stripe))
-                    || tape.stripes_per_neighborhood != Some(scheme.stripes_per_neighborhood)
-            })
+        if tape.block_size != Some(u64::from(record.block_size))
+            || tape.scheme_id != expected_scheme_id
             || tape.total_committed_ordinals != bundle.total_committed_ordinals
         {
             return Err(StateError::IndexCorrupt(format!(
-                "terminal checkpoint geometry or ordinal scope conflicts with tape {}",
+                "structured terminal checkpoint geometry or scope conflicts with tape {}",
                 hex_uuid(record.tape_uuid)
             )));
         }
+        let operation_id = finalization
+            .manual
+            .as_ref()
+            .map(|manual| Uuid::from_bytes(manual.operation_id));
+        let input = TerminalFinalizationProjectionInput {
+            tape_uuid: record.tape_uuid,
+            trigger: finalization.trigger,
+            operation_id,
+            progress: TerminalFinalizationProgress::AfterReplicaC,
+            edition_digest: finalization.edition_digest,
+            layout_digest: finalization.layout.layout_digest,
+            outcome: TerminalFinalizationOutcome::Finalized,
+            updated_at_utc: None,
+        };
+        validate_terminal_finalization_input(&input)?;
         let updated_at = now_utc()?;
         let tx = self
             .conn
             .transaction()
-            .map_err(|err| sqlite_error("begin terminal checkpoint projection", err))?;
+            .map_err(|error| sqlite_error("begin structured terminal projection", error))?;
         project_tape_written_extent_tx(&tx, record.tape_uuid, record.eod_lba)?;
-        project_checkpoint_tape_seal_tx(&tx, record.tape_uuid, true, updated_at.as_str())?;
+        project_terminal_finalization_tx(&tx, &input, updated_at.as_str())?;
         tx.commit()
-            .map_err(|err| sqlite_error("commit terminal checkpoint projection", err))?;
+            .map_err(|error| sqlite_error("commit structured terminal projection", error))?;
         Ok(())
     }
 
@@ -3284,7 +3539,10 @@ impl CatalogIndex {
                  )
                  values(?1, ?2, ?3, ?4, ?5, ?6, 'ingestion_pending', ?7)
                  on conflict(tape_uuid) do update set
-                   state = excluded.state,
+                   state = case
+                     when tapes.finalization_progress is not null then tapes.state
+                     else excluded.state
+                   end,
                    updated_at_utc = excluded.updated_at_utc",
                 params![
                     tape_uuid.to_vec(),
@@ -3526,11 +3784,25 @@ impl CatalogIndex {
         let existing_memberships = query_memberships_tx(&tx)?;
         for (tape_uuid, pool_id) in existing_memberships {
             if !configured_memberships.contains(&(tape_uuid.clone(), pool_id)) {
-                tx.execute(
-                    "update tapes set pool_id = null where tape_uuid = ?1",
-                    params![tape_uuid],
-                )
-                .map_err(|err| sqlite_error("clear stale derived tape pool membership", err))?;
+                let tape_uuid: [u8; 16] = tape_uuid.try_into().map_err(|tape_uuid: Vec<u8>| {
+                    StateError::IndexCorrupt(format!(
+                        "tape pool membership UUID has length {}, expected 16",
+                        tape_uuid.len()
+                    ))
+                })?;
+                let snapshot =
+                    query_tape_assignment_snapshot_tx(&tx, tape_uuid)?.ok_or_else(|| {
+                        StateError::IndexCorrupt(
+                            "tape vanished during pool-rule reconciliation".to_string(),
+                        )
+                    })?;
+                set_tape_pool_membership_tx(
+                    &tx,
+                    tape_uuid,
+                    snapshot.assignment_generation,
+                    None,
+                    now_utc()?.as_str(),
+                )?;
             }
         }
 
@@ -3575,15 +3847,98 @@ impl CatalogIndex {
         tape_uuid: [u8; 16],
         pool_id: &str,
     ) -> Result<(), StateError> {
-        let pool_id = normalize_pool_id(pool_id)?;
+        let snapshot = self
+            .get_tape_assignment_snapshot(&tape_uuid)?
+            .ok_or_else(|| {
+                StateError::TapePoolAssignmentConflict(format!(
+                    "cannot assign unknown tape {}",
+                    hex_uuid(tape_uuid)
+                ))
+            })?;
+        self.compare_and_set_tape_pool_assignment(
+            tape_uuid,
+            snapshot.assignment_generation,
+            Some(pool_id),
+        )?;
+        Ok(())
+    }
+
+    /// Clear a tape's pool membership under its current assignment generation.
+    pub fn clear_tape_pool_membership(&mut self, tape_uuid: [u8; 16]) -> Result<(), StateError> {
+        let snapshot = self
+            .get_tape_assignment_snapshot(&tape_uuid)?
+            .ok_or_else(|| {
+                StateError::TapePoolAssignmentConflict(format!(
+                    "cannot clear assignment for unknown tape {}",
+                    hex_uuid(tape_uuid)
+                ))
+            })?;
+        self.compare_and_set_tape_pool_assignment(tape_uuid, snapshot.assignment_generation, None)?;
+        Ok(())
+    }
+
+    /// Read the pool assignment and generation as one conditional-update snapshot.
+    pub fn get_tape_assignment_snapshot(
+        &self,
+        tape_uuid: &[u8; 16],
+    ) -> Result<Option<TapeAssignmentSnapshot>, StateError> {
+        self.conn
+            .query_row(
+                "select tape_uuid, pool_id, assignment_generation
+                 from tapes where tape_uuid = ?1",
+                params![tape_uuid.to_vec()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| sqlite_error("lookup tape assignment snapshot", err))?
+            .map(|(tape_uuid, pool_id, generation)| {
+                Ok(TapeAssignmentSnapshot {
+                    tape_uuid,
+                    pool_id,
+                    assignment_generation: i64_to_u64(generation, "assignment_generation")?,
+                })
+            })
+            .transpose()
+    }
+
+    /// Conditionally assign or clear a pool using the observed generation.
+    ///
+    /// An effective change increments the generation exactly once. Repeating
+    /// the same value is idempotent and retains the current generation.
+    pub fn compare_and_set_tape_pool_assignment(
+        &mut self,
+        tape_uuid: [u8; 16],
+        expected_generation: u64,
+        pool_id: Option<&str>,
+    ) -> Result<TapeAssignmentSnapshot, StateError> {
+        let pool_id = pool_id.map(normalize_pool_id).transpose()?;
+        let updated_at_utc = now_utc()?;
         let tx = self
             .conn
             .transaction()
-            .map_err(|err| sqlite_error("begin tape pool membership projection", err))?;
-        project_tape_pool_membership_tx(&tx, tape_uuid, pool_id.as_str())?;
+            .map_err(|err| sqlite_error("begin conditional tape pool assignment", err))?;
+        set_tape_pool_membership_tx(
+            &tx,
+            tape_uuid,
+            expected_generation,
+            pool_id.as_deref(),
+            updated_at_utc.as_str(),
+        )?;
+        let snapshot = query_tape_assignment_snapshot_tx(&tx, tape_uuid)?.ok_or_else(|| {
+            StateError::TapePoolAssignmentConflict(format!(
+                "tape {} vanished during assignment",
+                hex_uuid(tape_uuid)
+            ))
+        })?;
         tx.commit()
-            .map_err(|err| sqlite_error("commit tape pool membership projection", err))?;
-        Ok(())
+            .map_err(|err| sqlite_error("commit conditional tape pool assignment", err))?;
+        Ok(snapshot)
     }
 
     /// List configured tape pools.
@@ -3645,6 +4000,34 @@ impl CatalogIndex {
             )
             .optional()
             .map_err(|err| sqlite_error("lookup tape pool membership", err))
+    }
+
+    /// Project one monotonic terminal-finalization state for a known tape.
+    pub fn project_terminal_finalization(
+        &mut self,
+        input: TerminalFinalizationProjectionInput,
+    ) -> Result<TapeRecord, StateError> {
+        validate_terminal_finalization_input(&input)?;
+        let updated_at_utc = input.updated_at_utc.clone().unwrap_or(now_utc()?);
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin terminal finalization projection", err))?;
+        project_terminal_finalization_tx(&tx, &input, updated_at_utc.as_str())?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit terminal finalization projection", err))?;
+        self.get_tape(&input.tape_uuid)?
+            .ok_or_else(|| StateError::IndexCorrupt("finalizing tape vanished".to_string()))
+    }
+
+    /// Return a tape's durable terminal-finalization projection.
+    pub fn terminal_finalization(
+        &self,
+        tape_uuid: &[u8; 16],
+    ) -> Result<Option<TerminalFinalizationProjection>, StateError> {
+        Ok(self
+            .get_tape(tape_uuid)?
+            .and_then(|tape| tape.terminal_finalization))
     }
 
     /// Project a native object commit and its concrete tape copies into Layer 4.
@@ -3846,7 +4229,11 @@ impl CatalogIndex {
                     block_size, scheme_id,
                     data_blocks_per_stripe, parity_blocks_per_stripe,
                     stripes_per_neighborhood, last_committed_tape_file,
-                    total_committed_ordinals, written_extent_lba, state, updated_at_utc
+                    total_committed_ordinals, written_extent_lba, state, updated_at_utc,
+                    assignment_generation, finalization_progress,
+                    finalization_trigger, finalization_operation_id,
+                    finalization_edition_digest, finalization_layout_digest,
+                    completed_replicas, finalization_outcome
              from tapes{where_clause}
              order by hex(tapes.tape_uuid)"
         );
@@ -3991,7 +4378,11 @@ impl CatalogIndex {
                         block_size, scheme_id,
                         data_blocks_per_stripe, parity_blocks_per_stripe,
                         stripes_per_neighborhood, last_committed_tape_file,
-                        total_committed_ordinals, written_extent_lba, state, updated_at_utc
+                        total_committed_ordinals, written_extent_lba, state, updated_at_utc,
+                        assignment_generation, finalization_progress,
+                        finalization_trigger, finalization_operation_id,
+                        finalization_edition_digest, finalization_layout_digest,
+                        completed_replicas, finalization_outcome
                  from tapes
                  where tapes.tape_uuid = ?1",
             )
@@ -4032,7 +4423,11 @@ impl CatalogIndex {
                         block_size, scheme_id,
                         data_blocks_per_stripe, parity_blocks_per_stripe,
                         stripes_per_neighborhood, last_committed_tape_file,
-                        total_committed_ordinals, written_extent_lba, state, updated_at_utc
+                        total_committed_ordinals, written_extent_lba, state, updated_at_utc,
+                        assignment_generation, finalization_progress,
+                        finalization_trigger, finalization_operation_id,
+                        finalization_edition_digest, finalization_layout_digest,
+                        completed_replicas, finalization_outcome
                  from tapes
                  where tapes.voltag = ?1",
             )
@@ -4712,22 +5107,189 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("read session state", err))
     }
 
-    /// Return the projected idempotency terminal state for typed callers/tests.
-    pub fn idempotency_terminal_state(
+    /// Reserve one actor/operation-kind/idempotency-key scope.
+    ///
+    /// An identical request returns the operation originally registered for
+    /// the scope. Reuse with a different request fingerprint is a typed
+    /// conflict and never rewrites the original operation.
+    pub fn register_idempotency_request(
+        &mut self,
+        actor_fingerprint: &str,
+        operation_kind: &str,
+        idempotency_key: Uuid,
+        request_fingerprint: [u8; 32],
+        operation_id: Uuid,
+        updated_at_utc: Option<&str>,
+    ) -> Result<IdempotencyRegistration, StateError> {
+        let actor_fingerprint = actor_fingerprint.trim();
+        let operation_kind = operation_kind.trim();
+        if actor_fingerprint.is_empty() || operation_kind.is_empty() {
+            return Err(StateError::ConfigInvalid(
+                "idempotency actor fingerprint and operation kind must be non-empty".to_string(),
+            ));
+        }
+        let updated_at_utc = match updated_at_utc {
+            Some(value) => value.to_string(),
+            None => now_utc()?,
+        };
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin idempotency registration", err))?;
+        let registration = upsert_idempotency_request(
+            &tx,
+            IdempotencyRequestProjection {
+                actor_fingerprint,
+                operation_kind,
+                idempotency_key,
+                request_fingerprint: request_fingerprint.to_vec(),
+                operation_id,
+                updated_at_utc: updated_at_utc.as_str(),
+            },
+            IdempotencyProjectionMode::Live,
+        )?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit idempotency registration", err))?;
+        Ok(registration)
+    }
+
+    /// Read the exact durable idempotency binding before creating a new plan.
+    pub fn idempotency_scope_record(
         &self,
         actor_fingerprint: &str,
+        operation_kind: &str,
+        idempotency_key: Uuid,
+    ) -> Result<Option<IdempotencyScopeRecord>, StateError> {
+        let actor_fingerprint = actor_fingerprint.trim();
+        let operation_kind = operation_kind.trim();
+        if actor_fingerprint.is_empty() || operation_kind.is_empty() {
+            return Err(StateError::ConfigInvalid(
+                "idempotency actor fingerprint and operation kind must be non-empty".to_string(),
+            ));
+        }
+        self.conn
+            .query_row(
+                "select actor_fingerprint, operation_kind, idempotency_key,
+                        request_fingerprint, operation_id, terminal_state,
+                        response_fingerprint, updated_at_utc
+                 from idempotency_keys
+                 where actor_fingerprint = ?1
+                   and operation_kind = ?2
+                   and idempotency_key = ?3",
+                params![
+                    actor_fingerprint,
+                    operation_kind,
+                    idempotency_key.to_string()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|err| sqlite_error("read exact idempotency scope", err))?
+            .map(
+                |(
+                    actor_fingerprint,
+                    operation_kind,
+                    idempotency_key,
+                    request_fingerprint,
+                    operation_id,
+                    terminal_state,
+                    response_fingerprint,
+                    updated_at_utc,
+                )| {
+                    Ok(IdempotencyScopeRecord {
+                        actor_fingerprint,
+                        operation_kind,
+                        idempotency_key: parse_uuid_for_index(
+                            idempotency_key.as_str(),
+                            "idempotency_key",
+                        )?,
+                        request_fingerprint,
+                        operation_id: parse_uuid_for_index(
+                            operation_id.as_str(),
+                            "idempotency operation_id",
+                        )?,
+                        terminal_state,
+                        response_fingerprint,
+                        updated_at_utc,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    /// Return terminal idempotency state for the complete primary scope.
+    pub fn idempotency_terminal_state_scoped(
+        &self,
+        actor_fingerprint: &str,
+        operation_kind: &str,
         idempotency_key: Uuid,
     ) -> Result<Option<String>, StateError> {
         self.conn
             .query_row(
                 "select terminal_state from idempotency_keys
-                 where actor_fingerprint = ?1 and idempotency_key = ?2",
-                params![actor_fingerprint, idempotency_key.to_string()],
+                 where actor_fingerprint = ?1
+                   and operation_kind = ?2
+                   and idempotency_key = ?3",
+                params![
+                    actor_fingerprint,
+                    operation_kind,
+                    idempotency_key.to_string()
+                ],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|err| sqlite_error("read idempotency terminal state", err))
+            .map_err(|err| sqlite_error("read scoped idempotency terminal state", err))
             .map(|value| value.flatten())
+    }
+
+    /// Return terminal idempotency state when actor/key resolves uniquely.
+    ///
+    /// New state-changing callers should use
+    /// [`Self::idempotency_terminal_state_scoped`]. This compatibility lookup
+    /// fails closed if the same actor/key exists under multiple operation kinds.
+    pub fn idempotency_terminal_state(
+        &self,
+        actor_fingerprint: &str,
+        idempotency_key: Uuid,
+    ) -> Result<Option<String>, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select terminal_state from idempotency_keys
+                 where actor_fingerprint = ?1 and idempotency_key = ?2
+                 order by operation_kind",
+            )
+            .map_err(|err| sqlite_error("prepare idempotency terminal state", err))?;
+        let mut rows = stmt
+            .query(params![actor_fingerprint, idempotency_key.to_string()])
+            .map_err(|err| sqlite_error("query idempotency terminal state", err))?;
+        let first = rows
+            .next()
+            .map_err(|err| sqlite_error("iterate idempotency terminal state", err))?
+            .map(|row| row.get::<_, Option<String>>(0))
+            .transpose()
+            .map_err(|err| sqlite_error("decode idempotency terminal state", err))?;
+        if rows
+            .next()
+            .map_err(|err| sqlite_error("iterate idempotency terminal ambiguity", err))?
+            .is_some()
+        {
+            return Err(StateError::AmbiguousCatalogLookup(format!(
+                "idempotency actor {actor_fingerprint} and key {idempotency_key} exist under multiple operation kinds"
+            )));
+        }
+        Ok(first.flatten())
     }
 }
 
@@ -4776,7 +5338,7 @@ struct ExistingProvisionedTape {
     tape_uuid: Vec<u8>,
     voltag: Option<String>,
     geometry: ProvisionTapeGeometry,
-    last_committed_tape_file: Option<i64>,
+    last_committed_tape_file: Option<SqliteU64>,
     state: String,
 }
 
@@ -4785,6 +5347,7 @@ struct PreservedTapeRow {
     tape_uuid: Vec<u8>,
     voltag: Option<String>,
     pool_id: Option<String>,
+    assignment_generation: i64,
     kind: String,
     cleaning_uses: Option<i64>,
     cleaning_state: Option<String>,
@@ -4793,11 +5356,18 @@ struct PreservedTapeRow {
     data_blocks_per_stripe: Option<i64>,
     parity_blocks_per_stripe: Option<i64>,
     stripes_per_neighborhood: Option<i64>,
-    highest_protected_ordinal: i64,
-    total_committed_ordinals: i64,
-    last_committed_tape_file: Option<i64>,
+    highest_protected_ordinal: SqliteU64,
+    total_committed_ordinals: SqliteU64,
+    last_committed_tape_file: Option<SqliteU64>,
     state: String,
     updated_at_utc: String,
+    finalization_progress: Option<String>,
+    finalization_trigger: Option<String>,
+    finalization_operation_id: Option<String>,
+    finalization_edition_digest: Option<Vec<u8>>,
+    finalization_layout_digest: Option<Vec<u8>>,
+    completed_replicas: Option<i64>,
+    finalization_outcome: Option<String>,
 }
 
 /// Stable identities for cache rows whose original writers predate durable
@@ -5109,7 +5679,10 @@ fn insert_provisioned_tape_tx(
            highest_protected_ordinal, total_committed_ordinals,
            last_committed_tape_file, state, updated_at_utc
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, null, 'ready', ?8)",
+         values(
+           ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+           X'0000000000000000', X'0000000000000000', null, 'ready', ?8
+         )",
         params![
             tape_uuid.to_vec(),
             voltag,
@@ -5161,8 +5734,8 @@ fn reprovision_tape_tx(
              parity_blocks_per_stripe = ?7,
              stripes_per_neighborhood = ?8,
              state = 'ready',
-             highest_protected_ordinal = 0,
-             total_committed_ordinals = 0,
+             highest_protected_ordinal = X'0000000000000000',
+             total_committed_ordinals = X'0000000000000000',
              last_committed_tape_file = null,
              updated_at_utc = ?9
          where tape_uuid = ?1",
@@ -5223,19 +5796,28 @@ fn query_preserved_tape_rows_tx(
 ) -> Result<Vec<PreservedTapeRow>, StateError> {
     let mut stmt = tx
         .prepare(
-            "select tape_uuid, voltag, pool_id, kind, cleaning_uses, cleaning_state,
+            "select tape_uuid, voltag, pool_id, assignment_generation,
+                    kind, cleaning_uses, cleaning_state,
                     block_size, scheme_id,
                     data_blocks_per_stripe, parity_blocks_per_stripe,
                     stripes_per_neighborhood, highest_protected_ordinal,
                     total_committed_ordinals, last_committed_tape_file,
-                    state, updated_at_utc
+                    state, updated_at_utc, finalization_progress,
+                    finalization_trigger, finalization_operation_id,
+                    finalization_edition_digest, finalization_layout_digest,
+                    completed_replicas, finalization_outcome
              from tapes
              where voltag is not null
                 or pool_id is not null
+                or assignment_generation != 0
                 or kind != 'data'
                 or cleaning_uses is not null
                 or cleaning_state is not null
-                or state in ('ready', 'sealed', 'retired')",
+                or finalization_progress is not null
+                or state in (
+                  'ready', 'sealed', 'retired', 'finalizing',
+                  'finalized', 'finalized_degraded', 'recovery_required'
+                )",
         )
         .map_err(|err| sqlite_error("prepare preserved tape query", err))?;
     let mut rows = stmt
@@ -5250,19 +5832,27 @@ fn query_preserved_tape_rows_tx(
             tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
             voltag: row_get(row, 1, "tapes.voltag")?,
             pool_id: row_get(row, 2, "tapes.pool_id")?,
-            kind: row_get(row, 3, "tapes.kind")?,
-            cleaning_uses: row_get(row, 4, "tapes.cleaning_uses")?,
-            cleaning_state: row_get(row, 5, "tapes.cleaning_state")?,
-            block_size: row_get(row, 6, "tapes.block_size")?,
-            scheme_id: row_get(row, 7, "tapes.scheme_id")?,
-            data_blocks_per_stripe: row_get(row, 8, "tapes.data_blocks_per_stripe")?,
-            parity_blocks_per_stripe: row_get(row, 9, "tapes.parity_blocks_per_stripe")?,
-            stripes_per_neighborhood: row_get(row, 10, "tapes.stripes_per_neighborhood")?,
-            highest_protected_ordinal: row_get(row, 11, "tapes.highest_protected_ordinal")?,
-            total_committed_ordinals: row_get(row, 12, "tapes.total_committed_ordinals")?,
-            last_committed_tape_file: row_get(row, 13, "tapes.last_committed_tape_file")?,
-            state: row_get(row, 14, "tapes.state")?,
-            updated_at_utc: row_get(row, 15, "tapes.updated_at_utc")?,
+            assignment_generation: row_get(row, 3, "tapes.assignment_generation")?,
+            kind: row_get(row, 4, "tapes.kind")?,
+            cleaning_uses: row_get(row, 5, "tapes.cleaning_uses")?,
+            cleaning_state: row_get(row, 6, "tapes.cleaning_state")?,
+            block_size: row_get(row, 7, "tapes.block_size")?,
+            scheme_id: row_get(row, 8, "tapes.scheme_id")?,
+            data_blocks_per_stripe: row_get(row, 9, "tapes.data_blocks_per_stripe")?,
+            parity_blocks_per_stripe: row_get(row, 10, "tapes.parity_blocks_per_stripe")?,
+            stripes_per_neighborhood: row_get(row, 11, "tapes.stripes_per_neighborhood")?,
+            highest_protected_ordinal: row_get(row, 12, "tapes.highest_protected_ordinal")?,
+            total_committed_ordinals: row_get(row, 13, "tapes.total_committed_ordinals")?,
+            last_committed_tape_file: row_get(row, 14, "tapes.last_committed_tape_file")?,
+            state: row_get(row, 15, "tapes.state")?,
+            updated_at_utc: row_get(row, 16, "tapes.updated_at_utc")?,
+            finalization_progress: row_get(row, 17, "tapes.finalization_progress")?,
+            finalization_trigger: row_get(row, 18, "tapes.finalization_trigger")?,
+            finalization_operation_id: row_get(row, 19, "tapes.finalization_operation_id")?,
+            finalization_edition_digest: row_get(row, 20, "tapes.finalization_edition_digest")?,
+            finalization_layout_digest: row_get(row, 21, "tapes.finalization_layout_digest")?,
+            completed_replicas: row_get(row, 22, "tapes.completed_replicas")?,
+            finalization_outcome: row_get(row, 23, "tapes.finalization_outcome")?,
         });
     }
     Ok(preserved)
@@ -5275,17 +5865,25 @@ fn restore_preserved_tape_rows_tx(
     for row in rows {
         tx.execute(
             "insert into tapes(
-               tape_uuid, voltag, pool_id, kind, cleaning_uses,
+               tape_uuid, voltag, pool_id, assignment_generation, kind, cleaning_uses,
                cleaning_state, block_size, scheme_id, data_blocks_per_stripe,
                parity_blocks_per_stripe, stripes_per_neighborhood,
                highest_protected_ordinal, total_committed_ordinals,
-               last_committed_tape_file, state, updated_at_utc
+               last_committed_tape_file, state, updated_at_utc,
+               finalization_progress, finalization_trigger,
+               finalization_operation_id, finalization_edition_digest,
+               finalization_layout_digest, completed_replicas,
+               finalization_outcome
             )
-             values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             values(
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+               ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+             )",
             params![
                 row.tape_uuid.as_slice(),
                 row.voltag.as_deref(),
                 row.pool_id.as_deref(),
+                row.assignment_generation,
                 row.kind.as_str(),
                 row.cleaning_uses,
                 row.cleaning_state.as_deref(),
@@ -5299,6 +5897,13 @@ fn restore_preserved_tape_rows_tx(
                 row.last_committed_tape_file,
                 row.state.as_str(),
                 row.updated_at_utc.as_str(),
+                row.finalization_progress.as_deref(),
+                row.finalization_trigger.as_deref(),
+                row.finalization_operation_id.as_deref(),
+                row.finalization_edition_digest.as_deref(),
+                row.finalization_layout_digest.as_deref(),
+                row.completed_replicas,
+                row.finalization_outcome.as_deref(),
             ],
         )
         .map_err(|err| sqlite_error("restore preserved tape row", err))?;
@@ -5318,23 +5923,45 @@ fn merge_preserved_tape_operator_columns_tx(
         // retired identity as `ingested`.
         if row.voltag.is_none()
             && row.pool_id.is_none()
+            && row.assignment_generation == 0
             && row.kind == "data"
             && row.cleaning_uses.is_none()
             && row.cleaning_state.is_none()
-            && !matches!(row.state.as_str(), "ready" | "sealed" | "retired")
+            && row.finalization_progress.is_none()
+            && !matches!(
+                row.state.as_str(),
+                "ready"
+                    | "sealed"
+                    | "retired"
+                    | "finalizing"
+                    | "finalized"
+                    | "finalized_degraded"
+                    | "recovery_required"
+            )
         {
             continue;
         }
         tx.execute(
             "update tapes
              set voltag = coalesce(?2, voltag),
-                 pool_id = coalesce(?3, pool_id),
-                 kind = ?4,
-                 cleaning_uses = ?5,
-                 cleaning_state = ?6,
+                 pool_id = ?3,
+                 assignment_generation = max(assignment_generation, ?4),
+                 kind = ?5,
+                 cleaning_uses = ?6,
+                 cleaning_state = ?7,
+                 finalization_progress = ?8,
+                 finalization_trigger = ?9,
+                 finalization_operation_id = ?10,
+                 finalization_edition_digest = ?11,
+                 finalization_layout_digest = ?12,
+                 completed_replicas = ?13,
+                 finalization_outcome = ?14,
                  state =
                    case
-                     when ?7 in ('ready', 'sealed', 'retired') then ?7
+                     when ?15 in (
+                       'ready', 'sealed', 'retired', 'finalizing',
+                       'finalized', 'finalized_degraded', 'recovery_required'
+                     ) then ?15
                      else state
                    end
              where tape_uuid = ?1",
@@ -5342,9 +5969,17 @@ fn merge_preserved_tape_operator_columns_tx(
                 row.tape_uuid.as_slice(),
                 row.voltag.as_deref(),
                 row.pool_id.as_deref(),
+                row.assignment_generation,
                 row.kind.as_str(),
                 row.cleaning_uses,
                 row.cleaning_state.as_deref(),
+                row.finalization_progress.as_deref(),
+                row.finalization_trigger.as_deref(),
+                row.finalization_operation_id.as_deref(),
+                row.finalization_edition_digest.as_deref(),
+                row.finalization_layout_digest.as_deref(),
+                row.completed_replicas,
+                row.finalization_outcome.as_deref(),
                 row.state.as_str(),
             ],
         )
@@ -5364,8 +5999,8 @@ fn index_committed_tape_journal_tx(
         .entries
         .iter()
         .map(|entry| entry.tape_file_number)
-        .max()
-        .map(i64::from);
+        .max();
+    let last_committed_tape_file = last_committed_tape_file.map(SqliteU64::new);
     tx.execute(
         "insert into tapes(
            tape_uuid, block_size, scheme_id, data_blocks_per_stripe,
@@ -5385,7 +6020,11 @@ fn index_committed_tape_journal_tx(
            last_committed_tape_file = excluded.last_committed_tape_file,
            state =
              case
-               when tapes.state in ('sealed', 'retired') then tapes.state
+               when tapes.finalization_progress is not null
+                 or tapes.state in (
+                   'sealed', 'retired', 'finalizing', 'finalized',
+                   'finalized_degraded', 'recovery_required'
+                 ) then tapes.state
                else excluded.state
              end,
            updated_at_utc = excluded.updated_at_utc",
@@ -5396,8 +6035,8 @@ fn index_committed_tape_journal_tx(
             scheme.map(|scheme| i64::from(scheme.data_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.parity_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
-            u64_to_i64(state.highest_protected_ordinal, "highest_protected_ordinal")?,
-            u64_to_i64(state.total_committed_ordinals, "total_committed_ordinals")?,
+            SqliteU64::new(state.highest_protected_ordinal),
+            SqliteU64::new(state.total_committed_ordinals),
             last_committed_tape_file,
             updated_at,
         ],
@@ -5635,10 +6274,10 @@ fn insert_native_object_file_projection_tx(
             file.object_id.as_str(),
             file.file_id.as_str(),
             file.path.as_str(),
-            u64_to_i64(file.size_bytes, "object_files.size_bytes")?,
+            SqliteU64::new(file.size_bytes),
             file.file_sha256.as_slice(),
-            opt_u64_to_i64(file.first_chunk_lba, "object_files.first_chunk_lba")?,
-            u64_to_i64(file.chunk_count, "object_files.chunk_count")?,
+            file.first_chunk_lba.map(SqliteU64::new),
+            SqliteU64::new(file.chunk_count),
             file.mtime.as_deref(),
             executable,
         ],
@@ -5672,11 +6311,11 @@ struct CheckpointObjectFileView {
     object_id: String,
     file_id: String,
     path: String,
-    size_bytes: i64,
+    size_bytes: SqliteU64,
     file_sha256: Vec<u8>,
     file_digest_algorithm: String,
-    first_chunk_lba: Option<i64>,
-    chunk_count: i64,
+    first_chunk_lba: Option<SqliteU64>,
+    chunk_count: SqliteU64,
     mtime: Option<String>,
     executable: Option<i64>,
 }
@@ -5685,14 +6324,14 @@ struct CheckpointObjectFileView {
 struct CheckpointObjectCopyView {
     object_id: String,
     tape_uuid: Vec<u8>,
-    tape_file_number: i64,
-    first_body_lba: i64,
-    first_parity_data_ordinal: Option<i64>,
-    protected_until_ordinal: Option<i64>,
+    tape_file_number: SqliteU64,
+    first_body_lba: SqliteU64,
+    first_parity_data_ordinal: Option<SqliteU64>,
+    protected_until_ordinal: Option<SqliteU64>,
     status: String,
     representation: String,
     recipient_epoch_ids: Option<String>,
-    metadata_frame_len: Option<i64>,
+    metadata_frame_len: Option<SqliteU64>,
     plaintext_digest: Option<Vec<u8>>,
     plaintext_digest_algorithm: Option<String>,
     stored_digest: Option<Vec<u8>>,
@@ -5702,15 +6341,15 @@ struct CheckpointObjectCopyView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CheckpointTapeFileView {
     tape_uuid: Vec<u8>,
-    tape_file_number: i64,
+    tape_file_number: SqliteU64,
     kind: String,
-    block_count: i64,
-    physical_start_hint: Option<i64>,
+    block_count: SqliteU64,
+    physical_start_hint: Option<SqliteU64>,
     object_id: Option<String>,
-    first_parity_data_ordinal: Option<i64>,
-    epoch_id: Option<i64>,
-    protected_ordinal_start: Option<i64>,
-    protected_ordinal_end_exclusive: Option<i64>,
+    first_parity_data_ordinal: Option<SqliteU64>,
+    epoch_id: Option<SqliteU64>,
+    protected_ordinal_start: Option<SqliteU64>,
+    protected_ordinal_end_exclusive: Option<SqliteU64>,
     canonical_metadata_hash: Option<Vec<u8>>,
     canonical_metadata_hash_algorithm: Option<String>,
     bundle_uuid: Option<String>,
@@ -5732,9 +6371,9 @@ struct CheckpointTapeView {
     data_blocks_per_stripe: Option<i64>,
     parity_blocks_per_stripe: Option<i64>,
     stripes_per_neighborhood: Option<i64>,
-    highest_protected_ordinal: i64,
-    total_committed_ordinals: i64,
-    last_committed_tape_file: Option<i64>,
+    highest_protected_ordinal: SqliteU64,
+    total_committed_ordinals: SqliteU64,
+    last_committed_tape_file: Option<SqliteU64>,
     state: String,
 }
 
@@ -5771,7 +6410,7 @@ fn checkpoint_object_bundle(
             protected_ordinal_start: None,
             protected_ordinal_end_exclusive: None,
             canonical_metadata_hash: None,
-            bootstrap_object_row: None,
+            object_recovery_row: None,
         });
     }
     entries.push(TapeFileEntry {
@@ -5785,7 +6424,7 @@ fn checkpoint_object_bundle(
         protected_ordinal_start: None,
         protected_ordinal_end_exclusive: None,
         canonical_metadata_hash: None,
-        bootstrap_object_row: None,
+        object_recovery_row: None,
     });
     Ok(CommittedBundle {
         kind: CommittedBundleKind::Object,
@@ -5795,37 +6434,20 @@ fn checkpoint_object_bundle(
     })
 }
 
-/// Start LBA of a parity-off checkpoint record's on-tape bootstrap file,
-/// derived from the record's barrier-proved `eod_lba`: the bootstrap is one
-/// block plus its trailing filemark, so it starts two records before EOD.
-fn no_parity_checkpoint_bootstrap_start(
-    record: &crate::checkpoint::CheckpointJournalRecord,
-) -> Result<u64, StateError> {
-    record.eod_lba.checked_sub(2).ok_or_else(|| {
-        StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} eod_lba {} cannot cover its checkpoint bootstrap",
-            hex_uuid(record.tape_uuid),
-            record.ordinal,
-            record.eod_lba
-        ))
-    })
-}
-
 /// Volume-global LBA of block 0 of one object tape file in a parity-off
 /// checkpoint record, derived backward from the barrier-proved `eod_lba`.
 ///
 /// The record's structural layout is validated at journal append/replay
 /// time: each object occupies `[start, start + block_count)`, exclusive,
-/// with its trailing filemark at `start + block_count`, and the record
-/// closes with the checkpoint bootstrap plus its filemark. Walking backward
-/// from the measured EOD therefore reproduces exactly the dead-reckoned
-/// starts the write path captured forward — the same barrier proves both —
-/// so a checkpoint replay agrees with the live projection by construction.
+/// with its trailing filemark at `start + block_count`. Walking backward from
+/// the measured EOD therefore reproduces exactly the dead-reckoned starts the
+/// write path captured forward — the same barrier proves both — so a
+/// checkpoint replay agrees with the live projection by construction.
 fn no_parity_checkpoint_object_start(
     record: &crate::checkpoint::CheckpointJournalRecord,
     projection_index: usize,
 ) -> Result<u64, StateError> {
-    let mut cursor = no_parity_checkpoint_bootstrap_start(record)?;
+    let mut cursor = record.eod_lba;
     for projection in record.objects[projection_index..].iter().rev() {
         let file_records = projection.block_count.checked_add(1).ok_or_else(|| {
             StateError::IndexCorrupt(format!(
@@ -5846,58 +6468,14 @@ fn no_parity_checkpoint_object_start(
     Ok(cursor)
 }
 
-fn checkpoint_control_bundle(
-    record: &crate::checkpoint::CheckpointJournalRecord,
-    projections: &[crate::checkpoint::CheckpointObjectProjection],
-) -> Result<CommittedBundle, StateError> {
-    let total_committed_ordinals = projections
-        .last()
-        .map(|projection| projection.total_committed_ordinals)
-        .ok_or_else(|| {
-            StateError::IndexCorrupt(
-                "checkpoint record has no final ordinal projection".to_string(),
-            )
-        })?;
-    let bundle = match record.checkpoint_bundle.clone() {
-        Some(bundle) => bundle,
-        None => CommittedBundle {
-            kind: CommittedBundleKind::Control,
-            entries: vec![TapeFileEntry {
-                tape_file_number: record.checkpoint_tape_file_number,
-                kind: TapeFileKind::Bootstrap,
-                block_count: 1,
-                physical_start_hint: Some(no_parity_checkpoint_bootstrap_start(record)?),
-                object_id: None,
-                first_parity_data_ordinal: None,
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                bootstrap_object_row: None,
-            }],
-            highest_protected_ordinal: 0,
-            total_committed_ordinals,
-        },
-    };
-    if bundle.total_committed_ordinals != total_committed_ordinals {
-        return Err(StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} barrier watermark {} does not match final object watermark {total_committed_ordinals}",
-            hex_uuid(record.tape_uuid),
-            record.ordinal,
-            bundle.total_committed_ordinals
-        )));
-    }
-    Ok(bundle)
-}
-
 fn validate_checkpoint_record_bundle_shape(
     record: &crate::checkpoint::CheckpointJournalRecord,
     object_bundles: &[CommittedBundle],
-    checkpoint_bundle: &CommittedBundle,
+    barrier_bundle: Option<&CommittedBundle>,
 ) -> Result<(), StateError> {
     let parity_layout = if record.scheme.is_some() {
         Some(
-            crate::checkpoint::validate_parity_checkpoint_bundles(record).map_err(|err| {
+            crate::checkpoint::validate_parity_barrier_bundles(record).map_err(|err| {
                 StateError::IndexCorrupt(format!(
                     "checkpoint record tape={} ordinal={} has invalid parity bundles: {err}",
                     hex_uuid(record.tape_uuid),
@@ -5908,7 +6486,7 @@ fn validate_checkpoint_record_bundle_shape(
     } else {
         None
     };
-    let mut last_new_tape_file: Option<u32> = None;
+    let mut last_new_tape_file: Option<u64> = None;
     let mut prior_total_committed_ordinals: Option<u64> = None;
     for (projection, bundle) in record.objects.iter().zip(object_bundles) {
         if projection.block_size != record.block_size {
@@ -5945,7 +6523,7 @@ fn validate_checkpoint_record_bundle_shape(
         })?;
         if let Some(last) = last_new_tape_file {
             let expected = last.checked_add(1).ok_or_else(|| {
-                StateError::IndexCorrupt("checkpoint tape-file number overflows u32".to_string())
+                StateError::IndexCorrupt("checkpoint tape-file number overflows u64".to_string())
             })?;
             if bundle_first.tape_file_number != expected {
                 return Err(StateError::IndexCorrupt(format!(
@@ -6013,20 +6591,20 @@ fn validate_checkpoint_record_bundle_shape(
             }
         }
         prior_total_committed_ordinals = Some(projection.total_committed_ordinals);
-        if projection.bootstrap_object_row.tape_file_number != projection.copy.tape_file_number
-            || projection.bootstrap_object_row.stored_block_count != projection.block_count
-            || projection.bootstrap_object_row.object_id != projection.object.object_id.as_bytes()
+        if projection.object_recovery_row.tape_file_number != projection.copy.tape_file_number
+            || projection.object_recovery_row.stored_block_count != projection.block_count
+            || projection.object_recovery_row.object_id != projection.object.object_id.as_bytes()
         {
             return Err(checkpoint_projection_conflict(
                 record,
-                format!("bootstrap object row {}", projection.object.object_id).as_str(),
+                format!("object recovery row {}", projection.object.object_id).as_str(),
                 format!(
                     "object_id={} tape_file={} block_count={}",
                     projection.object.object_id,
                     projection.copy.tape_file_number,
                     projection.block_count
                 ),
-                format!("{:?}", projection.bootstrap_object_row),
+                format!("{:?}", projection.object_recovery_row),
             ));
         }
         let mut file_ids = HashSet::with_capacity(projection.files.len());
@@ -6045,46 +6623,33 @@ fn validate_checkpoint_record_bundle_shape(
         }
     }
 
-    let checkpoint_first = if let Some(layout) = &parity_layout {
-        layout.checkpoint_first_tape_file
-    } else {
-        if checkpoint_bundle.kind != CommittedBundleKind::Control
-            || checkpoint_bundle.entries.len() != 1
-            || checkpoint_bundle.entries[0].kind != TapeFileKind::Bootstrap
-            || checkpoint_bundle.entries[0].block_count != 1
-            || checkpoint_bundle.entries[0].tape_file_number != record.checkpoint_tape_file_number
-        {
-            return Err(StateError::IndexCorrupt(format!(
-                "checkpoint record tape={} ordinal={} has invalid checkpoint control bundle {:?}",
-                hex_uuid(record.tape_uuid),
-                record.ordinal,
-                checkpoint_bundle
-            )));
-        }
-        &checkpoint_bundle.entries[0]
-    };
-    let expected_checkpoint_first = last_new_tape_file
+    let expected_next_tape_file_number = last_new_tape_file
         .and_then(|last| last.checked_add(1))
         .ok_or_else(|| {
             StateError::IndexCorrupt("checkpoint has no object tape-file prefix".into())
         })?;
-    if checkpoint_first.tape_file_number != expected_checkpoint_first {
+    let actual_next_tape_file_number = match parity_layout.as_ref() {
+        Some(layout) => layout
+            .last_tape_file
+            .tape_file_number
+            .checked_add(1)
+            .ok_or_else(|| {
+                StateError::IndexCorrupt("checkpoint next tape-file number overflows u64".into())
+            })?,
+        None => expected_next_tape_file_number,
+    };
+    if actual_next_tape_file_number != record.next_tape_file_number {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} expected checkpoint bundle to start at tape file {expected_checkpoint_first}, got {}",
+            "checkpoint record tape={} ordinal={} expected next tape file {}, got {}",
             hex_uuid(record.tape_uuid),
             record.ordinal,
-            checkpoint_first.tape_file_number
+            actual_next_tape_file_number,
+            record.next_tape_file_number
         )));
     }
-    if parity_layout.is_none()
-        && checkpoint_bundle.highest_protected_ordinal
-            != object_bundles
-                .last()
-                .map(|bundle| bundle.highest_protected_ordinal)
-                .unwrap_or(0)
-    {
+    if parity_layout.is_none() && barrier_bundle.is_some() {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint record tape={} ordinal={} parity-off control changed its highest-protected watermark",
+            "checkpoint record tape={} ordinal={} carries a parity-off barrier bundle",
             hex_uuid(record.tape_uuid),
             record.ordinal
         )));
@@ -6096,13 +6661,20 @@ fn inspect_checkpoint_projection_tx(
     tx: &rusqlite::Transaction<'_>,
     record: &crate::checkpoint::CheckpointJournalRecord,
     object_bundles: &[CommittedBundle],
-    checkpoint_bundle: &CommittedBundle,
+    barrier_bundle: Option<&CommittedBundle>,
 ) -> Result<CheckpointReplayPlan, StateError> {
     let mut missing = false;
     let mut record_component_visible = false;
     let mut last_committed_tape_file = None;
     let mut tape_is_retired = false;
 
+    let authority_bundle = barrier_bundle
+        .or_else(|| object_bundles.last())
+        .ok_or_else(|| StateError::IndexCorrupt("checkpoint has no committed authority".into()))?;
+    let expected_last_committed_tape_file =
+        record.next_tape_file_number.checked_sub(1).ok_or_else(|| {
+            StateError::IndexCorrupt("checkpoint next tape-file number cannot be zero".into())
+        })?;
     let expected_tape = CheckpointTapeView {
         block_size: Some(i64::from(record.block_size)),
         scheme_id: record
@@ -6121,15 +6693,9 @@ fn inspect_checkpoint_projection_tx(
             .scheme
             .as_ref()
             .map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
-        highest_protected_ordinal: u64_to_i64(
-            checkpoint_bundle.highest_protected_ordinal,
-            "checkpoint highest_protected_ordinal",
-        )?,
-        total_committed_ordinals: u64_to_i64(
-            checkpoint_bundle.total_committed_ordinals,
-            "checkpoint total_committed_ordinals",
-        )?,
-        last_committed_tape_file: Some(i64::from(record.checkpoint_tape_file_number)),
+        highest_protected_ordinal: SqliteU64::new(authority_bundle.highest_protected_ordinal),
+        total_committed_ordinals: SqliteU64::new(authority_bundle.total_committed_ordinals),
+        last_committed_tape_file: Some(SqliteU64::new(expected_last_committed_tape_file)),
         state: "ready".to_string(),
     };
     let actual_tape = tx
@@ -6221,6 +6787,19 @@ fn inspect_checkpoint_projection_tx(
             .map_err(|err| sqlite_error("inspect checkpoint object projection", err))?;
         match actual_object {
             Some(actual) => {
+                // Global Object metadata can predate this tape projection and
+                // is not by itself evidence that a gapped tape prefix is
+                // repairable. It counts as a partially visible checkpoint
+                // only when the tape already proves the dense predecessor of
+                // this Object file (the live restart cut after a prior
+                // checkpoint, before copy/tape-file projection).
+                let dense_predecessor_visible = projection
+                    .copy
+                    .tape_file_number
+                    .checked_sub(1)
+                    .map(SqliteU64::new)
+                    == last_committed_tape_file;
+                record_component_visible |= dense_predecessor_visible;
                 let mut comparable_expected = expected_object.clone();
                 if comparable_expected.created_at_utc.is_none() {
                     comparable_expected.created_at_utc = actual.created_at_utc.clone();
@@ -6305,7 +6884,7 @@ fn inspect_checkpoint_projection_tx(
                 params![
                     projection.copy.object_id.as_str(),
                     projection.copy.tape_uuid.to_vec(),
-                    i64::from(projection.copy.tape_file_number),
+                    SqliteU64::new(projection.copy.tape_file_number),
                 ],
                 checkpoint_object_copy_view_from_row,
             )
@@ -6339,7 +6918,7 @@ fn inspect_checkpoint_projection_tx(
                  order by object_id limit 1",
                 params![
                     projection.copy.tape_uuid.to_vec(),
-                    i64::from(projection.copy.tape_file_number),
+                    SqliteU64::new(projection.copy.tape_file_number),
                     projection.copy.object_id.as_str(),
                 ],
                 |row| row.get::<_, String>(0),
@@ -6405,7 +6984,11 @@ fn inspect_checkpoint_projection_tx(
     for entry in object_bundles
         .iter()
         .flat_map(|bundle| bundle.entries.iter())
-        .chain(checkpoint_bundle.entries.iter())
+        .chain(
+            barrier_bundle
+                .into_iter()
+                .flat_map(|bundle| bundle.entries.iter()),
+        )
     {
         let expected = checkpoint_tape_file_view(record.tape_uuid, entry)?;
         let actual = tx
@@ -6417,7 +7000,10 @@ fn inspect_checkpoint_projection_tx(
                         canonical_metadata_hash, canonical_metadata_hash_algorithm,
                         bundle_uuid, bundle_kind
                  from tape_files where tape_uuid = ?1 and tape_file_number = ?2",
-                params![record.tape_uuid.to_vec(), i64::from(entry.tape_file_number)],
+                params![
+                    record.tape_uuid.to_vec(),
+                    SqliteU64::new(entry.tape_file_number)
+                ],
                 checkpoint_tape_file_view_from_row,
             )
             .optional()
@@ -6444,8 +7030,9 @@ fn inspect_checkpoint_projection_tx(
     if !missing {
         return Ok(CheckpointReplayPlan::AlreadyProjected);
     }
-    let later_prefix_visible = last_committed_tape_file
-        .is_some_and(|last| last >= i64::from(record.checkpoint_tape_file_number));
+    let next_tape_file_number = SqliteU64::new(record.next_tape_file_number);
+    let later_prefix_visible =
+        last_committed_tape_file.is_some_and(|last| last >= next_tape_file_number);
     if record_component_visible || later_prefix_visible {
         if tape_is_retired {
             Ok(CheckpointReplayPlan::RepairRetired)
@@ -6488,14 +7075,11 @@ fn checkpoint_object_file_view(
         object_id: file.object_id.clone(),
         file_id: file.file_id.clone(),
         path: file.path.clone(),
-        size_bytes: u64_to_i64(file.size_bytes, "checkpoint object_files.size_bytes")?,
+        size_bytes: SqliteU64::new(file.size_bytes),
         file_sha256: file.file_sha256.clone(),
         file_digest_algorithm: DIGEST_ALGORITHM_SHA256.to_string(),
-        first_chunk_lba: file
-            .first_chunk_lba
-            .map(|value| u64_to_i64(value, "checkpoint object_files.first_chunk_lba"))
-            .transpose()?,
-        chunk_count: u64_to_i64(file.chunk_count, "checkpoint object_files.chunk_count")?,
+        first_chunk_lba: file.first_chunk_lba.map(SqliteU64::new),
+        chunk_count: SqliteU64::new(file.chunk_count),
         mtime: file.mtime.clone(),
         executable: file.executable.map(i64::from),
     })
@@ -6537,23 +7121,14 @@ fn checkpoint_object_copy_view(
     Ok(CheckpointObjectCopyView {
         object_id: copy.object_id.clone(),
         tape_uuid: copy.tape_uuid.to_vec(),
-        tape_file_number: i64::from(copy.tape_file_number),
-        first_body_lba: u64_to_i64(copy.first_body_lba, "checkpoint first_body_lba")?,
-        first_parity_data_ordinal: copy
-            .first_parity_data_ordinal
-            .map(|value| u64_to_i64(value, "checkpoint first_parity_data_ordinal"))
-            .transpose()?,
-        protected_until_ordinal: copy
-            .protected_until_ordinal
-            .map(|value| u64_to_i64(value, "checkpoint protected_until_ordinal"))
-            .transpose()?,
+        tape_file_number: SqliteU64::new(copy.tape_file_number),
+        first_body_lba: SqliteU64::new(copy.first_body_lba),
+        first_parity_data_ordinal: copy.first_parity_data_ordinal.map(SqliteU64::new),
+        protected_until_ordinal: copy.protected_until_ordinal.map(SqliteU64::new),
         status: copy.status.clone(),
         representation: copy.representation.clone(),
         recipient_epoch_ids,
-        metadata_frame_len: copy
-            .metadata_frame_len
-            .map(|value| u64_to_i64(value, "checkpoint metadata_frame_len"))
-            .transpose()?,
+        metadata_frame_len: copy.metadata_frame_len.map(SqliteU64::new),
         plaintext_digest: copy.plaintext_digest.clone(),
         plaintext_digest_algorithm: copy
             .plaintext_digest
@@ -6595,7 +7170,8 @@ fn checkpoint_object_copy_conflicts(
     expected.object_id != actual.object_id
         || expected.tape_uuid != actual.tape_uuid
         || expected.tape_file_number != actual.tape_file_number
-        || actual.first_body_lba != 0 && expected.first_body_lba != actual.first_body_lba
+        || actual.first_body_lba != SqliteU64::ZERO
+            && expected.first_body_lba != actual.first_body_lba
         || optional_projection_conflicts(
             &expected.first_parity_data_ordinal,
             &actual.first_parity_data_ordinal,
@@ -6627,35 +7203,15 @@ fn checkpoint_tape_file_view(
 ) -> Result<CheckpointTapeFileView, StateError> {
     Ok(CheckpointTapeFileView {
         tape_uuid: tape_uuid.to_vec(),
-        tape_file_number: i64::from(entry.tape_file_number),
+        tape_file_number: SqliteU64::new(entry.tape_file_number),
         kind: tape_file_kind(entry.kind).to_string(),
-        block_count: u64_to_i64(entry.block_count, "checkpoint tape_files.block_count")?,
-        physical_start_hint: entry
-            .physical_start_hint
-            .map(|value| u64_to_i64(value, "checkpoint tape_files.physical_start_hint"))
-            .transpose()?,
+        block_count: SqliteU64::new(entry.block_count),
+        physical_start_hint: entry.physical_start_hint.map(SqliteU64::new),
         object_id: entry.object_id.clone(),
-        first_parity_data_ordinal: entry
-            .first_parity_data_ordinal
-            .map(|value| u64_to_i64(value, "checkpoint tape_files.first_parity_data_ordinal"))
-            .transpose()?,
-        epoch_id: entry
-            .epoch_id
-            .map(|value| u64_to_i64(value, "checkpoint tape_files.epoch_id"))
-            .transpose()?,
-        protected_ordinal_start: entry
-            .protected_ordinal_start
-            .map(|value| u64_to_i64(value, "checkpoint tape_files.protected_ordinal_start"))
-            .transpose()?,
-        protected_ordinal_end_exclusive: entry
-            .protected_ordinal_end_exclusive
-            .map(|value| {
-                u64_to_i64(
-                    value,
-                    "checkpoint tape_files.protected_ordinal_end_exclusive",
-                )
-            })
-            .transpose()?,
+        first_parity_data_ordinal: entry.first_parity_data_ordinal.map(SqliteU64::new),
+        epoch_id: entry.epoch_id.map(SqliteU64::new),
+        protected_ordinal_start: entry.protected_ordinal_start.map(SqliteU64::new),
+        protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive.map(SqliteU64::new),
         canonical_metadata_hash: entry.canonical_metadata_hash.map(|hash| hash.to_vec()),
         canonical_metadata_hash_algorithm: entry
             .canonical_metadata_hash
@@ -6750,8 +7306,8 @@ fn project_committed_tape_file_bundle_tx(
         .entries
         .iter()
         .map(|entry| entry.tape_file_number)
-        .max()
-        .map(i64::from);
+        .max();
+    let last_committed_tape_file = last_committed_tape_file.map(SqliteU64::new);
     // The retired arm of the state CASE below is defense in depth: this live
     // bundle path cannot legitimately fire for a retired tape because pool
     // selection rejects any non-`ready` state before a write session opens.
@@ -6791,7 +7347,11 @@ fn project_committed_tape_file_bundle_tx(
              end,
            state =
              case
-               when tapes.state in ('sealed', 'retired') then tapes.state
+               when tapes.finalization_progress is not null
+                 or tapes.state in (
+                   'sealed', 'retired', 'finalizing', 'finalized',
+                   'finalized_degraded', 'recovery_required'
+                 ) then tapes.state
                else excluded.state
              end,
            updated_at_utc = excluded.updated_at_utc",
@@ -6802,11 +7362,8 @@ fn project_committed_tape_file_bundle_tx(
             scheme.map(|scheme| i64::from(scheme.data_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.parity_blocks_per_stripe)),
             scheme.map(|scheme| i64::from(scheme.stripes_per_neighborhood)),
-            u64_to_i64(
-                bundle.highest_protected_ordinal,
-                "highest_protected_ordinal"
-            )?,
-            u64_to_i64(bundle.total_committed_ordinals, "total_committed_ordinals")?,
+            SqliteU64::new(bundle.highest_protected_ordinal),
+            SqliteU64::new(bundle.total_committed_ordinals),
             last_committed_tape_file,
             updated_at,
         ],
@@ -6951,10 +7508,10 @@ fn validate_append_bundle_extension_tx(
              limit 1",
             params![
                 input.tape_uuid.to_vec(),
-                i64::from(first_entry.tape_file_number),
-                i64::from(last_entry.tape_file_number),
+                SqliteU64::new(first_entry.tape_file_number),
+                SqliteU64::new(last_entry.tape_file_number),
             ],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, SqliteU64>(0),
         )
         .optional()
         .map_err(|err| sqlite_error("query append tape-file overlap", err))?;
@@ -6962,33 +7519,33 @@ fn validate_append_bundle_extension_tx(
         return Err(StateError::IndexCorrupt(format!(
             "append projection for tape {} overlaps existing tape file {}",
             hex_uuid(input.tape_uuid),
-            existing
+            existing.get()
         )));
     }
     Ok(())
 }
 
-fn validate_checkpoint_control_extension_tx(
+fn validate_checkpoint_sidecar_extension_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &TapeJournalIndexInput,
     bundle: &CommittedBundle,
 ) -> Result<(), StateError> {
-    if bundle.kind != CommittedBundleKind::Control {
+    if bundle.kind != CommittedBundleKind::CheckpointSidecars {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint projection for tape {} requires a Control bundle, got {:?}",
+            "checkpoint projection for tape {} requires a CheckpointSidecars bundle, got {:?}",
             hex_uuid(input.tape_uuid),
             bundle.kind
         )));
     }
     remanence_parity::validate_committed_bundle_shape(bundle).map_err(|err| {
         StateError::IndexCorrupt(format!(
-            "checkpoint projection for tape {} has invalid Control bundle: {err}",
+            "checkpoint projection for tape {} has an invalid sidecar bundle: {err}",
             hex_uuid(input.tape_uuid)
         ))
     })?;
     let first_entry = bundle.entries.first().ok_or_else(|| {
         StateError::IndexCorrupt(format!(
-            "checkpoint projection for tape {} has an empty Control bundle",
+            "checkpoint projection for tape {} has an empty sidecar bundle",
             hex_uuid(input.tape_uuid)
         ))
     })?;
@@ -7013,14 +7570,14 @@ fn validate_checkpoint_control_extension_tx(
         })?;
     if first_entry.tape_file_number != expected_first {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint projection for tape {} is non-contiguous: expected first Control tape file {expected_first}, got {}",
+            "checkpoint projection for tape {} is non-contiguous: expected first sidecar tape file {expected_first}, got {}",
             hex_uuid(input.tape_uuid),
             first_entry.tape_file_number
         )));
     }
     if bundle.total_committed_ordinals != prefix.total_committed_ordinals {
         return Err(StateError::IndexCorrupt(format!(
-            "checkpoint Control bundle for tape {} changed total committed ordinals",
+            "checkpoint sidecar bundle for tape {} changed total committed ordinals",
             hex_uuid(input.tape_uuid)
         )));
     }
@@ -7032,13 +7589,13 @@ fn validate_checkpoint_control_extension_tx(
         )
         .map_err(|err| {
             StateError::IndexCorrupt(format!(
-                "checkpoint Control bundle for tape {} has an invalid sidecar transition: {err}",
+                "checkpoint sidecar bundle for tape {} has an invalid sidecar transition: {err}",
                 hex_uuid(input.tape_uuid)
             ))
         })?;
         if bundle.highest_protected_ordinal != expected_highest {
             return Err(StateError::IndexCorrupt(format!(
-                "checkpoint Control bundle for tape {} reports W={}, expected {expected_highest} from W={} and its sidecars",
+                "checkpoint sidecar bundle for tape {} reports W={}, expected {expected_highest} from W={} and its sidecars",
                 hex_uuid(input.tape_uuid),
                 bundle.highest_protected_ordinal,
                 prefix.highest_protected_ordinal
@@ -7046,7 +7603,7 @@ fn validate_checkpoint_control_extension_tx(
         }
     } else if bundle.highest_protected_ordinal != prefix.highest_protected_ordinal {
         return Err(StateError::IndexCorrupt(format!(
-            "parity-off checkpoint Control bundle for tape {} changed its highest-protected ordinal",
+            "parity-off checkpoint sidecar bundle for tape {} changed its highest-protected ordinal",
             hex_uuid(input.tape_uuid)
         )));
     }
@@ -7059,18 +7616,18 @@ fn validate_checkpoint_control_extension_tx(
              limit 1",
             params![
                 input.tape_uuid.to_vec(),
-                i64::from(first_entry.tape_file_number),
-                i64::from(last_entry.tape_file_number),
+                SqliteU64::new(first_entry.tape_file_number),
+                SqliteU64::new(last_entry.tape_file_number),
             ],
-            |row| row.get::<_, i64>(0),
+            |row| row.get::<_, SqliteU64>(0),
         )
         .optional()
-        .map_err(|err| sqlite_error("query checkpoint bootstrap overlap", err))?;
+        .map_err(|err| sqlite_error("query checkpoint sidecar overlap", err))?;
     if let Some(existing) = overlapping {
         return Err(StateError::IndexCorrupt(format!(
             "checkpoint projection for tape {} overlaps tape file {}",
             hex_uuid(input.tape_uuid),
-            existing
+            existing.get()
         )));
     }
     Ok(())
@@ -7104,14 +7661,14 @@ fn validate_dense_bundle_entries(
         ));
     };
     for (offset, entry) in entries.iter().enumerate() {
-        let offset = u32::try_from(offset).map_err(|_| {
+        let offset = u64::try_from(offset).map_err(|_| {
             StateError::IndexMigrationFailed(
-                "append commit bundle entry count exceeds u32 tape-file space".to_string(),
+                "append commit bundle entry count exceeds u64 tape-file space".to_string(),
             )
         })?;
         let expected = first.tape_file_number.checked_add(offset).ok_or_else(|| {
             StateError::IndexMigrationFailed(
-                "append commit bundle tape-file number overflows u32".to_string(),
+                "append commit bundle tape-file number overflows u64".to_string(),
             )
         })?;
         if entry.tape_file_number != expected {
@@ -7136,7 +7693,7 @@ struct AppendProjectionPrefix {
     scheme_id: Option<String>,
     highest_protected_ordinal: u64,
     total_committed_ordinals: u64,
-    last_committed_tape_file: Option<u32>,
+    last_committed_tape_file: Option<u64>,
     state: String,
 }
 
@@ -7154,9 +7711,9 @@ fn load_append_projection_prefix_tx(
             Ok((
                 row.get::<_, Option<i64>>(0)?,
                 row.get::<_, Option<String>>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, SqliteU64>(2)?,
+                row.get::<_, SqliteU64>(3)?,
+                row.get::<_, Option<SqliteU64>>(4)?,
                 row.get::<_, String>(5)?,
             ))
         },
@@ -7181,18 +7738,9 @@ fn load_append_projection_prefix_tx(
             Ok(AppendProjectionPrefix {
                 block_size: opt_i64_to_u64(block_size, "tapes.block_size")?,
                 scheme_id,
-                highest_protected_ordinal: i64_to_u64(
-                    highest_protected_ordinal,
-                    "tapes.highest_protected_ordinal",
-                )?,
-                total_committed_ordinals: i64_to_u64(
-                    total_committed_ordinals,
-                    "tapes.total_committed_ordinals",
-                )?,
-                last_committed_tape_file: opt_i64_to_u32(
-                    last_committed_tape_file,
-                    "tapes.last_committed_tape_file",
-                )?,
+                highest_protected_ordinal: highest_protected_ordinal.get(),
+                total_committed_ordinals: total_committed_ordinals.get(),
+                last_committed_tape_file: last_committed_tape_file.map(SqliteU64::get),
                 state,
             })
         },
@@ -7301,7 +7849,7 @@ fn validate_append_object_conflicts_tx(
                 params![
                     copy.object_id.as_str(),
                     copy.tape_uuid.to_vec(),
-                    i64::from(copy.tape_file_number),
+                    SqliteU64::new(copy.tape_file_number),
                 ],
                 |_| Ok(()),
             )
@@ -7445,6 +7993,15 @@ enum IdempotencyProjectionMode {
     Replay,
 }
 
+struct IdempotencyRequestProjection<'a> {
+    actor_fingerprint: &'a str,
+    operation_kind: &'a str,
+    idempotency_key: Uuid,
+    request_fingerprint: Vec<u8>,
+    operation_id: Uuid,
+    updated_at_utc: &'a str,
+}
+
 fn project_idempotency_record(
     tx: &rusqlite::Transaction<'_>,
     record: &AuditRecord,
@@ -7455,6 +8012,24 @@ fn project_idempotency_record(
     };
     let actor_fingerprint = detail_text(record, "actor_fingerprint")
         .unwrap_or_else(|| actor_fingerprint(&record.actor));
+    let operation_kind = idempotency_operation_kind(tx, record)?;
+    if operation_kind != "unknown" {
+        if let Some(operation_id) = record.operation_id {
+            tx.execute(
+                "update idempotency_keys
+                 set operation_kind = ?1
+                 where actor_fingerprint = ?2
+                   and operation_id = ?3
+                   and operation_kind = 'unknown'",
+                params![
+                    operation_kind.as_str(),
+                    actor_fingerprint.as_str(),
+                    operation_id.to_string(),
+                ],
+            )
+            .map_err(|err| sqlite_error("refine idempotency operation kind", err))?;
+        }
+    }
     if let Some(request_fingerprint) = detail_bytes(record, "request_fingerprint") {
         let Some(operation_id) = record.operation_id else {
             return Err(StateError::IndexMigrationFailed(
@@ -7463,28 +8038,41 @@ fn project_idempotency_record(
         };
         upsert_idempotency_request(
             tx,
-            &actor_fingerprint,
-            idempotency_key,
-            request_fingerprint,
-            operation_id,
-            &record.timestamp_utc,
+            IdempotencyRequestProjection {
+                actor_fingerprint: actor_fingerprint.as_str(),
+                operation_kind: operation_kind.as_str(),
+                idempotency_key,
+                request_fingerprint,
+                operation_id,
+                updated_at_utc: record.timestamp_utc.as_str(),
+            },
             mode,
         )?;
     }
 
     if let Some(terminal_state) = terminal_state_for_event(&record.event) {
+        let Some(operation_id) = record.operation_id else {
+            return Err(StateError::IndexMigrationFailed(
+                "terminal idempotency record is missing operation_id".to_string(),
+            ));
+        };
         tx.execute(
             "update idempotency_keys
              set terminal_state = ?1,
                  response_fingerprint = coalesce(?2, response_fingerprint),
                  updated_at_utc = ?3
-             where actor_fingerprint = ?4 and idempotency_key = ?5",
+             where actor_fingerprint = ?4
+               and operation_kind = ?5
+               and idempotency_key = ?6
+               and operation_id = ?7",
             params![
                 terminal_state,
                 detail_bytes(record, "response_fingerprint"),
                 record.timestamp_utc.as_str(),
                 actor_fingerprint,
+                operation_kind,
                 idempotency_key.to_string(),
+                operation_id.to_string(),
             ],
         )
         .map_err(|err| sqlite_error("project idempotency terminal state", err))?;
@@ -7576,14 +8164,13 @@ fn project_catalog_evidence_record(
             }
             tx.execute(
                 "insert into tapes(
-                   tape_uuid, voltag, pool_id, block_size, scheme_id,
+                   tape_uuid, voltag, block_size, scheme_id,
                    data_blocks_per_stripe, parity_blocks_per_stripe,
                    stripes_per_neighborhood, state, updated_at_utc
                  )
-                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'ready', ?9)
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8)
                  on conflict(tape_uuid) do update set
                    voltag = coalesce(excluded.voltag, tapes.voltag),
-                   pool_id = coalesce(excluded.pool_id, tapes.pool_id),
                    block_size = coalesce(excluded.block_size, tapes.block_size),
                    scheme_id = coalesce(excluded.scheme_id, tapes.scheme_id),
                    data_blocks_per_stripe = coalesce(
@@ -7598,12 +8185,14 @@ fn project_catalog_evidence_record(
                      excluded.stripes_per_neighborhood,
                      tapes.stripes_per_neighborhood
                    ),
-                   state = 'ready',
+                   state = case
+                     when tapes.finalization_progress is not null then tapes.state
+                     else 'ready'
+                   end,
                    updated_at_utc = max(tapes.updated_at_utc, excluded.updated_at_utc)",
                 params![
-                    tape_uuid,
+                    tape_uuid.as_slice(),
                     voltag,
-                    pool_id,
                     block_size,
                     geometry.scheme_id,
                     geometry.data_blocks_per_stripe,
@@ -7613,6 +8202,26 @@ fn project_catalog_evidence_record(
                 ],
             )
             .map_err(|err| sqlite_error("project TapeProvisioned audit record", err))?;
+            if let Some(pool_id) = pool_id.as_deref() {
+                let tape_uuid: [u8; 16] = tape_uuid.as_slice().try_into().map_err(|_| {
+                    StateError::IndexMigrationFailed(
+                        "TapeProvisioned audit record has invalid tape UUID length".to_string(),
+                    )
+                })?;
+                let snapshot =
+                    query_tape_assignment_snapshot_tx(tx, tape_uuid)?.ok_or_else(|| {
+                        StateError::IndexCorrupt(
+                            "provisioned tape vanished before pool projection".to_string(),
+                        )
+                    })?;
+                set_tape_pool_membership_tx(
+                    tx,
+                    tape_uuid,
+                    snapshot.assignment_generation,
+                    Some(pool_id),
+                    record.timestamp_utc.as_str(),
+                )?;
+            }
         }
         AuditEvent::TapePoolAssigned => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
@@ -7647,13 +8256,23 @@ fn project_catalog_evidence_record(
                     Some(&pool_id),
                 );
             }
-            tx.execute(
-                "update tapes
-                 set pool_id = ?2, updated_at_utc = ?3
-                 where tape_uuid = ?1",
-                params![tape_uuid, pool_id, record.timestamp_utc.as_str()],
-            )
-            .map_err(|err| sqlite_error("project TapePoolAssigned audit record", err))?;
+            let tape_uuid: [u8; 16] = tape_uuid.as_slice().try_into().map_err(|_| {
+                StateError::IndexMigrationFailed(
+                    "TapePoolAssigned audit record has invalid tape UUID length".to_string(),
+                )
+            })?;
+            let snapshot = query_tape_assignment_snapshot_tx(tx, tape_uuid)?.ok_or_else(|| {
+                StateError::IndexMigrationFailed(
+                    "TapePoolAssigned audit record references unknown tape".to_string(),
+                )
+            })?;
+            set_tape_pool_membership_tx(
+                tx,
+                tape_uuid,
+                snapshot.assignment_generation,
+                Some(pool_id.as_str()),
+                record.timestamp_utc.as_str(),
+            )?;
         }
         AuditEvent::TapeSealed | AuditEvent::TapeRetired => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
@@ -8315,44 +8934,66 @@ fn audit_drive_health_key(record: &AuditRecord) -> Option<String> {
 
 fn upsert_idempotency_request(
     tx: &rusqlite::Transaction<'_>,
-    actor_fingerprint: &str,
-    idempotency_key: Uuid,
-    request_fingerprint: Vec<u8>,
-    operation_id: Uuid,
-    updated_at_utc: &str,
+    request: IdempotencyRequestProjection<'_>,
     mode: IdempotencyProjectionMode,
-) -> Result<(), StateError> {
-    let existing: Option<Vec<u8>> = tx
+) -> Result<IdempotencyRegistration, StateError> {
+    let IdempotencyRequestProjection {
+        actor_fingerprint,
+        operation_kind,
+        idempotency_key,
+        request_fingerprint,
+        operation_id,
+        updated_at_utc,
+    } = request;
+    let existing: Option<(Vec<u8>, String)> = tx
         .query_row(
-            "select request_fingerprint from idempotency_keys
-             where actor_fingerprint = ?1 and idempotency_key = ?2",
-            params![actor_fingerprint, idempotency_key.to_string()],
-            |row| row.get(0),
+            "select request_fingerprint, operation_id from idempotency_keys
+             where actor_fingerprint = ?1
+               and operation_kind = ?2
+               and idempotency_key = ?3",
+            params![
+                actor_fingerprint,
+                operation_kind,
+                idempotency_key.to_string()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|err| sqlite_error("read existing idempotency request", err))?;
-    if let Some(existing) = existing {
-        if existing != request_fingerprint {
+    if let Some((existing_fingerprint, existing_operation_id)) = existing {
+        if existing_fingerprint != request_fingerprint {
             return match mode {
                 IdempotencyProjectionMode::Live => Err(StateError::IdempotencyConflict(format!(
-                    "actor {actor_fingerprint} reused idempotency key {idempotency_key}"
+                    "actor {actor_fingerprint} reused {operation_kind} idempotency key {idempotency_key}"
                 ))),
-                IdempotencyProjectionMode::Replay => Ok(()),
+                IdempotencyProjectionMode::Replay => Ok(IdempotencyRegistration {
+                    operation_id: parse_uuid_for_index(
+                        existing_operation_id.as_str(),
+                        "idempotency operation_id",
+                    )?,
+                    newly_registered: false,
+                }),
             };
         }
+        return Ok(IdempotencyRegistration {
+            operation_id: parse_uuid_for_index(
+                existing_operation_id.as_str(),
+                "idempotency operation_id",
+            )?,
+            newly_registered: false,
+        });
     }
 
     tx.execute(
         "insert into idempotency_keys(
-           actor_fingerprint, idempotency_key, request_fingerprint,
-           operation_id, terminal_state, response_fingerprint, updated_at_utc
+           actor_fingerprint, operation_kind, idempotency_key,
+           request_fingerprint, operation_id, terminal_state,
+           response_fingerprint, updated_at_utc
          )
-         values(?1, ?2, ?3, ?4, null, null, ?5)
-         on conflict(actor_fingerprint, idempotency_key) do update set
-           operation_id = excluded.operation_id,
-           updated_at_utc = excluded.updated_at_utc",
+         values(?1, ?2, ?3, ?4, ?5, null, null, ?6)",
         params![
             actor_fingerprint,
+            operation_kind,
             idempotency_key.to_string(),
             request_fingerprint,
             operation_id.to_string(),
@@ -8360,7 +9001,10 @@ fn upsert_idempotency_request(
         ],
     )
     .map_err(|err| sqlite_error("project idempotency request", err))?;
-    Ok(())
+    Ok(IdempotencyRegistration {
+        operation_id,
+        newly_registered: true,
+    })
 }
 
 fn operation_state_for_event(event: &AuditEvent) -> Option<&'static str> {
@@ -8417,6 +9061,35 @@ fn actor_fingerprint(actor: &AuditActor) -> String {
         AuditActor::User(id) => format!("user:{id}"),
         AuditActor::Service(id) => format!("service:{id}"),
     }
+}
+
+fn idempotency_operation_kind(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+) -> Result<String, StateError> {
+    if let Some(operation_kind) = detail_text(record, "operation_kind") {
+        let operation_kind = operation_kind.trim();
+        if !operation_kind.is_empty() {
+            return Ok(operation_kind.to_string());
+        }
+    }
+    if let Some(operation_id) = record.operation_id {
+        if let Some(operation_kind) = tx
+            .query_row(
+                "select operation_kind from operations where operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| sqlite_error("derive idempotency operation kind", err))?
+        {
+            let operation_kind = operation_kind.trim();
+            if !operation_kind.is_empty() {
+                return Ok(operation_kind.to_string());
+            }
+        }
+    }
+    Ok("unknown".to_string())
 }
 
 fn detail_text(record: &AuditRecord, key: &str) -> Option<String> {
@@ -8496,12 +9169,14 @@ fn project_tape_written_extent_tx(
     tape_uuid: [u8; 16],
     eod_lba: u64,
 ) -> Result<(), StateError> {
-    let eod_lba = u64_to_i64(eod_lba, "checkpoint eod_lba")?;
     tx.execute(
         "update tapes
-         set written_extent_lba = max(coalesce(written_extent_lba, 0), ?2)
+         set written_extent_lba = case
+           when written_extent_lba is null or written_extent_lba < ?2 then ?2
+           else written_extent_lba
+         end
          where tape_uuid = ?1",
-        params![tape_uuid.to_vec(), eod_lba],
+        params![tape_uuid.to_vec(), SqliteU64::new(eod_lba)],
     )
     .map_err(|err| sqlite_error("project tape written extent", err))?;
     Ok(())
@@ -8567,18 +9242,15 @@ fn insert_tape_file(
            bundle_kind = excluded.bundle_kind",
         params![
             tape_uuid.to_vec(),
-            i64::from(entry.tape_file_number),
+            SqliteU64::new(entry.tape_file_number),
             tape_file_kind(entry.kind),
-            u64_to_i64(entry.block_count, "block_count")?,
-            opt_u64_to_i64(entry.physical_start_hint, "physical_start_hint")?,
+            SqliteU64::new(entry.block_count),
+            entry.physical_start_hint.map(SqliteU64::new),
             entry.object_id.as_deref(),
-            opt_u64_to_i64(entry.first_parity_data_ordinal, "first_parity_data_ordinal")?,
-            opt_u64_to_i64(entry.epoch_id, "epoch_id")?,
-            opt_u64_to_i64(entry.protected_ordinal_start, "protected_ordinal_start")?,
-            opt_u64_to_i64(
-                entry.protected_ordinal_end_exclusive,
-                "protected_ordinal_end_exclusive"
-            )?,
+            entry.first_parity_data_ordinal.map(SqliteU64::new),
+            entry.epoch_id.map(SqliteU64::new),
+            entry.protected_ordinal_start.map(SqliteU64::new),
+            entry.protected_ordinal_end_exclusive.map(SqliteU64::new),
             entry.canonical_metadata_hash.map(|hash| hash.to_vec()),
         ],
     )
@@ -8620,32 +9292,378 @@ fn project_tape_pool_membership_tx(
     tape_uuid: [u8; 16],
     pool_id: &str,
 ) -> Result<(), StateError> {
-    let conflicting_pool: Option<Option<String>> = tx
+    let snapshot = query_tape_assignment_snapshot_tx(tx, tape_uuid)?.ok_or_else(|| {
+        StateError::TapePoolAssignmentConflict(format!(
+            "cannot assign unknown tape {}",
+            hex_uuid(tape_uuid)
+        ))
+    })?;
+    let updated_at_utc = now_utc()?;
+    set_tape_pool_membership_tx(
+        tx,
+        tape_uuid,
+        snapshot.assignment_generation,
+        Some(pool_id),
+        updated_at_utc.as_str(),
+    )?;
+    Ok(())
+}
+
+fn query_tape_assignment_snapshot_tx(
+    tx: &rusqlite::Transaction<'_>,
+    tape_uuid: [u8; 16],
+) -> Result<Option<TapeAssignmentSnapshot>, StateError> {
+    tx.query_row(
+        "select tape_uuid, pool_id, assignment_generation
+         from tapes where tape_uuid = ?1",
+        params![tape_uuid.to_vec()],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )
+    .optional()
+    .map_err(|err| sqlite_error("query tape assignment snapshot", err))?
+    .map(|(tape_uuid, pool_id, assignment_generation)| {
+        Ok(TapeAssignmentSnapshot {
+            tape_uuid,
+            pool_id,
+            assignment_generation: i64_to_u64(assignment_generation, "assignment_generation")?,
+        })
+    })
+    .transpose()
+}
+
+fn set_tape_pool_membership_tx(
+    tx: &rusqlite::Transaction<'_>,
+    tape_uuid: [u8; 16],
+    expected_generation: u64,
+    pool_id: Option<&str>,
+    updated_at_utc: &str,
+) -> Result<(), StateError> {
+    let existing: Option<(Option<String>, i64, String, Option<String>)> = tx
         .query_row(
-            "select pool_id
-             from object_copies
-             where tape_uuid = ?1
-               and (pool_id is null or pool_id != ?2)
-             order by pool_id is not null, pool_id
-             limit 1",
-            params![tape_uuid.to_vec(), pool_id],
-            |row| row.get(0),
+            "select pool_id, assignment_generation, state, finalization_progress
+             from tapes where tape_uuid = ?1",
+            params![tape_uuid.to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
-        .map_err(|err| sqlite_error("check tape pool reassignment", err))?;
-    if let Some(conflicting_pool) = conflicting_pool {
-        let conflicting_pool = conflicting_pool.as_deref().unwrap_or("unassigned");
+        .map_err(|err| sqlite_error("read guarded tape pool assignment", err))?;
+    let Some((existing_pool_id, generation, state, finalization_progress)) = existing else {
         return Err(StateError::TapePoolAssignmentConflict(format!(
-            "tape {} already has committed copies in pool {conflicting_pool}; cannot assign to {pool_id}",
+            "cannot change assignment for unknown tape {}",
+            hex_uuid(tape_uuid)
+        )));
+    };
+    let generation = i64_to_u64(generation, "assignment_generation")?;
+    if generation != expected_generation {
+        return Err(StateError::TapePoolAssignmentConflict(format!(
+            "stale assignment generation for tape {}: expected {expected_generation}, current {generation}",
             hex_uuid(tape_uuid)
         )));
     }
-    tx.execute(
-        "update tapes set pool_id = ?2 where tape_uuid = ?1",
-        params![tape_uuid.to_vec(), pool_id],
-    )
-    .map_err(|err| sqlite_error("project tape pool membership", err))?;
+    if existing_pool_id.as_deref() == pool_id {
+        return Ok(());
+    }
+    if finalization_progress.is_some()
+        || matches!(
+            state.as_str(),
+            "finalizing" | "finalized" | "sealed" | "finalized_degraded" | "recovery_required"
+        )
+    {
+        return Err(StateError::TapePoolAssignmentConflict(format!(
+            "tape {} is {state}; pool assignment is frozen",
+            hex_uuid(tape_uuid)
+        )));
+    }
+    if let Some(pool_id) = pool_id {
+        let conflicting_pool: Option<Option<String>> = tx
+            .query_row(
+                "select pool_id
+                 from object_copies
+                 where tape_uuid = ?1
+                   and (pool_id is null or pool_id != ?2)
+                 order by pool_id is not null, pool_id
+                 limit 1",
+                params![tape_uuid.to_vec(), pool_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| sqlite_error("check tape pool reassignment", err))?;
+        if let Some(conflicting_pool) = conflicting_pool {
+            let conflicting_pool = conflicting_pool.as_deref().unwrap_or("unassigned");
+            return Err(StateError::TapePoolAssignmentConflict(format!(
+                "tape {} already has committed copies in pool {conflicting_pool}; cannot assign to {pool_id}",
+                hex_uuid(tape_uuid)
+            )));
+        }
+    }
+    let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
+        StateError::TapePoolAssignmentConflict(format!(
+            "assignment generation exhausted for tape {}",
+            hex_uuid(tape_uuid)
+        ))
+    })?;
+    let changed = tx
+        .execute(
+            "update tapes
+             set pool_id = ?2,
+                 assignment_generation = ?3,
+                 updated_at_utc = ?4
+             where tape_uuid = ?1
+               and assignment_generation = ?5
+               and finalization_progress is null
+               and state not in (
+                 'finalizing', 'finalized', 'sealed',
+                 'finalized_degraded', 'recovery_required'
+               )",
+            params![
+                tape_uuid.to_vec(),
+                pool_id,
+                u64_to_i64(next_generation, "assignment_generation")?,
+                updated_at_utc,
+                u64_to_i64(expected_generation, "assignment_generation")?,
+            ],
+        )
+        .map_err(|err| sqlite_error("conditionally update tape pool assignment", err))?;
+    if changed != 1 {
+        return Err(StateError::TapePoolAssignmentConflict(format!(
+            "tape {} assignment changed or became final while updating generation {expected_generation}",
+            hex_uuid(tape_uuid)
+        )));
+    }
     Ok(())
+}
+
+fn validate_terminal_finalization_input(
+    input: &TerminalFinalizationProjectionInput,
+) -> Result<(), StateError> {
+    match (input.trigger, input.operation_id) {
+        (TerminalFinalizationTrigger::OperatorCloseOut, None) => {
+            return Err(StateError::JournalReplayFailed(
+                "operator terminal finalization is missing operation identity".to_string(),
+            ));
+        }
+        (TerminalFinalizationTrigger::OperatorCloseOut, Some(_)) => {}
+        (_, Some(_)) => {
+            return Err(StateError::JournalReplayFailed(
+                "automatic terminal finalization unexpectedly carries operation identity"
+                    .to_string(),
+            ));
+        }
+        (_, None) => {}
+    }
+    if matches!(input.outcome, TerminalFinalizationOutcome::Finalized)
+        && input.progress != TerminalFinalizationProgress::AfterReplicaC
+    {
+        return Err(StateError::JournalReplayFailed(
+            "terminal finalization cannot be finalized before replica C".to_string(),
+        ));
+    }
+    if matches!(input.outcome, TerminalFinalizationOutcome::InProgress)
+        && input.progress == TerminalFinalizationProgress::AfterReplicaC
+    {
+        return Err(StateError::JournalReplayFailed(
+            "terminal finalization after replica C must carry a terminal outcome".to_string(),
+        ));
+    }
+    if matches!(
+        input.outcome,
+        TerminalFinalizationOutcome::FinalizedDegraded
+    ) && !(1..=2).contains(&input.progress.completed_replicas())
+    {
+        return Err(StateError::JournalReplayFailed(
+            "degraded terminal finalization requires exactly one or two complete replicas"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+struct ExistingTerminalFinalizationProjection {
+    state: String,
+    progress: Option<String>,
+    trigger: Option<String>,
+    operation_id: Option<String>,
+    edition_digest: Option<Vec<u8>>,
+    layout_digest: Option<Vec<u8>>,
+    outcome: Option<String>,
+}
+
+fn project_terminal_finalization_tx(
+    tx: &rusqlite::Transaction<'_>,
+    input: &TerminalFinalizationProjectionInput,
+    updated_at_utc: &str,
+) -> Result<(), StateError> {
+    let existing: Option<ExistingTerminalFinalizationProjection> = tx
+        .query_row(
+            "select state, finalization_progress, finalization_trigger,
+                    finalization_operation_id, finalization_edition_digest,
+                    finalization_layout_digest, finalization_outcome
+             from tapes where tape_uuid = ?1",
+            params![input.tape_uuid.to_vec()],
+            |row| {
+                Ok(ExistingTerminalFinalizationProjection {
+                    state: row.get(0)?,
+                    progress: row.get(1)?,
+                    trigger: row.get(2)?,
+                    operation_id: row.get(3)?,
+                    edition_digest: row.get(4)?,
+                    layout_digest: row.get(5)?,
+                    outcome: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| sqlite_error("read terminal finalization projection", err))?;
+    let Some(ExistingTerminalFinalizationProjection {
+        state,
+        progress: existing_progress,
+        trigger: existing_trigger,
+        operation_id: existing_operation_id,
+        edition_digest: existing_edition_digest,
+        layout_digest: existing_layout_digest,
+        outcome: existing_outcome,
+    }) = existing
+    else {
+        return Err(StateError::JournalReplayFailed(format!(
+            "cannot finalize unknown tape {}",
+            hex_uuid(input.tape_uuid)
+        )));
+    };
+    if state == "retired" {
+        let exact_completed_replay = existing_progress
+            .as_deref()
+            .map(parse_terminal_finalization_progress)
+            .transpose()?
+            == Some(TerminalFinalizationProgress::AfterReplicaC)
+            && input.progress == TerminalFinalizationProgress::AfterReplicaC
+            && input.outcome == TerminalFinalizationOutcome::Finalized
+            && existing_trigger.as_deref()
+                == Some(terminal_finalization_trigger_name(input.trigger))
+            && existing_operation_id == input.operation_id.map(|value| value.to_string())
+            && existing_edition_digest.as_deref() == Some(input.edition_digest.as_slice())
+            && existing_layout_digest.as_deref() == Some(input.layout_digest.as_slice())
+            && existing_outcome.as_deref() == Some(TerminalFinalizationOutcome::Finalized.as_str());
+        if exact_completed_replay {
+            return Ok(());
+        }
+        return Err(StateError::JournalReplayFailed(format!(
+            "cannot project changed terminal authority onto retired tape {}",
+            hex_uuid(input.tape_uuid)
+        )));
+    }
+
+    if let Some(existing_progress) = existing_progress.as_deref() {
+        let existing_progress = parse_terminal_finalization_progress(existing_progress)?;
+        let completed_checkpoint_replay = input.outcome == TerminalFinalizationOutcome::Finalized
+            && input.progress == TerminalFinalizationProgress::AfterReplicaC
+            && terminal_progress_reaches(existing_progress, input.progress);
+        let same_or_successor = input.progress == existing_progress
+            || existing_progress.successor() == Some(input.progress)
+            || completed_checkpoint_replay;
+        if !same_or_successor {
+            return Err(StateError::JournalReplayFailed(format!(
+                "terminal finalization progress for tape {} cannot move from {existing_progress:?} to {:?}",
+                hex_uuid(input.tape_uuid),
+                input.progress
+            )));
+        }
+        let expected_trigger = terminal_finalization_trigger_name(input.trigger);
+        let expected_operation_id = input.operation_id.map(|value| value.to_string());
+        if existing_trigger.as_deref() != Some(expected_trigger)
+            || existing_operation_id != expected_operation_id
+            || existing_edition_digest.as_deref() != Some(input.edition_digest.as_slice())
+            || existing_layout_digest.as_deref() != Some(input.layout_digest.as_slice())
+        {
+            return Err(StateError::JournalReplayFailed(format!(
+                "terminal finalization identity changed for tape {}",
+                hex_uuid(input.tape_uuid)
+            )));
+        }
+        let existing_outcome =
+            TerminalFinalizationOutcome::parse(existing_outcome.as_deref().ok_or_else(|| {
+                StateError::IndexCorrupt(
+                    "existing terminal finalization row is missing outcome".to_string(),
+                )
+            })?)?;
+        if matches!(
+            existing_outcome,
+            TerminalFinalizationOutcome::Finalized | TerminalFinalizationOutcome::FinalizedDegraded
+        ) && input.outcome != existing_outcome
+        {
+            return Err(StateError::JournalReplayFailed(
+                "terminal final projection cannot change outcome or resume progress".to_string(),
+            ));
+        }
+    } else if existing_trigger.is_some()
+        || existing_operation_id.is_some()
+        || existing_edition_digest.is_some()
+        || existing_layout_digest.is_some()
+        || existing_outcome.is_some()
+    {
+        return Err(StateError::IndexCorrupt(
+            "partial terminal finalization projection without progress".to_string(),
+        ));
+    }
+
+    let state = match input.outcome {
+        TerminalFinalizationOutcome::InProgress => "finalizing",
+        TerminalFinalizationOutcome::Finalized => "sealed",
+        TerminalFinalizationOutcome::FinalizedDegraded => "finalized_degraded",
+        TerminalFinalizationOutcome::RecoveryRequired => "recovery_required",
+    };
+    let changed = tx
+        .execute(
+            "update tapes
+             set finalization_progress = ?2,
+                 finalization_trigger = ?3,
+                 finalization_operation_id = ?4,
+                 finalization_edition_digest = ?5,
+                 finalization_layout_digest = ?6,
+                 completed_replicas = ?7,
+                 finalization_outcome = ?8,
+                 state = ?9,
+                 updated_at_utc = ?10
+             where tape_uuid = ?1",
+            params![
+                input.tape_uuid.to_vec(),
+                terminal_finalization_progress_name(input.progress),
+                terminal_finalization_trigger_name(input.trigger),
+                input.operation_id.map(|value| value.to_string()),
+                input.edition_digest.to_vec(),
+                input.layout_digest.to_vec(),
+                i64::from(input.progress.completed_replicas()),
+                input.outcome.as_str(),
+                state,
+                updated_at_utc,
+            ],
+        )
+        .map_err(|err| sqlite_error("project terminal finalization", err))?;
+    if changed != 1 {
+        return Err(StateError::IndexCorrupt(
+            "terminal finalization tape vanished during projection".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn terminal_progress_reaches(
+    from: TerminalFinalizationProgress,
+    target: TerminalFinalizationProgress,
+) -> bool {
+    let mut cursor = Some(from);
+    while let Some(progress) = cursor {
+        if progress == target {
+            return true;
+        }
+        cursor = progress.successor();
+    }
+    false
 }
 
 fn query_memberships_tx(
@@ -8716,7 +9734,7 @@ fn query_tape_pool_ids_tx(tx: &rusqlite::Transaction<'_>) -> Result<Vec<String>,
 struct ObjectCopyProjectionRow<'a> {
     object_id: &'a str,
     tape_uuid: [u8; 16],
-    tape_file_number: u32,
+    tape_file_number: u64,
     first_body_lba: u64,
     first_parity_data_ordinal: Option<u64>,
     protected_until_ordinal: Option<u64>,
@@ -8737,7 +9755,7 @@ struct ObjectCopyEnvelopeProjection {
 fn object_copy_envelope_from_tape_entry(
     entry: &TapeFileEntry,
 ) -> Result<ObjectCopyEnvelopeProjection, StateError> {
-    let Some(row) = entry.bootstrap_object_row.as_ref() else {
+    let Some(row) = entry.object_recovery_row.as_ref() else {
         return Ok(ObjectCopyEnvelopeProjection {
             representation: Some(OBJECT_COPY_REPRESENTATION_UNKNOWN),
             recipient_epoch_ids: None,
@@ -8746,23 +9764,23 @@ fn object_copy_envelope_from_tape_entry(
     };
     if row.tape_file_number != entry.tape_file_number {
         return Err(StateError::IndexMigrationFailed(format!(
-            "bootstrap object row tape file {} does not match journal entry {}",
+            "object recovery row tape file {} does not match journal entry {}",
             row.tape_file_number, entry.tape_file_number
         )));
     }
     if row.stored_block_count != entry.block_count {
         return Err(StateError::IndexMigrationFailed(format!(
-            "bootstrap object row block count {} does not match journal entry {}",
+            "object recovery row block count {} does not match journal entry {}",
             row.stored_block_count, entry.block_count
         )));
     }
     match &row.representation {
-        BootstrapObjectRepresentation::Plaintext { .. } => Ok(ObjectCopyEnvelopeProjection {
+        ObjectRecoveryRepresentation::Plaintext { .. } => Ok(ObjectCopyEnvelopeProjection {
             representation: Some(OBJECT_COPY_REPRESENTATION_PLAINTEXT),
             recipient_epoch_ids: None,
             metadata_frame_len: None,
         }),
-        BootstrapObjectRepresentation::Encrypted {
+        ObjectRecoveryRepresentation::Encrypted {
             recipient_epoch_ids,
             metadata_frame_len,
             ..
@@ -8790,8 +9808,7 @@ fn insert_object_copy_projection_tx(
     )?;
     validate_optional_sha256(row.plaintext_digest, "object_copies.plaintext_digest")?;
     validate_optional_sha256(row.stored_digest, "object_copies.stored_digest")?;
-    let metadata_frame_len =
-        opt_u64_to_i64(row.metadata_frame_len, "object_copies.metadata_frame_len")?;
+    let metadata_frame_len = row.metadata_frame_len.map(SqliteU64::new);
     let recipient_epoch_ids = row
         .recipient_epoch_ids
         .map(serde_json::to_string)
@@ -8819,7 +9836,8 @@ fn insert_object_copy_projection_tx(
          on conflict(object_id, tape_uuid, tape_file_number) do update set
            first_body_lba =
              case
-               when excluded.first_body_lba != 0 then excluded.first_body_lba
+               when excluded.first_body_lba != X'0000000000000000'
+                 then excluded.first_body_lba
                else object_copies.first_body_lba
              end,
            first_parity_data_ordinal = excluded.first_parity_data_ordinal,
@@ -8854,10 +9872,10 @@ fn insert_object_copy_projection_tx(
         params![
             row.object_id,
             row.tape_uuid.to_vec(),
-            i64::from(row.tape_file_number),
-            u64_to_i64(row.first_body_lba, "first_body_lba")?,
-            opt_u64_to_i64(row.first_parity_data_ordinal, "first_parity_data_ordinal")?,
-            opt_u64_to_i64(row.protected_until_ordinal, "protected_until_ordinal")?,
+            SqliteU64::new(row.tape_file_number),
+            SqliteU64::new(row.first_body_lba),
+            row.first_parity_data_ordinal.map(SqliteU64::new),
+            row.protected_until_ordinal.map(SqliteU64::new),
             row.status,
             row.representation,
             recipient_epoch_ids,
@@ -8986,7 +10004,7 @@ fn insert_native_catalog_unit_tx(
     tx: &rusqlite::Transaction<'_>,
     object_id: &str,
     tape_uuid: [u8; 16],
-    tape_file_number: u32,
+    tape_file_number: u64,
     format_id: &str,
     created_at_utc: &str,
 ) -> Result<(), StateError> {
@@ -9030,7 +10048,7 @@ fn native_object_format_id_tx(
     .map(|value| value.flatten().unwrap_or_else(|| "unknown".to_string()))
 }
 
-fn native_catalog_unit_id(object_id: &str, tape_uuid: [u8; 16], tape_file_number: u32) -> String {
+fn native_catalog_unit_id(object_id: &str, tape_uuid: [u8; 16], tape_file_number: u64) -> String {
     format!(
         "native:{}:{tape_file_number}:{object_id}",
         hex_uuid(tape_uuid)
@@ -9052,6 +10070,8 @@ fn tape_file_kind(kind: TapeFileKind) -> &'static str {
         TapeFileKind::ParitySidecar => "parity_sidecar",
         TapeFileKind::ParityMap => "parity_map",
         TapeFileKind::Bootstrap => "bootstrap",
+        TapeFileKind::TapeIndexReplica => "tape_index_replica",
+        TapeFileKind::IndexSeparationExtent => "index_separation_extent",
     }
 }
 
@@ -9189,17 +10209,15 @@ fn native_object_copy_from_row(
         stored_digest_algorithm.as_deref(),
         "object_copies.stored_digest",
     )?;
+    let envelope = object_copy_envelope_from_row(row, 8, 9, 10)?;
     // The span, through the copy→tape-file join. Both fields are present
     // exactly when the joined tape file carries a captured start; an
     // absent hint stays absent — never zero, never guessed.
-    let global_start_block = opt_i64_to_u64(
-        row_get(row, 15, "tape_files.physical_start_hint")?,
-        "physical_start_hint",
-    )?;
-    let joined_block_count = opt_i64_to_u64(
-        row_get(row, 16, "tape_files.block_count")?,
-        "tape_files.block_count",
-    )?;
+    let global_start_block =
+        row_get::<Option<SqliteU64>>(row, 15, "tape_files.physical_start_hint")?
+            .map(SqliteU64::get);
+    let joined_block_count =
+        row_get::<Option<SqliteU64>>(row, 16, "tape_files.block_count")?.map(SqliteU64::get);
     let global_end_block = match (global_start_block, joined_block_count) {
         (Some(start), Some(block_count)) => {
             Some(start.checked_add(block_count).ok_or_else(|| {
@@ -9211,34 +10229,25 @@ fn native_object_copy_from_row(
     Ok(NativeObjectCopyRecord {
         object_id: row_get(row, 0, "object_copies.object_id")?,
         tape_uuid: row_get(row, 1, "object_copies.tape_uuid")?,
-        tape_file_number: i64_to_u32(
-            row_get(row, 2, "object_copies.tape_file_number")?,
-            "tape_file_number",
-        )?,
-        first_body_lba: i64_to_u64(
-            row_get(row, 3, "object_copies.first_body_lba")?,
-            "first_body_lba",
-        )?,
-        first_parity_data_ordinal: opt_i64_to_u64(
-            row_get(row, 4, "object_copies.first_parity_data_ordinal")?,
-            "first_parity_data_ordinal",
-        )?,
-        protected_until_ordinal: opt_i64_to_u64(
-            row_get(row, 5, "object_copies.protected_until_ordinal")?,
-            "protected_until_ordinal",
-        )?,
+        tape_file_number: row_get::<SqliteU64>(row, 2, "object_copies.tape_file_number")?.get(),
+        first_body_lba: row_get::<SqliteU64>(row, 3, "object_copies.first_body_lba")?.get(),
+        first_parity_data_ordinal: row_get::<Option<SqliteU64>>(
+            row,
+            4,
+            "object_copies.first_parity_data_ordinal",
+        )?
+        .map(SqliteU64::get),
+        protected_until_ordinal: row_get::<Option<SqliteU64>>(
+            row,
+            5,
+            "object_copies.protected_until_ordinal",
+        )?
+        .map(SqliteU64::get),
         status: row_get(row, 6, "object_copies.status")?,
         pool_id: row_get(row, 7, "object_copies.pool_id")?,
-        representation: row_get(row, 8, "object_copies.representation")?,
-        recipient_epoch_ids: parse_recipient_epoch_ids_json(row_get(
-            row,
-            9,
-            "object_copies.recipient_epoch_ids",
-        )?)?,
-        metadata_frame_len: opt_i64_to_u64(
-            row_get(row, 10, "object_copies.metadata_frame_len")?,
-            "metadata_frame_len",
-        )?,
+        representation: envelope.representation,
+        recipient_epoch_ids: envelope.recipient_epoch_ids,
+        metadata_frame_len: envelope.metadata_frame_len,
         plaintext_digest,
         plaintext_digest_algorithm,
         stored_digest,
@@ -9271,14 +10280,12 @@ fn native_object_file_from_row(
         object_id: row_get(row, 0, "object_files.object_id")?,
         file_id: row_get(row, 1, "object_files.file_id")?,
         path: row_get(row, 2, "object_files.path")?,
-        size_bytes: i64_to_u64(row_get(row, 3, "object_files.size_bytes")?, "size_bytes")?,
+        size_bytes: row_get::<SqliteU64>(row, 3, "object_files.size_bytes")?.get(),
         file_sha256,
         file_digest_algorithm,
-        first_chunk_lba: opt_i64_to_u64(
-            row_get(row, 5, "object_files.first_chunk_lba")?,
-            "first_chunk_lba",
-        )?,
-        chunk_count: i64_to_u64(row_get(row, 6, "object_files.chunk_count")?, "chunk_count")?,
+        first_chunk_lba: row_get::<Option<SqliteU64>>(row, 5, "object_files.first_chunk_lba")?
+            .map(SqliteU64::get),
+        chunk_count: row_get::<SqliteU64>(row, 6, "object_files.chunk_count")?.get(),
         mtime: row_get(row, 7, "object_files.mtime")?,
         executable,
     })
@@ -9309,14 +10316,13 @@ fn native_object_copy_from_join_row(
         stored_digest_algorithm.as_deref(),
         "object_copies.stored_digest",
     )?;
-    let global_start_block = opt_i64_to_u64(
-        row_get(row, offset + 15, "tape_files.physical_start_hint")?,
-        "physical_start_hint",
-    )?;
-    let joined_block_count = opt_i64_to_u64(
-        row_get(row, offset + 16, "tape_files.block_count")?,
-        "tape_files.block_count",
-    )?;
+    let envelope = object_copy_envelope_from_row(row, offset + 8, offset + 9, offset + 10)?;
+    let global_start_block =
+        row_get::<Option<SqliteU64>>(row, offset + 15, "tape_files.physical_start_hint")?
+            .map(SqliteU64::get);
+    let joined_block_count =
+        row_get::<Option<SqliteU64>>(row, offset + 16, "tape_files.block_count")?
+            .map(SqliteU64::get);
     let global_end_block = match (global_start_block, joined_block_count) {
         (Some(start), Some(block_count)) => {
             Some(start.checked_add(block_count).ok_or_else(|| {
@@ -9328,34 +10334,27 @@ fn native_object_copy_from_join_row(
     Ok(Some(NativeObjectCopyRecord {
         object_id,
         tape_uuid: row_get(row, offset + 1, "object_copies.tape_uuid")?,
-        tape_file_number: i64_to_u32(
-            row_get(row, offset + 2, "object_copies.tape_file_number")?,
-            "tape_file_number",
-        )?,
-        first_body_lba: i64_to_u64(
-            row_get(row, offset + 3, "object_copies.first_body_lba")?,
-            "first_body_lba",
-        )?,
-        first_parity_data_ordinal: opt_i64_to_u64(
-            row_get(row, offset + 4, "object_copies.first_parity_data_ordinal")?,
-            "first_parity_data_ordinal",
-        )?,
-        protected_until_ordinal: opt_i64_to_u64(
-            row_get(row, offset + 5, "object_copies.protected_until_ordinal")?,
-            "protected_until_ordinal",
-        )?,
+        tape_file_number: row_get::<SqliteU64>(row, offset + 2, "object_copies.tape_file_number")?
+            .get(),
+        first_body_lba: row_get::<SqliteU64>(row, offset + 3, "object_copies.first_body_lba")?
+            .get(),
+        first_parity_data_ordinal: row_get::<Option<SqliteU64>>(
+            row,
+            offset + 4,
+            "object_copies.first_parity_data_ordinal",
+        )?
+        .map(SqliteU64::get),
+        protected_until_ordinal: row_get::<Option<SqliteU64>>(
+            row,
+            offset + 5,
+            "object_copies.protected_until_ordinal",
+        )?
+        .map(SqliteU64::get),
         status: row_get(row, offset + 6, "object_copies.status")?,
         pool_id: row_get(row, offset + 7, "object_copies.pool_id")?,
-        representation: row_get(row, offset + 8, "object_copies.representation")?,
-        recipient_epoch_ids: parse_recipient_epoch_ids_json(row_get(
-            row,
-            offset + 9,
-            "object_copies.recipient_epoch_ids",
-        )?)?,
-        metadata_frame_len: opt_i64_to_u64(
-            row_get(row, offset + 10, "object_copies.metadata_frame_len")?,
-            "metadata_frame_len",
-        )?,
+        representation: envelope.representation,
+        recipient_epoch_ids: envelope.recipient_epoch_ids,
+        metadata_frame_len: envelope.metadata_frame_len,
         plaintext_digest,
         plaintext_digest_algorithm,
         stored_digest,
@@ -9385,12 +10384,138 @@ fn parse_recipient_epoch_ids_json(
         .transpose()
 }
 
+struct DecodedObjectCopyEnvelope {
+    representation: String,
+    recipient_epoch_ids: Option<Vec<String>>,
+    metadata_frame_len: Option<u64>,
+}
+
+fn object_copy_envelope_from_row(
+    row: &rusqlite::Row<'_>,
+    representation_index: usize,
+    recipient_epoch_ids_index: usize,
+    metadata_frame_len_index: usize,
+) -> Result<DecodedObjectCopyEnvelope, StateError> {
+    let representation: String =
+        row_get(row, representation_index, "object_copies.representation")?;
+    let recipient_epoch_ids = parse_recipient_epoch_ids_json(row_get(
+        row,
+        recipient_epoch_ids_index,
+        "object_copies.recipient_epoch_ids",
+    )?)?;
+    let metadata_frame_len = row_get::<Option<SqliteU64>>(
+        row,
+        metadata_frame_len_index,
+        "object_copies.metadata_frame_len",
+    )?
+    .map(SqliteU64::get);
+    validate_object_copy_envelope(
+        Some(representation.as_str()),
+        recipient_epoch_ids.as_deref(),
+        metadata_frame_len,
+    )?;
+    Ok(DecodedObjectCopyEnvelope {
+        representation,
+        recipient_epoch_ids,
+        metadata_frame_len,
+    })
+}
+
 fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
+    let assignment_generation = i64_to_u64(
+        row_get(row, 15, "tapes.assignment_generation")?,
+        "assignment_generation",
+    )?;
+    let finalization_progress: Option<String> = row_get(row, 16, "tapes.finalization_progress")?;
+    let finalization_trigger: Option<String> = row_get(row, 17, "tapes.finalization_trigger")?;
+    let finalization_operation_id: Option<String> =
+        row_get(row, 18, "tapes.finalization_operation_id")?;
+    let finalization_edition_digest: Option<Vec<u8>> =
+        row_get(row, 19, "tapes.finalization_edition_digest")?;
+    let finalization_layout_digest: Option<Vec<u8>> =
+        row_get(row, 20, "tapes.finalization_layout_digest")?;
+    let completed_replicas: Option<i64> = row_get(row, 21, "tapes.completed_replicas")?;
+    let finalization_outcome: Option<String> = row_get(row, 22, "tapes.finalization_outcome")?;
+    let terminal_finalization = match finalization_progress {
+        Some(progress) => {
+            let progress = parse_terminal_finalization_progress(progress.as_str())?;
+            let trigger = parse_terminal_finalization_trigger(
+                finalization_trigger.as_deref().ok_or_else(|| {
+                    StateError::IndexCorrupt(
+                        "terminal finalization row is missing trigger".to_string(),
+                    )
+                })?,
+            )?;
+            let edition_digest = fixed_digest(
+                finalization_edition_digest.ok_or_else(|| {
+                    StateError::IndexCorrupt(
+                        "terminal finalization row is missing edition digest".to_string(),
+                    )
+                })?,
+                "finalization_edition_digest",
+            )?;
+            let layout_digest = fixed_digest(
+                finalization_layout_digest.ok_or_else(|| {
+                    StateError::IndexCorrupt(
+                        "terminal finalization row is missing layout digest".to_string(),
+                    )
+                })?,
+                "finalization_layout_digest",
+            )?;
+            let completed_replicas = i64_to_u8(
+                completed_replicas.ok_or_else(|| {
+                    StateError::IndexCorrupt(
+                        "terminal finalization row is missing completed replica count".to_string(),
+                    )
+                })?,
+                "completed_replicas",
+            )?;
+            if completed_replicas != progress.completed_replicas() {
+                return Err(StateError::IndexCorrupt(format!(
+                    "terminal finalization completed replica count {completed_replicas} disagrees with progress {progress:?}"
+                )));
+            }
+            let outcome = TerminalFinalizationOutcome::parse(
+                finalization_outcome.as_deref().ok_or_else(|| {
+                    StateError::IndexCorrupt(
+                        "terminal finalization row is missing outcome".to_string(),
+                    )
+                })?,
+            )?;
+            let operation_id = finalization_operation_id
+                .map(|value| parse_uuid_for_index(value.as_str(), "finalization_operation_id"))
+                .transpose()?;
+            Some(TerminalFinalizationProjection {
+                trigger,
+                operation_id,
+                progress,
+                edition_digest,
+                layout_digest,
+                completed_replicas,
+                outcome,
+            })
+        }
+        None => {
+            if finalization_trigger.is_some()
+                || finalization_operation_id.is_some()
+                || finalization_edition_digest.is_some()
+                || finalization_layout_digest.is_some()
+                || completed_replicas.is_some()
+                || finalization_outcome.is_some()
+            {
+                return Err(StateError::IndexCorrupt(
+                    "partial terminal finalization projection without progress".to_string(),
+                ));
+            }
+            None
+        }
+    };
     Ok(TapeRecord {
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
         kind: row_get(row, 2, "tapes.kind")?,
         pool_id: row_get(row, 3, "tapes.pool_id")?,
+        assignment_generation,
         body_format: row_get(row, 4, "tapes.body_format")?,
         block_size: opt_i64_to_u64(row_get(row, 5, "tapes.block_size")?, "block_size")?,
         scheme_id: row_get(row, 6, "tapes.scheme_id")?,
@@ -9406,21 +10531,86 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
             row_get(row, 9, "tapes.stripes_per_neighborhood")?,
             "stripes_per_neighborhood",
         )?,
-        last_committed_tape_file: opt_i64_to_u64(
-            row_get(row, 10, "tapes.last_committed_tape_file")?,
-            "last_committed_tape_file",
-        )?,
-        total_committed_ordinals: i64_to_u64(
-            row_get(row, 11, "tapes.total_committed_ordinals")?,
-            "total_committed_ordinals",
-        )?,
-        written_extent_lba: opt_i64_to_u64(
-            row_get(row, 12, "tapes.written_extent_lba")?,
-            "written_extent_lba",
-        )?,
+        last_committed_tape_file: row_get::<Option<SqliteU64>>(
+            row,
+            10,
+            "tapes.last_committed_tape_file",
+        )?
+        .map(SqliteU64::get),
+        total_committed_ordinals: row_get::<SqliteU64>(row, 11, "tapes.total_committed_ordinals")?
+            .get(),
+        written_extent_lba: row_get::<Option<SqliteU64>>(row, 12, "tapes.written_extent_lba")?
+            .map(SqliteU64::get),
+        terminal_finalization,
         state: row_get(row, 13, "tapes.state")?,
         updated_at_utc: row_get(row, 14, "tapes.updated_at_utc")?,
     })
+}
+
+fn fixed_digest(bytes: Vec<u8>, field: &str) -> Result<[u8; 32], StateError> {
+    bytes.try_into().map_err(|bytes: Vec<u8>| {
+        StateError::IndexCorrupt(format!(
+            "tapes.{field} has length {}, expected 32",
+            bytes.len()
+        ))
+    })
+}
+
+fn terminal_finalization_progress_name(progress: TerminalFinalizationProgress) -> &'static str {
+    match progress {
+        TerminalFinalizationProgress::BeforeReplicaA => "before_replica_a",
+        TerminalFinalizationProgress::AfterReplicaA => "after_replica_a",
+        TerminalFinalizationProgress::AfterSeparationAb => "after_separation_ab",
+        TerminalFinalizationProgress::AfterReplicaB => "after_replica_b",
+        TerminalFinalizationProgress::AfterSeparationBc => "after_separation_bc",
+        TerminalFinalizationProgress::AfterReplicaC => "after_replica_c",
+    }
+}
+
+fn parse_terminal_finalization_progress(
+    value: &str,
+) -> Result<TerminalFinalizationProgress, StateError> {
+    match value {
+        "before_replica_a" => Ok(TerminalFinalizationProgress::BeforeReplicaA),
+        "after_replica_a" => Ok(TerminalFinalizationProgress::AfterReplicaA),
+        "after_separation_ab" => Ok(TerminalFinalizationProgress::AfterSeparationAb),
+        "after_replica_b" => Ok(TerminalFinalizationProgress::AfterReplicaB),
+        "after_separation_bc" => Ok(TerminalFinalizationProgress::AfterSeparationBc),
+        "after_replica_c" => Ok(TerminalFinalizationProgress::AfterReplicaC),
+        other => Err(StateError::IndexCorrupt(format!(
+            "unknown terminal finalization progress {other:?}"
+        ))),
+    }
+}
+
+fn terminal_finalization_trigger_name(trigger: TerminalFinalizationTrigger) -> &'static str {
+    match trigger {
+        TerminalFinalizationTrigger::ReachedLowWatermark => "reached_low_watermark",
+        TerminalFinalizationTrigger::HardwareEarlyWarning => "hardware_early_warning",
+        TerminalFinalizationTrigger::OperatorCloseOut => "operator_close_out",
+        TerminalFinalizationTrigger::PoolCloseOut => "pool_close_out",
+        TerminalFinalizationTrigger::NoPendingObjectFits => "no_pending_object_fits",
+    }
+}
+
+fn parse_terminal_finalization_trigger(
+    value: &str,
+) -> Result<TerminalFinalizationTrigger, StateError> {
+    match value {
+        "reached_low_watermark" => Ok(TerminalFinalizationTrigger::ReachedLowWatermark),
+        "hardware_early_warning" => Ok(TerminalFinalizationTrigger::HardwareEarlyWarning),
+        "operator_close_out" => Ok(TerminalFinalizationTrigger::OperatorCloseOut),
+        "pool_close_out" => Ok(TerminalFinalizationTrigger::PoolCloseOut),
+        "no_pending_object_fits" => Ok(TerminalFinalizationTrigger::NoPendingObjectFits),
+        other => Err(StateError::IndexCorrupt(format!(
+            "unknown terminal finalization trigger {other:?}"
+        ))),
+    }
+}
+
+fn i64_to_u8(value: i64, field: &str) -> Result<u8, StateError> {
+    u8::try_from(value)
+        .map_err(|_| StateError::IndexCorrupt(format!("{field} is outside u8: {value}")))
 }
 
 const DRIVE_SELECT_SQL_WITH_WHERE_UUID: &str = concat!(
@@ -9964,12 +11154,9 @@ fn tape_file_from_row(row: &rusqlite::Row<'_>) -> Result<TapeFileRecord, StateEr
     )?;
     Ok(TapeFileRecord {
         tape_uuid: row_get(row, 0, "tape_files.tape_uuid")?,
-        tape_file_number: i64_to_u32(
-            row_get(row, 1, "tape_files.tape_file_number")?,
-            "tape_file_number",
-        )?,
+        tape_file_number: row_get::<SqliteU64>(row, 1, "tape_files.tape_file_number")?.get(),
         kind: row_get(row, 2, "tape_files.kind")?,
-        block_count: i64_to_u64(row_get(row, 3, "tape_files.block_count")?, "block_count")?,
+        block_count: row_get::<SqliteU64>(row, 3, "tape_files.block_count")?.get(),
         object_id: row_get(row, 4, "tape_files.object_id")?,
         canonical_metadata_hash,
         canonical_metadata_hash_algorithm,
@@ -10075,7 +11262,7 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
     if current == SCHEMA_VERSION {
-        return Ok(());
+        return validate_unsigned_structural_schema(conn);
     }
     if current > SCHEMA_VERSION {
         return Err(StateError::IndexMigrationFailed(format!(
@@ -10083,7 +11270,7 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
         )));
     }
     Err(StateError::IndexMigrationFailed(format!(
-        "sqlite user_version {current} is older than supported {SCHEMA_VERSION}; open read-write to migrate"
+        "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; rebuild the catalog from its authoritative journals and audit log"
     )))
 }
 
@@ -10096,6 +11283,14 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
             "sqlite user_version {current} is newer than supported {SCHEMA_VERSION}"
         )));
     }
+    if current == SCHEMA_VERSION {
+        return validate_unsigned_structural_schema(conn);
+    }
+    if current != 0 || database_has_user_tables(conn)? {
+        return Err(StateError::IndexMigrationFailed(format!(
+            "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; rebuild the catalog from its authoritative journals and audit log"
+        )));
+    }
 
     conn.execute_batch(MINIMUM_SCHEMA)
         .map_err(|err| sqlite_error("apply sqlite schema", err))?;
@@ -10103,7 +11298,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         conn,
         "object_copies",
         "first_body_lba",
-        "first_body_lba integer not null default 0",
+        "first_body_lba blob not null default X'0000000000000000' check(typeof(first_body_lba) = 'blob' and length(first_body_lba) = 8)",
     )?;
     ensure_column(conn, "object_copies", "pool_id", "pool_id text")?;
     ensure_column(
@@ -10122,7 +11317,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         conn,
         "object_copies",
         "metadata_frame_len",
-        "metadata_frame_len integer",
+        "metadata_frame_len blob check(metadata_frame_len is null or (typeof(metadata_frame_len) = 'blob' and length(metadata_frame_len) = 8))",
     )?;
     ensure_column(
         conn,
@@ -10189,17 +11384,66 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     ensure_column(conn, "catalog_units", "source_kind", "source_kind text")?;
     ensure_column(conn, "catalog_units", "source_id", "source_id text")?;
     ensure_column(conn, "tapes", "pool_id", "pool_id text")?;
+    ensure_column(
+        conn,
+        "tapes",
+        "assignment_generation",
+        "assignment_generation integer not null default 0",
+    )?;
     ensure_column(conn, "tapes", "kind", "kind text not null default 'data'")?;
     ensure_column(
         conn,
         "tapes",
         "written_extent_lba",
-        "written_extent_lba integer",
+        "written_extent_lba blob check(written_extent_lba is null or (typeof(written_extent_lba) = 'blob' and length(written_extent_lba) = 8))",
     )?;
     ensure_column(conn, "tapes", "cleaning_uses", "cleaning_uses integer")?;
     ensure_column(conn, "tapes", "cleaning_state", "cleaning_state text")?;
+    ensure_column(
+        conn,
+        "tapes",
+        "finalization_progress",
+        "finalization_progress text",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "finalization_trigger",
+        "finalization_trigger text",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "finalization_operation_id",
+        "finalization_operation_id text",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "finalization_edition_digest",
+        "finalization_edition_digest blob",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "finalization_layout_digest",
+        "finalization_layout_digest blob",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "completed_replicas",
+        "completed_replicas integer",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "finalization_outcome",
+        "finalization_outcome text",
+    )?;
     ensure_column(conn, "sessions", "drive_uuid", "drive_uuid blob")?;
     ensure_column(conn, "operations", "error_summary", "error_summary text")?;
+    migrate_idempotency_scope(conn)?;
     if current < 9 {
         conn.execute(
             "update tapes
@@ -10272,6 +11516,51 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         params![SCHEMA_VERSION.to_string().into_bytes()],
     )
     .map_err(|err| sqlite_error("write schema_meta schema_version", err))?;
+    validate_unsigned_structural_schema(conn)
+}
+
+fn database_has_user_tables(conn: &Connection) -> Result<bool, StateError> {
+    conn.query_row(
+        "select exists(
+           select 1 from sqlite_master
+           where type = 'table' and name not like 'sqlite_%'
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|err| sqlite_error("inspect pre-schema sqlite catalog", err))
+}
+
+fn validate_unsigned_structural_schema(conn: &Connection) -> Result<(), StateError> {
+    for &(table, column) in STRUCTURAL_U64_COLUMNS {
+        let declared_type = conn
+            .query_row(
+                "select type from pragma_table_info(?1) where name = ?2",
+                params![table, column],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|err| sqlite_error("inspect unsigned structural column", err))?;
+        if !declared_type.is_some_and(|value| value.eq_ignore_ascii_case("blob")) {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "{table}.{column} is not a canonical unsigned BLOB column; rebuild the catalog from its authoritative journals and audit log"
+            )));
+        }
+        let table_sql = conn
+            .query_row(
+                "select sql from sqlite_master where type = 'table' and name = ?1",
+                params![table],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|err| sqlite_error("inspect unsigned structural constraints", err))?;
+        let type_check = format!("typeof({column}) = 'blob'");
+        let length_check = format!("length({column}) = 8");
+        if !table_sql.contains(type_check.as_str()) || !table_sql.contains(length_check.as_str()) {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "{table}.{column} lacks canonical unsigned BLOB constraints; rebuild the catalog from its authoritative journals and audit log"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -10288,6 +11577,56 @@ fn ensure_column(
     conn.execute(&sql, [])
         .map(|_| ())
         .map_err(|err| sqlite_error(&format!("add {table_name}.{column_name} column"), err))
+}
+
+fn migrate_idempotency_scope(conn: &Connection) -> Result<(), StateError> {
+    if table_column_exists(conn, "idempotency_keys", "operation_kind")? {
+        return Ok(());
+    }
+
+    conn.execute_batch("begin immediate")
+        .map_err(|err| sqlite_error("begin idempotency scope migration", err))?;
+    let migration = (|| {
+        conn.execute_batch(
+            "alter table idempotency_keys rename to idempotency_keys_actor_key;
+             create table idempotency_keys(
+               actor_fingerprint text not null,
+               operation_kind text not null,
+               idempotency_key text not null,
+               request_fingerprint blob not null,
+               operation_id text not null,
+               terminal_state text,
+               response_fingerprint blob,
+               updated_at_utc text not null,
+               primary key(actor_fingerprint, operation_kind, idempotency_key)
+             );
+             insert into idempotency_keys(
+               actor_fingerprint, operation_kind, idempotency_key,
+               request_fingerprint, operation_id, terminal_state,
+               response_fingerprint, updated_at_utc
+             )
+             select legacy.actor_fingerprint,
+                    coalesce(
+                      (select operations.operation_kind
+                       from operations
+                       where operations.operation_id = legacy.operation_id),
+                      'unknown'
+                    ),
+                    legacy.idempotency_key, legacy.request_fingerprint,
+                    legacy.operation_id, legacy.terminal_state,
+                    legacy.response_fingerprint, legacy.updated_at_utc
+             from idempotency_keys_actor_key legacy;
+             drop table idempotency_keys_actor_key;",
+        )
+        .map_err(|err| sqlite_error("migrate idempotency scope", err))?;
+        conn.execute_batch("commit")
+            .map_err(|err| sqlite_error("commit idempotency scope migration", err))?;
+        Ok(())
+    })();
+    if migration.is_err() {
+        let _ = conn.execute_batch("rollback");
+    }
+    migration
 }
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, StateError> {
@@ -10345,6 +11684,7 @@ create table if not exists tapes(
   tape_uuid blob primary key,
   voltag text,
   pool_id text,
+  assignment_generation integer not null default 0,
   kind text not null default 'data',
   cleaning_uses integer,
   cleaning_state text,
@@ -10353,10 +11693,21 @@ create table if not exists tapes(
   data_blocks_per_stripe integer,
   parity_blocks_per_stripe integer,
   stripes_per_neighborhood integer,
-  highest_protected_ordinal integer not null default 0,
-  total_committed_ordinals integer not null default 0,
-  last_committed_tape_file integer,
-  written_extent_lba integer,
+  highest_protected_ordinal blob not null default X'0000000000000000'
+    check(typeof(highest_protected_ordinal) = 'blob' and length(highest_protected_ordinal) = 8),
+  total_committed_ordinals blob not null default X'0000000000000000'
+    check(typeof(total_committed_ordinals) = 'blob' and length(total_committed_ordinals) = 8),
+  last_committed_tape_file blob
+    check(last_committed_tape_file is null or (typeof(last_committed_tape_file) = 'blob' and length(last_committed_tape_file) = 8)),
+  written_extent_lba blob
+    check(written_extent_lba is null or (typeof(written_extent_lba) = 'blob' and length(written_extent_lba) = 8)),
+  finalization_progress text,
+  finalization_trigger text,
+  finalization_operation_id text,
+  finalization_edition_digest blob,
+  finalization_layout_digest blob,
+  completed_replicas integer,
+  finalization_outcome text,
   state text not null,
   updated_at_utc text not null
 );
@@ -10375,15 +11726,22 @@ create table if not exists tape_pools(
 
 create table if not exists tape_files(
   tape_uuid blob not null,
-  tape_file_number integer not null,
+  tape_file_number blob not null
+    check(typeof(tape_file_number) = 'blob' and length(tape_file_number) = 8),
   kind text not null,
-  block_count integer not null,
-  physical_start_hint integer,
+  block_count blob not null
+    check(typeof(block_count) = 'blob' and length(block_count) = 8),
+  physical_start_hint blob
+    check(physical_start_hint is null or (typeof(physical_start_hint) = 'blob' and length(physical_start_hint) = 8)),
   object_id text,
-  first_parity_data_ordinal integer,
-  epoch_id integer,
-  protected_ordinal_start integer,
-  protected_ordinal_end_exclusive integer,
+  first_parity_data_ordinal blob
+    check(first_parity_data_ordinal is null or (typeof(first_parity_data_ordinal) = 'blob' and length(first_parity_data_ordinal) = 8)),
+  epoch_id blob
+    check(epoch_id is null or (typeof(epoch_id) = 'blob' and length(epoch_id) = 8)),
+  protected_ordinal_start blob
+    check(protected_ordinal_start is null or (typeof(protected_ordinal_start) = 'blob' and length(protected_ordinal_start) = 8)),
+  protected_ordinal_end_exclusive blob
+    check(protected_ordinal_end_exclusive is null or (typeof(protected_ordinal_end_exclusive) = 'blob' and length(protected_ordinal_end_exclusive) = 8)),
   canonical_metadata_hash blob,
   canonical_metadata_hash_algorithm text,
   bundle_uuid text,
@@ -10414,14 +11772,19 @@ create index if not exists objects_caller_object_id_idx
 create table if not exists object_copies(
   object_id text not null,
   tape_uuid blob not null,
-  tape_file_number integer not null,
-  first_body_lba integer not null default 0,
-  first_parity_data_ordinal integer,
-  protected_until_ordinal integer,
+  tape_file_number blob not null
+    check(typeof(tape_file_number) = 'blob' and length(tape_file_number) = 8),
+  first_body_lba blob not null default X'0000000000000000'
+    check(typeof(first_body_lba) = 'blob' and length(first_body_lba) = 8),
+  first_parity_data_ordinal blob
+    check(first_parity_data_ordinal is null or (typeof(first_parity_data_ordinal) = 'blob' and length(first_parity_data_ordinal) = 8)),
+  protected_until_ordinal blob
+    check(protected_until_ordinal is null or (typeof(protected_until_ordinal) = 'blob' and length(protected_until_ordinal) = 8)),
   status text not null,
   representation text not null default 'unknown',
   recipient_epoch_ids text,
-  metadata_frame_len integer,
+  metadata_frame_len blob
+    check(metadata_frame_len is null or (typeof(metadata_frame_len) = 'blob' and length(metadata_frame_len) = 8)),
   plaintext_digest blob,
   plaintext_digest_algorithm text,
   stored_digest blob,
@@ -10434,11 +11797,14 @@ create table if not exists object_files(
   object_id text not null,
   file_id text not null,
   path text not null,
-  size_bytes integer not null,
+  size_bytes blob not null
+    check(typeof(size_bytes) = 'blob' and length(size_bytes) = 8),
   file_sha256 blob not null,
   file_digest_algorithm text not null default 'sha256',
-  first_chunk_lba integer,
-  chunk_count integer not null,
+  first_chunk_lba blob
+    check(first_chunk_lba is null or (typeof(first_chunk_lba) = 'blob' and length(first_chunk_lba) = 8)),
+  chunk_count blob not null
+    check(typeof(chunk_count) = 'blob' and length(chunk_count) = 8),
   mtime text,
   executable integer,
   primary key(object_id, file_id)
@@ -10472,13 +11838,14 @@ create index if not exists catalog_units_native_object_idx
 
 create table if not exists idempotency_keys(
   actor_fingerprint text not null,
+  operation_kind text not null,
   idempotency_key text not null,
   request_fingerprint blob not null,
   operation_id text not null,
   terminal_state text,
   response_fingerprint blob,
   updated_at_utc text not null,
-  primary key(actor_fingerprint, idempotency_key)
+  primary key(actor_fingerprint, operation_kind, idempotency_key)
 );
 
 create table if not exists operations(
@@ -10803,7 +12170,7 @@ mod tests {
         DriveBay, ElementLayout, IdentitySource, InstalledDrive, Library, Slot,
     };
     use remanence_parity::{
-        BootstrapObjectRow, CommittedBundleKind, CommittedState, SchemeId, TapeFileEntry,
+        CommittedBundleKind, CommittedState, ObjectRecoveryRow, SchemeId, TapeFileEntry,
     };
 
     use super::*;
@@ -10957,7 +12324,7 @@ mod tests {
                     protected_ordinal_start: None,
                     protected_ordinal_end_exclusive: None,
                     canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
                 TapeFileEntry {
                     tape_file_number: 2,
@@ -10970,7 +12337,7 @@ mod tests {
                     protected_ordinal_start: Some(0),
                     protected_ordinal_end_exclusive: Some(3),
                     canonical_metadata_hash: Some([9u8; 32]),
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
                 TapeFileEntry {
                     tape_file_number: 3,
@@ -10983,7 +12350,7 @@ mod tests {
                     protected_ordinal_start: Some(0),
                     protected_ordinal_end_exclusive: Some(3),
                     canonical_metadata_hash: Some([8u8; 32]),
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
                 TapeFileEntry {
                     tape_file_number: 4,
@@ -10996,7 +12363,7 @@ mod tests {
                     protected_ordinal_start: None,
                     protected_ordinal_end_exclusive: None,
                     canonical_metadata_hash: Some([7u8; 32]),
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
             ],
             highest_protected_ordinal: 3,
@@ -11044,7 +12411,7 @@ mod tests {
                 protected_ordinal_start: None,
                 protected_ordinal_end_exclusive: None,
                 canonical_metadata_hash: None,
-                bootstrap_object_row: None,
+                object_recovery_row: None,
             }],
             highest_protected_ordinal: 3,
             total_committed_ordinals: 4,
@@ -11079,7 +12446,7 @@ mod tests {
     fn append_copy_projection(
         object_id: &str,
         tape_uuid: [u8; 16],
-        tape_file_number: u32,
+        tape_file_number: u64,
     ) -> NativeObjectCopyProjectionInput {
         NativeObjectCopyProjectionInput {
             object_id: object_id.to_string(),
@@ -11099,7 +12466,7 @@ mod tests {
 
     fn append_object_entry(
         object_id: &str,
-        tape_file_number: u32,
+        tape_file_number: u64,
         block_count: u64,
     ) -> TapeFileEntry {
         TapeFileEntry {
@@ -11113,7 +12480,7 @@ mod tests {
             protected_ordinal_start: None,
             protected_ordinal_end_exclusive: None,
             canonical_metadata_hash: None,
-            bootstrap_object_row: None,
+            object_recovery_row: None,
         }
     }
 
@@ -11129,7 +12496,76 @@ mod tests {
             protected_ordinal_start: None,
             protected_ordinal_end_exclusive: None,
             canonical_metadata_hash: None,
-            bootstrap_object_row: None,
+            object_recovery_row: None,
+        }
+    }
+
+    fn structured_terminal_checkpoint(
+        prior: &crate::checkpoint::CheckpointJournalRecord,
+    ) -> crate::checkpoint::CheckpointJournalRecord {
+        let layout = remanence_parity::TerminalTailLayout::new(
+            prior.eod_partition,
+            prior.block_size,
+            prior.next_tape_file_number,
+            prior.eod_lba,
+            2,
+            4_096,
+        )
+        .expect("terminal layout");
+        let persisted_layout = crate::checkpoint::TerminalFinalizationLayout::try_from(layout)
+            .expect("persist terminal layout");
+        let replica_c = persisted_layout.components[4];
+        let finalization = crate::checkpoint::TerminalFinalizationIntent {
+            tape_uuid: prior.tape_uuid,
+            trigger: crate::checkpoint::TerminalFinalizationTrigger::ReachedLowWatermark,
+            manual: None,
+            progress: crate::checkpoint::TerminalFinalizationProgress::AfterReplicaC,
+            edition_id: [0x71; 16],
+            edition_sequence: 1,
+            edition_digest: [0x72; 32],
+            writer_version: "remanence-index-test".to_string(),
+            write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+            terminal_prefix: None,
+            layout: persisted_layout,
+        };
+        crate::checkpoint::CheckpointJournalRecord {
+            ordinal: prior.ordinal + 1,
+            committed_object_count: prior.committed_object_count,
+            eod_partition: finalization.layout.partition,
+            eod_lba: finalization.layout.expected_eod_lba,
+            tape_uuid: prior.tape_uuid,
+            batch_id: [0x73; 16],
+            next_tape_file_number: replica_c
+                .tape_file_number
+                .checked_add(1)
+                .expect("first free file after replica C"),
+            block_size: prior.block_size,
+            objects: Vec::new(),
+            scheme: prior.scheme.clone(),
+            object_tape_file_bundles: Vec::new(),
+            barrier_bundle: Some(CommittedBundle {
+                kind: CommittedBundleKind::TerminalComponent,
+                entries: vec![TapeFileEntry {
+                    tape_file_number: replica_c.tape_file_number,
+                    kind: TapeFileKind::TapeIndexReplica,
+                    block_count: replica_c.record_count,
+                    physical_start_hint: Some(replica_c.start_lba),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: Some(finalization.edition_digest),
+                    object_recovery_row: None,
+                }],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: prior
+                    .objects
+                    .last()
+                    .map_or(0, |object| object.total_committed_ordinals),
+            }),
+            terminal_finalization: Some(finalization),
+            sealed_after_write: true,
         }
     }
 
@@ -11203,6 +12639,23 @@ mod tests {
         }
     }
 
+    fn terminal_projection(
+        tape_uuid: [u8; 16],
+        progress: TerminalFinalizationProgress,
+        outcome: TerminalFinalizationOutcome,
+    ) -> TerminalFinalizationProjectionInput {
+        TerminalFinalizationProjectionInput {
+            tape_uuid,
+            trigger: TerminalFinalizationTrigger::OperatorCloseOut,
+            operation_id: Some(Uuid::from_u128(0xFA11)),
+            progress,
+            edition_digest: [0xED; 32],
+            layout_digest: [0x1A; 32],
+            outcome,
+            updated_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
+        }
+    }
+
     fn written_bootstrap_state() -> CommittedState {
         CommittedState {
             entries: vec![TapeFileEntry {
@@ -11216,7 +12669,7 @@ mod tests {
                 protected_ordinal_start: None,
                 protected_ordinal_end_exclusive: None,
                 canonical_metadata_hash: Some([1u8; 32]),
-                bootstrap_object_row: None,
+                object_recovery_row: None,
             }],
             highest_protected_ordinal: 0,
             total_committed_ordinals: 0,
@@ -11240,7 +12693,7 @@ mod tests {
             .query_row(
                 "select highest_protected_ordinal from tapes where tape_uuid = ?1",
                 params![tape_uuid.to_vec()],
-                |row| row.get::<_, u64>(0),
+                |row| row.get::<_, SqliteU64>(0).map(SqliteU64::get),
             )
             .expect("highest protected ordinal")
     }
@@ -11461,8 +12914,8 @@ mod tests {
             .conn
             .execute(
                 "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
-                 values('obj-guard', ?1, 1, 'committed')",
-                params![tape_uuid.to_vec()],
+                 values('obj-guard', ?1, ?2, 'committed')",
+                params![tape_uuid.to_vec(), SqliteU64::new(1)],
             )
             .expect("seed committed copy");
 
@@ -11607,7 +13060,7 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 3,
                     total_committed_ordinals: 3,
@@ -12524,7 +13977,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v12_operation_rows_gain_nullable_failure_detail() {
+    fn schema_v12_catalog_is_refused_at_the_clean_break() {
         let dir = tempfile::Builder::new()
             .prefix("rem-operation-detail-migration")
             .tempdir()
@@ -12551,18 +14004,13 @@ mod tests {
             .expect("mark schema v12");
         drop(conn);
 
-        let index = CatalogIndex::open(&path).expect("migrate v12 index");
-        let operation = index
-            .get_operation("00000000-0000-0000-0000-000000000013")
-            .expect("query migrated operation")
-            .expect("legacy operation preserved");
-
-        assert_eq!(
-            index.schema_version().expect("schema version"),
-            SCHEMA_VERSION
+        let error = CatalogIndex::open(&path).expect_err("v12 catalog must require rebuild");
+        assert!(
+            matches!(error, StateError::IndexMigrationFailed(ref message)
+                if message.contains("rebuild the catalog")
+                    && message.contains(&SCHEMA_VERSION.to_string())),
+            "{error}"
         );
-        assert_eq!(operation.operation_kind, "clean_drive");
-        assert_eq!(operation.error_summary, None);
     }
 
     #[test]
@@ -12618,79 +14066,115 @@ mod tests {
     }
 
     #[test]
-    fn ds_m1_migration_adds_drive_schema_and_backfills_unwritten_cln_tapes() {
+    fn schema_v16_catalog_is_refused_at_the_clean_break() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-stage-two-migration")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let conn = Connection::open(&path).expect("open legacy sqlite");
+        conn.execute_batch(
+            "create table tapes(
+               tape_uuid blob primary key,
+               voltag text,
+               pool_id text,
+               kind text not null default 'data',
+               cleaning_uses integer,
+               cleaning_state text,
+               block_size integer,
+               scheme_id text,
+               data_blocks_per_stripe integer,
+               parity_blocks_per_stripe integer,
+               stripes_per_neighborhood integer,
+               highest_protected_ordinal integer not null default 0,
+               total_committed_ordinals integer not null default 0,
+               last_committed_tape_file integer,
+               written_extent_lba integer,
+               state text not null,
+               updated_at_utc text not null
+             );",
+        )
+        .expect("create legacy tapes table");
+        conn.execute_batch(MINIMUM_SCHEMA)
+            .expect("create remaining catalog tables");
+        conn.execute_batch(
+            "drop table idempotency_keys;
+             create table idempotency_keys(
+               actor_fingerprint text not null,
+               idempotency_key text not null,
+               request_fingerprint blob not null,
+               operation_id text not null,
+               terminal_state text,
+               response_fingerprint blob,
+               updated_at_utc text not null,
+               primary key(actor_fingerprint, idempotency_key)
+             );",
+        )
+        .expect("restore actor-key idempotency schema");
+        let tape_uuid = [0x17_u8; 16];
+        let operation_id = Uuid::from_u128(0x1700);
+        let idempotency_key = Uuid::from_u128(0x1701);
+        conn.execute(
+            "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
+             values(?1, 'RMN017L9', 'ready', '2026-08-08T00:00:00Z')",
+            params![tape_uuid.to_vec()],
+        )
+        .expect("insert legacy tape");
+        conn.execute(
+            "insert into operations(
+               operation_id, operation_kind, state, session_id, subject,
+               error_summary, started_at_utc, updated_at_utc
+             ) values(?1, 'close_out', 'running', null, null, null, ?2, ?2)",
+            params![operation_id.to_string(), "2026-08-08T00:00:00Z"],
+        )
+        .expect("insert operation for scope derivation");
+        conn.execute(
+            "insert into idempotency_keys(
+               actor_fingerprint, idempotency_key, request_fingerprint,
+               operation_id, terminal_state, response_fingerprint, updated_at_utc
+             ) values('user:alice', ?1, ?2, ?3, null, null, ?4)",
+            params![
+                idempotency_key.to_string(),
+                vec![0x17_u8; 32],
+                operation_id.to_string(),
+                "2026-08-08T00:00:00Z",
+            ],
+        )
+        .expect("insert legacy idempotency row");
+        conn.pragma_update(None, "user_version", 16_u32)
+            .expect("mark stage-one schema");
+        drop(conn);
+
+        let error = CatalogIndex::open(&path).expect_err("v16 catalog must require rebuild");
+        assert!(
+            matches!(error, StateError::IndexMigrationFailed(ref message)
+                if message.contains("rebuild the catalog")
+                    && message.contains(&SCHEMA_VERSION.to_string())),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn schema_v8_catalog_is_refused_at_the_clean_break() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
             .expect("temp dir");
         let path = temp.path().join("rem-state.sqlite");
         let conn = Connection::open(&path).expect("open raw sqlite");
-        conn.execute_batch(MINIMUM_SCHEMA)
-            .expect("seed pre-migration schema shape");
-        let cleaning_tape = vec![0x11_u8; 16];
-        let written_cln_tape = vec![0x22_u8; 16];
-        conn.execute(
-            "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
-             values(?1, 'CLN001L9', 'ready', '2026-07-04T00:00:00Z')",
-            params![cleaning_tape.as_slice()],
-        )
-        .expect("seed unwritten CLN tape");
-        conn.execute(
-            "insert into tapes(tape_uuid, voltag, state, updated_at_utc)
-             values(?1, 'CLN999L9', 'ready', '2026-07-04T00:00:00Z')",
-            params![written_cln_tape.as_slice()],
-        )
-        .expect("seed written CLN tape");
-        conn.execute(
-            "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
-             values('obj-written', ?1, 1, 'committed')",
-            params![written_cln_tape.as_slice()],
-        )
-        .expect("seed committed copy guard");
+        conn.execute_batch("create table legacy_catalog_marker(id integer primary key);")
+            .expect("seed pre-clean-break schema");
         conn.pragma_update(None, "user_version", 8_u32)
             .expect("mark pre-DS-M1 version");
         drop(conn);
 
-        let index = CatalogIndex::open(&path).expect("migrate DS-M1 schema");
-        for table in [
-            "drives",
-            "drive_events",
-            "drive_health_snapshots",
-            "clean_runs",
-            "alarms",
-        ] {
-            assert!(index.table_exists(table).expect("table exists"), "{table}");
-        }
-        assert!(table_column_exists(&index.conn, "sessions", "drive_uuid")
-            .expect("sessions.drive_uuid exists"));
-        assert!(table_column_exists(&index.conn, "tapes", "kind").expect("tapes.kind exists"));
-
-        let unwritten: (String, Option<i64>, Option<String>) = index
-            .conn
-            .query_row(
-                "select kind, cleaning_uses, cleaning_state from tapes where voltag = 'CLN001L9'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("unwritten CLN tape row");
-        assert_eq!(
-            unwritten,
-            (
-                "cleaning".to_string(),
-                Some(0),
-                Some("unverified".to_string())
-            )
+        let error = CatalogIndex::open(&path).expect_err("v8 catalog must require rebuild");
+        assert!(
+            matches!(error, StateError::IndexMigrationFailed(ref message)
+                if message.contains("rebuild the catalog")
+                    && message.contains(&SCHEMA_VERSION.to_string())),
+            "{error}"
         );
-
-        let written: (String, Option<i64>, Option<String>) = index
-            .conn
-            .query_row(
-                "select kind, cleaning_uses, cleaning_state from tapes where voltag = 'CLN999L9'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .expect("written CLN tape row");
-        assert_eq!(written, ("data".to_string(), None, None));
     }
 
     #[test]
@@ -13880,6 +15364,70 @@ mod tests {
     }
 
     #[test]
+    fn schema_v17_catalog_is_refused_without_rewriting_rows() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-v17-clean-break")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let conn = Connection::open(&path).expect("open raw sqlite");
+        conn.execute_batch(
+            "create table tapes(
+               tape_uuid blob primary key,
+               highest_protected_ordinal integer not null default 0
+             );
+             insert into tapes(tape_uuid) values(X'17171717171717171717171717171717');",
+        )
+        .expect("seed v17 catalog");
+        conn.pragma_update(None, "user_version", 17_u32)
+            .expect("set v17 version");
+        drop(conn);
+
+        let error = CatalogIndex::open(&path).expect_err("v17 catalog must require rebuild");
+        let StateError::IndexMigrationFailed(message) = error else {
+            panic!("expected migration failure, got {error}");
+        };
+        assert_eq!(
+            message,
+            "sqlite user_version 17 predates the unsigned structural-index schema 18; rebuild the catalog from its authoritative journals and audit log"
+        );
+        let conn = Connection::open(&path).expect("reopen raw sqlite");
+        let preserved: i64 = conn
+            .query_row("select highest_protected_ordinal from tapes", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy row remains intact");
+        assert_eq!(preserved, 0, "clean-break refusal must not rewrite rows");
+    }
+
+    #[test]
+    fn current_version_with_noncanonical_schema_is_refused() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-v18-schema-shape")
+            .tempdir()
+            .expect("temp dir");
+        let path = temp.path().join("rem-state.sqlite");
+        let conn = Connection::open(&path).expect("open raw sqlite");
+        conn.execute_batch(
+            "create table tapes(
+               tape_uuid blob primary key,
+               highest_protected_ordinal integer not null default 0
+             );",
+        )
+        .expect("seed noncanonical schema");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("spoof current version");
+        drop(conn);
+
+        let error = CatalogIndex::open(&path).expect_err("schema shape must be validated");
+        assert!(
+            matches!(error, StateError::IndexMigrationFailed(ref message)
+                if message.contains("not a canonical unsigned BLOB column")),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn read_only_open_validates_existing_schema() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
@@ -13932,7 +15480,7 @@ mod tests {
                     protected_ordinal_start: None,
                     protected_ordinal_end_exclusive: None,
                     canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
                 TapeFileEntry {
                     tape_file_number: 2,
@@ -13945,7 +15493,7 @@ mod tests {
                     protected_ordinal_start: Some(0),
                     protected_ordinal_end_exclusive: Some(3),
                     canonical_metadata_hash: Some([9u8; 32]),
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
                 TapeFileEntry {
                     tape_file_number: 3,
@@ -13958,7 +15506,7 @@ mod tests {
                     protected_ordinal_start: Some(0),
                     protected_ordinal_end_exclusive: Some(3),
                     canonical_metadata_hash: Some([8u8; 32]),
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
                 TapeFileEntry {
                     tape_file_number: 4,
@@ -13971,7 +15519,7 @@ mod tests {
                     protected_ordinal_start: None,
                     protected_ordinal_end_exclusive: None,
                     canonical_metadata_hash: Some([7u8; 32]),
-                    bootstrap_object_row: None,
+                    object_recovery_row: None,
                 },
             ],
             highest_protected_ordinal: 3,
@@ -14168,7 +15716,7 @@ mod tests {
             .index_committed_tape_journal(input.clone(), &state)
             .expect("ingest committed journal");
 
-        let (state, last_file): (String, Option<i64>) = index
+        let (state, last_file): (String, Option<SqliteU64>) = index
             .conn
             .query_row(
                 "select state, last_committed_tape_file from tapes where tape_uuid = ?1",
@@ -14178,7 +15726,7 @@ mod tests {
             .expect("tape row");
 
         assert_eq!(state, "sealed");
-        assert_eq!(last_file, Some(4));
+        assert_eq!(last_file.map(SqliteU64::get), Some(4));
     }
 
     /// Provision the rebuild fixture's tape, ingest its journal so committed
@@ -14472,7 +16020,7 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 3,
                     total_committed_ordinals: 4,
@@ -14497,6 +16045,7 @@ mod tests {
             tape_uuid: input.tape_uuid.to_vec(),
             voltag: None,
             pool_id: None,
+            assignment_generation: 0,
             kind: "data".to_string(),
             cleaning_uses: None,
             cleaning_state: None,
@@ -14505,17 +16054,212 @@ mod tests {
             data_blocks_per_stripe: None,
             parity_blocks_per_stripe: None,
             stripes_per_neighborhood: None,
-            highest_protected_ordinal: 0,
-            total_committed_ordinals: 0,
+            highest_protected_ordinal: SqliteU64::ZERO,
+            total_committed_ordinals: SqliteU64::ZERO,
             last_committed_tape_file: None,
             state: "retired".to_string(),
             updated_at_utc: "2026-06-10T00:00:00Z".to_string(),
+            finalization_progress: None,
+            finalization_trigger: None,
+            finalization_operation_id: None,
+            finalization_edition_digest: None,
+            finalization_layout_digest: None,
+            completed_replicas: None,
+            finalization_outcome: None,
         };
         let tx = index.conn.transaction().expect("begin merge transaction");
         merge_preserved_tape_operator_columns_tx(&tx, &[preserved]).expect("merge retired row");
         tx.commit().expect("commit merge transaction");
         let (tape_state, _) = tape_state_and_voltag(&index, input.tape_uuid);
         assert_eq!(tape_state, "retired", "merge did not re-apply retired");
+    }
+
+    #[test]
+    fn structural_u64_blobs_round_trip_and_sort_through_u64_max() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-u64-tape-files")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x64; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMN064L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        let values = [0, 1_u64 << 32, 1_u64 << 53, (i64::MAX as u64) + 1, u64::MAX];
+        for value in values {
+            let encoded = SqliteU64::new(value);
+            assert_eq!(encoded.0, value.to_be_bytes());
+            assert_eq!(
+                SqliteU64::column_result(ValueRef::Blob(&encoded.0))
+                    .expect("decode canonical blob")
+                    .get(),
+                value
+            );
+        }
+        assert!(SqliteU64::column_result(ValueRef::Integer(0)).is_err());
+        assert!(SqliteU64::column_result(ValueRef::Blob(&[0_u8; 7])).is_err());
+
+        let entries = values.map(|value| TapeFileEntry {
+            tape_file_number: value,
+            kind: if value == u64::MAX {
+                TapeFileKind::IndexSeparationExtent
+            } else {
+                TapeFileKind::TapeIndexReplica
+            },
+            block_count: 1,
+            physical_start_hint: Some(value),
+            object_id: None,
+            first_parity_data_ordinal: Some(value),
+            epoch_id: Some(value),
+            protected_ordinal_start: Some(value),
+            protected_ordinal_end_exclusive: Some(value),
+            canonical_metadata_hash: None,
+            object_recovery_row: None,
+        });
+        index
+            .reconcile_tape_files_projection(tape_uuid, &entries, u64::MAX, u64::MAX)
+            .expect("project unsigned boundary values");
+        let tx = index.conn.transaction().expect("begin extent transaction");
+        project_tape_written_extent_tx(&tx, tape_uuid, u64::MAX)
+            .expect("project maximum written extent");
+        tx.commit().expect("commit extent transaction");
+        let files = index
+            .list_tape_files(tape_uuid.as_slice())
+            .expect("list projected tape files");
+        assert_eq!(
+            files
+                .iter()
+                .map(|entry| entry.tape_file_number)
+                .collect::<Vec<_>>(),
+            values
+        );
+        assert_eq!(files[0].kind, "tape_index_replica");
+        assert_eq!(files[4].kind, "index_separation_extent");
+        assert_eq!(highest_protected_ordinal(&index, tape_uuid), u64::MAX);
+        let tape = index.get_tape(&tape_uuid).expect("get tape").expect("tape");
+        assert_eq!(tape.total_committed_ordinals, u64::MAX);
+        assert_eq!(tape.last_committed_tape_file, Some(u64::MAX));
+        assert_eq!(tape.written_extent_lba, Some(u64::MAX));
+
+        let mut stmt = index
+            .conn
+            .prepare("select tape_file_number from tape_files order by tape_file_number")
+            .expect("prepare raw ordering query");
+        let encoded = stmt
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .expect("query raw ordering")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect raw ordering");
+        assert_eq!(
+            encoded,
+            values
+                .iter()
+                .map(|value| value.to_be_bytes().to_vec())
+                .collect::<Vec<_>>()
+        );
+        drop(stmt);
+        let mut range_stmt = index
+            .conn
+            .prepare(
+                "select tape_file_number from tape_files
+                 where tape_file_number between ?1 and ?2
+                 order by tape_file_number",
+            )
+            .expect("prepare unsigned range query");
+        let ranged = range_stmt
+            .query_map(
+                params![SqliteU64::new(1_u64 << 53), SqliteU64::new(u64::MAX)],
+                |row| row.get::<_, SqliteU64>(0).map(SqliteU64::get),
+            )
+            .expect("query unsigned range")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect unsigned range");
+        assert_eq!(ranged, values[2..]);
+    }
+
+    #[test]
+    fn structural_u64_columns_enforce_blob_type_and_width() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-u64-constraints")
+            .tempdir()
+            .expect("temp dir");
+        let index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x65_u8; 16];
+        index
+            .conn
+            .execute(
+                "insert into tapes(tape_uuid, state, updated_at_utc)
+                 values(?1, 'ready', '2026-08-09T00:00:00Z')",
+                params![tape_uuid.to_vec()],
+            )
+            .expect("seed tape");
+        index
+            .conn
+            .execute(
+                "insert into tape_files(tape_uuid, tape_file_number, kind, block_count)
+                 values(?1, ?2, 'object', ?3)",
+                params![tape_uuid.to_vec(), SqliteU64::ZERO, SqliteU64::new(1)],
+            )
+            .expect("seed tape file");
+        index
+            .conn
+            .execute(
+                "insert into object_copies(object_id, tape_uuid, tape_file_number, status)
+                 values('object-u64', ?1, ?2, 'committed')",
+                params![tape_uuid.to_vec(), SqliteU64::ZERO],
+            )
+            .expect("seed object copy");
+        index
+            .conn
+            .execute(
+                "insert into object_files(
+                   object_id, file_id, path, size_bytes, file_sha256, chunk_count
+                 ) values('object-u64', 'file-u64', 'u64.bin', ?1, ?2, ?3)",
+                params![SqliteU64::ZERO, vec![0x65_u8; 32], SqliteU64::ZERO],
+            )
+            .expect("seed object file");
+
+        for &(table, column) in STRUCTURAL_U64_COLUMNS {
+            let update = format!("update {table} set {column} = ?1");
+            index
+                .conn
+                .execute(&update, params![SqliteU64::new(1)])
+                .unwrap_or_else(|error| panic!("valid {table}.{column}: {error}"));
+            let inspect = format!("select typeof({column}), length({column}) from {table}");
+            let storage: (String, i64) = index
+                .conn
+                .query_row(&inspect, [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap_or_else(|error| panic!("inspect {table}.{column}: {error}"));
+            assert_eq!(storage, ("blob".to_string(), 8), "{table}.{column}");
+            assert!(
+                index.conn.execute(&update, params![1_i64]).is_err(),
+                "{table}.{column} accepted INTEGER storage"
+            );
+            assert!(
+                index.conn.execute(&update, params![vec![0_u8; 7]]).is_err(),
+                "{table}.{column} accepted a non-canonical BLOB width"
+            );
+        }
+        index
+            .conn
+            .execute(
+                "update object_copies
+                 set representation = 'encrypted',
+                     recipient_epoch_ids = '[\"00000000000000000000000000000001\"]',
+                     metadata_frame_len = ?1",
+                params![SqliteU64::new(u64::MAX)],
+            )
+            .expect("seed semantically invalid metadata length");
+        let error = index
+            .find_native_object_copies("object-u64")
+            .expect_err("semantic metadata cap must be checked on read");
+        assert!(error.to_string().contains("must be in [17, 16 MiB]"));
     }
 
     #[test]
@@ -14542,7 +16286,7 @@ mod tests {
                 protected_ordinal_start: None,
                 protected_ordinal_end_exclusive: None,
                 canonical_metadata_hash: None,
-                bootstrap_object_row: None,
+                object_recovery_row: None,
             },
             TapeFileEntry {
                 tape_file_number: 2,
@@ -14555,7 +16299,7 @@ mod tests {
                 protected_ordinal_start: None,
                 protected_ordinal_end_exclusive: None,
                 canonical_metadata_hash: None,
-                bootstrap_object_row: None,
+                object_recovery_row: None,
             },
         ];
 
@@ -14735,12 +16479,12 @@ mod tests {
                 block_count: 3,
                 fresh_tape: true,
                 total_committed_ordinals: 3,
-                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                object_recovery_row: crate::checkpoint::CheckpointObjectRecoveryRow {
                     tape_file_number: 1,
                     stored_block_count: 3,
                     object_id: object_1.to_string().into_bytes(),
                     representation:
-                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                        crate::checkpoint::CheckpointObjectRecoveryRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
                             manifest_size_bytes: 1,
                             manifest_chunk_count: 1,
@@ -14756,12 +16500,12 @@ mod tests {
                 block_count: 2,
                 fresh_tape: false,
                 total_committed_ordinals: 5,
-                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                object_recovery_row: crate::checkpoint::CheckpointObjectRecoveryRow {
                     tape_file_number: 2,
                     stored_block_count: 2,
                     object_id: object_2.to_string().into_bytes(),
                     representation:
-                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                        crate::checkpoint::CheckpointObjectRecoveryRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
                             manifest_size_bytes: 1,
                             manifest_chunk_count: 1,
@@ -14790,58 +16534,60 @@ mod tests {
             ordinal: 1,
             committed_object_count: 2,
             eod_partition: 0,
-            eod_lba: 11,
+            eod_lba: 9,
             tape_uuid,
             batch_id: [0x61; 16],
-            checkpoint_tape_file_number: 3,
+            next_tape_file_number: 3,
             block_size: 256 * 1024,
             objects: projections,
             scheme: None,
             object_tape_file_bundles: Vec::new(),
-            checkpoint_bundle: None,
+            barrier_bundle: None,
+            terminal_finalization: None,
             sealed_after_write: false,
         };
         journal.append(&record).expect("fsync checkpoint record");
-        let terminal_record = crate::checkpoint::CheckpointJournalRecord {
-            ordinal: 2,
-            committed_object_count: 2,
-            eod_partition: 0,
-            eod_lba: 13,
-            tape_uuid,
-            batch_id: [0x62; 16],
-            checkpoint_tape_file_number: 4,
-            block_size: 256 * 1024,
-            objects: Vec::new(),
-            scheme: None,
-            object_tape_file_bundles: Vec::new(),
-            checkpoint_bundle: Some(CommittedBundle {
-                kind: CommittedBundleKind::Finish,
-                entries: vec![TapeFileEntry {
-                    tape_file_number: 4,
-                    kind: TapeFileKind::Bootstrap,
-                    block_count: 1,
-                    physical_start_hint: Some(11),
-                    object_id: None,
-                    first_parity_data_ordinal: None,
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
-                }],
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: 5,
-            }),
-            sealed_after_write: true,
-        };
+        let terminal_record = structured_terminal_checkpoint(&record);
         let mut journal_lease = journal
             .acquire_exclusive()
             .expect("acquire checkpoint journal");
+        let mut initial_finalization = terminal_record
+            .terminal_finalization
+            .clone()
+            .expect("structured terminal completion");
+        initial_finalization.progress =
+            crate::checkpoint::TerminalFinalizationProgress::BeforeReplicaA;
         journal_lease
-            .begin_terminal_transition()
-            .expect("begin terminal checkpoint transition");
+            .begin_terminal_finalization(&initial_finalization)
+            .expect("begin structured terminal checkpoint transition");
+        for (expected, next) in [
+            (
+                crate::checkpoint::TerminalFinalizationProgress::BeforeReplicaA,
+                crate::checkpoint::TerminalFinalizationProgress::AfterReplicaA,
+            ),
+            (
+                crate::checkpoint::TerminalFinalizationProgress::AfterReplicaA,
+                crate::checkpoint::TerminalFinalizationProgress::AfterSeparationAb,
+            ),
+            (
+                crate::checkpoint::TerminalFinalizationProgress::AfterSeparationAb,
+                crate::checkpoint::TerminalFinalizationProgress::AfterReplicaB,
+            ),
+            (
+                crate::checkpoint::TerminalFinalizationProgress::AfterReplicaB,
+                crate::checkpoint::TerminalFinalizationProgress::AfterSeparationBc,
+            ),
+            (
+                crate::checkpoint::TerminalFinalizationProgress::AfterSeparationBc,
+                crate::checkpoint::TerminalFinalizationProgress::AfterReplicaC,
+            ),
+        ] {
+            journal_lease
+                .advance_terminal_finalization(expected, next)
+                .expect("advance structured terminal component");
+        }
         journal_lease
-            .append_terminal_transition(std::slice::from_ref(&terminal_record))
+            .append_terminal_finalization(std::slice::from_ref(&terminal_record))
             .expect("fsync terminal checkpoint record");
         drop(journal_lease);
 
@@ -14865,7 +16611,7 @@ mod tests {
             .get_tape(&tape_uuid)
             .expect("query tape")
             .expect("checkpoint tape");
-        assert_eq!(tape.last_committed_tape_file, Some(3));
+        assert_eq!(tape.last_committed_tape_file, Some(2));
         assert_eq!(tape.total_committed_ordinals, 5);
         assert_eq!(
             tape.state, "sealed",
@@ -14891,9 +16637,8 @@ mod tests {
         // spans synthesised from the record's barrier-proved eod_lba must
         // equal the forward dead-reckoned layout. Structural layout of this
         // record: bootstrap [0,1) fm@1, object-1 [2,5) fm@5, object-2 [6,8)
-        // fm@8, checkpoint bootstrap [9,10) fm@10, checkpoint EOD 11,
-        // terminal bootstrap [11,12) fm@12, terminal EOD 13.
-        let spans: Vec<(i64, Option<i64>)> = {
+        // fm@8, checkpoint EOD 9. Terminal finalization begins there.
+        let spans: Vec<(u64, Option<u64>)> = {
             let mut stmt = index
                 .conn
                 .prepare(
@@ -14904,14 +16649,17 @@ mod tests {
                 .expect("prepare span query");
             let rows = stmt
                 .query_map(params![tape_uuid.to_vec()], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((
+                        row.get::<_, SqliteU64>(0)?.get(),
+                        row.get::<_, Option<SqliteU64>>(1)?.map(SqliteU64::get),
+                    ))
                 })
                 .expect("query spans");
             rows.collect::<Result<_, _>>().expect("collect spans")
         };
         assert_eq!(
             spans,
-            vec![(0, Some(0)), (1, Some(2)), (2, Some(6)), (3, Some(9))],
+            vec![(0, Some(0)), (1, Some(2)), (2, Some(6))],
             "checkpoint replay derives the forward layout backward from the barrier-proved EOD"
         );
         // The per-copy wire span, through the copy→tape-file join.
@@ -14934,7 +16682,7 @@ mod tests {
             .get_tape(&tape_uuid)
             .expect("query tape")
             .expect("tape row");
-        assert_eq!(tape.written_extent_lba, Some(13));
+        assert_eq!(tape.written_extent_lba, Some(terminal_record.eod_lba));
 
         index
             .retire_tape(RetireTapeInput {
@@ -15015,8 +16763,8 @@ mod tests {
         );
 
         // Checkpoint replay covering the same commit. Layout: bootstrap
-        // [0,1) fm@1, object [2,5) fm@5, checkpoint bootstrap [6,7) fm@7,
-        // eod 8. The synthesised spans must agree with the forward layout —
+        // [0,1) fm@1, object [2,5) fm@5, EOD 6. The synthesised spans must
+        // agree with the forward layout —
         // a divergent Some-vs-Some pair would raise a projection conflict.
         let object_projection = crate::checkpoint::CheckpointObjectProjection {
             object: append_object_projection("span-object"),
@@ -15026,12 +16774,12 @@ mod tests {
             block_count: 3,
             fresh_tape: true,
             total_committed_ordinals: 3,
-            bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+            object_recovery_row: crate::checkpoint::CheckpointObjectRecoveryRow {
                 tape_file_number: 1,
                 stored_block_count: 3,
                 object_id: b"span-object".to_vec(),
                 representation:
-                    crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                    crate::checkpoint::CheckpointObjectRecoveryRepresentation::Plaintext {
                         manifest_first_chunk_lba: 1,
                         manifest_size_bytes: 1,
                         manifest_chunk_count: 1,
@@ -15043,15 +16791,16 @@ mod tests {
             ordinal: 1,
             committed_object_count: 1,
             eod_partition: 0,
-            eod_lba: 8,
+            eod_lba: 6,
             tape_uuid,
             batch_id: [0x63; 16],
-            checkpoint_tape_file_number: 2,
+            next_tape_file_number: 2,
             block_size: 4096,
             objects: vec![object_projection],
             scheme: None,
             object_tape_file_bundles: Vec::new(),
-            checkpoint_bundle: None,
+            barrier_bundle: None,
+            terminal_finalization: None,
             sealed_after_write: false,
         };
         index
@@ -15063,16 +16812,16 @@ mod tests {
             .expect("query repaired copies");
         assert_eq!(copies[0].global_start_block, Some(2));
         assert_eq!(copies[0].global_end_block, Some(5));
-        let checkpoint_hint: Option<i64> = index
+        let checkpoint_file_count: u64 = index
             .conn
             .query_row(
-                "select physical_start_hint from tape_files
-                 where tape_uuid = ?1 and tape_file_number = 2",
-                params![tape_uuid.to_vec()],
+                "select count(*) from tape_files
+                 where tape_uuid = ?1 and tape_file_number = ?2",
+                params![tape_uuid.to_vec(), SqliteU64::new(2)],
                 |row| row.get(0),
             )
-            .expect("checkpoint bootstrap hint");
-        assert_eq!(checkpoint_hint, Some(6));
+            .expect("checkpoint tape-file count");
+        assert_eq!(checkpoint_file_count, 0);
 
         // A NEW build's live projection carries the same forward values, so
         // replaying the checkpoint on top of it is a clean no-op — the two
@@ -15128,7 +16877,7 @@ mod tests {
                     journal_offset_bytes: 0,
                 },
                 &CommittedBundle {
-                    kind: CommittedBundleKind::Control,
+                    kind: CommittedBundleKind::BotBootstrap,
                     entries: vec![TapeFileEntry {
                         tape_file_number: 0,
                         kind: TapeFileKind::Bootstrap,
@@ -15140,7 +16889,7 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -15149,9 +16898,8 @@ mod tests {
             .expect("project BOT bootstrap before the first parity checkpoint");
 
         // Physical layout: bootstrap [0,1) fm@1, object [2,6) fm@6, sidecar
-        // [7,9) fm@9, checkpoint bootstrap [10,11) fm@11. The barrier
-        // measured EOD 12 after that final filemark; the object rollup would
-        // say 4.
+        // [7,9) fm@9. The barrier measured EOD 10 after that final filemark;
+        // the object rollup would say 4.
         let object_bundle = CommittedBundle {
             kind: CommittedBundleKind::Object,
             entries: vec![TapeFileEntry {
@@ -15165,41 +16913,26 @@ mod tests {
                 protected_ordinal_start: None,
                 protected_ordinal_end_exclusive: None,
                 canonical_metadata_hash: None,
-                bootstrap_object_row: None,
+                object_recovery_row: None,
             }],
             highest_protected_ordinal: 0,
             total_committed_ordinals: 4,
         };
-        let checkpoint_bundle = CommittedBundle {
-            kind: CommittedBundleKind::Control,
-            entries: vec![
-                TapeFileEntry {
-                    tape_file_number: 2,
-                    kind: TapeFileKind::ParitySidecar,
-                    block_count: 2,
-                    physical_start_hint: Some(7),
-                    object_id: None,
-                    first_parity_data_ordinal: None,
-                    epoch_id: Some(0),
-                    protected_ordinal_start: Some(0),
-                    protected_ordinal_end_exclusive: Some(4),
-                    canonical_metadata_hash: Some([0x66; 32]),
-                    bootstrap_object_row: None,
-                },
-                TapeFileEntry {
-                    tape_file_number: 3,
-                    kind: TapeFileKind::Bootstrap,
-                    block_count: 1,
-                    physical_start_hint: Some(10),
-                    object_id: None,
-                    first_parity_data_ordinal: None,
-                    epoch_id: None,
-                    protected_ordinal_start: None,
-                    protected_ordinal_end_exclusive: None,
-                    canonical_metadata_hash: None,
-                    bootstrap_object_row: None,
-                },
-            ],
+        let barrier_bundle = CommittedBundle {
+            kind: CommittedBundleKind::CheckpointSidecars,
+            entries: vec![TapeFileEntry {
+                tape_file_number: 2,
+                kind: TapeFileKind::ParitySidecar,
+                block_count: 2,
+                physical_start_hint: Some(7),
+                object_id: None,
+                first_parity_data_ordinal: None,
+                epoch_id: Some(0),
+                protected_ordinal_start: Some(0),
+                protected_ordinal_end_exclusive: Some(4),
+                canonical_metadata_hash: Some([0x66; 32]),
+                object_recovery_row: None,
+            }],
             highest_protected_ordinal: 4,
             total_committed_ordinals: 4,
         };
@@ -15207,10 +16940,10 @@ mod tests {
             ordinal: 1,
             committed_object_count: 1,
             eod_partition: 0,
-            eod_lba: 12,
+            eod_lba: 10,
             tape_uuid,
             batch_id: [0x64; 16],
-            checkpoint_tape_file_number: 3,
+            next_tape_file_number: 3,
             block_size: 4096,
             objects: vec![crate::checkpoint::CheckpointObjectProjection {
                 object: append_object_projection("extent-object"),
@@ -15224,12 +16957,12 @@ mod tests {
                 block_count: 4,
                 fresh_tape: true,
                 total_committed_ordinals: 4,
-                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                object_recovery_row: crate::checkpoint::CheckpointObjectRecoveryRow {
                     tape_file_number: 1,
                     stored_block_count: 4,
                     object_id: b"extent-object".to_vec(),
                     representation:
-                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                        crate::checkpoint::CheckpointObjectRecoveryRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
                             manifest_size_bytes: 1,
                             manifest_chunk_count: 1,
@@ -15239,22 +16972,21 @@ mod tests {
             }],
             scheme: Some(scheme),
             object_tape_file_bundles: vec![object_bundle],
-            checkpoint_bundle: Some(checkpoint_bundle),
+            barrier_bundle: Some(barrier_bundle),
+            terminal_finalization: None,
             sealed_after_write: false,
         };
         index
             .project_checkpoint_record(&record)
             .expect("project parity checkpoint record");
 
-        let object_rollup: i64 = index
-            .conn
-            .query_row(
-                "select sum(block_count) from tape_files
-                 where tape_uuid = ?1 and kind = 'object'",
-                params![tape_uuid.to_vec()],
-                |row| row.get(0),
-            )
-            .expect("object rollup");
+        let object_rollup = index
+            .list_tape_files(&tape_uuid)
+            .expect("list tape files")
+            .into_iter()
+            .filter(|entry| entry.kind == "object")
+            .try_fold(0_u64, |total, entry| total.checked_add(entry.block_count))
+            .expect("object rollup does not overflow");
         assert_eq!(object_rollup, 4);
         let tape = index
             .get_tape(&tape_uuid)
@@ -15262,12 +16994,12 @@ mod tests {
             .expect("tape row");
         assert_eq!(
             tape.written_extent_lba,
-            Some(12),
+            Some(10),
             "the extent is the barrier-proved measurement"
         );
         assert_ne!(
             tape.written_extent_lba,
-            Some(object_rollup as u64),
+            Some(object_rollup),
             "an object-commit rollup would understate the extent past trailing \
              sidecars and checkpoint files"
         );
@@ -15283,7 +17015,7 @@ mod tests {
                 .expect("query tape")
                 .expect("tape row")
                 .written_extent_lba,
-            Some(12)
+            Some(10)
         );
     }
 
@@ -15318,7 +17050,7 @@ mod tests {
             eod_lba: 8,
             tape_uuid,
             batch_id: [0x62; 16],
-            checkpoint_tape_file_number: 4,
+            next_tape_file_number: 4,
             block_size: 256 * 1024,
             objects: vec![crate::checkpoint::CheckpointObjectProjection {
                 object,
@@ -15328,12 +17060,12 @@ mod tests {
                 block_count: 2,
                 fresh_tape: false,
                 total_committed_ordinals: 2,
-                bootstrap_object_row: crate::checkpoint::CheckpointBootstrapObjectRow {
+                object_recovery_row: crate::checkpoint::CheckpointObjectRecoveryRow {
                     tape_file_number: 3,
                     stored_block_count: 2,
                     object_id: object_uuid.to_string().into_bytes(),
                     representation:
-                        crate::checkpoint::CheckpointBootstrapObjectRepresentation::Plaintext {
+                        crate::checkpoint::CheckpointObjectRecoveryRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
                             manifest_size_bytes: 1,
                             manifest_chunk_count: 1,
@@ -15343,7 +17075,8 @@ mod tests {
             }],
             scheme: None,
             object_tape_file_bundles: Vec::new(),
-            checkpoint_bundle: None,
+            barrier_bundle: None,
+            terminal_finalization: None,
             sealed_after_write: false,
         };
 
@@ -15449,8 +17182,8 @@ mod tests {
             .conn
             .execute(
                 "insert into tape_files(tape_uuid, tape_file_number, kind, block_count)
-                 values(?1, 0, 'bootstrap', 1)",
-                params![tape_uuid.to_vec()],
+                 values(?1, ?2, 'bootstrap', ?3)",
+                params![tape_uuid.to_vec(), SqliteU64::ZERO, SqliteU64::new(1)],
             )
             .expect("seed stale overlapping tape-file row");
 
@@ -15707,7 +17440,7 @@ mod tests {
     }
 
     #[test]
-    fn combined_native_object_and_bundle_projection_rolls_back_on_bundle_error() {
+    fn combined_native_object_and_bundle_projection_accepts_u64_max_block_count() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -15721,7 +17454,7 @@ mod tests {
             stripes_per_neighborhood: 3,
         };
         let object_id = "object-atomic";
-        let err = index
+        let report = index
             .project_native_object_and_committed_tape_file_bundle(
                 NativeObjectProjectionInput {
                     object_id: object_id.to_string(),
@@ -15732,14 +17465,24 @@ mod tests {
                     metadata_hash: Some(vec![2u8; 32]),
                     created_at_utc: Some("2026-05-28T10:00:00Z".to_string()),
                 },
-                &[],
+                &[NativeObjectFileProjectionInput {
+                    object_id: object_id.to_string(),
+                    file_id: "file-max".to_string(),
+                    path: "max.bin".to_string(),
+                    size_bytes: u64::MAX,
+                    file_sha256: vec![0x31; 32],
+                    first_chunk_lba: Some(u64::MAX),
+                    chunk_count: u64::MAX,
+                    mtime: None,
+                    executable: None,
+                }],
                 &[NativeObjectCopyProjectionInput {
                     object_id: object_id.to_string(),
                     tape_uuid,
-                    tape_file_number: 1,
-                    first_body_lba: 5,
-                    first_parity_data_ordinal: Some(0),
-                    protected_until_ordinal: Some(3),
+                    tape_file_number: u64::MAX,
+                    first_body_lba: u64::MAX,
+                    first_parity_data_ordinal: Some(u64::MAX),
+                    protected_until_ordinal: Some(u64::MAX),
                     status: "committed".to_string(),
                     representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
                     recipient_epoch_ids: None,
@@ -15756,48 +17499,46 @@ mod tests {
                 &CommittedBundle {
                     kind: CommittedBundleKind::Object,
                     entries: vec![TapeFileEntry {
-                        tape_file_number: 1,
+                        tape_file_number: u64::MAX,
                         kind: TapeFileKind::Object,
                         block_count: u64::MAX,
-                        physical_start_hint: Some(0),
+                        physical_start_hint: None,
                         object_id: Some(object_id.to_string()),
-                        first_parity_data_ordinal: Some(0),
+                        first_parity_data_ordinal: Some(u64::MAX),
                         epoch_id: None,
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
-                    highest_protected_ordinal: 3,
-                    total_committed_ordinals: 3,
+                    highest_protected_ordinal: u64::MAX,
+                    total_committed_ordinals: u64::MAX,
                 },
             )
-            .expect_err("bad bundle input must abort combined projection");
+            .expect("full-width bundle projection");
 
-        assert!(matches!(err, StateError::IndexMigrationFailed(_)), "{err}");
+        assert_eq!(report.tape_files_rebuilt, 1);
         assert!(index
             .get_native_object(object_id)
             .expect("query native object")
-            .is_none());
-        assert!(index
+            .is_some());
+        let copies = index
             .find_native_object_copies(object_id)
-            .expect("query native object copies")
-            .is_empty());
+            .expect("query native object copies");
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].tape_file_number, u64::MAX);
+        assert_eq!(copies[0].first_body_lba, u64::MAX);
+        assert_eq!(copies[0].first_parity_data_ordinal, Some(u64::MAX));
+        assert_eq!(copies[0].protected_until_ordinal, Some(u64::MAX));
+        let files = index
+            .list_native_object_files(object_id)
+            .expect("list native object files");
+        assert_eq!(files[0].size_bytes, u64::MAX);
+        assert_eq!(files[0].first_chunk_lba, Some(u64::MAX));
+        assert_eq!(files[0].chunk_count, u64::MAX);
         assert_eq!(
-            index
-                .conn
-                .query_row("select count(*) from tape_files", [], |row| {
-                    row.get::<_, u64>(0)
-                })
-                .expect("tape file count"),
-            0
-        );
-        assert_eq!(
-            index
-                .conn
-                .query_row("select count(*) from tapes", [], |row| row.get::<_, u64>(0))
-                .expect("tape count"),
-            0
+            index.list_tape_files(&tape_uuid).expect("list tape files")[0].block_count,
+            u64::MAX
         );
     }
 
@@ -16123,7 +17864,7 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 31,
                     total_committed_ordinals: 4,
@@ -16165,7 +17906,7 @@ mod tests {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, SqliteU64>(2)?,
                         row.get::<_, Vec<u8>>(3)?,
                         row.get::<_, Vec<u8>>(4)?,
                     ))
@@ -16177,7 +17918,7 @@ mod tests {
             serde_json::from_str::<Vec<String>>(&stored_recipient_epoch_ids).unwrap(),
             recipient_epoch_ids
         );
-        assert_eq!(metadata_frame_len, 66);
+        assert_eq!(metadata_frame_len.get(), 66);
         assert_eq!(plaintext_digest, vec![0x44; 32]);
         assert_eq!(stored_digest, vec![0x55; 32]);
     }
@@ -16200,7 +17941,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_entry_without_bootstrap_row_projects_unknown_representation() {
+    fn journal_entry_without_recovery_row_projects_unknown_representation() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -16229,14 +17970,14 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 26,
                     total_committed_ordinals: 26,
                     orphaned_bundles: Vec::new(),
                 },
             )
-            .expect("index journal without bootstrap object row");
+            .expect("index journal without object recovery row");
 
         let copies = index
             .find_native_object_copies(object_id)
@@ -16248,7 +17989,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_bootstrap_object_row_projects_encrypted_copy_fields() {
+    fn journal_object_recovery_row_projects_encrypted_copy_fields() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index")
             .tempdir()
@@ -16278,8 +18019,8 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: Some(
-                            BootstrapObjectRow::encrypted(
+                        object_recovery_row: Some(
+                            ObjectRecoveryRow::encrypted(
                                 5,
                                 9,
                                 recipient_epoch_ids.clone(),
@@ -16294,7 +18035,7 @@ mod tests {
                     orphaned_bundles: Vec::new(),
                 },
             )
-            .expect("index journal with encrypted bootstrap object row");
+            .expect("index journal with encrypted object recovery row");
 
         let copies = index
             .find_native_object_copies(object_id)
@@ -17388,5 +19129,362 @@ mod tests {
                 .expect("idempotency row"),
             (vec![1], first_operation_id.to_string())
         );
+    }
+
+    #[test]
+    fn assignment_generation_is_monotonic_and_finalization_fences_changes() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-assignment-generation")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0xA5; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMNA05L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .upsert_tape_pool_projection(pool_projection("pool-a"))
+            .expect("project pool A");
+        index
+            .upsert_tape_pool_projection(pool_projection("pool-b"))
+            .expect("project pool B");
+
+        let initial = index
+            .get_tape_assignment_snapshot(&tape_uuid)
+            .expect("initial assignment snapshot")
+            .expect("known tape");
+        assert_eq!(initial.pool_id, None);
+        assert_eq!(initial.assignment_generation, 0);
+
+        let assigned = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 0, Some("pool-a"))
+            .expect("assign pool A");
+        assert_eq!(assigned.pool_id.as_deref(), Some("pool-a"));
+        assert_eq!(assigned.assignment_generation, 1);
+
+        let repeated = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 1, Some("pool-a"))
+            .expect("repeat identical assignment");
+        assert_eq!(repeated.assignment_generation, 1);
+        let stale = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 0, Some("pool-b"))
+            .expect_err("stale generation must fail");
+        assert!(
+            matches!(stale, StateError::TapePoolAssignmentConflict(_)),
+            "{stale}"
+        );
+
+        let cleared = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 1, None)
+            .expect("clear assignment");
+        assert_eq!(cleared.pool_id, None);
+        assert_eq!(cleared.assignment_generation, 2);
+        let reassigned = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 2, Some("pool-b"))
+            .expect("assign pool B");
+        assert_eq!(reassigned.assignment_generation, 3);
+
+        index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::BeforeReplicaA,
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect("start terminal finalization");
+        let fenced = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 3, None)
+            .expect_err("finalizing tape assignment must be frozen");
+        assert!(
+            matches!(fenced, StateError::TapePoolAssignmentConflict(_)),
+            "{fenced}"
+        );
+    }
+
+    #[test]
+    fn terminal_finalization_projection_is_monotonic_and_survives_rebuild() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-terminal-finalization")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0xF1; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMNF01L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, "final-pool")
+            .expect("seed assignment generation");
+
+        let progress = [
+            TerminalFinalizationProgress::BeforeReplicaA,
+            TerminalFinalizationProgress::AfterReplicaA,
+            TerminalFinalizationProgress::AfterSeparationAb,
+            TerminalFinalizationProgress::AfterReplicaB,
+            TerminalFinalizationProgress::AfterSeparationBc,
+            TerminalFinalizationProgress::AfterReplicaC,
+        ];
+        let first = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                progress[0],
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect("project initial terminal state");
+        assert_eq!(first.state, "finalizing");
+        assert_eq!(
+            first
+                .terminal_finalization
+                .as_ref()
+                .expect("terminal projection")
+                .completed_replicas,
+            0
+        );
+
+        let skipped = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                progress[2],
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect_err("skipped progress must fail");
+        assert!(matches!(skipped, StateError::JournalReplayFailed(_)));
+
+        for (index_in_sequence, next) in progress.iter().copied().enumerate().skip(1) {
+            let outcome = if next == TerminalFinalizationProgress::AfterReplicaC {
+                TerminalFinalizationOutcome::Finalized
+            } else {
+                TerminalFinalizationOutcome::InProgress
+            };
+            let tape = index
+                .project_terminal_finalization(terminal_projection(tape_uuid, next, outcome))
+                .expect("advance terminal progress");
+            let projected = tape.terminal_finalization.expect("terminal projection");
+            assert_eq!(projected.progress, next);
+            assert_eq!(projected.completed_replicas, next.completed_replicas());
+            if index_in_sequence == progress.len() - 1 {
+                assert_eq!(tape.state, "sealed");
+                assert_eq!(projected.outcome, TerminalFinalizationOutcome::Finalized);
+            }
+        }
+
+        let regressed = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::AfterReplicaB,
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect_err("terminal progress must not regress");
+        assert!(matches!(regressed, StateError::JournalReplayFailed(_)));
+
+        index
+            .rebuild_from_authoritative_sources(&[], &[])
+            .expect("rebuild preserved terminal projection");
+        let rebuilt = index
+            .get_tape(&tape_uuid)
+            .expect("read rebuilt tape")
+            .expect("preserved tape");
+        assert_eq!(rebuilt.assignment_generation, 1);
+        assert_eq!(rebuilt.pool_id.as_deref(), Some("final-pool"));
+        assert_eq!(rebuilt.state, "sealed");
+        let projected = rebuilt
+            .terminal_finalization
+            .expect("preserved terminal projection");
+        assert_eq!(
+            projected.progress,
+            TerminalFinalizationProgress::AfterReplicaC
+        );
+        assert_eq!(projected.completed_replicas, 3);
+        assert_eq!(projected.edition_digest, [0xED; 32]);
+        assert_eq!(projected.layout_digest, [0x1A; 32]);
+        assert_eq!(projected.outcome, TerminalFinalizationOutcome::Finalized);
+    }
+
+    #[test]
+    fn degraded_terminal_projection_requires_one_or_two_replicas_and_is_terminal() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-terminal-degraded")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0xD1; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMND01L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+
+        let zero = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::BeforeReplicaA,
+                TerminalFinalizationOutcome::FinalizedDegraded,
+            ))
+            .expect_err("zero-replica degraded state must fail");
+        assert!(matches!(zero, StateError::JournalReplayFailed(_)));
+
+        let degraded = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::AfterReplicaA,
+                TerminalFinalizationOutcome::FinalizedDegraded,
+            ))
+            .expect("one complete replica may be final degraded");
+        assert_eq!(degraded.state, "finalized_degraded");
+        let projection = degraded.terminal_finalization.expect("terminal projection");
+        assert_eq!(projection.completed_replicas, 1);
+        assert_eq!(
+            projection.outcome,
+            TerminalFinalizationOutcome::FinalizedDegraded
+        );
+
+        let resumed = index
+            .project_terminal_finalization(terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::AfterSeparationAb,
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect_err("final-degraded WORM state must not resume");
+        assert!(matches!(resumed, StateError::JournalReplayFailed(_)));
+
+        let complete_as_degraded = validate_terminal_finalization_input(&terminal_projection(
+            [0xD2; 16],
+            TerminalFinalizationProgress::AfterReplicaC,
+            TerminalFinalizationOutcome::FinalizedDegraded,
+        ))
+        .expect_err("three complete replicas are ordinary finalized state");
+        assert!(matches!(
+            complete_as_degraded,
+            StateError::JournalReplayFailed(_)
+        ));
+    }
+
+    #[test]
+    fn idempotency_scope_returns_original_operation_and_separates_kinds() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-idempotency-scope")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let key = Uuid::from_u128(0x1D3A);
+        let original_operation = Uuid::from_u128(0x0A);
+        let duplicate_operation = Uuid::from_u128(0x0B);
+
+        let first = index
+            .register_idempotency_request(
+                "user:alice",
+                "close_out",
+                key,
+                [0x11; 32],
+                original_operation,
+                Some("2026-08-09T01:00:00Z"),
+            )
+            .expect("register original request");
+        assert_eq!(
+            first,
+            IdempotencyRegistration {
+                operation_id: original_operation,
+                newly_registered: true,
+            }
+        );
+
+        let duplicate = index
+            .register_idempotency_request(
+                "user:alice",
+                "close_out",
+                key,
+                [0x11; 32],
+                duplicate_operation,
+                Some("2026-08-09T01:01:00Z"),
+            )
+            .expect("repeat identical request");
+        assert_eq!(duplicate.operation_id, original_operation);
+        assert!(!duplicate.newly_registered);
+        let exact = index
+            .idempotency_scope_record("user:alice", "close_out", key)
+            .expect("read exact idempotency scope")
+            .expect("scope exists");
+        assert_eq!(exact.actor_fingerprint, "user:alice");
+        assert_eq!(exact.operation_kind, "close_out");
+        assert_eq!(exact.idempotency_key, key);
+        assert_eq!(exact.request_fingerprint, vec![0x11; 32]);
+        assert_eq!(exact.operation_id, original_operation);
+        assert_eq!(exact.terminal_state, None);
+        assert_eq!(exact.response_fingerprint, None);
+        assert_eq!(exact.updated_at_utc, "2026-08-09T01:00:00Z");
+        assert_eq!(
+            index
+                .idempotency_scope_record("user:alice", "missing", key)
+                .expect("read missing exact scope"),
+            None
+        );
+
+        let conflict = index
+            .register_idempotency_request(
+                "user:alice",
+                "close_out",
+                key,
+                [0x22; 32],
+                duplicate_operation,
+                None,
+            )
+            .expect_err("changed request fingerprint must conflict");
+        assert!(matches!(conflict, StateError::IdempotencyConflict(_)));
+
+        let other_kind = index
+            .register_idempotency_request(
+                "user:alice",
+                "retire",
+                key,
+                [0x22; 32],
+                duplicate_operation,
+                None,
+            )
+            .expect("same key under another kind is independent");
+        assert_eq!(other_kind.operation_id, duplicate_operation);
+        assert!(other_kind.newly_registered);
+        let other_actor = index
+            .register_idempotency_request(
+                "user:bob",
+                "close_out",
+                key,
+                [0x33; 32],
+                Uuid::from_u128(0x0C),
+                None,
+            )
+            .expect("same kind and key under another actor is independent");
+        assert!(other_actor.newly_registered);
+
+        let stored_operation: String = index
+            .conn
+            .query_row(
+                "select operation_id from idempotency_keys
+                 where actor_fingerprint = 'user:alice'
+                   and operation_kind = 'close_out'
+                   and idempotency_key = ?1",
+                params![key.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read original idempotency binding");
+        assert_eq!(stored_operation, original_operation.to_string());
+        let ambiguous = index
+            .idempotency_terminal_state("user:alice", key)
+            .expect_err("actor/key-only compatibility lookup must fail closed");
+        assert!(matches!(ambiguous, StateError::AmbiguousCatalogLookup(_)));
     }
 }

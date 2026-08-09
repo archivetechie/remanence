@@ -20,7 +20,7 @@ use remanence_api::{
     read_core::{read_object_payload, CapturePayloadSink},
     select_tape_in_pool_for_write_session, verify_tape_identity,
     write_to_selected_tape_checkpointed, PoolWriteObjectRecord, PoolWriteRepresentation,
-    PoolWriteResult, TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
+    PoolWriteResources, PoolWriteResult, TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -268,6 +268,13 @@ pub fn run_archive_write(
     };
 
     let parity_journal_path = state_handle.journal_path(selected.tape_uuid);
+    let resources = match PoolWriteResources::new(state_handle.config().daemon.io_memory_ceiling) {
+        Ok(resources) => resources,
+        Err(error) => {
+            let _ = writeln!(err, "error: configure write resources: {error}");
+            return ExitCode::from(1);
+        }
+    };
     let result = {
         let mut sink = DriveHandleSink(&mut drive);
         write_to_selected_tape_checkpointed(
@@ -278,6 +285,7 @@ pub fn run_archive_write(
             selected,
             &checkpoint_journal_dir,
             &parity_journal_path,
+            &resources,
         )
     };
 
@@ -409,8 +417,8 @@ fn print_locator_json_with_recipients(
     // §4: single compact line on stdout — no pretty-printing.
     let json = serde_json::json!({
         "tape_uuid": tape_uuid_hex.as_str(),
-        "tape_file_number": copy.tape_file_number,
-        "first_body_lba": copy.first_body_lba,
+        "tape_file_number": copy.tape_file_number.to_string(),
+        "first_body_lba": copy.first_body_lba.to_string(),
         "object_id": object_id,
         "caller_object_id": object.caller_object_id,
         "content_sha256": content_sha256_hex,
@@ -421,13 +429,13 @@ fn print_locator_json_with_recipients(
         "format_version": (copy.representation == OBJECT_COPY_REPRESENTATION_ENCRYPTED)
             .then_some(2),
         "recipient_epochs": recipient_epochs,
-        "metadata_frame_len": copy.metadata_frame_len,
+        "metadata_frame_len": copy.metadata_frame_len.map(|value| value.to_string()),
         "append_commit_info": {
             "append_mode": append_mode,
             "tape_uuid": tape_uuid_hex.as_str(),
             "voltag": serde_json::Value::Null,
-            "tape_file_number": copy.tape_file_number,
-            "first_body_lba": copy.first_body_lba,
+            "tape_file_number": copy.tape_file_number.to_string(),
+            "first_body_lba": copy.first_body_lba.to_string(),
             "position_before_lba": serde_json::Value::Null,
             "position_after_lba": serde_json::Value::Null,
             "journal_record_ordinal": serde_json::Value::Null,
@@ -500,7 +508,9 @@ fn print_locator_human(object: &PoolWriteObjectRecord, pool_id: &str, out: &mut 
 #[derive(serde::Deserialize)]
 pub struct ObjectLocator {
     pub tape_uuid: String,
-    pub tape_file_number: u32,
+    #[serde(deserialize_with = "deserialize_decimal_u64")]
+    pub tape_file_number: u64,
+    #[serde(deserialize_with = "deserialize_decimal_u64")]
     pub first_body_lba: u64,
     pub object_id: String,
     pub caller_object_id: Option<String>,
@@ -509,11 +519,43 @@ pub struct ObjectLocator {
     pub body_format: Option<String>,
 }
 
+fn deserialize_decimal_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) {
+        return Err(serde::de::Error::custom(
+            "unsigned 64-bit structural values must be canonical decimal strings",
+        ));
+    }
+    value.parse::<u64>().map_err(serde::de::Error::custom)
+}
+
+fn serialize_decimal_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(value.to_string().as_str())
+}
+
+fn serialize_optional_decimal_u64<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_some(value.to_string().as_str()),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Locator decoded into rem's byte-typed identity fields.
 pub(crate) struct DecodedLocator {
     pub(crate) tape_uuid: TapeUuid,
     pub(crate) object_id: String,
-    tape_file_number: u32,
+    tape_file_number: u64,
     first_body_lba: u64,
     content_sha256: [u8; 32],
 }
@@ -933,10 +975,18 @@ fn stream_tape_object<W: Write + Send>(
             })?;
             let opened = {
                 let mut source = DriveHandleSource(&mut mounted.drive);
-                if let Err(error) = source.space(
-                    i64::from(mounted.loc.tape_file_number),
-                    remanence_library::SpaceKind::Filemarks,
-                ) {
+                let tape_file_count =
+                    i64::try_from(mounted.loc.tape_file_number).map_err(|_| {
+                        let _ = writeln!(
+                            err,
+                            "error: tape file number {} exceeds the drive SPACE command range",
+                            mounted.loc.tape_file_number
+                        );
+                        ExitCode::from(1)
+                    })?;
+                if let Err(error) =
+                    source.space(tape_file_count, remanence_library::SpaceKind::Filemarks)
+                {
                     let _ = writeln!(err, "error: space to object tape file: {error}");
                     return Err(ExitCode::from(1));
                 }
@@ -1006,10 +1056,15 @@ fn stream_stored_tape_object<W: Write>(
     let mut mounted = mount_tape_object(report, target, allow, allow_derived, err)?;
     let (bytes_written, object_sha256) = {
         let mut source = DriveHandleSource(&mut mounted.drive);
-        if let Err(error) = source.space(
-            i64::from(mounted.loc.tape_file_number),
-            SpaceKind::Filemarks,
-        ) {
+        let tape_file_count = i64::try_from(mounted.loc.tape_file_number).map_err(|_| {
+            let _ = writeln!(
+                err,
+                "error: tape file number {} exceeds the drive SPACE command range",
+                mounted.loc.tape_file_number
+            );
+            ExitCode::from(1)
+        })?;
+        if let Err(error) = source.space(tape_file_count, SpaceKind::Filemarks) {
             let _ = writeln!(err, "error: space to object tape file: {error}");
             return Err(ExitCode::from(1));
         }
@@ -1324,13 +1379,16 @@ pub struct ArchiveListArgs {
 #[derive(serde::Serialize)]
 struct CatalogObjectRecord {
     tape_uuid: String,
-    tape_file_number: u32,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    tape_file_number: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     first_body_lba: u64,
     object_id: String,
     caller_object_id: Option<String>,
     content_sha256: String,
     pool_id: Option<String>,
     body_format: Option<String>,
+    #[serde(serialize_with = "serialize_optional_decimal_u64")]
     size_bytes: Option<u64>,
     status: String,
 }
@@ -1510,8 +1568,8 @@ mod tests {
     fn decode_locator_parses_and_validates() {
         let raw = r#"{
             "tape_uuid":"000102030405060708090a0b0c0d0e0f",
-            "tape_file_number":1,
-            "first_body_lba":1,
+            "tape_file_number":"1",
+            "first_body_lba":"1",
             "object_id":"11111111-1111-1111-1111-111111111111",
             "caller_object_id":"c-1",
             "content_sha256":"0000000000000000000000000000000000000000000000000000000000000000",
@@ -1528,6 +1586,33 @@ mod tests {
         assert_eq!(loc.object_id, "11111111-1111-1111-1111-111111111111");
         assert_eq!(loc.content_sha256, [0u8; 32]);
 
+        let above_u32 = u64::from(u32::MAX) + 17;
+        let high = raw.replace(
+            "\"tape_file_number\":\"1\"",
+            &format!("\"tape_file_number\":\"{above_u32}\""),
+        );
+        assert_eq!(
+            super::decode_locator(&high)
+                .expect("u64 tape-file locator decodes")
+                .tape_file_number,
+            above_u32
+        );
+
+        let numeric = raw.replace("\"tape_file_number\":\"1\"", "\"tape_file_number\":1");
+        assert!(super::decode_locator(&numeric).is_err());
+        let noncanonical = raw.replace("\"tape_file_number\":\"1\"", "\"tape_file_number\":\"01\"");
+        assert!(super::decode_locator(&noncanonical).is_err());
+        let maximum = raw.replace(
+            "\"tape_file_number\":\"1\"",
+            "\"tape_file_number\":\"18446744073709551615\"",
+        );
+        assert_eq!(
+            super::decode_locator(&maximum)
+                .expect("u64::MAX tape-file locator decodes")
+                .tape_file_number,
+            u64::MAX
+        );
+
         let bad = raw.replace("000102030405060708090a0b0c0d0e0f", "00ff");
         assert!(super::decode_locator(&bad).is_err());
         assert!(super::decode_locator("{ not json").is_err());
@@ -1535,7 +1620,7 @@ mod tests {
 
     fn decoded(
         object_id: &str,
-        tape_file_number: u32,
+        tape_file_number: u64,
         first_body_lba: u64,
     ) -> super::DecodedLocator {
         super::DecodedLocator {
@@ -1547,7 +1632,7 @@ mod tests {
         }
     }
 
-    fn copy(object_id: &str, tape_file_number: u32, first_body_lba: u64) -> NativeObjectCopyRecord {
+    fn copy(object_id: &str, tape_file_number: u64, first_body_lba: u64) -> NativeObjectCopyRecord {
         NativeObjectCopyRecord {
             object_id: object_id.to_string(),
             tape_uuid: vec![7u8; 16],
@@ -1569,7 +1654,7 @@ mod tests {
         }
     }
 
-    fn obj_tape_file(object_id: &str, tape_file_number: u32, block_count: u64) -> TapeFileRecord {
+    fn obj_tape_file(object_id: &str, tape_file_number: u64, block_count: u64) -> TapeFileRecord {
         TapeFileRecord {
             tape_uuid: vec![7u8; 16],
             tape_file_number,
@@ -1825,8 +1910,8 @@ mod tests {
 
         // Check values.
         assert_eq!(parsed["caller_object_id"].as_str().unwrap(), "caller-123");
-        assert_eq!(parsed["tape_file_number"].as_u64().unwrap(), 1);
-        assert_eq!(parsed["first_body_lba"].as_u64().unwrap(), 2);
+        assert_eq!(parsed["tape_file_number"].as_str().unwrap(), "1");
+        assert_eq!(parsed["first_body_lba"].as_str().unwrap(), "2");
         assert_eq!(parsed["pool_id"].as_str().unwrap(), "scenario-a");
         assert_eq!(parsed["body_format"].as_str().unwrap(), "rem-object-v1");
         assert_eq!(parsed["representation"].as_str().unwrap(), "plaintext");
@@ -1836,8 +1921,8 @@ mod tests {
         assert!(parsed["metadata_frame_len"].is_null());
         let append_info = parsed["append_commit_info"].as_object().unwrap();
         assert_eq!(append_info["append_mode"].as_str().unwrap(), "fresh");
-        assert_eq!(append_info["tape_file_number"].as_u64().unwrap(), 1);
-        assert_eq!(append_info["first_body_lba"].as_u64().unwrap(), 2);
+        assert_eq!(append_info["tape_file_number"].as_str().unwrap(), "1");
+        assert_eq!(append_info["first_body_lba"].as_str().unwrap(), "2");
         assert!(append_info["position_before_lba"].is_null());
         assert!(append_info["position_after_lba"].is_null());
         assert!(append_info["journal_record_ordinal"].is_null());
@@ -1860,5 +1945,45 @@ mod tests {
         // object_id must be a valid UUID string.
         Uuid::parse_str(parsed["object_id"].as_str().unwrap())
             .expect("object_id must be a valid UUID string");
+    }
+
+    #[test]
+    fn json_locator_preserves_structural_u64_max_as_decimal_text() {
+        let structural_max = u64::MAX;
+        let object = PoolWriteObjectRecord {
+            object_id: *Uuid::from_u128(1).as_bytes(),
+            caller_object_id: "u64-locator".to_string(),
+            content_sha256: [0xabu8; 32],
+            logical_size_bytes: 1,
+            body_format: "rem-object-v1".to_string(),
+            created_at_utc: "2026-08-09T00:00:00Z".to_string(),
+            copies: vec![PoolWriteObjectCopyRecord {
+                tape_uuid: *Uuid::from_u128(2).as_bytes(),
+                tape_file_number: structural_max,
+                first_body_lba: structural_max,
+                pool_id: "scenario-a".to_string(),
+                representation: OBJECT_COPY_REPRESENTATION_PLAINTEXT.to_string(),
+                recipient_epoch_ids: None,
+                metadata_frame_len: None,
+                plaintext_digest: Some([0x31; 32]),
+                stored_digest: Some([0x32; 32]),
+            }],
+        };
+
+        let mut out = Vec::new();
+        super::print_locator_json(&object, "scenario-a", &mut out);
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("locator JSON parses");
+        assert_eq!(
+            parsed["tape_file_number"].as_str(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(
+            parsed["first_body_lba"].as_str(),
+            Some("18446744073709551615")
+        );
+        assert_eq!(
+            parsed["append_commit_info"]["tape_file_number"].as_str(),
+            Some("18446744073709551615")
+        );
     }
 }

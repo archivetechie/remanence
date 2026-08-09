@@ -167,11 +167,16 @@ Pool writes fail closed on a set of preconditions. The common refusals:
 - `write session poisoned by a failed append; abort the session and open
   a new one` — the session-level poison: the first failed `AppendObject`
   in a write session poisons it permanently, so a retry cannot silently
-  start writing a fresh mid-tape bootstrap. There is no way to clear this
+  continue writing at an uncertain physical position. There is no way to clear this
   short of closing the session and opening a new one. This is separate
   from (and stricter than) the per-transfer staging-ring poison, which is
   scoped to discarding the rest of one already-failing `AppendObject`
   call rather than the whole session.
+- `terminal finalization requires recovery` — finalization crossed its first
+  durable boundary and then failed. Object admission is permanently disabled;
+  recovery may write only the missing terminal control components from the
+  proved progress position. Do not open a new Object-writing session for that
+  cartridge.
 - `staging ring accounting imbalance` — an internal invariant violation
   in the pipelined write path (allocated/returned buffer counts don't
   match at transfer end); treat as a bug report, not an operator action.

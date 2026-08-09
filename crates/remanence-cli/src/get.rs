@@ -225,7 +225,7 @@ async fn get(
             "object_id": object_uuid,
             "caller_object_id": record.caller_object_id,
             "tape_uuid": format_uuid(&copy.tape_uuid),
-            "tape_file_number": copy.tape_file_number,
+            "tape_file_number": copy.tape_file_number.to_string(),
             "pool_id": copy.pool_id,
             "dest": args.dest.display().to_string(),
             "digest_verified": true,
@@ -233,7 +233,7 @@ async fn get(
                 serde_json::json!({
                     "archive_path": member.archive_path,
                     "restored_to": member.dest_path.display().to_string(),
-                    "size_bytes": member.size_bytes,
+                    "size_bytes": member.size_bytes.to_string(),
                     "sha256": member.sha256,
                 })
             }).collect::<Vec<_>>(),
@@ -677,6 +677,23 @@ mod tests {
         ) -> Result<Response<pb::Tape>, Status> {
             Err(Status::unimplemented("not needed"))
         }
+        type GetTapeInventoryStream = Pin<
+            Box<
+                dyn tokio_stream::Stream<Item = Result<pb::TapeInventoryStreamItem, Status>> + Send,
+            >,
+        >;
+        async fn get_tape_inventory(
+            &self,
+            _request: Request<pb::TapeInventoryRequest>,
+        ) -> Result<Response<Self::GetTapeInventoryStream>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+        async fn verify_tape_index(
+            &self,
+            _request: Request<pb::VerifyTapeIndexRequest>,
+        ) -> Result<Response<pb::TapeIndexVerification>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
         async fn list_tape_files(
             &self,
             _request: Request<pb::ListTapeFilesRequest>,
@@ -713,6 +730,18 @@ mod tests {
             &self,
             _request: Request<pb::ReconcileTapeRequest>,
         ) -> Result<Response<pb::OperationRef>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+        async fn finalize_tape(
+            &self,
+            _request: Request<pb::FinalizeTapeRequest>,
+        ) -> Result<Response<pb::TapeFinalization>, Status> {
+            Err(Status::unimplemented("not needed"))
+        }
+        async fn get_tape_finalization(
+            &self,
+            _request: Request<pb::GetTapeFinalizationRequest>,
+        ) -> Result<Response<pb::TapeFinalization>, Status> {
             Err(Status::unimplemented("not needed"))
         }
         async fn get_file(
@@ -946,7 +975,8 @@ mod tests {
         let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         assert_eq!(receipt["digest_verified"], true);
         assert_eq!(receipt["members"].as_array().unwrap().len(), 2);
-        assert_eq!(receipt["tape_file_number"], 42);
+        assert_eq!(receipt["tape_file_number"], "42");
+        assert_eq!(receipt["members"][0]["size_bytes"], alpha.len().to_string());
     }
 
     #[test]

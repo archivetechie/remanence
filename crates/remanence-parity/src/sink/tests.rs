@@ -26,7 +26,7 @@ fn capacity_input_with_block_size(
     projected_object_blocks: u64,
     remaining_tape_blocks: u64,
     block_size_bytes: u32,
-) -> CapacityReserveInput {
+) -> TerminalTripleCloseInput {
     capacity_input_with_current_fill(
         projected_object_blocks,
         remaining_tape_blocks,
@@ -40,41 +40,80 @@ fn capacity_input_with_current_fill(
     remaining_tape_blocks: u64,
     block_size_bytes: u32,
     current_epoch_fill_blocks: u64,
-) -> CapacityReserveInput {
-    CapacityReserveInput {
+) -> TerminalTripleCloseInput {
+    TerminalTripleCloseInput {
+        projected_object_present: true,
         projected_object_blocks,
-        block_size_bytes: block_size_bytes as u64,
+        block_size_bytes,
         current_epoch_fill_blocks,
         data_shards_per_epoch: 12,
         parity_shards_per_epoch: 6,
-        sidecar_index_block_count: 2,
+        pending_completed_sidecars: 0,
+        sidecar_entries_before_object: 0,
+        structural_entries_before_object: 1,
+        object_rows_before_object: 0,
         object_filemark_blocks: 1,
         sidecar_filemark_blocks: 1,
-        bootstrap_filemark_blocks: 1,
-        pending_completed_sidecars: 0,
-        remaining_bootstrap_count: 1,
+        parity_map_filemark_blocks: 1,
+        replica_filemark_blocks: 1,
+        gap_filemark_blocks: 1,
+        gap_nominal_bytes: crate::DEFAULT_INDEX_SEPARATION_BYTES,
         safety_margin_blocks: 3,
         remaining_tape_blocks,
-        empty_tape_usable_blocks: u64::MAX,
+        capacity_basis_blocks: 1_000_000.max(remaining_tape_blocks),
+        low_watermark_blocks: 0,
+        high_watermark_blocks: 1,
         pending_completed_epoch_parity_bytes: 0,
-        remaining_spool_bytes: 1024 * 1024,
+        remaining_spool_bytes: u64::MAX,
     }
 }
 
 fn capacity_input(
     projected_object_blocks: u64,
     remaining_tape_blocks: u64,
-) -> CapacityReserveInput {
+) -> TerminalTripleCloseInput {
     capacity_input_with_block_size(projected_object_blocks, remaining_tape_blocks, 8)
 }
 
+fn capacity_input_for_sink(
+    sink: &ParitySink<'_>,
+    mut input: TerminalTripleCloseInput,
+) -> TerminalTripleCloseInput {
+    let runtime = sink
+        .terminal_triple_capacity_runtime_state()
+        .expect("test runtime capacity state");
+    input.current_epoch_fill_blocks = runtime.current_epoch_fill_blocks;
+    input.pending_completed_sidecars = runtime.pending_completed_sidecars;
+    input.pending_completed_epoch_parity_bytes = runtime.pending_completed_epoch_parity_bytes;
+    input.sidecar_entries_before_object = runtime.sidecar_entries_before_object;
+    input.structural_entries_before_object = runtime.structural_entries_before_object;
+    input.object_rows_before_object = runtime.object_rows_before_object;
+    let capacity_basis_blocks = runtime
+        .used_tape_blocks
+        .checked_add(input.remaining_tape_blocks)
+        .expect("test capacity basis");
+    input.capacity_basis_blocks = capacity_basis_blocks;
+    input
+}
+
+fn begin_object_with_runtime_capacity(
+    sink: &mut ParitySink<'_>,
+    input: TerminalTripleCloseInput,
+) -> Result<(u64, TerminalTripleCloseReport), ParityError> {
+    if sink.filemark_map.tape_file_count()? == 0 {
+        let bot = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])?;
+        sink.filemark_map = FilemarkMapBuilder::from_committed_prefix(&bot);
+        sink.bot_bootstrap_committed = true;
+        sink.durable_boundary = DurableBoundaryState::from_last_committed_tape_file_number(Some(0));
+    }
+    let input = capacity_input_for_sink(sink, input);
+    let reservation = crate::capacity::reserve_terminal_object_for_sink_test(input)?;
+    sink.begin_object_with_terminal_triple_reservation(reservation)
+}
+
 fn start_object(sink: &mut ParitySink<'_>, projected_object_blocks: u64, block_size_bytes: u32) {
-    sink.begin_object_with_capacity_reserve(capacity_input_with_block_size(
-        projected_object_blocks,
-        10_000,
-        block_size_bytes,
-    ))
-    .expect("object reserve fits");
+    let input = capacity_input_with_block_size(projected_object_blocks, 10_000, block_size_bytes);
+    begin_object_with_runtime_capacity(sink, input).expect("object reserve fits");
 }
 
 fn exhaust_runtime_tape_reserve(sink: &mut ParitySink<'_>) {
@@ -92,27 +131,13 @@ fn fixed_block(seed: u8, block_size_bytes: u32) -> Vec<u8> {
     block
 }
 
-fn committed_prefix_sidecar_directory_entries(
-    map: &FilemarkMap,
-) -> Vec<SidecarEpochDirectoryEntry> {
-    map.entries()
+fn body_entries_renumbered_for_test(entries: &[TapeFileMapEntry]) -> Vec<TapeFileMapEntry> {
+    entries[1..]
         .iter()
-        .filter(|entry| entry.kind == TapeFileKind::ParitySidecar)
-        .map(|entry| SidecarEpochDirectoryEntry {
-            tape_file_number: entry.tape_file_number,
-            epoch_id: entry.epoch_id.expect("test sidecar has epoch id"),
-            protected_ordinal_start: entry
-                .protected_ordinal_start
-                .expect("test sidecar has start ordinal"),
-            protected_ordinal_end_exclusive: entry
-                .protected_ordinal_end_exclusive
-                .expect("test sidecar has end ordinal"),
-            sidecar_total_block_count: entry.block_count,
-            sidecar_header_block_count: 1,
-            parity_shard_block_count: 1,
-            canonical_metadata_hash: [entry.tape_file_number as u8; 32],
-            flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
-                | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+        .cloned()
+        .map(|mut entry| {
+            entry.tape_file_number -= 1;
+            entry
         })
         .collect()
 }
@@ -412,6 +437,12 @@ impl RawTapeSource for RecordingRawTapeSource {
         Ok(())
     }
 
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.cursor = u64::try_from(self.records.len())
+            .map_err(|_| ParityError::Invariant("recording source length exceeds u64"))?;
+        Ok(PhysicalPositionHint::new(self.cursor))
+    }
+
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
         if count != 0 {
             return Err(ParityError::Invariant(
@@ -700,6 +731,96 @@ fn completed_sidecar_queue_is_bounded_by_object_reserve() {
 }
 
 #[test]
+fn unwritten_object_rollback_restores_detachable_session_state() {
+    let block_size = 4096;
+    let tape_uuid = [0xA4; 16];
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(tape_uuid);
+    let mut sink = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        small_scheme(),
+        tape_uuid,
+        block_size,
+    )
+    .expect("session sink");
+    let input = capacity_input_with_block_size(2, 10_000, block_size);
+    begin_object_with_runtime_capacity(&mut sink, input).expect("local Object admission");
+    assert_eq!(sink.active_object_blocks_written(), Some(0));
+
+    sink.rollback_unwritten_object()
+        .expect("rollback before raw motion");
+    assert_eq!(sink.active_object_tape_file_number(), None);
+    let state = sink.into_session_state().expect("detached after rollback");
+    assert_eq!(raw.cursor, 0);
+    assert!(
+        raw.events.is_empty(),
+        "admission and rollback perform no raw I/O"
+    );
+
+    let mut resumed = match ParitySink::try_from_session_state(&mut raw, &mut journal, state) {
+        Ok(resumed) => resumed,
+        Err((error, _state)) => panic!("reattach rolled-back state: {error}"),
+    };
+    begin_object_with_runtime_capacity(&mut resumed, input).expect("retry admission");
+    resumed
+        .write_block(&fixed_block(0x5A, block_size))
+        .expect("retry reaches raw write");
+    assert_eq!(resumed.active_object_blocks_written(), Some(1));
+}
+
+#[test]
+fn parity_attach_position_or_journal_mismatch_returns_session_state() {
+    let block_size = 4096;
+    let tape_uuid = [0xA5; 16];
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(tape_uuid);
+    let state = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        small_scheme(),
+        tape_uuid,
+        block_size,
+    )
+    .expect("session sink")
+    .into_session_state()
+    .expect("detach fresh session");
+
+    let mut wrong_journal = RecordingJournal::new([0xFF; 16]);
+    let state = match ParitySink::try_from_session_state(&mut raw, &mut wrong_journal, state) {
+        Ok(_) => panic!("wrong journal UUID must reject"),
+        Err((error, state)) => {
+            assert!(error.to_string().contains("journal tape UUID"), "{error}");
+            *state
+        }
+    };
+    assert!(
+        raw.events.is_empty(),
+        "journal mismatch must reject before querying the transport"
+    );
+
+    raw.cursor = 1;
+    let state = match ParitySink::try_from_session_state(&mut raw, &mut journal, state) {
+        Ok(_) => panic!("wrong physical cursor must reject"),
+        Err((error, state)) => {
+            assert!(error.to_string().contains("expected partition 0 lba 0"));
+            *state
+        }
+    };
+    assert_eq!(raw.events, [RawSinkEvent::Position]);
+
+    raw.cursor = 0;
+    raw.events.clear();
+    let resumed = match ParitySink::try_from_session_state(&mut raw, &mut journal, state) {
+        Ok(resumed) => resumed,
+        Err((error, _state)) => panic!("returned state must remain retryable: {error}"),
+    };
+    assert_eq!(resumed.active_object_tape_file_number(), None);
+    drop(resumed);
+    assert_eq!(raw.events, [RawSinkEvent::Position]);
+}
+
+#[test]
 fn wrong_length_first_object_block_does_not_pin_session_block_size() {
     let block_size: u32 = 32;
     let mut raw = RecordingRawTapeSink::default();
@@ -858,7 +979,7 @@ fn fresh_tape_first_object_span_starts_after_bootstrap_prefix() {
 }
 
 #[test]
-fn journaled_write_bootstrap_commits_control_bundle() {
+fn journaled_write_bootstrap_commits_bot_bundle() {
     let block_size: u32 = 1024;
     let mut raw = RecordingRawTapeSink::default();
     let mut journal = RecordingJournal::new(sample_uuid());
@@ -876,7 +997,7 @@ fn journaled_write_bootstrap_commits_control_bundle() {
 
     assert_eq!(journal.bundles.len(), 1);
     let bundle = &journal.bundles[0];
-    assert_eq!(bundle.kind, CommittedBundleKind::Control);
+    assert_eq!(bundle.kind, CommittedBundleKind::BotBootstrap);
     assert_eq!(bundle.highest_protected_ordinal, 0);
     assert_eq!(bundle.total_committed_ordinals, 0);
     assert_eq!(bundle.entries.len(), 1);
@@ -1003,6 +1124,7 @@ fn checkpoint_returns_committed_prefix_summary() {
             block_size,
         )
         .expect("journaled sink opens");
+        sink.write_bootstrap().expect("BOT Bootstrap writes");
         start_object(&mut sink, 3, block_size);
         for i in 0..3 {
             sink.write_block(&fixed_block(i + 1, block_size))
@@ -1012,16 +1134,18 @@ fn checkpoint_returns_committed_prefix_summary() {
         sink.checkpoint().expect("checkpoint writes")
     };
 
-    assert_eq!(checkpoint.bootstrap_tape_file_number, 2);
-    assert_eq!(checkpoint.tape_file_count, 3);
+    assert_eq!(checkpoint.next_tape_file_number, 3);
     assert_eq!(checkpoint.highest_protected_ordinal, 3);
     assert_eq!(checkpoint.total_committed_ordinals, 3);
     assert_eq!(checkpoint.sidecars_emitted.len(), 1);
-    assert_eq!(journal.bundles.len(), 3);
-    assert_eq!(journal.bundles[1].kind, CommittedBundleKind::Control);
-    assert_eq!(journal.bundles[1].total_committed_ordinals, 3);
+    assert_eq!(journal.bundles.len(), 4);
     assert_eq!(
         journal.bundles[2].kind,
+        CommittedBundleKind::CheckpointSidecars
+    );
+    assert_eq!(journal.bundles[2].total_committed_ordinals, 3);
+    assert_eq!(
+        journal.bundles[3].kind,
         CommittedBundleKind::CheckpointedThrough
     );
 }
@@ -1070,9 +1194,9 @@ fn failed_checkpoint_barrier_poisons_without_committing_journal_bundle() {
 #[test]
 fn checkpoint_barrier_end_of_medium_is_tape_io_and_poisons_without_commit() {
     let block_size: u32 = 1024;
-    // The checkpoint bootstrap trailing filemark is operation 1; its shared
-    // zero-count synchronizing barrier is operation 2.
-    let mut raw = EwEomTripwireRawTapeSink::on_filemark(2);
+    // With no open epoch, the checkpoint's first media operation is its
+    // zero-count synchronizing barrier.
+    let mut raw = EwEomTripwireRawTapeSink::on_filemark(1);
     let mut journal = RecordingJournal::new(sample_uuid());
     {
         let mut sink = ParitySink::new_with_journal(
@@ -1105,7 +1229,7 @@ fn checkpoint_barrier_end_of_medium_is_tape_io_and_poisons_without_commit() {
         }
     }
 
-    assert_eq!(raw.ew_eom_filemarks_seen, vec![2]);
+    assert_eq!(raw.ew_eom_filemarks_seen, vec![1]);
     assert!(
         journal.bundles.is_empty(),
         "barrier EOM must leave no journal bundle or checkpointed-through advance"
@@ -1141,497 +1265,11 @@ fn checkpoint_rejects_mid_object() {
 }
 
 #[test]
-fn checkpoint_resume_rebuilds_open_epoch_and_finish_protects_everything() {
-    let block_size: u32 = 1024;
-    let scheme = small_scheme();
-    let pre_checkpoint_blocks = (1..=5)
-        .map(|seed| fixed_block(seed, block_size))
-        .collect::<Vec<_>>();
-    let pre_resume_row =
-        BootstrapObjectRow::plaintext(0, pre_checkpoint_blocks.len() as u64, 0, 1, 1, [0x11; 32])
-            .with_object_id([0x11; 16]);
-    let mut raw = RecordingRawTapeSink::default();
-    let mut journal = RecordingJournal::new(sample_uuid());
-    let checkpoint = {
-        let mut sink = ParitySink::new_with_journal(
-            &mut raw,
-            &mut journal,
-            scheme.clone(),
-            sample_uuid(),
-            block_size,
-        )
-        .expect("journaled sink opens");
-        sink.begin_object_with_capacity_reserve_and_bootstrap_object_row(
-            capacity_input_with_block_size(pre_checkpoint_blocks.len() as u64, 10_000, block_size),
-            BootstrapObjectRowAdmission::PlaintextRemObject,
-        )
-        .expect("pre-checkpoint object reserve fits");
-        for block in &pre_checkpoint_blocks {
-            sink.write_block(block)
-                .expect("pre-checkpoint object block");
-        }
-        sink.record_bootstrap_object_row(pre_resume_row.clone())
-            .expect("pre-resume object row records");
-        let summary = sink.finish_object().expect("pre-checkpoint object closes");
-        assert_eq!(summary.bootstrap_object_row.as_ref(), Some(&pre_resume_row));
-        assert_eq!(summary.highest_protected_ordinal, 0);
-        assert!(
-            summary.sidecars_emitted.is_empty(),
-            "checkpointed prefix intentionally leaves one partial epoch live"
-        );
-        sink.checkpoint()
-            .expect("checkpoint writes clean resume point")
-    };
-
-    assert_eq!(checkpoint.bootstrap_tape_file_number, 2);
-    assert_eq!(checkpoint.total_committed_ordinals, 5);
-    assert_eq!(checkpoint.highest_protected_ordinal, 5);
-    assert!(!checkpoint.sidecars_emitted[0].final_partial_epoch);
-
-    let (committed_state, committed_prefix) =
-        crate::resume::committed_prefix_from_journal(&journal, &scheme)
-            .expect("journal prefix replays");
-    assert_eq!(committed_state.highest_protected_ordinal, 5);
-    assert_eq!(committed_state.total_committed_ordinals, 5);
-    assert_eq!(committed_prefix.tape_file_count(), 3);
-
-    let mut source = RecordingRawTapeSource::from_sink(&raw);
-    let rebuild = crate::resume::rebuild_open_epoch_from_committed_prefix(
-        &mut source,
-        &committed_prefix,
-        &scheme,
-        sample_uuid(),
-        block_size,
-    )
-    .expect("checkpointed partial epoch rebuilds");
-    let journal_plan = crate::resume::plan_resume_append_from_journal(&journal, &scheme)
-        .expect("journal resume plan builds");
-    assert_eq!(journal_plan, rebuild.plan);
-    assert!(rebuild.rebuilt_sidecars.is_empty());
-    assert_eq!(rebuild.plan.append_after_tape_file_number, 2);
-    assert_eq!(rebuild.plan.highest_protected_ordinal_before_rebuild, 5);
-    assert_eq!(rebuild.plan.highest_protected_ordinal_after_rebuild, 5);
-    assert_eq!(rebuild.plan.live_epoch_start, 5);
-    assert_eq!(rebuild.plan.next_data_ordinal, 5);
-    assert!(rebuild.live_epoch.is_none());
-
-    let resume_plan = rebuild.plan.clone();
-    let resume_result = resume_plan
-        .complete(Vec::new())
-        .expect("no sidecars are emitted for a partial-epoch rebuild");
-    let append_position = committed_prefix
-        .append_position_after_prefix()
-        .expect("checkpoint prefix append position computes");
-    let mut resumed_raw = RecordingRawTapeSink {
-        cursor: append_position.lba,
-        events: Vec::new(),
-        blocks: Vec::new(),
-    };
-    {
-        let mut sink = ParitySink::new_sidecar_only_from_resume_without_journal(
-            &mut resumed_raw,
-            scheme.clone(),
-            sample_uuid(),
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &committed_prefix,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&committed_prefix),
-                committed_prefix_object_rows: vec![pre_resume_row.clone()],
-                resume_result: &resume_result,
-                live_epoch: rebuild.live_epoch,
-                next_bootstrap_sequence: 1,
-            },
-        )
-        .expect("resumed writer opens at checkpoint append point");
-        assert_eq!(sink.neighborhood_idx(), 1);
-        assert_eq!(sink.data_blocks_in_neighborhood(), 0);
-
-        sink.begin_object_with_capacity_reserve_and_bootstrap_object_row(
-            capacity_input_with_current_fill(
-                7,
-                10_000,
-                block_size,
-                sink.data_blocks_in_neighborhood(),
-            ),
-            BootstrapObjectRowAdmission::PlaintextRemObject,
-        )
-        .expect("post-resume object reserve fits");
-        for seed in 6..=12 {
-            sink.write_block(&fixed_block(seed, block_size))
-                .expect("post-resume object block");
-        }
-        let post_resume_row =
-            BootstrapObjectRow::plaintext(3, 7, 0, 1, 1, [0x22; 32]).with_object_id([0x22; 16]);
-        sink.record_bootstrap_object_row(post_resume_row.clone())
-            .expect("post-resume object row records");
-        let summary = sink.finish_object().expect("post-resume object closes");
-        assert_eq!(
-            summary.bootstrap_object_row.as_ref(),
-            Some(&post_resume_row)
-        );
-        assert_eq!(summary.tape_file_number, 3);
-        assert_eq!(summary.first_parity_data_ordinal, 5);
-        assert_eq!(summary.data_block_count, 7);
-        assert_eq!(summary.highest_protected_ordinal, 5);
-        assert!(summary.sidecars_emitted.is_empty());
-
-        let geometry = sink
-            .finish()
-            .expect("resumed finish writes final bootstrap");
-        assert_eq!(geometry.data_area_end_lba, append_position.lba + 7);
-    }
-
-    let sidecar_starts = resumed_raw
-        .blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, block)| {
-            matches!(
-                crate::sidecar::classify_sidecar_header_block(block, &sample_uuid()),
-                Ok(Some(_))
-            )
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(sidecar_starts.len(), 1);
-    let sidecar = crate::sidecar::parse_sidecar_tape_file(
-        &resumed_raw.blocks[sidecar_starts[0]..resumed_raw.blocks.len() - 1],
-        &sample_uuid(),
-    )
-    .expect("post-resume sidecar parses");
-    assert_eq!(sidecar.header.protected_ordinal_start, 5);
-    assert_eq!(sidecar.header.protected_ordinal_end_exclusive, 12);
-
-    let final_bootstrap =
-        crate::bootstrap::parse_bootstrap_block(resumed_raw.blocks.last().unwrap())
-            .expect("final bootstrap parses");
-    let digest = final_bootstrap
-        .filemark_map_digest
-        .expect("final bootstrap carries map digest");
-    assert!(digest.is_final_map);
-    assert_eq!(digest.tape_file_count, 6);
-    assert_eq!(digest.map_total_data_ordinals, 12);
-    assert_eq!(digest.highest_protected_ordinal, 12);
-    assert_eq!(
-        final_bootstrap.object_rows,
-        vec![
-            pre_resume_row,
-            BootstrapObjectRow::plaintext(3, 7, 0, 1, 1, [0x22; 32]).with_object_id([0x22; 16])
-        ]
-    );
-}
-
-#[test]
-fn resume_rejects_object_rows_that_cannot_fit_bootstrap() {
-    let block_size: u32 = 512;
-    let object_count = 120u32;
-    let entries = (0..object_count)
-        .map(|tape_file_number| {
-            TapeFileMapEntry::object(tape_file_number, 1, u64::from(tape_file_number))
-        })
-        .collect::<Vec<_>>();
-    let committed_prefix = FilemarkMap::new(entries).expect("object-only prefix validates");
-    let committed_object_rows = (0..object_count)
-        .map(|tape_file_number| {
-            BootstrapObjectRow::plaintext(
-                tape_file_number,
-                1,
-                0,
-                1,
-                1,
-                [tape_file_number as u8; 32],
-            )
-            .with_object_id([((tape_file_number % 255) + 1) as u8; 64])
-        })
-        .collect::<Vec<_>>();
-    let append_position = committed_prefix
-        .append_position_after_prefix()
-        .expect("object-only append position computes");
-    let mut raw = RecordingRawTapeSink {
-        cursor: append_position.lba,
-        events: Vec::new(),
-        blocks: Vec::new(),
-    };
-    let resume_result = ResumeAppendResult {
-        append_after_tape_file_number: object_count - 1,
-        sidecars_emitted: Vec::new(),
-        highest_protected_ordinal: 0,
-        live_epoch_start: u64::from(object_count),
-        next_data_ordinal: u64::from(object_count),
-        next_epoch_id: 0,
-    };
-
-    let result = ParitySink::new_sidecar_only_from_resume_without_journal(
-        &mut raw,
-        small_scheme(),
-        sample_uuid(),
-        block_size,
-        ResumeWriterSeed {
-            committed_prefix: &committed_prefix,
-            committed_prefix_sidecar_directory_entries: Vec::new(),
-            committed_prefix_object_rows: committed_object_rows,
-            resume_result: &resume_result,
-            live_epoch: None,
-            next_bootstrap_sequence: 0,
-        },
-    );
-    let err = match result {
-        Ok(_) => panic!("oversized object-row set must be rejected before append"),
-        Err(err) => err,
-    };
-
-    assert!(
-        matches!(err, ParityError::BootstrapPayloadTooLarge { .. }),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn bootstrap_placement_policy_bundle_floor_folds_into_object_bundle() {
+fn terminal_prefix_close_emits_sidecar_and_parity_map_without_bootstrap() {
     let block_size: u32 = 1024;
     let mut raw = RecordingRawTapeSink::default();
     let mut journal = RecordingJournal::new(sample_uuid());
-    let summary = {
-        let mut sink = ParitySink::new_with_journal(
-            &mut raw,
-            &mut journal,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-        )
-        .expect("journaled sink opens");
-        assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-        sink.set_bootstrap_placement_policy(BootstrapPlacementPolicy {
-            bundles_per_bootstrap: 1,
-            ordinals_per_bootstrap: u64::MAX,
-            eom_taper: Vec::new(),
-            min_physical_separation_blocks: 0,
-        })
-        .expect("placement policy installs");
-        start_object(&mut sink, 3, block_size);
-        for seed in 1..=3 {
-            sink.write_block(&fixed_block(seed, block_size))
-                .expect("object block writes");
-        }
-        sink.finish_object().expect("object closes")
-    };
-
-    assert_eq!(summary.tape_file_number, 1);
-    assert_eq!(summary.control_tape_files_emitted.len(), 1);
-    assert_eq!(
-        summary.control_tape_files_emitted[0].to_map_entry(),
-        TapeFileMapEntry::bootstrap(2, 1)
-    );
-    assert_eq!(journal.bundles.len(), 2);
-    assert_eq!(journal.bundles[1].kind, CommittedBundleKind::Object);
-    assert_eq!(journal.bundles[1].entries.len(), 2);
-    assert_eq!(journal.bundles[1].entries[0].kind, TapeFileKind::Object);
-    assert_eq!(journal.bundles[1].entries[1].kind, TapeFileKind::Bootstrap);
-    assert_eq!(journal.bundles[1].total_committed_ordinals, 3);
-}
-
-#[test]
-fn bootstrap_placement_policy_min_separation_defers_tripped_floor() {
-    let block_size: u32 = 1024;
-    let mut raw = RecordingRawTapeSink::default();
-    let mut sink =
-        ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-            .expect("sink opens");
-    assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-    sink.set_bootstrap_placement_policy(BootstrapPlacementPolicy {
-        bundles_per_bootstrap: 1,
-        ordinals_per_bootstrap: u64::MAX,
-        eom_taper: Vec::new(),
-        min_physical_separation_blocks: 5,
-    })
-    .expect("placement policy installs");
-
-    start_object(&mut sink, 1, block_size);
-    sink.write_block(&fixed_block(1, block_size))
-        .expect("first object block");
-    let first = sink.finish_object().expect("first object closes");
-    assert!(first.control_tape_files_emitted.is_empty());
-
-    sink.begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-        1,
-        10_000,
-        block_size,
-        sink.data_blocks_in_neighborhood(),
-    ))
-    .expect("second object reserve fits");
-    sink.write_block(&fixed_block(2, block_size))
-        .expect("second object block");
-    let second = sink.finish_object().expect("second object closes");
-    assert_eq!(second.control_tape_files_emitted.len(), 1);
-    assert_eq!(
-        second.control_tape_files_emitted[0].to_map_entry(),
-        TapeFileMapEntry::bootstrap(3, 1)
-    );
-}
-
-#[test]
-fn bootstrap_placement_policy_eom_taper_tightens_floor() {
-    let block_size: u32 = 1024;
-    let mut raw = RecordingRawTapeSink::default();
-    let mut sink =
-        ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-            .expect("sink opens");
-    assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-    sink.set_bootstrap_placement_policy(BootstrapPlacementPolicy {
-        bundles_per_bootstrap: 4,
-        ordinals_per_bootstrap: u64::MAX,
-        eom_taper: vec![(0.9, 2)],
-        min_physical_separation_blocks: 0,
-    })
-    .expect("placement policy installs");
-
-    sink.begin_object_with_capacity_reserve(capacity_input_with_current_fill(1, 25, block_size, 0))
-        .expect("first object reserve fits");
-    sink.write_block(&fixed_block(1, block_size))
-        .expect("first object block");
-    let first = sink.finish_object().expect("first object closes");
-    assert!(
-        first.control_tape_files_emitted.is_empty(),
-        "taper alone should not emit until the tightened bundle floor is reached"
-    );
-
-    sink.begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-        1,
-        23,
-        block_size,
-        sink.data_blocks_in_neighborhood(),
-    ))
-    .expect("second object reserve fits");
-    sink.write_block(&fixed_block(2, block_size))
-        .expect("second object block");
-    let second = sink.finish_object().expect("second object closes");
-    assert_eq!(
-        second.control_tape_files_emitted.len(),
-        1,
-        "remaining fraction crossed 90%, so bundles floor tightens from 4 to 2"
-    );
-    assert_eq!(
-        second.control_tape_files_emitted[0].to_map_entry(),
-        TapeFileMapEntry::bootstrap(3, 1)
-    );
-}
-
-#[test]
-fn bootstrap_placement_policy_rejects_non_monotone_eom_taper() {
-    let unordered_fraction = BootstrapPlacementPolicy {
-        bundles_per_bootstrap: 4,
-        ordinals_per_bootstrap: 64,
-        eom_taper: vec![(0.01, 4), (0.10, 8)],
-        min_physical_separation_blocks: 0,
-    };
-    let err = unordered_fraction
-        .validate()
-        .expect_err("fractions must be descending");
-    match err {
-        ParityError::Invariant(message) => {
-            assert!(
-                message.contains("descending remaining_fraction"),
-                "{message}"
-            );
-        }
-        other => panic!("expected taper ordering invariant, got {other:?}"),
-    }
-
-    let unordered_divisor = BootstrapPlacementPolicy {
-        bundles_per_bootstrap: 4,
-        ordinals_per_bootstrap: 64,
-        eom_taper: vec![(0.10, 4), (0.01, 2)],
-        min_physical_separation_blocks: 0,
-    };
-    let err = unordered_divisor
-        .validate()
-        .expect_err("divisors must be increasing");
-    match err {
-        ParityError::Invariant(message) => {
-            assert!(
-                message.contains("strictly increasing divisors"),
-                "{message}"
-            );
-        }
-        other => panic!("expected taper ordering invariant, got {other:?}"),
-    }
-
-    BootstrapPlacementPolicy {
-        bundles_per_bootstrap: 4,
-        ordinals_per_bootstrap: 64,
-        eom_taper: vec![(0.10, 2), (0.01, 4)],
-        min_physical_separation_blocks: 0,
-    }
-    .validate()
-    .expect("design example ordering is valid");
-}
-
-#[test]
-fn checkpoint_resets_bootstrap_placement_counters() {
-    let block_size: u32 = 1024;
-    let mut raw = RecordingRawTapeSink::default();
-    let mut journal = RecordingJournal::new(sample_uuid());
-    let second = {
-        let mut sink = ParitySink::new_with_journal(
-            &mut raw,
-            &mut journal,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-        )
-        .expect("journaled sink opens");
-        assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-        sink.set_bootstrap_placement_policy(BootstrapPlacementPolicy {
-            bundles_per_bootstrap: 2,
-            ordinals_per_bootstrap: u64::MAX,
-            eom_taper: Vec::new(),
-            min_physical_separation_blocks: 0,
-        })
-        .expect("placement policy installs");
-
-        start_object(&mut sink, 1, block_size);
-        sink.write_block(&fixed_block(1, block_size))
-            .expect("first object block");
-        let first = sink.finish_object().expect("first object closes");
-        assert!(first.control_tape_files_emitted.is_empty());
-
-        let checkpoint = sink.checkpoint().expect("checkpoint writes");
-        assert_eq!(checkpoint.bootstrap_tape_file_number, 3);
-
-        sink.begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-            1,
-            10_000,
-            block_size,
-            sink.data_blocks_in_neighborhood(),
-        ))
-        .expect("second object reserve fits");
-        sink.write_block(&fixed_block(2, block_size))
-            .expect("second object block");
-        sink.finish_object().expect("second object closes")
-    };
-
-    assert!(
-        second.control_tape_files_emitted.is_empty(),
-        "checkpoint reset the placement counters; the second object alone should not trip floor=2"
-    );
-    assert_eq!(
-        journal
-            .bundles
-            .iter()
-            .filter(|bundle| bundle.kind == CommittedBundleKind::Control)
-            .count(),
-        2,
-        "only BOT and checkpoint control bundles should have been written"
-    );
-}
-
-#[test]
-fn journaled_finish_commits_final_sidecar_and_bootstrap_bundle() {
-    let block_size: u32 = 1024;
-    let mut raw = RecordingRawTapeSink::default();
-    let mut journal = RecordingJournal::new(sample_uuid());
-    {
+    let (result, plan) = {
         let mut sink = ParitySink::new_with_journal(
             &mut raw,
             &mut journal,
@@ -1646,33 +1284,111 @@ fn journaled_finish_commits_final_sidecar_and_bootstrap_bundle() {
                 .expect("object block writes");
         }
         sink.finish_object().expect("object closes");
-        sink.finish().expect("finish writes final bundle");
-    }
+        let plan = sink
+            .plan_terminal_index_close()
+            .expect("terminal prefix preflight plans");
+        assert_eq!(
+            plan.committed_bundle.kind,
+            CommittedBundleKind::TerminalPrefix
+        );
+        assert!(plan.tail_start_lba > plan.start_lba);
+        let result = sink
+            .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+            .expect("terminal parity prefix closes");
+        (result, plan)
+    };
 
-    assert_eq!(journal.bundles.len(), 3);
-    assert_eq!(journal.bundles[0].kind, CommittedBundleKind::Object);
-    assert_eq!(journal.bundles[0].entries.len(), 1);
-    assert_eq!(journal.bundles[0].entries[0].kind, TapeFileKind::Object);
-
-    let finish_bundle = &journal.bundles[1];
-    assert_eq!(finish_bundle.kind, CommittedBundleKind::Finish);
-    assert_eq!(finish_bundle.highest_protected_ordinal, 5);
-    assert_eq!(finish_bundle.total_committed_ordinals, 5);
-    assert!(
-        finish_bundle
-            .entries
-            .iter()
-            .any(|entry| entry.kind == TapeFileKind::ParitySidecar),
-        "final partial epoch sidecar should be journaled"
-    );
+    let mut physical = RecordingRawTapeSource::from_sink(&raw);
     assert_eq!(
-        finish_bundle.entries.last().map(|entry| entry.kind),
-        Some(TapeFileKind::Bootstrap)
+        reconcile_terminal_prefix(&mut physical, &plan, &sample_uuid(), block_size, true,),
+        TerminalPrefixReconcileEvidence::Complete
     );
+    assert_eq!(physical.cursor, plan.tail_start_lba);
+    let parity_lba = plan
+        .start_lba
+        .checked_add(plan.sidecar_directory_entries[0].sidecar_header_block_count)
+        .expect("sidecar parity lba fits u64");
+    let parity_lba = usize::try_from(parity_lba).expect("sidecar parity lba fits usize");
+    let RecordedTapeRecord::Block(first_prefix_block) = &mut physical.records[parity_lba] else {
+        panic!("terminal prefix starts with a block");
+    };
+    first_prefix_block[0] ^= 0x80;
+    assert_eq!(
+        reconcile_terminal_prefix(&mut physical, &plan, &sample_uuid(), block_size, false,),
+        TerminalPrefixReconcileEvidence::TornWorm
+    );
+
+    assert_eq!(result.sidecars_emitted.len(), 1);
+    assert!(result.parity_map_tape_file_number.is_some());
+    assert_eq!(
+        result.committed_bundle.kind,
+        CommittedBundleKind::TerminalPrefix
+    );
+    assert!(result
+        .committed_bundle
+        .entries
+        .iter()
+        .any(|entry| entry.kind == TapeFileKind::ParitySidecar));
+    assert_eq!(
+        result
+            .committed_bundle
+            .entries
+            .last()
+            .map(|entry| entry.kind),
+        Some(TapeFileKind::ParityMap)
+    );
+    assert!(!result
+        .committed_bundle
+        .entries
+        .iter()
+        .any(|entry| entry.kind == TapeFileKind::Bootstrap));
+    assert_eq!(journal.bundles.len(), 3);
+    assert_eq!(journal.bundles[1].kind, CommittedBundleKind::TerminalPrefix);
     assert_eq!(
         journal.bundles[2].kind,
         CommittedBundleKind::CheckpointedThrough
     );
+    assert_eq!(
+        raw.events.last(),
+        Some(&RawSinkEvent::Position),
+        "post-barrier position must be re-read before journal authority"
+    );
+    assert!(raw.events.contains(&RawSinkEvent::SyncBarrier));
+}
+
+#[test]
+fn terminal_prefix_execution_rejects_stale_preflight_before_motion() {
+    let block_size: u32 = 1024;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    let error = {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            small_scheme(),
+            sample_uuid(),
+            block_size,
+        )
+        .expect("journaled sink opens");
+        start_object(&mut sink, 1, block_size);
+        sink.write_block(&fixed_block(1, block_size))
+            .expect("object block writes");
+        sink.finish_object().expect("object closes");
+        let mut stale = sink
+            .plan_terminal_index_close()
+            .expect("terminal prefix preflight plans");
+        stale.tail_start_lba += 1;
+        sink.close_for_terminal_index(&stale, TerminalPrefixReconcileEvidence::Absent)
+            .expect_err("stale prefix plan fails")
+    };
+    assert!(error
+        .to_string()
+        .contains("does not match persisted immutable plan"));
+    assert_eq!(journal.bundles.len(), 1, "no prefix bundle was journaled");
+    assert!(!raw
+        .events
+        .iter()
+        .any(|event| matches!(event, RawSinkEvent::SyncBarrier)));
 }
 
 #[test]
@@ -1680,9 +1396,8 @@ fn sidecar_only_writer_uses_raw_sink_filemark_barriers() {
     let block_size: u32 = 512;
     let mut raw = RecordingRawTapeSink::default();
     {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
         sink.write_bootstrap().expect("initial bootstrap");
         start_object(&mut sink, 3, block_size);
         for seed in 1..=3 {
@@ -1690,7 +1405,7 @@ fn sidecar_only_writer_uses_raw_sink_filemark_barriers() {
                 .expect("object block");
         }
         sink.finish_object().expect("object filemark");
-        sink.finish().expect("final sidecar and bootstrap");
+        sink.finish().expect("final sidecar");
     }
 
     let filemark_count = raw
@@ -1699,9 +1414,9 @@ fn sidecar_only_writer_uses_raw_sink_filemark_barriers() {
         .filter(|event| matches!(event, RawSinkEvent::WriteFilemark))
         .count();
     assert_eq!(
-            filemark_count, 4,
-            "initial bootstrap, object, final partial sidecar, and final bootstrap each need a raw filemark barrier"
-        );
+        filemark_count, 3,
+        "initial bootstrap, object, and final partial sidecar each need a raw filemark barrier"
+    );
     assert!(raw.events.iter().all(|event| match event {
         RawSinkEvent::WriteBlock(len) => *len == block_size as usize,
         RawSinkEvent::WriteFilemark | RawSinkEvent::SyncBarrier | RawSinkEvent::Position => true,
@@ -1722,13 +1437,12 @@ fn sidecar_only_writer_uses_raw_sink_filemark_barriers() {
 }
 
 #[test]
-fn sidecar_and_bootstrap_tape_files_do_not_advance_data_ordinals() {
+fn sidecar_tape_files_do_not_advance_data_ordinals() {
     let block_size: u32 = 512;
     let mut raw = RecordingRawTapeSink::default();
     let _final_geometry = {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
 
         assert_eq!(sink.write_bootstrap().expect("initial bootstrap"), 0);
 
@@ -1763,23 +1477,21 @@ fn sidecar_and_bootstrap_tape_files_do_not_advance_data_ordinals() {
         assert_eq!(first_bundle.highest_protected_ordinal, 12);
         assert_eq!(first_bundle.total_committed_ordinals, 12);
 
-        assert_eq!(sink.write_bootstrap().expect("intermediate bootstrap"), 3);
-
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                2, 10_000, block_size,
-            ))
-            .expect("second object reserve fits");
-        assert_eq!(second_tape_file, 4);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(2, 10_000, block_size),
+        )
+        .expect("second object reserve fits");
+        assert_eq!(second_tape_file, 3);
         for seed in 12..14 {
             sink.write_block(&fixed_block(seed, block_size))
                 .expect("second object block");
         }
         let second = sink.finish_object().expect("second object closes");
-        assert_eq!(second.tape_file_number, 4);
+        assert_eq!(second.tape_file_number, 3);
         assert_eq!(
             second.first_parity_data_ordinal, 12,
-            "bootstrap and sidecar tape files between objects must not consume data ordinals"
+            "sidecar tape files between objects must not consume data ordinals"
         );
         assert_eq!(second.data_block_count, 2);
         assert!(second.sidecars_emitted.is_empty());
@@ -1789,7 +1501,7 @@ fn sidecar_and_bootstrap_tape_files_do_not_advance_data_ordinals() {
         assert_eq!(second_bundle.entries.len(), 1);
         assert_eq!(
             second_bundle.entries[0].to_map_entry(),
-            TapeFileMapEntry::object(4, 2, 12)
+            TapeFileMapEntry::object(3, 2, 12)
         );
         assert_eq!(second_bundle.highest_protected_ordinal, 12);
         assert_eq!(second_bundle.total_committed_ordinals, 14);
@@ -1798,7 +1510,7 @@ fn sidecar_and_bootstrap_tape_files_do_not_advance_data_ordinals() {
             "v1 object bundles may leave only a partial epoch unprotected"
         );
 
-        sink.finish().expect("final partial sidecar and bootstrap")
+        sink.finish().expect("final partial sidecar")
     };
 
     assert_eq!(
@@ -1806,7 +1518,7 @@ fn sidecar_and_bootstrap_tape_files_do_not_advance_data_ordinals() {
             .iter()
             .filter(|event| matches!(event, RawSinkEvent::WriteFilemark))
             .count(),
-        7,
+        5,
         "each bootstrap, object, and sidecar tape file is delimited by its own filemark"
     );
 
@@ -1824,27 +1536,12 @@ fn sidecar_and_bootstrap_tape_files_do_not_advance_data_ordinals() {
         .collect::<Vec<_>>();
     assert_eq!(sidecar_starts.len(), 2);
 
-    let final_sidecar = crate::sidecar::parse_sidecar_tape_file(
-        &raw.blocks[sidecar_starts[1]..raw.blocks.len() - 1],
-        &sample_uuid(),
-    )
-    .expect("final partial sidecar parses");
+    let final_sidecar =
+        crate::sidecar::parse_sidecar_tape_file(&raw.blocks[sidecar_starts[1]..], &sample_uuid())
+            .expect("final partial sidecar parses");
     assert_eq!(final_sidecar.header.protected_ordinal_start, 12);
     assert_eq!(final_sidecar.header.protected_ordinal_end_exclusive, 14);
     assert_eq!(final_sidecar.header.real_data_shard_count, 2);
-
-    let final_bootstrap = crate::bootstrap::parse_bootstrap_block(raw.blocks.last().unwrap())
-        .expect("final bootstrap parses");
-    let digest = final_bootstrap
-        .filemark_map_digest
-        .expect("final bootstrap carries map digest");
-    assert!(digest.is_final_map);
-    assert_eq!(digest.tape_file_count, 7);
-    assert_eq!(
-        digest.map_total_data_ordinals, 14,
-        "only object blocks, not sidecar/bootstrap blocks, contribute to ParityDataOrdinal"
-    );
-    assert_eq!(digest.highest_protected_ordinal, 14);
 }
 
 #[test]
@@ -1867,150 +1564,6 @@ fn object_bundle_bound_rejects_full_unprotected_epoch() {
 }
 
 #[test]
-fn final_bootstrap_carries_inline_sidecar_epoch_directory_when_it_fits() {
-    let block_size: u32 = 2048;
-    let mut raw = RecordingRawTapeSink::default();
-    let sidecar_summary = {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
-        sink.write_bootstrap().expect("initial bootstrap");
-        start_object(&mut sink, 12, block_size);
-        for seed in 0..12 {
-            sink.write_block(&fixed_block(seed, block_size))
-                .expect("object block");
-        }
-        let object = sink.finish_object().expect("object closes");
-        assert_eq!(object.sidecars_emitted.len(), 1);
-        let sidecar_summary = object.sidecars_emitted[0].clone();
-        sink.finish().expect("final bootstrap writes");
-        sidecar_summary
-    };
-
-    let final_bootstrap = crate::bootstrap::parse_bootstrap_block(raw.blocks.last().unwrap())
-        .expect("final bootstrap parses");
-    assert!(final_bootstrap.parity_map_reference.is_none());
-    let directory = final_bootstrap
-        .sidecar_epoch_directory
-        .expect("final bootstrap carries inline sidecar directory");
-    assert_eq!(directory.directory_scope_tape_file_count, 4);
-    assert_eq!(directory.directory_scope_total_data_ordinals, 12);
-    assert_eq!(directory.directory_scope_highest_protected_ordinal, 12);
-    assert!(directory.is_final_directory);
-    assert_eq!(directory.entries.len(), 1);
-    let entry = &directory.entries[0];
-    assert_eq!(entry.tape_file_number, sidecar_summary.tape_file_number);
-    assert_eq!(entry.epoch_id, sidecar_summary.epoch_id);
-    assert_eq!(
-        entry.canonical_metadata_hash,
-        sidecar_summary.canonical_metadata_hash
-    );
-    assert_eq!(
-        entry.flags,
-        SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD
-    );
-}
-
-#[test]
-fn final_bootstrap_references_parity_map_when_directory_overflows_inline_space() {
-    let block_size: u32 = 512;
-    let object_count = 48u8;
-    let mut raw = RecordingRawTapeSink::default();
-    let mut journal = RecordingJournal::new(sample_uuid());
-    {
-        let mut sink = ParitySink::new_with_journal(
-            &mut raw,
-            &mut journal,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-        )
-        .expect("journaled raw sink constructs");
-        sink.write_bootstrap().expect("initial bootstrap");
-        for object_index in 0..object_count {
-            start_object(&mut sink, 12, block_size);
-            for offset in 0..12 {
-                sink.write_block(&fixed_block(
-                    object_index.wrapping_mul(13).wrapping_add(offset),
-                    block_size,
-                ))
-                .expect("object block");
-            }
-            let object = sink.finish_object().expect("object closes");
-            assert_eq!(object.sidecars_emitted.len(), 1);
-        }
-        sink.finish().expect("final parity_map and bootstrap write");
-    }
-
-    let final_bootstrap = crate::bootstrap::parse_bootstrap_block(raw.blocks.last().unwrap())
-        .expect("final bootstrap parses");
-    assert!(final_bootstrap.sidecar_epoch_directory.is_none());
-    let reference = final_bootstrap
-        .parity_map_reference
-        .expect("final bootstrap references external parity_map");
-    assert_eq!(reference.tape_file_number, u32::from(object_count) * 2 + 1);
-    assert_eq!(
-        reference.directory_scope_tape_file_count,
-        u32::from(object_count) * 2 + 3
-    );
-    assert_eq!(
-        reference.directory_scope_total_data_ordinals,
-        u64::from(object_count) * 12
-    );
-    assert_eq!(
-        reference.directory_scope_highest_protected_ordinal,
-        u64::from(object_count) * 12
-    );
-    assert!(reference.is_final_directory);
-    let final_bundle = journal
-        .bundles
-        .iter()
-        .rev()
-        .find(|bundle| bundle.kind == CommittedBundleKind::Finish)
-        .expect("final bundle was journaled");
-    assert_eq!(final_bundle.kind, CommittedBundleKind::Finish);
-    let parity_map_entry = final_bundle
-        .entries
-        .iter()
-        .find(|entry| entry.kind == TapeFileKind::ParityMap)
-        .expect("final bundle includes parity_map row");
-    assert_eq!(
-        parity_map_entry.canonical_metadata_hash,
-        Some(reference.parity_map_payload_sha256)
-    );
-
-    let parity_map_start = raw
-        .blocks
-        .iter()
-        .position(|block| {
-            matches!(
-                crate::parity_map::classify_parity_map_header_block(block, &sample_uuid()),
-                Ok(Some(header))
-                    if header.copy_kind == crate::parity_map::ParityMapCopyKind::Primary
-            )
-        })
-        .expect("parity_map primary header block is present");
-    let parity_map_end = parity_map_start + reference.block_count as usize;
-    let decoded = crate::parity_map::parse_parity_map_tape_file(
-        &raw.blocks[parity_map_start..parity_map_end],
-        &sample_uuid(),
-    )
-    .expect("referenced parity_map parses");
-    assert_eq!(
-        decoded.header.payload_sha256,
-        reference.parity_map_payload_sha256
-    );
-    assert_eq!(
-        decoded.payload.canonical_map_digest,
-        reference.canonical_map_digest
-    );
-    assert_eq!(
-        decoded.payload.directory.entries.len(),
-        usize::from(object_count)
-    );
-}
-
-#[test]
 fn raw_sink_error_context_survives_block_sink_wrapper() {
     let block_size: u32 = 512;
     let mut raw = FailingRawTapeSink {
@@ -2019,9 +1572,8 @@ fn raw_sink_error_context_survives_block_sink_wrapper() {
         )),
         cursor: 0,
     };
-    let mut sink =
-        ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-            .expect("sidecar-only raw sink constructs");
+    let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+        .expect("sidecar-only raw sink constructs");
 
     let err = sink
         .write_bootstrap()
@@ -2052,9 +1604,8 @@ fn raw_sink_transport_error_remains_completion_unknown() {
         ))),
         cursor: 0,
     };
-    let mut sink =
-        ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-            .expect("sidecar-only raw sink constructs");
+    let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+        .expect("sidecar-only raw sink constructs");
 
     let err = sink
         .write_bootstrap()
@@ -2218,12 +1769,12 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_data_eom() {
         assert_eq!(first.highest_protected_ordinal, 12);
         sidecar_block_count = sidecar.block_count;
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                1, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(1, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar EW");
+        assert_eq!(second_tape_file, 3);
 
         let err = sink
             .write_block(&fixed_block(0xE3, block_size))
@@ -2244,7 +1795,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_data_eom() {
             .build()
             .expect("first object and sidecar map remains valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, sidecar_block_count, 0, 0, 12),
@@ -2381,12 +1932,12 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_filemark_eom() {
         assert_eq!(first.highest_protected_ordinal, 12);
         sidecar_block_count = sidecar.block_count;
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                1, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(1, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar EW");
+        assert_eq!(second_tape_file, 3);
         let outcome = sink
             .write_block(&fixed_block(0xE4, block_size))
             .expect("second object data writes before filemark EOM");
@@ -2412,7 +1963,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_object_filemark_eom() {
             .build()
             .expect("first object and sidecar map remains valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, sidecar_block_count, 0, 0, 12),
@@ -2541,12 +2092,12 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_body_eom() {
         assert_eq!(first.highest_protected_ordinal, 12);
         first_sidecar_block_count = first_sidecar.block_count;
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                12, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(12, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar EW");
+        assert_eq!(second_tape_file, 3);
         for seed in 13..=24 {
             let outcome = sink
                 .write_block(&fixed_block(seed, block_size))
@@ -2574,7 +2125,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_body_eom() {
             .build()
             .expect("objects and first sidecar map remain valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -2716,12 +2267,12 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_filemark_eom() {
         assert_eq!(first.highest_protected_ordinal, 12);
         first_sidecar_block_count = first_sidecar.block_count;
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                12, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(12, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar EW");
+        assert_eq!(second_tape_file, 3);
         for seed in 13..=24 {
             let outcome = sink
                 .write_block(&fixed_block(seed, block_size))
@@ -2749,7 +2300,7 @@ fn sidecar_filemark_early_warning_does_not_mask_later_sidecar_filemark_eom() {
             .build()
             .expect("objects and first sidecar map remain valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -2953,12 +2504,12 @@ fn sidecar_body_early_warning_does_not_mask_later_object_data_eom() {
         first_sidecar_block_count =
             commit_first_full_object_with_sidecar_body_ew(&mut sink, block_size);
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                1, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar-body EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(1, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar-body EW");
+        assert_eq!(second_tape_file, 3);
 
         let err = sink
             .write_block(&fixed_block(0xE5, block_size))
@@ -2979,7 +2530,7 @@ fn sidecar_body_early_warning_does_not_mask_later_object_data_eom() {
             .build()
             .expect("first object and sidecar map remains valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -3048,12 +2599,12 @@ fn sidecar_body_early_warning_does_not_mask_later_object_filemark_eom() {
         first_sidecar_block_count =
             commit_first_full_object_with_sidecar_body_ew(&mut sink, block_size);
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                1, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar-body EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(1, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar-body EW");
+        assert_eq!(second_tape_file, 3);
         let outcome = sink
             .write_block(&fixed_block(0xE6, block_size))
             .expect("second object data writes before object-filemark EOM");
@@ -3079,7 +2630,7 @@ fn sidecar_body_early_warning_does_not_mask_later_object_filemark_eom() {
             .build()
             .expect("first object and sidecar map remains valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -3149,12 +2700,12 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_body_eom() {
         first_sidecar_block_count =
             commit_first_full_object_with_sidecar_body_ew(&mut sink, block_size);
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                12, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar-body EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(12, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar-body EW");
+        assert_eq!(second_tape_file, 3);
         for seed in 13..=24 {
             let outcome = sink
                 .write_block(&fixed_block(seed, block_size))
@@ -3182,7 +2733,7 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_body_eom() {
             .build()
             .expect("objects and first sidecar map remain valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -3259,12 +2810,12 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_second_body_block_eom(
             "fixture needs a multi-block later sidecar body"
         );
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                12, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar-body EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(12, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar-body EW");
+        assert_eq!(second_tape_file, 3);
         for seed in 13..=24 {
             let outcome = sink
                 .write_block(&fixed_block(seed, block_size))
@@ -3292,7 +2843,7 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_second_body_block_eom(
             .build()
             .expect("objects and first sidecar map remain valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -3442,12 +2993,12 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_filemark_eom() {
         assert_eq!(first.highest_protected_ordinal, 12);
         first_sidecar_block_count = first_sidecar.block_count;
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                12, 10_000, block_size,
-            ))
-            .expect("second object reserve fits after sidecar-body EW");
-        assert_eq!(second_tape_file, 2);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_block_size(12, 10_000, block_size),
+        )
+        .expect("second object reserve fits after sidecar-body EW");
+        assert_eq!(second_tape_file, 3);
         for seed in 13..=24 {
             let outcome = sink
                 .write_block(&fixed_block(seed, block_size))
@@ -3475,7 +3026,7 @@ fn sidecar_body_early_warning_does_not_mask_later_sidecar_filemark_eom() {
             .build()
             .expect("objects and first sidecar map remain valid");
         assert_eq!(
-            map.entries(),
+            body_entries_renumbered_for_test(map.entries()).as_slice(),
             &[
                 TapeFileMapEntry::object(0, 12, 0),
                 TapeFileMapEntry::parity_sidecar(1, first_sidecar_block_count, 0, 0, 12),
@@ -3576,30 +3127,17 @@ fn sidecar_only_object_data_and_filemark_early_warning_still_commits() {
         sidecar_block_count = sidecar.block_count;
 
         sink.finish()
-            .expect("final bootstrap still writes after EW-only object close")
+            .expect("clean finish after EW-only object close")
     };
 
     assert_eq!(raw.ew_blocks_seen, vec![1, 5, 10]);
     assert_eq!(raw.ew_filemarks_seen, vec![1]);
-    assert_eq!(raw.filemark_count, 4);
+    assert_eq!(raw.filemark_count, 3);
     assert_eq!(
         raw.block_count as u64,
-        12 + sidecar_block_count + 1,
-        "object, sidecar, and final bootstrap blocks must all be written"
+        12 + sidecar_block_count,
+        "object and sidecar blocks must all be written"
     );
-
-    let final_bootstrap = crate::bootstrap::parse_bootstrap_block(
-        raw.blocks
-            .last()
-            .expect("final bootstrap block was written"),
-    )
-    .expect("final bootstrap parses after EW-only object close");
-    let digest = final_bootstrap
-        .filemark_map_digest
-        .expect("final bootstrap carries map digest");
-    assert!(digest.is_final_map);
-    assert_eq!(digest.tape_file_count, 3);
-    assert_eq!(digest.map_total_data_ordinals, 12);
 }
 
 #[test]
@@ -3650,12 +3188,11 @@ fn session_state_carries_open_epoch_fill_across_two_objects_before_barrier() {
             block_size,
         )
         .expect("journaled sink opens");
-        sink.reserve_checkpoint_batch_object_rows(2)
-            .expect("two-object batch reserves before tape motion");
         sink.write_bootstrap().expect("BOT bootstrap writes");
-        sink.begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-            2, 10_000, block_size, 0,
-        ))
+        begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_current_fill(2, 10_000, block_size, 0),
+        )
         .expect("first object reserves from an empty epoch");
         sink.write_block(&fixed_block(1, block_size)).unwrap();
         sink.write_block(&fixed_block(2, block_size)).unwrap();
@@ -3667,9 +3204,10 @@ fn session_state_carries_open_epoch_fill_across_two_objects_before_barrier() {
     {
         let mut sink = ParitySink::from_session_state(&mut raw, &mut journal, state)
             .expect("second object reattaches");
-        sink.begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-            2, 10_000, block_size, 2,
-        ))
+        begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_current_fill(2, 10_000, block_size, 2),
+        )
         .expect("second object reserves from the carried epoch fill");
         sink.write_block(&fixed_block(3, block_size)).unwrap();
         sink.write_block(&fixed_block(4, block_size)).unwrap();
@@ -3860,7 +3398,10 @@ fn sidecar_filemark_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
             .expect("object-only map remains valid after sidecar-filemark EOM");
         assert_eq!(
             map.entries(),
-            &[TapeFileMapEntry::object(0, 12, 0)],
+            &[
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, 12, 0),
+            ],
             "co-fired sidecar-filemark EW+EOM must not commit the failed sidecar"
         );
 
@@ -3895,23 +3436,15 @@ fn sidecar_filemark_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
 }
 
 #[test]
-fn bootstrap_block_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
+fn sole_bot_bootstrap_block_rejects_cofired_early_warning_and_eom() {
     let block_size: u32 = 512;
-    let mut raw = EwEomTripwireRawTapeSink::on_block(2);
+    let mut raw = EwEomTripwireRawTapeSink::on_block(1);
     {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
-        start_object(&mut sink, 1, block_size);
-        sink.write_block(&fixed_block(0xC3, block_size))
-            .expect("object data writes before bootstrap EW+EOM");
-        sink.finish_object()
-            .expect("object closes before bootstrap");
-        exhaust_runtime_tape_reserve(&mut sink);
-
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
         let err = sink
             .write_bootstrap()
-            .expect_err("bootstrap block EW+EOM must hard-abort before reserve failure");
+            .expect_err("BOT Bootstrap block EW+EOM must hard-abort");
         match err {
             ParityError::Invariant(message) => {
                 assert!(
@@ -3924,7 +3457,7 @@ fn bootstrap_block_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
 
         let err = sink
             .finish()
-            .expect_err("poisoned sink must not write final bootstrap after bootstrap EOM");
+            .expect_err("poisoned sink must not finish after Bootstrap EOM");
         match err {
             ParityError::Invariant(message) => {
                 assert!(message.contains("poisoned"), "{message}");
@@ -3935,36 +3468,24 @@ fn bootstrap_block_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
         }
     }
 
-    assert_eq!(raw.ew_eom_blocks_seen, vec![2]);
+    assert_eq!(raw.ew_eom_blocks_seen, vec![1]);
     assert_eq!(
         raw.events,
-        vec![
-            RawSinkEvent::WriteBlock(block_size as usize),
-            RawSinkEvent::WriteFilemark,
-            RawSinkEvent::WriteBlock(block_size as usize),
-        ],
+        vec![RawSinkEvent::WriteBlock(block_size as usize)],
         "co-fired bootstrap-block EW+EOM must stop before the bootstrap filemark"
     );
 }
 
 #[test]
-fn bootstrap_filemark_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
+fn sole_bot_bootstrap_filemark_rejects_cofired_early_warning_and_eom() {
     let block_size: u32 = 512;
-    let mut raw = EwEomTripwireRawTapeSink::on_filemark(2);
+    let mut raw = EwEomTripwireRawTapeSink::on_filemark(1);
     {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
-        start_object(&mut sink, 1, block_size);
-        sink.write_block(&fixed_block(0xC4, block_size))
-            .expect("object data writes before bootstrap-filemark EW+EOM");
-        sink.finish_object()
-            .expect("object closes before bootstrap");
-        exhaust_runtime_tape_reserve(&mut sink);
-
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
         let err = sink
             .write_bootstrap()
-            .expect_err("bootstrap filemark EW+EOM must hard-abort before reserve failure");
+            .expect_err("BOT Bootstrap filemark EW+EOM must hard-abort");
         match err {
             ParityError::Invariant(message) => {
                 assert!(
@@ -3977,7 +3498,7 @@ fn bootstrap_filemark_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
 
         let err = sink
             .finish()
-            .expect_err("poisoned sink must not write final bootstrap after bootstrap EOM");
+            .expect_err("poisoned sink must not finish after Bootstrap EOM");
         match err {
             ParityError::Invariant(message) => {
                 assert!(message.contains("poisoned"), "{message}");
@@ -3988,302 +3509,14 @@ fn bootstrap_filemark_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
         }
     }
 
-    assert_eq!(raw.ew_eom_filemarks_seen, vec![2]);
+    assert_eq!(raw.ew_eom_filemarks_seen, vec![1]);
     assert_eq!(
         raw.events,
         vec![
             RawSinkEvent::WriteBlock(block_size as usize),
             RawSinkEvent::WriteFilemark,
-            RawSinkEvent::WriteBlock(block_size as usize),
-            RawSinkEvent::WriteFilemark,
         ],
-        "co-fired bootstrap-filemark EW+EOM must not be followed by final bootstrap"
-    );
-}
-
-#[test]
-fn sidecar_body_early_warning_detects_natural_runtime_reserve_exhaustion() {
-    let block_size: u32 = 256;
-    let scheme = small_scheme();
-    let object_blocks: Vec<_> = (1..=12).map(|seed| fixed_block(seed, block_size)).collect();
-    let parity_shards = expected_epoch_parity(&scheme, &object_blocks, block_size);
-    let data_crcs = object_blocks
-        .iter()
-        .map(|block| data_shard_crc64(block))
-        .collect();
-    let descriptor = SidecarDescriptor {
-        tape_uuid: sample_uuid(),
-        epoch_id: 0,
-        k: scheme.data_blocks_per_stripe,
-        m: scheme.parity_blocks_per_stripe,
-        stripes_per_epoch: scheme.stripes_per_neighborhood,
-        block_size,
-        protected_ordinal_start: 0,
-        protected_ordinal_end_exclusive: object_blocks.len() as u64,
-    };
-    let encoded = encode_sidecar_tape_file(&descriptor, &parity_shards, data_crcs)
-        .expect("test sidecar encodes");
-    assert!(
-        encoded.header.shard_index_block_count > 1,
-        "this fixture needs a multi-block sidecar index to under-model body reserve only"
-    );
-    let sidecar_block_count = encoded.blocks.len();
-    let ew_on_last_sidecar_body_block = object_blocks.len() + sidecar_block_count;
-
-    let mut reserve_input =
-        capacity_input_with_block_size(object_blocks.len() as u64, 10_000, block_size);
-    reserve_input.sidecar_index_block_count = 0;
-    reserve_input.remaining_bootstrap_count = 0;
-    reserve_input.safety_margin_blocks = 0;
-    reserve_input.remaining_tape_blocks = reserve_input
-        .evaluate()
-        .expect("under-modeled reserve still admits the object at start")
-        .required_tape_blocks;
-
-    let mut raw = EarlyWarningRawTapeSink::new(vec![ew_on_last_sidecar_body_block], vec![]);
-    {
-        let mut sink = ParitySink::new_sidecar_only(&mut raw, scheme, sample_uuid(), block_size)
-            .expect("sidecar-only raw sink constructs");
-        sink.begin_object_with_capacity_reserve(reserve_input)
-            .expect("start reserve admits the object");
-        for block in &object_blocks {
-            sink.write_block(block).expect("object data writes");
-        }
-
-        let err = sink
-            .finish_object()
-            .expect_err("late sidecar EW must detect consumed reserve shortfall");
-        match err {
-            ParityError::CapacityReserveExceeded {
-                cause,
-                projected_object_blocks,
-                remaining_blocks,
-                reserve_blocks,
-                remaining_spool_bytes,
-                required_spool_bytes,
-            } => {
-                assert_eq!(cause, crate::CapacityReserveCause::TapeCapacity);
-                assert_eq!(projected_object_blocks, object_blocks.len() as u64);
-                assert_eq!(remaining_blocks, Some(0));
-                assert_eq!(reserve_blocks, Some(0));
-                assert_eq!(remaining_spool_bytes, None);
-                assert_eq!(required_spool_bytes, None);
-            }
-            other => panic!("expected runtime tape-capacity reserve failure, got {other:?}"),
-        }
-
-        let map = sink
-            .filemark_map
-            .clone()
-            .build()
-            .expect("object map remains valid after sidecar reserve abort");
-        assert_eq!(
-            map.entries(),
-            &[TapeFileMapEntry::object(0, object_blocks.len() as u64, 0)],
-            "sidecar reserve exhaustion must not commit the failed sidecar map entry"
-        );
-
-        let err = sink
-            .finish_object()
-            .expect_err("poisoned sink must not retry after reserve exhaustion");
-        match err {
-            ParityError::Invariant(message) => {
-                assert!(message.contains("poisoned"), "{message}");
-            }
-            other => panic!("expected poisoned invariant after reserve failure, got {other:?}"),
-        }
-    }
-
-    assert_eq!(raw.ew_blocks_seen, vec![ew_on_last_sidecar_body_block]);
-    assert_eq!(raw.filemark_count, 1, "only the object filemark committed");
-    assert_eq!(
-        raw.block_count, ew_on_last_sidecar_body_block,
-        "sidecar emission must stop at the EW reserve failure"
-    );
-}
-
-#[test]
-fn final_bootstrap_early_warning_detects_under_modeled_bootstrap_reserve() {
-    let block_size: u32 = 256;
-    let scheme = small_scheme();
-    let object_blocks: Vec<_> = (1..=2).map(|seed| fixed_block(seed, block_size)).collect();
-    let parity_shards = expected_epoch_parity(&scheme, &object_blocks, block_size);
-    let data_crcs = object_blocks
-        .iter()
-        .map(|block| data_shard_crc64(block))
-        .collect();
-    let descriptor = SidecarDescriptor {
-        tape_uuid: sample_uuid(),
-        epoch_id: 0,
-        k: scheme.data_blocks_per_stripe,
-        m: scheme.parity_blocks_per_stripe,
-        stripes_per_epoch: scheme.stripes_per_neighborhood,
-        block_size,
-        protected_ordinal_start: 0,
-        protected_ordinal_end_exclusive: object_blocks.len() as u64,
-    };
-    let encoded = encode_sidecar_tape_file(&descriptor, &parity_shards, data_crcs)
-        .expect("test final partial sidecar encodes");
-    let final_bootstrap_block = object_blocks.len() + encoded.blocks.len() + 1;
-
-    let mut reserve_input =
-        capacity_input_with_block_size(object_blocks.len() as u64, 10_000, block_size);
-    reserve_input.sidecar_index_block_count = u64::from(encoded.header.shard_index_block_count);
-    reserve_input.parity_shards_per_epoch = u64::from(encoded.header.parity_block_count);
-    reserve_input.remaining_bootstrap_count = 0;
-    reserve_input.safety_margin_blocks = 0;
-    reserve_input.remaining_tape_blocks = reserve_input
-        .evaluate()
-        .expect("under-modeled bootstrap reserve still admits the object")
-        .required_tape_blocks;
-
-    let mut raw = EarlyWarningRawTapeSink::new(vec![final_bootstrap_block], vec![]);
-    {
-        let mut sink = ParitySink::new_sidecar_only(&mut raw, scheme, sample_uuid(), block_size)
-            .expect("sidecar-only raw sink constructs");
-        sink.begin_object_with_capacity_reserve(reserve_input)
-            .expect("start reserve admits the object");
-        for block in &object_blocks {
-            sink.write_block(block).expect("object data writes");
-        }
-        sink.finish_object()
-            .expect("partial object closes before final sidecar/bootstrap flush");
-
-        let err = sink
-            .finish()
-            .expect_err("final bootstrap EW must detect the missing bootstrap reserve");
-        match err {
-            ParityError::CapacityReserveExceeded {
-                cause,
-                projected_object_blocks,
-                remaining_blocks,
-                reserve_blocks,
-                remaining_spool_bytes,
-                required_spool_bytes,
-            } => {
-                assert_eq!(cause, crate::CapacityReserveCause::TapeCapacity);
-                assert_eq!(projected_object_blocks, object_blocks.len() as u64);
-                assert_eq!(remaining_blocks, Some(0));
-                assert_eq!(reserve_blocks, Some(0));
-                assert_eq!(remaining_spool_bytes, None);
-                assert_eq!(required_spool_bytes, None);
-            }
-            other => panic!("expected final-bootstrap tape reserve failure, got {other:?}"),
-        }
-    }
-
-    assert_eq!(raw.ew_blocks_seen, vec![final_bootstrap_block]);
-    assert_eq!(
-        raw.filemark_count, 2,
-        "object and final sidecar filemarks commit, but bootstrap filemark must not"
-    );
-    assert_eq!(
-        raw.block_count, final_bootstrap_block,
-        "the final bootstrap block is the first write beyond the under-modeled reserve"
-    );
-}
-
-#[test]
-fn sidecar_filemark_early_warning_detects_under_modeled_filemark_reserve() {
-    let block_size: u32 = 256;
-    let scheme = small_scheme();
-    let object_blocks: Vec<_> = (1..=12).map(|seed| fixed_block(seed, block_size)).collect();
-    let parity_shards = expected_epoch_parity(&scheme, &object_blocks, block_size);
-    let data_crcs = object_blocks
-        .iter()
-        .map(|block| data_shard_crc64(block))
-        .collect();
-    let descriptor = SidecarDescriptor {
-        tape_uuid: sample_uuid(),
-        epoch_id: 0,
-        k: scheme.data_blocks_per_stripe,
-        m: scheme.parity_blocks_per_stripe,
-        stripes_per_epoch: scheme.stripes_per_neighborhood,
-        block_size,
-        protected_ordinal_start: 0,
-        protected_ordinal_end_exclusive: object_blocks.len() as u64,
-    };
-    let encoded = encode_sidecar_tape_file(&descriptor, &parity_shards, data_crcs)
-        .expect("test sidecar encodes");
-    let sidecar_block_count = encoded.blocks.len();
-
-    let mut reserve_input =
-        capacity_input_with_block_size(object_blocks.len() as u64, 10_000, block_size);
-    reserve_input.sidecar_index_block_count = u64::from(encoded.header.shard_index_block_count);
-    reserve_input.parity_shards_per_epoch = u64::from(encoded.header.parity_block_count);
-    reserve_input.sidecar_filemark_blocks = 0;
-    reserve_input.remaining_bootstrap_count = 0;
-    reserve_input.safety_margin_blocks = 0;
-    reserve_input.remaining_tape_blocks = reserve_input
-        .evaluate()
-        .expect("under-modeled sidecar-filemark reserve still admits the object")
-        .required_tape_blocks;
-
-    let mut raw = EarlyWarningRawTapeSink::new(vec![], vec![2]);
-    {
-        let mut sink = ParitySink::new_sidecar_only(&mut raw, scheme, sample_uuid(), block_size)
-            .expect("sidecar-only raw sink constructs");
-        sink.begin_object_with_capacity_reserve(reserve_input)
-            .expect("start reserve admits the object");
-        for block in &object_blocks {
-            sink.write_block(block).expect("object data writes");
-        }
-
-        let err = sink
-            .finish_object()
-            .expect_err("sidecar filemark EW must detect the missing filemark reserve");
-        match err {
-            ParityError::CapacityReserveExceeded {
-                cause,
-                projected_object_blocks,
-                remaining_blocks,
-                reserve_blocks,
-                remaining_spool_bytes,
-                required_spool_bytes,
-            } => {
-                assert_eq!(cause, crate::CapacityReserveCause::TapeCapacity);
-                assert_eq!(projected_object_blocks, object_blocks.len() as u64);
-                assert_eq!(remaining_blocks, Some(0));
-                assert_eq!(reserve_blocks, Some(0));
-                assert_eq!(remaining_spool_bytes, None);
-                assert_eq!(required_spool_bytes, None);
-            }
-            other => {
-                panic!("expected sidecar-filemark tape reserve failure, got {other:?}")
-            }
-        }
-
-        let map = sink
-            .filemark_map
-            .clone()
-            .build()
-            .expect("object map remains valid after sidecar filemark reserve abort");
-        assert_eq!(
-            map.entries(),
-            &[TapeFileMapEntry::object(0, object_blocks.len() as u64, 0)],
-            "sidecar filemark reserve exhaustion must not commit the sidecar map entry"
-        );
-
-        let err = sink
-            .finish_object()
-            .expect_err("poisoned sink must not retry after sidecar filemark reserve failure");
-        match err {
-            ParityError::Invariant(message) => {
-                assert!(message.contains("poisoned"), "{message}");
-            }
-            other => panic!("expected poisoned invariant after reserve failure, got {other:?}"),
-        }
-    }
-
-    assert_eq!(raw.ew_filemarks_seen, vec![2]);
-    assert_eq!(
-        raw.filemark_count, 2,
-        "object and sidecar filemarks were written, but only the object may be cataloged"
-    );
-    assert_eq!(
-        raw.block_count,
-        object_blocks.len() + sidecar_block_count,
-        "sidecar emission must stop immediately after the EW-bearing filemark"
+        "co-fired BOT Bootstrap filemark EW+EOM must stop the session"
     );
 }
 
@@ -4364,15 +3597,8 @@ fn sidecar_body_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
     let sidecar_block_count = encoded.blocks.len();
     let ew_eom_on_last_sidecar_body_block = object_blocks.len() + sidecar_block_count;
 
-    let mut reserve_input =
+    let reserve_input =
         capacity_input_with_block_size(object_blocks.len() as u64, 10_000, block_size);
-    reserve_input.sidecar_index_block_count = 0;
-    reserve_input.remaining_bootstrap_count = 0;
-    reserve_input.safety_margin_blocks = 0;
-    reserve_input.remaining_tape_blocks = reserve_input
-        .evaluate()
-        .expect("under-modeled reserve still admits the object at start")
-        .required_tape_blocks;
 
     let mut raw = EarlyWarningEomRawTapeSink {
         cursor: 0,
@@ -4385,7 +3611,7 @@ fn sidecar_body_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
     {
         let mut sink = ParitySink::new_sidecar_only(&mut raw, scheme, sample_uuid(), block_size)
             .expect("sidecar-only raw sink constructs");
-        sink.begin_object_with_capacity_reserve(reserve_input)
+        begin_object_with_runtime_capacity(&mut sink, reserve_input)
             .expect("start reserve admits the object");
         for block in &object_blocks {
             sink.write_block(block).expect("object data writes");
@@ -4411,7 +3637,10 @@ fn sidecar_body_eom_bypasses_runtime_reserve_predicate_when_ew_cofires() {
             .expect("object map remains valid after sidecar EOM");
         assert_eq!(
             map.entries(),
-            &[TapeFileMapEntry::object(0, object_blocks.len() as u64, 0)],
+            &[
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, object_blocks.len() as u64, 0),
+            ],
             "co-fired EW+EOM must not commit the failed sidecar map entry"
         );
 
@@ -4472,7 +3701,7 @@ fn sidecar_only_multi_object_early_warning_interleaves_without_state_leakage() {
         let first = sink
             .finish_object()
             .expect("first object closes despite EW on its filemark");
-        assert_eq!(first.tape_file_number, 0);
+        assert_eq!(first.tape_file_number, 1);
         assert_eq!(first.first_parity_data_ordinal, 0);
         assert_eq!(first.data_block_count, 5);
         assert!(first.filemark_outcome.early_warning);
@@ -4480,12 +3709,12 @@ fn sidecar_only_multi_object_early_warning_interleaves_without_state_leakage() {
         assert!(first.sidecars_emitted.is_empty());
         assert_eq!(first.highest_protected_ordinal, 0);
 
-        let (second_tape_file, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-                7, 10_000, block_size, 5,
-            ))
-            .expect("second object reserve fits across a partial epoch");
-        assert_eq!(second_tape_file, 1);
+        let (second_tape_file, _) = begin_object_with_runtime_capacity(
+            &mut sink,
+            capacity_input_with_current_fill(7, 10_000, block_size, 5),
+        )
+        .expect("second object reserve fits across a partial epoch");
+        assert_eq!(second_tape_file, 2);
         for local in 1u8..=7 {
             let seed = 5 + local;
             let outcome = sink
@@ -4503,14 +3732,14 @@ fn sidecar_only_multi_object_early_warning_interleaves_without_state_leakage() {
         let second = sink
             .finish_object()
             .expect("second object closes and emits completed sidecar");
-        assert_eq!(second.tape_file_number, 1);
+        assert_eq!(second.tape_file_number, 2);
         assert_eq!(second.first_parity_data_ordinal, 5);
         assert_eq!(second.data_block_count, 7);
         assert!(!second.filemark_outcome.early_warning);
         assert!(!second.filemark_outcome.end_of_medium);
         assert_eq!(second.sidecars_emitted.len(), 1);
         let sidecar = &second.sidecars_emitted[0];
-        assert_eq!(sidecar.tape_file_number, 2);
+        assert_eq!(sidecar.tape_file_number, 3);
         assert_eq!(sidecar.protected_ordinal_start, 0);
         assert_eq!(sidecar.protected_ordinal_end_exclusive, 12);
         assert!(!sidecar.filemark_outcome.early_warning);
@@ -4518,68 +3747,42 @@ fn sidecar_only_multi_object_early_warning_interleaves_without_state_leakage() {
         assert_eq!(second.highest_protected_ordinal, 12);
         sidecar_block_count = sidecar.block_count;
 
-        sink.finish()
-            .expect("final bootstrap still writes after interleaved EW")
+        sink.finish().expect("clean finish after interleaved EW")
     };
 
     assert_eq!(raw.ew_blocks_seen, vec![6, 12]);
     assert_eq!(raw.ew_filemarks_seen, vec![1]);
-    assert_eq!(raw.filemark_count, 5);
+    assert_eq!(raw.filemark_count, 4);
     assert_eq!(
         raw.block_count as u64,
-        12 + sidecar_block_count + 1,
-        "both objects, the completed sidecar, and final bootstrap must be written"
+        12 + sidecar_block_count,
+        "both objects and the completed sidecar must be written"
     );
-
-    let final_bootstrap = crate::bootstrap::parse_bootstrap_block(
-        raw.blocks
-            .last()
-            .expect("final bootstrap block was written"),
-    )
-    .expect("final bootstrap parses after interleaved EW");
-    let digest = final_bootstrap
-        .filemark_map_digest
-        .expect("final bootstrap carries map digest");
-    assert!(digest.is_final_map);
-    assert_eq!(digest.tape_file_count, 4);
-    assert_eq!(digest.map_total_data_ordinals, 12);
-    assert_eq!(digest.highest_protected_ordinal, 12);
 }
 
 #[test]
-fn bootstrap_early_warning_finishes_bootstrap_tape_files() {
+fn bootstrap_early_warning_finishes_the_sole_bot_tape_file() {
     let block_size: u32 = 512;
     let mut raw = EarlyWarningRawTapeSink::new(vec![1, 2], vec![1, 2]);
     let _final_geometry = {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
         assert_eq!(
             sink.write_bootstrap()
-                .expect("non-final bootstrap EW does not abort"),
+                .expect("sole BOT Bootstrap EW does not abort"),
             0
         );
         sink.finish()
-            .expect("final bootstrap EW does not abort the clean session")
+            .expect("clean session finish emits no additional Bootstrap")
     };
 
-    assert_eq!(raw.ew_blocks_seen, vec![1, 2]);
+    assert_eq!(raw.ew_blocks_seen, vec![1]);
     assert_eq!(raw.ew_filemarks_seen, vec![1, 2]);
-    assert_eq!(raw.block_count, 2);
-    assert_eq!(raw.filemark_count, 3);
-
-    let final_bootstrap = crate::bootstrap::parse_bootstrap_block(
-        raw.blocks
-            .last()
-            .expect("final bootstrap block was written"),
-    )
-    .expect("final bootstrap parses after EW-only writes");
-    let digest = final_bootstrap
-        .filemark_map_digest
-        .expect("final bootstrap carries map digest");
-    assert!(digest.is_final_map);
-    assert_eq!(digest.tape_file_count, 2);
-    assert_eq!(digest.map_total_data_ordinals, 0);
+    assert_eq!(raw.block_count, 1);
+    assert_eq!(raw.filemark_count, 2);
+    let parsed = crate::bootstrap::parse_bootstrap_block(&raw.blocks[0])
+        .expect("sole BOT Bootstrap parses after EW-only write");
+    assert_eq!(parsed.sequence, 0);
 }
 
 #[test]
@@ -5259,7 +4462,10 @@ fn finish_object_rejects_sidecar_filemark_eom_even_when_early_warning_cofires() 
             .expect("object-only map remains valid after sidecar filemark EOM");
         assert_eq!(
             map.entries(),
-            &[TapeFileMapEntry::object(0, 12, 0)],
+            &[
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, 12, 0),
+            ],
             "EW+EOM on the sidecar filemark must not commit the sidecar map entry"
         );
 
@@ -5394,9 +4600,8 @@ fn write_bootstrap_rejects_eom_on_bootstrap_block_before_filemark() {
     let block_size: u32 = 512;
     let mut raw = BootstrapEomRawTapeSink::eom_on_block(1);
     {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
 
         let err = sink
             .write_bootstrap()
@@ -5434,9 +4639,8 @@ fn write_bootstrap_rejects_eom_on_bootstrap_filemark_before_catalog_commit() {
     let block_size: u32 = 512;
     let mut raw = BootstrapEomRawTapeSink::eom_on_filemark(1);
     {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
 
         let err = sink
             .write_bootstrap()
@@ -5479,9 +4683,8 @@ fn write_bootstrap_prior_early_warning_does_not_mask_bootstrap_filemark_eom() {
         .with_early_warning_on_block(1)
         .with_early_warning_on_filemark(1);
     {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
+        let mut sink = ParitySink::new(&mut raw, small_scheme(), sample_uuid(), block_size)
+            .expect("sidecar-only raw sink constructs");
 
         let err = sink
             .write_bootstrap()
@@ -5520,1119 +4723,39 @@ fn write_bootstrap_prior_early_warning_does_not_mask_bootstrap_filemark_eom() {
 }
 
 #[test]
-fn finish_rejects_eom_on_final_bootstrap_block_before_filemark() {
+fn begin_object_rejects_object_larger_than_capacity_without_spanning() {
     let block_size: u32 = 512;
-    let mut raw = BootstrapEomRawTapeSink::eom_on_block(1);
+    let capacity_basis_blocks = 20_000;
+    let projected_object_blocks = capacity_basis_blocks + 1;
+    let mut raw = RecordingRawTapeSink::default();
     {
         let sink =
             ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
-
-        let err = sink
-            .finish()
-            .expect_err("final bootstrap block EOM must abort before filemark");
-        match err {
-            ParityError::Invariant(message) => {
-                assert!(
-                    message.contains("bootstrap block write reached end of medium"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected final bootstrap block EOM invariant, got {other:?}"),
-        }
-    }
-
-    assert_eq!(
-        raw.events,
-        vec![RawSinkEvent::WriteBlock(block_size as usize)],
-        "final bootstrap block EOM must not be followed by its filemark"
-    );
-}
-
-#[test]
-fn finish_prior_early_warning_does_not_mask_final_bootstrap_filemark_eom() {
-    let block_size: u32 = 512;
-    let mut raw = BootstrapEomRawTapeSink::eom_on_filemark(1)
-        .with_early_warning_on_block(1)
-        .with_early_warning_on_filemark(1);
-    {
-        let sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
-
-        let err = sink
-            .finish()
-            .expect_err("final bootstrap filemark EOM must win over prior EW");
-        match err {
-            ParityError::Invariant(message) => {
-                assert!(
-                    message.contains("bootstrap trailing filemark reached end of medium"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected bootstrap filemark EOM invariant, got {other:?}"),
-        }
-    }
-
-    assert_eq!(raw.ew_blocks_seen, vec![1]);
-    assert_eq!(raw.ew_filemarks_seen, vec![1]);
-    assert_eq!(
-        raw.events,
-        vec![
-            RawSinkEvent::WriteBlock(block_size as usize),
-            RawSinkEvent::WriteFilemark,
-        ],
-        "EW before final-bootstrap filemark EOM must not be reported as a clean finish"
-    );
-}
-
-#[test]
-fn finish_rejects_eom_on_final_bootstrap_filemark() {
-    let block_size: u32 = 512;
-    let mut raw = BootstrapEomRawTapeSink::eom_on_filemark(1);
-    {
-        let sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sidecar-only raw sink constructs");
-
-        let err = sink
-            .finish()
-            .expect_err("final bootstrap filemark EOM must abort the session");
-        match err {
-            ParityError::Invariant(message) => {
-                assert!(
-                    message.contains("bootstrap trailing filemark reached end of medium"),
-                    "{message}"
-                );
-            }
-            other => panic!("expected bootstrap filemark EOM invariant, got {other:?}"),
-        }
-    }
-
-    assert_eq!(
-        raw.events,
-        vec![
-            RawSinkEvent::WriteBlock(block_size as usize),
-            RawSinkEvent::WriteFilemark,
-        ],
-        "final bootstrap filemark EOM must not be reported as a clean finish"
-    );
-}
-
-#[test]
-fn sidecar_only_from_resume_continues_rebuilt_live_epoch() {
-    let block_size: u32 = 512;
-    let committed_prefix = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 14, 0),
-        TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-    ])
-    .expect("committed prefix validates");
-    let live_block_a = fixed_block(0xA1, block_size);
-    let live_block_b = fixed_block(0xA2, block_size);
-    let live_epoch = ResumeLiveEpochState {
-        epoch_id: 1,
-        protected_ordinal_start: 12,
-        next_data_ordinal: 14,
-        data_blocks_in_epoch: 2,
-        stripe_buffers: vec![
-            vec![live_block_a.clone()],
-            vec![live_block_b.clone()],
-            Vec::new(),
-        ],
-        data_shard_crc64s: vec![
-            data_shard_crc64(&live_block_a),
-            data_shard_crc64(&live_block_b),
-        ],
-    };
-    let resume_result = ResumeAppendResult {
-        append_after_tape_file_number: 2,
-        sidecars_emitted: Vec::new(),
-        highest_protected_ordinal: 12,
-        live_epoch_start: 12,
-        next_data_ordinal: 14,
-        next_epoch_id: 1,
-    };
-    let append_lba: u64 = committed_prefix
-        .entries()
-        .iter()
-        .map(|entry| entry.block_count + 1)
-        .sum();
-    let mut raw = RecordingRawTapeSink {
-        cursor: append_lba,
-        events: Vec::new(),
-        blocks: Vec::new(),
-    };
-
-    let mut sink = ParitySink::new_sidecar_only_from_resume_without_journal(
-        &mut raw,
-        small_scheme(),
-        sample_uuid(),
-        block_size,
-        ResumeWriterSeed {
-            committed_prefix: &committed_prefix,
-            committed_prefix_sidecar_directory_entries: committed_prefix_sidecar_directory_entries(
-                &committed_prefix,
-            ),
-            committed_prefix_object_rows: Vec::new(),
-            resume_result: &resume_result,
-            live_epoch: Some(live_epoch),
-            next_bootstrap_sequence: 7,
-        },
-    )
-    .expect("resume sink constructs");
-    assert_eq!(sink.neighborhood_idx(), 1);
-    assert_eq!(sink.data_blocks_in_neighborhood(), 2);
-
-    let (tape_file_number, _) = sink
-        .begin_object_with_capacity_reserve(capacity_input_with_current_fill(
-            10, 10_000, block_size, 2,
-        ))
-        .expect("resumed object reserve fits");
-    assert_eq!(tape_file_number, 3);
-    for seed in 0..10 {
-        sink.write_block(&fixed_block(seed, block_size))
-            .expect("append object block");
-    }
-    let summary = sink.finish_object().expect("object closes");
-
-    assert_eq!(summary.tape_file_number, 3);
-    assert_eq!(summary.first_parity_data_ordinal, 14);
-    assert_eq!(summary.data_block_count, 10);
-    assert_eq!(summary.sidecars_emitted.len(), 1);
-    let sidecar = &summary.sidecars_emitted[0];
-    assert_eq!(sidecar.tape_file_number, 4);
-    assert_eq!(sidecar.epoch_id, 1);
-    assert_eq!(sidecar.protected_ordinal_start, 12);
-    assert_eq!(sidecar.protected_ordinal_end_exclusive, 24);
-    assert_eq!(summary.highest_protected_ordinal, 24);
-    assert_eq!(sink.neighborhood_idx(), 2);
-    assert_eq!(sink.data_blocks_in_neighborhood(), 0);
-    drop(sink);
-    assert_eq!(
-        raw.events
-            .iter()
-            .filter(|event| matches!(event, RawSinkEvent::WriteFilemark))
-            .count(),
-        2,
-        "object close and the resumed sidecar each use a raw filemark barrier"
-    );
-}
-
-#[test]
-fn sidecar_only_from_resume_checkpoint_preserves_prefix_sidecar_directory() {
-    let block_size: u32 = 512;
-    let committed_prefix = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 12, 0),
-        TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-    ])
-    .expect("committed prefix validates");
-    let resume_result = ResumeAppendResult {
-        append_after_tape_file_number: 2,
-        sidecars_emitted: Vec::new(),
-        highest_protected_ordinal: 12,
-        live_epoch_start: 12,
-        next_data_ordinal: 12,
-        next_epoch_id: 1,
-    };
-    let append_lba: u64 = committed_prefix
-        .entries()
-        .iter()
-        .map(|entry| entry.block_count + 1)
-        .sum();
-    let mut raw = RecordingRawTapeSink {
-        cursor: append_lba,
-        events: Vec::new(),
-        blocks: Vec::new(),
-    };
-
-    let checkpoint = {
-        let mut sink = ParitySink::new_sidecar_only_from_resume_without_journal(
-            &mut raw,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &committed_prefix,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&committed_prefix),
-                committed_prefix_object_rows: Vec::new(),
-                resume_result: &resume_result,
-                live_epoch: None,
-                next_bootstrap_sequence: 1,
-            },
-        )
-        .expect("resume sink constructs with prefix sidecar directory");
-        sink.checkpoint()
-            .expect("checkpoint after no-sidecar resume succeeds")
-    };
-
-    assert_eq!(checkpoint.bootstrap_tape_file_number, 3);
-    assert_eq!(checkpoint.highest_protected_ordinal, 12);
-    assert_eq!(checkpoint.total_committed_ordinals, 12);
-    let payload = crate::bootstrap::parse_bootstrap_block(
-        raw.blocks
-            .last()
-            .expect("checkpoint wrote a bootstrap block"),
-    )
-    .expect("checkpoint bootstrap parses");
-    let directory = payload
-        .sidecar_epoch_directory
-        .expect("checkpoint bootstrap carries sidecar directory");
-    assert_eq!(directory.directory_scope_tape_file_count, 4);
-    assert_eq!(directory.directory_scope_highest_protected_ordinal, 12);
-    assert_eq!(directory.entries.len(), 1);
-    assert_eq!(directory.entries[0].tape_file_number, 2);
-    assert_eq!(directory.entries[0].protected_ordinal_start, 0);
-    assert_eq!(directory.entries[0].protected_ordinal_end_exclusive, 12);
-}
-
-#[test]
-fn sidecar_only_from_resume_rejects_stale_bootstrap_sequence() {
-    let block_size: u32 = 512;
-    let committed_prefix = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 12, 0),
-        TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-        TapeFileMapEntry::bootstrap(3, 1),
-    ])
-    .expect("committed prefix validates");
-    let resume_result = ResumeAppendResult {
-        append_after_tape_file_number: 3,
-        sidecars_emitted: Vec::new(),
-        highest_protected_ordinal: 12,
-        live_epoch_start: 12,
-        next_data_ordinal: 12,
-        next_epoch_id: 1,
-    };
-    let append_lba: u64 = committed_prefix
-        .entries()
-        .iter()
-        .map(|entry| entry.block_count + 1)
-        .sum();
-    let mut raw = RecordingRawTapeSink {
-        cursor: append_lba,
-        events: Vec::new(),
-        blocks: Vec::new(),
-    };
-
-    let result = ParitySink::new_sidecar_only_from_resume_without_journal(
-        &mut raw,
-        small_scheme(),
-        sample_uuid(),
-        block_size,
-        ResumeWriterSeed {
-            committed_prefix: &committed_prefix,
-            committed_prefix_sidecar_directory_entries: committed_prefix_sidecar_directory_entries(
-                &committed_prefix,
-            ),
-            committed_prefix_object_rows: Vec::new(),
-            resume_result: &resume_result,
-            live_epoch: None,
-            next_bootstrap_sequence: 1,
-        },
-    );
-    let err = match result {
-        Ok(_) => panic!("stale bootstrap sequence must be rejected"),
-        Err(err) => err,
-    };
-    match err {
-        ParityError::Invariant(message) => {
-            assert!(message.contains("bootstrap sequence"));
-        }
-        other => panic!("expected bootstrap-sequence invariant, got {other:?}"),
-    }
-    assert!(
-        raw.events.is_empty(),
-        "stale resume seed must be rejected before querying the raw sink"
-    );
-}
-
-#[test]
-fn sidecar_only_from_resume_requires_raw_cursor_at_catalog_append_point() {
-    let block_size: u32 = 512;
-    let committed_prefix = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 12, 0),
-        TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-    ])
-    .expect("committed prefix validates");
-    let resume_result = ResumeAppendResult {
-        append_after_tape_file_number: 2,
-        sidecars_emitted: Vec::new(),
-        highest_protected_ordinal: 12,
-        live_epoch_start: 12,
-        next_data_ordinal: 12,
-        next_epoch_id: 1,
-    };
-    let expected_append = committed_prefix
-        .append_position_after_prefix()
-        .expect("append position computes");
-    for (cursor, label) in [
-        (0, "at BOT after a reset"),
-        (expected_append.lba - 1, "before the catalog append point"),
-        (
-            expected_append.lba + 1,
-            "one block past the catalog append point",
-        ),
-        (
-            expected_append.lba + 4,
-            "past a stale provisional physical tail",
-        ),
-    ] {
-        let mut raw = RecordingRawTapeSink {
-            cursor,
-            events: Vec::new(),
-            blocks: Vec::new(),
-        };
-
-        let result = ParitySink::new_sidecar_only_from_resume_without_journal(
-            &mut raw,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &committed_prefix,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&committed_prefix),
-                committed_prefix_object_rows: Vec::new(),
-                resume_result: &resume_result,
-                live_epoch: None,
-                next_bootstrap_sequence: 1,
-            },
-        );
-        let err = match result {
-            Ok(_) => panic!("resume sink must reject a raw cursor {label}"),
-            Err(err) => err,
-        };
-        match err {
-            ParityError::ResumeAppend(message) => {
-                assert!(
-                    message.contains("expected append position"),
-                    "{label}: {message}"
-                );
-                assert!(
-                    message.contains("catalog-committed prefix"),
-                    "{label}: {message}"
-                );
-            }
-            other => panic!("expected resume append cursor error for {label}, got {other:?}"),
-        }
-        assert_eq!(raw.events, vec![RawSinkEvent::Position], "{label}");
-        assert!(
-            raw.blocks.is_empty(),
-            "{label}: wrong-cursor resume must reject before appending object data"
-        );
-    }
-}
-
-#[test]
-fn sidecar_only_from_resume_cursor_guard_covers_prefix_tail_shapes() {
-    let block_size: u32 = 512;
-    let live_block_a = fixed_block(0xB1, block_size);
-    let live_block_b = fixed_block(0xB2, block_size);
-    let partial_object_live_epoch = ResumeLiveEpochState {
-        epoch_id: 0,
-        protected_ordinal_start: 0,
-        next_data_ordinal: 2,
-        data_blocks_in_epoch: 2,
-        stripe_buffers: vec![
-            vec![live_block_a.clone()],
-            vec![live_block_b.clone()],
-            Vec::new(),
-        ],
-        data_shard_crc64s: vec![
-            data_shard_crc64(&live_block_a),
-            data_shard_crc64(&live_block_b),
-        ],
-    };
-
-    let cases = vec![
-        (
-            "partial object tail",
-            FilemarkMap::new(vec![
-                TapeFileMapEntry::bootstrap(0, 1),
-                TapeFileMapEntry::object(1, 2, 0),
-            ])
-            .expect("partial-object prefix validates"),
-            ResumeAppendResult {
-                append_after_tape_file_number: 1,
-                sidecars_emitted: Vec::new(),
-                highest_protected_ordinal: 0,
-                live_epoch_start: 0,
-                next_data_ordinal: 2,
-                next_epoch_id: 0,
-            },
-            Some(partial_object_live_epoch),
-            1,
-        ),
-        (
-            "committed sidecar after intermediate bootstrap",
-            FilemarkMap::new(vec![
-                TapeFileMapEntry::bootstrap(0, 1),
-                TapeFileMapEntry::object(1, 12, 0),
-                TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-                TapeFileMapEntry::bootstrap(3, 1),
-                TapeFileMapEntry::object(4, 12, 12),
-                TapeFileMapEntry::parity_sidecar(5, 1, 1, 12, 24),
-            ])
-            .expect("sidecar-tail prefix validates"),
-            ResumeAppendResult {
-                append_after_tape_file_number: 5,
-                sidecars_emitted: Vec::new(),
-                highest_protected_ordinal: 24,
-                live_epoch_start: 24,
-                next_data_ordinal: 24,
-                next_epoch_id: 2,
-            },
-            None,
-            2,
-        ),
-        (
-            "final bootstrap tail",
-            FilemarkMap::new(vec![
-                TapeFileMapEntry::bootstrap(0, 1),
-                TapeFileMapEntry::object(1, 12, 0),
-                TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-                TapeFileMapEntry::bootstrap(3, 1),
-                TapeFileMapEntry::object(4, 12, 12),
-                TapeFileMapEntry::parity_sidecar(5, 1, 1, 12, 24),
-                TapeFileMapEntry::bootstrap(6, 1),
-            ])
-            .expect("bootstrap-tail prefix validates"),
-            ResumeAppendResult {
-                append_after_tape_file_number: 6,
-                sidecars_emitted: Vec::new(),
-                highest_protected_ordinal: 24,
-                live_epoch_start: 24,
-                next_data_ordinal: 24,
-                next_epoch_id: 2,
-            },
-            None,
-            3,
-        ),
-    ];
-
-    for (label, committed_prefix, resume_result, live_epoch, next_bootstrap_sequence) in cases {
-        let expected_append = committed_prefix
-            .append_position_after_prefix()
-            .expect("append position computes");
-
-        for (cursor, cursor_label) in [
-            (0, "at BOT after a reset"),
-            (expected_append.lba - 1, "one block before the append point"),
-            (expected_append.lba + 1, "one block past the append point"),
-            (
-                expected_append.lba + 4,
-                "past a stale provisional sidecar tail",
-            ),
-            (
-                expected_append.lba + 1_000_000,
-                "far past the catalog prefix",
-            ),
-            (u64::MAX, "at the absolute maximum LBA"),
-        ] {
-            let case_label = format!("{label}; cursor {cursor_label}");
-            let mut raw = RecordingRawTapeSink {
-                cursor,
-                events: Vec::new(),
-                blocks: Vec::new(),
-            };
-
-            let result = ParitySink::new_sidecar_only_from_resume_without_journal(
-                &mut raw,
-                small_scheme(),
-                sample_uuid(),
+                .unwrap();
+        let input = TerminalTripleCloseInput {
+            capacity_basis_blocks,
+            ..capacity_input_with_block_size(
+                projected_object_blocks,
+                capacity_basis_blocks,
                 block_size,
-                ResumeWriterSeed {
-                    committed_prefix: &committed_prefix,
-                    committed_prefix_sidecar_directory_entries:
-                        committed_prefix_sidecar_directory_entries(&committed_prefix),
-                    committed_prefix_object_rows: Vec::new(),
-                    resume_result: &resume_result,
-                    live_epoch: live_epoch.clone(),
-                    next_bootstrap_sequence,
-                },
-            );
-            let err = match result {
-                Ok(_) => panic!("resume sink must reject {case_label}"),
-                Err(err) => err,
-            };
-            match err {
-                ParityError::ResumeAppend(message) => {
-                    assert!(
-                        message.contains("expected append position"),
-                        "{case_label}: {message}"
-                    );
-                    assert!(
-                        message.contains("catalog-committed prefix"),
-                        "{case_label}: {message}"
-                    );
-                    assert!(
-                        message.contains(&format!("lba: {}", expected_append.lba)),
-                        "{case_label}: {message}"
-                    );
-                    assert!(
-                        message.contains(&format!("lba: {cursor}")),
-                        "{case_label}: {message}"
-                    );
-                }
-                other => {
-                    panic!("expected resume append cursor error for {case_label}, got {other:?}")
-                }
-            }
-            assert_eq!(raw.events, vec![RawSinkEvent::Position], "{case_label}");
-            assert!(
-                raw.blocks.is_empty(),
-                "{case_label}: wrong-cursor resume must reject before any raw block write"
-            );
-        }
-    }
-}
-
-#[test]
-fn sidecar_only_from_resume_appends_after_committed_resume_sidecars() {
-    let block_size: u32 = 512;
-    let committed_prefix = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 36, 0),
-        TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 12),
-        TapeFileMapEntry::parity_sidecar(3, 1, 1, 12, 24),
-        TapeFileMapEntry::parity_sidecar(4, 1, 2, 24, 36),
-    ])
-    .expect("committed prefix with resume sidecars validates");
-    let original_append = committed_prefix
-        .truncate_to_tape_files(3)
-        .expect("original committed prefix validates")
-        .append_position_after_prefix()
-        .expect("original append position computes");
-    let first_resume_sidecar_append = committed_prefix
-        .truncate_to_tape_files(4)
-        .expect("prefix after first resume sidecar validates")
-        .append_position_after_prefix()
-        .expect("first resume sidecar append position computes");
-    let committed_append = committed_prefix
-        .append_position_after_prefix()
-        .expect("committed append position computes");
-    assert_ne!(
-        original_append, committed_append,
-        "resume-generated sidecars must move the catalog append point"
-    );
-    let first_resume_sidecar = SidecarTapeFile {
-        tape_file_number: 3,
-        epoch_id: 1,
-        block_count: 1,
-        protected_ordinal_start: 12,
-        protected_ordinal_end_exclusive: 24,
-        sidecar_header_block_count: 1,
-        parity_shard_block_count: 1,
-        canonical_metadata_hash: [0xB1; 32],
-        final_partial_epoch: false,
-        filemark_outcome: WriteFilemarksOutcome::from_device_position(
-            false,
-            false,
-            physical_to_tape_position(first_resume_sidecar_append),
-        ),
-        physical_start_lba: None,
-    };
-    let second_resume_sidecar = SidecarTapeFile {
-        tape_file_number: 4,
-        epoch_id: 2,
-        block_count: 1,
-        protected_ordinal_start: 24,
-        protected_ordinal_end_exclusive: 36,
-        sidecar_header_block_count: 1,
-        parity_shard_block_count: 1,
-        canonical_metadata_hash: [0xB2; 32],
-        final_partial_epoch: false,
-        filemark_outcome: WriteFilemarksOutcome::from_device_position(
-            false,
-            false,
-            physical_to_tape_position(committed_append),
-        ),
-        physical_start_lba: None,
-    };
-    let resume_result = ResumeAppendResult {
-        append_after_tape_file_number: 2,
-        sidecars_emitted: vec![first_resume_sidecar, second_resume_sidecar],
-        highest_protected_ordinal: 36,
-        live_epoch_start: 36,
-        next_data_ordinal: 36,
-        next_epoch_id: 3,
-    };
-
-    for (cursor, label) in [
-        (original_append, "pre-rebuild append point"),
-        (
-            first_resume_sidecar_append,
-            "append point after only the first resume sidecar",
-        ),
-    ] {
-        let mut stale_raw = RecordingRawTapeSink {
-            cursor: cursor.lba,
-            events: Vec::new(),
-            blocks: Vec::new(),
+            )
         };
-        let result = ParitySink::new_sidecar_only_from_resume_without_journal(
-            &mut stale_raw,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &committed_prefix,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&committed_prefix),
-                committed_prefix_object_rows: Vec::new(),
-                resume_result: &resume_result,
-                live_epoch: None,
-                next_bootstrap_sequence: 1,
-            },
-        );
-        let err = match result {
-            Ok(_) => {
-                panic!("resume sink must reject the {label} after multiple resume sidecars commit")
-            }
-            Err(err) => err,
-        };
-        match err {
-            ParityError::ResumeAppend(message) => {
-                assert!(message.contains("catalog-committed prefix"), "{message}");
-                assert!(
-                    message.contains(&format!("lba: {}", committed_append.lba)),
-                    "{message}"
-                );
-                assert!(
-                    message.contains(&format!("lba: {}", cursor.lba)),
-                    "{message}"
-                );
-            }
-            other => panic!("expected resume append cursor error, got {other:?}"),
-        }
-        assert_eq!(stale_raw.events, vec![RawSinkEvent::Position], "{label}");
-        assert!(
-            stale_raw.blocks.is_empty(),
-            "{label}: stale cursor must reject before any raw block write"
-        );
-    }
+        let err = crate::capacity::reserve_terminal_object_for_sink_test(input)
+            .expect_err("object larger than an empty tape must not start");
 
-    let mut raw = RecordingRawTapeSink {
-        cursor: committed_append.lba,
-        events: Vec::new(),
-        blocks: Vec::new(),
-    };
-    {
-        let mut sink = ParitySink::new_sidecar_only_from_resume_without_journal(
-            &mut raw,
-            small_scheme(),
-            sample_uuid(),
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &committed_prefix,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&committed_prefix),
-                committed_prefix_object_rows: Vec::new(),
-                resume_result: &resume_result,
-                live_epoch: None,
-                next_bootstrap_sequence: 1,
-            },
-        )
-        .expect("resume sink constructs at the post-sidecar append point");
-        let (next_tape_file_number, _) = sink
-            .begin_object_with_capacity_reserve(capacity_input_with_block_size(
-                1, 10_000, block_size,
-            ))
-            .expect("resumed object reserve fits");
-        assert_eq!(
-            next_tape_file_number, 5,
-            "new object must be assigned after the committed resume sidecars"
-        );
-        let next_object_block = fixed_block(0xE1, block_size);
-        let write = sink
-            .write_block(&next_object_block)
-            .expect("resumed object block writes after committed sidecars");
-        assert_eq!(
-            write.position_after.lba,
-            committed_append.lba + 1,
-            "first resumed object block must append after all committed resume sidecars"
-        );
-        let summary = sink
-            .finish_object()
-            .expect("resumed object filemark writes after data");
-        assert_eq!(summary.tape_file_number, 5);
-        assert_eq!(summary.first_parity_data_ordinal, 36);
-        assert_eq!(summary.projected_size_blocks, 1);
-        assert_eq!(summary.data_block_count, 1);
-        assert_eq!(summary.highest_protected_ordinal, 36);
-        assert!(summary.sidecars_emitted.is_empty());
-        assert_eq!(
-            summary.filemark_outcome.position_after.lba,
-            committed_append.lba + 2,
-            "resumed object filemark must close the object after the written body block"
-        );
-    }
-    assert_eq!(
-        raw.events,
-        vec![
-            RawSinkEvent::Position,
-            RawSinkEvent::WriteBlock(block_size as usize),
-            RawSinkEvent::WriteFilemark,
-        ]
-    );
-    assert_eq!(
-        raw.blocks,
-        vec![fixed_block(0xE1, block_size)],
-        "resumed writer must write the next object's body only after the resume sidecars"
-    );
-}
-
-#[cfg(any())]
-#[test]
-fn begin_object_with_capacity_reserve_starts_only_after_reserve_passes() {
-    let mut inner = VecBlockSink::new();
-    {
-        let mut sink = ParitySink::new(&mut inner, small_scheme(), sample_uuid(), 8).unwrap();
-
-        let err = sink
-            .begin_object_with_capacity_reserve(capacity_input(2, 16))
-            .expect_err("reserve should reject before object starts");
         match err {
             ParityError::CapacityReserveExceeded {
-                cause,
-                projected_object_blocks,
+                cause: crate::CapacityReserveCause::TapeCapacity,
+                projected_object_blocks: reported_projected,
                 remaining_blocks,
                 reserve_blocks,
                 ..
             } => {
-                assert_eq!(cause, crate::CapacityReserveCause::TapeCapacity);
-                assert_eq!(projected_object_blocks, 2);
-                assert_eq!(remaining_blocks, Some(16));
-                assert_eq!(reserve_blocks, Some(18));
-            }
-            other => panic!("expected CapacityReserveExceeded, got {other:?}"),
-        }
-        assert_eq!(sink.active_object_tape_file_number(), None);
-
-        let (tape_file_number, report) = sink
-            .begin_object_with_capacity_reserve(capacity_input(2, 17))
-            .expect("reserve fits");
-        assert_eq!(tape_file_number, 0);
-        assert_eq!(report.required_tape_blocks, 17);
-        assert_eq!(sink.active_object_tape_file_number(), Some(0));
-
-        sink.write_block(&[0xAA; 8]).unwrap();
-        sink.write_block(&[0xBB; 8]).unwrap();
-        assert_eq!(sink.active_object_blocks_written(), Some(2));
-
-        let err = sink.write_block(&[0xCC; 8]).unwrap_err();
-        assert!(matches!(err, TapeIoError::CheckCondition(_)));
-        assert_eq!(
-            sink.active_object_blocks_written(),
-            Some(2),
-            "projected-size overrun must be rejected before writing a third block"
-        );
-
-        let summary = sink.finish_object().expect("finish object");
-        assert_eq!(summary.tape_file_number, 0);
-        assert_eq!(summary.projected_size_blocks, 2);
-        assert_eq!(summary.data_block_count, 2);
-        assert_eq!(summary.filemark_outcome.position_after.lba, 3);
-        assert_eq!(sink.active_object_tape_file_number(), None);
-        let err = sink.write_block(&[0xDD; 8]).unwrap_err();
-        match err {
-            TapeIoError::CheckCondition(ScsiError::InvalidInput(message)) => {
-                assert!(message.contains("outside active object"));
-            }
-            other => panic!("expected post-finish_object write rejection, got {other:?}"),
-        }
-    }
-    assert_eq!(inner.blocks.len(), 2);
-    assert_eq!(inner.filemarks, vec![1]);
-}
-
-#[test]
-fn begin_object_with_capacity_reserve_rejects_tape_shortfall_before_raw_write() {
-    let mut raw = RecordingRawTapeSink::default();
-    {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), 8).unwrap();
-        let err = sink
-            .begin_object_with_capacity_reserve(capacity_input(2, 16))
-            .expect_err("tape reserve should reject before object starts");
-
-        match err {
-            ParityError::CapacityReserveExceeded {
-                cause,
-                projected_object_blocks,
-                remaining_blocks,
-                reserve_blocks,
-                remaining_spool_bytes,
-                required_spool_bytes,
-            } => {
-                assert_eq!(cause, crate::CapacityReserveCause::TapeCapacity);
-                assert_eq!(projected_object_blocks, 2);
-                assert_eq!(remaining_blocks, Some(16));
-                assert_eq!(reserve_blocks, Some(18));
-                assert_eq!(remaining_spool_bytes, None);
-                assert_eq!(required_spool_bytes, None);
-            }
-            other => panic!("expected CapacityReserveExceeded, got {other:?}"),
-        }
-        assert_eq!(sink.active_object_tape_file_number(), None);
-    }
-
-    assert!(
-        raw.events.is_empty(),
-        "tape-capacity rejection must happen before any raw tape operation"
-    );
-}
-
-#[test]
-fn bootstrap_object_row_fit_budget_includes_final_reference_overhead() {
-    let block_size: u32 = 512;
-    let mut raw = RecordingRawTapeSink::default();
-    let sink = ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-        .expect("sink opens");
-    let mut rows = Vec::new();
-    let mut found_boundary = false;
-
-    for tape_file_number in 0..512u32 {
-        rows.push(
-            BootstrapObjectRow::plaintext(
-                tape_file_number,
-                1,
-                0,
-                1,
-                1,
-                [tape_file_number as u8; 32],
-            )
-            .with_object_id([((tape_file_number % 255) + 1) as u8; 64]),
-        );
-        if sink.validate_bootstrap_object_rows_fit(&rows).is_err()
-            && legacy_object_rows_fit_without_final_overhead(&sink, &rows).is_ok()
-        {
-            found_boundary = true;
-            break;
-        }
-    }
-
-    assert!(
-        found_boundary,
-        "test geometry should expose a row count admitted by the old narrow model"
-    );
-}
-
-#[test]
-fn begin_object_with_bootstrap_row_admission_rejects_before_raw_write() {
-    let block_size: u32 = 512;
-    let mut raw = RecordingRawTapeSink::default();
-    {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("sink opens");
-        let mut rows = Vec::new();
-        for tape_file_number in 0..512u32 {
-            let row = BootstrapObjectRow::plaintext(
-                tape_file_number,
-                1,
-                0,
-                1,
-                1,
-                [tape_file_number as u8; 32],
-            )
-            .with_object_id([((tape_file_number % 255) + 1) as u8; 64]);
-            let mut candidate = rows.clone();
-            candidate.push(row);
-            if sink.validate_bootstrap_object_rows_fit(&candidate).is_err() {
-                break;
-            }
-            rows = candidate;
-        }
-        assert!(
-            !rows.is_empty(),
-            "test geometry should admit at least one row"
-        );
-        let committed_prefix = FilemarkMap::new(
-            rows.iter()
-                .enumerate()
-                .map(|(index, row)| {
-                    TapeFileMapEntry::object(
-                        row.tape_file_number,
-                        row.stored_block_count,
-                        index as u64,
-                    )
-                })
-                .collect(),
-        )
-        .expect("synthetic committed object map validates");
-        sink.filemark_map = FilemarkMapBuilder::from_committed_prefix(&committed_prefix);
-        sink.bootstrap_object_rows = rows;
-
-        let err = sink
-            .begin_object_with_capacity_reserve_and_bootstrap_object_row(
-                capacity_input_with_block_size(1, 10_000, block_size),
-                BootstrapObjectRowAdmission::PlaintextRemObject,
-            )
-            .expect_err("bootstrap row admission should reject before object start");
-
-        assert!(
-            matches!(err, ParityError::BootstrapPayloadTooLarge { .. }),
-            "{err:?}"
-        );
-        assert_eq!(sink.active_object_tape_file_number(), None);
-    }
-
-    assert!(
-        raw.events.is_empty(),
-        "bootstrap-row admission rejection must happen before any raw tape operation"
-    );
-}
-
-#[test]
-fn checkpoint_batch_headroom_uses_encrypted_max_rows_and_refuses_before_motion() {
-    let block_size: u32 = 4096;
-    let mut largest_fit = 0u64;
-    let mut first_refused = None;
-
-    for object_count in 1..=512u64 {
-        let mut raw = RecordingRawTapeSink::default();
-        let result = {
-            let mut sink =
-                ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                    .expect("probe sink opens");
-            sink.reserve_checkpoint_batch_object_rows(object_count)
-        };
-        match result {
-            Ok(()) => largest_fit = object_count,
-            Err(err) => {
-                first_refused = Some((object_count, err));
-                assert!(
-                    raw.events.is_empty(),
-                    "directory-ceiling admission must refuse before tape motion"
-                );
-                break;
-            }
-        }
-    }
-
-    assert!(largest_fit > 0, "test geometry must admit at least one row");
-    let (refused_count, error) = first_refused.expect("test geometry must expose a ceiling");
-    assert_eq!(refused_count, largest_fit + 1);
-    assert!(
-        matches!(error, ParityError::BootstrapPayloadTooLarge { .. }),
-        "{error:?}"
-    );
-
-    let mut raw = RecordingRawTapeSink::default();
-    {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .expect("admitted sink opens");
-        sink.reserve_checkpoint_batch_object_rows(largest_fit)
-            .expect("largest encrypted-max batch reserves");
-        for index in 0..largest_fit {
-            let current_fill = index % 12;
-            let (tape_file_number, _) = sink
-                .begin_object_with_capacity_reserve_and_bootstrap_object_row(
-                    capacity_input_with_current_fill(1, 100_000, block_size, current_fill),
-                    BootstrapObjectRowAdmission::EncryptedRemObject,
-                )
-                .expect("reserved object admits");
-            sink.write_block(&fixed_block(index as u8, block_size))
-                .expect("reserved object block writes");
-            sink.record_bootstrap_object_row(
-                BootstrapObjectRow::encrypted(
-                    tape_file_number,
-                    1,
-                    (1u8..=8).map(|byte| [byte; 16]).collect(),
-                    OBJECT_ROW_METADATA_FRAME_MAX_LEN,
-                    16_384,
-                )
-                .with_object_id([((index % 255) + 1) as u8; 64]),
-            )
-            .expect("reserved encrypted-max row records without a ceiling failure");
-            sink.finish_object().expect("reserved object closes");
-        }
-        sink.close_open_epoch(CloseReason::Barrier)
-            .expect("admitted batch always fits its checkpoint stop");
-    }
-    assert!(
-        !raw.events.is_empty(),
-        "admitted batch must exercise tape writes"
-    );
-}
-
-fn legacy_object_rows_fit_without_final_overhead(
-    sink: &ParitySink<'_>,
-    object_rows: &[BootstrapObjectRow],
-) -> Result<(), ParityError> {
-    let payload = BootstrapPayload {
-        scheme: Some(ParitySchemeRecord {
-            id: sink.scheme.id.as_str().to_string(),
-            data_blocks_per_stripe: sink.scheme.data_blocks_per_stripe,
-            parity_blocks_per_stripe: sink.scheme.parity_blocks_per_stripe,
-            stripes_per_neighborhood: sink.scheme.stripes_per_neighborhood,
-            no_parity_flag: false,
-        }),
-        no_parity_flag: false,
-        filemark_map_digest: Some(FilemarkMapDigest {
-            map_sha256: [0; 32],
-            tape_file_count: 0,
-            map_total_data_ordinals: 0,
-            highest_protected_ordinal: 0,
-            is_final_map: false,
-        }),
-        tape_uuid: sink.tape_uuid,
-        written_by_version: env!("CARGO_PKG_VERSION").to_string(),
-        written_at: String::new(),
-        sequence: 0,
-        block_size_bytes: sink.block_size_bytes,
-        drive_compression: false,
-        sidecar_epoch_directory: None,
-        parity_map_reference: None,
-        object_rows: object_rows.to_vec(),
-    };
-    let mut block = vec![0u8; sink.block_size_bytes as usize];
-    write_bootstrap_block(&payload, &mut block).map(|_| ())
-}
-
-#[test]
-fn begin_object_rejects_object_larger_than_empty_tape_without_spanning() {
-    let block_size: u32 = 512;
-    let empty_tape_usable_blocks = 20;
-    let projected_object_blocks = empty_tape_usable_blocks + 1;
-    let mut raw = RecordingRawTapeSink::default();
-    {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
-                .unwrap();
-        let input = CapacityReserveInput {
-            empty_tape_usable_blocks,
-            ..capacity_input_with_block_size(
-                projected_object_blocks,
-                empty_tape_usable_blocks,
-                block_size,
-            )
-        };
-        let err = sink
-            .begin_object_with_capacity_reserve(input)
-            .expect_err("object larger than an empty tape must not start");
-
-        match err {
-            ParityError::ObjectTooLargeForEmptyTape {
-                projected_object_blocks: reported_projected,
-                empty_tape_usable_blocks: reported_empty,
-                required_reserve_blocks,
-            } => {
                 assert_eq!(reported_projected, projected_object_blocks);
-                assert_eq!(reported_empty, empty_tape_usable_blocks);
-                assert!(projected_object_blocks > empty_tape_usable_blocks);
-                assert!(
-                        required_reserve_blocks > 0,
-                        "reserve accounting should still include sidecars, filemarks, bootstraps, and margin"
-                    );
+                assert_eq!(remaining_blocks, Some(capacity_basis_blocks));
+                assert!(reserve_blocks.expect("close reserve") > 0);
             }
-            other => panic!("expected ObjectTooLargeForEmptyTape, got {other:?}"),
+            other => panic!("expected tape-capacity rejection, got {other:?}"),
         }
         assert_eq!(sink.active_object_tape_file_number(), None);
     }
@@ -6644,13 +4767,13 @@ fn begin_object_rejects_object_larger_than_empty_tape_without_spanning() {
 }
 
 #[test]
-fn begin_object_rejects_empty_tape_boundary_variants_without_spanning() {
+fn begin_object_rejects_capacity_boundary_variants_without_spanning() {
     let block_size: u32 = 512;
-    let empty_tape_usable_blocks = 20;
+    let capacity_basis_blocks = 20_000;
     let cases = [
         (
             "exact-body-fill",
-            empty_tape_usable_blocks,
+            capacity_basis_blocks,
             true,
             "an object whose body exactly fills the usable tape still needs reserve",
         ),
@@ -6665,53 +4788,54 @@ fn begin_object_rejects_empty_tape_boundary_variants_without_spanning() {
     for (label, projected_object_blocks, exactly_fills_empty_tape, message) in cases {
         let mut raw = RecordingRawTapeSink::default();
         {
-            let mut sink =
+            let sink =
                 ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), block_size)
                     .unwrap();
-            let input = CapacityReserveInput {
-                empty_tape_usable_blocks,
+            let input = TerminalTripleCloseInput {
+                capacity_basis_blocks,
                 ..capacity_input_with_block_size(
                     projected_object_blocks,
-                    empty_tape_usable_blocks,
+                    capacity_basis_blocks,
                     block_size,
                 )
             };
-            let err = sink
-                .begin_object_with_capacity_reserve(input)
-                .expect_err(message);
+            let err =
+                crate::capacity::reserve_terminal_object_for_sink_test(input).expect_err(message);
 
             match err {
-                ParityError::ObjectTooLargeForEmptyTape {
+                ParityError::CapacityReserveExceeded {
+                    cause: crate::CapacityReserveCause::TapeCapacity,
                     projected_object_blocks: reported_projected,
-                    empty_tape_usable_blocks: reported_empty,
-                    required_reserve_blocks,
+                    remaining_blocks,
+                    reserve_blocks,
+                    ..
                 } => {
                     assert_eq!(reported_projected, projected_object_blocks, "{label}");
-                    assert_eq!(reported_empty, empty_tape_usable_blocks, "{label}");
+                    assert_eq!(remaining_blocks, Some(capacity_basis_blocks), "{label}");
                     if exactly_fills_empty_tape {
                         assert_eq!(
-                            projected_object_blocks, empty_tape_usable_blocks,
+                            projected_object_blocks, capacity_basis_blocks,
                             "{label}: this case pins the exact empty-tape body boundary"
                         );
                     } else {
                         assert!(
-                            projected_object_blocks > empty_tape_usable_blocks,
+                            projected_object_blocks > capacity_basis_blocks,
                             "{label}: this case pins the oversized-object boundary"
                         );
                     }
                     assert!(
-                        required_reserve_blocks > 0,
+                        reserve_blocks.expect("close reserve") > 0,
                         "{label}: reserve must include sidecars, filemarks, bootstraps, and margin"
                     );
                     assert!(
                             projected_object_blocks
-                                .checked_add(required_reserve_blocks)
+                                .checked_add(reserve_blocks.expect("close reserve"))
                                 .expect("test reserve arithmetic should not overflow")
-                                > empty_tape_usable_blocks,
+                                > capacity_basis_blocks,
                             "{label}: projected body plus reserve must exceed the empty-tape usable capacity"
                         );
                 }
-                other => panic!("{label}: expected ObjectTooLargeForEmptyTape, got {other:?}"),
+                other => panic!("{label}: expected tape-capacity rejection, got {other:?}"),
             }
             assert_eq!(sink.active_object_tape_file_number(), None, "{label}");
         }
@@ -6724,14 +4848,18 @@ fn begin_object_rejects_empty_tape_boundary_variants_without_spanning() {
 }
 
 #[test]
-fn begin_object_with_capacity_reserve_rejects_spool_shortfall_before_raw_write() {
+fn terminal_reservation_rejects_spool_shortfall_before_raw_write() {
+    let baseline =
+        crate::capacity::reserve_terminal_object_for_sink_test(capacity_input(12, 10_000))
+            .expect("baseline terminal reservation");
+    let required = baseline.report().required_spool_bytes;
     let mut raw = RecordingRawTapeSink::default();
     {
-        let mut sink =
+        let sink =
             ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), 8).unwrap();
-        let err = sink
-            .begin_object_with_capacity_reserve(CapacityReserveInput {
-                remaining_spool_bytes: 95,
+        let err =
+            crate::capacity::reserve_terminal_object_for_sink_test(TerminalTripleCloseInput {
+                remaining_spool_bytes: required - 1,
                 ..capacity_input(12, 10_000)
             })
             .expect_err("spool reserve should reject before object starts");
@@ -6749,8 +4877,8 @@ fn begin_object_with_capacity_reserve_rejects_spool_shortfall_before_raw_write()
                 assert_eq!(projected_object_blocks, 12);
                 assert_eq!(remaining_blocks, None);
                 assert_eq!(reserve_blocks, None);
-                assert_eq!(remaining_spool_bytes, Some(95));
-                assert_eq!(required_spool_bytes, Some(96));
+                assert_eq!(remaining_spool_bytes, Some(required - 1));
+                assert_eq!(required_spool_bytes, Some(required));
             }
             other => panic!("expected CapacityReserveExceeded, got {other:?}"),
         }
@@ -6765,19 +4893,29 @@ fn begin_object_with_capacity_reserve_rejects_spool_shortfall_before_raw_write()
 
 #[test]
 fn begin_object_rejects_pending_spool_shortfall_before_raw_write() {
-    let mut raw = RecordingRawTapeSink::default();
-    {
-        let mut sink =
-            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), 8).unwrap();
-        let input = CapacityReserveInput {
+    let baseline =
+        crate::capacity::reserve_terminal_object_for_sink_test(TerminalTripleCloseInput {
             projected_object_blocks: 1,
             pending_completed_epoch_parity_bytes: 128,
-            remaining_spool_bytes: 127,
+            remaining_spool_bytes: u64::MAX,
+            remaining_tape_blocks: 10_000,
+            ..capacity_input(1, 10_000)
+        })
+        .expect("baseline pending-spool reservation");
+    let required = baseline.report().required_spool_bytes;
+    assert!(required >= 128);
+    let mut raw = RecordingRawTapeSink::default();
+    {
+        let sink =
+            ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), 8).unwrap();
+        let input = TerminalTripleCloseInput {
+            projected_object_blocks: 1,
+            pending_completed_epoch_parity_bytes: 128,
+            remaining_spool_bytes: required - 1,
             remaining_tape_blocks: 10_000,
             ..capacity_input(1, 10_000)
         };
-        let err = sink
-            .begin_object_with_capacity_reserve(input)
+        let err = crate::capacity::reserve_terminal_object_for_sink_test(input)
             .expect_err("pending spool reserve should reject before object starts");
 
         match err {
@@ -6793,8 +4931,8 @@ fn begin_object_rejects_pending_spool_shortfall_before_raw_write() {
                 assert_eq!(projected_object_blocks, 1);
                 assert_eq!(remaining_blocks, None);
                 assert_eq!(reserve_blocks, None);
-                assert_eq!(remaining_spool_bytes, Some(127));
-                assert_eq!(required_spool_bytes, Some(128));
+                assert_eq!(remaining_spool_bytes, Some(required - 1));
+                assert_eq!(required_spool_bytes, Some(required));
             }
             other => panic!("expected pending spool CapacityReserveExceeded, got {other:?}"),
         }
@@ -6813,41 +4951,33 @@ fn begin_object_spool_reserve_boundary_variants_do_not_touch_raw_tape() {
     let scheme = small_scheme();
     let data_shards_per_epoch =
         u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.data_blocks_per_stripe);
-    let sidecar_tape_file_blocks = (2 * 2)
-        + u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe)
-        + 1
-        + 1;
-    let sidecar_tape_file_bytes = sidecar_tape_file_blocks * u64::from(block_size);
     let cases = [
-        (
-            "exact-spool-fit",
-            data_shards_per_epoch,
-            sidecar_tape_file_bytes,
-            true,
-        ),
-        (
-            "one-byte-short",
-            data_shards_per_epoch,
-            sidecar_tape_file_bytes - 1,
-            false,
-        ),
+        ("exact-spool-fit", data_shards_per_epoch, true),
+        ("one-byte-short", data_shards_per_epoch, false),
         (
             "far-oversized-spool-need",
             data_shards_per_epoch * 1_000,
-            sidecar_tape_file_bytes,
             false,
         ),
     ];
 
-    for (label, projected_object_blocks, remaining_spool_bytes, should_fit) in cases {
-        let epochs_completed = projected_object_blocks / data_shards_per_epoch;
-        let expected_required_spool_bytes = epochs_completed * sidecar_tape_file_bytes;
+    for (label, projected_object_blocks, should_fit) in cases {
+        let probe = crate::capacity::reserve_terminal_object_for_sink_test(
+            capacity_input_with_block_size(projected_object_blocks, 1_000_000, block_size),
+        )
+        .expect("baseline exact reservation");
+        let expected_required_spool_bytes = probe.report().required_spool_bytes;
+        let remaining_spool_bytes = if should_fit {
+            expected_required_spool_bytes
+        } else {
+            expected_required_spool_bytes - 1
+        };
         let mut raw = RecordingRawTapeSink::default();
         {
             let mut sink =
                 ParitySink::new_sidecar_only(&mut raw, scheme.clone(), sample_uuid(), block_size)
                     .unwrap();
-            let input = CapacityReserveInput {
+            let input = TerminalTripleCloseInput {
                 projected_object_blocks,
                 remaining_tape_blocks: 1_000_000,
                 remaining_spool_bytes,
@@ -6855,10 +4985,13 @@ fn begin_object_spool_reserve_boundary_variants_do_not_touch_raw_tape() {
             };
 
             if should_fit {
+                let input = capacity_input_for_sink(&sink, input);
+                let reservation = crate::capacity::reserve_terminal_object_for_sink_test(input)
+                    .expect("exact spool fit should mint a reservation");
                 let (tape_file_number, report) = sink
-                    .begin_object_with_capacity_reserve(input)
+                    .begin_object_with_terminal_triple_reservation(reservation)
                     .expect("exact spool fit should admit the object");
-                assert_eq!(tape_file_number, 0, "{label}");
+                assert_eq!(tape_file_number, 1, "{label}");
                 assert_eq!(
                     report.required_spool_bytes, expected_required_spool_bytes,
                     "{label}"
@@ -6867,10 +5000,9 @@ fn begin_object_spool_reserve_boundary_variants_do_not_touch_raw_tape() {
                     remaining_spool_bytes, expected_required_spool_bytes,
                     "{label}: equality at the spool boundary must be accepted"
                 );
-                assert_eq!(sink.active_object_tape_file_number(), Some(0), "{label}");
+                assert_eq!(sink.active_object_tape_file_number(), Some(1), "{label}");
             } else {
-                let err = sink
-                    .begin_object_with_capacity_reserve(input)
+                let err = crate::capacity::reserve_terminal_object_for_sink_test(input)
                     .expect_err("spool reserve should reject before object starts");
                 match err {
                     ParityError::CapacityReserveExceeded {
@@ -6922,24 +5054,26 @@ fn begin_object_spool_reserve_boundary_variants_do_not_touch_raw_tape() {
 #[test]
 fn begin_object_combined_tape_and_spool_shortfall_reports_tape_capacity_first() {
     let projected_object_blocks = 12;
-    let baseline = capacity_input(projected_object_blocks, u64::MAX)
-        .evaluate()
-        .expect("baseline reserve computes");
+    let baseline = *crate::capacity::reserve_terminal_object_for_sink_test(capacity_input(
+        projected_object_blocks,
+        1_000_000,
+    ))
+    .expect("baseline reserve computes")
+    .report();
     assert!(baseline.required_tape_blocks > 0);
     assert!(baseline.required_spool_bytes > 0);
 
-    let input = CapacityReserveInput {
+    let input = TerminalTripleCloseInput {
         remaining_tape_blocks: baseline.required_tape_blocks - 1,
         remaining_spool_bytes: baseline.required_spool_bytes - 1,
         ..capacity_input(projected_object_blocks, baseline.required_tape_blocks - 1)
     };
 
-    let spool_probe = CapacityReserveInput {
+    let spool_probe = TerminalTripleCloseInput {
         remaining_tape_blocks: baseline.required_tape_blocks,
         ..input
     };
-    match spool_probe
-        .evaluate()
+    match crate::capacity::reserve_terminal_object_for_sink_test(spool_probe)
         .expect_err("the same input is also short on spool when tape fits")
     {
         ParityError::CapacityReserveExceeded { cause, .. } => {
@@ -6950,10 +5084,9 @@ fn begin_object_combined_tape_and_spool_shortfall_reports_tape_capacity_first() 
 
     let mut raw = RecordingRawTapeSink::default();
     {
-        let mut sink =
+        let sink =
             ParitySink::new_sidecar_only(&mut raw, small_scheme(), sample_uuid(), 8).unwrap();
-        let err = sink
-            .begin_object_with_capacity_reserve(input)
+        let err = crate::capacity::reserve_terminal_object_for_sink_test(input)
             .expect_err("combined shortfall must reject before object starts");
 
         match err {
@@ -6968,7 +5101,10 @@ fn begin_object_combined_tape_and_spool_shortfall_reports_tape_capacity_first() 
                 assert_eq!(cause, crate::CapacityReserveCause::TapeCapacity);
                 assert_eq!(reported_projected, projected_object_blocks);
                 assert_eq!(remaining_blocks, Some(baseline.required_tape_blocks - 1));
-                assert_eq!(reserve_blocks, Some(baseline.reserve_after_object_blocks));
+                assert_eq!(
+                    reserve_blocks,
+                    Some(baseline.required_tape_blocks - projected_object_blocks)
+                );
                 assert_eq!(remaining_spool_bytes, None);
                 assert_eq!(required_spool_bytes, None);
             }

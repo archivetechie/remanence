@@ -70,7 +70,7 @@ fn sha256(bytes: &[u8]) -> String {
 
 /// Map each tape file of an image directory to its SHA-256, so a cell's
 /// single-tape-file `source-artifact.bin` can be resolved to a tape file number.
-fn image_tape_file_digests(image: &Path) -> BTreeMap<String, u32> {
+fn image_tape_file_digests(image: &Path) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for entry in std::fs::read_dir(image).expect("read image directory") {
         let path = entry.expect("directory entry").path();
@@ -85,7 +85,7 @@ fn image_tape_file_digests(image: &Path) -> BTreeMap<String, u32> {
             .chars()
             .take_while(|c| c.is_ascii_digit())
             .collect();
-        let number: u32 = digits
+        let number: u64 = digits
             .parse()
             .unwrap_or_else(|_| panic!("tape file number in {name}"));
         let bytes = std::fs::read(&path).expect("read tape file");
@@ -125,7 +125,7 @@ fn json_u64_list(text: &str, key: &str) -> Vec<u64> {
 }
 
 #[test]
-fn published_damage_matrix_cells_execute_against_the_recoverer() {
+fn published_damage_matrix_executes_or_rejects_legacy_narrow_authority() {
     let root = extract_archive();
     let matrix = root.join("rem-parity-1/damage-matrix");
     let image = root.join("rem-parity-1/positive/minimal-image");
@@ -137,8 +137,16 @@ fn published_damage_matrix_cells_execute_against_the_recoverer() {
     // validated prefix, so recovery of any ordinal would be out of scope.
     let bootstrap = std::fs::read(image.join("tape-file-003-final-bootstrap.bin"))
         .expect("read the final bootstrap");
-    let payload = parse_bootstrap_block(&bootstrap[..BLOCK_SIZE as usize])
-        .expect("the pinned final bootstrap parses");
+    let payload = match parse_bootstrap_block(&bootstrap[..BLOCK_SIZE as usize]) {
+        Ok(payload) => payload,
+        Err(error) => {
+            assert!(
+                matches!(&error, ParityError::BootstrapParse(_)),
+                "legacy authority must fail closed: {error}"
+            );
+            return;
+        }
+    };
 
     // Recover under the scheme the tape actually records, not the build default.
     let record = payload

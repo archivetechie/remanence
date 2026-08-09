@@ -1,0 +1,15 @@
+case_id	base_profile	a	b	c	expected
+healthy	multi-256k	valid	valid	valid	select-c
+damage-a	multi-256k	damaged	valid	valid	select-c
+damage-b	multi-256k	valid	damaged	valid	select-c
+damage-c	multi-256k	valid	valid	damaged	select-b
+damage-a-b	multi-256k	damaged	damaged	valid	select-c
+damage-a-c	multi-256k	damaged	valid	damaged	select-b
+damage-b-c	multi-256k	valid	damaged	damaged	select-a
+all-invalid	multi-256k	damaged	damaged	damaged	bot-structural-recovery
+all-torn	multi-256k	torn	torn	torn	bot-structural-recovery
+all-missing	multi-256k	missing	missing	missing	bot-structural-recovery
+all-conflicting	multi-256k	conflict-minimal	valid	conflict-minimal	conflict
+conflicting-a	multi-256k	conflict-minimal	valid	valid	conflict
+conflicting-b	multi-256k	valid	conflict-minimal	valid	conflict
+conflicting-c	multi-256k	valid	valid	conflict-minimal	conflict

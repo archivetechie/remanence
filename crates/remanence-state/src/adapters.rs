@@ -556,11 +556,7 @@ pub fn parity_recovery_audit_record(event: &ParityRecoveryEvent) -> AuditEventRe
         uint(&mut detail, "lost_count", u64::from(lost_count));
     }
     uint(&mut detail, "at_lba_requested", event.at_lba_requested);
-    uint(
-        &mut detail,
-        "tape_file_number",
-        u64::from(event.at_requested.0),
-    );
+    uint(&mut detail, "tape_file_number", event.at_requested.0);
     uint(&mut detail, "body_lba", event.at_requested.1);
 
     AuditEventRecord {
@@ -599,7 +595,7 @@ pub fn sidecar_metadata_health_audit_record(
     uint(
         &mut detail,
         "sidecar_tape_file_number",
-        u64::from(event.sidecar_tape_file_number),
+        event.sidecar_tape_file_number,
     );
     uint(&mut detail, "epoch_id", event.epoch_id);
     text(

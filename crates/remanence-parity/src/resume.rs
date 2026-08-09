@@ -6,15 +6,21 @@
 //! planning surface plus the raw-tape open-epoch reread and rebuilt-sidecar
 //! emission bridge.
 
-use remanence_library::{TapePosition, WriteFilemarksOutcome};
+use ciborium::value::Value as CborValue;
+use remanence_library::{TapeIoError, TapePosition, WriteFilemarksOutcome};
+use sha2::{Digest, Sha256};
 
 use crate::codec::ReedSolomonCodec;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
 use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
-use crate::journal::{CommittedState, TapeFileJournal};
+use crate::journal::{
+    validate_committed_bundle_shape, BoundedJournalReplayMetrics, CommittedBundle,
+    CommittedBundleKind, FileTapeFileJournalCommittedSnapshot, TapeFileEntry, TapeFileJournal,
+};
 use crate::model::ParityScheme;
 use crate::parity_map::{
+    encode_parity_map_tape_file, ParityMapPayload, SidecarEpochDirectory,
     SidecarEpochDirectoryEntry, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
     SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
@@ -25,7 +31,7 @@ use crate::sidecar::{
     data_shard_crc64, encode_sidecar_tape_file, parity_block_position, parse_sidecar_tape_file,
     EncodedSidecarTapeFile, SidecarDescriptor,
 };
-use crate::sink::SidecarTapeFile;
+use crate::sink::{SidecarTapeFile, TerminalPrefixPlan, TerminalPrefixReconcileEvidence};
 
 /// One full parity epoch that resume must rebuild and emit as an ordinary
 /// sidecar tape file before accepting new object data.
@@ -44,7 +50,7 @@ pub struct ResumeSidecarPlan {
 pub struct ResumeAppendPlan {
     /// Last catalog-committed tape file in the prefix. Physical append starts
     /// just after this file's trailing filemark.
-    pub append_after_tape_file_number: u32,
+    pub append_after_tape_file_number: u64,
     /// Physical block-position hint immediately after the committed prefix.
     pub append_position: PhysicalPositionHint,
     /// Protection watermark loaded from the committed prefix before any
@@ -71,7 +77,7 @@ pub struct ResumeAppendPlan {
 pub struct ResumeAppendResult {
     /// Last catalog-committed tape file that established the original append
     /// point for this resume operation.
-    pub append_after_tape_file_number: u32,
+    pub append_after_tape_file_number: u64,
     /// Sidecars emitted during resume and committed through the ordinary
     /// sidecar transaction path.
     pub sidecars_emitted: Vec<SidecarTapeFile>,
@@ -154,7 +160,7 @@ impl ResumeAppendPlan {
             let expected_tape_file_number = self
                 .append_after_tape_file_number
                 .checked_add(1)
-                .and_then(|value| value.checked_add(u32::try_from(index).ok()?))
+                .and_then(|value| value.checked_add(u64::try_from(index).ok()?))
                 .ok_or_else(|| resume_error("resume sidecar tape-file number overflows"))?;
             if actual.tape_file_number != expected_tape_file_number
                 || actual.epoch_id != expected.epoch_id
@@ -179,85 +185,1051 @@ impl ResumeAppendPlan {
     }
 }
 
-/// Replay the local journal into a validated committed-prefix map.
+/// One committed Object extent needed to reread the unprotected open epoch.
 ///
-/// This is the v0.7.2 fast-resume entry point before raw-tape positioning and
-/// open-epoch rebuild. It drops torn trailing journal records through
-/// [`TapeFileJournal::load_committed`], validates the one-open-epoch restart
-/// bound, and converts the committed rows into a structural filemark map.
-pub fn committed_prefix_from_journal(
-    journal: &dyn TapeFileJournal,
-    scheme: &ParityScheme,
-) -> Result<(CommittedState, FilemarkMap), ParityError> {
-    let state = journal.load_committed()?;
-    state.validate_v1_restart_bound(scheme)?;
-    let map = state.filemark_map()?;
-    Ok((state, map))
+/// A normal checkpoint has `W == T` and retains no extents. If a valid v1
+/// restart has an open epoch, only Objects intersecting `[W, T)` are kept;
+/// older Object and structural rows remain replayable in the journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeOpenEpochObjectExtent {
+    /// Object tape-file number used for tape positioning.
+    pub tape_file_number: u64,
+    /// First parity-data ordinal carried by this Object.
+    pub first_parity_data_ordinal: u64,
+    /// Number of fixed blocks in this Object tape file.
+    pub block_count: u64,
+    /// Physical start LBA derived from the validated structural prefix.
+    pub physical_start_lba: u64,
 }
 
-/// Rebuild bootstrap sidecar-directory rows from committed journal geometry.
+impl ResumeOpenEpochObjectExtent {
+    fn end_exclusive(&self) -> Result<u64, ParityError> {
+        self.first_parity_data_ordinal
+            .checked_add(self.block_count)
+            .ok_or_else(|| resume_error("resume Object ordinal range overflows"))
+    }
+
+    fn position_for_ordinal(
+        &self,
+        ordinal: u64,
+    ) -> Result<Option<PhysicalPositionHint>, ParityError> {
+        let end = self.end_exclusive()?;
+        if ordinal < self.first_parity_data_ordinal || ordinal >= end {
+            return Ok(None);
+        }
+        let block_within_file = ordinal - self.first_parity_data_ordinal;
+        let lba = self
+            .physical_start_lba
+            .checked_add(block_within_file)
+            .ok_or_else(|| resume_error("resume Object physical position overflows"))?;
+        Ok(Some(PhysicalPositionHint::new(lba)))
+    }
+}
+
+/// Allocation-bounded authority needed to reopen a parity append session.
 ///
-/// Sidecars store `2H + P + 1` blocks, where `P = S*m`; therefore the
-/// replicated header/index size `H` is recoverable without rereading tape.
-pub fn sidecar_directory_from_committed_state(
-    committed: &CommittedState,
+/// The summary retains scalars, one directory row per parity epoch, and only
+/// Object extents intersecting the single permitted open epoch. It never owns
+/// the complete structural map or any Object recovery row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundedResumeSummary {
+    scheme: ParityScheme,
+    /// Number of committed tape files in the frozen prefix.
+    pub committed_tape_file_count: u64,
+    /// Last committed tape-file number, or `None` for a fresh journal.
+    pub last_committed_tape_file_number: Option<u64>,
+    /// Physical append cursor derived from every committed structural row.
+    pub append_position: PhysicalPositionHint,
+    /// Highest protected ordinal at the checkpoint boundary.
+    pub highest_protected_ordinal: u64,
+    /// Total committed Object-data ordinals at the checkpoint boundary.
+    pub total_committed_ordinals: u64,
+    /// Bare epoch identifier following the last committed sidecar.
+    pub next_epoch_id: u64,
+    /// Whether the sole tape-file-0 BOT Bootstrap is committed.
+    pub bot_bootstrap_committed: bool,
+    /// Number of committed external ParityMap tape files.
+    pub next_parity_map_sequence: u64,
+    /// Number of committed Object tape files.
+    pub committed_object_count: u64,
+    /// Header-derived metadata retained once per protected parity epoch.
+    pub sidecar_directory_entries: Vec<SidecarEpochDirectoryEntry>,
+    /// Object extents intersecting `[W, T)`; empty at an ordinary checkpoint.
+    pub open_epoch_object_extents: Vec<ResumeOpenEpochObjectExtent>,
+    /// Bounded journal scan and peak-live metrics.
+    pub replay_metrics: BoundedJournalReplayMetrics,
+}
+
+impl BoundedResumeSummary {
+    /// Parity scheme frozen into the replayed journal header.
+    pub fn scheme(&self) -> &ParityScheme {
+        &self.scheme
+    }
+
+    /// Build the ordinary v1 append plan without reconstructing a filemark map.
+    pub fn append_plan(&self, scheme: &ParityScheme) -> Result<ResumeAppendPlan, ParityError> {
+        scheme.validate()?;
+        if scheme != &self.scheme {
+            return Err(resume_error(
+                "resume parity scheme does not match frozen journal authority",
+            ));
+        }
+        let last = self
+            .last_committed_tape_file_number
+            .ok_or_else(|| resume_error("committed prefix has no tape files"))?;
+        let epoch_data_shards = epoch_data_shards(scheme)?;
+        let rebuild_data_shards = self
+            .total_committed_ordinals
+            .checked_sub(self.highest_protected_ordinal)
+            .ok_or_else(|| resume_error("protection watermark exceeds committed data ordinals"))?;
+        if rebuild_data_shards >= epoch_data_shards {
+            return Err(resume_error(format!(
+                "committed v1 prefix has {rebuild_data_shards} unprotected ordinals, reaching the restart bound of one full epoch ({epoch_data_shards}); multi-epoch rebuild is legacy/forensic only"
+            )));
+        }
+        Ok(ResumeAppendPlan {
+            append_after_tape_file_number: last,
+            append_position: self.append_position,
+            highest_protected_ordinal_before_rebuild: self.highest_protected_ordinal,
+            highest_protected_ordinal_after_rebuild: self.highest_protected_ordinal,
+            live_epoch_start: self.highest_protected_ordinal,
+            next_data_ordinal: self.total_committed_ordinals,
+            next_epoch_id: self.next_epoch_id,
+            sidecars_to_emit: Vec::new(),
+        })
+    }
+
+    fn position_for_open_epoch_ordinal(
+        &self,
+        ordinal: u64,
+    ) -> Result<PhysicalPositionHint, ParityError> {
+        for extent in &self.open_epoch_object_extents {
+            if let Some(position) = extent.position_for_ordinal(ordinal)? {
+                return Ok(position);
+            }
+        }
+        Err(resume_error(format!(
+            "open-epoch ordinal {ordinal} is absent from bounded resume extents"
+        )))
+    }
+}
+
+fn sidecar_directory_entry_from_journal(
+    entry: &TapeFileEntry,
     scheme: &ParityScheme,
-) -> Result<Vec<SidecarEpochDirectoryEntry>, ParityError> {
+) -> Result<SidecarEpochDirectoryEntry, ParityError> {
     let parity_blocks = u64::from(scheme.stripes_per_neighborhood)
         .checked_mul(u64::from(scheme.parity_blocks_per_stripe))
         .ok_or(ParityError::Invariant(
             "sidecar parity block count overflows",
         ))?;
-    committed
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == crate::filemark_map::TapeFileKind::ParitySidecar)
-        .map(|entry| {
-            let replicated_index_blocks = entry
-                .block_count
-                .checked_sub(parity_blocks)
-                .and_then(|value| value.checked_sub(1))
-                .ok_or(ParityError::Invariant("sidecar block geometry underflows"))?;
-            if replicated_index_blocks == 0 || replicated_index_blocks % 2 != 0 {
-                return Err(ParityError::Invariant(
-                    "sidecar block geometry cannot recover replicated index size",
-                ));
-            }
-            Ok(SidecarEpochDirectoryEntry {
-                tape_file_number: entry.tape_file_number,
-                epoch_id: entry
-                    .epoch_id
-                    .ok_or(ParityError::Invariant("journal sidecar missing epoch id"))?,
-                protected_ordinal_start: entry.protected_ordinal_start.ok_or(
-                    ParityError::Invariant("journal sidecar missing protected range start"),
-                )?,
-                protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive.ok_or(
-                    ParityError::Invariant("journal sidecar missing protected range end"),
-                )?,
-                sidecar_total_block_count: entry.block_count,
-                sidecar_header_block_count: u32::try_from(replicated_index_blocks / 2).map_err(
-                    |_| ParityError::Invariant("sidecar header block count overflows u32"),
-                )?,
-                parity_shard_block_count: u32::try_from(parity_blocks).map_err(|_| {
-                    ParityError::Invariant("sidecar parity block count overflows u32")
-                })?,
-                canonical_metadata_hash: entry.canonical_metadata_hash.ok_or(
-                    ParityError::Invariant("journal sidecar missing canonical metadata hash"),
-                )?,
-                flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
-                    | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
-            })
-        })
-        .collect()
+    let replicated_index_blocks = entry
+        .block_count
+        .checked_sub(parity_blocks)
+        .and_then(|value| value.checked_sub(1))
+        .ok_or(ParityError::Invariant("sidecar block geometry underflows"))?;
+    if replicated_index_blocks == 0 || replicated_index_blocks % 2 != 0 {
+        return Err(ParityError::Invariant(
+            "sidecar block geometry cannot recover replicated index size",
+        ));
+    }
+    Ok(SidecarEpochDirectoryEntry {
+        tape_file_number: entry.tape_file_number,
+        epoch_id: entry
+            .epoch_id
+            .ok_or(ParityError::Invariant("journal sidecar missing epoch id"))?,
+        protected_ordinal_start: entry.protected_ordinal_start.ok_or(ParityError::Invariant(
+            "journal sidecar missing protected range start",
+        ))?,
+        protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive.ok_or(
+            ParityError::Invariant("journal sidecar missing protected range end"),
+        )?,
+        sidecar_total_block_count: entry.block_count,
+        sidecar_header_block_count: replicated_index_blocks / 2,
+        parity_shard_block_count: parity_blocks,
+        canonical_metadata_hash: entry.canonical_metadata_hash.ok_or(ParityError::Invariant(
+            "journal sidecar missing canonical metadata hash",
+        ))?,
+        flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    })
 }
 
-/// Plan resume append directly from a [`TapeFileJournal`].
-pub fn plan_resume_append_from_journal(
-    journal: &dyn TapeFileJournal,
-    scheme: &ParityScheme,
-) -> Result<ResumeAppendPlan, ParityError> {
-    let (_state, committed_prefix) = committed_prefix_from_journal(journal, scheme)?;
-    plan_resume_append_from_committed_prefix(&committed_prefix, scheme)
+/// Stream and validate the exact journal state needed for ordinary v1 resume.
+///
+/// The journal snapshot has already validated framing, CRCs, bundle grammar,
+/// monotonic W/T, and the absence of orphan evidence. This pass additionally
+/// proves the global dense map, contiguous Object ordinals, contiguous parity
+/// epochs, exact checkpoint W/T, append position, and sequence counters.
+pub fn checked_bounded_resume_summary(
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+) -> Result<BoundedResumeSummary, ParityError> {
+    snapshot.scheme().validate()?;
+    let epoch_blocks = epoch_data_shards(snapshot.scheme())?;
+    let journal_w = snapshot.highest_protected_ordinal();
+    let journal_t = snapshot.total_committed_ordinals();
+    if journal_w > journal_t {
+        return Err(resume_error(format!(
+            "journal committed state is incoherent: W={journal_w} exceeds T={journal_t}"
+        )));
+    }
+    let live_ordinals = journal_t
+        .checked_sub(journal_w)
+        .ok_or(ParityError::Invariant("bounded resume W/T underflows"))?;
+    if live_ordinals >= epoch_blocks {
+        return Err(resume_error(format!(
+            "journal committed prefix has {live_ordinals} unprotected ordinals, exceeding the v1 restart bound of one partial epoch ({epoch_blocks})"
+        )));
+    }
+
+    let mut replay = snapshot.replay()?;
+    let mut expected_file = 0u64;
+    let mut append_lba = 0u64;
+    let mut total_data_ordinals = 0u64;
+    let mut expected_protected_start = 0u64;
+    let mut next_epoch_id = 0u64;
+    let mut bot_bootstrap_committed = false;
+    let mut next_parity_map_sequence = 0u64;
+    let mut committed_object_count = 0u64;
+    let mut sidecar_directory_entries = Vec::new();
+    let mut open_epoch_object_extents = Vec::new();
+    let mut tail = None;
+
+    while let Some(entry) = replay.next_entry()? {
+        if entry.tape_file_number != expected_file {
+            return Err(resume_error(format!(
+                "resume structural map is not dense at {expected_file}: found {}",
+                entry.tape_file_number
+            )));
+        }
+        let mapped = entry.to_map_entry();
+        validate_terminal_close_entry(&entry, &mapped)?;
+        match entry.kind {
+            TapeFileKind::Object => {
+                let first = entry.first_parity_data_ordinal.ok_or_else(|| {
+                    resume_error(format!(
+                        "Object at tape file {expected_file} lacks its first parity ordinal"
+                    ))
+                })?;
+                if first != total_data_ordinals {
+                    return Err(resume_error(format!(
+                        "Object at tape file {expected_file} starts at ordinal {first}, expected {total_data_ordinals}"
+                    )));
+                }
+                let end = first.checked_add(entry.block_count).ok_or_else(|| {
+                    resume_error(format!(
+                        "Object at tape file {expected_file} ordinal range overflows"
+                    ))
+                })?;
+                if end > journal_w {
+                    open_epoch_object_extents.push(ResumeOpenEpochObjectExtent {
+                        tape_file_number: entry.tape_file_number,
+                        first_parity_data_ordinal: first,
+                        block_count: entry.block_count,
+                        physical_start_lba: append_lba,
+                    });
+                }
+                total_data_ordinals = end;
+                committed_object_count =
+                    committed_object_count
+                        .checked_add(1)
+                        .ok_or(ParityError::Invariant(
+                            "bounded resume Object count overflows",
+                        ))?;
+            }
+            TapeFileKind::ParitySidecar => {
+                let directory_entry =
+                    sidecar_directory_entry_from_journal(&entry, snapshot.scheme())?;
+                if directory_entry.epoch_id != next_epoch_id {
+                    return Err(resume_error(format!(
+                        "sidecar epoch id {} is not the expected monotonic id {next_epoch_id}",
+                        directory_entry.epoch_id
+                    )));
+                }
+                if directory_entry.protected_ordinal_start != expected_protected_start {
+                    return Err(resume_error(format!(
+                        "sidecar epoch {next_epoch_id} starts at ordinal {}, expected contiguous start {expected_protected_start}",
+                        directory_entry.protected_ordinal_start
+                    )));
+                }
+                if directory_entry.protected_ordinal_end_exclusive > journal_t {
+                    return Err(resume_error(format!(
+                        "sidecar epoch {next_epoch_id} ends at ordinal {}, beyond committed data ordinals {journal_t}",
+                        directory_entry.protected_ordinal_end_exclusive
+                    )));
+                }
+                let protected_len = directory_entry
+                    .protected_ordinal_end_exclusive
+                    .checked_sub(directory_entry.protected_ordinal_start)
+                    .ok_or_else(|| {
+                        resume_error(format!(
+                            "sidecar epoch {next_epoch_id} has a descending protected range"
+                        ))
+                    })?;
+                if protected_len == 0 || protected_len > epoch_blocks {
+                    return Err(resume_error(format!(
+                        "sidecar epoch {next_epoch_id} range length {protected_len} is outside 1..={epoch_blocks}"
+                    )));
+                }
+                expected_protected_start = directory_entry.protected_ordinal_end_exclusive;
+                next_epoch_id = next_epoch_id
+                    .checked_add(1)
+                    .ok_or(ParityError::Invariant("bounded resume epoch id overflows"))?;
+                sidecar_directory_entries.push(directory_entry);
+            }
+            TapeFileKind::Bootstrap => {
+                if expected_file != 0 || bot_bootstrap_committed {
+                    return Err(resume_error(
+                        "schema-major 2 journal contains a Bootstrap outside tape file 0",
+                    ));
+                }
+                bot_bootstrap_committed = true;
+            }
+            TapeFileKind::ParityMap => {
+                next_parity_map_sequence =
+                    next_parity_map_sequence
+                        .checked_add(1)
+                        .ok_or(ParityError::Invariant(
+                            "bounded resume ParityMap sequence overflows",
+                        ))?;
+            }
+            TapeFileKind::TapeIndexReplica | TapeFileKind::IndexSeparationExtent => {
+                return Err(resume_error(
+                    "ordinary append authority contains terminal index components",
+                ));
+            }
+        }
+        append_lba = append_lba
+            .checked_add(entry.block_count)
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ParityError::Invariant(
+                "bounded resume append position overflows",
+            ))?;
+        expected_file = expected_file.checked_add(1).ok_or(ParityError::Invariant(
+            "bounded resume tape-file count overflows",
+        ))?;
+        tail = Some(mapped);
+    }
+
+    if expected_file != replay.committed_entry_count()
+        || expected_file != snapshot.committed_entry_count()
+        || total_data_ordinals != replay.total_committed_ordinals()
+        || total_data_ordinals != journal_t
+        || expected_protected_start != replay.highest_protected_ordinal()
+        || expected_protected_start != journal_w
+    {
+        return Err(resume_error(format!(
+            "bounded resume replay disagrees with checkpoint metadata: rows {expected_file}/{}/{}, W {expected_protected_start}/{}/{}, T {total_data_ordinals}/{}/{}",
+            replay.committed_entry_count(),
+            snapshot.committed_entry_count(),
+            replay.highest_protected_ordinal(),
+            journal_w,
+            replay.total_committed_ordinals(),
+            journal_t
+        )));
+    }
+    if expected_file != 0 && !bot_bootstrap_committed {
+        return Err(resume_error(
+            "schema-major 2 committed prefix lacks the sole BOT Bootstrap",
+        ));
+    }
+    if let Some(tail) = tail.as_ref() {
+        validate_tail_coherence(tail, journal_t, journal_w, epoch_blocks)?;
+    }
+    if journal_w == journal_t && !open_epoch_object_extents.is_empty() {
+        return Err(ParityError::Invariant(
+            "bounded resume retained Object extents for a closed epoch",
+        ));
+    }
+    let metrics = replay.metrics();
+    Ok(BoundedResumeSummary {
+        scheme: snapshot.scheme().clone(),
+        committed_tape_file_count: expected_file,
+        last_committed_tape_file_number: tail.map(|entry| entry.tape_file_number),
+        append_position: PhysicalPositionHint::new(append_lba),
+        highest_protected_ordinal: journal_w,
+        total_committed_ordinals: journal_t,
+        next_epoch_id,
+        bot_bootstrap_committed,
+        next_parity_map_sequence,
+        committed_object_count,
+        sidecar_directory_entries,
+        open_epoch_object_extents,
+        replay_metrics: metrics,
+    })
+}
+
+/// Hash a bounded committed prefix plus live append rows without flattening it.
+pub fn streamed_filemark_map_digest(
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+    appended_entries: &[TapeFileMapEntry],
+    highest_protected_ordinal: u64,
+    covers_complete_map: bool,
+) -> Result<crate::filemark_map::FilemarkMapDigest, ParityError> {
+    let appended_count = u64::try_from(appended_entries.len())
+        .map_err(|_| ParityError::Invariant("appended map row count does not fit u64"))?;
+    let total_count = snapshot
+        .committed_entry_count()
+        .checked_add(appended_count)
+        .ok_or(ParityError::Invariant("streamed map row count overflows"))?;
+    let mut hasher = Sha256::new();
+    hash_canonical_array_head(&mut hasher, total_count);
+    let mut replay = snapshot.replay()?;
+    let mut expected_file = 0u64;
+    let mut total_ordinals = 0u64;
+    while let Some(entry) = replay.next_entry()? {
+        let mapped = entry.to_map_entry();
+        if mapped.tape_file_number != expected_file {
+            return Err(resume_error("streamed map base is not dense"));
+        }
+        hash_filemark_map_entry(&mut hasher, &mapped)?;
+        if mapped.kind == TapeFileKind::Object {
+            total_ordinals = total_ordinals
+                .checked_add(mapped.block_count)
+                .ok_or(ParityError::Invariant("streamed map ordinals overflow"))?;
+        }
+        expected_file = expected_file
+            .checked_add(1)
+            .ok_or(ParityError::Invariant("streamed map file number overflows"))?;
+    }
+    for entry in appended_entries {
+        if entry.tape_file_number != expected_file {
+            return Err(resume_error("appended streamed map rows are not dense"));
+        }
+        if entry.kind == TapeFileKind::Object {
+            if entry.first_parity_data_ordinal != Some(total_ordinals) {
+                return Err(resume_error(
+                    "appended streamed Object ordinal is not dense",
+                ));
+            }
+            total_ordinals = total_ordinals
+                .checked_add(entry.block_count)
+                .ok_or(ParityError::Invariant("streamed map ordinals overflow"))?;
+        }
+        hash_filemark_map_entry(&mut hasher, entry)?;
+        expected_file = expected_file
+            .checked_add(1)
+            .ok_or(ParityError::Invariant("streamed map file number overflows"))?;
+    }
+    Ok(crate::filemark_map::FilemarkMapDigest {
+        map_sha256: hasher.finalize().into(),
+        tape_file_count: expected_file,
+        map_total_data_ordinals: total_ordinals,
+        highest_protected_ordinal,
+        covers_complete_map,
+    })
+}
+
+/// Allocation-bounded, checked state needed to close a checkpointed parity tape.
+///
+/// Object recovery rows and the complete structural map are deliberately not
+/// retained. The only variable-sized field is one row per parity epoch, which
+/// is required to encode the final external ParityMap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointedTerminalCloseSummary {
+    /// Number of structural tape files in the checkpointed prefix.
+    pub committed_tape_file_count: u64,
+    /// Physical append cursor derived from every committed row.
+    pub append_position: PhysicalPositionHint,
+    /// Highest protected data ordinal at the checkpoint watermark.
+    pub highest_protected_ordinal: u64,
+    /// Total committed data ordinals at the checkpoint watermark.
+    pub total_committed_ordinals: u64,
+    /// Sequence assigned to a newly emitted final ParityMap.
+    pub next_parity_map_sequence: u64,
+    /// Header-derived metadata retained once per protected parity epoch.
+    pub sidecar_directory_entries: Vec<SidecarEpochDirectoryEntry>,
+    /// Number of bounded row-emission passes used to derive this summary.
+    pub row_replay_passes: u64,
+    /// Largest number of decoded rows retained by the journal validation scan.
+    pub peak_live_journal_entry_count: u64,
+}
+
+/// Result of executing an immutable checkpoint-bound terminal-prefix plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointedTerminalPrefixCloseResult {
+    /// Exact post-barrier physical cursor.
+    pub used_tape_blocks: u64,
+}
+
+struct CheckedTerminalCloseProjection {
+    summary: CheckpointedTerminalCloseSummary,
+    projected_map_hasher: Sha256,
+}
+
+/// Stream and validate the exact checkpointed prefix needed by terminal close.
+///
+/// The replay proves dense structural numbering, kind-specific row shape,
+/// monotonic Object ordinals, exact W/T agreement, no open epoch, physical
+/// append position, and parity-directory consistency. Peak retained state is
+/// one length-bounded journal bundle plus O(epoch-count) directory metadata.
+pub fn checked_checkpointed_terminal_close_summary(
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+) -> Result<CheckpointedTerminalCloseSummary, ParityError> {
+    Ok(checked_terminal_close_projection(snapshot)?.summary)
+}
+
+/// Reconstruct the exact terminal prefix without materializing the prefix map.
+pub fn plan_checkpointed_terminal_index_close(
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+) -> Result<TerminalPrefixPlan, ParityError> {
+    let CheckedTerminalCloseProjection {
+        summary,
+        mut projected_map_hasher,
+    } = checked_terminal_close_projection(snapshot)?;
+    let start_tape_file_number = summary.committed_tape_file_count;
+    let start_lba = summary.append_position.lba;
+    if summary.sidecar_directory_entries.is_empty() {
+        return Ok(TerminalPrefixPlan {
+            start_tape_file_number,
+            tail_start_tape_file_number: start_tape_file_number,
+            start_lba,
+            tail_start_lba: start_lba,
+            parity_map_tape_file_number: None,
+            sidecar_directory_entries: Vec::new(),
+            committed_bundle: CommittedBundle {
+                kind: CommittedBundleKind::TerminalPrefix,
+                entries: Vec::new(),
+                highest_protected_ordinal: summary.highest_protected_ordinal,
+                total_committed_ordinals: summary.total_committed_ordinals,
+            },
+        });
+    }
+
+    let parity_map_tape_file_number = start_tape_file_number;
+    let scope_tape_file_count = start_tape_file_number
+        .checked_add(1)
+        .ok_or(ParityError::Invariant("terminal ParityMap scope overflows"))?;
+    let directory = SidecarEpochDirectory {
+        directory_scope_tape_file_count: scope_tape_file_count,
+        directory_scope_total_data_ordinals: summary.total_committed_ordinals,
+        directory_scope_highest_protected_ordinal: summary.highest_protected_ordinal,
+        is_final_directory: true,
+        entries: summary.sidecar_directory_entries.clone(),
+    };
+    directory.validate()?;
+    let provisional = encode_parity_map_tape_file(
+        &ParityMapPayload {
+            tape_uuid: snapshot.tape_uuid(),
+            sequence: summary.next_parity_map_sequence,
+            directory: directory.clone(),
+            canonical_map_digest: [0; 32],
+            writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            write_timestamp: None,
+        },
+        snapshot.block_size(),
+    )?;
+    let block_count = u64::try_from(provisional.blocks.len())
+        .map_err(|_| ParityError::Invariant("terminal ParityMap block count overflows u64"))?;
+    let projected_entry = TapeFileMapEntry::parity_map(parity_map_tape_file_number, block_count);
+    hash_filemark_map_entry(&mut projected_map_hasher, &projected_entry)?;
+    let canonical_map_digest: [u8; 32] = projected_map_hasher.finalize().into();
+    let encoded = encode_parity_map_tape_file(
+        &ParityMapPayload {
+            tape_uuid: snapshot.tape_uuid(),
+            sequence: summary.next_parity_map_sequence,
+            directory,
+            canonical_map_digest,
+            writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            write_timestamp: None,
+        },
+        snapshot.block_size(),
+    )?;
+    if u64::try_from(encoded.blocks.len()).ok() != Some(block_count) {
+        return Err(ParityError::Invariant(
+            "terminal ParityMap geometry changed after digest finalization",
+        ));
+    }
+    let tail_start_lba = start_lba
+        .checked_add(block_count)
+        .and_then(|lba| lba.checked_add(1))
+        .ok_or(ParityError::Invariant(
+            "terminal prefix physical position overflows",
+        ))?;
+    let entry = TapeFileEntry {
+        tape_file_number: parity_map_tape_file_number,
+        kind: TapeFileKind::ParityMap,
+        block_count,
+        physical_start_hint: Some(start_lba),
+        object_id: None,
+        first_parity_data_ordinal: None,
+        epoch_id: None,
+        protected_ordinal_start: None,
+        protected_ordinal_end_exclusive: None,
+        canonical_metadata_hash: Some(encoded.header.payload_sha256),
+        object_recovery_row: None,
+    };
+    let committed_bundle = CommittedBundle {
+        kind: CommittedBundleKind::TerminalPrefix,
+        entries: vec![entry],
+        highest_protected_ordinal: summary.highest_protected_ordinal,
+        total_committed_ordinals: summary.total_committed_ordinals,
+    };
+    validate_committed_bundle_shape(&committed_bundle)
+        .map_err(|error| resume_error(error.to_string()))?;
+    Ok(TerminalPrefixPlan {
+        start_tape_file_number,
+        tail_start_tape_file_number: scope_tape_file_count,
+        start_lba,
+        tail_start_lba,
+        parity_map_tape_file_number: Some(parity_map_tape_file_number),
+        sidecar_directory_entries: summary.sidecar_directory_entries,
+        committed_bundle,
+    })
+}
+
+/// Execute an immutable checkpoint-bound terminal prefix and journal barrier.
+///
+/// Planning is repeated from the frozen base before any write. Complete media
+/// is adopted without rewriting; absent or proved-rewritable media emits the
+/// final ParityMap, one delimiter, the synchronous zero-count barrier, and the
+/// exact TerminalPrefix/checkpoint transition used by the ordinary sink path.
+pub fn close_checkpointed_terminal_index_prefix(
+    raw: &mut dyn RawTapeSink,
+    journal: &mut dyn TapeFileJournal,
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+    expected_plan: &TerminalPrefixPlan,
+    evidence: TerminalPrefixReconcileEvidence,
+) -> Result<CheckpointedTerminalPrefixCloseResult, ParityError> {
+    let current_plan = plan_checkpointed_terminal_index_close(snapshot)?;
+    if &current_plan != expected_plan {
+        return Err(ParityError::Invariant(
+            "terminal prefix execution does not match persisted immutable plan",
+        ));
+    }
+    match evidence {
+        TerminalPrefixReconcileEvidence::Absent => {
+            ensure_raw_position(raw, expected_plan.start_lba, "absent terminal prefix")?;
+            write_planned_terminal_parity_map(raw, snapshot, expected_plan)?;
+        }
+        TerminalPrefixReconcileEvidence::TornRewritable => {
+            raw.locate_for_overwrite(PhysicalPositionHint::new(expected_plan.start_lba))?;
+            ensure_raw_position(raw, expected_plan.start_lba, "rewritable terminal prefix")?;
+            write_planned_terminal_parity_map(raw, snapshot, expected_plan)?;
+        }
+        TerminalPrefixReconcileEvidence::Complete => {
+            ensure_raw_position(
+                raw,
+                expected_plan.tail_start_lba,
+                "complete terminal prefix",
+            )?;
+        }
+        TerminalPrefixReconcileEvidence::TornWorm | TerminalPrefixReconcileEvidence::Unproved => {
+            return Err(ParityError::SessionOpen(format!(
+                "terminal prefix requires recovery: {evidence:?}"
+            )));
+        }
+    }
+
+    let barrier = raw.write_filemarks(0, false)?;
+    let RawWriteOutcome::WroteFilemark {
+        position_after,
+        end_of_medium,
+        ..
+    } = barrier
+    else {
+        return Err(ParityError::Invariant(
+            "terminal prefix zero-count barrier returned a block outcome",
+        ));
+    };
+    if end_of_medium {
+        return Err(hard_end_of_medium());
+    }
+    let observed = raw.position()?;
+    if observed != position_after || observed.lba != expected_plan.tail_start_lba {
+        return Err(ParityError::SessionOpen(format!(
+            "terminal prefix barrier observed {:?}, position re-read returned {:?}, expected lba {}",
+            position_after, observed, expected_plan.tail_start_lba
+        )));
+    }
+    let checkpoint = CommittedBundle {
+        kind: CommittedBundleKind::CheckpointedThrough,
+        entries: Vec::new(),
+        highest_protected_ordinal: expected_plan.committed_bundle.highest_protected_ordinal,
+        total_committed_ordinals: expected_plan.committed_bundle.total_committed_ordinals,
+    };
+    journal.commit_terminal_prefix_transition(&expected_plan.committed_bundle, &checkpoint)?;
+    Ok(CheckpointedTerminalPrefixCloseResult {
+        used_tape_blocks: observed.lba,
+    })
+}
+
+fn checked_terminal_close_projection(
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+) -> Result<CheckedTerminalCloseProjection, ParityError> {
+    let projected_count =
+        snapshot
+            .committed_entry_count()
+            .checked_add(1)
+            .ok_or(ParityError::Invariant(
+                "terminal projected tape-file count overflows",
+            ))?;
+    let mut projected_map_hasher = Sha256::new();
+    hash_canonical_array_head(&mut projected_map_hasher, projected_count);
+    let mut replay = snapshot.replay()?;
+    let mut expected_file = 0u64;
+    let mut append_lba = 0u64;
+    let mut total_data_ordinals = 0u64;
+    let mut highest_protected_ordinal = 0u64;
+    let mut next_parity_map_sequence = 0u64;
+    let mut sidecar_directory_entries = Vec::new();
+    while let Some(entry) = replay.next_entry()? {
+        if entry.tape_file_number != expected_file {
+            return Err(resume_error(format!(
+                "terminal close structural map is not dense at {expected_file}: found {}",
+                entry.tape_file_number
+            )));
+        }
+        let mapped = entry.to_map_entry();
+        validate_terminal_close_entry(&entry, &mapped)?;
+        hash_filemark_map_entry(&mut projected_map_hasher, &mapped)?;
+        match entry.kind {
+            TapeFileKind::Object => {
+                let first = entry
+                    .first_parity_data_ordinal
+                    .ok_or(ParityError::Invariant(
+                        "terminal Object row lacks its first parity ordinal",
+                    ))?;
+                if first != total_data_ordinals {
+                    return Err(resume_error(format!(
+                        "terminal Object at tape file {expected_file} starts at ordinal {first}, expected {total_data_ordinals}"
+                    )));
+                }
+                total_data_ordinals = total_data_ordinals.checked_add(entry.block_count).ok_or(
+                    ParityError::Invariant("terminal Object ordinal count overflows"),
+                )?;
+            }
+            TapeFileKind::ParitySidecar => {
+                let directory_entry =
+                    sidecar_directory_entry_from_journal(&entry, snapshot.scheme())?;
+                let protected_len = directory_entry
+                    .protected_ordinal_end_exclusive
+                    .checked_sub(directory_entry.protected_ordinal_start)
+                    .ok_or(ParityError::Invariant(
+                        "terminal sidecar protected range underflows",
+                    ))?;
+                if protected_len > epoch_data_shards(snapshot.scheme())? {
+                    return Err(resume_error(format!(
+                        "terminal sidecar epoch {} protects {protected_len} ordinals, exceeding one epoch",
+                        directory_entry.epoch_id
+                    )));
+                }
+                highest_protected_ordinal =
+                    highest_protected_ordinal.max(directory_entry.protected_ordinal_end_exclusive);
+                sidecar_directory_entries.push(directory_entry);
+            }
+            TapeFileKind::ParityMap => {
+                next_parity_map_sequence = next_parity_map_sequence
+                    .checked_add(1)
+                    .ok_or(ParityError::Invariant("parity_map sequence overflows"))?;
+            }
+            TapeFileKind::Bootstrap => {}
+            TapeFileKind::TapeIndexReplica | TapeFileKind::IndexSeparationExtent => {
+                return Err(resume_error(
+                    "checkpointed terminal-close base contains terminal index components",
+                ));
+            }
+        }
+        append_lba = append_lba
+            .checked_add(entry.block_count)
+            .and_then(|lba| lba.checked_add(1))
+            .ok_or(ParityError::Invariant(
+                "terminal committed-prefix position overflows",
+            ))?;
+        expected_file = expected_file.checked_add(1).ok_or(ParityError::Invariant(
+            "terminal structural count overflows",
+        ))?;
+    }
+    if expected_file != replay.committed_entry_count()
+        || total_data_ordinals != replay.total_committed_ordinals()
+        || highest_protected_ordinal != replay.highest_protected_ordinal()
+    {
+        return Err(resume_error(format!(
+            "terminal close summary disagrees with checkpointed journal metadata: rows {expected_file}/{}, W {highest_protected_ordinal}/{}, T {total_data_ordinals}/{}",
+            replay.committed_entry_count(),
+            replay.highest_protected_ordinal(),
+            replay.total_committed_ordinals()
+        )));
+    }
+    if highest_protected_ordinal != total_data_ordinals {
+        return Err(resume_error(format!(
+            "checkpointed terminal close retains an open epoch: W={highest_protected_ordinal}, T={total_data_ordinals}"
+        )));
+    }
+    let directory = SidecarEpochDirectory {
+        directory_scope_tape_file_count: expected_file,
+        directory_scope_total_data_ordinals: total_data_ordinals,
+        directory_scope_highest_protected_ordinal: highest_protected_ordinal,
+        is_final_directory: false,
+        entries: sidecar_directory_entries.clone(),
+    };
+    if !sidecar_directory_entries.is_empty() {
+        directory.validate()?;
+    }
+    let metrics = replay.metrics();
+    Ok(CheckedTerminalCloseProjection {
+        summary: CheckpointedTerminalCloseSummary {
+            committed_tape_file_count: expected_file,
+            append_position: PhysicalPositionHint::new(append_lba),
+            highest_protected_ordinal,
+            total_committed_ordinals: total_data_ordinals,
+            next_parity_map_sequence,
+            sidecar_directory_entries,
+            row_replay_passes: metrics.row_replay_passes,
+            peak_live_journal_entry_count: metrics.peak_live_entry_count,
+        },
+        projected_map_hasher,
+    })
+}
+
+fn validate_terminal_close_entry(
+    entry: &TapeFileEntry,
+    mapped: &TapeFileMapEntry,
+) -> Result<(), ParityError> {
+    if entry.block_count == 0 {
+        return Err(resume_error(format!(
+            "terminal structural row {} has zero blocks",
+            entry.tape_file_number
+        )));
+    }
+    let valid_fields = match entry.kind {
+        TapeFileKind::Object => {
+            mapped.first_parity_data_ordinal.is_some()
+                && mapped.protected_ordinal_start.is_none()
+                && mapped.protected_ordinal_end_exclusive.is_none()
+                && mapped.epoch_id.is_none()
+        }
+        TapeFileKind::ParitySidecar => {
+            mapped.first_parity_data_ordinal.is_none()
+                && mapped.protected_ordinal_start.is_some()
+                && mapped
+                    .protected_ordinal_end_exclusive
+                    .zip(mapped.protected_ordinal_start)
+                    .is_some_and(|(end, start)| end > start)
+                && mapped.epoch_id.is_some()
+        }
+        TapeFileKind::Bootstrap => {
+            entry.block_count == 1
+                && mapped.first_parity_data_ordinal.is_none()
+                && mapped.protected_ordinal_start.is_none()
+                && mapped.protected_ordinal_end_exclusive.is_none()
+                && mapped.epoch_id.is_none()
+        }
+        TapeFileKind::ParityMap
+        | TapeFileKind::TapeIndexReplica
+        | TapeFileKind::IndexSeparationExtent => {
+            mapped.first_parity_data_ordinal.is_none()
+                && mapped.protected_ordinal_start.is_none()
+                && mapped.protected_ordinal_end_exclusive.is_none()
+                && mapped.epoch_id.is_none()
+        }
+    };
+    if !valid_fields {
+        return Err(resume_error(format!(
+            "terminal structural row {} has invalid {:?} fields",
+            entry.tape_file_number, entry.kind
+        )));
+    }
+    Ok(())
+}
+
+fn write_planned_terminal_parity_map(
+    raw: &mut dyn RawTapeSink,
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+    plan: &TerminalPrefixPlan,
+) -> Result<(), ParityError> {
+    let Some(entry) = plan.committed_bundle.entries.first() else {
+        return Ok(());
+    };
+    if plan.committed_bundle.entries.len() != 1 || entry.kind != TapeFileKind::ParityMap {
+        return Err(ParityError::Invariant(
+            "checkpoint-bound terminal prefix is not one final ParityMap",
+        ));
+    }
+    let CheckedTerminalCloseProjection {
+        summary,
+        mut projected_map_hasher,
+    } = checked_terminal_close_projection(snapshot)?;
+    let directory = SidecarEpochDirectory {
+        directory_scope_tape_file_count: plan.tail_start_tape_file_number,
+        directory_scope_total_data_ordinals: summary.total_committed_ordinals,
+        directory_scope_highest_protected_ordinal: summary.highest_protected_ordinal,
+        is_final_directory: true,
+        entries: summary.sidecar_directory_entries,
+    };
+    hash_filemark_map_entry(
+        &mut projected_map_hasher,
+        &TapeFileMapEntry::parity_map(entry.tape_file_number, entry.block_count),
+    )?;
+    let encoded = encode_parity_map_tape_file(
+        &ParityMapPayload {
+            tape_uuid: snapshot.tape_uuid(),
+            sequence: summary.next_parity_map_sequence,
+            directory,
+            canonical_map_digest: projected_map_hasher.finalize().into(),
+            writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            write_timestamp: None,
+        },
+        snapshot.block_size(),
+    )?;
+    if u64::try_from(encoded.blocks.len()).ok() != Some(entry.block_count)
+        || Some(encoded.header.payload_sha256) != entry.canonical_metadata_hash
+    {
+        return Err(ParityError::Invariant(
+            "terminal ParityMap bytes diverge from persisted immutable plan",
+        ));
+    }
+    let mut expected_lba = plan.start_lba;
+    for block in &encoded.blocks {
+        let outcome = raw.write_fixed_block(block)?;
+        let RawWriteOutcome::WroteBlock {
+            bytes_written,
+            position_after,
+            end_of_medium,
+            ..
+        } = outcome
+        else {
+            return Err(ParityError::Invariant(
+                "terminal ParityMap block write returned a filemark outcome",
+            ));
+        };
+        if end_of_medium {
+            return Err(hard_end_of_medium());
+        }
+        expected_lba = expected_lba
+            .checked_add(1)
+            .ok_or(ParityError::Invariant("terminal ParityMap LBA overflows"))?;
+        if bytes_written != snapshot.block_size()
+            || position_after != PhysicalPositionHint::new(expected_lba)
+        {
+            return Err(ParityError::SessionOpen(format!(
+                "terminal ParityMap write completed at {:?} with {bytes_written} bytes, expected lba {expected_lba} and {} bytes",
+                position_after,
+                snapshot.block_size()
+            )));
+        }
+    }
+    let outcome = raw.write_filemarks(1, true)?;
+    let RawWriteOutcome::WroteFilemark {
+        position_after,
+        end_of_medium,
+        ..
+    } = outcome
+    else {
+        return Err(ParityError::Invariant(
+            "terminal ParityMap delimiter returned a block outcome",
+        ));
+    };
+    if end_of_medium {
+        return Err(hard_end_of_medium());
+    }
+    expected_lba = expected_lba.checked_add(1).ok_or(ParityError::Invariant(
+        "terminal ParityMap delimiter LBA overflows",
+    ))?;
+    if position_after != PhysicalPositionHint::new(expected_lba)
+        || expected_lba != plan.tail_start_lba
+    {
+        return Err(ParityError::SessionOpen(format!(
+            "terminal ParityMap delimiter completed at {:?}, expected lba {}",
+            position_after, plan.tail_start_lba
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_raw_position(
+    raw: &mut dyn RawTapeSink,
+    expected_lba: u64,
+    context: &str,
+) -> Result<(), ParityError> {
+    let position = raw.position()?;
+    if position != PhysicalPositionHint::new(expected_lba) {
+        return Err(ParityError::SessionOpen(format!(
+            "{context} cursor is at {:?}, expected partition 0 lba {expected_lba}",
+            position
+        )));
+    }
+    Ok(())
+}
+
+fn hard_end_of_medium() -> ParityError {
+    ParityError::TapeIo(TapeIoError::HardEndOfMedium { sense: Vec::new() })
+}
+
+fn hash_filemark_map_entry(
+    hasher: &mut Sha256,
+    entry: &TapeFileMapEntry,
+) -> Result<(), ParityError> {
+    let kind = match entry.kind {
+        TapeFileKind::Object => 0u64,
+        TapeFileKind::ParitySidecar => 1,
+        TapeFileKind::Bootstrap => 2,
+        TapeFileKind::ParityMap => 3,
+        TapeFileKind::TapeIndexReplica => 4,
+        TapeFileKind::IndexSeparationExtent => 5,
+    };
+    let mut bytes = Vec::new();
+    ciborium::into_writer(
+        &CborValue::Array(vec![
+            CborValue::Integer(entry.tape_file_number.into()),
+            CborValue::Integer(kind.into()),
+            CborValue::Integer(entry.block_count.into()),
+            optional_cbor_u64(entry.first_parity_data_ordinal),
+            optional_cbor_u64(entry.protected_ordinal_start),
+            optional_cbor_u64(entry.protected_ordinal_end_exclusive),
+            optional_cbor_u64(entry.epoch_id),
+        ]),
+        &mut bytes,
+    )
+    .map_err(|error| resume_error(format!("canonical map row encode failed: {error}")))?;
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn optional_cbor_u64(value: Option<u64>) -> CborValue {
+    value.map_or(CborValue::Null, |value| CborValue::Integer(value.into()))
+}
+
+fn hash_canonical_array_head(hasher: &mut Sha256, len: u64) {
+    let mut head = [0u8; 9];
+    let bytes: &[u8] = match len {
+        0..=23 => {
+            head[0] = 0x80 | u8::try_from(len).expect("small CBOR array length fits u8");
+            &head[..1]
+        }
+        24..=0xff => {
+            head[0] = 0x98;
+            head[1] = len as u8;
+            &head[..2]
+        }
+        0x100..=0xffff => {
+            head[0] = 0x99;
+            head[1..3].copy_from_slice(&(len as u16).to_be_bytes());
+            &head[..3]
+        }
+        0x1_0000..=0xffff_ffff => {
+            head[0] = 0x9a;
+            head[1..5].copy_from_slice(&(len as u32).to_be_bytes());
+            &head[..5]
+        }
+        _ => {
+            head[0] = 0x9b;
+            head[1..9].copy_from_slice(&len.to_be_bytes());
+            &head[..9]
+        }
+    };
+    hasher.update(bytes);
+}
+
+/// Plan ordinary v1 append from a frozen bounded journal snapshot.
+///
+/// The snapshot keeps replay bounded without materializing the committed tape
+/// prefix in memory.
+pub fn plan_resume_append_from_snapshot(
+    snapshot: &FileTapeFileJournalCommittedSnapshot,
+) -> Result<(BoundedResumeSummary, ResumeAppendPlan), ParityError> {
+    let summary = checked_bounded_resume_summary(snapshot)?;
+    let plan = summary.append_plan(snapshot.scheme())?;
+    Ok((summary, plan))
 }
 
 /// Reread committed object blocks above the protection watermark and rebuild
@@ -270,7 +1242,8 @@ pub fn plan_resume_append_from_journal(
 /// partial epoch as live state. Full-epoch or multi-epoch rebuild is not a v1
 /// production append path; tests keep it behind an explicitly named
 /// legacy/forensic helper so the sidecar-emission bridge remains covered.
-pub fn rebuild_open_epoch_from_committed_prefix(
+#[cfg(test)]
+fn rebuild_open_epoch_from_committed_prefix(
     source: &mut dyn RawTapeSource,
     committed_prefix: &FilemarkMap,
     scheme: &ParityScheme,
@@ -286,6 +1259,67 @@ pub fn rebuild_open_epoch_from_committed_prefix(
         block_size,
         plan,
     )
+}
+
+/// Reread the single open epoch from bounded resume authority.
+///
+/// Physical positions for only the intersecting Object extents were retained
+/// during journal replay, so this path does not need a complete filemark map.
+pub fn rebuild_open_epoch_from_bounded_summary(
+    source: &mut dyn RawTapeSource,
+    summary: &BoundedResumeSummary,
+    scheme: &ParityScheme,
+    tape_uuid: [u8; 16],
+    block_size: u32,
+) -> Result<ResumeOpenEpochRebuild, ParityError> {
+    let plan = summary.append_plan(scheme)?;
+    if block_size == 0 {
+        return Err(resume_error("resume rebuild block size is zero"));
+    }
+    source
+        .configure_fixed_block_size(block_size)
+        .map_err(|err| {
+            resume_error(format!(
+                "resume rebuild could not configure fixed block size {block_size}: {err}"
+            ))
+        })?;
+    if plan.highest_protected_ordinal_before_rebuild == plan.next_data_ordinal {
+        if !summary.open_epoch_object_extents.is_empty() {
+            return Err(ParityError::Invariant(
+                "closed bounded resume summary retained open-epoch Object extents",
+            ));
+        }
+        locate_resume_append_position(source, plan.append_position)?;
+        return Ok(ResumeOpenEpochRebuild {
+            plan,
+            rebuilt_sidecars: Vec::new(),
+            live_epoch: None,
+        });
+    }
+
+    let mut accumulator = ResumeEpochAccumulator::new(
+        scheme,
+        tape_uuid,
+        block_size,
+        plan.highest_protected_ordinal_before_rebuild,
+        plan.next_epoch_id,
+    )?;
+    for ordinal in plan.highest_protected_ordinal_before_rebuild..plan.next_data_ordinal {
+        let block = read_bounded_open_epoch_object_block(source, summary, ordinal, block_size)?;
+        accumulator.push_block(ordinal, block)?;
+    }
+    let (rebuilt_sidecars, live_epoch) = accumulator.finish()?;
+    if !rebuilt_sidecars.is_empty() {
+        return Err(ParityError::Invariant(
+            "v1 bounded open epoch unexpectedly rebuilt a complete sidecar",
+        ));
+    }
+    locate_resume_append_position(source, plan.append_position)?;
+    Ok(ResumeOpenEpochRebuild {
+        plan,
+        rebuilt_sidecars,
+        live_epoch,
+    })
 }
 
 fn rebuild_open_epoch_from_plan(
@@ -446,7 +1480,7 @@ where
         let expected_tape_file_number = plan
             .append_after_tape_file_number
             .checked_add(1)
-            .and_then(|value| value.checked_add(u32::try_from(index).ok()?))
+            .and_then(|value| value.checked_add(u64::try_from(index).ok()?))
             .ok_or_else(|| resume_error("resume sidecar tape-file number overflows"))?;
         if index > 0 {
             let current_position = sink.position().map_err(|err| {
@@ -509,7 +1543,7 @@ where
 
 fn abandon_resume_sidecar_boundary_or(
     durable_boundary: &mut DurableBoundaryState,
-    tape_file_number: u32,
+    tape_file_number: u64,
     err: ParityError,
 ) -> ParityError {
     match durable_boundary.abandon_tape_file(TapeFileKind::ParitySidecar, tape_file_number) {
@@ -533,7 +1567,8 @@ fn resume_boundary_error(err: ParityError) -> ParityError {
 /// The caller is Layer 5: it loads
 /// `catalog_tape_files WHERE tape_id = ? AND committed = true ORDER BY tape_file_number`,
 /// verifies that catalog prefix, and passes the resulting [`FilemarkMap`] here.
-pub fn plan_resume_append_from_committed_prefix(
+#[cfg(test)]
+fn plan_resume_append_from_committed_prefix(
     committed_prefix: &FilemarkMap,
     scheme: &ParityScheme,
 ) -> Result<ResumeAppendPlan, ParityError> {
@@ -950,14 +1985,52 @@ fn read_committed_object_block(
         ))
     })?;
 
-    let mut buf = vec![0u8; block_size as usize];
+    let block_size_usize = usize::try_from(block_size)
+        .map_err(|_| resume_error("resume rebuild block size does not fit usize"))?;
+    let mut buf = vec![0u8; block_size_usize];
     match source.read_record(&mut buf).map_err(|err| {
         resume_error(format!(
             "resume rebuild failed reading ordinal {ordinal} at physical LBA {}: {err}",
             physical.lba
         ))
     })? {
-        RawReadOutcome::Block { bytes, .. } if bytes == block_size as usize => Ok(buf),
+        RawReadOutcome::Block { bytes, .. } if bytes == block_size_usize => Ok(buf),
+        RawReadOutcome::Block { bytes, .. } => Err(resume_error(format!(
+            "resume rebuild ordinal {ordinal} read {bytes} bytes, expected {block_size}"
+        ))),
+        RawReadOutcome::Filemark { .. } => Err(resume_error(format!(
+            "resume rebuild ordinal {ordinal} encountered a filemark instead of object data"
+        ))),
+        RawReadOutcome::EndOfData { .. } => Err(resume_error(format!(
+            "resume rebuild ordinal {ordinal} encountered end-of-data instead of object data"
+        ))),
+    }
+}
+
+fn read_bounded_open_epoch_object_block(
+    source: &mut dyn RawTapeSource,
+    summary: &BoundedResumeSummary,
+    ordinal: u64,
+    block_size: u32,
+) -> Result<Vec<u8>, ParityError> {
+    let physical = summary.position_for_open_epoch_ordinal(ordinal)?;
+    source.locate_physical(physical).map_err(|err| {
+        resume_error(format!(
+            "resume rebuild could not locate ordinal {ordinal} at physical LBA {}: {err}",
+            physical.lba
+        ))
+    })?;
+
+    let block_size_usize = usize::try_from(block_size)
+        .map_err(|_| resume_error("resume rebuild block size does not fit usize"))?;
+    let mut buf = vec![0u8; block_size_usize];
+    match source.read_record(&mut buf).map_err(|err| {
+        resume_error(format!(
+            "resume rebuild failed reading ordinal {ordinal} at physical LBA {}: {err}",
+            physical.lba
+        ))
+    })? {
+        RawReadOutcome::Block { bytes, .. } if bytes == block_size_usize => Ok(buf),
         RawReadOutcome::Block { bytes, .. } => Err(resume_error(format!(
             "resume rebuild ordinal {ordinal} read {bytes} bytes, expected {block_size}"
         ))),
@@ -1018,7 +2091,7 @@ fn validate_rebuilt_sidecars(
 
 fn write_rebuilt_sidecar_to_raw(
     sink: &mut dyn RawTapeSink,
-    tape_file_number: u32,
+    tape_file_number: u64,
     rebuilt: &ResumeRebuiltSidecar,
     expected_tape_uuid: &[u8; 16],
 ) -> Result<SidecarTapeFile, ParityError> {
@@ -1144,7 +2217,7 @@ fn write_rebuilt_sidecar_to_raw(
 }
 
 fn validate_encoded_sidecar_before_write(
-    tape_file_number: u32,
+    tape_file_number: u64,
     rebuilt: &ResumeRebuiltSidecar,
     expected_tape_uuid: &[u8; 16],
 ) -> Result<(), ParityError> {
@@ -1215,8 +2288,18 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const RESUME_TEST_BLOCK_SIZE: u32 = 256;
+    static TERMINAL_JOURNAL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn terminal_journal_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "remanence-resume-{label}-{}-{}.remjournal",
+            std::process::id(),
+            TERMINAL_JOURNAL_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RawCall {
@@ -1230,7 +2313,7 @@ mod tests {
         Position(u64),
         WriteBlock(usize),
         WriteFilemark,
-        Commit(u32, u64),
+        Commit(u64, u64),
     }
 
     #[derive(Debug, Default)]
@@ -1255,29 +2338,6 @@ mod tests {
         position_calls: usize,
         wrong_position_on_call: Option<usize>,
         events: Rc<RefCell<Vec<RawSinkEvent>>>,
-    }
-
-    #[derive(Debug)]
-    struct StaticJournal {
-        tape_uuid: [u8; 16],
-        state: CommittedState,
-    }
-
-    impl TapeFileJournal for StaticJournal {
-        fn tape_uuid(&self) -> [u8; 16] {
-            self.tape_uuid
-        }
-
-        fn commit_bundle(
-            &mut self,
-            _bundle: &CommittedBundle,
-        ) -> Result<(), crate::journal::JournalError> {
-            Ok(())
-        }
-
-        fn load_committed(&self) -> Result<CommittedState, crate::journal::JournalError> {
-            Ok(self.state.clone())
-        }
     }
 
     impl RecordingResumeRawSource {
@@ -1361,6 +2421,16 @@ mod tests {
             self.calls.push(RawCall::Locate(hint.lba));
             self.cursor = hint.lba;
             Ok(())
+        }
+
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.cursor = self
+                .blocks
+                .keys()
+                .next_back()
+                .copied()
+                .map_or(0, |lba| lba.saturating_add(1));
+            Ok(PhysicalPositionHint::new(self.cursor))
         }
 
         fn space_filemarks(&mut self, _count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
@@ -1483,46 +2553,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_resume_from_journal_replays_prefix_and_enforces_restart_bound() {
-        let ok_journal = StaticJournal {
-            tape_uuid: [0x33; 16],
-            state: CommittedState {
-                entries: vec![
-                    TapeFileEntry::from_map_entry(TapeFileMapEntry::bootstrap(0, 1)),
-                    TapeFileEntry::from_map_entry(TapeFileMapEntry::object(1, 4, 0)),
-                    TapeFileEntry::from_map_entry(TapeFileMapEntry::parity_sidecar(2, 1, 0, 0, 4)),
-                    TapeFileEntry::from_map_entry(TapeFileMapEntry::object(3, 3, 4)),
-                ],
-                highest_protected_ordinal: 4,
-                total_committed_ordinals: 7,
-                orphaned_bundles: Vec::new(),
-            },
-        };
-        let plan = plan_resume_append_from_journal(&ok_journal, &rebuild_scheme())
-            .expect("journal state within one open epoch plans");
-        assert_eq!(plan.append_after_tape_file_number, 3);
-        assert_eq!(plan.highest_protected_ordinal_before_rebuild, 4);
-        assert_eq!(plan.next_data_ordinal, 7);
-        assert!(plan.sidecars_to_emit.is_empty());
-
-        let bad_journal = StaticJournal {
-            tape_uuid: [0x33; 16],
-            state: CommittedState {
-                entries: vec![
-                    TapeFileEntry::from_map_entry(TapeFileMapEntry::bootstrap(0, 1)),
-                    TapeFileEntry::from_map_entry(TapeFileMapEntry::object(1, 4, 0)),
-                ],
-                highest_protected_ordinal: 0,
-                total_committed_ordinals: 4,
-                orphaned_bundles: Vec::new(),
-            },
-        };
-        let err = plan_resume_append_from_journal(&bad_journal, &rebuild_scheme())
-            .expect_err("journal with a full unprotected epoch is rejected");
-        assert!(matches!(err, ParityError::ResumeAppend(_)));
-    }
-
-    #[test]
     fn plan_resume_rejects_sidecar_range_larger_than_scheme_epoch() {
         let map = FilemarkMap::new(vec![
             TapeFileMapEntry::bootstrap(0, 1),
@@ -1579,7 +2609,7 @@ mod tests {
         )
     }
 
-    fn sidecar(tape_file_number: u32, epoch_id: u64, start: u64, end: u64) -> SidecarTapeFile {
+    fn sidecar(tape_file_number: u64, epoch_id: u64, start: u64, end: u64) -> SidecarTapeFile {
         SidecarTapeFile {
             tape_file_number,
             epoch_id,
@@ -1590,7 +2620,7 @@ mod tests {
             parity_shard_block_count: 4,
             canonical_metadata_hash: [0xA5; 32],
             final_partial_epoch: false,
-            filemark_outcome: outcome(u64::from(tape_file_number) + 100),
+            filemark_outcome: outcome(tape_file_number + 100),
             physical_start_lba: None,
         }
     }
@@ -1638,12 +2668,12 @@ mod tests {
     }
 
     #[test]
-    fn append_point_can_be_after_committed_bootstrap_even_when_watermark_lags() {
+    fn append_point_can_be_after_committed_parity_map_even_when_watermark_lags() {
         let map = FilemarkMap::new(vec![
             TapeFileMapEntry::bootstrap(0, 1),
             TapeFileMapEntry::object(1, 17, 0),
             TapeFileMapEntry::parity_sidecar(2, 6, 0, 0, 12),
-            TapeFileMapEntry::bootstrap(3, 1),
+            TapeFileMapEntry::parity_map(3, 1),
         ])
         .expect("map validates");
 
@@ -3023,16 +4053,522 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_rejects_empty_committed_prefix() {
-        let map = FilemarkMap::new(Vec::new()).expect("empty map validates structurally");
-        let err = plan_resume_append_from_committed_prefix(&map, &scheme()).unwrap_err();
-
-        match err {
-            ParityError::ResumeAppend(message) => {
-                assert!(message.contains("no tape files"), "{message}");
-            }
-            other => panic!("expected resume append error, got {other:?}"),
+    fn journal_entry(
+        tape_file_number: u64,
+        kind: TapeFileKind,
+        block_count: u64,
+        first_parity_data_ordinal: Option<u64>,
+        epoch: Option<(u64, u64, u64)>,
+    ) -> TapeFileEntry {
+        TapeFileEntry {
+            tape_file_number,
+            kind,
+            block_count,
+            physical_start_hint: None,
+            object_id: None,
+            first_parity_data_ordinal,
+            epoch_id: epoch.map(|value| value.0),
+            protected_ordinal_start: epoch.map(|value| value.1),
+            protected_ordinal_end_exclusive: epoch.map(|value| value.2),
+            canonical_metadata_hash: (kind == TapeFileKind::ParitySidecar).then_some([0x5a; 32]),
+            object_recovery_row: None,
         }
+    }
+
+    fn append_checkpointed_terminal_fixture(
+        journal: &mut crate::journal::FileTapeFileJournal,
+        object_count: u64,
+    ) {
+        assert_eq!(object_count % 12, 0, "fixture ends at an epoch boundary");
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            })
+            .expect("commit BOT Bootstrap");
+        let mut next_file = 1u64;
+        for object_ordinal in 0..object_count {
+            let mut entries = vec![journal_entry(
+                next_file,
+                TapeFileKind::Object,
+                1,
+                Some(object_ordinal),
+                None,
+            )];
+            next_file += 1;
+            let total = object_ordinal + 1;
+            let closes_epoch = total % 12 == 0;
+            if closes_epoch {
+                let epoch_id = total / 12 - 1;
+                entries.push(journal_entry(
+                    next_file,
+                    TapeFileKind::ParitySidecar,
+                    11,
+                    None,
+                    Some((epoch_id, total - 12, total)),
+                ));
+                next_file += 1;
+            }
+            journal
+                .commit_bundle(&CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries,
+                    highest_protected_ordinal: if closes_epoch {
+                        total
+                    } else {
+                        total - total % 12
+                    },
+                    total_committed_ordinals: total,
+                })
+                .expect("commit Object fixture bundle");
+        }
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: object_count,
+                total_committed_ordinals: object_count,
+            })
+            .expect("commit checkpoint watermark");
+    }
+
+    struct ExactTerminalRawSink {
+        cursor: u64,
+        blocks: Vec<Vec<u8>>,
+        filemark_calls: Vec<(u32, bool)>,
+    }
+
+    impl RawTapeSink for ExactTerminalRawSink {
+        fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            self.cursor = hint.lba;
+            self.blocks.clear();
+            Ok(())
+        }
+
+        fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+            self.blocks.push(buf.to_vec());
+            self.cursor += 1;
+            Ok(RawWriteOutcome::WroteBlock {
+                bytes_written: u32::try_from(buf.len()).expect("test block length fits u32"),
+                position_after: PhysicalPositionHint::new(self.cursor),
+                early_warning: false,
+                end_of_medium: false,
+            })
+        }
+
+        fn write_filemarks(
+            &mut self,
+            count: u32,
+            immed: bool,
+        ) -> Result<RawWriteOutcome, ParityError> {
+            self.filemark_calls.push((count, immed));
+            self.cursor += u64::from(count);
+            Ok(RawWriteOutcome::WroteFilemark {
+                position_after: PhysicalPositionHint::new(self.cursor),
+                early_warning: false,
+                end_of_medium: false,
+            })
+        }
+
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            Ok(PhysicalPositionHint::new(self.cursor))
+        }
+    }
+
+    #[test]
+    fn bounded_terminal_plan_writes_the_planned_bytes() {
+        let tape_uuid = [0x91; 16];
+        let path = terminal_journal_path("bounded-terminal-exact");
+        let mut journal = crate::journal::FileTapeFileJournal::open(
+            &path,
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .expect("open parity journal");
+        append_checkpointed_terminal_fixture(&mut journal, 12);
+        let snapshot = journal
+            .committed_snapshot_bounded()
+            .expect("freeze bounded authority");
+        let bounded = plan_checkpointed_terminal_index_close(&snapshot)
+            .expect("plan bounded terminal prefix");
+
+        let mut raw = ExactTerminalRawSink {
+            cursor: bounded.start_lba,
+            blocks: Vec::new(),
+            filemark_calls: Vec::new(),
+        };
+        let result = close_checkpointed_terminal_index_prefix(
+            &mut raw,
+            &mut journal,
+            &snapshot,
+            &bounded,
+            TerminalPrefixReconcileEvidence::Absent,
+        )
+        .expect("write bounded terminal prefix");
+        assert_eq!(result.used_tape_blocks, bounded.tail_start_lba);
+        assert_eq!(raw.filemark_calls, vec![(1, true), (0, false)]);
+        let decoded = crate::parity_map::parse_parity_map_tape_file(&raw.blocks, &tape_uuid)
+            .expect("decode emitted final ParityMap");
+        assert_eq!(
+            Some(decoded.header.payload_sha256),
+            bounded.committed_bundle.entries[0].canonical_metadata_hash
+        );
+        let checkpoint = CommittedBundle {
+            kind: CommittedBundleKind::CheckpointedThrough,
+            entries: Vec::new(),
+            highest_protected_ordinal: bounded.committed_bundle.highest_protected_ordinal,
+            total_committed_ordinals: bounded.committed_bundle.total_committed_ordinals,
+        };
+        assert!(journal
+            .terminal_prefix_transition_is_durable(&bounded.committed_bundle, &checkpoint)
+            .expect("inspect durable bounded transition"));
+    }
+
+    #[test]
+    fn high_object_count_terminal_summary_has_one_pass_and_bounded_peak() {
+        const OBJECT_COUNT: u64 = 384;
+        let tape_uuid = [0x92; 16];
+        let path = terminal_journal_path("bounded-terminal-high-count");
+        let mut journal = crate::journal::FileTapeFileJournal::open(
+            &path,
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .expect("open high-count parity journal");
+        append_checkpointed_terminal_fixture(&mut journal, OBJECT_COUNT);
+        let snapshot = journal
+            .committed_snapshot_bounded()
+            .expect("freeze high-count bounded authority");
+        let summary = checked_checkpointed_terminal_close_summary(&snapshot)
+            .expect("derive high-count terminal summary");
+
+        assert_eq!(summary.row_replay_passes, 1);
+        assert_eq!(summary.total_committed_ordinals, OBJECT_COUNT);
+        assert_eq!(summary.highest_protected_ordinal, OBJECT_COUNT);
+        assert_eq!(
+            summary.sidecar_directory_entries.len() as u64,
+            OBJECT_COUNT / 12
+        );
+        assert!(summary.committed_tape_file_count > OBJECT_COUNT);
+        assert!(summary.peak_live_journal_entry_count <= 4);
+        assert!(summary.peak_live_journal_entry_count < OBJECT_COUNT);
+
+        let bounded = plan_checkpointed_terminal_index_close(&snapshot)
+            .expect("plan high-count bounded terminal prefix");
+        assert_eq!(
+            bounded.start_tape_file_number,
+            summary.committed_tape_file_count
+        );
+        assert_eq!(bounded.committed_bundle.entries.len(), 1);
+    }
+
+    #[test]
+    fn high_object_count_resume_summary_and_sink_stay_bounded() {
+        const OBJECT_COUNT: u64 = 1_200;
+        let tape_uuid = [0x95; 16];
+        let mut journal = crate::journal::FileTapeFileJournal::open(
+            terminal_journal_path("bounded-resume-high-count"),
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .expect("open high-count resume journal");
+        append_checkpointed_terminal_fixture(&mut journal, OBJECT_COUNT);
+        let snapshot = journal
+            .committed_snapshot_bounded()
+            .expect("freeze bounded resume authority");
+        let (summary, bounded_plan) =
+            plan_resume_append_from_snapshot(&snapshot).expect("plan bounded resume");
+
+        assert_eq!(summary.committed_object_count, OBJECT_COUNT);
+        assert_eq!(summary.next_epoch_id, OBJECT_COUNT / 12);
+        assert!(summary.bot_bootstrap_committed);
+        assert_eq!(summary.next_parity_map_sequence, 0);
+        assert!(summary.open_epoch_object_extents.is_empty());
+        assert_eq!(summary.replay_metrics.validation_passes, 1);
+        assert_eq!(summary.replay_metrics.row_replay_passes, 1);
+        assert!(summary.replay_metrics.peak_live_entry_count <= 4);
+        assert!(summary.replay_metrics.peak_live_entry_count < OBJECT_COUNT);
+        assert_eq!(
+            summary.sidecar_directory_entries.len() as u64,
+            OBJECT_COUNT / 12
+        );
+
+        let resume_result = bounded_plan
+            .clone()
+            .complete(Vec::new())
+            .expect("complete bounded checkpoint resume");
+        let sink_snapshot = journal
+            .committed_snapshot_bounded()
+            .expect("freeze sink-owned bounded authority");
+        let sink_summary = checked_bounded_resume_summary(&sink_snapshot)
+            .expect("derive sink-owned bounded summary");
+        let mut raw = ExactTerminalRawSink {
+            cursor: sink_summary.append_position.lba,
+            blocks: Vec::new(),
+            filemark_calls: Vec::new(),
+        };
+        let sink = crate::sink::ParitySink::new_sidecar_only_from_bounded_resume(
+            &mut raw,
+            &mut journal,
+            scheme(),
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+            crate::sink::BoundedResumeWriterSeed {
+                committed_prefix_snapshot: sink_snapshot,
+                committed_prefix_summary: sink_summary,
+                resume_result: &resume_result,
+                live_epoch: None,
+            },
+        )
+        .expect("seed high-count bounded sink");
+        let state = sink.into_session_state().expect("detach bounded sink");
+        assert_eq!(state.retained_live_structural_row_count(), 0);
+        assert_eq!(
+            state.total_committed_ordinals().expect("bounded ordinals"),
+            OBJECT_COUNT
+        );
+        assert_eq!(
+            state
+                .terminal_triple_capacity_runtime_state()
+                .expect("bounded capacity authority")
+                .object_rows_before_object,
+            OBJECT_COUNT
+        );
+    }
+
+    #[test]
+    fn bounded_resume_retains_and_rereads_only_the_open_epoch() {
+        let tape_uuid = [0x96; 16];
+        let mut journal = crate::journal::FileTapeFileJournal::open(
+            terminal_journal_path("bounded-resume-open-epoch"),
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .expect("open bounded open-epoch journal");
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            })
+            .expect("commit BOT Bootstrap");
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries: vec![
+                    journal_entry(1, TapeFileKind::Object, 12, Some(0), None),
+                    journal_entry(2, TapeFileKind::ParitySidecar, 11, None, Some((0, 0, 12))),
+                ],
+                highest_protected_ordinal: 12,
+                total_committed_ordinals: 12,
+            })
+            .expect("commit protected Object");
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries: vec![journal_entry(3, TapeFileKind::Object, 3, Some(12), None)],
+                highest_protected_ordinal: 12,
+                total_committed_ordinals: 15,
+            })
+            .expect("commit open-epoch Object");
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: 12,
+                total_committed_ordinals: 15,
+            })
+            .expect("commit open-epoch checkpoint");
+
+        let snapshot = journal
+            .committed_snapshot_bounded()
+            .expect("freeze open-epoch authority");
+        let (summary, bounded_plan) =
+            plan_resume_append_from_snapshot(&snapshot).expect("plan bounded open epoch");
+        assert_eq!(summary.open_epoch_object_extents.len(), 1);
+        assert_eq!(
+            summary.open_epoch_object_extents[0],
+            ResumeOpenEpochObjectExtent {
+                tape_file_number: 3,
+                first_parity_data_ordinal: 12,
+                block_count: 3,
+                physical_start_lba: 27,
+            }
+        );
+        assert_eq!(summary.append_position, PhysicalPositionHint::new(31));
+
+        let mut bounded_source = RecordingResumeRawSource::default();
+        for offset in 0..3u64 {
+            let block = vec![u8::try_from(offset + 1).expect("small test byte"); 256];
+            bounded_source = bounded_source.with_block(27 + offset, block);
+        }
+        let bounded_rebuild = rebuild_open_epoch_from_bounded_summary(
+            &mut bounded_source,
+            &summary,
+            &scheme(),
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+        )
+        .expect("rebuild bounded open epoch");
+        assert_eq!(bounded_rebuild.plan, bounded_plan);
+        assert_eq!(
+            bounded_source.calls,
+            vec![
+                RawCall::Configure(RESUME_TEST_BLOCK_SIZE),
+                RawCall::Locate(27),
+                RawCall::Read(27),
+                RawCall::Locate(28),
+                RawCall::Read(28),
+                RawCall::Locate(29),
+                RawCall::Read(29),
+                RawCall::Locate(31),
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_resume_fails_closed_on_bot_orphan_and_epoch_discontinuity() {
+        let tape_uuid = [0x97; 16];
+        let mut orphan = crate::journal::FileTapeFileJournal::open(
+            terminal_journal_path("bounded-resume-bot-orphan"),
+            tape_uuid,
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .expect("open BOT-orphan journal");
+        orphan
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            })
+            .expect("persist orphaned BOT bundle");
+        let legacy = orphan.load_committed().expect("replay orphan evidence");
+        assert!(legacy.entries.is_empty());
+        assert_eq!(legacy.orphaned_bundles.len(), 1);
+        let orphan_error = orphan
+            .committed_snapshot_bounded()
+            .expect_err("orphaned BOT must fence bounded resume");
+        assert!(
+            orphan_error
+                .to_string()
+                .contains("beyond its last checkpoint"),
+            "{orphan_error}"
+        );
+
+        let mut discontinuous = crate::journal::FileTapeFileJournal::open(
+            terminal_journal_path("bounded-resume-epoch-gap"),
+            [0x98; 16],
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .expect("open epoch-gap journal");
+        discontinuous
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            })
+            .expect("commit epoch-gap BOT");
+        discontinuous
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries: vec![
+                    journal_entry(1, TapeFileKind::Object, 1, Some(0), None),
+                    journal_entry(2, TapeFileKind::ParitySidecar, 11, None, Some((1, 0, 1))),
+                ],
+                highest_protected_ordinal: 1,
+                total_committed_ordinals: 1,
+            })
+            .expect("commit discontinuous epoch label");
+        discontinuous
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: 1,
+                total_committed_ordinals: 1,
+            })
+            .expect("commit epoch-gap watermark");
+        let snapshot = discontinuous
+            .committed_snapshot_bounded()
+            .expect("freeze discontinuous journal framing");
+        let error = checked_bounded_resume_summary(&snapshot)
+            .expect_err("discontinuous epoch labels must fail bounded resume");
+        assert!(
+            error.to_string().contains("expected monotonic id 0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bounded_terminal_summary_rejects_open_epoch_and_structural_gap() {
+        for (label, object_file, highest, expected) in [
+            ("open-epoch", 1, 0, "open epoch"),
+            ("structural-gap", 2, 1, "not dense"),
+        ] {
+            let tape_uuid = if object_file == 1 {
+                [0x93; 16]
+            } else {
+                [0x94; 16]
+            };
+            let mut journal = crate::journal::FileTapeFileJournal::open(
+                terminal_journal_path(label),
+                tape_uuid,
+                RESUME_TEST_BLOCK_SIZE,
+                scheme(),
+            )
+            .expect("open rejection fixture journal");
+            journal
+                .commit_bundle(&CommittedBundle {
+                    kind: CommittedBundleKind::BotBootstrap,
+                    entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 0,
+                })
+                .expect("commit rejection BOT");
+            journal
+                .commit_bundle(&CommittedBundle {
+                    kind: CommittedBundleKind::Object,
+                    entries: vec![journal_entry(
+                        object_file,
+                        TapeFileKind::Object,
+                        1,
+                        Some(0),
+                        None,
+                    )],
+                    highest_protected_ordinal: highest,
+                    total_committed_ordinals: 1,
+                })
+                .expect("commit rejection Object");
+            journal
+                .commit_bundle(&CommittedBundle {
+                    kind: CommittedBundleKind::CheckpointedThrough,
+                    entries: Vec::new(),
+                    highest_protected_ordinal: highest,
+                    total_committed_ordinals: 1,
+                })
+                .expect("commit rejection checkpoint");
+            let snapshot = journal
+                .committed_snapshot_bounded()
+                .expect("freeze rejection authority");
+            let error = checked_checkpointed_terminal_close_summary(&snapshot)
+                .expect_err("invalid terminal close authority must fail closed");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn empty_committed_prefix_is_not_a_schema_major_2_map() {
+        let err = FilemarkMap::new(Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("sole tape-file-0 BOT Bootstrap"));
     }
 }

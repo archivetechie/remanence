@@ -6,13 +6,15 @@
 //! normal writer and the resume-generated sidecar writer.
 
 use crate::error::ParityError;
-use crate::filemark_map::{FilemarkMap, ScopedFilemarkMap, TapeFileKind};
+#[cfg(test)]
+use crate::filemark_map::FilemarkMap;
+use crate::filemark_map::{ScopedFilemarkMap, TapeFileKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OutstandingTapeFileCommit {
     kind: TapeFileKind,
-    tape_file_number: u32,
-    started_after_tape_file_number: Option<u32>,
+    tape_file_number: u64,
+    started_after_tape_file_number: Option<u64>,
 }
 
 /// Tracks the last tape-file boundary that is safe to expose to the catalog.
@@ -24,7 +26,7 @@ struct OutstandingTapeFileCommit {
 /// advances `last_committed_tape_file_number`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DurableBoundaryState {
-    last_committed_tape_file_number: Option<u32>,
+    last_committed_tape_file_number: Option<u64>,
     outstanding: Option<OutstandingTapeFileCommit>,
 }
 
@@ -35,6 +37,7 @@ impl DurableBoundaryState {
     }
 
     /// Seed from a committed filemark-map prefix.
+    #[cfg(test)]
     pub(crate) fn from_committed_prefix(prefix: &FilemarkMap) -> Self {
         Self::from_last_committed_tape_file_number(
             prefix.entries().last().map(|entry| entry.tape_file_number),
@@ -44,7 +47,7 @@ impl DurableBoundaryState {
     /// Seed the read-side boundary from a scoped catalog/bootstrap map.
     ///
     /// Complete maps expose every described tape file as committed. Prefix
-    /// maps expose only the authenticated leading tape files; any suffix rows
+    /// maps expose only the digest-validated leading tape files; any suffix rows
     /// are forensic navigation and must not drive parity recovery.
     pub(crate) fn from_scoped_map(scoped_map: &ScopedFilemarkMap) -> Result<Self, ParityError> {
         let last_committed_tape_file_number = match scoped_map.validated_prefix_tape_files {
@@ -84,7 +87,7 @@ impl DurableBoundaryState {
 
     /// Seed from the last catalog-committed tape-file number.
     pub(crate) fn from_last_committed_tape_file_number(
-        last_committed_tape_file_number: Option<u32>,
+        last_committed_tape_file_number: Option<u64>,
     ) -> Self {
         Self {
             last_committed_tape_file_number,
@@ -96,7 +99,7 @@ impl DurableBoundaryState {
     pub(crate) fn begin_tape_file(
         &mut self,
         kind: TapeFileKind,
-        tape_file_number: u32,
+        tape_file_number: u64,
     ) -> Result<(), ParityError> {
         if self.outstanding.is_some() {
             return Err(ParityError::Invariant(
@@ -129,7 +132,7 @@ impl DurableBoundaryState {
     pub(crate) fn commit_tape_file(
         &mut self,
         kind: TapeFileKind,
-        tape_file_number: u32,
+        tape_file_number: u64,
     ) -> Result<(), ParityError> {
         self.expect_outstanding(kind, tape_file_number)?;
         self.last_committed_tape_file_number = Some(tape_file_number);
@@ -141,8 +144,8 @@ impl DurableBoundaryState {
     pub(crate) fn abandon_tape_file(
         &mut self,
         kind: TapeFileKind,
-        tape_file_number: u32,
-    ) -> Result<Option<u32>, ParityError> {
+        tape_file_number: u64,
+    ) -> Result<Option<u64>, ParityError> {
         let outstanding = self.expect_outstanding(kind, tape_file_number)?;
         self.last_committed_tape_file_number = outstanding.started_after_tape_file_number;
         self.outstanding = None;
@@ -150,12 +153,12 @@ impl DurableBoundaryState {
     }
 
     #[cfg(test)]
-    fn last_committed_tape_file_number(&self) -> Option<u32> {
+    fn last_committed_tape_file_number(&self) -> Option<u64> {
         self.last_committed_tape_file_number
     }
 
     /// Whether a tape file sits at or before the durable committed boundary.
-    pub(crate) fn contains_committed_tape_file(&self, tape_file_number: u32) -> bool {
+    pub(crate) fn contains_committed_tape_file(&self, tape_file_number: u64) -> bool {
         self.last_committed_tape_file_number
             .is_some_and(|last_committed| tape_file_number <= last_committed)
     }
@@ -168,7 +171,7 @@ impl DurableBoundaryState {
     fn expect_outstanding(
         &self,
         kind: TapeFileKind,
-        tape_file_number: u32,
+        tape_file_number: u64,
     ) -> Result<OutstandingTapeFileCommit, ParityError> {
         let Some(outstanding) = self.outstanding else {
             return Err(ParityError::Invariant(
@@ -332,5 +335,25 @@ mod tests {
             .expect("zero prefix derives an empty durable boundary");
         assert_eq!(zero_boundary.last_committed_tape_file_number(), None);
         assert!(!zero_boundary.contains_committed_tape_file(0));
+    }
+
+    #[test]
+    fn durable_boundary_preserves_u64_tape_file_numbers_and_stops_at_maximum() {
+        let mut boundary =
+            DurableBoundaryState::from_last_committed_tape_file_number(Some(u64::MAX - 1));
+
+        boundary
+            .begin_tape_file(TapeFileKind::Object, u64::MAX)
+            .expect("the final u64 tape-file number can begin");
+        boundary
+            .commit_tape_file(TapeFileKind::Object, u64::MAX)
+            .expect("the final u64 tape-file number can commit");
+        assert_eq!(boundary.last_committed_tape_file_number(), Some(u64::MAX));
+        assert!(boundary.contains_committed_tape_file(u64::MAX));
+
+        let error = boundary
+            .begin_tape_file(TapeFileKind::ParitySidecar, u64::MAX)
+            .expect_err("the durable boundary cannot wrap past u64::MAX");
+        assert!(matches!(error, ParityError::Invariant(message) if message.contains("overflow")));
     }
 }

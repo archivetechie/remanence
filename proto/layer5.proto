@@ -663,6 +663,14 @@ message LibraryEvent {
 service Catalog {
   rpc ListTapes        (ListTapesRequest)        returns (ListTapesResponse);
   rpc GetTape          (GetTapeRequest)          returns (Tape);
+  // Read the terminal triple index of one exact tape through the same
+  // exact-tape/read owner used by ordinary read sessions. This is a bounded
+  // fast inventory, not a whole-tape physical verification.
+  rpc GetTapeInventory (TapeInventoryRequest)    returns (stream TapeInventoryStreamItem);
+  // Perform the slow physical verification: measure EOD, walk the complete
+  // prefix, compare its canonical map, and read all three replicas and both
+  // typed separation extents. This is distinct from GetTapeInventory.
+  rpc VerifyTapeIndex  (VerifyTapeIndexRequest)  returns (TapeIndexVerification);
   rpc ListTapeFiles    (ListTapeFilesRequest)    returns (ListTapeFilesResponse);
   rpc ListTapePools    (ListTapePoolsRequest)    returns (ListTapePoolsResponse);
   rpc GetTapePool      (GetTapePoolRequest)      returns (TapePool);
@@ -684,6 +692,13 @@ service Catalog {
   // a fresh enumeration that bypasses the SQLite cache. Slow; intended for
   // periodic scrub or after suspected drift.
   rpc ReconcileTape    (ReconcileTapeRequest)    returns (OperationRef);
+
+  // Permanently finalize an exact reconciled tape at its current Object
+  // boundary. This is valid below the pool low watermark and bypasses only
+  // that automatic trigger; all fit, fence, ownership, and format checks stay
+  // mandatory. An accepted request can never reopen the tape for Objects.
+  rpc FinalizeTape     (FinalizeTapeRequest)      returns (TapeFinalization);
+  rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
 
   // Body-format-aware queries. The daemon delegates to the registered
   // format adapter (rem-tar-v1, rem-tar-legacy, rem-bru, future).
@@ -732,6 +747,9 @@ message Tape {
     TAPE_STATE_DEGRADED    = 3;
     TAPE_STATE_FAILED      = 4;
     TAPE_STATE_SEALED      = 5;
+    TAPE_STATE_FINALIZING  = 6;
+    TAPE_STATE_FINALIZED_DEGRADED = 7;
+    TAPE_STATE_COMPLETION_UNKNOWN = 8;
   }
   State state                  = 9;  // NOT NULL; UNSPECIFIED already says "unknown"
   google.protobuf.Timestamp updated_at = 10;
@@ -744,6 +762,266 @@ message Tape {
   // object commits. Exclusive: last written block + 1. Absent = no barrier
   // has proved one; absent is never zero.
   optional uint64 written_extent_lba = 13;
+}
+
+message FinalizeTapeRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
+  bytes tape_uuid = 1;
+  // Wire-optional so an unpooled tape can be finalized. If the tape is pooled,
+  // this field is mandatory and must equal the assignment reread under the
+  // per-tape owner.
+  optional string expected_pool_id = 2;
+  // Exact non-empty operator reason preserved in audit/idempotency authority.
+  string reason = 3;
+  // Required durable key, scoped by actor and operation kind.
+  IdempotencyKey idempotency_key = 4;
+}
+
+message GetTapeFinalizationRequest {
+  bytes tape_uuid = 1;
+}
+
+enum TapeFinalizationProgress {
+  TAPE_FINALIZATION_PROGRESS_UNSPECIFIED = 0;
+  TAPE_FINALIZATION_PROGRESS_BEFORE_REPLICA_A = 1;
+  TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_A = 2;
+  TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_AB = 3;
+  TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_B = 4;
+  TAPE_FINALIZATION_PROGRESS_AFTER_SEPARATION_BC = 5;
+  TAPE_FINALIZATION_PROGRESS_AFTER_REPLICA_C = 6;
+}
+
+enum TapeFinalizationOutcome {
+  TAPE_FINALIZATION_OUTCOME_UNSPECIFIED = 0;
+  TAPE_FINALIZATION_OUTCOME_FINALIZING = 1;
+  TAPE_FINALIZATION_OUTCOME_FINALIZED = 2;
+  TAPE_FINALIZATION_OUTCOME_FINALIZED_DEGRADED = 3;
+  TAPE_FINALIZATION_OUTCOME_RECOVERY_REQUIRED = 4;
+  TAPE_FINALIZATION_OUTCOME_FAILED = 5;
+  // Exact tape ownership is held by an in-flight Object/read operation or by
+  // another close-out admission. No state or media motion occurred.
+  TAPE_FINALIZATION_OUTCOME_BUSY = 6;
+}
+
+message TapeIndexReplicaHealth {
+  uint32 replica_ordinal = 1;
+  enum State {
+    TAPE_INDEX_REPLICA_STATE_UNSPECIFIED = 0;
+    TAPE_INDEX_REPLICA_STATE_PENDING = 1;
+    TAPE_INDEX_REPLICA_STATE_COMPLETE = 2;
+    TAPE_INDEX_REPLICA_STATE_INVALID = 3;
+    TAPE_INDEX_REPLICA_STATE_UNKNOWN = 4;
+    // Header/footer, local placement, and common edition facts agree. Fast
+    // inventory did not stream this older member's payload.
+    TAPE_INDEX_REPLICA_STATE_ENVELOPE_VALID = 5;
+  }
+  State state = 2;
+  string detail = 3;
+}
+
+message TapeInventoryRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
+  bytes tape_uuid = 1;
+}
+
+// One bounded event in the book-like inventory stream. Replica rows are
+// provisional until the final summary selects their attempt_id: payload
+// validation can reject C after emitting rows, then continue with B and A.
+message TapeInventoryStreamItem {
+  oneof item {
+    TapeInventoryReplicaAttemptStarted replica_attempt_started = 1;
+    TapeInventoryStructuralEntry structural_entry = 2;
+    TapeInventoryObjectRow object_row = 3;
+    TapeInventoryReplicaAttemptRejected replica_attempt_rejected = 4;
+    TapeInventoryBotObject bot_object = 5;
+    TapeInventory summary = 6;
+  }
+}
+
+message TapeInventoryReplicaAttemptStarted {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+}
+
+message TapeInventoryReplicaAttemptRejected {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+  string failure_kind = 3;
+  string detail = 4;
+}
+
+enum TapeInventoryStructuralKind {
+  TAPE_INVENTORY_STRUCTURAL_KIND_UNSPECIFIED = 0;
+  TAPE_INVENTORY_STRUCTURAL_KIND_OBJECT = 1;
+  TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_SIDECAR = 2;
+  TAPE_INVENTORY_STRUCTURAL_KIND_BOOTSTRAP = 3;
+  TAPE_INVENTORY_STRUCTURAL_KIND_PARITY_MAP = 4;
+  TAPE_INVENTORY_STRUCTURAL_KIND_TAPE_INDEX_REPLICA = 5;
+  TAPE_INVENTORY_STRUCTURAL_KIND_INDEX_SEPARATION_EXTENT = 6;
+}
+
+message TapeInventoryStructuralEntry {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+  uint64 tape_file_number = 3;
+  TapeInventoryStructuralKind kind = 4;
+  uint64 block_count = 5;
+  optional uint64 first_parity_data_ordinal = 6;
+  optional uint64 protected_ordinal_start = 7;
+  optional uint64 protected_ordinal_end_exclusive = 8;
+  optional uint64 epoch_id = 9;
+}
+
+message TapeInventoryPlaintextRecovery {
+  uint64 manifest_first_chunk_lba = 1;
+  uint64 manifest_size_bytes = 2;
+  uint64 manifest_chunk_count = 3;
+  bytes manifest_sha256 = 4;
+}
+
+message TapeInventoryEncryptedRecovery {
+  repeated bytes recipient_epoch_ids = 1;
+  uint64 metadata_frame_len = 2;
+  uint32 key_frame_len = 3;
+}
+
+message TapeInventoryObjectRow {
+  uint64 attempt_id = 1;
+  uint32 replica_ordinal = 2;
+  uint64 tape_file_number = 3;
+  uint64 stored_block_count = 4;
+  bytes object_id = 5;
+  oneof representation {
+    TapeInventoryPlaintextRecovery plaintext = 6;
+    TapeInventoryEncryptedRecovery encrypted = 7;
+  }
+}
+
+enum TapeInventoryBotObjectState {
+  TAPE_INVENTORY_BOT_OBJECT_STATE_UNSPECIFIED = 0;
+  TAPE_INVENTORY_BOT_OBJECT_STATE_RECOVERED = 1;
+  TAPE_INVENTORY_BOT_OBJECT_STATE_UNKNOWN = 2;
+  TAPE_INVENTORY_BOT_OBJECT_STATE_INCOMPLETE = 3;
+}
+
+message TapeInventoryBotObject {
+  uint64 tape_file_number = 1;
+  uint64 stored_block_count = 2;
+  optional bytes object_id = 3;
+  TapeInventoryBotObjectState state = 4;
+}
+
+enum TapeInventoryOutcome {
+  TAPE_INVENTORY_OUTCOME_UNSPECIFIED = 0;
+  TAPE_INVENTORY_OUTCOME_COMPLETE = 1;
+  TAPE_INVENTORY_OUTCOME_DEGRADED = 2;
+  // No terminal member is authoritative. The caller must invoke structural
+  // recovery from BOT; zero counts in this outcome are never empty success.
+  TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERY_REQUIRED = 3;
+  // No terminal member survived, but the daemon completed the explicit BOT
+  // structural recovery and classified every physical Object candidate.
+  TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERED = 4;
+}
+
+message TapeInventory {
+  bytes tape_uuid = 1;
+  TapeInventoryOutcome outcome = 2;
+  // One-based member ordinal (A=1, B=2, C=3); selection prefers C, then B,
+  // then A. Zero only for BOT recovery required.
+  uint32 selected_replica_ordinal = 3;
+  repeated TapeIndexReplicaHealth replica_health = 4;
+  uint64 structural_entry_count = 5;
+  uint64 object_row_count = 6;
+  bytes edition_digest = 7;
+  bytes layout_digest = 8;
+  bytes payload_digest = 9;
+  bytes canonical_map_digest = 10;
+  // Stable basis label: "terminal_index_fast" or
+  // "bot_structural_recovery".
+  string inventory_basis = 11;
+  string detail = 12;
+  // BOT recovery classifications are streamed internally; the unary summary
+  // stays bounded instead of materialising a whole-tape row set.
+  uint64 recovered_object_count = 13;
+  uint64 unknown_object_count = 14;
+  uint64 incomplete_object_count = 15;
+  uint64 damaged_region_count = 16;
+  // Attempt whose structural and Object rows are authoritative. Zero for BOT
+  // recovery outcomes, whose rows use TapeInventoryBotObject instead.
+  uint64 selected_attempt_id = 17;
+}
+
+message VerifyTapeIndexRequest {
+  // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
+  bytes tape_uuid = 1;
+}
+
+enum TapeIndexVerificationState {
+  TAPE_INDEX_VERIFICATION_STATE_UNSPECIFIED = 0;
+  // Retained for older daemons that truthfully lacked the physical verifier.
+  TAPE_INDEX_VERIFICATION_STATE_DEFERRED_FULL_PHYSICAL_VERIFY = 1;
+  // Every physical prefix row and all five terminal components validated.
+  TAPE_INDEX_VERIFICATION_STATE_VERIFIED_COMPLETE = 2;
+  // The canonical physical prefix has a valid survivor, but one or more
+  // redundant replicas/separations are damaged or incomplete.
+  TAPE_INDEX_VERIFICATION_STATE_VERIFIED_DEGRADED = 3;
+  // No surviving terminal authority could prove the measured physical prefix;
+  // explicit BOT recovery evidence is attached.
+  TAPE_INDEX_VERIFICATION_STATE_RECOVERY_REQUIRED = 4;
+}
+
+message TapeIndexSeparationHealth {
+  // One-based gap ordinal (AB=1, BC=2).
+  uint32 separation_ordinal = 1;
+  enum State {
+    TAPE_INDEX_SEPARATION_STATE_UNSPECIFIED = 0;
+    TAPE_INDEX_SEPARATION_STATE_VALID = 1;
+    TAPE_INDEX_SEPARATION_STATE_INVALID = 2;
+    TAPE_INDEX_SEPARATION_STATE_UNKNOWN = 3;
+  }
+  State state = 2;
+  // Number of zero-filled interior records read and validated.
+  uint64 verified_interior_record_count = 3;
+  string detail = 4;
+}
+
+message TapeIndexVerification {
+  bytes tape_uuid = 1;
+  TapeIndexVerificationState state = 2;
+  // Present only in the legacy deferred response. A verified response carries
+  // full physical evidence below and does not pretend fast inventory was the
+  // basis of verification.
+  TapeInventory fast_inventory = 3;
+  string detail = 4;
+  repeated TapeIndexReplicaHealth replica_health = 5;
+  repeated TapeIndexSeparationHealth separation_health = 6;
+  uint64 measured_eod_lba = 7;
+  uint64 verified_prefix_tape_file_count = 8;
+  uint64 verified_prefix_record_count = 9;
+  uint64 measured_tape_file_count = 10;
+  bytes edition_digest = 11;
+  bytes layout_digest = 12;
+  bytes payload_digest = 13;
+  bytes canonical_map_digest = 14;
+  // Stable basis label: "measured_full_physical" or
+  // "bot_structural_recovery".
+  string verification_basis = 15;
+  // Present only for RECOVERY_REQUIRED. This is a real BOT scan summary, not
+  // a zero-count placeholder or fast terminal inventory.
+  TapeInventory recovery_inventory = 16;
+}
+
+message TapeFinalization {
+  bytes tape_uuid = 1;
+  bytes operation_id = 2;
+  TapeFinalizationProgress progress = 3;
+  uint32 completed_replicas = 4;
+  repeated TapeIndexReplicaHealth replica_health = 5;
+  bytes edition_digest = 6;
+  bytes layout_digest = 7;
+  TapeFinalizationOutcome outcome = 8;
+  string trigger = 9;
+  string detail = 10;
 }
 
 // A daemon-local tape eligibility group. Sutradhara decides the policy that maps
@@ -876,7 +1154,7 @@ message FileRecord {
   // also stand for "not recorded". Every other field here is NOT NULL, because
   // a catalogued file genuinely does know its own path, size and digest.
   optional uint64 first_chunk_body_lba = 6;
-  uint32 chunk_count           = 7;
+  uint64 chunk_count           = 7;
   // Algorithm-aware mirror of file_sha256. During the compatibility window
   // servers populate both fields with the same SHA-256 value.
   Digest file_digest           = 8;

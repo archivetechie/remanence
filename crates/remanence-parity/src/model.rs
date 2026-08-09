@@ -240,7 +240,7 @@ pub struct RecoveryEvent {
     ///
     /// Layer 3c v0.4.4 audit events are keyed by
     /// `(tape_file_number, body_lba)`.
-    pub at_requested: (u32, u64),
+    pub at_requested: (u64, u64),
 }
 
 /// Emitted when an object read sees a transport fault and the mandated single
@@ -248,7 +248,7 @@ pub struct RecoveryEvent {
 #[derive(Clone, Debug)]
 pub struct TransportRetryEvent {
     /// Object-scoped address the caller asked for.
-    pub at_requested: (u32, u64),
+    pub at_requested: (u64, u64),
     /// Object-local LBA the caller asked for.
     pub at_lba_requested: u64,
     /// Physical LBA retried after repositioning through the filemark map.
@@ -286,7 +286,7 @@ impl SidecarMetadataHealth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarMetadataHealthEvent {
     /// Parity sidecar tape file whose metadata health was observed.
-    pub sidecar_tape_file_number: u32,
+    pub sidecar_tape_file_number: u64,
     /// Parity epoch protected by the sidecar.
     pub epoch_id: u64,
     /// Which replicated metadata-copy degradation was observed.

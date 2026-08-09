@@ -29,8 +29,8 @@ use remanence_library::{
     BlockSink, BlockSource, TapeIoError, TapePosition, WriteFilemarksOutcome, WriteOutcome,
 };
 use remanence_parity::{
-    BootstrapObjectRow, BootstrapObjectRowAdmission, CapacityReserveInput, CommittedBundle,
-    ObjectParityState, ObjectWriteSummary, ParityError, ParitySink, TapeFileKind,
+    CommittedBundle, ObjectParityState, ObjectWriteSummary, ParityError, ParitySink, TapeFileKind,
+    TerminalTripleObjectReservation,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -147,7 +147,7 @@ pub struct ObjectCopyProjection {
     /// Tape UUID that received the object copy.
     pub tape_uuid: [u8; 16],
     /// Filemark-delimited tape-file number of the object.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// First parity data ordinal assigned by Layer 3c, absent for no-parity copies.
     pub first_parity_data_ordinal: Option<u64>,
     /// Number of object-data ordinals in the copy.
@@ -379,8 +379,8 @@ pub fn plan_prepared_object(
 
 /// Write prepared files as one `rem-object-v1` object through a parity sink.
 ///
-/// The caller supplies `reserve` after applying its current tape-capacity
-/// model. This function verifies that the reserve's projected object block
+/// The caller supplies an opaque reservation minted by the exact terminal-
+/// triple authority. This function verifies that the projected object block
 /// count matches the Layer 3b layout before opening the object. If a lower
 /// layer fails after object admission, the parity session may need normal
 /// abort/recovery handling by the caller. This initial surface assumes the
@@ -391,7 +391,7 @@ pub fn write_prepared_object_to_parity(
     tape_uuid: [u8; 16],
     options: &RemTarObjectOptions,
     files: &[PreparedFile],
-    reserve: CapacityReserveInput,
+    reservation: TerminalTripleObjectReservation,
 ) -> Result<StreamingObjectWriteReport, StreamingError> {
     let mut readers = open_prepared_readers(files)?
         .into_iter()
@@ -403,7 +403,7 @@ pub fn write_prepared_object_to_parity(
         options,
         files,
         &mut readers,
-        reserve,
+        reservation,
     )
 }
 
@@ -415,10 +415,10 @@ pub fn write_prepared_object_to_parity_from_readers(
     options: &RemTarObjectOptions,
     files: &[PreparedFile],
     readers: &mut [Box<dyn Read + Send>],
-    reserve: CapacityReserveInput,
+    reservation: TerminalTripleObjectReservation,
 ) -> Result<StreamingObjectWriteReport, StreamingError> {
     let plan = plan_prepared_object(options, files)?;
-    validate_reserve(options, &plan.layout, reserve)?;
+    validate_terminal_reservation(options, &plan.layout, &reservation)?;
     if readers.len() != files.len() {
         return Err(StreamingError::InvalidInput(format!(
             "prepared file count {} does not match reader count {}",
@@ -431,27 +431,10 @@ pub fn write_prepared_object_to_parity_from_readers(
         streams.push(RemTarFileStream::new(file.spec.clone(), reader.as_mut()));
     }
 
-    let opened = parity.begin_object_with_capacity_reserve_and_bootstrap_object_row(
-        reserve,
-        BootstrapObjectRowAdmission::PlaintextRemObject,
-    )?;
+    let opened = parity.begin_object_with_terminal_triple_reservation(reservation)?;
     let mut object_sink = ObjectDigestBlockSink::new(parity);
     let layout = write_rem_tar_object_from_readers(&mut object_sink, options, &mut streams)?;
     let object_digest = object_sink.finish_digest();
-    let manifest_first_chunk_lba = layout.manifest.first_chunk_lba.ok_or_else(|| {
-        StreamingError::InvalidInput("generated REM-OBJECT manifest has no body LBA".to_string())
-    })?;
-    parity.record_bootstrap_object_row(
-        BootstrapObjectRow::plaintext(
-            opened.0,
-            layout.projected_size_blocks,
-            manifest_first_chunk_lba.0,
-            layout.manifest.size_bytes,
-            layout.manifest.chunk_count,
-            layout.manifest_sha256,
-        )
-        .with_object_id(options.object_id.as_bytes().to_vec()),
-    )?;
     let object_close = parity.finish_object()?;
     if opened.0 != object_close.tape_file_number {
         return Err(StreamingError::InvalidInput(
@@ -553,21 +536,23 @@ pub fn restore_archive_reader_to_directory(
     })
 }
 
-fn validate_reserve(
+fn validate_terminal_reservation(
     options: &RemTarObjectOptions,
     layout: &RemTarObjectLayout,
-    reserve: CapacityReserveInput,
+    reservation: &TerminalTripleObjectReservation,
 ) -> Result<(), StreamingError> {
-    if reserve.projected_object_blocks != layout.projected_size_blocks {
+    if reservation.projected_object_blocks() != layout.projected_size_blocks {
         return Err(StreamingError::InvalidInput(format!(
-            "capacity reserve projected {} object blocks, but layout projected {}",
-            reserve.projected_object_blocks, layout.projected_size_blocks
+            "terminal reservation projected {} object blocks, but layout projected {}",
+            reservation.projected_object_blocks(),
+            layout.projected_size_blocks
         )));
     }
-    if reserve.block_size_bytes != options.chunk_size as u64 {
+    if u64::from(reservation.block_size_bytes()) != options.chunk_size as u64 {
         return Err(StreamingError::InvalidInput(format!(
-            "capacity reserve block size {} does not match REM-OBJECT chunk size {}",
-            reserve.block_size_bytes, options.chunk_size
+            "terminal reservation block size {} does not match REM-OBJECT chunk size {}",
+            reservation.block_size_bytes(),
+            options.chunk_size
         )));
     }
     Ok(())
@@ -959,7 +944,7 @@ fn xattrs_unsupported(error: &io::Error) -> bool {
 
 fn attach_object_id_to_bundle(
     bundle: &mut CommittedBundle,
-    object_tape_file_number: u32,
+    object_tape_file_number: u64,
     options: &RemTarObjectOptions,
 ) {
     for entry in &mut bundle.entries {
@@ -1825,15 +1810,16 @@ mod tests {
     use remanence_format::{RemTarEntryType, RemTarObjectOptions};
     use remanence_library::{TapeIoError, VecBlockSink, VecBlockSource, VecBlockSourceCall};
     use remanence_parity::{
-        BlockSinkRawTapeSink, BootstrapObjectRepresentation, CommittedBundle, CommittedBundleKind,
-        CommittedState, FilemarkMap, JournalError, ObjectParitySource, OpenTrust, ParityScheme,
-        PhysicalPositionHint, RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap,
-        SpaceFilemarksOutcome, TapeFileJournal, TapeFileMapEntry,
+        BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
+        JournalError, ObjectParitySource, OpenTrust, ParityScheme, PhysicalPositionHint,
+        RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome,
+        TapeFileJournal, TapeFileMapEntry, TerminalTripleCloseInput,
+        DEFAULT_INDEX_SEPARATION_BYTES,
     };
 
     use super::*;
 
-    const BLOCK_SIZE: u32 = 4096;
+    const BLOCK_SIZE: u32 = 256 * 1024;
     const TAPE_UUID: [u8; 16] = [0x51; 16];
 
     #[cfg(unix)]
@@ -2054,42 +2040,10 @@ mod tests {
             object_entry.object_id.as_deref(),
             Some(opts.object_id.as_str())
         );
-        let bootstrap_object_row = object_entry
-            .bootstrap_object_row
-            .as_ref()
-            .expect("object entry carries bootstrap row");
-        assert_eq!(
-            bootstrap_object_row.tape_file_number,
-            report.object_close.tape_file_number
+        assert!(
+            object_entry.object_recovery_row.is_none(),
+            "the sink journal carries structure only; checkpoint recovery rows are projected independently"
         );
-        assert_eq!(
-            bootstrap_object_row.stored_block_count,
-            report.layout.projected_size_blocks
-        );
-        assert_eq!(
-            bootstrap_object_row.object_id.as_deref(),
-            Some(opts.object_id.as_bytes()),
-            "bootstrap binding carries the REM-OBJECT object_id string bytes verbatim"
-        );
-        match &bootstrap_object_row.representation {
-            BootstrapObjectRepresentation::Plaintext {
-                manifest_first_chunk_lba,
-                manifest_size_bytes,
-                manifest_chunk_count,
-                manifest_sha256,
-            } => {
-                assert_eq!(
-                    Some(BodyLba(*manifest_first_chunk_lba)),
-                    report.layout.manifest.first_chunk_lba
-                );
-                assert_eq!(*manifest_size_bytes, report.layout.manifest.size_bytes);
-                assert_eq!(*manifest_chunk_count, report.layout.manifest.chunk_count);
-                assert_eq!(*manifest_sha256, report.layout.manifest_sha256);
-            }
-            BootstrapObjectRepresentation::Encrypted { .. } => {
-                panic!("plaintext streaming write emitted encrypted bootstrap row")
-            }
-        }
         assert_eq!(report.audit_events[0].kind, "streaming_object_committed");
 
         let scoped = scoped_map_from_close(&report.object_close);
@@ -3379,25 +3333,34 @@ mod tests {
         }
     }
 
-    fn capacity_input(projected_object_blocks: u64) -> CapacityReserveInput {
-        CapacityReserveInput {
+    fn capacity_input(projected_object_blocks: u64) -> TerminalTripleObjectReservation {
+        TerminalTripleCloseInput {
+            projected_object_present: true,
             projected_object_blocks,
-            block_size_bytes: BLOCK_SIZE as u64,
+            block_size_bytes: BLOCK_SIZE,
             current_epoch_fill_blocks: 0,
             data_shards_per_epoch: 4,
             parity_shards_per_epoch: 2,
-            sidecar_index_block_count: 1,
+            pending_completed_sidecars: 0,
+            sidecar_entries_before_object: 0,
+            structural_entries_before_object: 1,
+            object_rows_before_object: 0,
             object_filemark_blocks: 1,
             sidecar_filemark_blocks: 1,
-            bootstrap_filemark_blocks: 1,
-            pending_completed_sidecars: 0,
-            remaining_bootstrap_count: 1,
+            parity_map_filemark_blocks: 1,
+            replica_filemark_blocks: 1,
+            gap_filemark_blocks: 1,
+            gap_nominal_bytes: DEFAULT_INDEX_SEPARATION_BYTES,
             safety_margin_blocks: 4,
             remaining_tape_blocks: 10_000,
-            empty_tape_usable_blocks: 10_000,
+            capacity_basis_blocks: 10_002,
+            low_watermark_blocks: 0,
+            high_watermark_blocks: 1,
             pending_completed_epoch_parity_bytes: 0,
-            remaining_spool_bytes: 10_000_000,
+            remaining_spool_bytes: u64::MAX,
         }
+        .reserve_object()
+        .expect("stream fixture terminal-triple reservation")
     }
 
     fn scoped_map_from_close(close: &ObjectWriteSummary) -> ScopedFilemarkMap {
@@ -3414,12 +3377,6 @@ mod tests {
                 .sidecars_emitted
                 .iter()
                 .map(|sidecar| sidecar.tape_file_entry().to_map_entry()),
-        );
-        entries.extend(
-            close
-                .control_tape_files_emitted
-                .iter()
-                .map(|entry| entry.to_map_entry()),
         );
         let map = FilemarkMap::new(entries).unwrap();
         ScopedFilemarkMap::from_catalog(map, close.highest_protected_ordinal)
@@ -3553,6 +3510,11 @@ mod tests {
         fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
             self.cursor_lba = hint.lba;
             Ok(())
+        }
+
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.cursor_lba = self.end_lba;
+            Ok(PhysicalPositionHint::new(self.cursor_lba))
         }
 
         fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {

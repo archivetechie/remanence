@@ -27,31 +27,30 @@ type HmacSha256 = Hmac<Sha256>;
 pub const PARITY_MAP_FORMAT_ID: &str = "rem-parity-map-v1";
 
 /// Parity-map header schema version emitted and accepted by this codec.
-pub const PARITY_MAP_SCHEMA_VERSION: u16 = 1;
+pub const PARITY_MAP_SCHEMA_VERSION: u16 = 2;
 
 /// Parity-map footer schema version emitted and accepted by this codec.
-pub const PARITY_MAP_FOOTER_VERSION: u16 = 1;
+pub const PARITY_MAP_FOOTER_VERSION: u16 = 2;
 
 /// Byte length of the fixed parity-map header fields including CRC.
-pub const PARITY_MAP_HEADER_LEN: usize = 0xB8;
+pub const PARITY_MAP_HEADER_LEN: usize = 0xC8;
 
 /// Byte offset of the header CRC-64/XZ field.
-pub const PARITY_MAP_HEADER_CRC_OFFSET: usize = 0xB0;
+pub const PARITY_MAP_HEADER_CRC_OFFSET: usize = 0xC0;
 
 /// Byte length of the fixed parity-map footer fields including CRC.
-pub const PARITY_MAP_FOOTER_LEN: usize = 0xB8;
+pub const PARITY_MAP_FOOTER_LEN: usize = 0xC8;
 
 /// Byte offset of the footer CRC-64/XZ field.
-pub const PARITY_MAP_FOOTER_CRC_OFFSET: usize = 0xB0;
+pub const PARITY_MAP_FOOTER_CRC_OFFSET: usize = 0xC0;
 
 /// Maximum bytes charged for the non-directory-row portion of one canonical
 /// parity-map CBOR payload.
 ///
 /// The bound includes the largest CBOR container heads, all seven root keys,
 /// the fixed format/tape/digest fields, u64-width numeric fields, and the
-/// maximum accepted writer-version and timestamp strings.  It deliberately
-/// remains valid when the draft's remaining u32 structural fields widen to
-/// u64.
+/// maximum accepted writer-version and timestamp strings. All structural
+/// numeric fields are charged at their full wire widths.
 pub const PARITY_MAP_CBOR_FIXED_UPPER_BOUND_BYTES: u64 = 325;
 
 /// Maximum bytes charged for the directory envelope apart from its rows.
@@ -103,7 +102,7 @@ const KNOWN_DIRECTORY_FLAGS: u32 = SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarEpochDirectoryEntry {
     /// Filemark-delimited tape-file number of the parity sidecar.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Parity epoch identifier recorded in the sidecar metadata.
     pub epoch_id: u64,
     /// First protected object-data ordinal.
@@ -113,9 +112,9 @@ pub struct SidecarEpochDirectoryEntry {
     /// Total sidecar tape-file blocks before the trailing filemark.
     pub sidecar_total_block_count: u64,
     /// Blocks in one sidecar header/index metadata copy.
-    pub sidecar_header_block_count: u32,
+    pub sidecar_header_block_count: u64,
     /// Raw parity-shard block count.
-    pub parity_shard_block_count: u32,
+    pub parity_shard_block_count: u64,
     /// Canonical metadata hash shared by the primary/tail sidecar copies.
     pub canonical_metadata_hash: [u8; 32],
     /// Addendum-defined structural flags.
@@ -126,7 +125,7 @@ pub struct SidecarEpochDirectoryEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarEpochDirectory {
     /// Number of leading tape files described by this directory scope.
-    pub directory_scope_tape_file_count: u32,
+    pub directory_scope_tape_file_count: u64,
     /// Total object-data ordinals in the directory scope.
     pub directory_scope_total_data_ordinals: u64,
     /// Highest protected ordinal in the directory scope.
@@ -225,11 +224,11 @@ impl SidecarEpochDirectory {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParityMapReference {
     /// Filemark-delimited tape-file number of the referenced parity map.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Fixed-block count in the parity-map tape file, excluding filemark.
     pub block_count: u64,
     /// Directory scope tape-file count.
-    pub directory_scope_tape_file_count: u32,
+    pub directory_scope_tape_file_count: u64,
     /// Directory scope total data ordinals.
     pub directory_scope_total_data_ordinals: u64,
     /// Directory scope highest protected ordinal.
@@ -272,7 +271,7 @@ pub struct ParityMapPayload {
     /// Tape UUID this parity map belongs to.
     pub tape_uuid: [u8; 16],
     /// Writer-assigned parity-map sequence number.
-    pub sequence: u32,
+    pub sequence: u64,
     /// Sidecar directory carried by this parity map.
     pub directory: SidecarEpochDirectory,
     /// Canonical filemark-map digest for this directory scope.
@@ -341,7 +340,7 @@ pub struct ParityMapHeader {
     /// Tape UUID.
     pub tape_uuid: [u8; 16],
     /// Parity-map sequence number.
-    pub sequence: u32,
+    pub sequence: u64,
     /// Fixed tape block size.
     pub block_size: u32,
     /// Canonical payload byte length.
@@ -351,7 +350,7 @@ pub struct ParityMapHeader {
     /// Canonical map digest for the directory scope.
     pub canonical_map_digest: [u8; 32],
     /// Directory scope tape-file count.
-    pub directory_scope_tape_file_count: u32,
+    pub directory_scope_tape_file_count: u64,
     /// Directory scope total data ordinals.
     pub directory_scope_total_data_ordinals: u64,
     /// Directory scope highest protected ordinal.
@@ -382,7 +381,7 @@ pub struct ParityMapFooter {
     /// Tape UUID.
     pub tape_uuid: [u8; 16],
     /// Parity-map sequence number.
-    pub sequence: u32,
+    pub sequence: u64,
     /// Fixed tape block size.
     pub block_size: u32,
     /// Canonical payload byte length.
@@ -392,7 +391,7 @@ pub struct ParityMapFooter {
     /// Canonical map digest for the directory scope.
     pub canonical_map_digest: [u8; 32],
     /// Directory scope tape-file count.
-    pub directory_scope_tape_file_count: u32,
+    pub directory_scope_tape_file_count: u64,
     /// Directory scope total data ordinals.
     pub directory_scope_total_data_ordinals: u64,
     /// Directory scope highest protected ordinal.
@@ -554,8 +553,13 @@ pub fn parse_parity_map_header_block(
     if &tape_uuid != expected_tape_uuid {
         return Err(parity_map_parse("parity-map tape UUID mismatch"));
     }
-    let sequence = read_u32_le(block0, 0x20);
-    let block_size = read_u32_le(block0, 0x24);
+    let sequence = read_u64_le(block0, 0x20);
+    let block_size = read_u32_le(block0, 0x28);
+    if read_u32_le(block0, 0x2C) != 0 {
+        return Err(parity_map_parse(
+            "parity-map header sequence padding is non-zero",
+        ));
+    }
     if usize::try_from(block_size).ok() != Some(block0.len()) {
         return Err(parity_map_parse(format!(
             "parity-map block_size {block_size} does not match block length {}",
@@ -563,15 +567,15 @@ pub fn parse_parity_map_header_block(
         )));
     }
     validate_block_size(block_size)?;
-    let payload_len = read_u64_le(block0, 0x28);
+    let payload_len = read_u64_le(block0, 0x30);
     let mut payload_sha256 = [0u8; 32];
-    payload_sha256.copy_from_slice(&block0[0x30..0x50]);
+    payload_sha256.copy_from_slice(&block0[0x38..0x58]);
     let mut canonical_map_digest = [0u8; 32];
-    canonical_map_digest.copy_from_slice(&block0[0x50..0x70]);
-    let directory_scope_tape_file_count = read_u32_le(block0, 0x70);
-    let directory_scope_total_data_ordinals = read_u64_le(block0, 0x74);
-    let directory_scope_highest_protected_ordinal = read_u64_le(block0, 0x7C);
-    let is_final_directory = match block0[0x84] {
+    canonical_map_digest.copy_from_slice(&block0[0x58..0x78]);
+    let directory_scope_tape_file_count = read_u64_le(block0, 0x78);
+    let directory_scope_total_data_ordinals = read_u64_le(block0, 0x80);
+    let directory_scope_highest_protected_ordinal = read_u64_le(block0, 0x88);
+    let is_final_directory = match block0[0x90] {
         0 => false,
         1 => true,
         value => {
@@ -580,16 +584,16 @@ pub fn parse_parity_map_header_block(
             )))
         }
     };
-    if block0[0x85..0x88].iter().any(|byte| *byte != 0) {
+    if block0[0x91..0x98].iter().any(|byte| *byte != 0) {
         return Err(parity_map_parse(
             "parity-map header bool padding is non-zero",
         ));
     }
-    let copy_block_count = read_u64_le(block0, 0x88);
-    let parity_map_total_block_count = read_u64_le(block0, 0x90);
-    let primary_copy_start_block = read_u64_le(block0, 0x98);
-    let tail_copy_start_block = read_u64_le(block0, 0xA0);
-    let footer_block_index = read_u64_le(block0, 0xA8);
+    let copy_block_count = read_u64_le(block0, 0x98);
+    let parity_map_total_block_count = read_u64_le(block0, 0xA0);
+    let primary_copy_start_block = read_u64_le(block0, 0xA8);
+    let tail_copy_start_block = read_u64_le(block0, 0xB0);
+    let footer_block_index = read_u64_le(block0, 0xB8);
     let header_crc64 = read_u64_le(block0, PARITY_MAP_HEADER_CRC_OFFSET);
     let computed = crc64_xz(&block0[..PARITY_MAP_HEADER_CRC_OFFSET]);
     if header_crc64 != computed {
@@ -675,8 +679,13 @@ pub fn parse_parity_map_footer_block(
     if &tape_uuid != expected_tape_uuid {
         return Err(parity_map_parse("parity-map footer tape UUID mismatch"));
     }
-    let sequence = read_u32_le(footer_block, 0x20);
-    let block_size = read_u32_le(footer_block, 0x24);
+    let sequence = read_u64_le(footer_block, 0x20);
+    let block_size = read_u32_le(footer_block, 0x28);
+    if read_u32_le(footer_block, 0x2C) != 0 {
+        return Err(parity_map_parse(
+            "parity-map footer sequence padding is non-zero",
+        ));
+    }
     if usize::try_from(block_size).ok() != Some(footer_block.len()) {
         return Err(parity_map_parse(format!(
             "parity-map footer block_size {block_size} does not match block length {}",
@@ -684,15 +693,15 @@ pub fn parse_parity_map_footer_block(
         )));
     }
     validate_block_size(block_size)?;
-    let payload_len = read_u64_le(footer_block, 0x28);
+    let payload_len = read_u64_le(footer_block, 0x30);
     let mut payload_sha256 = [0u8; 32];
-    payload_sha256.copy_from_slice(&footer_block[0x30..0x50]);
+    payload_sha256.copy_from_slice(&footer_block[0x38..0x58]);
     let mut canonical_map_digest = [0u8; 32];
-    canonical_map_digest.copy_from_slice(&footer_block[0x50..0x70]);
-    let directory_scope_tape_file_count = read_u32_le(footer_block, 0x70);
-    let directory_scope_total_data_ordinals = read_u64_le(footer_block, 0x74);
-    let directory_scope_highest_protected_ordinal = read_u64_le(footer_block, 0x7C);
-    let is_final_directory = match footer_block[0x84] {
+    canonical_map_digest.copy_from_slice(&footer_block[0x58..0x78]);
+    let directory_scope_tape_file_count = read_u64_le(footer_block, 0x78);
+    let directory_scope_total_data_ordinals = read_u64_le(footer_block, 0x80);
+    let directory_scope_highest_protected_ordinal = read_u64_le(footer_block, 0x88);
+    let is_final_directory = match footer_block[0x90] {
         0 => false,
         1 => true,
         value => {
@@ -701,16 +710,16 @@ pub fn parse_parity_map_footer_block(
             )))
         }
     };
-    if footer_block[0x85..0x88].iter().any(|byte| *byte != 0) {
+    if footer_block[0x91..0x98].iter().any(|byte| *byte != 0) {
         return Err(parity_map_parse(
             "parity-map footer bool padding is non-zero",
         ));
     }
-    let copy_block_count = read_u64_le(footer_block, 0x88);
-    let parity_map_total_block_count = read_u64_le(footer_block, 0x90);
-    let primary_copy_start_block = read_u64_le(footer_block, 0x98);
-    let tail_copy_start_block = read_u64_le(footer_block, 0xA0);
-    let footer_block_index = read_u64_le(footer_block, 0xA8);
+    let copy_block_count = read_u64_le(footer_block, 0x98);
+    let parity_map_total_block_count = read_u64_le(footer_block, 0xA0);
+    let primary_copy_start_block = read_u64_le(footer_block, 0xA8);
+    let tail_copy_start_block = read_u64_le(footer_block, 0xB0);
+    let footer_block_index = read_u64_le(footer_block, 0xB8);
     let footer_crc64 = read_u64_le(footer_block, PARITY_MAP_FOOTER_CRC_OFFSET);
     let computed = crc64_xz(&footer_block[..PARITY_MAP_FOOTER_CRC_OFFSET]);
     if footer_crc64 != computed {
@@ -906,7 +915,7 @@ pub(crate) fn decode_sidecar_epoch_directory_cbor(
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
                 directory_scope_tape_file_count =
-                    Some(cbor_int_to_u32(i, "directory_scope_tape_file_count")?)
+                    Some(cbor_int_to_u64(i, "directory_scope_tape_file_count")?)
             }
             (2, CborValue::Integer(i)) => {
                 directory_scope_total_data_ordinals =
@@ -950,6 +959,7 @@ pub(crate) fn decode_sidecar_epoch_directory_cbor(
     Ok(directory)
 }
 
+#[cfg(test)]
 pub(crate) fn encode_parity_map_reference_cbor(reference: &ParityMapReference) -> CborValue {
     CborValue::Map(vec![
         (
@@ -987,6 +997,7 @@ pub(crate) fn encode_parity_map_reference_cbor(reference: &ParityMapReference) -
     ])
 }
 
+#[cfg(test)]
 pub(crate) fn decode_parity_map_reference_cbor(
     value: CborValue,
 ) -> Result<ParityMapReference, ParityError> {
@@ -1010,12 +1021,12 @@ pub(crate) fn decode_parity_map_reference_cbor(
             .map_err(parity_map_parse)?;
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
-                tape_file_number = Some(cbor_int_to_u32(i, "tape_file_number")?)
+                tape_file_number = Some(cbor_int_to_u64(i, "tape_file_number")?)
             }
             (2, CborValue::Integer(i)) => block_count = Some(cbor_int_to_u64(i, "block_count")?),
             (3, CborValue::Integer(i)) => {
                 directory_scope_tape_file_count =
-                    Some(cbor_int_to_u32(i, "directory_scope_tape_file_count")?)
+                    Some(cbor_int_to_u64(i, "directory_scope_tape_file_count")?)
             }
             (4, CborValue::Integer(i)) => {
                 directory_scope_total_data_ordinals =
@@ -1128,7 +1139,7 @@ fn decode_sidecar_epoch_directory_entry_cbor(
             .map_err(parity_map_parse)?;
         match (key_i, value) {
             (1, CborValue::Integer(i)) => {
-                tape_file_number = Some(cbor_int_to_u32(i, "tape_file_number")?)
+                tape_file_number = Some(cbor_int_to_u64(i, "tape_file_number")?)
             }
             (2, CborValue::Integer(i)) => epoch_id = Some(cbor_int_to_u64(i, "epoch_id")?),
             (3, CborValue::Integer(i)) => {
@@ -1142,10 +1153,10 @@ fn decode_sidecar_epoch_directory_entry_cbor(
                 sidecar_total_block_count = Some(cbor_int_to_u64(i, "sidecar_total_block_count")?)
             }
             (6, CborValue::Integer(i)) => {
-                sidecar_header_block_count = Some(cbor_int_to_u32(i, "sidecar_header_block_count")?)
+                sidecar_header_block_count = Some(cbor_int_to_u64(i, "sidecar_header_block_count")?)
             }
             (7, CborValue::Integer(i)) => {
-                parity_shard_block_count = Some(cbor_int_to_u32(i, "parity_shard_block_count")?)
+                parity_shard_block_count = Some(cbor_int_to_u64(i, "parity_shard_block_count")?)
             }
             (8, CborValue::Bytes(bytes)) => {
                 canonical_metadata_hash = Some(bytes_to_32(bytes, "canonical_metadata_hash")?)
@@ -1251,7 +1262,7 @@ fn decode_parity_map_payload(bytes: &[u8]) -> Result<ParityMapPayload, ParityErr
         match (key_i, value) {
             (1, CborValue::Text(value)) => format_id = Some(value),
             (2, CborValue::Bytes(bytes)) => tape_uuid = Some(bytes_to_16(bytes, "tape_uuid")?),
-            (3, CborValue::Integer(i)) => sequence = Some(cbor_int_to_u32(i, "sequence")?),
+            (3, CborValue::Integer(i)) => sequence = Some(cbor_int_to_u64(i, "sequence")?),
             (4, value) => directory = Some(decode_sidecar_epoch_directory_cbor(value)?),
             (5, CborValue::Bytes(bytes)) => {
                 canonical_map_digest = Some(bytes_to_32(bytes, "canonical_map_digest")?)
@@ -1372,35 +1383,36 @@ fn encode_footer_block(
     block[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes());
     block[0x0C..0x10].copy_from_slice(&0u32.to_le_bytes());
     block[0x10..0x20].copy_from_slice(&payload.tape_uuid);
-    block[0x20..0x24].copy_from_slice(&payload.sequence.to_le_bytes());
-    block[0x24..0x28].copy_from_slice(&layout.block_size.to_le_bytes());
-    block[0x28..0x30].copy_from_slice(&layout.payload_len.to_le_bytes());
-    block[0x30..0x50].copy_from_slice(&layout.payload_sha256);
-    block[0x50..0x70].copy_from_slice(&payload.canonical_map_digest);
-    block[0x70..0x74].copy_from_slice(
+    block[0x20..0x28].copy_from_slice(&payload.sequence.to_le_bytes());
+    block[0x28..0x2C].copy_from_slice(&layout.block_size.to_le_bytes());
+    block[0x2C..0x30].copy_from_slice(&0u32.to_le_bytes());
+    block[0x30..0x38].copy_from_slice(&layout.payload_len.to_le_bytes());
+    block[0x38..0x58].copy_from_slice(&layout.payload_sha256);
+    block[0x58..0x78].copy_from_slice(&payload.canonical_map_digest);
+    block[0x78..0x80].copy_from_slice(
         &payload
             .directory
             .directory_scope_tape_file_count
             .to_le_bytes(),
     );
-    block[0x74..0x7C].copy_from_slice(
+    block[0x80..0x88].copy_from_slice(
         &payload
             .directory
             .directory_scope_total_data_ordinals
             .to_le_bytes(),
     );
-    block[0x7C..0x84].copy_from_slice(
+    block[0x88..0x90].copy_from_slice(
         &payload
             .directory
             .directory_scope_highest_protected_ordinal
             .to_le_bytes(),
     );
-    block[0x84] = u8::from(payload.directory.is_final_directory);
-    block[0x88..0x90].copy_from_slice(&layout.copy_block_count.to_le_bytes());
-    block[0x90..0x98].copy_from_slice(&layout.parity_map_total_block_count.to_le_bytes());
-    block[0x98..0xA0].copy_from_slice(&layout.primary_copy_start_block.to_le_bytes());
-    block[0xA0..0xA8].copy_from_slice(&layout.tail_copy_start_block.to_le_bytes());
-    block[0xA8..0xB0].copy_from_slice(&layout.footer_block_index.to_le_bytes());
+    block[0x90] = u8::from(payload.directory.is_final_directory);
+    block[0x98..0xA0].copy_from_slice(&layout.copy_block_count.to_le_bytes());
+    block[0xA0..0xA8].copy_from_slice(&layout.parity_map_total_block_count.to_le_bytes());
+    block[0xA8..0xB0].copy_from_slice(&layout.primary_copy_start_block.to_le_bytes());
+    block[0xB0..0xB8].copy_from_slice(&layout.tail_copy_start_block.to_le_bytes());
+    block[0xB8..0xC0].copy_from_slice(&layout.footer_block_index.to_le_bytes());
     let crc = crc64_xz(&block[..PARITY_MAP_FOOTER_CRC_OFFSET]);
     block[PARITY_MAP_FOOTER_CRC_OFFSET..PARITY_MAP_FOOTER_CRC_OFFSET + 8]
         .copy_from_slice(&crc.to_le_bytes());
@@ -1418,24 +1430,25 @@ fn write_header_fields(header: &ParityMapHeader, block: &mut [u8]) -> Result<(),
     block[0x0A..0x0C].copy_from_slice(&header.copy_kind.to_u16().to_le_bytes());
     block[0x0C..0x10].copy_from_slice(&0u32.to_le_bytes());
     block[0x10..0x20].copy_from_slice(&header.tape_uuid);
-    block[0x20..0x24].copy_from_slice(&header.sequence.to_le_bytes());
-    block[0x24..0x28].copy_from_slice(&header.block_size.to_le_bytes());
-    block[0x28..0x30].copy_from_slice(&header.payload_len.to_le_bytes());
-    block[0x30..0x50].copy_from_slice(&header.payload_sha256);
-    block[0x50..0x70].copy_from_slice(&header.canonical_map_digest);
-    block[0x70..0x74].copy_from_slice(&header.directory_scope_tape_file_count.to_le_bytes());
-    block[0x74..0x7C].copy_from_slice(&header.directory_scope_total_data_ordinals.to_le_bytes());
-    block[0x7C..0x84].copy_from_slice(
+    block[0x20..0x28].copy_from_slice(&header.sequence.to_le_bytes());
+    block[0x28..0x2C].copy_from_slice(&header.block_size.to_le_bytes());
+    block[0x2C..0x30].copy_from_slice(&0u32.to_le_bytes());
+    block[0x30..0x38].copy_from_slice(&header.payload_len.to_le_bytes());
+    block[0x38..0x58].copy_from_slice(&header.payload_sha256);
+    block[0x58..0x78].copy_from_slice(&header.canonical_map_digest);
+    block[0x78..0x80].copy_from_slice(&header.directory_scope_tape_file_count.to_le_bytes());
+    block[0x80..0x88].copy_from_slice(&header.directory_scope_total_data_ordinals.to_le_bytes());
+    block[0x88..0x90].copy_from_slice(
         &header
             .directory_scope_highest_protected_ordinal
             .to_le_bytes(),
     );
-    block[0x84] = u8::from(header.is_final_directory);
-    block[0x88..0x90].copy_from_slice(&header.copy_block_count.to_le_bytes());
-    block[0x90..0x98].copy_from_slice(&header.parity_map_total_block_count.to_le_bytes());
-    block[0x98..0xA0].copy_from_slice(&header.primary_copy_start_block.to_le_bytes());
-    block[0xA0..0xA8].copy_from_slice(&header.tail_copy_start_block.to_le_bytes());
-    block[0xA8..0xB0].copy_from_slice(&header.footer_block_index.to_le_bytes());
+    block[0x90] = u8::from(header.is_final_directory);
+    block[0x98..0xA0].copy_from_slice(&header.copy_block_count.to_le_bytes());
+    block[0xA0..0xA8].copy_from_slice(&header.parity_map_total_block_count.to_le_bytes());
+    block[0xA8..0xB0].copy_from_slice(&header.primary_copy_start_block.to_le_bytes());
+    block[0xB0..0xB8].copy_from_slice(&header.tail_copy_start_block.to_le_bytes());
+    block[0xB8..0xC0].copy_from_slice(&header.footer_block_index.to_le_bytes());
     let crc = crc64_xz(&block[..PARITY_MAP_HEADER_CRC_OFFSET]);
     block[PARITY_MAP_HEADER_CRC_OFFSET..PARITY_MAP_HEADER_CRC_OFFSET + 8]
         .copy_from_slice(&crc.to_le_bytes());
@@ -1857,7 +1870,7 @@ mod tests {
     #[test]
     fn allocation_free_payload_bound_dominates_canonical_encoder() {
         let mut payload = sample_payload();
-        payload.sequence = u32::MAX;
+        payload.sequence = u64::MAX;
         payload.writer_version = Some("v".repeat(128));
         payload.write_timestamp = Some("2026-05-23T10:00:00.123456789+05:30".to_string());
 
@@ -1870,13 +1883,13 @@ mod tests {
     #[test]
     fn directory_row_bound_dominates_all_current_field_widths() {
         let row = SidecarEpochDirectoryEntry {
-            tape_file_number: u32::MAX,
+            tape_file_number: u64::MAX,
             epoch_id: u64::MAX,
             protected_ordinal_start: u64::MAX,
             protected_ordinal_end_exclusive: u64::MAX,
             sidecar_total_block_count: u64::MAX,
-            sidecar_header_block_count: u32::MAX,
-            parity_shard_block_count: u32::MAX,
+            sidecar_header_block_count: u64::MAX,
+            parity_shard_block_count: u64::MAX,
             canonical_metadata_hash: [0xff; 32],
             flags: u32::MAX,
         };
@@ -1892,6 +1905,90 @@ mod tests {
             encoded.len(),
             PARITY_MAP_CBOR_DIRECTORY_ENTRY_UPPER_BOUND_BYTES
         );
+    }
+
+    #[test]
+    fn parity_map_carriers_preserve_full_u64_boundaries() {
+        for value in [
+            u64::from(u32::MAX) + 1,
+            (1_u64 << 53) + 1,
+            1_u64 << 63,
+            u64::MAX,
+        ] {
+            let mut entry = sample_directory().entries.remove(0);
+            entry.tape_file_number = value;
+            assert_eq!(
+                decode_sidecar_epoch_directory_entry_cbor(
+                    encode_sidecar_epoch_directory_entry_cbor(&entry),
+                )
+                .expect("u64 directory-entry tape-file number decodes"),
+                entry
+            );
+
+            let mut reference = sample_reference();
+            reference.tape_file_number = value;
+            reference.directory_scope_tape_file_count = value;
+            assert_eq!(
+                decode_parity_map_reference_cbor(encode_parity_map_reference_cbor(&reference))
+                    .expect("u64 parity-map reference decodes"),
+                reference
+            );
+
+            let mut payload = sample_payload();
+            payload.sequence = value;
+            payload.directory.directory_scope_tape_file_count = value;
+            let encoded = encode_parity_map_tape_file(&payload, BLOCK_SIZE)
+                .expect("u64 scope count encodes in fixed headers and payload");
+            let decoded = parse_parity_map_tape_file(&encoded.blocks, &TAPE_UUID)
+                .expect("u64 scope count decodes from fixed headers and payload");
+            assert_eq!(decoded.payload, payload);
+            assert_eq!(decoded.header.sequence, value);
+            assert_eq!(decoded.header.directory_scope_tape_file_count, value);
+        }
+    }
+
+    #[test]
+    fn parity_map_rejects_legacy_narrow_fixed_versions() {
+        let payload = sample_payload();
+        let encoded = encode_parity_map_tape_file(&payload, BLOCK_SIZE).expect("payload encodes");
+
+        let mut old_header = encoded.blocks[0].clone();
+        old_header[0x08..0x0A].copy_from_slice(&1_u16.to_le_bytes());
+        let header_error = parse_parity_map_header_block(&old_header, &TAPE_UUID)
+            .expect_err("legacy narrow header version must fail closed");
+        assert!(header_error
+            .to_string()
+            .contains("unsupported parity-map schema version"));
+
+        let mut old_footer = encoded.blocks.last().expect("footer exists").clone();
+        old_footer[0x08..0x0A].copy_from_slice(&1_u16.to_le_bytes());
+        let footer_error = parse_parity_map_footer_block(&old_footer, &TAPE_UUID)
+            .expect_err("legacy narrow footer version must fail closed");
+        assert!(footer_error
+            .to_string()
+            .contains("unsupported parity-map footer version"));
+    }
+
+    #[test]
+    fn parity_map_cbor_rejects_negative_structural_carriers() {
+        let mut reference = encode_parity_map_reference_cbor(&sample_reference());
+        let CborValue::Map(reference_fields) = &mut reference else {
+            panic!("reference encodes as a map");
+        };
+        reference_fields[0].1 = CborValue::Integer((-1_i64).into());
+        let reference_error = decode_parity_map_reference_cbor(reference)
+            .expect_err("negative reference tape-file number must reject");
+        assert!(reference_error.to_string().contains("out of u64 range"));
+
+        let mut directory =
+            encode_sidecar_epoch_directory_cbor(&sample_directory()).expect("directory encodes");
+        let CborValue::Map(directory_fields) = &mut directory else {
+            panic!("directory encodes as a map");
+        };
+        directory_fields[0].1 = CborValue::Integer((-1_i64).into());
+        let directory_error = decode_sidecar_epoch_directory_cbor(directory)
+            .expect_err("negative scope tape-file count must reject");
+        assert!(directory_error.to_string().contains("out of u64 range"));
     }
 
     #[test]

@@ -10,32 +10,32 @@ algebra, `Vec` allocation, slice copying, tape IO, or Reed-Solomon recovery.
 
 ## S1 -- sidecar header block fixed fields
 
-For every block size at least `SIDECAR_HEADER_LEN + 8 = 0xC0`, the extracted
+For every block size at least `SIDECAR_HEADER_LEN + 8 = 0xD0`, the extracted
 header layout succeeds and returns the sidecar header's fixed ranges, including
-the header CRC field at `[0xB0, 0xB8)` and the inline-index range
-`[0xB8, block_size - 8)`.
+the header CRC field at `[0xC0, 0xC8)` and the inline-index range
+`[0xC8, block_size - 8)`.
 
 ## S2 -- sidecar header CRC windows
 
 For every valid sidecar header block size:
 
-- `header_crc64` covers exactly `[0x00, 0xB0)`
-- `header_crc64` is stored at exactly `[0xB0, 0xB8)`
+- `header_crc64` covers exactly `[0x00, 0xC0)`
+- `header_crc64` is stored at exactly `[0xC0, 0xC8)`
 - the block-0 trailing CRC covers exactly `[0x00, block_size - 8)`
 - the block-0 trailing CRC is stored at exactly `[block_size - 8, block_size)`
 
 ## S3 -- sidecar footer locator fixed fields
 
-For every block size at least `SIDECAR_FOOTER_LEN = 0x80`, the extracted footer
+For every block size at least `SIDECAR_FOOTER_LEN = 0x88`, the extracted footer
 layout succeeds and returns the footer locator's fixed ranges, including the
-footer CRC field at `[0x78, 0x80)` and footer padding at `[0x80, block_size)`.
+footer CRC field at `[0x80, 0x88)` and footer padding at `[0x88, block_size)`.
 
 ## S4 -- sidecar footer CRC window
 
 For every valid footer block size:
 
-- `footer_crc64` covers exactly `[0x00, 0x78)`
-- `footer_crc64` is stored at exactly `[0x78, 0x80)`
+- `footer_crc64` covers exactly `[0x00, 0x80)`
+- `footer_crc64` is stored at exactly `[0x80, 0x88)`
 - bytes after `0x80` are padding and are outside the footer CRC window
 
 ## S5 -- sidecar tape-file block layout

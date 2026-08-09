@@ -1,0 +1,3032 @@
+//! Bounded fast inventory from the terminal triple-index tail.
+//!
+//! The reader starts with `SPACE(EOD)`, inspects at most the five terminal
+//! tape-file boundaries, and then uses a validated replica layout for exact
+//! absolute reads. It never classifies or walks Object files. Replica payloads
+//! are decoded through the existing fixed-slot streaming codec.
+
+use crate::bootstrap::parse_bootstrap_block;
+use crate::error::ParityError;
+use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
+use crate::index_separation::{
+    parse_index_separation_footer, parse_index_separation_header, validate_index_separation_full,
+    validate_index_separation_pair, IndexSeparationError, IndexSeparationInteriorBlockSource,
+};
+use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::scan::{scan_reconstruct_filemark_map_with_report, ScanDamageKind};
+use crate::tape_index_replica::{
+    parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
+    validate_tape_index_replica_pair, validate_tape_index_replica_payload, TapeIndexEditionPlan,
+    TapeIndexReplicaError, TapeIndexReplicaFileKind, TapeIndexReplicaHeader,
+    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaPayloadBlockSource,
+    TapeIndexReplicaPayloadSummary,
+};
+use crate::terminal_tail::{
+    validate_terminal_index_block_size_hint, TerminalTailLayout, TERMINAL_INDEX_REPLICA_COUNT,
+    TERMINAL_TAIL_COMPONENT_COUNT,
+};
+use std::cell::RefCell;
+
+/// Typed stage at which one terminal member failed validation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalReplicaFailureKind {
+    /// No complete member could be located at its planned position.
+    Missing,
+    /// The complete header record could not be read.
+    HeaderRead,
+    /// The header frame was malformed or belonged to another member.
+    HeaderInvalid,
+    /// The complete footer record could not be read.
+    FooterRead,
+    /// The footer frame or measured footer position was invalid.
+    FooterInvalid,
+    /// Header hash, local descriptor, or local observations disagreed.
+    LocalBinding,
+    /// A trailing filemark was absent or unreadable.
+    TrailingFilemark,
+    /// Fixed-slot payload streaming or digest validation failed.
+    PayloadInvalid,
+    /// An independently valid member disagreed with the selected survivor.
+    CrossSurvivorConflict,
+}
+
+/// Typed degraded evidence for an unusable A/B/C member.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalReplicaFailure {
+    /// Stable failure category.
+    pub kind: TerminalReplicaFailureKind,
+    /// Diagnostic detail from the parser or physical source.
+    pub detail: String,
+}
+
+/// Validation evidence for one one-based A/B/C ordinal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalReplicaEvidence {
+    /// Header, payload, footer, placement, and filemark all validated.
+    Valid {
+        /// Streamed payload summary.
+        summary: TapeIndexReplicaPayloadSummary,
+    },
+    /// Header/footer/local placement agree with the selected edition. Fast
+    /// inventory deliberately did not stream this older member's payload.
+    ConsistentEnvelope,
+    /// This member cannot be used as inventory authority.
+    Invalid(TerminalReplicaFailure),
+}
+
+/// Successful fast inventory selection and redundancy evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalInventorySelection {
+    /// Monotonic stream attempt that emitted the authoritative row set.
+    pub selected_attempt_id: u64,
+    /// Selected member, preferring C (3), then B (2), then A (1).
+    pub selected_replica_ordinal: u16,
+    /// Selected edition facts after cross-survivor comparison.
+    pub edition: TapeIndexEditionPlan,
+    /// Summary from the selected member's streamed body.
+    pub payload: TapeIndexReplicaPayloadSummary,
+    /// A, B, and C evidence in ordinal order.
+    pub replicas: [TerminalReplicaEvidence; 3],
+}
+
+/// One bounded event emitted while selecting C, then B, then A.
+///
+/// Rows are provisional until the returned [`TerminalInventorySelection`]
+/// names their `attempt_id`. A failed candidate is explicitly rejected, so a
+/// streaming consumer can discard its rows without retaining another member
+/// or mistaking partial output for inventory authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalInventoryStreamEvent {
+    /// A locally bound member body is about to be streamed and validated.
+    ReplicaAttemptStarted {
+        /// Monotonic identifier unique within this inventory call.
+        attempt_id: u64,
+        /// One-based A/B/C member ordinal.
+        replica_ordinal: u16,
+    },
+    /// One canonical pre-tail structural row from a candidate member.
+    StructuralEntry {
+        /// Candidate attempt that owns this row.
+        attempt_id: u64,
+        /// One-based A/B/C member ordinal.
+        replica_ordinal: u16,
+        /// Decoded fixed-slot row.
+        entry: TapeIndexReplicaMapEntry,
+    },
+    /// One Object recovery row from a candidate member.
+    ObjectRow {
+        /// Candidate attempt that owns this row.
+        attempt_id: u64,
+        /// One-based A/B/C member ordinal.
+        replica_ordinal: u16,
+        /// Decoded fixed-slot row.
+        row: TapeIndexReplicaObjectRow,
+    },
+    /// A candidate failed validation after zero or more provisional rows.
+    ReplicaAttemptRejected {
+        /// Candidate attempt whose rows are not authoritative.
+        attempt_id: u64,
+        /// One-based A/B/C member ordinal.
+        replica_ordinal: u16,
+        /// Typed validation evidence retained for fallback reporting.
+        failure: TerminalReplicaFailure,
+    },
+}
+
+impl TerminalInventorySelection {
+    /// True unless all three members independently validated and agreed.
+    pub fn is_degraded(&self) -> bool {
+        self.replicas
+            .iter()
+            .any(|evidence| matches!(evidence, TerminalReplicaEvidence::Invalid(_)))
+    }
+}
+
+/// Why fast inventory must hand off to the BOT structural recovery scanner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotStructuralRecoveryReason {
+    /// No trustworthy terminal layout could be recovered from bounded tail
+    /// footer inspection.
+    NoUsableTerminalLayout,
+    /// A layout was found, but A, B, and C all failed local validation.
+    AllMembersInvalid,
+}
+
+/// Evidence returned instead of treating a missing terminal index as empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotStructuralRecoveryRequired {
+    /// Stable recovery reason.
+    pub reason: BotStructuralRecoveryReason,
+    /// A, B, and C evidence in ordinal order.
+    pub replicas: [TerminalReplicaEvidence; 3],
+}
+
+/// BOT recovery classification for one physical Object candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotRecoveredObjectState {
+    /// A structurally complete Object matched exact external recovery authority.
+    Recovered,
+    /// The Object is structurally complete but has no trustworthy identity row.
+    Unknown,
+    /// The scanner reached EOD before this Object's trailing filemark.
+    Incomplete,
+}
+
+/// One Object classification emitted by the explicit BOT recovery pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotRecoveredObject {
+    /// Dense tape-file number measured from BOT.
+    pub tape_file_number: u64,
+    /// Complete fixed-block count, or zero when a torn file could not be measured.
+    pub stored_block_count: u64,
+    /// Recovered REM-OBJECT identifier when external authority survived.
+    pub object_id: Option<Vec<u8>>,
+    /// Typed recovery state.
+    pub state: BotRecoveredObjectState,
+}
+
+/// Summary of a completed BOT structural recovery pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotStructuralRecoverySummary {
+    /// Structurally complete tape files reconstructed from BOT.
+    pub structural_entry_count: u64,
+    /// Structurally complete physical Object candidates.
+    pub complete_object_count: u64,
+    /// Objects with exact external recovery authority.
+    pub recovered_object_count: u64,
+    /// Structurally complete Objects without trustworthy identity authority.
+    pub unknown_object_count: u64,
+    /// Torn Object candidates at EOD.
+    pub incomplete_object_count: u64,
+    /// Canonical digest of the structurally complete measured map.
+    pub canonical_map_digest: [u8; 32],
+    /// Number of physical damage regions retained as recovery evidence.
+    pub damaged_region_count: u64,
+}
+
+/// Failure of the explicit BOT structural recovery path.
+#[derive(Debug, thiserror::Error)]
+pub enum BotStructuralRecoveryError {
+    /// Physical scan failed and no recovery inventory can be claimed.
+    #[error("BOT structural scan failed: {message}")]
+    Scan {
+        /// Scanner/source detail.
+        message: String,
+    },
+    /// A readable BOT Bootstrap belongs to a different expected tape identity.
+    #[error("BOT Bootstrap tape UUID does not match the required recovery identity hint")]
+    TapeIdentityMismatch,
+    /// Object recovery authority was internally conflicting.
+    #[error("conflicting BOT Object authority for tape file {tape_file_number}: {detail}")]
+    ConflictingObjectAuthority {
+        /// Dense tape-file number.
+        tape_file_number: u64,
+        /// Conflict detail.
+        detail: String,
+    },
+    /// Caller rejected an emitted Object classification.
+    #[error("BOT recovery Object visitor failed: {message}")]
+    Visitor {
+        /// Caller detail.
+        message: String,
+    },
+    /// Checked recovery accounting overflowed.
+    #[error("BOT structural recovery arithmetic overflow: {context}")]
+    ArithmeticOverflow {
+        /// Failed counter.
+        context: &'static str,
+    },
+}
+
+/// Terminal inventory either succeeded or explicitly requires BOT recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalInventoryOutcome {
+    /// Complete inventory rows were emitted from the selected member.
+    Inventory(Box<TerminalInventorySelection>),
+    /// Fast authority is unavailable; invoke structural recovery from BOT.
+    BotStructuralRecoveryRequired(Box<BotStructuralRecoveryRequired>),
+}
+
+/// Physical positioning or post-selection streaming failure.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalInventoryReadError {
+    /// The supplied fixed-block profile is unsupported.
+    #[error("terminal inventory block-size validation failed: {0}")]
+    BlockSize(#[from] crate::terminal_tail::TerminalTailLayoutError),
+    /// An EOD/backward positioning operation failed before a member could be
+    /// classified as valid or invalid.
+    #[error("terminal inventory source operation {operation} failed: {message}")]
+    Source {
+        /// Stable operation name.
+        operation: &'static str,
+        /// Underlying source detail.
+        message: String,
+    },
+    /// A previously validated selected member changed or a caller visitor
+    /// rejected a row during the authoritative emission pass.
+    #[error("selected terminal replica {ordinal} failed during inventory emission: {source}")]
+    SelectedReplica {
+        /// One-based A/B/C ordinal.
+        ordinal: u16,
+        /// Codec or visitor failure.
+        source: TapeIndexReplicaError,
+    },
+    /// The bounded output consumer stopped accepting inventory events.
+    #[error("terminal inventory stream visitor failed: {message}")]
+    StreamVisitor {
+        /// Caller-provided failure detail.
+        message: String,
+    },
+    /// Independently valid terminal payloads carry conflicting editions.
+    #[error("terminal inventory found {count} independently valid conflicting replica editions")]
+    TerminalIndexReplicaConflict {
+        /// Number of distinct independently valid editions.
+        count: usize,
+    },
+}
+
+/// Physical proof returned only after the complete prefix and terminal tail
+/// have been measured and validated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalIndexCompleteEvidence {
+    /// Common edition facts independently recovered from all three replicas.
+    pub edition: TapeIndexEditionPlan,
+    /// Independently streamed payload result for A, B, and C.
+    pub replicas: [TapeIndexReplicaPayloadSummary; 3],
+    /// Validated zero-filled interior record counts for gaps AB and BC.
+    pub separation_interior_records: [u64; 2],
+    /// Physical EOD measured before the BOT walk.
+    pub measured_eod: PhysicalPositionHint,
+    /// Number of canonical pre-tail tape files compared row by row.
+    pub verified_prefix_tape_file_count: u64,
+    /// Number of fixed records in that verified physical prefix.
+    pub verified_prefix_record_count: u64,
+    /// Number of filemark-delimited files measured from BOT through C.
+    pub measured_tape_file_count: u64,
+}
+
+/// Full physical evidence for one separation extent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalSeparationEvidence {
+    /// Header, footer, every interior record, and trailing filemark validated.
+    Valid {
+        /// Number of zero-filled interior records read.
+        interior_record_count: u64,
+    },
+    /// The extent was missing, torn, corrupt, or physically misplaced.
+    Invalid {
+        /// Stable diagnostic detail.
+        detail: String,
+    },
+}
+
+/// Evidence shared by complete and degraded full-verification outcomes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalIndexVerification {
+    /// Canonical edition selected only from a physically valid survivor.
+    pub edition: TapeIndexEditionPlan,
+    /// Payload summary of the newest physically valid canonical survivor.
+    pub selected_payload: TapeIndexReplicaPayloadSummary,
+    /// A, B, and C full-payload evidence in ordinal order.
+    pub replicas: [TerminalReplicaEvidence; 3],
+    /// AB and BC full-extent evidence in ordinal order.
+    pub separations: [TerminalSeparationEvidence; 2],
+    /// Physical EOD measured before the BOT walk.
+    pub measured_eod: PhysicalPositionHint,
+    /// Number of canonical pre-tail tape files compared row by row.
+    pub verified_prefix_tape_file_count: u64,
+    /// Number of fixed records in that verified physical prefix.
+    pub verified_prefix_record_count: u64,
+    /// Number of structurally complete tape files measured from BOT.
+    pub measured_tape_file_count: u64,
+}
+
+/// Full verification could not establish a canonical physical prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalIndexRecoveryRequired {
+    /// Physical EOD measured before the BOT recovery walk.
+    pub measured_eod: PhysicalPositionHint,
+    /// BOT structural recovery summary; never an empty-success placeholder.
+    pub bot_recovery: BotStructuralRecoverySummary,
+    /// A, B, and C evidence available before the recovery decision.
+    pub replicas: [TerminalReplicaEvidence; 3],
+    /// Stable recovery reason.
+    pub detail: String,
+}
+
+/// Typed full physical verification outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalIndexVerificationOutcome {
+    /// Canonical prefix, A/B/C, AB/BC, and terminal EOD all validated.
+    VerifiedComplete(Box<TerminalIndexVerification>),
+    /// Canonical prefix has a valid survivor, but redundant tail evidence is degraded.
+    VerifiedDegraded(Box<TerminalIndexVerification>),
+    /// No survivor could prove the physical prefix; BOT recovery evidence is attached.
+    RecoveryRequired(Box<TerminalIndexRecoveryRequired>),
+}
+
+/// Typed reason a full physical terminal-index verification failed.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalIndexVerificationError {
+    /// The supplied fixed-block profile is unsupported.
+    #[error("terminal index verification block-size validation failed: {0}")]
+    BlockSize(#[from] crate::terminal_tail::TerminalTailLayoutError),
+    /// A positioning or record-read operation failed.
+    #[error("terminal index verification source operation {operation} failed: {message}")]
+    Source {
+        /// Stable operation name.
+        operation: &'static str,
+        /// Underlying source detail.
+        message: String,
+    },
+    /// No complete terminal layout was recoverable from EOD.
+    #[error("no complete terminal layout ends at measured EOD {measured_eod_lba}")]
+    NoCompleteLayout {
+        /// Physical EOD returned by the source.
+        measured_eod_lba: u64,
+    },
+    /// Surviving terminal footers proposed different complete layouts.
+    #[error("conflicting complete terminal layouts were recovered from EOD ({count} candidates)")]
+    ConflictingLayouts {
+        /// Number of distinct layouts ending at measured EOD.
+        count: usize,
+    },
+    /// The BOT structural walk itself failed.
+    #[error("physical prefix walk failed: {message}")]
+    PrefixWalk {
+        /// Scanner detail.
+        message: String,
+    },
+    /// The physical walk found a torn final tape file.
+    #[error("physical prefix walk found incomplete tape file {tape_file_number}: {kind:?}")]
+    PrefixTruncated {
+        /// Dense tape-file number at the truncation.
+        tape_file_number: u64,
+        /// Typed scanner truncation category.
+        kind: crate::scan::ScanTailTruncationKind,
+    },
+    /// The physical walk encountered media damage or invalid structural framing.
+    #[error("physical prefix walk reported {count} damaged region(s); first kind {first_kind:?}")]
+    PrefixDamaged {
+        /// Total damaged regions.
+        count: usize,
+        /// First typed damage category.
+        first_kind: ScanDamageKind,
+    },
+    /// The measured file count disagreed with the complete five-file layout.
+    #[error("measured tape-file count {actual}, expected {expected}")]
+    TapeFileCountMismatch {
+        /// Planned file count through replica C.
+        expected: u64,
+        /// Measured file count.
+        actual: u64,
+    },
+    /// A measured terminal tape file disagreed with its five-component plan.
+    #[error("measured terminal component at tape file {tape_file_number} mismatched: {detail}")]
+    TerminalComponentMismatch {
+        /// Dense tape-file number.
+        tape_file_number: u64,
+        /// Kind/count mismatch detail.
+        detail: String,
+    },
+    /// A physical structural row disagreed with the canonical replica map.
+    #[error("replica {ordinal} canonical map mismatch at tape file {tape_file_number}: {detail}")]
+    CanonicalMapMismatch {
+        /// One-based replica ordinal.
+        ordinal: u16,
+        /// Dense tape-file number under comparison.
+        tape_file_number: u64,
+        /// Stable mismatch detail.
+        detail: String,
+    },
+    /// A complete replica failed local or payload validation.
+    #[error("terminal replica {ordinal} failed full verification: {failure:?}: {detail}")]
+    Replica {
+        /// One-based replica ordinal.
+        ordinal: u16,
+        /// Stable validation phase.
+        failure: TerminalReplicaFailureKind,
+        /// Underlying detail.
+        detail: String,
+    },
+    /// Independently valid replicas did not carry identical edition/payload facts.
+    #[error("terminal replica {ordinal} conflicts with replica A")]
+    CrossReplicaConflict {
+        /// Conflicting one-based ordinal.
+        ordinal: u16,
+    },
+    /// A typed separation extent failed framing, placement, or zero-fill checks.
+    #[error("terminal separation {ordinal} failed full verification: {source}")]
+    Separation {
+        /// One-based gap ordinal (AB=1, BC=2).
+        ordinal: u16,
+        /// Typed codec or physical-source failure.
+        #[source]
+        source: IndexSeparationError,
+    },
+    /// Checked physical accounting overflowed.
+    #[error("terminal index verification arithmetic overflow: {context}")]
+    ArithmeticOverflow {
+        /// Failed accounting operation.
+        context: &'static str,
+    },
+}
+
+struct LayoutInspection {
+    replicas: [TerminalReplicaEvidence; 3],
+    envelopes: [Option<ValidatedReplicaEnvelope>; 3],
+}
+
+#[derive(Clone)]
+struct ValidatedReplicaEnvelope {
+    header: TapeIndexReplicaHeader,
+    footer: crate::tape_index_replica::TapeIndexBootstrapFooter,
+}
+
+/// Validate one healthy terminal-index body without walking the structural prefix.
+///
+/// The newest locally valid member is streamed exactly once. Older members are
+/// inspected only through their bounded header/footer envelopes unless the
+/// newer member fails payload validation. This is the production fast-inventory
+/// path for callers that need the canonical counts and digests but do not need
+/// each row delivered to a transactional catalog writer.
+pub fn read_terminal_index_inventory_summary(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<TerminalInventoryOutcome, TerminalInventoryReadError> {
+    read_terminal_index_inventory_streamed(source, tape_uuid, block_size, |_| Ok(()))
+}
+
+/// Stream candidate rows while selecting the newest valid terminal member.
+///
+/// The tape body for each attempted member is read at most once. Events carry
+/// an attempt id because rows precede the final payload digest: consumers must
+/// commit only the attempt named by the returned selection and discard every
+/// explicitly rejected attempt. This preserves bounded memory and propagates
+/// downstream backpressure without weakening C-to-B-to-A fallback.
+pub fn read_terminal_index_inventory_streamed<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    visit_event: F,
+) -> Result<TerminalInventoryOutcome, TerminalInventoryReadError>
+where
+    F: FnMut(TerminalInventoryStreamEvent) -> Result<(), String>,
+{
+    let visit_event = RefCell::new(visit_event);
+    validate_terminal_index_block_size_hint(block_size)?;
+    source
+        .configure_fixed_block_size(block_size)
+        .map_err(|error| source_error("configure fixed block size", error))?;
+    let eod = source
+        .locate_end_of_data()
+        .map_err(|error| source_error("SPACE(EOD)", error))?;
+    if eod.partition != 0 {
+        return Err(TerminalInventoryReadError::Source {
+            operation: "SPACE(EOD)",
+            message: format!("returned unsupported partition {}", eod.partition),
+        });
+    }
+
+    let layouts = discover_terminal_layouts(source, tape_uuid, block_size, eod)?;
+    if layouts.is_empty() {
+        return Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(
+            Box::new(BotStructuralRecoveryRequired {
+                reason: BotStructuralRecoveryReason::NoUsableTerminalLayout,
+                replicas: missing_evidence("no valid terminal footer was found from EOD"),
+            }),
+        ));
+    }
+
+    let mut inspections = Vec::with_capacity(layouts.len());
+    for layout in layouts {
+        let inspection = inspect_layout(source, tape_uuid, block_size, layout);
+        inspections.push((layout, inspection));
+    }
+    resolve_conflicting_survivor_envelopes(source, block_size, &mut inspections)?;
+
+    let mut next_attempt_id = 1u64;
+    for selected_index in (0..usize::from(TERMINAL_INDEX_REPLICA_COUNT)).rev() {
+        for (_layout, inspection) in &mut inspections {
+            let Some(envelope) = inspection.envelopes[selected_index].as_ref() else {
+                continue;
+            };
+            let selected_ordinal = u16::try_from(selected_index + 1)
+                .expect("terminal replica array has exactly three members");
+            let attempt_id = next_attempt_id;
+            next_attempt_id = next_attempt_id.checked_add(1).ok_or(
+                TerminalInventoryReadError::StreamVisitor {
+                    message: "terminal inventory attempt id overflow".to_string(),
+                },
+            )?;
+            emit_inventory_event(
+                &visit_event,
+                TerminalInventoryStreamEvent::ReplicaAttemptStarted {
+                    attempt_id,
+                    replica_ordinal: selected_ordinal,
+                },
+            )?;
+
+            let visitor_failure = RefCell::new(None);
+            let mut visit_entry = |entry: &TapeIndexReplicaMapEntry| {
+                let result =
+                    visit_event.borrow_mut()(TerminalInventoryStreamEvent::StructuralEntry {
+                        attempt_id,
+                        replica_ordinal: selected_ordinal,
+                        entry: entry.clone(),
+                    });
+                if let Err(message) = result {
+                    *visitor_failure.borrow_mut() = Some(message.clone());
+                    return Err(TapeIndexReplicaError::Payload { message });
+                }
+                Ok(())
+            };
+            let mut visit_row = |row: &TapeIndexReplicaObjectRow| {
+                let result = visit_event.borrow_mut()(TerminalInventoryStreamEvent::ObjectRow {
+                    attempt_id,
+                    replica_ordinal: selected_ordinal,
+                    row: row.clone(),
+                });
+                if let Err(message) = result {
+                    *visitor_failure.borrow_mut() = Some(message.clone());
+                    return Err(TapeIndexReplicaError::Payload { message });
+                }
+                Ok(())
+            };
+            let payload = validate_member_payload(
+                source,
+                block_size,
+                envelope,
+                &mut visit_entry,
+                &mut visit_row,
+            );
+            if let Some(message) = visitor_failure.into_inner() {
+                return Err(TerminalInventoryReadError::StreamVisitor { message });
+            }
+            let summary = match payload {
+                Ok(summary) => summary,
+                Err(failure) => {
+                    inspection.replicas[selected_index] =
+                        TerminalReplicaEvidence::Invalid(failure.clone());
+                    emit_inventory_event(
+                        &visit_event,
+                        TerminalInventoryStreamEvent::ReplicaAttemptRejected {
+                            attempt_id,
+                            replica_ordinal: selected_ordinal,
+                            failure,
+                        },
+                    )?;
+                    continue;
+                }
+            };
+            inspection.replicas[selected_index] = TerminalReplicaEvidence::Valid { summary };
+            for index in 0..usize::from(TERMINAL_INDEX_REPLICA_COUNT) {
+                if index == selected_index {
+                    continue;
+                }
+                if let Some(candidate) = inspection.envelopes[index].as_ref() {
+                    if matches!(
+                        inspection.replicas[index],
+                        TerminalReplicaEvidence::ConsistentEnvelope
+                    ) && candidate.header.plan.edition != envelope.header.plan.edition
+                    {
+                        inspection.replicas[index] = TerminalReplicaEvidence::Invalid(
+                            TerminalReplicaFailure {
+                                kind: TerminalReplicaFailureKind::CrossSurvivorConflict,
+                                detail: format!(
+                                    "replica {} edition/scope/count/digest facts disagree with selected replica {}",
+                                    index + 1,
+                                    selected_index + 1
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+            return Ok(TerminalInventoryOutcome::Inventory(Box::new(
+                TerminalInventorySelection {
+                    selected_attempt_id: attempt_id,
+                    selected_replica_ordinal: selected_ordinal,
+                    edition: envelope.header.plan.edition.clone(),
+                    payload: summary,
+                    replicas: inspection.replicas.clone(),
+                },
+            )));
+        }
+    }
+
+    let replicas = inspections
+        .into_iter()
+        .next()
+        .expect("nonempty terminal layout candidates produce an inspection")
+        .1
+        .replicas;
+    Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(
+        Box::new(BotStructuralRecoveryRequired {
+            reason: BotStructuralRecoveryReason::AllMembersInvalid,
+            replicas,
+        }),
+    ))
+}
+
+fn resolve_conflicting_survivor_envelopes(
+    source: &mut dyn RawTapeSource,
+    block_size: u32,
+    inspections: &mut [(TerminalTailLayout, LayoutInspection)],
+) -> Result<(), TerminalInventoryReadError> {
+    let mut envelope_editions = Vec::new();
+    for (_, inspection) in inspections.iter() {
+        for envelope in inspection.envelopes.iter().flatten() {
+            if !envelope_editions.contains(&envelope.header.plan.edition) {
+                envelope_editions.push(envelope.header.plan.edition.clone());
+            }
+        }
+    }
+    if envelope_editions.len() <= 1 {
+        return Ok(());
+    }
+
+    let mut surviving_editions = Vec::new();
+    for (_, inspection) in inspections.iter_mut() {
+        for index in 0..usize::from(TERMINAL_INDEX_REPLICA_COUNT) {
+            let Some(envelope) = inspection.envelopes[index].clone() else {
+                continue;
+            };
+            match validate_member_payload(
+                source,
+                block_size,
+                &envelope,
+                &mut |_| Ok(()),
+                &mut |_| Ok(()),
+            ) {
+                Ok(summary) => {
+                    inspection.replicas[index] = TerminalReplicaEvidence::Valid { summary };
+                    if !surviving_editions.contains(&envelope.header.plan.edition) {
+                        surviving_editions.push(envelope.header.plan.edition.clone());
+                    }
+                }
+                Err(failure) => {
+                    inspection.replicas[index] = TerminalReplicaEvidence::Invalid(failure);
+                    inspection.envelopes[index] = None;
+                }
+            }
+        }
+    }
+    if surviving_editions.len() > 1 {
+        return Err(TerminalInventoryReadError::TerminalIndexReplicaConflict {
+            count: surviving_editions.len(),
+        });
+    }
+    if let Some(survivor) = surviving_editions.first() {
+        for (_, inspection) in inspections.iter_mut() {
+            for index in 0..usize::from(TERMINAL_INDEX_REPLICA_COUNT) {
+                if inspection.envelopes[index]
+                    .as_ref()
+                    .is_some_and(|envelope| envelope.header.plan.edition != *survivor)
+                {
+                    inspection.replicas[index] =
+                        TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                            kind: TerminalReplicaFailureKind::CrossSurvivorConflict,
+                            detail:
+                                "replica edition conflicts with the only payload-valid survivor"
+                                    .to_string(),
+                        });
+                    inspection.envelopes[index] = None;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_inventory_event<F>(
+    visitor: &RefCell<F>,
+    event: TerminalInventoryStreamEvent,
+) -> Result<(), TerminalInventoryReadError>
+where
+    F: FnMut(TerminalInventoryStreamEvent) -> Result<(), String>,
+{
+    visitor.borrow_mut()(event)
+        .map_err(|message| TerminalInventoryReadError::StreamVisitor { message })
+}
+
+/// Stream a validated terminal inventory into row visitors.
+///
+/// This compatibility surface first runs the bounded summary selection, then
+/// replays the selected member into the supplied visitors. Callers must treat
+/// visitor output as authoritative only when the function returns
+/// [`TerminalInventoryOutcome::Inventory`]. Production summary-only inventory
+/// should use [`read_terminal_index_inventory_summary`] so the selected body is
+/// read exactly once.
+pub fn read_terminal_index_inventory<FE, FR>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mut visit_entry: FE,
+    mut visit_row: FR,
+) -> Result<TerminalInventoryOutcome, TerminalInventoryReadError>
+where
+    FE: FnMut(&TapeIndexReplicaMapEntry) -> Result<(), TapeIndexReplicaError>,
+    FR: FnMut(&TapeIndexReplicaObjectRow) -> Result<(), TapeIndexReplicaError>,
+{
+    let outcome = read_terminal_index_inventory_summary(source, tape_uuid, block_size)?;
+    let TerminalInventoryOutcome::Inventory(mut selection) = outcome else {
+        return Ok(outcome);
+    };
+    let selected_ordinal = selection.selected_replica_ordinal;
+    let envelope = validate_member_envelope(
+        source,
+        tape_uuid,
+        block_size,
+        selection.edition.descriptor.terminal_layout,
+        selected_ordinal,
+    )
+    .map_err(|failure| TerminalInventoryReadError::SelectedReplica {
+        ordinal: selected_ordinal,
+        source: TapeIndexReplicaError::Payload {
+            message: failure.detail,
+        },
+    })?;
+    let replayed_summary = validate_member_payload(
+        source,
+        block_size,
+        &envelope,
+        &mut visit_entry,
+        &mut visit_row,
+    )
+    .map_err(|failure| TerminalInventoryReadError::SelectedReplica {
+        ordinal: selected_ordinal,
+        source: TapeIndexReplicaError::Payload {
+            message: failure.detail,
+        },
+    })?;
+    if replayed_summary != selection.payload {
+        return Err(TerminalInventoryReadError::SelectedReplica {
+            ordinal: selected_ordinal,
+            source: TapeIndexReplicaError::DigestMismatch {
+                field: "inventory replay summary",
+            },
+        });
+    }
+    selection.payload = replayed_summary;
+    Ok(TerminalInventoryOutcome::Inventory(selection))
+}
+
+/// Reconstruct and classify Object evidence by walking from BOT.
+///
+/// This is the mandatory fallback when no terminal replica survives. It emits
+/// every complete Object candidate and, when the torn tail is classifiable as
+/// an Object, one incomplete candidate. Recognisable terminal replica or
+/// separation framing is retained as control evidence and never emitted as an
+/// Object or allowed to consume an Object ordinal.
+pub fn recover_terminal_inventory_from_bot<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mut visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    reject_readable_foreign_bot_bootstrap(source, tape_uuid, block_size)?;
+    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
+        |error| BotStructuralRecoveryError::Scan {
+            message: error.to_string(),
+        },
+    )?;
+    let mut complete_object_count = 0u64;
+    let recovered_object_count = 0u64;
+    let mut unknown_object_count = 0u64;
+    for entry in walked
+        .map
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind == TapeFileKind::Object)
+    {
+        complete_object_count =
+            checked_recovery_increment(complete_object_count, "complete BOT Object count")?;
+        unknown_object_count =
+            checked_recovery_increment(unknown_object_count, "unknown BOT Object count")?;
+        let (state, object_id) = (BotRecoveredObjectState::Unknown, None);
+        visit_object(&BotRecoveredObject {
+            tape_file_number: entry.tape_file_number,
+            stored_block_count: entry.block_count,
+            object_id,
+            state,
+        })
+        .map_err(|message| BotStructuralRecoveryError::Visitor { message })?;
+    }
+    let mut incomplete_object_count = 0u64;
+    if walked.truncation_candidate_kind == Some(TapeFileKind::Object) {
+        let truncation = walked
+            .truncation
+            .ok_or_else(|| BotStructuralRecoveryError::Scan {
+                message: "scanner classified a torn Object without truncation evidence".to_string(),
+            })?;
+        incomplete_object_count = 1;
+        visit_object(&BotRecoveredObject {
+            tape_file_number: truncation.tape_file_number,
+            stored_block_count: 0,
+            object_id: None,
+            state: BotRecoveredObjectState::Incomplete,
+        })
+        .map_err(|message| BotStructuralRecoveryError::Visitor { message })?;
+    }
+
+    Ok(BotStructuralRecoverySummary {
+        structural_entry_count: walked.map.tape_file_count(),
+        complete_object_count,
+        recovered_object_count,
+        unknown_object_count,
+        incomplete_object_count,
+        canonical_map_digest: walked.map.canonical_digest().map_err(|error| {
+            BotStructuralRecoveryError::Scan {
+                message: error.to_string(),
+            }
+        })?,
+        damaged_region_count: u64::try_from(walked.damaged_regions.len()).map_err(|_| {
+            BotStructuralRecoveryError::ArithmeticOverflow {
+                context: "BOT damaged-region count",
+            }
+        })?,
+    })
+}
+
+fn reject_readable_foreign_bot_bootstrap(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<(), BotStructuralRecoveryError> {
+    if source.configure_fixed_block_size(block_size).is_err()
+        || source
+            .locate_physical(PhysicalPositionHint::new(0))
+            .is_err()
+    {
+        return Ok(());
+    }
+    let Ok(block_size) = usize::try_from(block_size) else {
+        return Ok(());
+    };
+    let mut block = vec![0; block_size];
+    let Ok(RawReadOutcome::Block { bytes, .. }) = source.read_record(&mut block) else {
+        return Ok(());
+    };
+    if bytes != block_size {
+        return Ok(());
+    }
+    if let Ok(payload) = parse_bootstrap_block(&block) {
+        if payload.tape_uuid != *tape_uuid {
+            return Err(BotStructuralRecoveryError::TapeIdentityMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn checked_recovery_increment(
+    value: u64,
+    context: &'static str,
+) -> Result<u64, BotStructuralRecoveryError> {
+    value
+        .checked_add(1)
+        .ok_or(BotStructuralRecoveryError::ArithmeticOverflow { context })
+}
+
+/// Perform a complete physical verification distinct from bounded inventory.
+///
+/// Integrity damage is a typed outcome, not a transport error: a verified
+/// canonical prefix with damaged redundancy is `VerifiedDegraded`, while lack
+/// of a surviving canonical authority returns `RecoveryRequired` with a real
+/// BOT structural-recovery summary.
+pub fn verify_terminal_index_full(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    match verify_terminal_index_strict(source, tape_uuid, block_size) {
+        Ok(complete) => {
+            let replicas = complete
+                .replicas
+                .map(|summary| TerminalReplicaEvidence::Valid { summary });
+            let separations = complete
+                .separation_interior_records
+                .map(|interior_record_count| TerminalSeparationEvidence::Valid {
+                    interior_record_count,
+                });
+            Ok(TerminalIndexVerificationOutcome::VerifiedComplete(
+                Box::new(TerminalIndexVerification {
+                    edition: complete.edition,
+                    selected_payload: complete.replicas[2],
+                    replicas,
+                    separations,
+                    measured_eod: complete.measured_eod,
+                    verified_prefix_tape_file_count: complete.verified_prefix_tape_file_count,
+                    verified_prefix_record_count: complete.verified_prefix_record_count,
+                    measured_tape_file_count: complete.measured_tape_file_count,
+                }),
+            ))
+        }
+        Err(error) if verification_error_is_physical_damage(&error) => {
+            verify_terminal_index_after_damage(source, tape_uuid, block_size, error.to_string())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn verification_error_is_physical_damage(error: &TerminalIndexVerificationError) -> bool {
+    matches!(
+        error,
+        TerminalIndexVerificationError::NoCompleteLayout { .. }
+            | TerminalIndexVerificationError::ConflictingLayouts { .. }
+            | TerminalIndexVerificationError::PrefixTruncated { .. }
+            | TerminalIndexVerificationError::PrefixDamaged { .. }
+            | TerminalIndexVerificationError::TapeFileCountMismatch { .. }
+            | TerminalIndexVerificationError::TerminalComponentMismatch { .. }
+            | TerminalIndexVerificationError::CanonicalMapMismatch { .. }
+            | TerminalIndexVerificationError::Replica { .. }
+            | TerminalIndexVerificationError::CrossReplicaConflict { .. }
+            | TerminalIndexVerificationError::Separation { .. }
+    )
+}
+
+fn verify_terminal_index_after_damage(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    initial_detail: String,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    let inventory = match read_terminal_index_inventory_summary(source, tape_uuid, block_size) {
+        Ok(inventory) => inventory,
+        Err(TerminalInventoryReadError::SelectedReplica {
+            ordinal,
+            source: error,
+        }) => {
+            let mut replicas = missing_evidence(
+                "terminal member evidence became unavailable during inventory replay",
+            );
+            replicas[usize::from(ordinal - 1)] =
+                TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                    kind: TerminalReplicaFailureKind::PayloadInvalid,
+                    detail: error.to_string(),
+                });
+            return terminal_recovery_required(
+                source,
+                tape_uuid,
+                block_size,
+                replicas,
+                format!(
+                    "terminal replica {ordinal} failed while replaying its payload after physical damage: {error}"
+                ),
+            );
+        }
+        Err(error) => return Err(inventory_error_to_verification(error)),
+    };
+    let selection = match inventory {
+        TerminalInventoryOutcome::Inventory(selection) => selection,
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
+            return terminal_recovery_required(
+                source,
+                tape_uuid,
+                block_size,
+                recovery.replicas,
+                initial_detail,
+            )
+        }
+    };
+    let layout = selection.edition.descriptor.terminal_layout;
+    source
+        .configure_fixed_block_size(block_size)
+        .map_err(|error| verification_source_error("configure fixed block size", error))?;
+    let measured_eod = source
+        .locate_end_of_data()
+        .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
+    if measured_eod.partition != layout.partition || measured_eod.lba > layout.expected_eod_lba {
+        return terminal_recovery_required(
+            source,
+            tape_uuid,
+            block_size,
+            selection.replicas,
+            format!(
+                "measured EOD partition {} LBA {} lies beyond planned terminal EOD partition {} LBA {}",
+                measured_eod.partition,
+                measured_eod.lba,
+                layout.partition,
+                layout.expected_eod_lba
+            ),
+        );
+    }
+    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
+        |error| TerminalIndexVerificationError::PrefixWalk {
+            message: error.to_string(),
+        },
+    )?;
+    let prefix_count = layout.components[0].planned_tape_file_number;
+    if walked
+        .truncation
+        .is_some_and(|truncation| truncation.tape_file_number < prefix_count)
+        || walked
+            .damaged_regions
+            .iter()
+            .any(|damage| damage.start.lba < layout.components[0].planned_start_lba)
+    {
+        return terminal_recovery_required(
+            source,
+            tape_uuid,
+            block_size,
+            selection.replicas,
+            "physical damage or truncation lies inside the canonical pre-tail prefix".to_string(),
+        );
+    }
+    let prefix_len = usize::try_from(prefix_count).map_err(|_| {
+        TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "degraded verification prefix count to usize",
+        }
+    })?;
+    let Some(physical_prefix) = walked.map.entries().get(..prefix_len) else {
+        return terminal_recovery_required(
+            source,
+            tape_uuid,
+            block_size,
+            selection.replicas,
+            "BOT walk ended before the canonical pre-tail prefix".to_string(),
+        );
+    };
+    let verified_prefix_record_count = physical_prefix.iter().try_fold(0u64, |total, entry| {
+        total.checked_add(entry.block_count).ok_or(
+            TerminalIndexVerificationError::ArithmeticOverflow {
+                context: "degraded verified prefix record count",
+            },
+        )
+    })?;
+
+    let mut replicas = missing_evidence("replica full verification was not attempted");
+    let mut replica_editions: [Option<TapeIndexEditionPlan>; 3] = std::array::from_fn(|_| None);
+    for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+        let index = usize::from(ordinal - 1);
+        let envelope =
+            match validate_member_envelope(source, tape_uuid, block_size, layout, ordinal) {
+                Ok(envelope) => envelope,
+                Err(failure) => {
+                    replicas[index] = TerminalReplicaEvidence::Invalid(failure);
+                    continue;
+                }
+            };
+        let mut entry_index = 0usize;
+        let result = validate_member_payload(
+            source,
+            block_size,
+            &envelope,
+            &mut |entry| {
+                let Some(physical) = physical_prefix.get(entry_index) else {
+                    return Err(TapeIndexReplicaError::Payload {
+                        message: format!("canonical replica map emitted extra row {entry_index}"),
+                    });
+                };
+                if !canonical_entry_matches_physical(entry, physical) {
+                    return Err(TapeIndexReplicaError::Payload {
+                        message: format!(
+                            "canonical row {entry:?} disagrees with measured row {physical:?}"
+                        ),
+                    });
+                }
+                entry_index = entry_index.checked_add(1).ok_or(
+                    TapeIndexReplicaError::ArithmeticOverflow {
+                        context: "degraded verification canonical row index",
+                    },
+                )?;
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        );
+        replicas[index] = match result {
+            Ok(summary) if entry_index == physical_prefix.len() => {
+                replica_editions[index] = Some(envelope.header.plan.edition.clone());
+                TerminalReplicaEvidence::Valid { summary }
+            }
+            Ok(_) => TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::PayloadInvalid,
+                detail: format!(
+                    "canonical map emitted {entry_index} rows, measured prefix has {}",
+                    physical_prefix.len()
+                ),
+            }),
+            Err(failure) => TerminalReplicaEvidence::Invalid(failure),
+        };
+    }
+    let selected_index = replicas
+        .iter()
+        .rposition(|evidence| matches!(evidence, TerminalReplicaEvidence::Valid { .. }));
+    let Some(selected_index) = selected_index else {
+        return terminal_recovery_required(
+            source,
+            tape_uuid,
+            block_size,
+            replicas,
+            "no terminal replica survived full payload/canonical-prefix validation".to_string(),
+        );
+    };
+    let edition = replica_editions[selected_index]
+        .clone()
+        .expect("valid replica evidence records its edition");
+    let selected_payload = match replicas[selected_index] {
+        TerminalReplicaEvidence::Valid { summary } => summary,
+        _ => unreachable!("selected index was derived from valid evidence"),
+    };
+    for index in 0..replicas.len() {
+        if index == selected_index
+            || !matches!(replicas[index], TerminalReplicaEvidence::Valid { .. })
+        {
+            continue;
+        }
+        let same_edition = replica_editions[index]
+            .as_ref()
+            .is_some_and(|candidate| *candidate == edition);
+        let same_payload = matches!(
+            replicas[index],
+            TerminalReplicaEvidence::Valid { summary } if summary == selected_payload
+        );
+        if !same_edition || !same_payload {
+            replicas[index] = TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::CrossSurvivorConflict,
+                detail: format!(
+                    "replica {} conflicts with selected physically valid replica {}",
+                    index + 1,
+                    selected_index + 1
+                ),
+            });
+        }
+    }
+
+    let separations = std::array::from_fn(|index| {
+        let ordinal = u16::try_from(index + 1).expect("two separation ordinals fit u16");
+        match verify_separation_full(source, tape_uuid, block_size, layout, ordinal) {
+            Ok(interior_record_count) => TerminalSeparationEvidence::Valid {
+                interior_record_count,
+            },
+            Err(error) => TerminalSeparationEvidence::Invalid {
+                detail: error.to_string(),
+            },
+        }
+    });
+    let all_replicas_valid = replicas
+        .iter()
+        .all(|evidence| matches!(evidence, TerminalReplicaEvidence::Valid { .. }));
+    let all_separations_valid = separations
+        .iter()
+        .all(|evidence| matches!(evidence, TerminalSeparationEvidence::Valid { .. }));
+    let complete = all_replicas_valid
+        && all_separations_valid
+        && walked.truncation.is_none()
+        && measured_eod.lba == layout.expected_eod_lba
+        && walked.map.tape_file_count()
+            == layout.components[TERMINAL_TAIL_COMPONENT_COUNT - 1]
+                .planned_tape_file_number
+                .checked_add(1)
+                .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
+                    context: "degraded verification complete file count",
+                })?;
+    let evidence = Box::new(TerminalIndexVerification {
+        edition,
+        selected_payload,
+        replicas,
+        separations,
+        measured_eod,
+        verified_prefix_tape_file_count: prefix_count,
+        verified_prefix_record_count,
+        measured_tape_file_count: walked.map.tape_file_count(),
+    });
+    Ok(if complete {
+        TerminalIndexVerificationOutcome::VerifiedComplete(evidence)
+    } else {
+        TerminalIndexVerificationOutcome::VerifiedDegraded(evidence)
+    })
+}
+
+fn terminal_recovery_required(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    replicas: [TerminalReplicaEvidence; 3],
+    detail: String,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    source
+        .configure_fixed_block_size(block_size)
+        .map_err(|error| verification_source_error("configure fixed block size", error))?;
+    let measured_eod = source
+        .locate_end_of_data()
+        .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
+    let bot_recovery =
+        recover_terminal_inventory_from_bot(source, tape_uuid, block_size, |_| Ok(())).map_err(
+            |error| TerminalIndexVerificationError::PrefixWalk {
+                message: error.to_string(),
+            },
+        )?;
+    Ok(TerminalIndexVerificationOutcome::RecoveryRequired(
+        Box::new(TerminalIndexRecoveryRequired {
+            measured_eod,
+            bot_recovery,
+            replicas,
+            detail,
+        }),
+    ))
+}
+
+/// Strict complete-evidence pass used as the healthy fast path.
+///
+/// This operation measures EOD, walks every filemark-delimited tape file from
+/// BOT, compares the measured pre-tail prefix with the canonical map embedded
+/// in each replica, streams all three replica payloads, and reads every record
+/// in both typed separation extents. Success therefore means all five terminal
+/// components and the complete canonical prefix agreed physically.
+fn verify_terminal_index_strict(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<TerminalIndexCompleteEvidence, TerminalIndexVerificationError> {
+    validate_terminal_index_block_size_hint(block_size)?;
+    source
+        .configure_fixed_block_size(block_size)
+        .map_err(|error| verification_source_error("configure fixed block size", error))?;
+    let measured_eod = source
+        .locate_end_of_data()
+        .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
+    if measured_eod.partition != 0 {
+        return Err(TerminalIndexVerificationError::Source {
+            operation: "SPACE(EOD)",
+            message: format!("returned unsupported partition {}", measured_eod.partition),
+        });
+    }
+
+    let mut layouts = discover_terminal_layouts(source, tape_uuid, block_size, measured_eod)
+        .map_err(inventory_error_to_verification)?
+        .into_iter()
+        .filter(|layout| layout.expected_eod_lba == measured_eod.lba)
+        .collect::<Vec<_>>();
+    layouts.dedup();
+    let layout = match layouts.as_slice() {
+        [] => {
+            return Err(TerminalIndexVerificationError::NoCompleteLayout {
+                measured_eod_lba: measured_eod.lba,
+            })
+        }
+        [layout] => *layout,
+        _ => {
+            return Err(TerminalIndexVerificationError::ConflictingLayouts {
+                count: layouts.len(),
+            })
+        }
+    };
+
+    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
+        |error| TerminalIndexVerificationError::PrefixWalk {
+            message: error.to_string(),
+        },
+    )?;
+    if let Some(truncation) = walked.truncation {
+        return Err(TerminalIndexVerificationError::PrefixTruncated {
+            tape_file_number: truncation.tape_file_number,
+            kind: truncation.kind,
+        });
+    }
+    if let Some(first) = walked.damaged_regions.first() {
+        return Err(TerminalIndexVerificationError::PrefixDamaged {
+            count: walked.damaged_regions.len(),
+            first_kind: first.kind,
+        });
+    }
+
+    let expected_file_count = layout.components[TERMINAL_TAIL_COMPONENT_COUNT - 1]
+        .planned_tape_file_number
+        .checked_add(1)
+        .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "terminal physical tape-file count",
+        })?;
+    if walked.map.tape_file_count() != expected_file_count {
+        return Err(TerminalIndexVerificationError::TapeFileCountMismatch {
+            expected: expected_file_count,
+            actual: walked.map.tape_file_count(),
+        });
+    }
+    validate_measured_terminal_components(walked.map.entries(), &layout)?;
+
+    let prefix_count = layout.components[0].planned_tape_file_number;
+    let prefix_len = usize::try_from(prefix_count).map_err(|_| {
+        TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "canonical prefix count to usize",
+        }
+    })?;
+    let physical_prefix = walked.map.entries().get(..prefix_len).ok_or(
+        TerminalIndexVerificationError::TapeFileCountMismatch {
+            expected: expected_file_count,
+            actual: walked.map.tape_file_count(),
+        },
+    )?;
+    let verified_prefix_record_count = physical_prefix.iter().try_fold(0u64, |total, entry| {
+        total.checked_add(entry.block_count).ok_or(
+            TerminalIndexVerificationError::ArithmeticOverflow {
+                context: "verified prefix record count",
+            },
+        )
+    })?;
+
+    let mut replica_summaries = Vec::with_capacity(usize::from(TERMINAL_INDEX_REPLICA_COUNT));
+    let mut edition: Option<TapeIndexEditionPlan> = None;
+    for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+        let envelope = validate_member_envelope(source, tape_uuid, block_size, layout, ordinal)
+            .map_err(|failure| TerminalIndexVerificationError::Replica {
+                ordinal,
+                failure: failure.kind,
+                detail: failure.detail,
+            })?;
+        let mut entry_index = 0usize;
+        let mut canonical_mismatch = None;
+        let summary = validate_member_payload(
+            source,
+            block_size,
+            &envelope,
+            &mut |entry| {
+                let Some(physical) = physical_prefix.get(entry_index) else {
+                    let detail = format!("canonical map emitted extra row at index {entry_index}");
+                    canonical_mismatch = Some(detail.clone());
+                    return Err(TapeIndexReplicaError::Payload { message: detail });
+                };
+                if !canonical_entry_matches_physical(entry, physical) {
+                    canonical_mismatch = Some(format!(
+                        "canonical row {entry:?} disagrees with measured row {physical:?}"
+                    ));
+                    return Err(TapeIndexReplicaError::Payload {
+                        message: canonical_mismatch
+                            .clone()
+                            .expect("mismatch detail was just populated"),
+                    });
+                }
+                entry_index = entry_index.checked_add(1).ok_or(
+                    TapeIndexReplicaError::ArithmeticOverflow {
+                        context: "full verification canonical row index",
+                    },
+                )?;
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        )
+        .map_err(|failure| {
+            if let Some(detail) = canonical_mismatch {
+                TerminalIndexVerificationError::CanonicalMapMismatch {
+                    ordinal,
+                    tape_file_number: u64::try_from(entry_index).unwrap_or(u64::MAX),
+                    detail,
+                }
+            } else {
+                TerminalIndexVerificationError::Replica {
+                    ordinal,
+                    failure: failure.kind,
+                    detail: failure.detail,
+                }
+            }
+        })?;
+        if entry_index != physical_prefix.len() {
+            return Err(TerminalIndexVerificationError::CanonicalMapMismatch {
+                ordinal,
+                tape_file_number: u64::try_from(entry_index).unwrap_or(u64::MAX),
+                detail: format!(
+                    "canonical map emitted {entry_index} rows, measured prefix has {}",
+                    physical_prefix.len()
+                ),
+            });
+        }
+        if let Some(reference) = edition.as_ref() {
+            if envelope.header.plan.edition != *reference
+                || replica_summaries
+                    .first()
+                    .is_some_and(|first| *first != summary)
+            {
+                return Err(TerminalIndexVerificationError::CrossReplicaConflict { ordinal });
+            }
+        } else {
+            edition = Some(envelope.header.plan.edition.clone());
+        }
+        replica_summaries.push(summary);
+    }
+
+    let mut separation_interior_records = [0u64; 2];
+    for ordinal in 1..=crate::terminal_tail::TERMINAL_INDEX_SEPARATION_COUNT {
+        separation_interior_records[usize::from(ordinal - 1)] =
+            verify_separation_full(source, tape_uuid, block_size, layout, ordinal)?;
+    }
+
+    let replicas: [TapeIndexReplicaPayloadSummary; 3] = replica_summaries
+        .try_into()
+        .expect("terminal replica count is exactly three");
+    Ok(TerminalIndexCompleteEvidence {
+        edition: edition.expect("three verified replicas establish one edition"),
+        replicas,
+        separation_interior_records,
+        measured_eod,
+        verified_prefix_tape_file_count: prefix_count,
+        verified_prefix_record_count,
+        measured_tape_file_count: walked.map.tape_file_count(),
+    })
+}
+
+fn validate_measured_terminal_components(
+    entries: &[TapeFileMapEntry],
+    layout: &TerminalTailLayout,
+) -> Result<(), TerminalIndexVerificationError> {
+    let expected_tape_file_count = layout.components[TERMINAL_TAIL_COMPONENT_COUNT - 1]
+        .planned_tape_file_number
+        .checked_add(1)
+        .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "terminal planned tape-file count",
+        })?;
+    let actual_tape_file_count = u64::try_from(entries.len()).map_err(|_| {
+        TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "terminal measured tape-file count",
+        }
+    })?;
+    for component in layout.components {
+        let index = usize::try_from(component.planned_tape_file_number).map_err(|_| {
+            TerminalIndexVerificationError::ArithmeticOverflow {
+                context: "terminal tape-file number to usize",
+            }
+        })?;
+        let actual =
+            entries
+                .get(index)
+                .ok_or(TerminalIndexVerificationError::TapeFileCountMismatch {
+                    expected: expected_tape_file_count,
+                    actual: actual_tape_file_count,
+                })?;
+        let expected_kind = match component.kind {
+            crate::terminal_tail::TerminalTailComponentKind::TapeIndexReplica => {
+                TapeFileKind::TapeIndexReplica
+            }
+            crate::terminal_tail::TerminalTailComponentKind::IndexSeparationExtent => {
+                TapeFileKind::IndexSeparationExtent
+            }
+        };
+        if actual.tape_file_number != component.planned_tape_file_number
+            || actual.kind != expected_kind
+            || actual.block_count != component.record_count
+        {
+            return Err(TerminalIndexVerificationError::TerminalComponentMismatch {
+                tape_file_number: component.planned_tape_file_number,
+                detail: format!(
+                    "terminal component expected {expected_kind:?}/{} records, measured {:?}/{} records",
+                    component.record_count, actual.kind, actual.block_count
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_entry_matches_physical(
+    canonical: &TapeIndexReplicaMapEntry,
+    physical: &TapeFileMapEntry,
+) -> bool {
+    let kind_matches = matches!(
+        (canonical.kind, physical.kind),
+        (TapeIndexReplicaFileKind::Object, TapeFileKind::Object)
+            | (
+                TapeIndexReplicaFileKind::ParitySidecar,
+                TapeFileKind::ParitySidecar
+            )
+            | (TapeIndexReplicaFileKind::Bootstrap, TapeFileKind::Bootstrap)
+            | (TapeIndexReplicaFileKind::ParityMap, TapeFileKind::ParityMap)
+            | (
+                TapeIndexReplicaFileKind::TapeIndexReplica,
+                TapeFileKind::TapeIndexReplica
+            )
+            | (
+                TapeIndexReplicaFileKind::IndexSeparationExtent,
+                TapeFileKind::IndexSeparationExtent
+            )
+    );
+    kind_matches
+        && canonical.tape_file_number == physical.tape_file_number
+        && canonical.block_count == physical.block_count
+        && canonical.first_parity_data_ordinal == physical.first_parity_data_ordinal
+        && canonical.protected_ordinal_start == physical.protected_ordinal_start
+        && canonical.protected_ordinal_end_exclusive == physical.protected_ordinal_end_exclusive
+        && canonical.epoch_id == physical.epoch_id
+}
+
+fn verify_separation_full(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    layout: TerminalTailLayout,
+    ordinal: u16,
+) -> Result<u64, TerminalIndexVerificationError> {
+    let component =
+        layout
+            .separation(ordinal)
+            .map_err(|error| TerminalIndexVerificationError::Separation {
+                ordinal,
+                source: IndexSeparationError::Layout(error),
+            })?;
+    let header_block = read_fixed_block(
+        source,
+        PhysicalPositionHint {
+            lba: component.planned_start_lba,
+            partition: layout.partition,
+        },
+        block_size,
+    )
+    .map_err(|error| TerminalIndexVerificationError::Separation {
+        ordinal,
+        source: IndexSeparationError::PhysicalSource(error.to_string()),
+    })?;
+    let header = parse_index_separation_header(&header_block, tape_uuid)
+        .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
+    if header.plan.descriptor.gap_ordinal != ordinal
+        || header.plan.descriptor.terminal_layout != layout
+    {
+        return Err(TerminalIndexVerificationError::Separation {
+            ordinal,
+            source: IndexSeparationError::DigestMismatch {
+                field: "discovered terminal layout",
+            },
+        });
+    }
+    let footer_lba = component
+        .planned_start_lba
+        .checked_add(component.record_count.checked_sub(1).ok_or(
+            TerminalIndexVerificationError::ArithmeticOverflow {
+                context: "separation footer offset",
+            },
+        )?)
+        .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "separation footer LBA",
+        })?;
+    let footer_block = read_fixed_block(
+        source,
+        PhysicalPositionHint {
+            lba: footer_lba,
+            partition: layout.partition,
+        },
+        block_size,
+    )
+    .map_err(|error| TerminalIndexVerificationError::Separation {
+        ordinal,
+        source: IndexSeparationError::PhysicalSource(error.to_string()),
+    })?;
+    let footer = parse_index_separation_footer(&footer_block, tape_uuid)
+        .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
+    validate_index_separation_pair(&header, &footer)
+        .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
+    let interior_start = component.planned_start_lba.checked_add(1).ok_or(
+        TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "separation interior start",
+        },
+    )?;
+    let mut interior = RawSeparationInteriorSource {
+        source,
+        start: PhysicalPositionHint {
+            lba: interior_start,
+            partition: layout.partition,
+        },
+        block_size,
+        record_count: component.record_count.checked_sub(2).ok_or(
+            TerminalIndexVerificationError::ArithmeticOverflow {
+                context: "separation interior record count",
+            },
+        )?,
+    };
+    let verified = validate_index_separation_full(&header, &footer, &mut interior)
+        .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
+    let filemark_lba = component
+        .planned_start_lba
+        .checked_add(component.record_count)
+        .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
+            context: "separation trailing filemark LBA",
+        })?;
+    expect_filemark(
+        source,
+        PhysicalPositionHint {
+            lba: filemark_lba,
+            partition: layout.partition,
+        },
+        block_size,
+    )
+    .map_err(|failure| TerminalIndexVerificationError::Separation {
+        ordinal,
+        source: IndexSeparationError::PhysicalSource(failure.detail),
+    })?;
+    Ok(verified)
+}
+
+struct RawSeparationInteriorSource<'a> {
+    source: &'a mut dyn RawTapeSource,
+    start: PhysicalPositionHint,
+    block_size: u32,
+    record_count: u64,
+}
+
+impl IndexSeparationInteriorBlockSource for RawSeparationInteriorSource<'_> {
+    fn visit_interior_blocks(
+        &mut self,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<(), IndexSeparationError>,
+    ) -> Result<(), IndexSeparationError> {
+        for offset in 0..self.record_count {
+            let lba = self.start.lba.checked_add(offset).ok_or(
+                IndexSeparationError::ArithmeticOverflow {
+                    context: "full verification separation interior LBA",
+                },
+            )?;
+            let block = read_fixed_block(
+                self.source,
+                PhysicalPositionHint {
+                    lba,
+                    partition: self.start.partition,
+                },
+                self.block_size,
+            )
+            .map_err(|error| IndexSeparationError::PhysicalSource(error.to_string()))?;
+            visitor(&block)?;
+        }
+        Ok(())
+    }
+}
+
+fn discover_terminal_layouts(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    eod: PhysicalPositionHint,
+) -> Result<Vec<TerminalTailLayout>, TerminalInventoryReadError> {
+    source
+        .locate_physical(eod)
+        .map_err(|error| source_error("restore EOD position", error))?;
+    let mut layouts = Vec::new();
+    for _ in 0..TERMINAL_TAIL_COMPONENT_COUNT {
+        let spaced = source
+            .space_filemarks(-1)
+            .map_err(|error| source_error("backspace terminal filemark", error))?;
+        if spaced.filemarks_spaced != -1 || spaced.position_after.partition != eod.partition {
+            break;
+        }
+        let Some(footer_lba) = spaced.position_after.lba.checked_sub(1) else {
+            break;
+        };
+        let footer_position = PhysicalPositionHint {
+            lba: footer_lba,
+            partition: eod.partition,
+        };
+        if let Ok(block) = read_fixed_block(source, footer_position, block_size) {
+            if let Ok(footer) = parse_tape_index_bootstrap_footer(&block, tape_uuid) {
+                if footer.observed_footer_lba == footer_lba {
+                    let layout = footer.plan.edition.descriptor.terminal_layout;
+                    if layout.expected_eod_lba >= eod.lba && !layouts.contains(&layout) {
+                        layouts.push(layout);
+                    }
+                }
+            }
+        }
+        source
+            .locate_physical(spaced.position_after)
+            .map_err(|error| source_error("restore backspaced filemark position", error))?;
+    }
+    Ok(layouts)
+}
+
+fn inspect_layout(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    layout: TerminalTailLayout,
+) -> LayoutInspection {
+    let mut replicas = missing_evidence("member was not inspected");
+    let mut envelopes: [Option<ValidatedReplicaEnvelope>; 3] = [None, None, None];
+    for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+        let index = usize::from(ordinal - 1);
+        match validate_member_envelope(source, tape_uuid, block_size, layout, ordinal) {
+            Ok(envelope) => {
+                replicas[index] = TerminalReplicaEvidence::ConsistentEnvelope;
+                envelopes[index] = Some(envelope);
+            }
+            Err(failure) => replicas[index] = TerminalReplicaEvidence::Invalid(failure),
+        }
+    }
+
+    LayoutInspection {
+        replicas,
+        envelopes,
+    }
+}
+
+fn validate_member_envelope(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    layout: TerminalTailLayout,
+    ordinal: u16,
+) -> Result<ValidatedReplicaEnvelope, TerminalReplicaFailure> {
+    let component = layout
+        .replica(ordinal)
+        .map_err(|error| failure(TerminalReplicaFailureKind::Missing, error))?;
+    let header_position = PhysicalPositionHint {
+        lba: component.planned_start_lba,
+        partition: layout.partition,
+    };
+    let header_block = read_fixed_block(source, header_position, block_size)
+        .map_err(|error| failure(TerminalReplicaFailureKind::HeaderRead, error))?;
+    let header = parse_tape_index_replica_header(&header_block, tape_uuid)
+        .map_err(|error| failure(TerminalReplicaFailureKind::HeaderInvalid, error))?;
+    if header.plan.replica_ordinal != ordinal
+        || header.plan.component != component
+        || header.plan.edition.descriptor.terminal_layout != layout
+    {
+        return Err(failure(
+            TerminalReplicaFailureKind::HeaderInvalid,
+            format!("header does not describe the discovered layout for replica {ordinal}"),
+        ));
+    }
+
+    let footer_lba = component
+        .planned_start_lba
+        .checked_add(component.record_count.checked_sub(1).ok_or_else(|| {
+            failure(
+                TerminalReplicaFailureKind::FooterRead,
+                "replica record count has no footer",
+            )
+        })?)
+        .ok_or_else(|| {
+            failure(
+                TerminalReplicaFailureKind::FooterRead,
+                "replica footer LBA overflows u64",
+            )
+        })?;
+    let footer_block = read_fixed_block(
+        source,
+        PhysicalPositionHint {
+            lba: footer_lba,
+            partition: layout.partition,
+        },
+        block_size,
+    )
+    .map_err(|error| failure(TerminalReplicaFailureKind::FooterRead, error))?;
+    let footer = parse_tape_index_bootstrap_footer(&footer_block, tape_uuid)
+        .map_err(|error| failure(TerminalReplicaFailureKind::FooterInvalid, error))?;
+    if footer.observed_footer_lba != footer_lba || footer.plan.replica_ordinal != ordinal {
+        return Err(failure(
+            TerminalReplicaFailureKind::FooterInvalid,
+            format!("footer does not bind measured replica {ordinal} position"),
+        ));
+    }
+    validate_tape_index_replica_pair(&header, &footer)
+        .map_err(|error| failure(TerminalReplicaFailureKind::LocalBinding, error))?;
+
+    let filemark_lba = component
+        .planned_start_lba
+        .checked_add(component.record_count)
+        .ok_or_else(|| {
+            failure(
+                TerminalReplicaFailureKind::TrailingFilemark,
+                "replica trailing-filemark LBA overflows u64",
+            )
+        })?;
+    expect_filemark(
+        source,
+        PhysicalPositionHint {
+            lba: filemark_lba,
+            partition: layout.partition,
+        },
+        block_size,
+    )?;
+
+    Ok(ValidatedReplicaEnvelope { header, footer })
+}
+
+fn validate_member_payload<FE, FR>(
+    source: &mut dyn RawTapeSource,
+    block_size: u32,
+    envelope: &ValidatedReplicaEnvelope,
+    visit_entry: &mut FE,
+    visit_row: &mut FR,
+) -> Result<TapeIndexReplicaPayloadSummary, TerminalReplicaFailure>
+where
+    FE: FnMut(&TapeIndexReplicaMapEntry) -> Result<(), TapeIndexReplicaError>,
+    FR: FnMut(&TapeIndexReplicaObjectRow) -> Result<(), TapeIndexReplicaError>,
+{
+    let payload_start = envelope
+        .header
+        .plan
+        .component
+        .planned_start_lba
+        .checked_add(1)
+        .ok_or_else(|| {
+            failure(
+                TerminalReplicaFailureKind::PayloadInvalid,
+                "replica payload start overflows u64",
+            )
+        })?;
+    let mut payload_source = RawReplicaPayloadSource {
+        source,
+        start: PhysicalPositionHint {
+            lba: payload_start,
+            partition: envelope
+                .header
+                .plan
+                .edition
+                .descriptor
+                .terminal_layout
+                .partition,
+        },
+        block_size,
+        record_count: envelope
+            .header
+            .plan
+            .edition
+            .replica_layout
+            .payload_record_count,
+    };
+    let summary = validate_tape_index_replica_payload(
+        &envelope.header,
+        &envelope.footer,
+        &mut payload_source,
+        visit_entry,
+        visit_row,
+    )
+    .map_err(|error| failure(TerminalReplicaFailureKind::PayloadInvalid, error))?;
+    Ok(summary)
+}
+
+struct RawReplicaPayloadSource<'a> {
+    source: &'a mut dyn RawTapeSource,
+    start: PhysicalPositionHint,
+    block_size: u32,
+    record_count: u64,
+}
+
+impl TapeIndexReplicaPayloadBlockSource for RawReplicaPayloadSource<'_> {
+    fn visit_payload_blocks(
+        &mut self,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<(), TapeIndexReplicaError>,
+    ) -> Result<(), TapeIndexReplicaError> {
+        for offset in 0..self.record_count {
+            let lba = self.start.lba.checked_add(offset).ok_or(
+                TapeIndexReplicaError::ArithmeticOverflow {
+                    context: "terminal inventory payload LBA",
+                },
+            )?;
+            let block = read_fixed_block(
+                self.source,
+                PhysicalPositionHint {
+                    lba,
+                    partition: self.start.partition,
+                },
+                self.block_size,
+            )
+            .map_err(|error| TapeIndexReplicaError::Payload {
+                message: error.to_string(),
+            })?;
+            visitor(&block)?;
+        }
+        Ok(())
+    }
+}
+
+fn expect_filemark(
+    source: &mut dyn RawTapeSource,
+    position: PhysicalPositionHint,
+    block_size: u32,
+) -> Result<(), TerminalReplicaFailure> {
+    source
+        .locate_physical(position)
+        .map_err(|error| failure(TerminalReplicaFailureKind::TrailingFilemark, error))?;
+    let mut buffer = vec![
+        0;
+        usize::try_from(block_size).map_err(|_| {
+            failure(
+                TerminalReplicaFailureKind::TrailingFilemark,
+                "block size does not fit usize",
+            )
+        })?
+    ];
+    match source.read_record(&mut buffer) {
+        Ok(RawReadOutcome::Filemark { position_after })
+            if position_after.partition == position.partition
+                && position_after.lba
+                    == position.lba.checked_add(1).ok_or_else(|| {
+                        failure(
+                            TerminalReplicaFailureKind::TrailingFilemark,
+                            "position after filemark overflows u64",
+                        )
+                    })? =>
+        {
+            Ok(())
+        }
+        Ok(outcome) => Err(failure(
+            TerminalReplicaFailureKind::TrailingFilemark,
+            format!(
+                "expected filemark at LBA {}, observed {outcome:?}",
+                position.lba
+            ),
+        )),
+        Err(error) => Err(failure(TerminalReplicaFailureKind::TrailingFilemark, error)),
+    }
+}
+
+fn read_fixed_block(
+    source: &mut dyn RawTapeSource,
+    position: PhysicalPositionHint,
+    block_size: u32,
+) -> Result<Vec<u8>, ParityError> {
+    source.locate_physical(position)?;
+    let expected = usize::try_from(block_size)
+        .map_err(|_| ParityError::Invariant("terminal inventory block size does not fit usize"))?;
+    let mut block = vec![0; expected];
+    match source.read_record(&mut block)? {
+        RawReadOutcome::Block {
+            bytes,
+            position_after,
+        } if bytes == expected
+            && position_after.partition == position.partition
+            && position_after.lba
+                == position.lba.checked_add(1).ok_or(ParityError::Invariant(
+                    "terminal inventory post-read LBA overflows u64",
+                ))? =>
+        {
+            Ok(block)
+        }
+        outcome => Err(ParityError::TapeIndexReplica(format!(
+            "expected {expected}-byte block at partition {} LBA {}, observed {outcome:?}",
+            position.partition, position.lba
+        ))),
+    }
+}
+
+fn missing_evidence(detail: &str) -> [TerminalReplicaEvidence; 3] {
+    std::array::from_fn(|_| {
+        TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+            kind: TerminalReplicaFailureKind::Missing,
+            detail: detail.to_string(),
+        })
+    })
+}
+
+fn failure(
+    kind: TerminalReplicaFailureKind,
+    detail: impl std::fmt::Display,
+) -> TerminalReplicaFailure {
+    TerminalReplicaFailure {
+        kind,
+        detail: detail.to_string(),
+    }
+}
+
+fn source_error(operation: &'static str, error: ParityError) -> TerminalInventoryReadError {
+    TerminalInventoryReadError::Source {
+        operation,
+        message: error.to_string(),
+    }
+}
+
+fn verification_source_error(
+    operation: &'static str,
+    error: ParityError,
+) -> TerminalIndexVerificationError {
+    TerminalIndexVerificationError::Source {
+        operation,
+        message: error.to_string(),
+    }
+}
+
+fn inventory_error_to_verification(
+    error: TerminalInventoryReadError,
+) -> TerminalIndexVerificationError {
+    match error {
+        TerminalInventoryReadError::BlockSize(error) => {
+            TerminalIndexVerificationError::BlockSize(error)
+        }
+        TerminalInventoryReadError::Source { operation, message } => {
+            TerminalIndexVerificationError::Source { operation, message }
+        }
+        TerminalInventoryReadError::SelectedReplica { ordinal, source } => {
+            TerminalIndexVerificationError::Replica {
+                ordinal,
+                failure: TerminalReplicaFailureKind::PayloadInvalid,
+                detail: source.to_string(),
+            }
+        }
+        TerminalInventoryReadError::StreamVisitor { message } => {
+            TerminalIndexVerificationError::Source {
+                operation: "terminal inventory visitor",
+                message,
+            }
+        }
+        TerminalInventoryReadError::TerminalIndexReplicaConflict { count } => {
+            TerminalIndexVerificationError::ConflictingLayouts { count }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tape_index_replica::{
+        checked_tape_index_replica_layout, plan_tape_index_edition, plan_tape_index_replica,
+        write_tape_index_replica, TapeIndexEditionDescriptor, TapeIndexReplicaObservation,
+    };
+    use crate::{
+        TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
+        TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
+    };
+
+    const BLOCK_SIZE: u32 = 256 * 1024;
+    const TAPE_UUID: [u8; 16] = [0x61; 16];
+
+    #[derive(Clone)]
+    struct BotOnlyRows;
+
+    impl TapeIndexReplicaRecordSource for BotOnlyRows {
+        fn visit_structural_entries(
+            &mut self,
+            visitor: &mut dyn FnMut(&TapeIndexReplicaMapEntry) -> Result<(), ParityError>,
+        ) -> Result<(), ParityError> {
+            visitor(&TapeIndexReplicaMapEntry {
+                tape_file_number: 0,
+                kind: TapeIndexReplicaFileKind::Bootstrap,
+                block_count: 1,
+                first_parity_data_ordinal: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                epoch_id: None,
+            })
+        }
+
+        fn visit_object_rows(
+            &mut self,
+            _visitor: &mut dyn FnMut(&TapeIndexReplicaObjectRow) -> Result<(), ParityError>,
+        ) -> Result<(), ParityError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    enum Record {
+        Block(Vec<u8>),
+        Filemark,
+    }
+
+    struct RecordingSource {
+        records: Vec<Record>,
+        cursor: usize,
+        read_lbas: Vec<u64>,
+        eod_calls: u64,
+    }
+
+    impl RecordingSource {
+        fn new(records: Vec<Record>) -> Self {
+            Self {
+                records,
+                cursor: 0,
+                read_lbas: Vec::new(),
+                eod_calls: 0,
+            }
+        }
+    }
+
+    impl RawTapeSource for RecordingSource {
+        fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+            if block_size != BLOCK_SIZE {
+                return Err(ParityError::Invariant("unexpected test block size"));
+            }
+            Ok(())
+        }
+
+        fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            if hint.partition != 0 {
+                return Err(ParityError::Invariant("unexpected test partition"));
+            }
+            self.cursor = usize::try_from(hint.lba)
+                .map_err(|_| ParityError::Invariant("test LBA does not fit usize"))?
+                .min(self.records.len());
+            Ok(())
+        }
+
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.eod_calls = self
+                .eod_calls
+                .checked_add(1)
+                .ok_or(ParityError::Invariant("test EOD call count overflows"))?;
+            self.cursor = self.records.len();
+            Ok(PhysicalPositionHint::new(
+                u64::try_from(self.cursor)
+                    .map_err(|_| ParityError::Invariant("test EOD does not fit u64"))?,
+            ))
+        }
+
+        fn space_filemarks(
+            &mut self,
+            count: i64,
+        ) -> Result<crate::SpaceFilemarksOutcome, ParityError> {
+            let mut spaced = 0i64;
+            if count >= 0 {
+                while self.cursor < self.records.len() && spaced < count {
+                    if matches!(self.records[self.cursor], Record::Filemark) {
+                        spaced += 1;
+                    }
+                    self.cursor += 1;
+                }
+            } else {
+                while self.cursor > 0 && spaced > count {
+                    self.cursor -= 1;
+                    if matches!(self.records[self.cursor], Record::Filemark) {
+                        spaced -= 1;
+                    }
+                }
+            }
+            Ok(crate::SpaceFilemarksOutcome {
+                filemarks_spaced: spaced,
+                position_after: PhysicalPositionHint::new(
+                    u64::try_from(self.cursor)
+                        .map_err(|_| ParityError::Invariant("test cursor does not fit u64"))?,
+                ),
+                hit_end_of_data: spaced != count,
+            })
+        }
+
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            let lba = u64::try_from(self.cursor)
+                .map_err(|_| ParityError::Invariant("test cursor does not fit u64"))?;
+            self.read_lbas.push(lba);
+            let Some(record) = self.records.get(self.cursor) else {
+                return Ok(RawReadOutcome::EndOfData {
+                    position_after: PhysicalPositionHint::new(lba),
+                });
+            };
+            self.cursor = self
+                .cursor
+                .checked_add(1)
+                .ok_or(ParityError::Invariant("test cursor overflows"))?;
+            let position_after = PhysicalPositionHint::new(
+                lba.checked_add(1)
+                    .ok_or(ParityError::Invariant("test post-read LBA overflows"))?,
+            );
+            match record {
+                Record::Block(block) => {
+                    if block.len() != buf.len() {
+                        return Err(ParityError::Invariant("test record has wrong size"));
+                    }
+                    buf.copy_from_slice(block);
+                    Ok(RawReadOutcome::Block {
+                        bytes: block.len(),
+                        position_after,
+                    })
+                }
+                Record::Filemark => Ok(RawReadOutcome::Filemark { position_after }),
+            }
+        }
+
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            Ok(PhysicalPositionHint::new(
+                u64::try_from(self.cursor)
+                    .map_err(|_| ParityError::Invariant("test cursor does not fit u64"))?,
+            ))
+        }
+    }
+
+    struct TripleFixture {
+        records: Vec<Record>,
+        layout: TerminalTailLayout,
+    }
+
+    fn edition_plan(layout: TerminalTailLayout, edition_id: [u8; 16]) -> TapeIndexEditionPlan {
+        let counts = TapeIndexReplicaCounts {
+            structural_entry_count: 1,
+            object_row_count: 0,
+        };
+        let mut rows = BotOnlyRows;
+        plan_tape_index_edition(
+            TapeIndexEditionDescriptor {
+                tape_uuid: TAPE_UUID,
+                edition_id,
+                edition_sequence: 9,
+                scope: TapeIndexReplicaScope {
+                    covered_prefix_tape_file_count: 1,
+                    total_data_ordinals: 0,
+                    highest_protected_ordinal: 0,
+                },
+                counts,
+                block_size: BLOCK_SIZE,
+                compression_enabled: false,
+                writer_version: "terminal-inventory-test".to_string(),
+                write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+                terminal_layout: layout,
+            },
+            &mut rows,
+        )
+        .expect("edition plan")
+    }
+
+    fn triple_fixture() -> TripleFixture {
+        let counts = TapeIndexReplicaCounts {
+            structural_entry_count: 1,
+            object_row_count: 0,
+        };
+        let replica_records = checked_tape_index_replica_layout(BLOCK_SIZE, counts)
+            .expect("replica geometry")
+            .replica_record_count;
+        let layout = TerminalTailLayout::new(0, BLOCK_SIZE, 1, 2, replica_records, 3)
+            .expect("terminal layout");
+        let mut rows = BotOnlyRows;
+        let edition = edition_plan(layout, [0x72; 16]);
+
+        let mut bootstrap = vec![0u8; BLOCK_SIZE as usize];
+        crate::bootstrap::write_bootstrap_block(
+            &crate::BootstrapPayload {
+                scheme: None,
+                no_parity_flag: true,
+                filemark_map_digest: None,
+                tape_uuid: TAPE_UUID,
+                written_by_version: "terminal-inventory-test".to_string(),
+                written_at: "2026-08-09T00:00:00Z".to_string(),
+                sequence: 0,
+                block_size_bytes: BLOCK_SIZE,
+                drive_compression: false,
+            },
+            &mut bootstrap,
+        )
+        .expect("BOT bootstrap bytes");
+        let mut files = vec![vec![bootstrap]];
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            let plan = plan_tape_index_replica(edition.clone(), ordinal).expect("replica plan");
+            let mut blocks = Vec::new();
+            write_tape_index_replica(
+                &plan,
+                TapeIndexReplicaObservation {
+                    tape_file_number: plan.component.planned_tape_file_number,
+                    start_lba: plan.component.planned_start_lba,
+                    record_count: plan.component.record_count,
+                },
+                &mut rows,
+                |block| {
+                    blocks.push(block.to_vec());
+                    Ok(())
+                },
+            )
+            .expect("replica bytes");
+            files.push(blocks);
+            if ordinal != TERMINAL_INDEX_REPLICA_COUNT {
+                let gap_ordinal = ordinal;
+                let gap_plan = crate::plan_index_separation(crate::IndexSeparationDescriptor {
+                    tape_uuid: TAPE_UUID,
+                    edition_id: edition.descriptor.edition_id,
+                    gap_ordinal,
+                    block_size: BLOCK_SIZE,
+                    nominal_extent_bytes: u64::from(BLOCK_SIZE) * 3,
+                    total_records: 3,
+                    compression_enabled: false,
+                    terminal_layout: layout,
+                })
+                .expect("separation plan");
+                let mut gap_blocks = Vec::new();
+                crate::write_index_separation(
+                    &gap_plan,
+                    crate::IndexSeparationObservation {
+                        tape_file_number: gap_plan.component.planned_tape_file_number,
+                        start_lba: gap_plan.component.planned_start_lba,
+                        record_count: gap_plan.component.record_count,
+                    },
+                    |block| {
+                        gap_blocks.push(block.to_vec());
+                        Ok(())
+                    },
+                )
+                .expect("separation bytes");
+                files.push(gap_blocks);
+            }
+        }
+        let mut records = Vec::new();
+        for file in files {
+            records.extend(file.into_iter().map(Record::Block));
+            records.push(Record::Filemark);
+        }
+        assert_eq!(
+            u64::try_from(records.len()).expect("fixture length"),
+            layout.expected_eod_lba
+        );
+        TripleFixture { records, layout }
+    }
+
+    fn bot_bootstrap() -> Vec<u8> {
+        let mut block = vec![0u8; BLOCK_SIZE as usize];
+        crate::bootstrap::write_bootstrap_block(
+            &crate::BootstrapPayload {
+                scheme: None,
+                no_parity_flag: true,
+                filemark_map_digest: None,
+                tape_uuid: TAPE_UUID,
+                written_by_version: "terminal-recovery-test".to_string(),
+                written_at: "2026-08-09T00:00:00Z".to_string(),
+                sequence: 0,
+                block_size_bytes: BLOCK_SIZE,
+                drive_compression: false,
+            },
+            &mut block,
+        )
+        .expect("BOT recovery bootstrap bytes");
+        block
+    }
+
+    fn corrupt_replica_payload(fixture: &mut TripleFixture, ordinal: u16) {
+        let component = fixture.layout.replica(ordinal).expect("replica component");
+        let payload_lba = component
+            .planned_start_lba
+            .checked_add(1)
+            .expect("payload LBA");
+        let Record::Block(block) =
+            &mut fixture.records[usize::try_from(payload_lba).expect("payload index")]
+        else {
+            panic!("payload record must be a block")
+        };
+        block[5] ^= 0x80;
+    }
+
+    fn corrupt_separation_interior(fixture: &mut TripleFixture, ordinal: u16) {
+        let component = fixture
+            .layout
+            .separation(ordinal)
+            .expect("separation component");
+        let interior_lba = component
+            .planned_start_lba
+            .checked_add(1)
+            .expect("separation interior LBA");
+        let Record::Block(block) =
+            &mut fixture.records[usize::try_from(interior_lba).expect("interior index")]
+        else {
+            panic!("separation interior must be a block")
+        };
+        block[BLOCK_SIZE as usize - 1] = 0x7F;
+    }
+
+    fn replace_replica_edition(fixture: &mut TripleFixture, ordinal: u16, edition_id: [u8; 16]) {
+        let mut rows = BotOnlyRows;
+        let plan = plan_tape_index_replica(edition_plan(fixture.layout, edition_id), ordinal)
+            .expect("replacement replica plan");
+        let mut blocks = Vec::new();
+        write_tape_index_replica(
+            &plan,
+            TapeIndexReplicaObservation {
+                tape_file_number: plan.component.planned_tape_file_number,
+                start_lba: plan.component.planned_start_lba,
+                record_count: plan.component.record_count,
+            },
+            &mut rows,
+            |block| {
+                blocks.push(block.to_vec());
+                Ok(())
+            },
+        )
+        .expect("replacement replica bytes");
+        for (offset, block) in blocks.into_iter().enumerate() {
+            let lba = plan
+                .component
+                .planned_start_lba
+                .checked_add(u64::try_from(offset).expect("replacement offset"))
+                .expect("replacement LBA");
+            fixture.records[usize::try_from(lba).expect("replacement index")] =
+                Record::Block(block);
+        }
+    }
+
+    #[test]
+    fn healthy_summary_inventory_reads_c_once_and_never_reads_the_prefix() {
+        let fixture = triple_fixture();
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("healthy inventory");
+        let TerminalInventoryOutcome::Inventory(selection) = outcome else {
+            panic!("healthy triple must return inventory")
+        };
+        assert_eq!(selection.selected_replica_ordinal, 3);
+        assert!(!selection.is_degraded());
+        assert_eq!(source.eod_calls, 1);
+        assert!(source.read_lbas.iter().all(|lba| *lba >= 2));
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            let payload_lba = fixture
+                .layout
+                .replica(ordinal)
+                .expect("replica")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("payload LBA");
+            assert_eq!(
+                source
+                    .read_lbas
+                    .iter()
+                    .filter(|lba| **lba == payload_lba)
+                    .count(),
+                usize::from(ordinal == TERMINAL_INDEX_REPLICA_COUNT),
+                "healthy fast inventory must stream exactly one body, replica C"
+            );
+        }
+    }
+
+    #[test]
+    fn full_verify_walks_prefix_and_validates_three_replicas_and_two_gaps() {
+        let fixture = triple_fixture();
+        let expected_eod = fixture.layout.expected_eod_lba;
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("complete physical verification");
+        let TerminalIndexVerificationOutcome::VerifiedComplete(verification) = outcome else {
+            panic!("healthy physical tape must verify complete")
+        };
+
+        assert_eq!(verification.measured_eod.lba, expected_eod);
+        assert_eq!(verification.verified_prefix_tape_file_count, 1);
+        assert_eq!(verification.verified_prefix_record_count, 1);
+        assert_eq!(verification.measured_tape_file_count, 6);
+        assert!(verification.separations.iter().all(|evidence| matches!(
+            evidence,
+            TerminalSeparationEvidence::Valid {
+                interior_record_count: 1
+            }
+        )));
+        assert!(verification
+            .replicas
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]));
+        assert!(source.read_lbas.contains(&0), "full verify must walk BOT");
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            let payload_lba = fixture
+                .layout
+                .replica(ordinal)
+                .expect("replica")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("payload LBA");
+            assert!(
+                source.read_lbas.contains(&payload_lba),
+                "full verify must stream replica {ordinal}"
+            );
+        }
+        for ordinal in 1..=crate::TERMINAL_INDEX_SEPARATION_COUNT {
+            let interior_lba = fixture
+                .layout
+                .separation(ordinal)
+                .expect("separation")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("interior LBA");
+            assert!(
+                source.read_lbas.contains(&interior_lba),
+                "full verify must read gap {ordinal} interior"
+            );
+        }
+    }
+
+    #[test]
+    fn full_verify_reports_one_corrupt_replica_as_verified_degraded() {
+        let mut fixture = triple_fixture();
+        corrupt_replica_payload(&mut fixture, 1);
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("physical integrity damage is a typed outcome");
+        let TerminalIndexVerificationOutcome::VerifiedDegraded(verification) = outcome else {
+            panic!("one corrupt redundant replica must verify degraded")
+        };
+        assert!(matches!(
+            verification.replicas[0],
+            TerminalReplicaEvidence::Invalid(_)
+        ));
+        assert!(verification.replicas[1..]
+            .iter()
+            .all(|evidence| matches!(evidence, TerminalReplicaEvidence::Valid { .. })));
+    }
+
+    #[test]
+    fn full_verify_reports_nonzero_separation_interior_as_degraded() {
+        let mut fixture = triple_fixture();
+        corrupt_separation_interior(&mut fixture, 2);
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("separation damage is a typed outcome");
+        assert!(matches!(
+            outcome,
+            TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
+                if matches!(verification.separations[1], TerminalSeparationEvidence::Invalid { .. })
+        ));
+    }
+
+    #[test]
+    fn full_verify_rejects_physical_data_after_planned_eod() {
+        let mut fixture = triple_fixture();
+        fixture
+            .records
+            .push(Record::Block(vec![0xEE; BLOCK_SIZE as usize]));
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("untrusted tail returns typed recovery evidence");
+        assert!(matches!(
+            outcome,
+            TerminalIndexVerificationOutcome::RecoveryRequired(_)
+        ));
+    }
+
+    #[test]
+    fn full_verify_all_invalid_runs_bot_recovery_with_measured_eod() {
+        let mut fixture = triple_fixture();
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            corrupt_replica_payload(&mut fixture, ordinal);
+        }
+        let expected_eod = fixture.layout.expected_eod_lba;
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("semantic damage must return typed recovery evidence");
+        let TerminalIndexVerificationOutcome::RecoveryRequired(recovery) = outcome else {
+            panic!("no canonical survivor must require structural recovery")
+        };
+
+        assert_eq!(recovery.measured_eod.lba, expected_eod);
+        assert!(recovery.bot_recovery.structural_entry_count > 0);
+        assert!(recovery
+            .replicas
+            .iter()
+            .all(|evidence| matches!(evidence, TerminalReplicaEvidence::Invalid(_))));
+        assert!(
+            source.read_lbas.contains(&0),
+            "recovery must perform a BOT walk"
+        );
+    }
+
+    #[test]
+    fn bot_recovery_classifies_recovered_unknown_and_preserves_torn_control() {
+        let terminal = triple_fixture();
+        let replica_a_start = terminal
+            .layout
+            .replica(1)
+            .expect("replica A")
+            .planned_start_lba;
+        let torn_control =
+            terminal.records[usize::try_from(replica_a_start).expect("replica A index")].clone();
+        let bootstrap = bot_bootstrap();
+        let records = vec![
+            Record::Block(bootstrap),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Block(vec![0x11; BLOCK_SIZE as usize]),
+            Record::Filemark,
+            Record::Block(vec![0x20; BLOCK_SIZE as usize]),
+            Record::Filemark,
+            torn_control,
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut objects = Vec::new();
+        let summary =
+            recover_terminal_inventory_from_bot(&mut source, &TAPE_UUID, BLOCK_SIZE, |object| {
+                objects.push(object.clone());
+                Ok(())
+            })
+            .expect("BOT recovery");
+
+        assert_eq!(summary.structural_entry_count, 3);
+        assert_eq!(summary.complete_object_count, 2);
+        assert_eq!(summary.recovered_object_count, 0);
+        assert_eq!(summary.unknown_object_count, 2);
+        assert_eq!(summary.incomplete_object_count, 0);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].state, BotRecoveredObjectState::Unknown);
+        assert!(objects[0].object_id.is_none());
+        assert_eq!(objects[1].state, BotRecoveredObjectState::Unknown);
+        assert!(objects.iter().all(|object| object.tape_file_number < 3));
+    }
+
+    #[test]
+    fn bot_recovery_emits_torn_object_as_incomplete() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0xA7; BLOCK_SIZE as usize]),
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut objects = Vec::new();
+        let summary =
+            recover_terminal_inventory_from_bot(&mut source, &TAPE_UUID, BLOCK_SIZE, |object| {
+                objects.push(object.clone());
+                Ok(())
+            })
+            .expect("BOT recovery with torn Object");
+        assert_eq!(summary.complete_object_count, 0);
+        assert_eq!(summary.incomplete_object_count, 1);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].tape_file_number, 1);
+        assert_eq!(objects[0].state, BotRecoveredObjectState::Incomplete);
+        assert_eq!(objects[0].stored_block_count, 0);
+    }
+
+    #[test]
+    fn bot_recovery_rejects_a_readable_bootstrap_from_another_tape_identity() {
+        let records = vec![Record::Block(bot_bootstrap()), Record::Filemark];
+        let mut source = RecordingSource::new(records);
+        let error =
+            recover_terminal_inventory_from_bot(&mut source, &[0x99; 16], BLOCK_SIZE, |_| Ok(()))
+                .expect_err("a readable foreign BOT Bootstrap must fence recovery");
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::TapeIdentityMismatch
+        ));
+    }
+
+    #[test]
+    fn invalid_c_falls_back_to_b_with_typed_degraded_evidence() {
+        let mut fixture = triple_fixture();
+        corrupt_replica_payload(&mut fixture, 3);
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("fallback inventory");
+        let TerminalInventoryOutcome::Inventory(selection) = outcome else {
+            panic!("B must survive")
+        };
+        assert_eq!(selection.selected_replica_ordinal, 2);
+        assert!(selection.is_degraded());
+        assert!(matches!(
+            &selection.replicas[2],
+            TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::PayloadInvalid,
+                ..
+            })
+        ));
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            let payload_lba = fixture
+                .layout
+                .replica(ordinal)
+                .expect("replica")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("payload LBA");
+            assert_eq!(
+                source
+                    .read_lbas
+                    .iter()
+                    .filter(|lba| **lba == payload_lba)
+                    .count(),
+                usize::from(ordinal >= 2),
+                "fallback must try C then B exactly once and never stream A"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_fallback_rejects_c_and_commits_b_attempt_without_body_replay() {
+        let mut fixture = triple_fixture();
+        corrupt_replica_payload(&mut fixture, 3);
+        let mut source = RecordingSource::new(fixture.records);
+        let mut events = Vec::new();
+        let outcome =
+            read_terminal_index_inventory_streamed(&mut source, &TAPE_UUID, BLOCK_SIZE, |event| {
+                events.push(event);
+                Ok(())
+            })
+            .expect("streamed fallback inventory");
+        let TerminalInventoryOutcome::Inventory(selection) = outcome else {
+            panic!("B must survive")
+        };
+
+        assert_eq!(selection.selected_replica_ordinal, 2);
+        assert_eq!(selection.selected_attempt_id, 2);
+        assert!(matches!(
+            events.first(),
+            Some(TerminalInventoryStreamEvent::ReplicaAttemptStarted {
+                attempt_id: 1,
+                replica_ordinal: 3,
+            })
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalInventoryStreamEvent::ReplicaAttemptRejected {
+                attempt_id: 1,
+                replica_ordinal: 3,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TerminalInventoryStreamEvent::StructuralEntry {
+                attempt_id: 2,
+                replica_ordinal: 2,
+                ..
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            TerminalInventoryStreamEvent::ReplicaAttemptStarted {
+                replica_ordinal: 1,
+                ..
+            }
+        )));
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            let payload_lba = fixture
+                .layout
+                .replica(ordinal)
+                .expect("replica")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("payload LBA");
+            assert_eq!(
+                source
+                    .read_lbas
+                    .iter()
+                    .filter(|lba| **lba == payload_lba)
+                    .count(),
+                usize::from(ordinal >= 2),
+                "streamed fallback must read C and B once and never read A"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_c_and_b_fall_back_to_a() {
+        let mut fixture = triple_fixture();
+        corrupt_replica_payload(&mut fixture, 3);
+        corrupt_replica_payload(&mut fixture, 2);
+        let mut source = RecordingSource::new(fixture.records);
+        let outcome = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("A fallback inventory");
+        let TerminalInventoryOutcome::Inventory(selection) = outcome else {
+            panic!("A must survive")
+        };
+        assert_eq!(selection.selected_replica_ordinal, 1);
+        assert!(selection.is_degraded());
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            let payload_lba = fixture
+                .layout
+                .replica(ordinal)
+                .expect("replica")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("payload LBA");
+            assert_eq!(
+                source
+                    .read_lbas
+                    .iter()
+                    .filter(|lba| **lba == payload_lba)
+                    .count(),
+                1,
+                "fallback must try C, B, and A exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_payload_valid_survivors_fail_without_selecting_newer() {
+        let mut fixture = triple_fixture();
+        replace_replica_edition(&mut fixture, 2, [0x99; 16]);
+        let mut source = RecordingSource::new(fixture.records);
+        let error = read_terminal_index_inventory(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect_err("two payload-valid editions must fail closed");
+        assert!(matches!(
+            error,
+            TerminalInventoryReadError::TerminalIndexReplicaConflict { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn fast_inventory_rejects_cross_layout_survivors_before_selecting_one() {
+        let mut fixture = triple_fixture();
+        let primary_b = fixture.layout.replica(2).expect("primary B component");
+        let primary_c = fixture.layout.replica(3).expect("primary C component");
+        let replica_records = primary_c.record_count;
+        let primary_separation_records = fixture
+            .layout
+            .separation(1)
+            .expect("primary AB component")
+            .record_count;
+        let alternate_separation_records = replica_records
+            .checked_add(
+                primary_separation_records
+                    .checked_mul(2)
+                    .expect("doubled hostile separation count"),
+            )
+            .and_then(|records| records.checked_add(2))
+            .expect("hostile separation count");
+        let alternate_first_start = fixture
+            .layout
+            .replica(1)
+            .expect("primary A")
+            .planned_start_lba;
+        let alternate_layout = TerminalTailLayout::new(
+            0,
+            BLOCK_SIZE,
+            1,
+            alternate_first_start,
+            replica_records,
+            alternate_separation_records,
+        )
+        .expect("alternate hostile layout");
+        assert_eq!(
+            alternate_layout
+                .replica(2)
+                .expect("alternate B")
+                .planned_start_lba,
+            primary_c.planned_start_lba,
+            "alternate B must occupy the same physical LBA as primary C"
+        );
+        assert!(alternate_layout.expected_eod_lba > fixture.layout.expected_eod_lba);
+
+        let mut rows = BotOnlyRows;
+        let alternate_plan = plan_tape_index_replica(edition_plan(alternate_layout, [0x99; 16]), 2)
+            .expect("alternate B plan");
+        let mut alternate_blocks = Vec::new();
+        write_tape_index_replica(
+            &alternate_plan,
+            TapeIndexReplicaObservation {
+                tape_file_number: alternate_plan.component.planned_tape_file_number,
+                start_lba: alternate_plan.component.planned_start_lba,
+                record_count: alternate_plan.component.record_count,
+            },
+            &mut rows,
+            |block| {
+                alternate_blocks.push(block.to_vec());
+                Ok(())
+            },
+        )
+        .expect("encode alternate B survivor");
+        for (offset, block) in alternate_blocks.into_iter().enumerate() {
+            let lba = primary_c
+                .planned_start_lba
+                .checked_add(u64::try_from(offset).expect("alternate offset"))
+                .expect("alternate block LBA");
+            fixture.records[usize::try_from(lba).expect("alternate block index")] =
+                Record::Block(block);
+        }
+
+        let primary_b_payload_lba = primary_b
+            .planned_start_lba
+            .checked_add(1)
+            .expect("primary B payload LBA");
+        let alternate_b_payload_lba = primary_c
+            .planned_start_lba
+            .checked_add(1)
+            .expect("alternate B payload LBA");
+        let mut source = RecordingSource::new(fixture.records);
+        let error = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect_err("two physically discovered survivor layouts must fail closed");
+        assert!(matches!(
+            error,
+            TerminalInventoryReadError::TerminalIndexReplicaConflict { count: 2 }
+        ));
+        assert!(source.read_lbas.contains(&primary_b_payload_lba));
+        assert!(source.read_lbas.contains(&alternate_b_payload_lba));
+    }
+
+    #[test]
+    fn fast_inventory_accepts_4096_byte_hints_for_legacy_media() {
+        struct EmptyLegacySource {
+            configured: Option<u32>,
+        }
+
+        impl RawTapeSource for EmptyLegacySource {
+            fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+                self.configured = Some(block_size);
+                Ok(())
+            }
+
+            fn locate_physical(&mut self, _hint: PhysicalPositionHint) -> Result<(), ParityError> {
+                Ok(())
+            }
+
+            fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                Ok(PhysicalPositionHint::new(0))
+            }
+
+            fn space_filemarks(
+                &mut self,
+                _count: i64,
+            ) -> Result<crate::SpaceFilemarksOutcome, ParityError> {
+                Ok(crate::SpaceFilemarksOutcome {
+                    filemarks_spaced: 0,
+                    position_after: PhysicalPositionHint::new(0),
+                    hit_end_of_data: true,
+                })
+            }
+
+            fn read_record(&mut self, _buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+                Ok(RawReadOutcome::EndOfData {
+                    position_after: PhysicalPositionHint::new(0),
+                })
+            }
+
+            fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+                Ok(PhysicalPositionHint::new(0))
+            }
+        }
+
+        let mut source = EmptyLegacySource { configured: None };
+        let outcome = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, 4096)
+            .expect("4096-byte legacy hint must reach media discovery");
+        assert_eq!(source.configured, Some(4096));
+        assert!(matches!(
+            outcome,
+            TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery)
+                if recovery.reason == BotStructuralRecoveryReason::NoUsableTerminalLayout
+        ));
+    }
+
+    #[test]
+    fn all_invalid_requires_bot_recovery_instead_of_empty_inventory() {
+        let mut fixture = triple_fixture();
+        for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
+            corrupt_replica_payload(&mut fixture, ordinal);
+        }
+        let mut source = RecordingSource::new(fixture.records);
+        let mut visited = false;
+        let outcome = read_terminal_index_inventory(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |_| {
+                visited = true;
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .expect("typed recovery outcome");
+        let TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) = outcome else {
+            panic!("all invalid members cannot return inventory")
+        };
+        assert_eq!(
+            recovery.reason,
+            BotStructuralRecoveryReason::AllMembersInvalid
+        );
+        assert!(!visited);
+        assert!(recovery
+            .replicas
+            .iter()
+            .all(|evidence| matches!(evidence, TerminalReplicaEvidence::Invalid(_))));
+    }
+
+    #[test]
+    fn absent_terminal_footer_requires_bot_recovery_after_bounded_tail_probe() {
+        let records = vec![
+            Record::Block(vec![0xA5; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let outcome = read_terminal_index_inventory(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect("typed recovery outcome");
+        let TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) = outcome else {
+            panic!("missing terminal footer cannot return inventory")
+        };
+        assert_eq!(
+            recovery.reason,
+            BotStructuralRecoveryReason::NoUsableTerminalLayout
+        );
+        assert!(source.read_lbas.len() <= TERMINAL_TAIL_COMPONENT_COUNT);
+    }
+}

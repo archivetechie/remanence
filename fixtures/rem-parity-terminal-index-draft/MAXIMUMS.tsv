@@ -1,0 +1,4 @@
+vector	artifact	block_size	encoded_len	bytes	sha256	writer_version_len	write_timestamp_len
+maximum-plaintext-row	plaintext-row.slot	262144	164	256	97e4bff60ea6e7ead33f83903210050e132014294a7a764bcb56b4aa73e5c1d8	0	0
+maximum-encrypted-row	encrypted-row.slot	262144	247	256	6e64d8ee65e9aadebb3f1af7a7a7338e127a5a598900c95dea215a372ed77d75	0	0
+maximum-one-block-footer	bootstrap-footer.bin	262144	0	262144	a949536c39814b2091cb740d6582901354d03e24c4f4688c00ea638d2848196b	128	64

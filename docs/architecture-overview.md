@@ -256,22 +256,21 @@ unimplemented, unlike the read side below. A WRITTEN response
 is advisory and locator-free; callers retain the source until
 `CheckpointSession` returns the committed copy set, and re-send every object
 that was not reported CHECKPOINTED after any session, stream, or daemon loss.
-Each barrier closes the open parity epoch when present and writes a non-final
-checkpoint bootstrap on tape with the authenticated filemark-map prefix and
-every committed REM-OBJECT object row,
-then drains deferred drive errors with synchronous `WRITE FILEMARKS(0)` and
-captures `READ POSITION`. The daemon fsyncs that EOD and the replayable batch
-projection to its per-tape checkpoint journal before one SQLite transaction.
-For parity tapes, that checkpoint journal and the Layer 3c tape-file journal
-jointly form the required resume authority. Recovery first discards Layer 3c
-bundles beyond its last durable checkpoint watermark, then compares the
-complete checkpointed histories — tape-file entries, object identities, parity
-watermarks, and terminal EOD — before any append-positioning `LOCATE` or write.
-A missing, differently advanced, or conflicting checkpointed history fails
-closed instead of choosing one; only matching histories permit `LOCATE` to the
-recorded EOD and overwrite of a later physical tail. SQLite is replayed from
-the checkpoint journal and is not commit authority; the on-tape bootstrap is
-the tape-alone recovery copy.
+No intermediate index is written. Finalization closes the open parity epoch,
+emits one final ParityMap when sidecar metadata exists, fixes one immutable
+snapshot of that complete pre-A prefix, and emits replica A, separation AB, replica B,
+separation BC, and replica C, with a filemark and persistence barrier after
+each component. The daemon durably records each proved boundary before
+advancing.
+
+For parity tapes, the checkpoint journal and Layer 3c tape-file journal jointly
+form the required open-prefix and terminal-progress authority. The first
+durable finalization transition permanently disables Object admission. A
+failure enters `RecoveryRequired`, where only missing terminal control
+components may be repaired at proved positions; there is no path back to Open
+and no second terminal triple. SQLite is a replayable projection. On a
+finalized cartridge the three terminal replicas, selected C then B then A with
+agreement required between survivors, provide catalog-less tape authority.
 
 <!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
 ## The read path

@@ -1,60 +1,77 @@
 # On-tape layout reference
 
-What a Remanence-written cartridge physically contains, as the code writes
-it today. Byte-level detail lives in the published specifications —
+What a Remanence-written cartridge physically contains. Byte-level detail for
+the stable formats lives in the published specifications —
 [REM-OBJECT Core](../specs/publication/rem-object-core-1-specification.md),
 [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md), and
-[REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md) — this
-page is the orientation layer above them.
+[REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md). The
+terminal triple index described below is the experimental draft.4 replacement;
+its candidate byte tables are in the
+[in-progress byte draft](../specs/in-progress/supporting/rem-parity-terminal-index-byte-draft.md).
+It is not part of the unchanged publication baseline.
 
 The design goal behind all of it: a tape must be readable with no access
 to Remanence's host state. Everything the catalog knows is either written
 to the tape itself or rebuildable from journals; the SQLite index is a
 cache, never the truth.
 
-<!-- code-anchor: crates/remanence-parity/src/filemark_map.rs crates/remanence-parity/src/sink.rs crates/remanence-parity/src/bootstrap.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-parity/src/terminal_tail.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/index_separation.rs -->
 ## Tape files and filemarks
 
 A cartridge is a sequence of tape files separated by filemarks, written in
-fixed-size blocks. Four kinds of tape file exist (their codes are stable
-on tape): `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), and
-`ParityMap` (3).
+fixed-size records. Six structural kinds are emitted by the replacement draft:
+`Object` (0), `ParitySidecar` (1), `Bootstrap` (2), `ParityMap` (3),
+`TapeIndexReplica` (4), and `IndexSeparationExtent` (5).
+Structural file numbers, block counts,
+ordinals, sequences, and positions are carried as `u64`; the closed block-size
+profile remains 256 KiB, 512 KiB, and 1 MiB.
 
-- **Bootstrap** blocks are the tape's self-description. Copy 0 always sits
-  at LBA 0 — the beginning of tape — and further copies are spread down
-  the tape at roughly 5% capacity intervals. A bootstrap records the tape
-  UUID, the fixed block size, the parity scheme, a digest of the filemark
-  map, a sequence number, and the writer version. Because the block size
-  is in the bootstrap, a reader never needs MODE SENSE state to start; a
-  scan just probes the candidate block sizes (256 KiB, 512 KiB, 1 MiB) at
-  BOT. Copy 0 doubles as Remanence's volume label, the role a VOL1
-  record or the LTFS volume label plays elsewhere: identity and read
-  parameters, first thing on the tape. Unlike those labels it is not
-  written once and left behind — the copies repeating down the tape are
-  checkpoints of what has been written so far, so the label grows into a
-  recovery index over the tape's life. Checkpoint and final bootstraps
-  also carry a directory of REM-OBJECT-bound recovery rows: each row
-  binds a stored object's tape-file number to its verbatim REM-OBJECT
-  `object_id` and representation-specific recovery anchors (plaintext:
-  manifest LBA, size, and SHA-256; encrypted: recipient epoch IDs and
-  frame lengths), letting a reader locate and re-verify an individual
-  object without the SQLite catalog — the basis of `rem-debug tape
-  recovery-report`.
+- **Bootstrap** at tape file 0 is the volume label and geometry root: tape UUID,
+  fixed block size, and parity profile. It is Object-count independent and
+  contains no Object recovery rows, including on a no-parity tape. Host
+  checkpoint operations do not emit a Bootstrap. The terminal design does not write
+  intermediate bootstrap indexes and does not append a singular final
+  bootstrap.
 - **Object** tape files contain only body-format blocks (a stored REM-OBJECT
   object). The parity layer owns every filemark; body formats cannot emit
   them.
 - **Parity sidecar** tape files carry the Reed-Solomon parity shards and
   index for the data written since the last sidecar.
-- **Parity map** tape files are a directory of sidecar epochs, written
-  when the map no longer fits inline in the bootstrap.
+- **ParityMap** is emitted once during final parity closeout when the sidecar
+  directory is nonempty. It appears immediately before A and is covered as a
+  structural row in every terminal replica; it is not terminal inventory
+  authority and is never written at an intermediate checkpoint.
+- **Tape-index replicas** are three complete, payload-equivalent final
+  inventories. Each is one header record, streamed fixed-slot structural and
+  Object-recovery rows, and its own one-record `BootstrapFooter`, followed by
+  one filemark. The footer points backward to that replica's header. It has a
+  fixed 1024-byte meaningful frame and carries no per-Object data.
+- **Index-separation extents** are two typed control files between the three
+  replicas. Each default extent occupies `ceil(1 GiB / block_size)` records,
+  including its header and footer, then one filemark. Its interior is zero only
+  because the write session has already verified hardware compression is off.
 
-![Tape file sequence on one cartridge: bootstrap copy 0 at LBA 0, object tape files and parity sidecars separated by filemarks, bootstrap copies repeating down the tape](assets/tape-file-sequence.svg)
+The terminal suffix is exact:
 
-*Fig. 1 — One cartridge in tape-motion order: bootstrap copy 0 at LBA 0, object and parity-sidecar tape files separated by parity-layer filemarks, and bootstrap copies repeating at roughly 5% capacity intervals.*
+```text
+... final parity closeout
+TapeIndexReplica A       + filemark
+IndexSeparationExtent AB + filemark
+TapeIndexReplica B       + filemark
+IndexSeparationExtent BC + filemark
+TapeIndexReplica C       + filemark
+EOD
+```
 
-The only fixed literal on tape is the bootstrap magic, the 8 bytes
-`52 45 4D 00 42 4F 4F 01` (`REM\0BOO\x01`). Sidecar, sidecar-footer, and
-parity-map magics are derived per tape as the first 8 bytes of an
+All three payloads describe the complete prefix before A. Headers and footers
+differ where ordinal and position require it. The shared `edition_digest`
+binds the canonical inventory, while `layout_digest` binds the planned ordered
+five-file tail. Planned future components do not prove that they were written.
+
+The BOT Bootstrap keeps the fixed literal magic
+`52 45 4D 00 42 4F 4F 01` (`REM\0BOO\x01`). Sidecar, sidecar-footer,
+ParityMap, terminal replica, and separation role magics are
+derived per tape as the first 8 bytes of an
 HMAC-SHA-256 keyed by the tape UUID, so blocks from one tape cannot
 masquerade as another's. All parity-layer structures carry CRC-64/XZ
 checksums.
@@ -78,14 +95,12 @@ Parity-protected writes require LTO hardware compression disabled on the
 drive; compression would decouple logical block counts from physical
 media, and the stripe geometry is physical.
 
-Checkpoint barriers close the current epoch even when it is short. On a
-parity pool, a batch-of-one workload therefore pays for one short-epoch
-sidecar (up to `m` parity shards per populated stripe), one checkpoint
-edition block, and their filemarks for every object. Its directory grows at
-roughly two rows per object and reaches the inline ceiling about twice as
-soon as a well-batched workload. Heavy sync callers should batch; admission
-reserves worst-case directory and stop headroom, so reaching the ceiling
-seals and rolls placement at a checkpoint instead of failing an open batch.
+Durability barriers may close the current epoch even when it is short. A
+batch-of-one workload therefore pays for more short-epoch sidecars than a
+well-batched workload. Before an Object moves, admission includes the complete
+Object commit and the exact terminal reserve: parity closeout, three replica
+charges, two gap charges, and safety allowance. Each header, footer, record,
+and filemark is charged once.
 
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ f643f8c2 -->
 ## The stored object: rem-object-v1
@@ -162,7 +177,35 @@ new recipient set. CLI open/read/verify paths and standalone `rem-recover`
 select a slot using the REMP private key's epoch id; see the [CLI
 reference](reference-cli.md#rem-recover-standalone-recovery).
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
+## Finalization and catalog-less recovery
+
+Finalization becomes irreversible before replica A moves. The durable
+five-component progress states are `BeforeReplicaA`, `AfterReplicaA`,
+`AfterSeparationAb`, `AfterReplicaB`, `AfterSeparationBc`, and
+`AfterReplicaC`. The convenient completed-replica count (0, 1, 2, or 3) is a
+projection, not authority: a crash after a complete gap must not cause that
+gap to be duplicated. Ordinary `sealed` state requires `AfterReplicaC` plus
+the final journal and catalog projection order. A barrier-proved A or A+B is
+already a complete inventory but remains a typed degraded/resumable outcome.
+No finalizing state permits another Object.
+
+Healthy inventory reads BOT identity, positions to EOD, and validates C
+without walking an Object. If C is missing or invalid it tries B, then A, and
+reports degraded redundancy. Surviving replicas must agree on tape, edition,
+scope, counts, canonical payload/map digests, block/compression facts, writer
+facts, and the planned layout. If none survives, the truthful fallback is a
+structural scan from BOT; missing terminal authority is never an empty
+inventory. Full verification is a separate operation that walks the measured
+prefix and checks every surviving replica and both separation extents.
+
+The catalog inventory RPC is server-streamed. It emits the complete structural
+map and Object recovery rows from each attempted member under a bounded
+`attempt_id`; those rows are provisional until the final summary selects that
+attempt. A rejected attempt is named explicitly before fallback continues.
+Consumers therefore commit only the selected attempt, while the drive reads
+each attempted capsule body once and remains backpressured by the receiver.
+
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs -->
 ## Tape identity
 
 A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
@@ -200,8 +243,10 @@ the [configuration reference](reference-configuration.md)):
   configured cache directory.
 
 For parity tapes, the tape-file journal and checkpoint journal are both
-required resume authority. Replay first discards Layer 3c bundles beyond its
-last checkpoint watermark; before positioning for append, Remanence requires
-the remaining complete checkpointed histories to agree. A missing,
-differently advanced, or conflicting checkpointed history fails closed.
-SQLite and the per-tape catalog caches are projections, not commit authority.
+required authority. Replay first discards Layer 3c bundles beyond its last
+checkpoint watermark; before append or terminal continuation, Remanence
+requires the remaining complete histories to agree on the prefix and physical
+tail. During finalization they also carry the exact planned layout and the
+barrier-proved five-component progress. A missing, differently advanced, or
+conflicting history fails closed. SQLite and per-tape catalog caches remain
+projections, not commit authority.

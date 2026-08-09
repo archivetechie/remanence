@@ -161,6 +161,12 @@ pub trait RawTapeSource {
     /// Locate to a physical block-address hint.
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError>;
 
+    /// Position at physical end-of-data without walking tape files.
+    ///
+    /// Every adapter must implement the operation explicitly so a newly added
+    /// source cannot silently make fast terminal inventory unavailable.
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError>;
+
     /// Space forward or backward over filemarks.
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError>;
 
@@ -245,8 +251,8 @@ impl ImageDirectoryRawSource {
         let mut tape_files = Vec::with_capacity(numbered.len());
         let mut candidate_block_sizes = Vec::new();
         for (expected, (number, path)) in numbered.into_iter().enumerate() {
-            let expected = u32::try_from(expected)
-                .map_err(|_| image_source_error("image tape-file count exceeds u32::MAX"))?;
+            let expected = u64::try_from(expected)
+                .map_err(|_| image_source_error("image tape-file count exceeds u64::MAX"))?;
             if number != expected {
                 return Err(image_source_error(format!(
                     "image tape-file numbering is not dense: expected {expected}, found {number}"
@@ -336,7 +342,7 @@ impl ImageDirectoryRawSource {
     /// without rewriting or regenerating the pinned artifact bytes.
     pub fn mark_unreadable(
         &mut self,
-        tape_file_number: u32,
+        tape_file_number: u64,
         block_within_file: u64,
     ) -> Result<(), ParityError> {
         let tape_file_index = usize::try_from(tape_file_number)
@@ -409,23 +415,38 @@ impl RawTapeSource for ImageDirectoryRawSource {
         Ok(())
     }
 
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.cursor = self.records.len();
+        Ok(PhysicalPositionHint::new(
+            u64::try_from(self.cursor)
+                .map_err(|_| image_source_error("image EOD position exceeds u64::MAX"))?,
+        ))
+    }
+
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
-        if count < 0 {
-            return Err(image_source_error(
-                "image source supports forward filemark spacing only",
-            ));
-        }
         let mut spaced = 0i64;
-        while self.cursor < self.records.len() && spaced < count {
-            if self.records[self.cursor] == ImageRecord::Filemark {
-                spaced += 1;
+        if count >= 0 {
+            while self.cursor < self.records.len() && spaced < count {
+                if self.records[self.cursor] == ImageRecord::Filemark {
+                    spaced += 1;
+                }
+                self.cursor += 1;
             }
-            self.cursor += 1;
+        } else {
+            while self.cursor > 0 && spaced > count {
+                self.cursor -= 1;
+                if self.records[self.cursor] == ImageRecord::Filemark {
+                    spaced -= 1;
+                }
+            }
         }
         Ok(SpaceFilemarksOutcome {
             filemarks_spaced: spaced,
-            position_after: PhysicalPositionHint::new(self.cursor as u64),
-            hit_end_of_data: spaced < count,
+            position_after: PhysicalPositionHint::new(
+                u64::try_from(self.cursor)
+                    .map_err(|_| image_source_error("image filemark position exceeds u64::MAX"))?,
+            ),
+            hit_end_of_data: spaced != count,
         })
     }
 
@@ -489,7 +510,7 @@ impl RawTapeSource for ImageDirectoryRawSource {
     }
 }
 
-fn image_tape_file_number(name: &std::ffi::OsStr) -> Option<u32> {
+fn image_tape_file_number(name: &std::ffi::OsStr) -> Option<u64> {
     let name = name.to_str()?;
     let remainder = name.strip_prefix("tape-file-")?;
     let (number, suffix) = remainder.split_once('-')?;
@@ -517,6 +538,18 @@ fn image_source_error(message: impl Into<String>) -> ParityError {
 /// string-only `ParityError` variants; Layer 5 relies on the transport variant
 /// to observe the dirty-bit / rescan-required signal.
 pub trait RawTapeSink {
+    /// Locate to a proved component start before overwriting a torn terminal
+    /// control tail.
+    ///
+    /// The default rejects repositioning so append-only and legacy adapters
+    /// cannot accidentally advertise rewritable-media repair. Production
+    /// adapters for rewritable drives override this operation.
+    fn locate_for_overwrite(&mut self, _hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        Err(ParityError::Invariant(
+            "raw tape sink does not support proved-start overwrite",
+        ))
+    }
+
     /// Append one fixed-size tape block at the current physical position.
     ///
     /// The caller must pass exactly the fixed block size configured for the
@@ -619,6 +652,15 @@ impl RawTapeSource for BlockSourceRawTapeSource<'_> {
         let position = self.inner.locate(hint.lba)?;
         self.cursor_hint = position.into();
         Ok(())
+    }
+
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.cursor_hint = self
+            .inner
+            .space(0, SpaceKind::EndOfData)?
+            .position_after
+            .into();
+        Ok(self.cursor_hint)
     }
 
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
@@ -761,6 +803,19 @@ impl<'a> DriveHandleRawSink<'a> {
 }
 
 impl RawTapeSink for DriveHandleRawSink<'_> {
+    fn locate_for_overwrite(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        let observed: PhysicalPositionHint = self.drive.locate(hint.lba)?.into();
+        if observed.partition != hint.partition || observed.lba != hint.lba {
+            self.cursor_hint = Some(observed);
+            return Err(ParityError::SessionOpen(format!(
+                "overwrite locate returned partition {} lba {}, expected partition {} lba {}",
+                observed.partition, observed.lba, hint.partition, hint.lba
+            )));
+        }
+        self.cursor_hint = Some(observed);
+        Ok(())
+    }
+
     fn write_fixed_block(&mut self, buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
         let position_before = self.current_or_seed_position()?;
         let outcome = match self.drive.write_block_unpositioned(buf) {
@@ -858,6 +913,16 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
         Ok(())
     }
 
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        let position_after: PhysicalPositionHint = self
+            .drive
+            .space(0, SpaceKind::EndOfData)?
+            .position_after
+            .into();
+        self.cursor_hint = Some(position_after);
+        Ok(position_after)
+    }
+
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
         let outcome = self.drive.space(count, SpaceKind::Filemarks)?;
         let position_after = outcome.position_after.into();
@@ -935,6 +1000,10 @@ enum RawReadBoundary {
 }
 
 fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
+    if matches!(err, TapeIoError::FilemarkEncountered) {
+        return Some(RawReadBoundary::Filemark);
+    }
+
     #[cfg(target_os = "linux")]
     {
         let TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
@@ -988,6 +1057,58 @@ mod compat_tests {
     };
 
     type TestTransportFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>>;
+
+    #[test]
+    fn image_tape_file_number_parser_preserves_full_u64_domain() {
+        for number in [u64::from(u32::MAX) + 1, (1_u64 << 53) + 1, u64::MAX] {
+            let name = format!("tape-file-{number}-object.bin");
+            assert_eq!(
+                image_tape_file_number(std::ffi::OsStr::new(&name)),
+                Some(number)
+            );
+        }
+        assert_eq!(
+            image_tape_file_number(std::ffi::OsStr::new(
+                "tape-file-18446744073709551616-object.bin"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn image_fault_injection_does_not_narrow_tape_file_number() {
+        let mut source = ImageDirectoryRawSource::from_tape_files(vec![vec![0; 4]], 4)
+            .expect("construct image source");
+        let number = u64::from(u32::MAX) + 1;
+        let error = source
+            .mark_unreadable(number, 0)
+            .expect_err("out-of-image u64 tape-file number must fail");
+        assert!(error.to_string().contains(&number.to_string()), "{error}");
+    }
+
+    #[test]
+    fn image_source_models_eod_and_backward_filemark_positioning() {
+        let mut source =
+            ImageDirectoryRawSource::from_tape_files(vec![vec![0x11; 4], vec![0x22; 4]], 4)
+                .expect("construct image source");
+        source
+            .configure_fixed_block_size(4)
+            .expect("configure image source");
+        assert_eq!(
+            source.locate_end_of_data().expect("locate EOD"),
+            PhysicalPositionHint::new(4)
+        );
+        let last = source
+            .space_filemarks(-1)
+            .expect("backspace final filemark");
+        assert_eq!(last.filemarks_spaced, -1);
+        assert_eq!(last.position_after, PhysicalPositionHint::new(3));
+        let previous = source
+            .space_filemarks(-1)
+            .expect("backspace previous filemark");
+        assert_eq!(previous.filemarks_spaced, -1);
+        assert_eq!(previous.position_after, PhysicalPositionHint::new(1));
+    }
 
     struct ShortFirstWriteTransport {
         inner: FixtureTransport,
@@ -1743,6 +1864,14 @@ mod tests {
         let err = check_condition(fixed_sense(0x80, 0x00, 0x01));
         assert_eq!(
             classify_read_boundary(&err),
+            Some(RawReadBoundary::Filemark)
+        );
+    }
+
+    #[test]
+    fn classify_structured_filemark_boundary() {
+        assert_eq!(
+            classify_read_boundary(&TapeIoError::FilemarkEncountered),
             Some(RawReadBoundary::Filemark)
         );
     }

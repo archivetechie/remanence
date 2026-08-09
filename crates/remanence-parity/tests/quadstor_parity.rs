@@ -63,18 +63,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use remanence_library::{
     BlockRead, BlockSink, DriveHandle, StaticAllowlist, TapeConfig, TapeIoError,
 };
-use remanence_parity::bootstrap::{parse_bootstrap_block, write_bootstrap_block};
 use remanence_parity::{
-    emit_resume_rebuilt_sidecars_to_raw as emit_resume_sidecars_journaled,
-    plan_resume_append_from_journal, rebuild_open_epoch_from_committed_prefix,
-    scan_reconstruct_filemark_map, BootstrapPayload, CapacityReserveInput, CommittedBundle,
-    CommittedBundleKind, CommittedState, DriveHandleRawSink, DriveHandleRawSource,
-    FileTapeFileJournal, FilemarkMap, JournalError, ObjectParitySource, OpenTrust, ParityError,
-    ParityScheme, ParitySchemeRecord, ParitySink, PhysicalPositionHint, RawReadOutcome,
-    RawTapeSink, RawTapeSource, ResumeWriterSeed, SchemeId, ScopedFilemarkMap,
-    SidecarEpochDirectoryEntry, SpaceFilemarksOutcome, TapeFileJournal, TapeFileKind,
-    TapeFileMapEntry, TapeFilePosition, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
-    SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+    checked_bounded_resume_summary, emit_resume_rebuilt_sidecars_to_raw,
+    rebuild_open_epoch_from_bounded_summary, scan_reconstruct_filemark_map,
+    BoundedResumeWriterSeed, CommittedBundle, CommittedBundleKind, CommittedState,
+    DriveHandleRawSink, DriveHandleRawSource, FileTapeFileJournal, FilemarkMap, JournalError,
+    ObjectParitySource, OpenTrust, ParityError, ParityScheme, ParitySink, PhysicalPositionHint,
+    RawReadOutcome, RawTapeSource, SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome,
+    TapeFileJournal, TapeFileKind, TapeFilePosition, TerminalTripleCloseInput,
+    DEFAULT_INDEX_SEPARATION_BYTES, DEFAULT_SCHEME_BLOCK_SIZE_BYTES,
 };
 
 const TAPE_UUID: [u8; 16] = [
@@ -122,27 +119,6 @@ impl TapeFileJournal for FixtureJournal {
 
 fn fixture_journal() -> &'static mut FixtureJournal {
     Box::leak(Box::new(FixtureJournal::default()))
-}
-
-fn emit_resume_sidecars_with_fixture_journal<F>(
-    sink: &mut dyn RawTapeSink,
-    plan: remanence_parity::ResumeAppendPlan,
-    rebuilt_sidecars: &[remanence_parity::ResumeRebuiltSidecar],
-    expected_tape_uuid: [u8; 16],
-    commit_sidecar: F,
-) -> Result<remanence_parity::ResumeAppendResult, ParityError>
-where
-    F: FnMut(&remanence_parity::SidecarTapeFile) -> Result<(), ParityError>,
-{
-    let mut journal = FixtureJournal::default();
-    emit_resume_sidecars_journaled(
-        sink,
-        &mut journal,
-        plan,
-        rebuilt_sidecars,
-        expected_tape_uuid,
-        commit_sidecar,
-    )
 }
 
 fn drive_path() -> Option<PathBuf> {
@@ -316,33 +292,53 @@ fn smoke_scheme() -> ParityScheme {
     }
 }
 
-fn capacity_input_for_object(
+fn capacity_input(
     block_size: u32,
-    projected_object_blocks: u64,
-    current_epoch_fill_blocks: u64,
-) -> CapacityReserveInput {
-    CapacityReserveInput {
-        projected_object_blocks,
-        block_size_bytes: u64::from(block_size),
-        current_epoch_fill_blocks,
+    sidecar_entries_before_object: u64,
+    structural_entries_before_object: u64,
+    object_rows_before_object: u64,
+) -> TerminalTripleCloseInput {
+    TerminalTripleCloseInput {
+        projected_object_present: true,
+        projected_object_blocks: 2,
+        block_size_bytes: block_size,
+        current_epoch_fill_blocks: 0,
         data_shards_per_epoch: 2,
         parity_shards_per_epoch: 1,
-        sidecar_index_block_count: 1,
+        pending_completed_sidecars: 0,
+        sidecar_entries_before_object,
+        structural_entries_before_object,
+        object_rows_before_object,
         object_filemark_blocks: 1,
         sidecar_filemark_blocks: 1,
-        bootstrap_filemark_blocks: 1,
-        pending_completed_sidecars: 0,
-        remaining_bootstrap_count: 1,
+        parity_map_filemark_blocks: 1,
+        replica_filemark_blocks: 1,
+        gap_filemark_blocks: 1,
+        gap_nominal_bytes: DEFAULT_INDEX_SEPARATION_BYTES,
         safety_margin_blocks: 8,
-        remaining_tape_blocks: 10_000,
-        empty_tape_usable_blocks: 10_000,
+        remaining_tape_blocks: 1_000_000,
+        capacity_basis_blocks: 1_000_000,
+        low_watermark_blocks: 0,
+        high_watermark_blocks: 1,
         pending_completed_epoch_parity_bytes: 0,
-        remaining_spool_bytes: u64::from(block_size) * 16,
+        remaining_spool_bytes: u64::MAX,
     }
 }
 
-fn capacity_input(block_size: u32) -> CapacityReserveInput {
-    capacity_input_for_object(block_size, 2, 0)
+fn begin_two_block_object(
+    sink: &mut ParitySink<'_>,
+    block_size: u32,
+    sidecars: u64,
+    structural: u64,
+    objects: u64,
+) {
+    let reservation = capacity_input(block_size, sidecars, structural, objects)
+        .reserve_object()
+        .expect("terminal-triple Object reservation");
+    let (tape_file_number, _) = sink
+        .begin_object_with_terminal_triple_reservation(reservation)
+        .expect("begin reserved Object");
+    assert_eq!(tape_file_number, structural);
 }
 
 fn block(seed: u8, block_size: u32) -> Vec<u8> {
@@ -357,167 +353,6 @@ fn block(seed: u8, block_size: u32) -> Vec<u8> {
         }
     }
     out
-}
-
-fn bootstrap_block_for_map(
-    map: &FilemarkMap,
-    scheme: &ParityScheme,
-    block_size: u32,
-    sequence: u32,
-    is_final_map: bool,
-) -> Vec<u8> {
-    let payload = BootstrapPayload {
-        scheme: Some(ParitySchemeRecord {
-            id: scheme.id.as_str().to_string(),
-            data_blocks_per_stripe: scheme.data_blocks_per_stripe,
-            parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
-            stripes_per_neighborhood: scheme.stripes_per_neighborhood,
-            no_parity_flag: false,
-        }),
-        no_parity_flag: false,
-        filemark_map_digest: Some(map.digest(is_final_map).expect("map digest builds")),
-        tape_uuid: TAPE_UUID,
-        written_by_version: env!("CARGO_PKG_VERSION").to_string(),
-        written_at: String::new(),
-        sequence,
-        block_size_bytes: block_size,
-        drive_compression: false,
-        sidecar_epoch_directory: None,
-        parity_map_reference: None,
-        object_rows: Vec::new(),
-    };
-    let mut out = vec![0u8; block_size as usize];
-    write_bootstrap_block(&payload, &mut out).expect("bootstrap block encodes");
-    out
-}
-
-fn write_raw_block(sink: &mut dyn RawTapeSink, block: &[u8], label: &str) {
-    let outcome = sink
-        .write_fixed_block(block)
-        .unwrap_or_else(|err| panic!("{label}: {err}"));
-    assert!(
-        !outcome.end_of_medium(),
-        "{label}: unexpected end-of-medium on Quadstor scratch tape"
-    );
-}
-
-fn write_raw_filemark(sink: &mut dyn RawTapeSink, label: &str) {
-    let outcome = sink
-        .write_filemarks(1, false)
-        .unwrap_or_else(|err| panic!("{label}: {err}"));
-    assert!(
-        !outcome.end_of_medium(),
-        "{label}: unexpected end-of-medium on Quadstor scratch tape"
-    );
-}
-
-fn write_object_only_prefix(
-    sink: &mut dyn RawTapeSink,
-    scheme: &ParityScheme,
-    block_size: u32,
-    object_blocks: &[Vec<u8>],
-) -> FilemarkMap {
-    let bot_prefix =
-        FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("BOT map validates");
-    let committed_prefix = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(
-            1,
-            u64::try_from(object_blocks.len()).expect("object block count fits u64"),
-            0,
-        ),
-    ])
-    .expect("object-only prefix validates");
-
-    let bootstrap = bootstrap_block_for_map(&bot_prefix, scheme, block_size, 0, false);
-    write_raw_block(sink, &bootstrap, "write BOT bootstrap block");
-    write_raw_filemark(sink, "write BOT bootstrap filemark");
-    for (index, block) in object_blocks.iter().enumerate() {
-        assert_eq!(
-            block.len(),
-            block_size as usize,
-            "object-only prefix block {index} length mismatch"
-        );
-        write_raw_block(
-            sink,
-            block,
-            &format!("write object-only prefix block {index}"),
-        );
-    }
-    write_raw_filemark(sink, "write object-only prefix filemark");
-
-    committed_prefix
-}
-
-fn final_bootstrap_scope(
-    source: &mut dyn RawTapeSource,
-    map: &FilemarkMap,
-    block_size: u32,
-) -> ScopedFilemarkMap {
-    let final_entry = map.entries().last().expect("map has final bootstrap");
-    assert_eq!(final_entry.kind, TapeFileKind::Bootstrap);
-    let final_position = map
-        .physical_position(TapeFilePosition {
-            tape_file_number: final_entry.tape_file_number,
-            block_within_file: 0,
-        })
-        .expect("final bootstrap position resolves");
-    source
-        .locate_physical(final_position)
-        .expect("locate final bootstrap");
-    let mut buf = vec![0u8; block_size as usize];
-    match source
-        .read_record(&mut buf)
-        .expect("read final bootstrap block")
-    {
-        RawReadOutcome::Block { bytes, .. } => {
-            assert_eq!(bytes, block_size as usize);
-        }
-        other => panic!("expected final bootstrap block, got {other:?}"),
-    }
-    let payload = parse_bootstrap_block(&buf).expect("final bootstrap parses");
-    let digest = payload
-        .filemark_map_digest
-        .as_ref()
-        .expect("final bootstrap carries filemark-map digest");
-    assert!(digest.is_final_map);
-    ScopedFilemarkMap::validate_against_digest(map.clone(), digest)
-        .expect("final bootstrap validates scanned map")
-}
-
-fn bootstrap_count(map: &FilemarkMap) -> u32 {
-    u32::try_from(
-        map.entries()
-            .iter()
-            .filter(|entry| entry.kind == TapeFileKind::Bootstrap)
-            .count(),
-    )
-    .expect("bootstrap count fits u32")
-}
-
-fn committed_prefix_sidecar_directory_entries(
-    map: &FilemarkMap,
-) -> Vec<SidecarEpochDirectoryEntry> {
-    map.entries()
-        .iter()
-        .filter(|entry| entry.kind == TapeFileKind::ParitySidecar)
-        .map(|entry| SidecarEpochDirectoryEntry {
-            tape_file_number: entry.tape_file_number,
-            epoch_id: entry.epoch_id.expect("test sidecar has epoch id"),
-            protected_ordinal_start: entry
-                .protected_ordinal_start
-                .expect("test sidecar has start ordinal"),
-            protected_ordinal_end_exclusive: entry
-                .protected_ordinal_end_exclusive
-                .expect("test sidecar has end ordinal"),
-            sidecar_total_block_count: entry.block_count,
-            sidecar_header_block_count: 1,
-            parity_shard_block_count: 1,
-            canonical_metadata_hash: [entry.tape_file_number as u8; 32],
-            flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
-                | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
-        })
-        .collect()
 }
 
 fn assert_map_kinds(map: &FilemarkMap, expected: &[TapeFileKind]) {
@@ -544,7 +379,7 @@ fn read_object_blocks(
         TAPE_UUID,
         scoped,
         block_size,
-        tape_file_number,
+        u64::from(tape_file_number),
         OpenTrust::RequireValidated,
     )
     .expect("open hardware object source");
@@ -584,6 +419,10 @@ impl RawTapeSource for InjectReadFaultOnce<'_> {
 
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         self.inner.locate_physical(hint)
+    }
+
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.locate_end_of_data()
     }
 
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
@@ -662,12 +501,7 @@ fn quadstor_parity_roundtrip() {
         )
         .expect("construct hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-        assert_eq!(
-            sink.begin_object_with_capacity_reserve(capacity_input(block_size))
-                .expect("object reserve")
-                .0,
-            1
-        );
+        begin_two_block_object(&mut sink, block_size, 0, 1, 0);
         sink.write_block(&first_block)
             .expect("write object block 0");
         sink.write_block(&second_block)
@@ -676,7 +510,7 @@ fn quadstor_parity_roundtrip() {
         assert_eq!(object.tape_file_number, 1);
         assert_eq!(object.sidecars_emitted.len(), 1);
         assert_eq!(object.sidecars_emitted[0].tape_file_number, 2);
-        sink.finish().expect("finish final bootstrap");
+        sink.finish().expect("finish parity session");
     }
 
     drive.rewind().expect("rewind before verification read");
@@ -690,15 +524,12 @@ fn quadstor_parity_roundtrip() {
                 TapeFileKind::Bootstrap,
                 TapeFileKind::Object,
                 TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
             ],
         );
         assert_eq!(scanned.total_data_ordinals(), 2);
         assert_eq!(scanned.max_sidecar_end_exclusive(), 2);
 
-        let scoped = final_bootstrap_scope(&mut raw_source, &scanned, block_size);
-        assert_eq!(scoped.validated_prefix_tape_files, None);
-        assert_eq!(scoped.scope.watermark(), 2);
+        let scoped = ScopedFilemarkMap::from_catalog(scanned.clone(), 2);
         read_object_blocks(
             &mut raw_source,
             scheme,
@@ -769,12 +600,7 @@ fn quadstor_parity_journaled_session() {
             )
             .expect("construct journaled hardware parity sink");
             assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-            assert_eq!(
-                sink.begin_object_with_capacity_reserve(capacity_input(block_size))
-                    .expect("object reserve")
-                    .0,
-                1
-            );
+            begin_two_block_object(&mut sink, block_size, 0, 1, 0);
             sink.write_block(&first_block)
                 .expect("write journaled object block 0");
             sink.write_block(&second_block)
@@ -784,7 +610,7 @@ fn quadstor_parity_journaled_session() {
             assert_eq!(object.sidecars_emitted.len(), 1);
             assert_eq!(object.sidecars_emitted[0].tape_file_number, 2);
             let checkpoint = sink.checkpoint().expect("checkpoint journaled session");
-            assert_eq!(checkpoint.bootstrap_tape_file_number, 3);
+            assert_eq!(checkpoint.next_tape_file_number, 3);
         }
 
         let state = journal
@@ -799,16 +625,18 @@ fn quadstor_parity_journaled_session() {
                 TapeFileKind::Bootstrap,
                 TapeFileKind::Object,
                 TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
             ],
         );
     }
 
     let reopened = FileTapeFileJournal::open(&journal_path, TAPE_UUID, block_size, scheme.clone())
-        .expect("reopen journal for resume planning");
-    let plan = plan_resume_append_from_journal(&reopened, &scheme)
-        .expect("plan resume append from journal");
-    assert_eq!(plan.append_after_tape_file_number, 3);
+        .expect("reopen journal for bounded resume planning");
+    let snapshot = reopened
+        .committed_snapshot_bounded()
+        .expect("freeze bounded journal checkpoint");
+    let summary =
+        checked_bounded_resume_summary(&snapshot).expect("summarize bounded journal checkpoint");
+    assert_eq!(summary.last_committed_tape_file_number, Some(2));
 
     drive.rewind().expect("rewind after journaled smoke");
     drive
@@ -866,12 +694,7 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
         )
         .expect("construct hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-        assert_eq!(
-            sink.begin_object_with_capacity_reserve(capacity_input(block_size))
-                .expect("object reserve")
-                .0,
-            1
-        );
+        begin_two_block_object(&mut sink, block_size, 0, 1, 0);
         sink.write_block(&first_block)
             .expect("write object block 0");
         sink.write_block(&second_block)
@@ -880,7 +703,7 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
         assert_eq!(object.tape_file_number, 1);
         assert_eq!(object.sidecars_emitted.len(), 1);
         assert_eq!(object.sidecars_emitted[0].tape_file_number, 2);
-        sink.finish().expect("finish final bootstrap");
+        sink.finish().expect("finish parity session");
     }
 
     drive.rewind().expect("rewind before recovery scan");
@@ -894,7 +717,6 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
                 TapeFileKind::Bootstrap,
                 TapeFileKind::Object,
                 TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
             ],
         );
         assert_eq!(scanned.total_data_ordinals(), 2);
@@ -910,9 +732,7 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
 
     {
         let mut drive_source = DriveHandleRawSource::new(&mut drive);
-        let scoped = final_bootstrap_scope(&mut drive_source, &scanned, block_size);
-        assert_eq!(scoped.validated_prefix_tape_files, None);
-        assert_eq!(scoped.scope.watermark(), 2);
+        let scoped = ScopedFilemarkMap::from_catalog(scanned.clone(), 2);
         let mut faulting_source = InjectReadFaultOnce::new(&mut drive_source, fault_position);
         read_object_blocks(
             &mut faulting_source,
@@ -936,371 +756,121 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
 
 #[test]
 #[ignore]
-fn quadstor_parity_resume_append_roundtrip() {
+fn quadstor_parity_bounded_resume_append_roundtrip() {
     let Some(path) = skip_if_no_hardware() else {
         return;
     };
     if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_parity_resume_append_roundtrip: skipping — \
-             REM_QUADSTOR_PARITY_WRITE_LOOP not set to 1. This test writes \
-             and appends on the loaded cartridge; only enable on a scratch tape."
-        );
+        eprintln!("quadstor_parity_bounded_resume_append_roundtrip: destructive gate is disabled");
         return;
     }
 
     let block_size = block_size();
     let scheme = smoke_scheme();
-    let first_object = [block(0x31, block_size), block(0x32, block_size)];
-    let second_object = [block(0x41, block_size), block(0x42, block_size)];
+    let journal_path = journal_path("bounded-resume");
+    let _ = std::fs::remove_file(&journal_path);
     let (library, bay_address) = resolve_library_drive_for_path(&path);
-    eprintln!(
-        "quadstor_parity_resume_append_roundtrip: selected library {} bay 0x{bay_address:04x} at {path:?}",
-        library.serial
-    );
-
     let mut policy = StaticAllowlist::new([library.serial.clone()]);
     if allow_derived_drive_identity() {
         policy = policy.with_derived_allowed(library.serial.clone());
     }
     let mut handle = library
         .open(&policy)
-        .expect("open selected Quadstor library for state-changing append smoke");
+        .expect("open library for bounded resume smoke");
     let mut drive = handle
         .open_drive(bay_address, &policy)
-        .expect("open selected Quadstor drive");
-    let original_config = configure_parity_write_session(&mut drive, block_size, "append smoke");
-    drive.rewind().expect("rewind before destructive write");
+        .expect("open drive for bounded resume smoke");
+    let original_config =
+        configure_parity_write_session(&mut drive, block_size, "bounded resume smoke");
+    drive.rewind().expect("rewind before bounded resume write");
 
+    let mut journal =
+        FileTapeFileJournal::open(&journal_path, TAPE_UUID, block_size, scheme.clone())
+            .expect("open bounded resume journal");
     {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
         let mut sink = ParitySink::new_with_journal(
             &mut raw_sink,
-            fixture_journal(),
+            &mut journal,
             scheme.clone(),
             TAPE_UUID,
             block_size,
         )
-        .expect("construct first-session hardware parity sink");
-        assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
-        assert_eq!(
-            sink.begin_object_with_capacity_reserve(capacity_input(block_size))
-                .expect("first object reserve")
-                .0,
-            1
-        );
-        for block in &first_object {
-            sink.write_block(block).expect("write first-session block");
-        }
-        let object = sink.finish_object().expect("finish first object");
-        assert_eq!(object.tape_file_number, 1);
-        assert_eq!(object.sidecars_emitted.len(), 1);
-        assert_eq!(object.sidecars_emitted[0].tape_file_number, 2);
-        sink.finish().expect("finish first final bootstrap");
+        .expect("construct initial bounded-resume sink");
+        assert_eq!(sink.write_bootstrap().expect("write sole BOT Bootstrap"), 0);
+        begin_two_block_object(&mut sink, block_size, 0, 1, 0);
+        sink.write_block(&block(0x81, block_size))
+            .expect("write first prefix block");
+        sink.write_block(&block(0x82, block_size))
+            .expect("write second prefix block");
+        sink.finish_object()
+            .expect("commit first Object and sidecar");
+        sink.checkpoint().expect("checkpoint first bounded prefix");
     }
 
-    drive.rewind().expect("rewind before first-session scan");
-    let first_map = {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        let scanned = scan_reconstruct_filemark_map(&mut raw_source, &TAPE_UUID, block_size)
-            .expect("catalog-less scan reconstructs first-session map");
-        assert_map_kinds(
-            &scanned,
-            &[
-                TapeFileKind::Bootstrap,
-                TapeFileKind::Object,
-                TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
-            ],
-        );
-        assert_eq!(scanned.total_data_ordinals(), 2);
-        assert_eq!(scanned.max_sidecar_end_exclusive(), 2);
-        let scoped = final_bootstrap_scope(&mut raw_source, &scanned, block_size);
-        assert_eq!(scoped.validated_prefix_tape_files, None);
-        assert_eq!(scoped.scope.watermark(), 2);
-        scanned
-    };
+    let snapshot = journal
+        .committed_snapshot_bounded()
+        .expect("freeze bounded prefix");
+    let summary = checked_bounded_resume_summary(&snapshot).expect("validate bounded summary");
+    assert_eq!(summary.committed_tape_file_count, 3);
+    assert!(summary.open_epoch_object_extents.is_empty());
 
-    let resume = {
+    let rebuild = {
         let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        rebuild_open_epoch_from_committed_prefix(
+        rebuild_open_epoch_from_bounded_summary(
             &mut raw_source,
-            &first_map,
+            &summary,
             &scheme,
             TAPE_UUID,
             block_size,
         )
-        .expect("resume positions to committed final-bootstrap append point")
+        .expect("rebuild bounded open epoch")
     };
-    assert!(resume.rebuilt_sidecars.is_empty());
-    assert!(resume.live_epoch.is_none());
-    assert_eq!(resume.plan.append_after_tape_file_number, 3);
-    assert_eq!(
-        resume.plan.append_position,
-        first_map
-            .append_position_after_prefix()
-            .expect("first map append position")
-    );
-    let resume_result = resume
-        .plan
-        .clone()
-        .complete(Vec::new())
-        .expect("no sidecars are emitted for a clean finalized prefix");
-
-    {
-        let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        let mut sink = ParitySink::new_sidecar_only_from_resume(
-            &mut raw_sink,
-            fixture_journal(),
-            scheme.clone(),
-            TAPE_UUID,
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &first_map,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&first_map),
-                committed_prefix_object_rows: Vec::new(),
-                resume_result: &resume_result,
-                live_epoch: resume.live_epoch,
-                next_bootstrap_sequence: bootstrap_count(&first_map),
-            },
-        )
-        .expect("construct resumed parity sink at catalog append point");
-        assert_eq!(
-            sink.begin_object_with_capacity_reserve(capacity_input(block_size))
-                .expect("second object reserve")
-                .0,
-            4
-        );
-        for block in &second_object {
-            sink.write_block(block).expect("write resumed object block");
-        }
-        let object = sink.finish_object().expect("finish resumed object");
-        assert_eq!(object.tape_file_number, 4);
-        assert_eq!(object.sidecars_emitted.len(), 1);
-        assert_eq!(object.sidecars_emitted[0].tape_file_number, 5);
-        sink.finish().expect("finish appended final bootstrap");
-    }
-
-    drive.rewind().expect("rewind before appended verification");
-    {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        let scanned = scan_reconstruct_filemark_map(&mut raw_source, &TAPE_UUID, block_size)
-            .expect("catalog-less scan reconstructs appended hardware map");
-        assert_map_kinds(
-            &scanned,
-            &[
-                TapeFileKind::Bootstrap,
-                TapeFileKind::Object,
-                TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
-                TapeFileKind::Object,
-                TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
-            ],
-        );
-        assert_eq!(scanned.total_data_ordinals(), 4);
-        assert_eq!(scanned.max_sidecar_end_exclusive(), 4);
-
-        let scoped = final_bootstrap_scope(&mut raw_source, &scanned, block_size);
-        assert_eq!(scoped.validated_prefix_tape_files, None);
-        assert_eq!(scoped.scope.watermark(), 4);
-        read_object_blocks(
-            &mut raw_source,
-            scheme.clone(),
-            scoped.clone(),
-            block_size,
-            1,
-            &first_object,
-        );
-        read_object_blocks(
-            &mut raw_source,
-            scheme,
-            scoped,
-            block_size,
-            4,
-            &second_object,
-        );
-    }
-
-    drive.rewind().expect("rewind after append verification");
-    drive
-        .write_config(original_config)
-        .expect("restore original tape config after append smoke");
-}
-
-#[test]
-#[ignore]
-fn quadstor_parity_resume_rebuilds_open_epoch_then_appends() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_parity_resume_rebuilds_open_epoch_then_appends: skipping — \
-             REM_QUADSTOR_PARITY_WRITE_LOOP not set to 1. This test writes \
-             and appends on the loaded cartridge; only enable on a scratch tape."
-        );
-        return;
-    }
-
-    let block_size = block_size();
-    let scheme = smoke_scheme();
-    let prefix_object = [
-        block(0x61, block_size),
-        block(0x62, block_size),
-        block(0x63, block_size),
-    ];
-    let continued_object = [block(0x64, block_size)];
-    let (library, bay_address) = resolve_library_drive_for_path(&path);
-    eprintln!(
-        "quadstor_parity_resume_rebuilds_open_epoch_then_appends: selected library {} bay 0x{bay_address:04x} at {path:?}",
-        library.serial
-    );
-
-    let mut policy = StaticAllowlist::new([library.serial.clone()]);
-    if allow_derived_drive_identity() {
-        policy = policy.with_derived_allowed(library.serial.clone());
-    }
-    let mut handle = library
-        .open(&policy)
-        .expect("open selected Quadstor library for W<T resume smoke");
-    let mut drive = handle
-        .open_drive(bay_address, &policy)
-        .expect("open selected Quadstor drive");
-    let original_config =
-        configure_parity_write_session(&mut drive, block_size, "W<T resume smoke");
-    drive
-        .rewind()
-        .expect("rewind before destructive object-only prefix write");
-
-    let committed_prefix = {
-        let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        write_object_only_prefix(&mut raw_sink, &scheme, block_size, &prefix_object)
-    };
-
-    drive
-        .rewind()
-        .expect("rewind before object-only prefix scan");
-    {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        let scanned = scan_reconstruct_filemark_map(&mut raw_source, &TAPE_UUID, block_size)
-            .expect("catalog-less scan reconstructs object-only prefix");
-        assert_eq!(scanned, committed_prefix);
-        assert_map_kinds(&scanned, &[TapeFileKind::Bootstrap, TapeFileKind::Object]);
-        assert_eq!(scanned.total_data_ordinals(), 3);
-        assert_eq!(scanned.max_sidecar_end_exclusive(), 0);
-    }
-
-    let resume = {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        rebuild_open_epoch_from_committed_prefix(
-            &mut raw_source,
-            &committed_prefix,
-            &scheme,
-            TAPE_UUID,
-            block_size,
-        )
-        .expect("resume rereads W<T object blocks and positions to append point")
-    };
-    assert_eq!(resume.plan.append_after_tape_file_number, 1);
-    assert_eq!(
-        resume.plan.append_position,
-        committed_prefix
-            .append_position_after_prefix()
-            .expect("object-only prefix append position")
-    );
-    assert_eq!(resume.plan.highest_protected_ordinal_before_rebuild, 0);
-    assert_eq!(resume.plan.highest_protected_ordinal_after_rebuild, 2);
-    assert_eq!(resume.plan.live_epoch_start, 2);
-    assert_eq!(resume.plan.next_data_ordinal, 3);
-    assert_eq!(resume.rebuilt_sidecars.len(), 1);
-    let live_epoch = resume.live_epoch.clone().expect("one shard remains live");
-    assert_eq!(live_epoch.protected_ordinal_start, 2);
-    assert_eq!(live_epoch.next_data_ordinal, 3);
-    assert_eq!(live_epoch.data_blocks_in_epoch, 1);
-
     let resume_result = {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        emit_resume_sidecars_with_fixture_journal(
+        emit_resume_rebuilt_sidecars_to_raw(
             &mut raw_sink,
-            resume.plan.clone(),
-            &resume.rebuilt_sidecars,
+            &mut journal,
+            rebuild.plan,
+            &rebuild.rebuilt_sidecars,
             TAPE_UUID,
             |_| Ok(()),
         )
-        .expect("resume-generated sidecar writes through ordinary raw barrier")
+        .expect("complete bounded resume plan")
     };
-    assert_eq!(resume_result.sidecars_emitted.len(), 1);
-    let resume_sidecar = &resume_result.sidecars_emitted[0];
-    assert_eq!(resume_sidecar.tape_file_number, 2);
-    assert_eq!(resume_sidecar.protected_ordinal_start, 0);
-    assert_eq!(resume_sidecar.protected_ordinal_end_exclusive, 2);
-    assert_eq!(resume_result.highest_protected_ordinal, 2);
-    assert_eq!(resume_result.next_data_ordinal, 3);
-
-    let prefix_after_resume = FilemarkMap::new(vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 3, 0),
-        TapeFileMapEntry::parity_sidecar(
-            2,
-            resume_sidecar.block_count,
-            resume_sidecar.epoch_id,
-            resume_sidecar.protected_ordinal_start,
-            resume_sidecar.protected_ordinal_end_exclusive,
-        ),
-    ])
-    .expect("post-resume committed prefix validates");
-
     {
         let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        let mut sink = ParitySink::new_sidecar_only_from_resume(
+        let mut sink = ParitySink::new_sidecar_only_from_bounded_resume(
             &mut raw_sink,
-            fixture_journal(),
+            &mut journal,
             scheme.clone(),
             TAPE_UUID,
             block_size,
-            ResumeWriterSeed {
-                committed_prefix: &prefix_after_resume,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&prefix_after_resume),
-                committed_prefix_object_rows: Vec::new(),
+            BoundedResumeWriterSeed {
+                committed_prefix_snapshot: snapshot,
+                committed_prefix_summary: summary,
                 resume_result: &resume_result,
-                live_epoch: resume.live_epoch,
-                next_bootstrap_sequence: 1,
+                live_epoch: rebuild.live_epoch,
             },
         )
-        .expect("construct resumed W<T parity sink");
-        assert_eq!(
-            sink.begin_object_with_capacity_reserve(capacity_input_for_object(block_size, 1, 1))
-                .expect("continued object reserve")
-                .0,
-            3
-        );
-        for block in &continued_object {
-            sink.write_block(block)
-                .expect("write continued live-epoch block");
-        }
-        let object = sink.finish_object().expect("finish continued object");
-        assert_eq!(object.tape_file_number, 3);
-        assert_eq!(object.first_parity_data_ordinal, 3);
-        assert_eq!(object.sidecars_emitted.len(), 1);
-        assert_eq!(object.sidecars_emitted[0].tape_file_number, 4);
-        assert_eq!(object.sidecars_emitted[0].protected_ordinal_start, 2);
-        assert_eq!(
-            object.sidecars_emitted[0].protected_ordinal_end_exclusive,
-            4
-        );
-        sink.finish().expect("finish appended final bootstrap");
+        .expect("open bounded append sink");
+        begin_two_block_object(&mut sink, block_size, 1, 3, 1);
+        sink.write_block(&block(0x91, block_size))
+            .expect("write resumed block one");
+        sink.write_block(&block(0x92, block_size))
+            .expect("write resumed block two");
+        sink.finish_object()
+            .expect("commit resumed Object and sidecar");
+        sink.checkpoint().expect("checkpoint resumed prefix");
     }
 
     drive
         .rewind()
-        .expect("rewind before W<T resume verification");
+        .expect("rewind before bounded resume verification");
     {
         let mut raw_source = DriveHandleRawSource::new(&mut drive);
         let scanned = scan_reconstruct_filemark_map(&mut raw_source, &TAPE_UUID, block_size)
-            .expect("catalog-less scan reconstructs W<T resumed hardware map");
+            .expect("scan bounded-resume physical prefix");
         assert_map_kinds(
             &scanned,
             &[
@@ -1309,282 +879,13 @@ fn quadstor_parity_resume_rebuilds_open_epoch_then_appends() {
                 TapeFileKind::ParitySidecar,
                 TapeFileKind::Object,
                 TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
             ],
         );
-        assert_eq!(scanned.total_data_ordinals(), 4);
-        assert_eq!(scanned.max_sidecar_end_exclusive(), 4);
-
-        let scoped = final_bootstrap_scope(&mut raw_source, &scanned, block_size);
-        assert_eq!(scoped.validated_prefix_tape_files, None);
-        assert_eq!(scoped.scope.watermark(), 4);
-        read_object_blocks(
-            &mut raw_source,
-            scheme.clone(),
-            scoped.clone(),
-            block_size,
-            1,
-            &prefix_object,
-        );
-        read_object_blocks(
-            &mut raw_source,
-            scheme,
-            scoped,
-            block_size,
-            3,
-            &continued_object,
-        );
     }
 
-    drive
-        .rewind()
-        .expect("rewind after W<T resume verification");
+    drive.rewind().expect("rewind after bounded resume smoke");
     drive
         .write_config(original_config)
-        .expect("restore original tape config after W<T resume smoke");
-}
-
-#[test]
-#[ignore]
-fn quadstor_parity_resume_rebuilds_multiple_open_epochs_then_appends() {
-    let Some(path) = skip_if_no_hardware() else {
-        return;
-    };
-    if !write_loop_enabled() {
-        eprintln!(
-            "quadstor_parity_resume_rebuilds_multiple_open_epochs_then_appends: skipping - \
-             REM_QUADSTOR_PARITY_WRITE_LOOP not set to 1. This test writes \
-             and appends on the loaded cartridge; only enable on a scratch tape."
-        );
-        return;
-    }
-
-    let block_size = block_size();
-    let scheme = smoke_scheme();
-    let prefix_object = [
-        block(0x71, block_size),
-        block(0x72, block_size),
-        block(0x73, block_size),
-        block(0x74, block_size),
-        block(0x75, block_size),
-    ];
-    let continued_object = [block(0x76, block_size)];
-    let (library, bay_address) = resolve_library_drive_for_path(&path);
-    eprintln!(
-        "quadstor_parity_resume_rebuilds_multiple_open_epochs_then_appends: selected library {} bay 0x{bay_address:04x} at {path:?}",
-        library.serial
-    );
-
-    let mut policy = StaticAllowlist::new([library.serial.clone()]);
-    if allow_derived_drive_identity() {
-        policy = policy.with_derived_allowed(library.serial.clone());
-    }
-    let mut handle = library
-        .open(&policy)
-        .expect("open selected Quadstor library for multi-epoch W<T resume smoke");
-    let mut drive = handle
-        .open_drive(bay_address, &policy)
-        .expect("open selected Quadstor drive");
-    let original_config =
-        configure_parity_write_session(&mut drive, block_size, "multi-epoch W<T resume smoke");
-    drive
-        .rewind()
-        .expect("rewind before destructive multi-epoch object-only prefix write");
-
-    let committed_prefix = {
-        let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        write_object_only_prefix(&mut raw_sink, &scheme, block_size, &prefix_object)
-    };
-
-    drive
-        .rewind()
-        .expect("rewind before multi-epoch object-only prefix scan");
-    {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        let scanned = scan_reconstruct_filemark_map(&mut raw_source, &TAPE_UUID, block_size)
-            .expect("catalog-less scan reconstructs multi-epoch object-only prefix");
-        assert_eq!(scanned, committed_prefix);
-        assert_map_kinds(&scanned, &[TapeFileKind::Bootstrap, TapeFileKind::Object]);
-        assert_eq!(scanned.total_data_ordinals(), 5);
-        assert_eq!(scanned.max_sidecar_end_exclusive(), 0);
-    }
-
-    let resume = {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        rebuild_open_epoch_from_committed_prefix(
-            &mut raw_source,
-            &committed_prefix,
-            &scheme,
-            TAPE_UUID,
-            block_size,
-        )
-        .expect("resume rereads multi-epoch W<T object blocks and positions to append point")
-    };
-    assert_eq!(resume.plan.append_after_tape_file_number, 1);
-    assert_eq!(
-        resume.plan.append_position,
-        committed_prefix
-            .append_position_after_prefix()
-            .expect("multi-epoch object-only prefix append position")
-    );
-    assert_eq!(resume.plan.highest_protected_ordinal_before_rebuild, 0);
-    assert_eq!(resume.plan.highest_protected_ordinal_after_rebuild, 4);
-    assert_eq!(resume.plan.live_epoch_start, 4);
-    assert_eq!(resume.plan.next_data_ordinal, 5);
-    assert_eq!(resume.rebuilt_sidecars.len(), 2);
-    assert_eq!(resume.rebuilt_sidecars[0].plan.protected_ordinal_start, 0);
-    assert_eq!(
-        resume.rebuilt_sidecars[0]
-            .plan
-            .protected_ordinal_end_exclusive,
-        2
-    );
-    assert_eq!(resume.rebuilt_sidecars[1].plan.protected_ordinal_start, 2);
-    assert_eq!(
-        resume.rebuilt_sidecars[1]
-            .plan
-            .protected_ordinal_end_exclusive,
-        4
-    );
-    let live_epoch = resume.live_epoch.clone().expect("one shard remains live");
-    assert_eq!(live_epoch.protected_ordinal_start, 4);
-    assert_eq!(live_epoch.next_data_ordinal, 5);
-    assert_eq!(live_epoch.data_blocks_in_epoch, 1);
-
-    let resume_result = {
-        let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        emit_resume_sidecars_with_fixture_journal(
-            &mut raw_sink,
-            resume.plan.clone(),
-            &resume.rebuilt_sidecars,
-            TAPE_UUID,
-            |_| Ok(()),
-        )
-        .expect("two resume-generated sidecars write through ordinary raw barriers")
-    };
-    assert_eq!(resume_result.sidecars_emitted.len(), 2);
-    assert_eq!(resume_result.sidecars_emitted[0].tape_file_number, 2);
-    assert_eq!(resume_result.sidecars_emitted[0].protected_ordinal_start, 0);
-    assert_eq!(
-        resume_result.sidecars_emitted[0].protected_ordinal_end_exclusive,
-        2
-    );
-    assert_eq!(resume_result.sidecars_emitted[1].tape_file_number, 3);
-    assert_eq!(resume_result.sidecars_emitted[1].protected_ordinal_start, 2);
-    assert_eq!(
-        resume_result.sidecars_emitted[1].protected_ordinal_end_exclusive,
-        4
-    );
-    assert_eq!(resume_result.highest_protected_ordinal, 4);
-    assert_eq!(resume_result.next_data_ordinal, 5);
-
-    let mut prefix_entries = vec![
-        TapeFileMapEntry::bootstrap(0, 1),
-        TapeFileMapEntry::object(1, 5, 0),
-    ];
-    for sidecar in &resume_result.sidecars_emitted {
-        prefix_entries.push(TapeFileMapEntry::parity_sidecar(
-            sidecar.tape_file_number,
-            sidecar.block_count,
-            sidecar.epoch_id,
-            sidecar.protected_ordinal_start,
-            sidecar.protected_ordinal_end_exclusive,
-        ));
-    }
-    let prefix_after_resume =
-        FilemarkMap::new(prefix_entries).expect("multi-sidecar post-resume prefix validates");
-
-    {
-        let mut raw_sink = DriveHandleRawSink::new(&mut drive);
-        let mut sink = ParitySink::new_sidecar_only_from_resume(
-            &mut raw_sink,
-            fixture_journal(),
-            scheme.clone(),
-            TAPE_UUID,
-            block_size,
-            ResumeWriterSeed {
-                committed_prefix: &prefix_after_resume,
-                committed_prefix_sidecar_directory_entries:
-                    committed_prefix_sidecar_directory_entries(&prefix_after_resume),
-                committed_prefix_object_rows: Vec::new(),
-                resume_result: &resume_result,
-                live_epoch: resume.live_epoch,
-                next_bootstrap_sequence: 1,
-            },
-        )
-        .expect("construct resumed multi-epoch W<T parity sink");
-        assert_eq!(
-            sink.begin_object_with_capacity_reserve(capacity_input_for_object(block_size, 1, 1))
-                .expect("continued object reserve")
-                .0,
-            4
-        );
-        for block in &continued_object {
-            sink.write_block(block)
-                .expect("write continued multi-epoch live block");
-        }
-        let object = sink
-            .finish_object()
-            .expect("finish continued multi-epoch object");
-        assert_eq!(object.tape_file_number, 4);
-        assert_eq!(object.first_parity_data_ordinal, 5);
-        assert_eq!(object.sidecars_emitted.len(), 1);
-        assert_eq!(object.sidecars_emitted[0].tape_file_number, 5);
-        assert_eq!(object.sidecars_emitted[0].protected_ordinal_start, 4);
-        assert_eq!(
-            object.sidecars_emitted[0].protected_ordinal_end_exclusive,
-            6
-        );
-        sink.finish().expect("finish appended final bootstrap");
-    }
-
-    drive
-        .rewind()
-        .expect("rewind before multi-epoch W<T resume verification");
-    {
-        let mut raw_source = DriveHandleRawSource::new(&mut drive);
-        let scanned = scan_reconstruct_filemark_map(&mut raw_source, &TAPE_UUID, block_size)
-            .expect("catalog-less scan reconstructs multi-epoch W<T resumed hardware map");
-        assert_map_kinds(
-            &scanned,
-            &[
-                TapeFileKind::Bootstrap,
-                TapeFileKind::Object,
-                TapeFileKind::ParitySidecar,
-                TapeFileKind::ParitySidecar,
-                TapeFileKind::Object,
-                TapeFileKind::ParitySidecar,
-                TapeFileKind::Bootstrap,
-            ],
-        );
-        assert_eq!(scanned.total_data_ordinals(), 6);
-        assert_eq!(scanned.max_sidecar_end_exclusive(), 6);
-
-        let scoped = final_bootstrap_scope(&mut raw_source, &scanned, block_size);
-        assert_eq!(scoped.validated_prefix_tape_files, None);
-        assert_eq!(scoped.scope.watermark(), 6);
-        read_object_blocks(
-            &mut raw_source,
-            scheme.clone(),
-            scoped.clone(),
-            block_size,
-            1,
-            &prefix_object,
-        );
-        read_object_blocks(
-            &mut raw_source,
-            scheme,
-            scoped,
-            block_size,
-            4,
-            &continued_object,
-        );
-    }
-
-    drive
-        .rewind()
-        .expect("rewind after multi-epoch W<T resume verification");
-    drive
-        .write_config(original_config)
-        .expect("restore original tape config after multi-epoch W<T resume smoke");
+        .expect("restore tape config");
+    let _ = std::fs::remove_file(journal_path);
 }

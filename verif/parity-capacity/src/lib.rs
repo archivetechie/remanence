@@ -1,88 +1,42 @@
-//! Verification extraction of the v0.4.4 parity capacity-reserve arithmetic.
+//! Verification extraction of the exact terminal-triple capacity arithmetic.
 //!
 //! This crate is a standalone, dependency-free model of
-//! `crates/remanence-parity/src/capacity.rs`'s pure object-start reserve
+//! `crates/remanence-parity/src/capacity.rs`'s Object-admission/manual-close
 //! calculation. It preserves the production arithmetic and branch ordering but
 //! replaces the full production `ParityError` payloads with compact proof-facing
 //! variants. The `drift_guard` test pins the production formulas this extraction
 //! mirrors; if it fails, the extraction and Lean proofs must be re-synced.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapacityReserveCause {
-    TapeCapacity,
-    ParitySpoolCapacity,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapacityError {
     BlockSizeZero,
     UnsupportedBlockSize,
     DataShardsPerEpochZero,
-    ParityShardsPerEpochZero,
+    ParityOffHasState,
     ProfileNeighborhoodTooLarge,
     CurrentEpochFillOutsideOpenEpoch,
     ObjectRowsExceedStructuralEntries,
     SidecarRowsExceedStructuralEntries,
     RecoveryRowsExceedStructuralEntries,
     StructuralEntriesExceedCapacity,
+    MissingBotBootstrap,
+    ProjectedObjectPresenceMismatch,
+    GapExtentSizeMismatch,
     UnsafeCapacityProfile,
     CapacityProfileCloseExceedsCapacity,
+    CapacityPolicyInvalid,
     SidecarDirectoryExceedsCapacity,
     SidecarEntryDoesNotFit,
     ReplicatedControlHeaderTooLarge,
     ArithmeticOverflow,
-    ObjectTooLargeForEmptyTape,
     CapacityReserveExceededTape,
     CapacityReserveExceededSpool,
 }
 
+/// Proof-facing inputs for Object admission and operator terminal close-out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CapacityReserveInput {
-    pub projected_object_blocks: u64,
-    pub block_size_bytes: u64,
-    pub current_epoch_fill_blocks: u64,
-    pub data_shards_per_epoch: u64,
-    pub parity_shards_per_epoch: u64,
-    pub sidecar_index_block_count: u64,
-    pub object_filemark_blocks: u64,
-    pub sidecar_filemark_blocks: u64,
-    pub bootstrap_filemark_blocks: u64,
-    pub pending_completed_sidecars: u64,
-    pub remaining_bootstrap_count: u64,
-    pub safety_margin_blocks: u64,
-    pub remaining_tape_blocks: u64,
-    pub empty_tape_usable_blocks: u64,
-    pub pending_completed_epoch_parity_bytes: u64,
-    pub remaining_spool_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TapeReserveReport {
-    pub epochs_completed_by_object: u64,
-    pub final_partial_sidecar_needed: bool,
-    pub sidecar_tape_file_blocks: u64,
-    pub bootstrap_tape_file_blocks: u64,
-    pub reserve_after_object_blocks: u64,
-    pub required_tape_blocks: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CapacityReserveReport {
-    pub epochs_completed_by_object: u64,
-    pub final_partial_sidecar_needed: bool,
-    pub sidecar_tape_file_blocks: u64,
-    pub bootstrap_tape_file_blocks: u64,
-    pub reserve_after_object_blocks: u64,
-    pub required_tape_blocks: u64,
-    pub required_spool_bytes: u64,
-}
-
-/// Proof-facing inputs for the no-policy-snapshot final-close base kernel.
-///
-/// Counts describe committed authority before the proposed Object. Sidecar,
-/// ParityMap, and snapshot bounds are derived rather than supplied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotCloseInput {
+pub struct TerminalTripleCloseInput {
+    pub projected_object_present: bool,
     pub projected_object_blocks: u64,
     pub block_size_bytes: u64,
     pub current_epoch_fill_blocks: u64,
@@ -95,19 +49,22 @@ pub struct SnapshotCloseInput {
     pub object_filemark_blocks: u64,
     pub sidecar_filemark_blocks: u64,
     pub parity_map_filemark_blocks: u64,
-    pub snapshot_filemark_blocks: u64,
-    pub bootstrap_filemark_blocks: u64,
+    pub replica_filemark_blocks: u64,
+    pub gap_filemark_blocks: u64,
+    pub gap_nominal_bytes: u64,
     pub safety_margin_blocks: u64,
     pub remaining_tape_blocks: u64,
-    pub empty_tape_usable_blocks: u64,
+    pub capacity_basis_blocks: u64,
+    pub low_watermark_blocks: u64,
     pub high_watermark_blocks: u64,
     pub pending_completed_epoch_parity_bytes: u64,
     pub remaining_spool_bytes: u64,
 }
 
-/// Checked terms in the draft.4 close guarantee.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotCloseReport {
+/// Checked nonoverlapping terms in the terminal-triple close guarantee.
+#[derive(Clone, Copy, Debug)]
+pub struct TerminalTripleCloseReport {
+    pub projected_object_present: bool,
     pub epochs_completed_by_object: u64,
     pub final_partial_sidecar_needed: bool,
     pub sidecar_index_block_count: u64,
@@ -116,7 +73,7 @@ pub struct SnapshotCloseReport {
     pub sidecars_emitted_by_commit: u64,
     pub sidecar_blocks_emitted_by_commit: u64,
     pub object_tape_file_blocks: u64,
-    pub object_commit_charge_blocks: u64,
+    pub prefix_commit_charge_blocks: u64,
     pub object_rows_after: u64,
     pub sidecar_entries_after_closeout: u64,
     pub maximum_sidecar_entries_for_capacity: u64,
@@ -127,10 +84,17 @@ pub struct SnapshotCloseReport {
     pub final_parity_map_payload_bound_bytes: u64,
     pub final_parity_map_blocks_before_filemark: u64,
     pub final_parity_map_tape_file_blocks: u64,
-    pub snapshot_payload_bytes: u64,
-    pub snapshot_blocks_before_filemark: u64,
-    pub snapshot_tape_file_blocks: u64,
-    pub final_bootstrap_tape_file_blocks: u64,
+    pub replica_payload_bytes: u64,
+    pub replica_payload_record_count: u64,
+    pub replica_records_before_filemark: u64,
+    pub replica_tape_file_blocks: u64,
+    pub triple_replica_blocks: u64,
+    pub gap_nominal_bytes: u64,
+    pub gap_records_before_filemark: u64,
+    pub gap_tape_file_blocks: u64,
+    pub double_gap_blocks: u64,
+    pub parity_closeout_charge_blocks: u64,
+    pub terminal_tail_charge_blocks: u64,
     pub safety_margin_blocks: u64,
     pub close_bound_blocks: u64,
     pub required_tape_blocks: u64,
@@ -158,28 +122,20 @@ pub fn checked_sub(a: u64, b: u64) -> Result<u64, CapacityError> {
     }
 }
 
-pub fn block_count_per_bootstrap() -> u64 {
-    1
-}
-
-pub fn snapshot_header_bytes() -> u64 {
-    512
-}
-
-pub fn snapshot_structural_slot_bytes() -> u64 {
+pub fn terminal_structural_slot_bytes() -> u64 {
     64
 }
 
-pub fn snapshot_object_row_slot_bytes() -> u64 {
+pub fn terminal_object_row_slot_bytes() -> u64 {
     256
 }
 
 pub fn parity_map_header_bytes() -> u64 {
-    184
+    200
 }
 
 pub fn sidecar_header_bytes() -> u64 {
-    184
+    200
 }
 
 pub fn sidecar_trailing_crc_bytes() -> u64 {
@@ -335,12 +291,37 @@ pub fn parity_map_payload_len_upper_bound(
     checked_add(parity_map_fixed_bound_bytes(), rows)
 }
 
-pub fn supported_snapshot_block_size(block_size_bytes: u64) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParityMapCapacityLayout {
+    pub payload_bound_bytes: u64,
+    pub blocks_before_filemark: u64,
+    pub tape_file_blocks: u64,
+}
+
+pub fn checked_parity_map_capacity_layout(
+    block_size_bytes: u64,
+    sidecar_entry_count: u64,
+    filemark_blocks: u64,
+) -> Result<ParityMapCapacityLayout, CapacityError> {
+    let payload_bound_bytes = parity_map_payload_len_upper_bound(sidecar_entry_count)?;
+    let blocks_before_filemark = replicated_control_total_blocks(
+        block_size_bytes,
+        parity_map_header_bytes(),
+        payload_bound_bytes,
+    )?;
+    let tape_file_blocks = checked_add(blocks_before_filemark, filemark_blocks)?;
+    Ok(ParityMapCapacityLayout {
+        payload_bound_bytes,
+        blocks_before_filemark,
+        tape_file_blocks,
+    })
+}
+
+pub fn supported_terminal_block_size(block_size_bytes: u64) -> bool {
     block_size_bytes == 262_144 || block_size_bytes == 524_288 || block_size_bytes == 1_048_576
 }
 
-/// Checked `copy 1 + copy 2 + footer` geometry shared by ParityMap and the
-/// candidate TapeIndexSnapshot.
+/// Checked `copy 1 + copy 2 + footer` geometry used by external ParityMaps.
 pub fn replicated_control_total_blocks(
     block_size_bytes: u64,
     header_bytes: u64,
@@ -359,33 +340,33 @@ pub fn replicated_control_total_blocks(
     checked_add(checked_mul(2, copy_blocks)?, 1)
 }
 
-pub fn snapshot_payload_bytes(
+pub fn terminal_payload_bytes(
     structural_entry_count: u64,
     object_row_count: u64,
 ) -> Result<u64, CapacityError> {
     if object_row_count > structural_entry_count {
         return Err(CapacityError::ObjectRowsExceedStructuralEntries);
     }
-    let structural = checked_mul(structural_entry_count, snapshot_structural_slot_bytes())?;
-    let rows = checked_mul(object_row_count, snapshot_object_row_slot_bytes())?;
+    let structural = checked_mul(structural_entry_count, terminal_structural_slot_bytes())?;
+    let rows = checked_mul(object_row_count, terminal_object_row_slot_bytes())?;
     checked_add(structural, rows)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotSidecarTerms {
+pub struct TerminalSidecarTerms {
     pub index_block_count: u64,
     pub blocks_before_filemark: u64,
     pub tape_file_blocks: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotProjectionTerms {
+pub struct TerminalProjectionTerms {
     pub epochs_completed_by_object: u64,
     pub final_partial_sidecar_needed: bool,
     pub sidecars_emitted_by_commit: u64,
     pub sidecar_blocks_emitted_by_commit: u64,
     pub object_tape_file_blocks: u64,
-    pub object_commit_charge_blocks: u64,
+    pub prefix_commit_charge_blocks: u64,
     pub object_rows_after: u64,
     pub sidecar_entries_after_closeout: u64,
     pub maximum_sidecar_entries_for_capacity: u64,
@@ -396,26 +377,82 @@ pub struct SnapshotProjectionTerms {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotControlTerms {
+pub struct TerminalControlTerms {
     pub final_partial_sidecar_blocks: u64,
     pub final_parity_map_blocks_before_filemark: u64,
     pub final_parity_map_tape_file_blocks: u64,
-    pub snapshot_payload_bytes: u64,
-    pub snapshot_blocks_before_filemark: u64,
-    pub snapshot_tape_file_blocks: u64,
-    pub final_bootstrap_tape_file_blocks: u64,
+    pub replica_payload_bytes: u64,
+    pub replica_payload_record_count: u64,
+    pub replica_records_before_filemark: u64,
+    pub replica_tape_file_blocks: u64,
+    pub triple_replica_blocks: u64,
+    pub gap_records_before_filemark: u64,
+    pub gap_tape_file_blocks: u64,
+    pub double_gap_blocks: u64,
+    pub parity_closeout_charge_blocks: u64,
+    pub terminal_tail_charge_blocks: u64,
     pub close_bound_blocks: u64,
 }
 
-pub fn validate_snapshot_close_input(input: SnapshotCloseInput) -> Result<(), CapacityError> {
-    if !supported_snapshot_block_size(input.block_size_bytes) {
+pub fn terminal_replica_layout(
+    block_size_bytes: u64,
+    structural_entry_count: u64,
+    object_row_count: u64,
+) -> Result<(u64, u64, u64), CapacityError> {
+    if !supported_terminal_block_size(block_size_bytes) {
         return Err(CapacityError::UnsupportedBlockSize);
+    }
+    let payload_bytes = terminal_payload_bytes(structural_entry_count, object_row_count)?;
+    let adjusted = checked_add(payload_bytes, checked_sub(block_size_bytes, 1)?)?;
+    let payload_record_count = adjusted / block_size_bytes;
+    let records_before_filemark = checked_add(payload_record_count, 2)?;
+    Ok((payload_bytes, payload_record_count, records_before_filemark))
+}
+
+pub fn index_separation_records(
+    block_size_bytes: u64,
+    extent_bytes: u64,
+) -> Result<u64, CapacityError> {
+    if !supported_terminal_block_size(block_size_bytes) {
+        return Err(CapacityError::UnsupportedBlockSize);
+    }
+    let adjusted = checked_add(extent_bytes, checked_sub(block_size_bytes, 1)?)?;
+    let records = adjusted / block_size_bytes;
+    if records < 2 {
+        return Err(CapacityError::UnsafeCapacityProfile);
+    }
+    Ok(records)
+}
+
+pub fn validate_terminal_close_input(input: TerminalTripleCloseInput) -> Result<(), CapacityError> {
+    if input.remaining_tape_blocks > input.capacity_basis_blocks {
+        return Err(CapacityError::CapacityPolicyInvalid);
+    }
+    if input.low_watermark_blocks >= input.high_watermark_blocks
+        || input.high_watermark_blocks > input.capacity_basis_blocks
+    {
+        return Err(CapacityError::CapacityPolicyInvalid);
+    }
+    if !supported_terminal_block_size(input.block_size_bytes) {
+        return Err(CapacityError::UnsupportedBlockSize);
+    }
+    if input.projected_object_present != (input.projected_object_blocks != 0) {
+        return Err(CapacityError::ProjectedObjectPresenceMismatch);
+    }
+    if input.gap_nominal_bytes != 1_073_741_824 {
+        return Err(CapacityError::GapExtentSizeMismatch);
     }
     if input.data_shards_per_epoch == 0 {
         return Err(CapacityError::DataShardsPerEpochZero);
     }
-    if input.parity_shards_per_epoch == 0 {
-        return Err(CapacityError::ParityShardsPerEpochZero);
+    let parity_enabled = input.parity_shards_per_epoch != 0;
+    if !parity_enabled
+        && (input.current_epoch_fill_blocks != 0
+            || input.pending_completed_sidecars != 0
+            || input.sidecar_entries_before_object != 0
+            || input.pending_completed_epoch_parity_bytes != 0)
+    {
+        return Err(CapacityError::ParityOffHasState);
     }
     let profile_neighborhood_blocks =
         checked_add(input.data_shards_per_epoch, input.parity_shards_per_epoch)?;
@@ -438,15 +475,25 @@ pub fn validate_snapshot_close_input(input: SnapshotCloseInput) -> Result<(), Ca
     if recovery_rows_before_object > input.structural_entries_before_object {
         return Err(CapacityError::RecoveryRowsExceedStructuralEntries);
     }
-    if input.structural_entries_before_object > input.empty_tape_usable_blocks {
+    if input.structural_entries_before_object > input.capacity_basis_blocks {
         return Err(CapacityError::StructuralEntriesExceedCapacity);
+    }
+    if input.structural_entries_before_object == 0 {
+        return Err(CapacityError::MissingBotBootstrap);
     }
     Ok(())
 }
 
-pub fn compute_snapshot_sidecar_terms(
-    input: SnapshotCloseInput,
-) -> Result<SnapshotSidecarTerms, CapacityError> {
+pub fn compute_terminal_sidecar_terms(
+    input: TerminalTripleCloseInput,
+) -> Result<TerminalSidecarTerms, CapacityError> {
+    if input.parity_shards_per_epoch == 0 {
+        return Ok(TerminalSidecarTerms {
+            index_block_count: 0,
+            blocks_before_filemark: 0,
+            tape_file_blocks: 0,
+        });
+    }
     let layout = checked_sidecar_index_capacity_layout(
         input.block_size_bytes,
         input.parity_shards_per_epoch,
@@ -458,68 +505,103 @@ pub fn compute_snapshot_sidecar_terms(
         1,
     )?;
     let tape_file_blocks = checked_add(blocks_before_filemark, input.sidecar_filemark_blocks)?;
-    Ok(SnapshotSidecarTerms {
+    Ok(TerminalSidecarTerms {
         index_block_count: layout.block_count,
         blocks_before_filemark,
         tape_file_blocks,
     })
 }
 
+/// Exact terminal partial-sidecar charge for the projected epoch remainder.
+/// The parity shard count is fixed by the scheme, while the CRC index contains
+/// only the data shards actually present in the partial epoch.
+pub fn final_partial_sidecar_tape_file_blocks(
+    input: TerminalTripleCloseInput,
+) -> Result<u64, CapacityError> {
+    if input.data_shards_per_epoch == 0 {
+        return Err(CapacityError::DataShardsPerEpochZero);
+    }
+    let projected_epoch_fill = checked_add(
+        input.current_epoch_fill_blocks,
+        input.projected_object_blocks,
+    )?;
+    let data_crc_entry_count = projected_epoch_fill % input.data_shards_per_epoch;
+    let layout = checked_sidecar_index_capacity_layout(
+        input.block_size_bytes,
+        input.parity_shards_per_epoch,
+        data_crc_entry_count,
+    )?;
+    let replicated_index_blocks = checked_mul(2, layout.block_count)?;
+    let blocks_before_filemark = checked_add(
+        checked_add(replicated_index_blocks, input.parity_shards_per_epoch)?,
+        1,
+    )?;
+    checked_add(blocks_before_filemark, input.sidecar_filemark_blocks)
+}
+
 /// Validate capacity-derived worst-case control counts without allocating any
 /// hypothetical rows and return the physical sidecar-directory ceiling.
 pub fn validate_capacity_derived_profile_bounds(
-    input: SnapshotCloseInput,
+    input: TerminalTripleCloseInput,
+    parity_enabled: bool,
     maximum_complete_sidecar_tape_file_blocks: u64,
 ) -> Result<u64, CapacityError> {
     let closeout_budget_blocks =
-        checked_sub(input.empty_tape_usable_blocks, input.high_watermark_blocks)?;
-    if maximum_complete_sidecar_tape_file_blocks > input.empty_tape_usable_blocks {
+        checked_sub(input.capacity_basis_blocks, input.high_watermark_blocks)?;
+    if parity_enabled && maximum_complete_sidecar_tape_file_blocks > input.capacity_basis_blocks {
         return Err(CapacityError::CapacityProfileCloseExceedsCapacity);
     }
-    let minimum_sidecar_tape_file_blocks = checked_add(
-        checked_add(input.parity_shards_per_epoch, 3)?,
-        input.sidecar_filemark_blocks,
-    )?;
-    let maximum_sidecar_entries_for_capacity =
-        input.empty_tape_usable_blocks / minimum_sidecar_tape_file_blocks;
-    let _maximum_directory_bytes =
-        parity_map_directory_len_upper_bound(maximum_sidecar_entries_for_capacity)?;
-    let maximum_parity_map_payload_bytes =
-        parity_map_payload_len_upper_bound(maximum_sidecar_entries_for_capacity)?;
-    let maximum_parity_map_blocks_before_filemark = replicated_control_total_blocks(
+    let (maximum_sidecar_entries_for_capacity, maximum_parity_map_tape_file_blocks) =
+        if parity_enabled {
+            let minimum_sidecar_tape_file_blocks = checked_add(
+                checked_add(input.parity_shards_per_epoch, 3)?,
+                input.sidecar_filemark_blocks,
+            )?;
+            let maximum_sidecar_entries_for_capacity =
+                input.capacity_basis_blocks / minimum_sidecar_tape_file_blocks;
+            let _maximum_directory_bytes =
+                parity_map_directory_len_upper_bound(maximum_sidecar_entries_for_capacity)?;
+            let maximum_parity_map_payload_bytes =
+                parity_map_payload_len_upper_bound(maximum_sidecar_entries_for_capacity)?;
+            let maximum_parity_map_blocks_before_filemark = replicated_control_total_blocks(
+                input.block_size_bytes,
+                parity_map_header_bytes(),
+                maximum_parity_map_payload_bytes,
+            )?;
+            let maximum_parity_map_tape_file_blocks = if maximum_sidecar_entries_for_capacity == 0 {
+                0
+            } else {
+                checked_add(
+                    maximum_parity_map_blocks_before_filemark,
+                    input.parity_map_filemark_blocks,
+                )?
+            };
+            (
+                maximum_sidecar_entries_for_capacity,
+                maximum_parity_map_tape_file_blocks,
+            )
+        } else {
+            (0, 0)
+        };
+    let (_, _, maximum_replica_records_before_filemark) = terminal_replica_layout(
         input.block_size_bytes,
-        parity_map_header_bytes(),
-        maximum_parity_map_payload_bytes,
+        input.capacity_basis_blocks,
+        input.capacity_basis_blocks,
     )?;
-    let maximum_parity_map_tape_file_blocks = if maximum_sidecar_entries_for_capacity == 0 {
-        0
-    } else {
-        checked_add(
-            maximum_parity_map_blocks_before_filemark,
-            input.parity_map_filemark_blocks,
-        )?
-    };
-    let maximum_snapshot_payload_bytes = snapshot_payload_bytes(
-        input.empty_tape_usable_blocks,
-        input.empty_tape_usable_blocks,
+    let maximum_replica_tape_file_blocks = checked_add(
+        maximum_replica_records_before_filemark,
+        input.replica_filemark_blocks,
     )?;
-    let maximum_snapshot_blocks_before_filemark = replicated_control_total_blocks(
-        input.block_size_bytes,
-        snapshot_header_bytes(),
-        maximum_snapshot_payload_bytes,
-    )?;
-    let maximum_snapshot_tape_file_blocks = checked_add(
-        maximum_snapshot_blocks_before_filemark,
-        input.snapshot_filemark_blocks,
-    )?;
-    let final_bootstrap_tape_file_blocks =
-        checked_add(block_count_per_bootstrap(), input.bootstrap_filemark_blocks)?;
+    let maximum_triple_replica_blocks = checked_mul(3, maximum_replica_tape_file_blocks)?;
+    let gap_records = index_separation_records(input.block_size_bytes, input.gap_nominal_bytes)?;
+    let gap_tape_file_blocks = checked_add(gap_records, input.gap_filemark_blocks)?;
+    let double_gap_blocks = checked_mul(2, gap_tape_file_blocks)?;
     let maximum_close_step1 = checked_add(
         maximum_complete_sidecar_tape_file_blocks,
         maximum_parity_map_tape_file_blocks,
     )?;
-    let maximum_close_step2 = checked_add(maximum_close_step1, maximum_snapshot_tape_file_blocks)?;
-    let maximum_close_step3 = checked_add(maximum_close_step2, final_bootstrap_tape_file_blocks)?;
+    let maximum_close_step2 = checked_add(maximum_close_step1, maximum_triple_replica_blocks)?;
+    let maximum_close_step3 = checked_add(maximum_close_step2, double_gap_blocks)?;
     let maximum_close_bound_blocks = checked_add(maximum_close_step3, input.safety_margin_blocks)?;
     if maximum_close_bound_blocks > closeout_budget_blocks {
         return Err(CapacityError::CapacityProfileCloseExceedsCapacity);
@@ -527,26 +609,37 @@ pub fn validate_capacity_derived_profile_bounds(
     Ok(maximum_sidecar_entries_for_capacity)
 }
 
-pub fn compute_snapshot_projection_terms(
-    input: SnapshotCloseInput,
-    sidecar: SnapshotSidecarTerms,
+pub fn compute_terminal_projection_terms(
+    input: TerminalTripleCloseInput,
+    sidecar: TerminalSidecarTerms,
     maximum_sidecar_entries_for_capacity: u64,
-) -> Result<SnapshotProjectionTerms, CapacityError> {
-    let projected_epoch_fill = checked_add(
-        input.current_epoch_fill_blocks,
-        input.projected_object_blocks,
-    )?;
-    let epochs_completed_by_object = projected_epoch_fill / input.data_shards_per_epoch;
-    let final_partial_sidecar_needed = projected_epoch_fill % input.data_shards_per_epoch != 0;
+) -> Result<TerminalProjectionTerms, CapacityError> {
+    let parity_enabled = input.parity_shards_per_epoch != 0;
+    let (epochs_completed_by_object, final_partial_sidecar_needed) = if parity_enabled {
+        let projected_epoch_fill = checked_add(
+            input.current_epoch_fill_blocks,
+            input.projected_object_blocks,
+        )?;
+        (
+            projected_epoch_fill / input.data_shards_per_epoch,
+            projected_epoch_fill % input.data_shards_per_epoch != 0,
+        )
+    } else {
+        (0, false)
+    };
     let sidecars_emitted_by_commit =
         checked_add(input.pending_completed_sidecars, epochs_completed_by_object)?;
     let sidecar_blocks_emitted_by_commit =
         checked_mul(sidecars_emitted_by_commit, sidecar.tape_file_blocks)?;
-    let object_tape_file_blocks =
-        checked_add(input.projected_object_blocks, input.object_filemark_blocks)?;
-    let object_commit_charge_blocks =
+    let object_tape_file_blocks = if input.projected_object_present {
+        checked_add(input.projected_object_blocks, input.object_filemark_blocks)?
+    } else {
+        0
+    };
+    let prefix_commit_charge_blocks =
         checked_add(object_tape_file_blocks, sidecar_blocks_emitted_by_commit)?;
-    let object_rows_after = checked_add(input.object_rows_before_object, 1)?;
+    let projected_object_count = if input.projected_object_present { 1 } else { 0 };
+    let object_rows_after = checked_add(input.object_rows_before_object, projected_object_count)?;
     let sidecar_entries_after_commit = checked_add(
         input.sidecar_entries_before_object,
         sidecars_emitted_by_commit,
@@ -564,20 +657,23 @@ pub fn compute_snapshot_projection_terms(
     let final_parity_map_needed = sidecar_entries_after_closeout != 0;
     let final_parity_map_count = if final_parity_map_needed { 1 } else { 0 };
     let structural_entries_after_commit = checked_add(
-        checked_add(input.structural_entries_before_object, 1)?,
+        checked_add(
+            input.structural_entries_before_object,
+            projected_object_count,
+        )?,
         sidecars_emitted_by_commit,
     )?;
     let structural_entries_after_closeout = checked_add(
         checked_add(structural_entries_after_commit, final_partial_sidecar_count)?,
         final_parity_map_count,
     )?;
-    Ok(SnapshotProjectionTerms {
+    Ok(TerminalProjectionTerms {
         epochs_completed_by_object,
         final_partial_sidecar_needed,
         sidecars_emitted_by_commit,
         sidecar_blocks_emitted_by_commit,
         object_tape_file_blocks,
-        object_commit_charge_blocks,
+        prefix_commit_charge_blocks,
         object_rows_after,
         sidecar_entries_after_closeout,
         maximum_sidecar_entries_for_capacity,
@@ -588,24 +684,26 @@ pub fn compute_snapshot_projection_terms(
     })
 }
 
-pub fn compute_snapshot_control_terms(
-    input: SnapshotCloseInput,
-    sidecar: SnapshotSidecarTerms,
-    projection: SnapshotProjectionTerms,
-) -> Result<SnapshotControlTerms, CapacityError> {
-    let snapshot_payload_bytes = snapshot_payload_bytes(
-        projection.structural_entries_after_closeout,
-        projection.object_rows_after,
+pub fn compute_terminal_control_terms(
+    input: TerminalTripleCloseInput,
+    _sidecar: TerminalSidecarTerms,
+    projection: TerminalProjectionTerms,
+) -> Result<TerminalControlTerms, CapacityError> {
+    let (replica_payload_bytes, replica_payload_record_count, replica_records_before_filemark) =
+        terminal_replica_layout(
+            input.block_size_bytes,
+            projection.structural_entries_after_closeout,
+            projection.object_rows_after,
+        )?;
+    let replica_tape_file_blocks = checked_add(
+        replica_records_before_filemark,
+        input.replica_filemark_blocks,
     )?;
-    let snapshot_blocks_before_filemark = replicated_control_total_blocks(
-        input.block_size_bytes,
-        snapshot_header_bytes(),
-        snapshot_payload_bytes,
-    )?;
-    let snapshot_tape_file_blocks = checked_add(
-        snapshot_blocks_before_filemark,
-        input.snapshot_filemark_blocks,
-    )?;
+    let triple_replica_blocks = checked_mul(3, replica_tape_file_blocks)?;
+    let gap_records_before_filemark =
+        index_separation_records(input.block_size_bytes, input.gap_nominal_bytes)?;
+    let gap_tape_file_blocks = checked_add(gap_records_before_filemark, input.gap_filemark_blocks)?;
+    let double_gap_blocks = checked_mul(2, gap_tape_file_blocks)?;
     let final_parity_map_blocks_before_filemark = if projection.final_parity_map_needed {
         replicated_control_total_blocks(
             input.block_size_bytes,
@@ -624,70 +722,79 @@ pub fn compute_snapshot_control_terms(
         0
     };
     let final_partial_sidecar_blocks = if projection.final_partial_sidecar_needed {
-        sidecar.tape_file_blocks
+        final_partial_sidecar_tape_file_blocks(input)?
     } else {
         0
     };
-    let final_bootstrap_tape_file_blocks =
-        checked_add(block_count_per_bootstrap(), input.bootstrap_filemark_blocks)?;
-    let close_step1 = checked_add(
+    let parity_closeout_charge_blocks = checked_add(
         final_partial_sidecar_blocks,
         final_parity_map_tape_file_blocks,
     )?;
-    let close_step2 = checked_add(close_step1, snapshot_tape_file_blocks)?;
-    let close_step3 = checked_add(close_step2, final_bootstrap_tape_file_blocks)?;
-    let close_bound_blocks = checked_add(close_step3, input.safety_margin_blocks)?;
-    Ok(SnapshotControlTerms {
+    let terminal_tail_charge_blocks = checked_add(triple_replica_blocks, double_gap_blocks)?;
+    let close_step1 = checked_add(parity_closeout_charge_blocks, terminal_tail_charge_blocks)?;
+    let close_bound_blocks = checked_add(close_step1, input.safety_margin_blocks)?;
+    Ok(TerminalControlTerms {
         final_partial_sidecar_blocks,
         final_parity_map_blocks_before_filemark,
         final_parity_map_tape_file_blocks,
-        snapshot_payload_bytes,
-        snapshot_blocks_before_filemark,
-        snapshot_tape_file_blocks,
-        final_bootstrap_tape_file_blocks,
+        replica_payload_bytes,
+        replica_payload_record_count,
+        replica_records_before_filemark,
+        replica_tape_file_blocks,
+        triple_replica_blocks,
+        gap_records_before_filemark,
+        gap_tape_file_blocks,
+        double_gap_blocks,
+        parity_closeout_charge_blocks,
+        terminal_tail_charge_blocks,
         close_bound_blocks,
     })
 }
 
-/// Evaluate the no-policy Object commit plus conservative final-close bound
-/// before any Object block is written.
-pub fn evaluate_snapshot_close(
-    input: SnapshotCloseInput,
-) -> Result<SnapshotCloseReport, CapacityError> {
-    validate_snapshot_close_input(input)?;
-    let sidecar = compute_snapshot_sidecar_terms(input)?;
-    let maximum_sidecar_entries_for_capacity =
-        match validate_capacity_derived_profile_bounds(input, sidecar.tape_file_blocks) {
-            Ok(value) => value,
-            Err(_) => return Err(CapacityError::UnsafeCapacityProfile),
-        };
+/// Evaluate one optional Object commit plus the complete terminal close bound.
+pub fn evaluate_terminal_close(
+    input: TerminalTripleCloseInput,
+) -> Result<TerminalTripleCloseReport, CapacityError> {
+    validate_terminal_close_input(input)?;
+    let parity_enabled = input.parity_shards_per_epoch != 0;
+    let sidecar = compute_terminal_sidecar_terms(input)?;
+    let maximum_sidecar_entries_for_capacity = match validate_capacity_derived_profile_bounds(
+        input,
+        parity_enabled,
+        sidecar.tape_file_blocks,
+    ) {
+        Ok(value) => value,
+        Err(_) => return Err(CapacityError::UnsafeCapacityProfile),
+    };
     let projection =
-        compute_snapshot_projection_terms(input, sidecar, maximum_sidecar_entries_for_capacity)?;
-    let control = compute_snapshot_control_terms(input, sidecar, projection)?;
+        compute_terminal_projection_terms(input, sidecar, maximum_sidecar_entries_for_capacity)?;
+    let control = compute_terminal_control_terms(input, sidecar, projection)?;
     let required_tape_blocks = checked_add(
-        projection.object_commit_charge_blocks,
+        projection.prefix_commit_charge_blocks,
         control.close_bound_blocks,
     )?;
-    if input.empty_tape_usable_blocks < required_tape_blocks {
-        return Err(CapacityError::ObjectTooLargeForEmptyTape);
-    }
     if input.remaining_tape_blocks < required_tape_blocks {
         return Err(CapacityError::CapacityReserveExceededTape);
     }
-    let sidecar_tape_file_bytes =
-        checked_mul(sidecar.blocks_before_filemark, input.block_size_bytes)?;
-    let newly_completed_sidecar_bytes = checked_mul(
-        projection.epochs_completed_by_object,
-        sidecar_tape_file_bytes,
-    )?;
-    let required_spool_bytes = checked_add(
-        input.pending_completed_epoch_parity_bytes,
-        newly_completed_sidecar_bytes,
-    )?;
+    let required_spool_bytes = if parity_enabled {
+        let sidecar_tape_file_bytes =
+            checked_mul(sidecar.blocks_before_filemark, input.block_size_bytes)?;
+        let newly_completed_sidecar_bytes = checked_mul(
+            projection.epochs_completed_by_object,
+            sidecar_tape_file_bytes,
+        )?;
+        checked_add(
+            input.pending_completed_epoch_parity_bytes,
+            newly_completed_sidecar_bytes,
+        )?
+    } else {
+        0
+    };
     if input.remaining_spool_bytes < required_spool_bytes {
         return Err(CapacityError::CapacityReserveExceededSpool);
     }
-    Ok(SnapshotCloseReport {
+    Ok(TerminalTripleCloseReport {
+        projected_object_present: input.projected_object_present,
         epochs_completed_by_object: projection.epochs_completed_by_object,
         final_partial_sidecar_needed: projection.final_partial_sidecar_needed,
         sidecar_index_block_count: sidecar.index_block_count,
@@ -696,7 +803,7 @@ pub fn evaluate_snapshot_close(
         sidecars_emitted_by_commit: projection.sidecars_emitted_by_commit,
         sidecar_blocks_emitted_by_commit: projection.sidecar_blocks_emitted_by_commit,
         object_tape_file_blocks: projection.object_tape_file_blocks,
-        object_commit_charge_blocks: projection.object_commit_charge_blocks,
+        prefix_commit_charge_blocks: projection.prefix_commit_charge_blocks,
         object_rows_after: projection.object_rows_after,
         sidecar_entries_after_closeout: projection.sidecar_entries_after_closeout,
         maximum_sidecar_entries_for_capacity: projection.maximum_sidecar_entries_for_capacity,
@@ -707,10 +814,17 @@ pub fn evaluate_snapshot_close(
         final_parity_map_payload_bound_bytes: projection.final_parity_map_payload_bound_bytes,
         final_parity_map_blocks_before_filemark: control.final_parity_map_blocks_before_filemark,
         final_parity_map_tape_file_blocks: control.final_parity_map_tape_file_blocks,
-        snapshot_payload_bytes: control.snapshot_payload_bytes,
-        snapshot_blocks_before_filemark: control.snapshot_blocks_before_filemark,
-        snapshot_tape_file_blocks: control.snapshot_tape_file_blocks,
-        final_bootstrap_tape_file_blocks: control.final_bootstrap_tape_file_blocks,
+        replica_payload_bytes: control.replica_payload_bytes,
+        replica_payload_record_count: control.replica_payload_record_count,
+        replica_records_before_filemark: control.replica_records_before_filemark,
+        replica_tape_file_blocks: control.replica_tape_file_blocks,
+        triple_replica_blocks: control.triple_replica_blocks,
+        gap_nominal_bytes: input.gap_nominal_bytes,
+        gap_records_before_filemark: control.gap_records_before_filemark,
+        gap_tape_file_blocks: control.gap_tape_file_blocks,
+        double_gap_blocks: control.double_gap_blocks,
+        parity_closeout_charge_blocks: control.parity_closeout_charge_blocks,
+        terminal_tail_charge_blocks: control.terminal_tail_charge_blocks,
         safety_margin_blocks: input.safety_margin_blocks,
         close_bound_blocks: control.close_bound_blocks,
         required_tape_blocks,
@@ -718,106 +832,94 @@ pub fn evaluate_snapshot_close(
     })
 }
 
-pub fn compute_tape_reserve(
-    input: CapacityReserveInput,
-) -> Result<TapeReserveReport, CapacityError> {
-    if input.block_size_bytes == 0 {
-        return Err(CapacityError::BlockSizeZero);
-    }
-    if input.data_shards_per_epoch == 0 {
-        return Err(CapacityError::DataShardsPerEpochZero);
-    }
-    if input.current_epoch_fill_blocks >= input.data_shards_per_epoch {
-        return Err(CapacityError::CurrentEpochFillOutsideOpenEpoch);
-    }
+/// Proof-facing five-component terminal progress. Replica count is derived,
+/// never used as the state authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalTailProgress {
+    BeforeReplicaA,
+    AfterReplicaA,
+    AfterSeparationAb,
+    AfterReplicaB,
+    AfterSeparationBc,
+    AfterReplicaC,
+}
 
-    let sidecar_metadata_blocks = checked_add(checked_mul(2, input.sidecar_index_block_count)?, 1)?;
-    let sidecar_plus_parity = checked_add(sidecar_metadata_blocks, input.parity_shards_per_epoch)?;
-    let sidecar_tape_file_blocks = checked_add(sidecar_plus_parity, input.sidecar_filemark_blocks)?;
-    let bootstrap_tape_file_blocks =
-        checked_add(block_count_per_bootstrap(), input.bootstrap_filemark_blocks)?;
+/// Number of complete replicas implied by authoritative component progress.
+pub fn completed_terminal_replicas(progress: TerminalTailProgress) -> u64 {
+    match progress {
+        TerminalTailProgress::BeforeReplicaA => 0,
+        TerminalTailProgress::AfterReplicaA | TerminalTailProgress::AfterSeparationAb => 1,
+        TerminalTailProgress::AfterReplicaB | TerminalTailProgress::AfterSeparationBc => 2,
+        TerminalTailProgress::AfterReplicaC => 3,
+    }
+}
 
-    let projected_epoch_fill = checked_add(
-        input.current_epoch_fill_blocks,
-        input.projected_object_blocks,
-    )?;
-    let epochs_completed_by_object = projected_epoch_fill / input.data_shards_per_epoch;
-    let final_partial_sidecar_needed = projected_epoch_fill % input.data_shards_per_epoch != 0;
+/// Advance exactly one component only after its synchronous barrier succeeds.
+pub fn advance_terminal_progress(
+    progress: TerminalTailProgress,
+    barrier_succeeded: bool,
+) -> TerminalTailProgress {
+    if !barrier_succeeded {
+        return progress;
+    }
+    match progress {
+        TerminalTailProgress::BeforeReplicaA => TerminalTailProgress::AfterReplicaA,
+        TerminalTailProgress::AfterReplicaA => TerminalTailProgress::AfterSeparationAb,
+        TerminalTailProgress::AfterSeparationAb => TerminalTailProgress::AfterReplicaB,
+        TerminalTailProgress::AfterReplicaB => TerminalTailProgress::AfterSeparationBc,
+        TerminalTailProgress::AfterSeparationBc => TerminalTailProgress::AfterReplicaC,
+        TerminalTailProgress::AfterReplicaC => TerminalTailProgress::AfterReplicaC,
+    }
+}
 
-    let pending_sidecar_blocks =
-        checked_mul(input.pending_completed_sidecars, sidecar_tape_file_blocks)?;
-    let completed_by_object_sidecar_blocks =
-        checked_mul(epochs_completed_by_object, sidecar_tape_file_blocks)?;
-    let final_partial_sidecar_blocks = if final_partial_sidecar_needed {
-        sidecar_tape_file_blocks
+/// Finalizing is irreversible and therefore excludes later Object admission.
+pub fn object_admission_allowed(finalizing: bool) -> bool {
+    !finalizing
+}
+
+/// Ordinary sealed projection is possible only after replica C is durable.
+pub fn sealed_projection_allowed(progress: TerminalTailProgress) -> bool {
+    match progress {
+        TerminalTailProgress::AfterReplicaC => true,
+        TerminalTailProgress::BeforeReplicaA
+        | TerminalTailProgress::AfterReplicaA
+        | TerminalTailProgress::AfterSeparationAb
+        | TerminalTailProgress::AfterReplicaB
+        | TerminalTailProgress::AfterSeparationBc => false,
+    }
+}
+
+/// Proof-facing latest-valid replica selection outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalReplicaSelection {
+    ReplicaA,
+    ReplicaB,
+    ReplicaC,
+    FullBotScan,
+    Conflict,
+}
+
+/// Choose C, then B, then A. Two or more valid survivors must agree on their
+/// common edition/scope/payload facts or selection fails closed as conflict.
+pub fn select_terminal_replica(
+    replica_a_valid: bool,
+    replica_b_valid: bool,
+    replica_c_valid: bool,
+    surviving_replicas_agree: bool,
+) -> TerminalReplicaSelection {
+    let survivor_count =
+        (replica_a_valid as u8) + (replica_b_valid as u8) + (replica_c_valid as u8);
+    if survivor_count > 1 && !surviving_replicas_agree {
+        TerminalReplicaSelection::Conflict
+    } else if replica_c_valid {
+        TerminalReplicaSelection::ReplicaC
+    } else if replica_b_valid {
+        TerminalReplicaSelection::ReplicaB
+    } else if replica_a_valid {
+        TerminalReplicaSelection::ReplicaA
     } else {
-        0
-    };
-    let remaining_bootstrap_blocks =
-        checked_mul(input.remaining_bootstrap_count, bootstrap_tape_file_blocks)?;
-
-    let reserve_step1 = checked_add(input.object_filemark_blocks, pending_sidecar_blocks)?;
-    let reserve_step2 = checked_add(reserve_step1, completed_by_object_sidecar_blocks)?;
-    let reserve_step3 = checked_add(reserve_step2, final_partial_sidecar_blocks)?;
-    let reserve_step4 = checked_add(reserve_step3, remaining_bootstrap_blocks)?;
-    let reserve_after_object_blocks = checked_add(reserve_step4, input.safety_margin_blocks)?;
-    let required_tape_blocks =
-        checked_add(input.projected_object_blocks, reserve_after_object_blocks)?;
-
-    Ok(TapeReserveReport {
-        epochs_completed_by_object,
-        final_partial_sidecar_needed,
-        sidecar_tape_file_blocks,
-        bootstrap_tape_file_blocks,
-        reserve_after_object_blocks,
-        required_tape_blocks,
-    })
-}
-
-pub fn compute_spool_reserve(
-    input: CapacityReserveInput,
-    epochs_completed_by_object: u64,
-    sidecar_tape_file_blocks: u64,
-) -> Result<u64, CapacityError> {
-    let sidecar_tape_file_bytes = checked_mul(sidecar_tape_file_blocks, input.block_size_bytes)?;
-    let completed_by_object_spool_bytes =
-        checked_mul(epochs_completed_by_object, sidecar_tape_file_bytes)?;
-    checked_add(
-        input.pending_completed_epoch_parity_bytes,
-        completed_by_object_spool_bytes,
-    )
-}
-
-pub fn evaluate(input: CapacityReserveInput) -> Result<CapacityReserveReport, CapacityError> {
-    let tape = compute_tape_reserve(input)?;
-
-    if input.empty_tape_usable_blocks < tape.required_tape_blocks {
-        return Err(CapacityError::ObjectTooLargeForEmptyTape);
+        TerminalReplicaSelection::FullBotScan
     }
-
-    if input.remaining_tape_blocks < tape.required_tape_blocks {
-        return Err(CapacityError::CapacityReserveExceededTape);
-    }
-
-    let required_spool_bytes = compute_spool_reserve(
-        input,
-        tape.epochs_completed_by_object,
-        tape.sidecar_tape_file_blocks,
-    )?;
-
-    if input.remaining_spool_bytes < required_spool_bytes {
-        return Err(CapacityError::CapacityReserveExceededSpool);
-    }
-
-    Ok(CapacityReserveReport {
-        epochs_completed_by_object: tape.epochs_completed_by_object,
-        final_partial_sidecar_needed: tape.final_partial_sidecar_needed,
-        sidecar_tape_file_blocks: tape.sidecar_tape_file_blocks,
-        bootstrap_tape_file_blocks: tape.bootstrap_tape_file_blocks,
-        reserve_after_object_blocks: tape.reserve_after_object_blocks,
-        required_tape_blocks: tape.required_tape_blocks,
-        required_spool_bytes,
-    })
 }
 
 #[cfg(test)]
@@ -867,27 +969,6 @@ mod tests {
         );
     }
 
-    fn sample_input() -> CapacityReserveInput {
-        CapacityReserveInput {
-            projected_object_blocks: 20,
-            block_size_bytes: 1024,
-            current_epoch_fill_blocks: 5,
-            data_shards_per_epoch: 12,
-            parity_shards_per_epoch: 6,
-            sidecar_index_block_count: 2,
-            object_filemark_blocks: 1,
-            sidecar_filemark_blocks: 1,
-            bootstrap_filemark_blocks: 1,
-            pending_completed_sidecars: 1,
-            remaining_bootstrap_count: 2,
-            safety_margin_blocks: 3,
-            remaining_tape_blocks: 76,
-            empty_tape_usable_blocks: u64::MAX,
-            pending_completed_epoch_parity_bytes: 7 * 1024,
-            remaining_spool_bytes: 31 * 1024,
-        }
-    }
-
     #[test]
     fn drift_guard() {
         let this_file = include_str!("lib.rs");
@@ -906,59 +987,40 @@ mod tests {
             "/../../crates/remanence-parity/src/parity_map.rs"
         ))
         .expect("parity_map.rs must be readable from verif/parity-capacity");
-        let tape_index = std::fs::read_to_string(concat!(
+        let tape_index_replica = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/remanence-parity/src/tape_index.rs"
+            "/../../crates/remanence-parity/src/tape_index_replica.rs"
         ))
-        .expect("tape_index.rs must be readable from verif/parity-capacity");
+        .expect("tape_index_replica.rs must be readable from verif/parity-capacity");
+        let index_separation = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/remanence-parity/src/index_separation.rs"
+        ))
+        .expect("index_separation.rs must be readable from verif/parity-capacity");
         let replicated_control = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../crates/remanence-parity/src/replicated_control.rs"
         ))
         .expect("replicated_control.rs must be readable from verif/parity-capacity");
 
-        let snippets: &[&str] = &[
-            "if self.block_size_bytes == 0 {",
-            "if self.data_shards_per_epoch == 0 {",
-            "if self.current_epoch_fill_blocks >= self.data_shards_per_epoch {",
-            "checked_mul(2, self.sidecar_index_block_count)?",
-            "1, // footer locator",
-            "self.parity_shards_per_epoch,\n            self.sidecar_filemark_blocks,",
-            "checked_add(\n            self.block_count_per_bootstrap(),\n            self.bootstrap_filemark_blocks,",
-            "let projected_epoch_fill =\n            checked_add(self.current_epoch_fill_blocks, self.projected_object_blocks)?;",
-            "let epochs_completed_by_object = projected_epoch_fill / self.data_shards_per_epoch;",
-            "let final_partial_sidecar_needed = projected_epoch_fill % self.data_shards_per_epoch != 0;",
-            "checked_mul(self.pending_completed_sidecars, sidecar_tape_file_blocks)?;",
-            "checked_mul(epochs_completed_by_object, sidecar_tape_file_blocks)?;",
-            "checked_mul(self.remaining_bootstrap_count, bootstrap_tape_file_blocks)?;",
-            "self.empty_tape_usable_blocks < required_tape_blocks",
-            "self.remaining_tape_blocks < required_tape_blocks",
-            "checked_mul(sidecar_tape_file_blocks, self.block_size_bytes)?;",
-            "checked_mul(epochs_completed_by_object, sidecar_tape_file_bytes)?;",
-            "self.remaining_spool_bytes < required_spool_bytes",
-        ];
-        for (i, snippet) in snippets.iter().enumerate() {
-            assert!(
-                capacity.contains(snippet),
-                "snippet {i} no longer in remanence-parity capacity.rs -- original \
-                 changed; re-sync this extraction and its Lean proofs"
-            );
-        }
-
         let candidate_sources: &[(&str, &str, &[&str])] = &[
             (
                 "capacity.rs",
                 &capacity,
                 &[
-                    "pub struct SnapshotCloseInput",
-                    "pub struct SnapshotCloseReport",
+                    "pub struct TerminalTripleCloseInput",
+                    "pub struct TerminalTripleCloseReport",
                     "checked_sidecar_index_capacity_layout(",
                     "parity_map_directory_len_upper_bound(sidecar_entries_after_closeout)?",
                     "parity_map_payload_len_upper_bound(sidecar_entries_after_closeout)?",
-                    "structural_entry_count: structural_entries_after_closeout",
-                    "object_row_count: object_rows_after",
-                    "let required_tape_blocks = checked_add(object_commit_charge_blocks, close_bound_blocks)?;",
-                    "if self.empty_tape_usable_blocks < required_tape_blocks",
+                    "let triple_replica_blocks = checked_mul(3, replica_tape_file_blocks)?;",
+                    "let double_gap_blocks = checked_mul(2, gap_tape_file_blocks)?;",
+                    "let parity_closeout_charge_blocks = checked_add(",
+                    "let terminal_tail_charge_blocks = checked_add(triple_replica_blocks, double_gap_blocks)?;",
+                    "let required_tape_blocks = checked_add(prefix_commit_charge_blocks, close_bound_blocks)?;",
+                    "self.capacity_basis_blocks",
+                    "self.low_watermark_blocks",
+                    "self.high_watermark_blocks",
                     "if self.remaining_tape_blocks < required_tape_blocks",
                     "if self.remaining_spool_bytes < required_spool_bytes",
                 ],
@@ -971,7 +1033,7 @@ mod tests {
                     "let after_parity = pack_index_segment(",
                     "let after_data = pack_index_segment(",
                     "let layout = checked_sidecar_index_capacity_layout(",
-                    "u32::try_from(layout.block_count)",
+                    "Ok((layout.block_count, layout.inline_entry_bytes))",
                 ],
             ),
             (
@@ -986,15 +1048,19 @@ mod tests {
                 ],
             ),
             (
-                "tape_index.rs",
-                &tape_index,
+                "tape_index_replica.rs",
+                &tape_index_replica,
                 &[
-                    "pub const TAPE_INDEX_SNAPSHOT_HEADER_LEN: usize = 0x200;",
-                    "pub const TAPE_INDEX_STRUCTURAL_SLOT_LEN: u64 = 64;",
-                    "pub const TAPE_INDEX_OBJECT_ROW_SLOT_LEN: u64 = 256;",
-                    "if counts.object_row_count > counts.structural_entry_count",
-                    "pub fn tape_index_snapshot_layout(",
+                    "pub fn checked_tape_index_payload_len(",
+                    "pub fn checked_tape_index_replica_layout(",
+                    "let replica_record_count =",
+                    "payload_record_count",
                 ],
+            ),
+            (
+                "index_separation.rs",
+                &index_separation,
+                &["pub fn index_separation_records(", "let adjusted = extent_bytes.checked_add("],
             ),
             (
                 "replicated_control.rs",
@@ -1020,10 +1086,10 @@ mod tests {
             (
                 "capacity.rs",
                 &capacity,
-                "impl SnapshotCloseInput {",
-                "\nimpl CapacityReserveInput {",
-                15_766,
-                0xc983_0f45_f6cf_c77e,
+                "impl TerminalTripleCloseInput {",
+                "\nfn checked_add(",
+                20_542,
+                0x5f89_ec53_8caa_3d97,
             ),
             (
                 "sidecar.rs scalar packing",
@@ -1038,8 +1104,8 @@ mod tests {
                 &sidecar,
                 "fn compute_index_layout(",
                 "\nfn entry_kinds(",
-                830,
-                0x4663_278b_d1a1_d2dc,
+                594,
+                0x8829_827e_de38_c4be,
             ),
             (
                 "parity_map.rs bounds",
@@ -1048,30 +1114,6 @@ mod tests {
                 "\n/// Directory flag:",
                 1_665,
                 0xbaef_a316_1912_c258,
-            ),
-            (
-                "tape_index.rs constants",
-                &tape_index,
-                "pub const TAPE_INDEX_SNAPSHOT_HEADER_LEN",
-                "\nconst TAPE_INDEX_HEADER_MAGIC_MESSAGE",
-                1_309,
-                0x1449_9f0e_bd15_9869,
-            ),
-            (
-                "tape_index.rs layout",
-                &tape_index,
-                "pub fn tape_index_snapshot_layout(",
-                "\n/// Derive the HMAC-domain header magic",
-                883,
-                0xcd46_e2af_d46c_bdaf,
-            ),
-            (
-                "tape_index.rs payload formula",
-                &tape_index,
-                "fn validate_snapshot_counts(",
-                "\nfn validate_snapshot_descriptor(",
-                1_031,
-                0xe217_55e0_93ea_a776,
             ),
             (
                 "replicated_control.rs layout",
@@ -1096,25 +1138,15 @@ mod tests {
         }
 
         let extraction_snippets: &[&str] = &[
-            "checked_add(checked_mul(2, input.sidecar_index_block_count)?, 1)?",
-            "let sidecar_plus_parity = checked_add(sidecar_metadata_blocks, input.parity_shards_per_epoch)?;",
-            "let sidecar_tape_file_blocks = checked_add(sidecar_plus_parity, input.sidecar_filemark_blocks)?;",
-            "let bootstrap_tape_file_blocks =\n        checked_add(block_count_per_bootstrap(), input.bootstrap_filemark_blocks)?;",
-            "let epochs_completed_by_object = projected_epoch_fill / input.data_shards_per_epoch;",
-            "let final_partial_sidecar_needed = projected_epoch_fill % input.data_shards_per_epoch != 0;",
-            "let reserve_step1 = checked_add(input.object_filemark_blocks, pending_sidecar_blocks)?;",
-            "let reserve_step2 = checked_add(reserve_step1, completed_by_object_sidecar_blocks)?;",
-            "let reserve_step3 = checked_add(reserve_step2, final_partial_sidecar_blocks)?;",
-            "let reserve_step4 = checked_add(reserve_step3, remaining_bootstrap_blocks)?;",
-            "let tape = compute_tape_reserve(input)?;",
-            "let sidecar_tape_file_bytes = checked_mul(sidecar_tape_file_blocks, input.block_size_bytes)?;",
-            "let completed_by_object_spool_bytes =\n        checked_mul(epochs_completed_by_object, sidecar_tape_file_bytes)?;",
             "pub fn checked_sidecar_index_capacity_layout(",
             "pub fn parity_map_directory_len_upper_bound(",
             "pub fn parity_map_payload_len_upper_bound(",
+            "pub fn checked_parity_map_capacity_layout(",
             "pub fn replicated_control_total_blocks(",
-            "pub fn snapshot_payload_bytes(",
-            "pub fn evaluate_snapshot_close(",
+            "pub fn terminal_payload_bytes(",
+            "pub fn terminal_replica_layout(",
+            "pub fn index_separation_records(",
+            "pub fn evaluate_terminal_close(",
         ];
         for (i, snippet) in extraction_snippets.iter().enumerate() {
             assert!(
@@ -1124,8 +1156,11 @@ mod tests {
         }
     }
 
-    fn production_snapshot_input(input: SnapshotCloseInput) -> production::SnapshotCloseInput {
-        production::SnapshotCloseInput {
+    fn production_terminal_input(
+        input: TerminalTripleCloseInput,
+    ) -> production::TerminalTripleCloseInput {
+        production::TerminalTripleCloseInput {
+            projected_object_present: input.projected_object_present,
             projected_object_blocks: input.projected_object_blocks,
             block_size_bytes: u32::try_from(input.block_size_bytes)
                 .expect("behavior matrix block size fits u32"),
@@ -1139,19 +1174,24 @@ mod tests {
             object_filemark_blocks: input.object_filemark_blocks,
             sidecar_filemark_blocks: input.sidecar_filemark_blocks,
             parity_map_filemark_blocks: input.parity_map_filemark_blocks,
-            snapshot_filemark_blocks: input.snapshot_filemark_blocks,
-            bootstrap_filemark_blocks: input.bootstrap_filemark_blocks,
+            replica_filemark_blocks: input.replica_filemark_blocks,
+            gap_filemark_blocks: input.gap_filemark_blocks,
+            gap_nominal_bytes: input.gap_nominal_bytes,
             safety_margin_blocks: input.safety_margin_blocks,
             remaining_tape_blocks: input.remaining_tape_blocks,
-            empty_tape_usable_blocks: input.empty_tape_usable_blocks,
+            capacity_basis_blocks: input.capacity_basis_blocks,
+            low_watermark_blocks: input.low_watermark_blocks,
             high_watermark_blocks: input.high_watermark_blocks,
             pending_completed_epoch_parity_bytes: input.pending_completed_epoch_parity_bytes,
             remaining_spool_bytes: input.remaining_spool_bytes,
         }
     }
 
-    fn localize_production_report(report: production::SnapshotCloseReport) -> SnapshotCloseReport {
-        SnapshotCloseReport {
+    fn localize_production_report(
+        report: production::TerminalTripleCloseReport,
+    ) -> TerminalTripleCloseReport {
+        TerminalTripleCloseReport {
+            projected_object_present: report.projected_object_present,
             epochs_completed_by_object: report.epochs_completed_by_object,
             final_partial_sidecar_needed: report.final_partial_sidecar_needed,
             sidecar_index_block_count: report.sidecar_index_block_count,
@@ -1160,7 +1200,7 @@ mod tests {
             sidecars_emitted_by_commit: report.sidecars_emitted_by_commit,
             sidecar_blocks_emitted_by_commit: report.sidecar_blocks_emitted_by_commit,
             object_tape_file_blocks: report.object_tape_file_blocks,
-            object_commit_charge_blocks: report.object_commit_charge_blocks,
+            prefix_commit_charge_blocks: report.prefix_commit_charge_blocks,
             object_rows_after: report.object_rows_after,
             sidecar_entries_after_closeout: report.sidecar_entries_after_closeout,
             maximum_sidecar_entries_for_capacity: report.maximum_sidecar_entries_for_capacity,
@@ -1171,10 +1211,17 @@ mod tests {
             final_parity_map_payload_bound_bytes: report.final_parity_map_payload_bound_bytes,
             final_parity_map_blocks_before_filemark: report.final_parity_map_blocks_before_filemark,
             final_parity_map_tape_file_blocks: report.final_parity_map_tape_file_blocks,
-            snapshot_payload_bytes: report.snapshot_payload_bytes,
-            snapshot_blocks_before_filemark: report.snapshot_blocks_before_filemark,
-            snapshot_tape_file_blocks: report.snapshot_tape_file_blocks,
-            final_bootstrap_tape_file_blocks: report.final_bootstrap_tape_file_blocks,
+            replica_payload_bytes: report.replica_payload_bytes,
+            replica_payload_record_count: report.replica_payload_record_count,
+            replica_records_before_filemark: report.replica_records_before_filemark,
+            replica_tape_file_blocks: report.replica_tape_file_blocks,
+            triple_replica_blocks: report.triple_replica_blocks,
+            gap_nominal_bytes: report.gap_nominal_bytes,
+            gap_records_before_filemark: report.gap_records_before_filemark,
+            gap_tape_file_blocks: report.gap_tape_file_blocks,
+            double_gap_blocks: report.double_gap_blocks,
+            parity_closeout_charge_blocks: report.parity_closeout_charge_blocks,
+            terminal_tail_charge_blocks: report.terminal_tail_charge_blocks,
             safety_margin_blocks: report.safety_margin_blocks,
             close_bound_blocks: report.close_bound_blocks,
             required_tape_blocks: report.required_tape_blocks,
@@ -1182,8 +1229,8 @@ mod tests {
         }
     }
 
-    fn production_snapshot_report(input: SnapshotCloseInput) -> SnapshotCloseReport {
-        production_snapshot_input(input)
+    fn production_terminal_report(input: TerminalTripleCloseInput) -> TerminalTripleCloseReport {
+        production_terminal_input(input)
             .evaluate()
             .map(localize_production_report)
             .unwrap_or_else(|error| {
@@ -1191,9 +1238,56 @@ mod tests {
             })
     }
 
+    fn assert_terminal_reports_equal(
+        actual: TerminalTripleCloseReport,
+        expected: TerminalTripleCloseReport,
+    ) {
+        macro_rules! assert_fields_equal {
+            ($($field:ident),+ $(,)?) => {
+                $(assert_eq!(actual.$field, expected.$field, stringify!($field));)+
+            };
+        }
+        assert_fields_equal!(
+            projected_object_present,
+            epochs_completed_by_object,
+            final_partial_sidecar_needed,
+            sidecar_index_block_count,
+            sidecar_blocks_before_filemark,
+            sidecar_tape_file_blocks,
+            sidecars_emitted_by_commit,
+            sidecar_blocks_emitted_by_commit,
+            object_tape_file_blocks,
+            prefix_commit_charge_blocks,
+            object_rows_after,
+            sidecar_entries_after_closeout,
+            maximum_sidecar_entries_for_capacity,
+            structural_entries_after_closeout,
+            final_partial_sidecar_blocks,
+            final_parity_map_needed,
+            final_parity_map_directory_bound_bytes,
+            final_parity_map_payload_bound_bytes,
+            final_parity_map_blocks_before_filemark,
+            final_parity_map_tape_file_blocks,
+            replica_payload_bytes,
+            replica_payload_record_count,
+            replica_records_before_filemark,
+            replica_tape_file_blocks,
+            triple_replica_blocks,
+            gap_nominal_bytes,
+            gap_records_before_filemark,
+            gap_tape_file_blocks,
+            double_gap_blocks,
+            parity_closeout_charge_blocks,
+            terminal_tail_charge_blocks,
+            safety_margin_blocks,
+            close_bound_blocks,
+            required_tape_blocks,
+            required_spool_bytes,
+        );
+    }
+
     fn local_gate(error: CapacityError) -> &'static str {
         match error {
-            CapacityError::ObjectTooLargeForEmptyTape => "empty-tape",
             CapacityError::CapacityReserveExceededTape => "current-tape",
             CapacityError::CapacityReserveExceededSpool => "spool",
             other => panic!("unexpected extraction error in gate matrix: {other:?}"),
@@ -1202,7 +1296,6 @@ mod tests {
 
     fn production_gate(error: production::ParityError) -> &'static str {
         match error {
-            production::ParityError::ObjectTooLargeForEmptyTape { .. } => "empty-tape",
             production::ParityError::CapacityReserveExceeded {
                 cause: production::CapacityReserveCause::TapeCapacity,
                 ..
@@ -1225,7 +1318,7 @@ mod tests {
     fn production_profile_failure(error: production::ParityError) -> &'static str {
         match error {
             production::ParityError::InvalidScheme(message)
-                if message.starts_with("unsafe snapshot close capacity profile:") =>
+                if message.starts_with("unsafe terminal close capacity profile:") =>
             {
                 "unsafe-capacity-profile"
             }
@@ -1233,28 +1326,143 @@ mod tests {
         }
     }
 
-    fn local_structural_capacity_failure(error: CapacityError) -> &'static str {
-        match error {
-            CapacityError::StructuralEntriesExceedCapacity => "structural-capacity",
-            other => panic!("unexpected extraction structural-capacity error: {other:?}"),
-        }
-    }
-
-    fn production_structural_capacity_failure(error: production::ParityError) -> &'static str {
-        match error {
-            production::ParityError::Invariant(
-                "snapshot close committed structural entries exceed physical capacity bound",
-            ) => "structural-capacity",
-            other => panic!("unexpected production structural-capacity error: {other:?}"),
+    fn terminal_close_input() -> TerminalTripleCloseInput {
+        TerminalTripleCloseInput {
+            projected_object_present: true,
+            projected_object_blocks: 100,
+            block_size_bytes: 256 * 1024,
+            current_epoch_fill_blocks: 0,
+            data_shards_per_epoch: 512 * 128,
+            parity_shards_per_epoch: 512 * 4,
+            pending_completed_sidecars: 0,
+            sidecar_entries_before_object: 0,
+            structural_entries_before_object: 1,
+            object_rows_before_object: 0,
+            object_filemark_blocks: 1,
+            sidecar_filemark_blocks: 1,
+            parity_map_filemark_blocks: 1,
+            replica_filemark_blocks: 1,
+            gap_filemark_blocks: 1,
+            gap_nominal_bytes: 1 << 30,
+            safety_margin_blocks: 4,
+            remaining_tape_blocks: 10_371,
+            capacity_basis_blocks: 10_371,
+            low_watermark_blocks: 0,
+            high_watermark_blocks: 65,
+            pending_completed_epoch_parity_bytes: 0,
+            remaining_spool_bytes: u64::MAX,
         }
     }
 
     #[test]
-    fn drift_guard_snapshot_helpers_match_compiled_production_boundaries() {
-        let counts = [0, 1, 7, 8, 15, 16, 17, 255, 256, 257];
+    fn terminal_progress_and_selection_contract() {
+        let states = [
+            TerminalTailProgress::BeforeReplicaA,
+            TerminalTailProgress::AfterReplicaA,
+            TerminalTailProgress::AfterSeparationAb,
+            TerminalTailProgress::AfterReplicaB,
+            TerminalTailProgress::AfterSeparationBc,
+            TerminalTailProgress::AfterReplicaC,
+        ];
+        for state in states {
+            assert_eq!(advance_terminal_progress(state, false), state);
+            assert!(
+                completed_terminal_replicas(advance_terminal_progress(state, true))
+                    >= completed_terminal_replicas(state)
+            );
+        }
+        assert!(!object_admission_allowed(true));
+        assert!(object_admission_allowed(false));
+        assert!(sealed_projection_allowed(
+            TerminalTailProgress::AfterReplicaC
+        ));
+        assert!(!sealed_projection_allowed(
+            TerminalTailProgress::AfterSeparationBc
+        ));
+
+        assert_eq!(
+            select_terminal_replica(true, true, true, true),
+            TerminalReplicaSelection::ReplicaC
+        );
+        assert_eq!(
+            select_terminal_replica(true, true, false, true),
+            TerminalReplicaSelection::ReplicaB
+        );
+        assert_eq!(
+            select_terminal_replica(true, false, false, false),
+            TerminalReplicaSelection::ReplicaA
+        );
+        assert_eq!(
+            select_terminal_replica(false, false, false, false),
+            TerminalReplicaSelection::FullBotScan
+        );
+        assert_eq!(
+            select_terminal_replica(true, false, true, false),
+            TerminalReplicaSelection::Conflict
+        );
+    }
+
+    #[test]
+    fn no_parity_terminal_close_matches_production_without_sidecar_terms() {
+        let mut input = terminal_close_input();
+        input.parity_shards_per_epoch = 0;
+        input.data_shards_per_epoch = 1;
+        let local = evaluate_terminal_close(input).unwrap();
+        let production = production_terminal_report(input);
+        assert_terminal_reports_equal(local, production);
+        assert_eq!(local.sidecar_index_block_count, 0);
+        assert_eq!(local.sidecar_blocks_before_filemark, 0);
+        assert_eq!(local.sidecar_tape_file_blocks, 0);
+        assert_eq!(local.parity_closeout_charge_blocks, 0);
+        assert_eq!(local.required_spool_bytes, 0);
+        assert!(!local.final_parity_map_needed);
+    }
+
+    #[test]
+    fn drift_guard_terminal_helpers_match_compiled_production_boundaries() {
+        let counts = [1, 2, 4_095, 4_096, 4_097];
+        for block_size in [256 * 1024, 512 * 1024, 1024 * 1024] {
+            for structural in counts {
+                for object_rows in [0, 1, structural] {
+                    let extracted =
+                        terminal_replica_layout(block_size, structural, object_rows).unwrap();
+                    let compiled = production::checked_tape_index_replica_layout(
+                        u32::try_from(block_size).unwrap(),
+                        production::TapeIndexReplicaCounts {
+                            structural_entry_count: structural,
+                            object_row_count: object_rows,
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        extracted,
+                        (
+                            compiled.payload_len,
+                            compiled.payload_record_count,
+                            compiled.replica_record_count,
+                        ),
+                        "replica geometry drift for B={block_size}, S={structural}, R={object_rows}"
+                    );
+                }
+            }
+
+            for extent_bytes in [2 * block_size - 1, 2 * block_size, (1u64 << 30) + 1] {
+                assert_eq!(
+                    index_separation_records(block_size, extent_bytes).ok(),
+                    production::index_separation_records(
+                        u32::try_from(block_size).unwrap(),
+                        extent_bytes,
+                    )
+                    .ok(),
+                    "gap geometry drift for B={block_size}, E={extent_bytes}"
+                );
+            }
+        }
+
+        let sidecar_counts = [0, 1, 7, 8, 15, 16, 17, 255, 256, 257];
         for block_size in [192, 200, 256, 512, 256 * 1024] {
-            for parity_count in counts {
-                for data_count in counts {
+            for parity_count in sidecar_counts {
+                for data_count in sidecar_counts {
                     let extracted =
                         checked_sidecar_index_capacity_layout(block_size, parity_count, data_count)
                             .map(|layout| (layout.block_count, layout.inline_entry_bytes));
@@ -1265,10 +1473,7 @@ mod tests {
                     )
                     .map(|layout| (layout.block_count, layout.inline_entry_bytes))
                     .map_err(|_| CapacityError::SidecarEntryDoesNotFit);
-                    assert_eq!(
-                        extracted, compiled,
-                        "sidecar layout drift for B={block_size}, P={parity_count}, D={data_count}"
-                    );
+                    assert_eq!(extracted, compiled);
                 }
             }
         }
@@ -1283,380 +1488,211 @@ mod tests {
         ] {
             assert_eq!(
                 parity_map_directory_len_upper_bound(entry_count).ok(),
-                production::parity_map_directory_len_upper_bound(entry_count).ok(),
-                "ParityMap directory bound drift for N={entry_count}"
+                production::parity_map_directory_len_upper_bound(entry_count).ok()
             );
             assert_eq!(
                 parity_map_payload_len_upper_bound(entry_count).ok(),
-                production::parity_map_payload_len_upper_bound(entry_count).ok(),
-                "ParityMap payload bound drift for N={entry_count}"
+                production::parity_map_payload_len_upper_bound(entry_count).ok()
             );
         }
 
         for block_size in [256 * 1024, 512 * 1024, 1024 * 1024] {
             for (data_shards, parity_shards) in [(1u64, 1u64), (2, 1), (65_536, 2_048)] {
-                for projected_object_blocks in [
-                    0,
-                    1,
-                    data_shards.saturating_sub(1),
-                    data_shards,
-                    data_shards + 1,
+                for (projected_object_present, projected_object_blocks) in [
+                    (false, 0),
+                    (true, 1),
+                    (true, data_shards),
+                    (true, data_shards + 1),
                 ] {
-                    for current_epoch_fill_blocks in [0, data_shards - 1] {
-                        for pending_completed_sidecars in [0, 1] {
-                            let input = SnapshotCloseInput {
-                                projected_object_blocks,
-                                block_size_bytes: block_size,
-                                current_epoch_fill_blocks,
-                                data_shards_per_epoch: data_shards,
-                                parity_shards_per_epoch: parity_shards,
-                                pending_completed_sidecars,
-                                sidecar_entries_before_object: 1,
-                                structural_entries_before_object: 4,
-                                object_rows_before_object: 2,
-                                object_filemark_blocks: 1,
-                                sidecar_filemark_blocks: 1,
-                                parity_map_filemark_blocks: 1,
-                                snapshot_filemark_blocks: 1,
-                                bootstrap_filemark_blocks: 1,
-                                safety_margin_blocks: 4,
-                                remaining_tape_blocks: 10_000_000,
-                                empty_tape_usable_blocks: 10_000_000,
-                                high_watermark_blocks: 9_800_000,
-                                pending_completed_epoch_parity_bytes: 17,
-                                remaining_spool_bytes: u64::MAX,
-                            };
-                            let extracted =
-                                evaluate_snapshot_close(input).unwrap_or_else(|error| {
-                                    panic!("extraction rejected {input:?}: {error:?}")
-                                });
-                            assert_eq!(
-                                extracted,
-                                production_snapshot_report(input),
-                                "snapshot-close report drift for input {input:?}"
-                            );
-                        }
-                    }
+                    let input = TerminalTripleCloseInput {
+                        projected_object_present,
+                        projected_object_blocks,
+                        block_size_bytes: block_size,
+                        current_epoch_fill_blocks: 0,
+                        data_shards_per_epoch: data_shards,
+                        parity_shards_per_epoch: parity_shards,
+                        pending_completed_sidecars: 0,
+                        sidecar_entries_before_object: 1,
+                        structural_entries_before_object: 4,
+                        object_rows_before_object: 2,
+                        object_filemark_blocks: 1,
+                        sidecar_filemark_blocks: 1,
+                        parity_map_filemark_blocks: 1,
+                        replica_filemark_blocks: 1,
+                        gap_filemark_blocks: 1,
+                        gap_nominal_bytes: 1 << 30,
+                        safety_margin_blocks: 4,
+                        remaining_tape_blocks: 10_000_000,
+                        capacity_basis_blocks: 10_000_000,
+                        low_watermark_blocks: 9_200_000,
+                        high_watermark_blocks: 9_800_000,
+                        pending_completed_epoch_parity_bytes: 17,
+                        remaining_spool_bytes: u64::MAX,
+                    };
+                    let extracted = evaluate_terminal_close(input)
+                        .unwrap_or_else(|error| panic!("extraction rejected {input:?}: {error:?}"));
+                    assert_terminal_reports_equal(extracted, production_terminal_report(input));
                 }
             }
         }
+    }
 
-        let baseline = SnapshotCloseInput {
-            projected_object_blocks: 65_536,
-            block_size_bytes: 256 * 1024,
-            current_epoch_fill_blocks: 0,
-            data_shards_per_epoch: 65_536,
-            parity_shards_per_epoch: 2_048,
-            pending_completed_sidecars: 1,
-            sidecar_entries_before_object: 1,
-            structural_entries_before_object: 4,
-            object_rows_before_object: 2,
-            object_filemark_blocks: 1,
-            sidecar_filemark_blocks: 1,
-            parity_map_filemark_blocks: 1,
-            snapshot_filemark_blocks: 1,
-            bootstrap_filemark_blocks: 1,
-            safety_margin_blocks: 4,
-            remaining_tape_blocks: 10_000_000,
-            empty_tape_usable_blocks: 10_000_000,
-            high_watermark_blocks: 9_800_000,
-            pending_completed_epoch_parity_bytes: 17,
-            remaining_spool_bytes: u64::MAX,
+    #[test]
+    fn terminal_close_fixture_and_manual_close_match_production() {
+        let input = terminal_close_input();
+        let report = evaluate_terminal_close(input).expect("close fits");
+        assert_terminal_reports_equal(report, production_terminal_report(input));
+        assert_eq!(report.prefix_commit_charge_blocks, 101);
+        assert_eq!(report.replica_payload_bytes, 512);
+        assert_eq!(report.triple_replica_blocks, 12);
+        assert_eq!(report.double_gap_blocks, 8_194);
+        assert_eq!(report.parity_closeout_charge_blocks, 2_056);
+        assert_eq!(report.close_bound_blocks, 10_266);
+        assert_eq!(report.required_tape_blocks, 10_367);
+
+        let manual = TerminalTripleCloseInput {
+            projected_object_present: false,
+            projected_object_blocks: 0,
+            current_epoch_fill_blocks: 100,
+            structural_entries_before_object: 2,
+            object_rows_before_object: 1,
+            remaining_tape_blocks: 999_900,
+            capacity_basis_blocks: 1_000_000,
+            low_watermark_blocks: 920_000,
+            high_watermark_blocks: 980_000,
+            ..input
         };
-        let report = evaluate_snapshot_close(baseline).expect("baseline close fits");
-        let gate_inputs = [
-            SnapshotCloseInput {
-                empty_tape_usable_blocks: report.required_tape_blocks - 1,
+        let report = evaluate_terminal_close(manual).expect("manual close fits");
+        assert_terminal_reports_equal(report, production_terminal_report(manual));
+        assert_eq!(report.object_tape_file_blocks, 0);
+        assert_eq!(report.object_rows_after, 1);
+        assert_eq!(report.required_tape_blocks, report.close_bound_blocks);
+    }
+
+    #[test]
+    fn terminal_close_gate_order_and_fail_closed_profile_match_production() {
+        let baseline = TerminalTripleCloseInput {
+            projected_object_blocks: 65_536,
+            remaining_tape_blocks: 1_000_000,
+            capacity_basis_blocks: 1_000_000,
+            low_watermark_blocks: 0,
+            high_watermark_blocks: 1,
+            ..terminal_close_input()
+        };
+        let report = evaluate_terminal_close(baseline).expect("baseline close fits");
+
+        for input in [
+            TerminalTripleCloseInput {
+                capacity_basis_blocks: report.required_tape_blocks - 1,
                 remaining_tape_blocks: report.required_tape_blocks - 1,
-                high_watermark_blocks: 0,
+                low_watermark_blocks: 0,
+                high_watermark_blocks: 1,
                 ..baseline
             },
-            SnapshotCloseInput {
-                empty_tape_usable_blocks: report.required_tape_blocks,
+            TerminalTripleCloseInput {
+                capacity_basis_blocks: report.required_tape_blocks,
                 remaining_tape_blocks: report.required_tape_blocks - 1,
-                high_watermark_blocks: 0,
+                low_watermark_blocks: 0,
+                high_watermark_blocks: 1,
                 ..baseline
             },
-            SnapshotCloseInput {
-                empty_tape_usable_blocks: report.required_tape_blocks,
+            TerminalTripleCloseInput {
+                capacity_basis_blocks: report.required_tape_blocks,
                 remaining_tape_blocks: report.required_tape_blocks,
-                high_watermark_blocks: 0,
+                low_watermark_blocks: 0,
+                high_watermark_blocks: 1,
                 remaining_spool_bytes: report.required_spool_bytes - 1,
                 ..baseline
             },
-        ];
-        for input in gate_inputs {
-            let extracted = local_gate(evaluate_snapshot_close(input).unwrap_err());
-            let compiled =
-                production_gate(production_snapshot_input(input).evaluate().unwrap_err());
-            assert_eq!(extracted, compiled, "gate-order drift for input {input:?}");
+        ] {
+            assert_eq!(
+                local_gate(evaluate_terminal_close(input).unwrap_err()),
+                production_gate(production_terminal_input(input).evaluate().unwrap_err())
+            );
         }
 
-        let unsafe_profile = SnapshotCloseInput {
-            empty_tape_usable_blocks: u64::MAX,
-            remaining_tape_blocks: u64::MAX,
-            ..baseline
-        };
-        assert_eq!(
-            local_profile_failure(evaluate_snapshot_close(unsafe_profile).unwrap_err()),
-            production_profile_failure(
-                production_snapshot_input(unsafe_profile)
-                    .evaluate()
-                    .unwrap_err()
-            )
-        );
-
-        let physically_unusable_profile = SnapshotCloseInput {
-            data_shards_per_epoch: 2_000,
-            parity_shards_per_epoch: 1_000,
-            empty_tape_usable_blocks: 1_000,
-            remaining_tape_blocks: 1_000,
-            high_watermark_blocks: 0,
-            ..baseline
-        };
-        assert_eq!(
-            local_profile_failure(
-                evaluate_snapshot_close(physically_unusable_profile).unwrap_err()
-            ),
-            production_profile_failure(
-                production_snapshot_input(physically_unusable_profile)
-                    .evaluate()
-                    .unwrap_err()
-            )
-        );
-
-        let physically_unusable_close_profile = SnapshotCloseInput {
-            empty_tape_usable_blocks: 2_060,
-            remaining_tape_blocks: 2_060,
-            high_watermark_blocks: 0,
-            ..snapshot_close_input()
-        };
-        assert_eq!(
-            local_profile_failure(
-                evaluate_snapshot_close(physically_unusable_close_profile).unwrap_err()
-            ),
-            production_profile_failure(
-                production_snapshot_input(physically_unusable_close_profile)
-                    .evaluate()
-                    .unwrap_err()
-            )
-        );
-
-        let closeout_band_too_narrow = SnapshotCloseInput {
-            high_watermark_blocks: 100,
-            ..snapshot_close_input()
-        };
-        assert_eq!(
-            local_profile_failure(evaluate_snapshot_close(closeout_band_too_narrow).unwrap_err()),
-            production_profile_failure(
-                production_snapshot_input(closeout_band_too_narrow)
-                    .evaluate()
-                    .unwrap_err()
-            )
-        );
-
-        let invalid_high_watermark = SnapshotCloseInput {
-            high_watermark_blocks: 2_172,
-            ..snapshot_close_input()
-        };
-        assert_eq!(
-            local_profile_failure(evaluate_snapshot_close(invalid_high_watermark).unwrap_err()),
-            production_profile_failure(
-                production_snapshot_input(invalid_high_watermark)
-                    .evaluate()
-                    .unwrap_err()
-            )
-        );
-
-        let structurally_impossible_prefix = SnapshotCloseInput {
-            structural_entries_before_object: 10_000_001,
-            ..baseline
-        };
-        assert_eq!(
-            local_structural_capacity_failure(
-                evaluate_snapshot_close(structurally_impossible_prefix).unwrap_err()
-            ),
-            production_structural_capacity_failure(
-                production_snapshot_input(structurally_impossible_prefix)
-                    .evaluate()
-                    .unwrap_err()
-            )
-        );
-    }
-
-    fn snapshot_close_input() -> SnapshotCloseInput {
-        SnapshotCloseInput {
-            projected_object_blocks: 100,
-            block_size_bytes: 256 * 1024,
-            current_epoch_fill_blocks: 0,
-            data_shards_per_epoch: 512 * 128,
-            parity_shards_per_epoch: 512 * 4,
-            pending_completed_sidecars: 0,
-            sidecar_entries_before_object: 0,
-            structural_entries_before_object: 0,
-            object_rows_before_object: 0,
-            object_filemark_blocks: 1,
-            sidecar_filemark_blocks: 1,
-            parity_map_filemark_blocks: 1,
-            snapshot_filemark_blocks: 1,
-            bootstrap_filemark_blocks: 1,
-            safety_margin_blocks: 4,
-            remaining_tape_blocks: 2_171,
-            empty_tape_usable_blocks: 2_171,
-            high_watermark_blocks: 0,
-            pending_completed_epoch_parity_bytes: 0,
-            remaining_spool_bytes: u64::MAX,
-        }
-    }
-
-    #[test]
-    fn snapshot_close_fixture_matches_production_model() {
-        let input = snapshot_close_input();
-        let report = evaluate_snapshot_close(input).expect("close fits");
-        assert_eq!(report.sidecar_index_block_count, 3);
-        assert_eq!(report.sidecar_blocks_before_filemark, 2_055);
-        assert_eq!(report.object_commit_charge_blocks, 101);
-        assert_eq!(report.structural_entries_after_closeout, 3);
-        assert_eq!(report.snapshot_payload_bytes, 448);
-        assert_eq!(report.final_parity_map_payload_bound_bytes, 441);
-        assert_eq!(report.close_bound_blocks, 2_070);
-        assert_eq!(report.required_tape_blocks, 2_171);
-
-        evaluate_snapshot_close(SnapshotCloseInput {
-            high_watermark_blocks: 97,
-            ..input
-        })
-        .expect("worst-close equality with C-H must succeed");
-    }
-
-    #[test]
-    fn snapshot_close_rejects_row_mismatch_and_capacity_shortfall() {
-        assert_eq!(
-            snapshot_payload_bytes(1, 2),
-            Err(CapacityError::ObjectRowsExceedStructuralEntries)
-        );
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                remaining_tape_blocks: 2_170,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::CapacityReserveExceededTape)
-        );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                object_rows_before_object: 1,
-                sidecar_entries_before_object: 1,
-                structural_entries_before_object: 1,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::RecoveryRowsExceedStructuralEntries)
-        );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                empty_tape_usable_blocks: u64::MAX,
+        for input in [
+            TerminalTripleCloseInput {
+                capacity_basis_blocks: u64::MAX,
                 remaining_tape_blocks: u64::MAX,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::UnsafeCapacityProfile)
-        );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
+                low_watermark_blocks: 0,
+                high_watermark_blocks: 1,
+                ..baseline
+            },
+            TerminalTripleCloseInput {
                 data_shards_per_epoch: 2_000,
                 parity_shards_per_epoch: 1_000,
-                empty_tape_usable_blocks: 1_000,
+                capacity_basis_blocks: 1_000,
                 remaining_tape_blocks: 1_000,
-                high_watermark_blocks: 0,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::UnsafeCapacityProfile)
-        );
+                low_watermark_blocks: 0,
+                high_watermark_blocks: 1,
+                ..baseline
+            },
+            TerminalTripleCloseInput {
+                high_watermark_blocks: terminal_close_input().high_watermark_blocks + 1,
+                ..terminal_close_input()
+            },
+        ] {
+            assert_eq!(
+                local_profile_failure(evaluate_terminal_close(input).unwrap_err()),
+                production_profile_failure(
+                    production_terminal_input(input).evaluate().unwrap_err()
+                )
+            );
+        }
 
         assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                empty_tape_usable_blocks: 2_060,
-                remaining_tape_blocks: 2_060,
-                high_watermark_blocks: 0,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::UnsafeCapacityProfile)
+            terminal_payload_bytes(1, 2),
+            Err(CapacityError::ObjectRowsExceedStructuralEntries)
         );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                high_watermark_blocks: 100,
-                ..snapshot_close_input()
+        assert!(matches!(
+            evaluate_terminal_close(TerminalTripleCloseInput {
+                projected_object_present: false,
+                projected_object_blocks: 1,
+                ..terminal_close_input()
             }),
-            Err(CapacityError::UnsafeCapacityProfile)
-        );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                high_watermark_blocks: 2_172,
-                ..snapshot_close_input()
+            Err(CapacityError::ProjectedObjectPresenceMismatch)
+        ));
+        assert!(matches!(
+            evaluate_terminal_close(TerminalTripleCloseInput {
+                structural_entries_before_object: 0,
+                ..terminal_close_input()
             }),
-            Err(CapacityError::UnsafeCapacityProfile)
-        );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                structural_entries_before_object: 2_172,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::StructuralEntriesExceedCapacity)
-        );
-
-        assert_eq!(
-            evaluate_snapshot_close(SnapshotCloseInput {
-                projected_object_blocks: 512 * 128 * 3,
-                empty_tape_usable_blocks: 4_111,
-                remaining_tape_blocks: 4_111,
-                ..snapshot_close_input()
-            }),
-            Err(CapacityError::ObjectTooLargeForEmptyTape)
-        );
+            Err(CapacityError::MissingBotBootstrap)
+        ));
+        let wrong_gap = TerminalTripleCloseInput {
+            gap_nominal_bytes: (1 << 30) - 1,
+            ..terminal_close_input()
+        };
+        assert!(matches!(
+            evaluate_terminal_close(wrong_gap),
+            Err(CapacityError::GapExtentSizeMismatch)
+        ));
+        assert!(matches!(
+            production_terminal_input(wrong_gap).evaluate(),
+            Err(production::ParityError::InvalidScheme(message))
+                if message.starts_with("terminal close separation extent is ")
+        ));
     }
 
     #[test]
-    fn sample_report_matches_production_fixture() {
-        let report = evaluate(sample_input()).expect("reserve fits");
-        assert_eq!(report.epochs_completed_by_object, 2);
-        assert!(report.final_partial_sidecar_needed);
-        assert_eq!(report.sidecar_tape_file_blocks, 12);
-        assert_eq!(report.bootstrap_tape_file_blocks, 2);
-        assert_eq!(report.reserve_after_object_blocks, 56);
-        assert_eq!(report.required_tape_blocks, 76);
-        assert_eq!(report.required_spool_bytes, 31 * 1024);
+    fn external_parity_map_boundary_and_count_are_checked() {
+        let within = checked_parity_map_capacity_layout(4096, 30, 1).unwrap();
+        assert_eq!(within.payload_bound_bytes, 3805);
+        assert_eq!(within.blocks_before_filemark, 3);
+        assert_eq!(within.tape_file_blocks, 4);
+
+        let crossed = checked_parity_map_capacity_layout(4096, 31, 1).unwrap();
+        assert_eq!(crossed.payload_bound_bytes, 3921);
+        assert_eq!(crossed.blocks_before_filemark, 5);
+        assert_eq!(crossed.tape_file_blocks, 6);
     }
 
     #[test]
-    fn gate_order_matches_production_capacity_distinctions() {
+    fn external_parity_map_overflow_fails_closed() {
         assert_eq!(
-            evaluate(CapacityReserveInput {
-                empty_tape_usable_blocks: 75,
-                remaining_tape_blocks: 75,
-                ..sample_input()
-            })
-            .unwrap_err(),
-            CapacityError::ObjectTooLargeForEmptyTape
-        );
-        assert_eq!(
-            evaluate(CapacityReserveInput {
-                remaining_tape_blocks: 75,
-                ..sample_input()
-            })
-            .unwrap_err(),
-            CapacityError::CapacityReserveExceededTape
-        );
-        assert_eq!(
-            evaluate(CapacityReserveInput {
-                remaining_spool_bytes: 31 * 1024 - 1,
-                ..sample_input()
-            })
-            .unwrap_err(),
-            CapacityError::CapacityReserveExceededSpool
+            checked_parity_map_capacity_layout(4096, u64::MAX / 116 + 1, 1),
+            Err(CapacityError::ArithmeticOverflow)
         );
     }
 }

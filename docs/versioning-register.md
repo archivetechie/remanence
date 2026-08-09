@@ -70,17 +70,17 @@ documents and published artifacts themselves.
   Anything stronger — a flag whose ignorance would mislead a reader —
   requires a new `schema_major`.
 
-### 4. Bootstrap object rows — the integer-key vocabulary
+### 4. Terminal Object rows — the integer-key vocabulary
 
-- **What it is.** Inside the bootstrap payload, each stored object has a
-  row: a small map of numbered fields (1 = tape file number, 4 = object
-  identity, and so on). The set of assigned numbers is a vocabulary that
-  can grow.
+- **What it is.** Inside each of the three terminal index replica payloads,
+  each stored Object has one fixed 256-byte slot containing a small map of
+  numbered fields (1 = tape file number, 4 = object identity, and so on).
+  The sole BOT Bootstrap is Object-count independent and contains no rows.
+  The set of assigned numbers is a vocabulary that can grow.
 - **Where.** REM-PARITY §8.2.1.
 - **Current values.** Row keys 1–4, 10–13 and 21–23 are assigned; key 4
-  (`object_id`) is required from `schema_minor` 3. (Key 30 is not a row key:
-  it is the bootstrap *payload* key of §8.2 that carries the array of these
-  rows.)
+  (`object_id`) is required. Bootstrap payload key 30 is prohibited by the
+  replacement draft.
 - **Unknown value.** Readers MUST ignore unknown integer keys — this is
   the format's main extension mechanism.
 - **How it changes.** A minor revision may assign new keys. A new key MUST
@@ -94,35 +94,36 @@ documents and published artifacts themselves.
   carries a `footer_version`.
 - **Where.** Header offset 0x2C; footer offset 0x08. Normative: REM-PARITY
   §9.2, §9.6.
-- **Current values.** 1 and 1.
-- **Unknown value.** Readers MUST reject any value other than 1 —
+- **Current values.** 2 and 2 in the clean-break replacement draft.
+- **Unknown value.** Readers MUST reject any value other than 2 —
   fail-closed, unlike the bootstrap's `schema_minor`. The sidecar is
   recovery machinery; guessing about an unknown sidecar layout could
   corrupt a recovery, so refusal is the safe behaviour.
-- **How it changes.** Assigning 2 to either field is a wire change a
-  version-1 reader would refuse — permitted only through the change
-  policy's conditions, and in practice this pairs naturally with a new
-  major. The `copy_generation` field nearby is reserved and MUST be 0
-  while sidecar `schema_version` = 1.
+- **How it changes.** A later value is a wire change an earlier reader would
+  refuse and is permitted only through the change policy's conditions. The
+  `copy_generation` field nearby is reserved and MUST be 0 while sidecar
+  `schema_version` = 2.
 
-### 6. The parity map — `schema_version` and footer version
+### 6. ParityMap and terminal-control frame versions
 
-- **What it is.** The parity map is the index that locates every parity
-  group on the tape. Header and footer each carry a version.
-- **Where.** Both at offset 0x08 of their structures. Normative:
-  REM-PARITY §10.3.
-- **Current values.** 1 and 1.
-- **Unknown value.** MUST be rejected — fail-closed, same reasoning as the
-  sidecar.
-- **How it changes.** As the sidecar: effectively a major-class change.
+- **What it is.** The final pre-A ParityMap and every A/B/C replica or typed
+  separation header/footer carry a `schema_version`.
+- **Where.** Offset 0x08 of each meaningful frame. Normative: REM-PARITY §§8–10
+  and the preparing terminal byte draft.
+- **Current values.** 2 for the ParityMap header/footer; 1 for terminal replica
+  and separation frames.
+- **Unknown value.** MUST be rejected; guessing a terminal authority layout
+  could return the wrong catalog-less inventory.
+- **How it changes.** A new frame schema requires a wire-compatible extension
+  or a new major under the format change policy.
 
 ### 7. The magic labels — version bytes inside "fixed" constants
 
 - **What it is.** Every structure announces itself with magic bytes, and
-  each magic ends in a version byte: `"REM\0BOO\x01"`, `"REM\0PAR\x01"`,
-  `"REM\0PARFOOT\x01"` and `"REM\0PMAP\x01"`. The sidecar has distinct
-  header and footer labels; the parity map has one label for both.
-- **Where.** REM-PARITY §2.5. Sidecar and parity-map magics are further
+each magic label ends in a version byte. The active labels cover the BOT
+  Bootstrap, sidecar header/footer, terminal replica header/footer, and
+  separation header/footer.
+- **Where.** REM-PARITY §2.5. Every magic except the BOT Bootstrap is further
   keyed to the individual tape by HMAC, so structures cannot migrate
   between tapes.
 - **Current values.** All end `\x01`.

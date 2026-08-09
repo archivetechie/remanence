@@ -167,8 +167,28 @@ pool, and Remanence picks the tape. Pool ids may use letters, digits, and
 | `selection_policy` | string | `"complete-or-fill"` | Within-pool tape choice: `"complete-or-fill"` or `"fill-oldest"`. |
 | `watermark_low` | float | `0.92` | Fill target as a fraction of capacity; a tape at or above it is a candidate for sealing. |
 | `watermark_high` | float | `0.97` | Usable-capacity cap below end-of-media. Must satisfy `0 < low < high <= 1`. |
+| `capacity_cap` | byte size | unset | Optional conservative capacity basis `C` for this pool. Must be nonzero and strictly below the detected raw capacity of every selected cartridge; equality and upward caps are rejected. |
 | `block_size` | byte size | `262144` (256 KiB) | Fixed tape block size applied when a fresh tape is initialized into this pool. Must be exactly 256 KiB, 512 KiB, or 1 MiB. |
 | `min_object_size` | byte size | `0` | Minimum object/bundle size the orchestrator promises; checked against the watermark band. |
+
+Capacity admission subtracts the exact terminal reserve before admitting an
+Object. For block size `B`, fixed pre-A structural-row count `S`, Object-row
+count `R`, and configured separation extent record count `G`, the reserve is
+three replicas of `2 + ceil((64S + 256R)/B)` records plus two `G`-record gaps,
+five filemarks, pending parity closeout (including a final ParityMap when the
+sidecar directory is nonempty), and the implementation's safety
+allowance. The watermarks do not authorize consuming this reserve; increasing
+`block_size` changes replica rounding and the default 1 GiB gap record count.
+
+The system TIX acceptance scenario has a private, process-local fault surface;
+it is not a daemon API or an operator feature. It is disabled unless both
+`REM_TIX_TERMINAL_FAULT_ENABLE=terminal-index-stage7-v1-abort` and
+`REM_TIX_TERMINAL_FAULT_PLAN` are present. The plan must be exact-tape scoped
+and confined beneath `/tmp/system-harness/scenario-tix/terminal-faults`.
+Malformed, unconfined, or cross-component plans fail closed before terminal
+media motion. A matching cut durably fsyncs one evidence record before abort;
+the assignment-race variant uses the catalog's conditional generation update
+and then lets the normal FinalizeTape reread reject before Finalizing.
 
 `[[tape_pool_rules]]` maps barcodes to pools by prefix. Prefixes are ASCII
 alphanumeric, matched case-insensitively, longest match wins, and each
@@ -303,11 +323,14 @@ For the minimal config above, a running daemon owns:
 ```
 
 On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are
-both required resume authority. Replay first removes Layer 3c bundles beyond
-the last checkpoint watermark; Remanence then refuses append resume if a
-checkpointed history is missing, differently advanced, or conflicts on its
-tape-file history or physical EOD. SQLite and the per-tape catalog files remain
-rebuildable projections.
+both required while the tape is open and during terminal repair. In addition
+to the open prefix, they record the immutable terminal plan and the last
+barrier-proved progress state: `BeforeReplicaA`, `AfterReplicaA`, `AfterGapAB`,
+`AfterReplicaB`, `AfterGapBC`, or `AfterReplicaC`. Once finalization begins,
+Object admission is permanently disabled. A failure enters
+`RecoveryRequired`; only missing terminal control components may be written at
+their proved positions, never a new Object or a second terminal triple. SQLite
+and the per-tape catalog files remain rebuildable projections.
 
 `state.lock` is a kernel `flock`, and **`rem-daemon` never takes it** —
 it opens the SQLite catalog and drive pool directly. Only `rem-debug`'s
@@ -324,7 +347,8 @@ prior unclean exit before resolving the spool budget.
 
 The audit log and per-tape journals are append-only records; the SQLite
 file is a projection that `rem rebuild-catalog-from-journals` can
-regenerate from them. The tape itself stays the ultimate authority — its
-bootstrap and parity structures support a catalog-less scan. TLS material
+regenerate from them. The tape itself stays the ultimate authority — its BOT
+bootstrap, parity structures, and finalized A/B/C index replicas support a
+catalog-less scan. TLS material
 is read from wherever `[daemon.tls]` points and is never written by the
 daemon.

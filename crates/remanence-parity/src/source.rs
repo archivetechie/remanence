@@ -41,12 +41,12 @@ pub trait ParityAuditHook: Send + Sync {
 /// Trust policy when opening an object from a scoped filemark map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenTrust {
-    /// Reject objects that sit outside the authenticated prefix.
+    /// Reject objects that sit outside the digest-validated prefix.
     RequireValidated,
     /// Allow clean tar-only reads from an unvalidated suffix object.
     ///
     /// Recovery remains disabled for this mode because the suffix is not
-    /// authenticated by the selected bootstrap digest.
+    /// covered by the selected map digest.
     AllowTarOnlyUnverified,
 }
 
@@ -93,7 +93,7 @@ pub struct RecoveredOrdinalBlock {
     /// Global object-data ordinal recovered.
     pub ordinal: u64,
     /// Object tape file containing this ordinal.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Object-local body LBA within `tape_file_number`.
     pub body_lba: u64,
     /// Recovered fixed-size object block.
@@ -137,7 +137,7 @@ struct AutoBulkProbeRun {
 ///
 /// Object tape files contain only body-format blocks, so clean reads are raw
 /// passthrough within a single tape file. Recovery is object-scoped:
-/// `recover_block_at(body_lba)` resolves through the authenticated filemark
+/// `recover_block_at(body_lba)` resolves through the digest-validated filemark
 /// map to a `ParityDataOrdinal` and delegates to the sidecar recovery core.
 #[allow(missing_debug_implementations)]
 pub struct ObjectParitySource<'a> {
@@ -145,7 +145,7 @@ pub struct ObjectParitySource<'a> {
     scheme: ParityScheme,
     tape_uuid: [u8; 16],
     scoped_map: ScopedFilemarkMap,
-    tape_file_number: u32,
+    tape_file_number: u64,
     object_first_ordinal: u64,
     object_block_count: u64,
     block_size: u32,
@@ -154,7 +154,7 @@ pub struct ObjectParitySource<'a> {
     audit_hook: Option<Arc<dyn ParityAuditHook>>,
     auto_read_blocks: BTreeMap<u64, BufferedAutoReadBlock>,
     last_read_erasure_body_lba: Option<u64>,
-    reported_sidecar_metadata_health: BTreeSet<(u32, u64, SidecarMetadataHealth)>,
+    reported_sidecar_metadata_health: BTreeSet<(u64, u64, SidecarMetadataHealth)>,
 }
 
 impl<'a> ObjectParitySource<'a> {
@@ -170,7 +170,7 @@ impl<'a> ObjectParitySource<'a> {
         tape_uuid: [u8; 16],
         scoped_map: ScopedFilemarkMap,
         block_size: u32,
-        tape_file_number: u32,
+        tape_file_number: u64,
         trust: OpenTrust,
     ) -> Result<Self, ParityError> {
         scheme.validate()?;
@@ -1064,7 +1064,7 @@ fn checked_add(left: u64, right: u64, context: &'static str) -> Result<u64, Pari
 
 fn object_entry(
     scoped_map: &ScopedFilemarkMap,
-    tape_file_number: u32,
+    tape_file_number: u64,
 ) -> Result<&crate::filemark_map::TapeFileMapEntry, ParityError> {
     let entry = scoped_map
         .map
@@ -1243,7 +1243,7 @@ mod object_source_tests {
         medium_error_lbas: Vec<usize>,
         transient_transport_lbas: Vec<usize>,
         check_condition_lbas: Vec<(usize, u8, u8, u8)>,
-        read_lbas: Vec<usize>,
+        read_lbas: Vec<u64>,
     }
 
     impl RawVec {
@@ -1275,6 +1275,11 @@ mod object_source_tests {
             Ok(())
         }
 
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.cursor = self.records.len();
+            Ok(PhysicalPositionHint::new(self.cursor as u64))
+        }
+
         fn space_filemarks(
             &mut self,
             _count: i64,
@@ -1283,7 +1288,10 @@ mod object_source_tests {
         }
 
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-            self.read_lbas.push(self.cursor);
+            self.read_lbas.push(
+                u64::try_from(self.cursor)
+                    .map_err(|_| ParityError::Invariant("test cursor overflows u64"))?,
+            );
             if let Some(index) = self
                 .transient_transport_lbas
                 .iter()
@@ -1337,7 +1345,7 @@ mod object_source_tests {
         sidecar_blocks: &'a [Vec<u8>],
         cursor: usize,
         configured_block_size: Option<u32>,
-        read_lbas: Vec<usize>,
+        read_lbas: Vec<u64>,
     }
 
     impl<'a> RawBorrowedTape<'a> {
@@ -1391,6 +1399,11 @@ mod object_source_tests {
             Ok(())
         }
 
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.cursor = self.sidecar_end().saturating_add(1);
+            Ok(PhysicalPositionHint::new(self.cursor as u64))
+        }
+
         fn space_filemarks(
             &mut self,
             _count: i64,
@@ -1399,7 +1412,10 @@ mod object_source_tests {
         }
 
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-            self.read_lbas.push(self.cursor);
+            self.read_lbas.push(
+                u64::try_from(self.cursor)
+                    .map_err(|_| ParityError::Invariant("test cursor overflows u64"))?,
+            );
             let bytes = if self.cursor == 0 {
                 let block_size = self.configured_block_size.unwrap_or(BLOCK_SIZE);
                 let bootstrap = vec![0xB0; block_size as usize];
@@ -1708,7 +1724,7 @@ mod object_source_tests {
                     .map
                     .physical_position(position)
                     .expect("media-scale data peer has a physical position")
-                    .lba as usize;
+                    .lba;
                 assert_eq!(
                     raw.read_lbas.iter().filter(|read| **read == lba).count(),
                     1,
@@ -1730,7 +1746,7 @@ mod object_source_tests {
                         ),
                     })
                     .expect("media-scale parity peer has a physical position")
-                    .lba as usize;
+                    .lba;
                 assert_eq!(
                     raw.read_lbas.iter().filter(|read| **read == lba).count(),
                     1,
@@ -2678,7 +2694,9 @@ mod object_source_tests {
             assert_eq!(block.ordinal, ordinal);
             assert_eq!(block.tape_file_number, 2);
             assert_eq!(block.body_lba, body_lba);
-            assert_eq!(block.data, object_blocks[ordinal as usize]);
+            let ordinal_index =
+                usize::try_from(ordinal).expect("test ordinal fits object-block collection index");
+            assert_eq!(block.data, object_blocks[ordinal_index]);
         }
         assert_eq!(source.position().unwrap().lba, 4);
 
@@ -2779,7 +2797,7 @@ mod object_source_tests {
                 .map
                 .physical_position(position)
                 .expect("peer ordinal has a physical position")
-                .lba as usize;
+                .lba;
             assert_eq!(
                 raw.read_lbas.iter().filter(|read| **read == lba).count(),
                 1,
@@ -2802,7 +2820,7 @@ mod object_source_tests {
                     ),
                 })
                 .expect("parity shard has a physical position")
-                .lba as usize;
+                .lba;
             assert_eq!(
                 raw.read_lbas.iter().filter(|read| **read == lba).count(),
                 1,
