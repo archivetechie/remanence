@@ -414,8 +414,13 @@ over a stale companion intent left by interrupted cleanup, while a mismatch
 fails closed. A failure or completion-unknown outcome enters or retains
 `RecoveryRequired`; that classification is durable in the companion intent
 and restart cannot clear it at unchanged progress. A successful successor
-component clears it, while `AfterReplicaC` may clear it only in the no-media
-host completion path after host-authority alignment. Recovery may
+component clears it. At `AfterReplicaC`, host completion leaves it set until a
+normalized, non-recovery sealed checkpoint is fsynced, then retires the exact
+matching companion. Failure before that fsync retains `RecoveryRequired`;
+failure after it replays the sealed checkpoint. Because all reserved terminal
+blocks are already barrier-proved, this host-only suffix validates immutable
+plan/digest authority but does not reapply current capacity caps or watermarks.
+Recovery may
 reconcile, rewrite, or append only missing terminal control components at a
 proved location under the medium's rewrite policy. It MUST NOT write an Object,
 remove the finalization fence, or construct a second terminal triple. A

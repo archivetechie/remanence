@@ -8106,7 +8106,7 @@ BCw3Wyv2UWY=
                 .advance_terminal_finalization(expected, next)
                 .expect("advance durable terminal progress");
         }
-        let mut intent = lease
+        let intent = lease
             .mark_terminal_recovery_required()
             .expect("persist recovery-required state before restart");
         drop(lease);
@@ -8133,15 +8133,9 @@ BCw3Wyv2UWY=
         replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
             .expect("pending finalization replay is idempotent");
 
-        let mut lease = journal
-            .acquire_exclusive_for_terminal_recovery()
-            .expect("acquire host-only recovery clear");
-        intent = lease
-            .clear_terminal_recovery_required_after_replica_c()
-            .expect("clear recovery after durable replica C authority");
-        drop(lease);
-
         let replica_c = intent.layout.components[4];
+        let mut completed_intent = intent.clone();
+        completed_intent.recovery_required = false;
         let terminal = remanence_state::CheckpointJournalRecord {
             ordinal: checkpoint.ordinal + 1,
             committed_object_count: checkpoint.committed_object_count,
@@ -8175,7 +8169,7 @@ BCw3Wyv2UWY=
                 highest_protected_ordinal: 0,
                 total_committed_ordinals: 3,
             }),
-            terminal_finalization: Some(intent.clone()),
+            terminal_finalization: Some(completed_intent),
             sealed_after_write: true,
         };
         let mut lease = journal

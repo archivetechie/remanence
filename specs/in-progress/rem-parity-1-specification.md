@@ -531,8 +531,13 @@ fails closed.
 A component failure or completion-unknown result enters or retains
 `RecoveryRequired`. That classification is part of the fsynced companion
 intent: restart MUST retain it at the same progress. A successful successor
-component transition clears it; at `AfterReplicaC`, proved host-authority
-alignment may clear it only as part of the no-media final checkpoint path.
+component transition clears it. At `AfterReplicaC`, the companion MUST retain
+the classification until a normalized, non-recovery sealed checkpoint is
+fsynced; only then may the matching companion be retired. A failure before
+that fsync therefore remains `RecoveryRequired`, while a matching sealed
+checkpoint wins after it. Current capacity caps and watermarks MUST NOT be
+reapplied on this host-only suffix because the reserved terminal tail is
+already barrier-proved on media.
 From there a Writer may reconcile and repair only missing
 terminal control components at proved locations under the medium's rewrite
 policy. It MUST NOT write an Object, remove the finalization fence, or append a

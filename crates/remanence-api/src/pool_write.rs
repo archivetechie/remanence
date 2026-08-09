@@ -1288,10 +1288,26 @@ pub fn admit_pinned_tape_for_write_session(
             actual_pool_id: actual_pool.map(str::to_string),
         });
     }
+    let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
+    let host_only_after_replica_c = if checkpoint_journal_tapes.contains(&tape_uuid) {
+        remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, tape_uuid)?
+            .terminal_finalization_intent()?
+            .is_some_and(|intent| {
+                intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC
+                    && intent.manual.is_none()
+            })
+    } else {
+        false
+    };
     match check_writability_preconditions(&tape, 0)
         .and_then(|_| check_pool_block_size_precondition(&tape, pool_cfg))
     {
         Ok(()) => {}
+        Err(_) if host_only_after_replica_c => {
+            // This admission exists only so mount preflight can finish the
+            // sealed host suffix and reject the requested Object session.
+            // No write capability is resolved on that path.
+        }
         Err(WritabilityError::ParityAppendUnsupported { .. }) => {
             // The gate below requires a durable checkpoint record. Session
             // open compares that record with the sink journal before LOCATE.
@@ -1303,22 +1319,24 @@ pub fn admit_pinned_tape_for_write_session(
             });
         }
     }
-    let conflicts = state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
-    if let Some(conflict) = conflicts.first() {
-        return Err(PinnedTapeError::Fenced {
-            tape_uuid: uuid_text,
-            quarantine_id: conflict.quarantine_id.clone(),
-            reason: conflict.reason.clone(),
-        });
-    }
-    let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
-    if !fresh {
-        let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
-        if !tape_carries_checkpoint(checkpoint_journal_dir, &checkpoint_journal_tapes, tape_uuid)? {
-            return Err(PinnedTapeError::NotBatchEligible {
+    if !host_only_after_replica_c {
+        let conflicts = state.tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())?;
+        if let Some(conflict) = conflicts.first() {
+            return Err(PinnedTapeError::Fenced {
                 tape_uuid: uuid_text,
+                quarantine_id: conflict.quarantine_id.clone(),
+                reason: conflict.reason.clone(),
             });
         }
+    }
+    let fresh = tape_is_fresh_for_checkpoint_admission(state, &tape, &tape_uuid)?;
+    if !fresh
+        && !host_only_after_replica_c
+        && !tape_carries_checkpoint(checkpoint_journal_dir, &checkpoint_journal_tapes, tape_uuid)?
+    {
+        return Err(PinnedTapeError::NotBatchEligible {
+            tape_uuid: uuid_text,
+        });
     }
     Ok(selected_tape_from_record(tape, required_pool_id)?)
 }

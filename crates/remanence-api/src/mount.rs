@@ -2486,7 +2486,7 @@ mod tests {
         NativeObjectCopyProjectionInput, NativeObjectProjectionInput, PoolSelectionPolicyName,
         ProvisionTapeInput, TapeJournalIndexInput, TapePoolConfig, TapePoolProjectionInput,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn batched_selection_avoids_no_free_bay_failure_for_loaded_fresh_tape() {
@@ -2891,6 +2891,259 @@ mod tests {
         }
     }
 
+    fn seed_automatic_after_replica_c(
+        index_path: &Path,
+        tape_uuid: TapeUuid,
+        voltag: &str,
+        pool_id: &str,
+        block_size: u32,
+    ) -> TapePoolConfig {
+        let pool_config = TapePoolConfig {
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.92,
+            watermark_high: 0.97,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(block_size),
+            min_object_size_bytes: 0,
+        };
+        let mut index = CatalogIndex::open(index_path).expect("open host-only route catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project host-only route pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: voltag.to_string(),
+                block_size,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision host-only route tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign host-only route tape");
+
+        let mut checkpoint = manual_finalize_checkpoint(tape_uuid, block_size);
+        let object_id = Uuid::from_bytes(tape_uuid).to_string();
+        checkpoint.objects[0]
+            .object
+            .object_id
+            .clone_from(&object_id);
+        checkpoint.objects[0].copy.object_id.clone_from(&object_id);
+        checkpoint.objects[0].object_recovery_row.object_id = object_id.into_bytes();
+        let checkpoint_dir = index_path
+            .parent()
+            .expect("catalog parent")
+            .join("checkpoints");
+        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+            .expect("open host-only route checkpoint");
+        journal
+            .append(&checkpoint)
+            .expect("append host-only route checkpoint");
+        index
+            .project_checkpoint_record(&checkpoint)
+            .expect("project host-only route checkpoint");
+
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("acquire host-only route checkpoint");
+        let mut source =
+            remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
+                &lease,
+            )
+            .expect("reconstruct host-only route rows");
+        let summary = source.summary();
+        let replica =
+            remanence_parity::checked_tape_index_replica_layout(block_size, summary.counts)
+                .expect("plan host-only route replica");
+        let layout = remanence_parity::TerminalTailLayout::new(
+            0,
+            block_size,
+            summary.scope.covered_prefix_tape_file_count,
+            checkpoint.eod_lba,
+            replica.replica_record_count,
+            remanence_parity::index_separation_records(
+                block_size,
+                remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+            )
+            .expect("plan host-only route gaps"),
+        )
+        .expect("plan host-only route layout");
+        let edition_id = *Uuid::new_v4().as_bytes();
+        let edition = remanence_parity::plan_tape_index_edition(
+            remanence_parity::TapeIndexEditionDescriptor {
+                tape_uuid,
+                edition_id,
+                edition_sequence: checkpoint.ordinal + 1,
+                scope: summary.scope,
+                counts: summary.counts,
+                block_size,
+                compression_enabled: false,
+                writer_version: "mount-host-only-test".to_string(),
+                write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+                terminal_layout: layout,
+            },
+            &mut source,
+        )
+        .expect("plan host-only route edition");
+        drop(source);
+        let intent = remanence_state::TerminalFinalizationIntent {
+            tape_uuid,
+            trigger: remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark,
+            manual: None,
+            progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+            recovery_required: false,
+            edition_id,
+            edition_sequence: edition.descriptor.edition_sequence,
+            edition_digest: edition.edition_digest,
+            writer_version: edition.descriptor.writer_version,
+            write_timestamp: edition.descriptor.write_timestamp,
+            terminal_prefix: None,
+            layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
+                .expect("persist host-only route layout"),
+        };
+        lease
+            .begin_terminal_finalization(&intent)
+            .expect("begin host-only route finalization");
+        for (expected, next) in [
+            (
+                remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+            ),
+        ] {
+            lease
+                .advance_terminal_finalization(expected, next)
+                .expect("advance host-only route finalization");
+        }
+        let current = lease
+            .mark_terminal_recovery_required()
+            .expect("classify host-only route recovery");
+        index
+            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
+                tape_uuid,
+                trigger: current.trigger,
+                operation_id: None,
+                progress: current.progress,
+                edition_digest: current.edition_digest,
+                layout_digest: current.layout.layout_digest,
+                outcome: remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
+                updated_at_utc: None,
+            })
+            .expect("project host-only route recovery");
+        pool_config
+    }
+
+    #[tokio::test]
+    async fn open_and_automatic_after_c_routes_complete_before_actor_capabilities() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        const OPEN_TAPE: TapeUuid = [0xB1; 16];
+        const STARTUP_TAPE: TapeUuid = [0xB2; 16];
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-after-c-entry-routes")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("state.sqlite");
+        let pool_id = "after-c-host-only";
+        let pool_config =
+            seed_automatic_after_replica_c(&index_path, OPEN_TAPE, "HST001L9", pool_id, BLOCK_SIZE);
+        seed_automatic_after_replica_c(&index_path, STARTUP_TAPE, "HST002L9", pool_id, BLOCK_SIZE);
+        let index = CatalogIndex::open(&index_path).expect("reopen host-only route catalog");
+        let mut state = ApiState::new_with_pool_configs(index, [pool_config.clone()]);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+
+        let open_error = open_write_session_reserved(
+            &state,
+            &pool,
+            WriteSessionTarget::PinnedTape {
+                tape_uuid: OPEN_TAPE,
+                required_pool_id: pool_id.to_string(),
+            },
+            "unused-library".to_string(),
+        )
+        .await
+        .expect_err("host-only open recovery must reject later Object admission");
+        assert_eq!(open_error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            open_error.message().contains("host-only open recovery"),
+            "{open_error}"
+        );
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "open route reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "open route reached changer actor"
+        );
+
+        let mut lowered = pool_config;
+        lowered.capacity_cap_bytes = Some(u64::from(BLOCK_SIZE));
+        let lowered_index = CatalogIndex::open(&index_path).expect("open lowered-cap catalog");
+        let mut lowered_state = ApiState::new_with_pool_configs(lowered_index, [lowered]);
+        lowered_state.drive_pool = Some(pool);
+        recover_automatic_terminal_tape(&lowered_state, STARTUP_TAPE)
+            .await
+            .expect("automatic route seals after C despite a newly lowered capacity cap");
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "automatic route reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "automatic route reached changer actor"
+        );
+        let final_index = CatalogIndex::open(&index_path).expect("read host-only route results");
+        for tape_uuid in [OPEN_TAPE, STARTUP_TAPE] {
+            assert_eq!(
+                final_index
+                    .terminal_finalization(&tape_uuid)
+                    .expect("read terminal result")
+                    .expect("terminal result")
+                    .outcome,
+                remanence_state::TerminalFinalizationOutcome::Finalized
+            );
+        }
+    }
+
     #[tokio::test]
     async fn manual_finalize_accepts_rejoins_redispatches_and_restarts_without_duplicates() {
         use std::sync::atomic::AtomicBool;
@@ -3074,7 +3327,7 @@ mod tests {
             })
             .expect("project completion-unknown outcome");
         drop(recovery_index);
-        let retried = manual_finalize_tape(&state, admission)
+        let retried = manual_finalize_tape(&state, admission.clone())
             .await
             .expect("same-key retry restarts failed worker");
         let crate::write_owner::ManualFinalizeTapeResult::Accepted(retried) = retried else {
@@ -3136,6 +3389,109 @@ mod tests {
         assert!(
             drive_rx.try_recv().is_err(),
             "startup duplicated tail dispatch"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(probe) = pool.reserve_tape(tape_uuid) {
+                    drop(probe);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("startup worker releases exact-tape ownership");
+        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+            .expect("reopen manual terminal checkpoint");
+        let mut lease = journal
+            .acquire_exclusive_for_terminal_recovery()
+            .expect("acquire manual terminal recovery");
+        let mut recovery_index =
+            CatalogIndex::open(&index_path).expect("open manual progress projection");
+        let current = lease
+            .terminal_finalization_intent()
+            .expect("read manual finalization intent")
+            .expect("manual finalization intent");
+        assert_eq!(
+            current.progress,
+            remanence_state::TerminalFinalizationProgress::BeforeReplicaA
+        );
+        for (expected, next) in [
+            (
+                remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+            ),
+        ] {
+            let current = lease
+                .advance_terminal_finalization(expected, next)
+                .expect("advance manual finalization to replica C");
+            recovery_index
+                .project_terminal_finalization(
+                    remanence_state::TerminalFinalizationProjectionInput {
+                        tape_uuid,
+                        trigger: current.trigger,
+                        operation_id: Some(accepted.operation_id),
+                        progress: current.progress,
+                        edition_digest: current.edition_digest,
+                        layout_digest: current.layout.layout_digest,
+                        outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+                        updated_at_utc: None,
+                    },
+                )
+                .expect("project manual component progress");
+        }
+        let current = lease
+            .mark_terminal_recovery_required()
+            .expect("retain manual recovery classification after C");
+        recovery_index
+            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
+                tape_uuid,
+                trigger: current.trigger,
+                operation_id: Some(accepted.operation_id),
+                progress: current.progress,
+                edition_digest: current.edition_digest,
+                layout_digest: current.layout.layout_digest,
+                outcome: remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
+                updated_at_utc: None,
+            })
+            .expect("project manual post-C recovery state");
+        drop(recovery_index);
+        drop(lease);
+
+        let completed = manual_finalize_tape(&state, admission)
+            .await
+            .expect("manual API entry completes the post-C host suffix");
+        let crate::write_owner::ManualFinalizeTapeResult::Accepted(completed) = completed else {
+            panic!("manual host-only completion must retain durable acceptance");
+        };
+        assert_eq!(
+            completed.projection.outcome,
+            remanence_state::TerminalFinalizationOutcome::Finalized
+        );
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "manual post-C API route reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "manual post-C API route reached changer actor"
         );
     }
 

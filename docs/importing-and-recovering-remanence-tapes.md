@@ -194,6 +194,14 @@ remaining sealed-checkpoint, intent cleanup, SQLite projection, and audit work
 without loading, locating, reading, or writing the cartridge. This applies to
 automatic finalization and to an operator-requested close-out.
 
+If the operation was already classified `recovery_required`, that conservative
+flag remains durable until the sealed checkpoint itself is safely on disk. A
+failure before that point cannot silently downgrade the tape to ordinary
+`finalizing`; a failure after it replays the sealed checkpoint and removes the
+now-stale companion. Changes to a pool's capacity cap or watermarks do not block
+this final host-only bookkeeping, because the complete reserved tail is already
+barrier-proved on tape.
+
 Before that boundary, a failed or uncertain component is recorded durably as
 `recovery_required`. Restart does not quietly turn that state back into ordinary
 `finalizing`; it must reconcile the next physical component first. This
