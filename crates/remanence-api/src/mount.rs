@@ -212,12 +212,23 @@ async fn open_write_session_reserved(
     target: WriteSessionTarget,
     library_serial: String,
 ) -> Result<pb::WriteSession, Status> {
+    enum ReservedWriteDisposition {
+        Writable {
+            selected: crate::SelectedTape,
+            reservation: crate::write_owner::TapeReservation,
+        },
+        HostOnlyTerminalRecovery {
+            selected: crate::SelectedTape,
+            reservation: crate::write_owner::TapeReservation,
+        },
+    }
+
     let pool_cfg = state.pool_config(target.pool_id())?;
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
     let select_started = Instant::now();
     let mut select_attempts = 0u64;
-    let (selected, _tape_reservation) = match &target {
+    let disposition = match &target {
         WriteSessionTarget::Pool { .. } => loop {
             select_attempts = select_attempts.saturating_add(1);
             let selected = select_tape_in_pool_for_write_session(
@@ -229,7 +240,12 @@ async fn open_write_session_reserved(
             )
             .map_err(crate::write_owner::status_from_select_tape_error)?;
             match pool.reserve_tape(selected.tape_uuid) {
-                Ok(reservation) => break (selected, reservation),
+                Ok(reservation) => {
+                    break ReservedWriteDisposition::Writable {
+                        selected,
+                        reservation,
+                    };
+                }
                 Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
                 Err(err) => return Err(err),
             }
@@ -239,7 +255,11 @@ async fn open_write_session_reserved(
             required_pool_id,
         } => {
             select_attempts = 1;
-            let selected = crate::pool_write::admit_pinned_tape_for_write_session(
+            // Own the exact tape before consulting the exceptional post-C
+            // admission path. Recovery in this runtime uses the same owner,
+            // so it cannot finalize the tape between admission and preflight.
+            let reservation = pool.reserve_tape(*tape_uuid)?;
+            let disposition = crate::pool_write::admit_pinned_tape_for_write_session(
                 &index,
                 *tape_uuid,
                 required_pool_id,
@@ -247,19 +267,32 @@ async fn open_write_session_reserved(
                 state.checkpoint_journal_dir.as_path(),
             )
             .map_err(crate::write_owner::status_from_pinned_tape_error)?;
-            // Unlike pool mode, a reservation conflict is terminal: there is
-            // no other tape to fall back to, and the conflicting session
-            // already owns the one the caller pinned.
-            let reservation = pool.reserve_tape(selected.tape_uuid)?;
-            (selected, reservation)
+            match disposition {
+                crate::pool_write::PinnedWriteDisposition::Writable(selected) => {
+                    ReservedWriteDisposition::Writable {
+                        selected,
+                        reservation,
+                    }
+                }
+                crate::pool_write::PinnedWriteDisposition::HostOnlyTerminalRecovery(selected) => {
+                    ReservedWriteDisposition::HostOnlyTerminalRecovery {
+                        selected,
+                        reservation,
+                    }
+                }
+            }
         }
     };
     let select_elapsed = select_started.elapsed();
+    let selected = match &disposition {
+        ReservedWriteDisposition::Writable { selected, .. }
+        | ReservedWriteDisposition::HostOnlyTerminalRecovery { selected, .. } => selected,
+    };
     let tape_uuid = selected.tape_uuid;
     drop(index);
     let mut host_index = CatalogIndex::open(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?;
-    if crate::write_owner::preflight_automatic_terminal_completion(
+    let host_completion = crate::write_owner::preflight_automatic_terminal_completion(
         &mut host_index,
         crate::write_owner::ManualFinalizePreflightConfig {
             checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
@@ -267,15 +300,33 @@ async fn open_write_session_reserved(
             audit_fsync: state.audit_fsync,
             audit_append_lock: &state.audit_append_lock,
         },
-        &selected,
+        selected,
         &pool_cfg,
-    )? {
-        return Err(Status::failed_precondition(format!(
-            "tape {} completed terminal finalization during host-only open recovery and cannot accept Objects",
-            Uuid::from_bytes(tape_uuid)
-        )));
-    }
+    )?;
     drop(host_index);
+    let (selected, _tape_reservation) = match (disposition, host_completion) {
+        (
+            ReservedWriteDisposition::Writable {
+                selected,
+                reservation,
+            },
+            false,
+        ) => (selected, reservation),
+        (ReservedWriteDisposition::Writable { .. }, true)
+        | (ReservedWriteDisposition::HostOnlyTerminalRecovery { .. }, true) => {
+            return Err(Status::failed_precondition(format!(
+                "tape {} completed terminal finalization during host-only open recovery and cannot accept Objects",
+                Uuid::from_bytes(tape_uuid)
+            )));
+        }
+        (ReservedWriteDisposition::HostOnlyTerminalRecovery { reservation, .. }, false) => {
+            drop(reservation);
+            return Err(Status::failed_precondition(format!(
+                "tape {} terminal recovery authority changed during host-only preflight; refusing Object admission without media access",
+                Uuid::from_bytes(tape_uuid)
+            )));
+        }
+    };
     let open_started = Instant::now();
     let resolve_started = Instant::now();
     let (mount, drive_reservation) =
@@ -3067,6 +3118,8 @@ mod tests {
         const BLOCK_SIZE: u32 = 256 * 1024;
         const OPEN_TAPE: TapeUuid = [0xB1; 16];
         const STARTUP_TAPE: TapeUuid = [0xB2; 16];
+        const STALE_COMPANION_TAPE: TapeUuid = [0xB3; 16];
+        const OWNED_TAPE: TapeUuid = [0xB4; 16];
         let temp = tempfile::Builder::new()
             .prefix("remanence-after-c-entry-routes")
             .tempdir()
@@ -3076,6 +3129,14 @@ mod tests {
         let pool_config =
             seed_automatic_after_replica_c(&index_path, OPEN_TAPE, "HST001L9", pool_id, BLOCK_SIZE);
         seed_automatic_after_replica_c(&index_path, STARTUP_TAPE, "HST002L9", pool_id, BLOCK_SIZE);
+        seed_automatic_after_replica_c(
+            &index_path,
+            STALE_COMPANION_TAPE,
+            "HST003L9",
+            pool_id,
+            BLOCK_SIZE,
+        );
+        seed_automatic_after_replica_c(&index_path, OWNED_TAPE, "HST004L9", pool_id, BLOCK_SIZE);
         let index = CatalogIndex::open(&index_path).expect("reopen host-only route catalog");
         let mut state = ApiState::new_with_pool_configs(index, [pool_config.clone()]);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
@@ -3089,6 +3150,34 @@ mod tests {
             )])),
         );
         state.drive_pool = Some(pool.clone());
+
+        let competing_owner = pool
+            .reserve_tape(OWNED_TAPE)
+            .expect("reserve exact tape for concurrent recovery");
+        let busy = open_write_session_reserved(
+            &state,
+            &pool,
+            WriteSessionTarget::PinnedTape {
+                tape_uuid: OWNED_TAPE,
+                required_pool_id: pool_id.to_string(),
+            },
+            "unused-library".to_string(),
+        )
+        .await
+        .expect_err("pinned open must lose to the existing exact-tape owner");
+        assert_eq!(busy.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            remanence_state::FileCheckpointJournal::open(
+                state.checkpoint_journal_dir.as_path(),
+                OWNED_TAPE,
+            )
+            .expect("open owned-tape checkpoint")
+            .terminal_finalization_intent()
+            .expect("read owned-tape intent")
+            .is_some(),
+            "busy refusal must happen before host preflight changes authority"
+        );
+        drop(competing_owner);
 
         let open_error = open_write_session_reserved(
             &state,
@@ -3115,6 +3204,141 @@ mod tests {
             "open route reached changer actor"
         );
 
+        let stale_journal = remanence_state::FileCheckpointJournal::open(
+            state.checkpoint_journal_dir.as_path(),
+            STALE_COMPANION_TAPE,
+        )
+        .expect("open stale-companion checkpoint");
+        let mut companion_path = stale_journal.path().as_os_str().to_os_string();
+        companion_path.push(".finalizing");
+        let companion_path = PathBuf::from(companion_path);
+        let companion_bytes = std::fs::read(&companion_path).expect("save exact companion bytes");
+        recover_automatic_terminal_tape(&state, STALE_COMPANION_TAPE)
+            .await
+            .expect("first automatic completion seals the checkpoint");
+        let sealed_before_retry = stale_journal
+            .replay()
+            .expect("read sealed authority before retained-companion retry");
+        std::fs::write(&companion_path, companion_bytes)
+            .expect("restore exact post-fsync stale companion");
+        let selected_stale = crate::SelectedTape {
+            pool_id: pool_id.to_string(),
+            tape_uuid: STALE_COMPANION_TAPE,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::None,
+        };
+        let mut projection_failure_index = CatalogIndex::open(
+            temp.path()
+                .join("stale-companion-projection-failure.sqlite"),
+        )
+        .expect("open empty projection-failure catalog");
+        crate::write_owner::preflight_automatic_terminal_completion(
+            &mut projection_failure_index,
+            crate::write_owner::ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+                audit_dir: state.audit_dir.as_path(),
+                audit_fsync: state.audit_fsync,
+                audit_append_lock: &state.audit_append_lock,
+            },
+            &selected_stale,
+            &pool_config,
+        )
+        .expect_err("failed sealed projection must not consume retry authority");
+        let pending = stale_journal
+            .terminal_finalization_intent()
+            .expect("read companion after projection failure")
+            .expect("projection failure retains the exact companion");
+
+        let stale_index_path = temp.path().join("stale-companion-state.sqlite");
+        let mut stale_index =
+            CatalogIndex::open(&stale_index_path).expect("open stale recovery catalog");
+        stale_index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project stale recovery pool");
+        stale_index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: STALE_COMPANION_TAPE,
+                voltag: "HST003L9".to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision stale recovery tape");
+        stale_index
+            .project_tape_pool_membership(STALE_COMPANION_TAPE, pool_id)
+            .expect("assign stale recovery tape");
+        stale_index
+            .project_checkpoint_record(
+                sealed_before_retry
+                    .first()
+                    .expect("sealed history retains ordinary authority"),
+            )
+            .expect("project ordinary authority into stale catalog");
+        stale_index
+            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
+                tape_uuid: STALE_COMPANION_TAPE,
+                trigger: pending.trigger,
+                operation_id: None,
+                progress: pending.progress,
+                edition_digest: pending.edition_digest,
+                layout_digest: pending.layout.layout_digest,
+                outcome: remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
+                updated_at_utc: None,
+            })
+            .expect("project stale recovery-required catalog state");
+        let mut stale_state = ApiState::new_with_pool_configs(stale_index, [pool_config.clone()]);
+        stale_state.drive_pool = Some(pool.clone());
+        let stale_error = open_write_session_reserved(
+            &stale_state,
+            &pool,
+            WriteSessionTarget::PinnedTape {
+                tape_uuid: STALE_COMPANION_TAPE,
+                required_pool_id: pool_id.to_string(),
+            },
+            "unused-library".to_string(),
+        )
+        .await
+        .expect_err("stale companion retry must finish host-only and refuse Objects");
+        assert_eq!(stale_error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            stale_journal
+                .terminal_finalization_intent()
+                .expect("read companion after retry")
+                .is_none(),
+            "exact sealed replay must retire the stale companion"
+        );
+        assert_eq!(
+            stale_journal
+                .replay()
+                .expect("read sealed authority after retry"),
+            sealed_before_retry,
+            "host-only retry must not duplicate the sealed checkpoint"
+        );
+        assert_eq!(
+            CatalogIndex::open(&stale_index_path)
+                .expect("reopen healed stale catalog")
+                .terminal_finalization(&STALE_COMPANION_TAPE)
+                .expect("read healed stale projection")
+                .expect("healed stale projection")
+                .outcome,
+            remanence_state::TerminalFinalizationOutcome::Finalized,
+            "sealed retry must repair stale catalog authority before cleanup"
+        );
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "stale-companion route reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "stale-companion route reached changer actor"
+        );
+
         let mut lowered = pool_config;
         lowered.capacity_cap_bytes = Some(u64::from(BLOCK_SIZE));
         let lowered_index = CatalogIndex::open(&index_path).expect("open lowered-cap catalog");
@@ -3132,7 +3356,7 @@ mod tests {
             "automatic route reached changer actor"
         );
         let final_index = CatalogIndex::open(&index_path).expect("read host-only route results");
-        for tape_uuid in [OPEN_TAPE, STARTUP_TAPE] {
+        for tape_uuid in [OPEN_TAPE, STARTUP_TAPE, STALE_COMPANION_TAPE] {
             assert_eq!(
                 final_index
                     .terminal_finalization(&tape_uuid)
