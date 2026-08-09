@@ -6191,6 +6191,7 @@ pub(crate) fn preflight_manual_finalize_tape(
         }
         request.candidate_operation_id = scope.operation_id;
     }
+    let had_existing_intent = existing_intent.is_some();
 
     let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(request.tape_uuid)
         .map_err(|error| {
@@ -6209,7 +6210,6 @@ pub(crate) fn preflight_manual_finalize_tape(
             })?;
     }
     validate_manual_finalize_owned_request(index, request)?;
-    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
     let previous = checkpoint
         .last_record_bounded()
         .map_err(crate::status_from_state_error)?
@@ -6219,6 +6219,14 @@ pub(crate) fn preflight_manual_finalize_tape(
             )
         })?;
     if previous.sealed_after_write {
+        if had_existing_intent {
+            checkpoint
+                .replay_for_terminal_recovery()
+                .map_err(crate::status_from_state_error)?;
+        }
+        index
+            .project_checkpoint_record(&previous)
+            .map_err(crate::status_from_state_error)?;
         let projection = index
             .terminal_finalization(&request.tape_uuid)
             .map_err(crate::status_from_state_error)?
@@ -6236,6 +6244,9 @@ pub(crate) fn preflight_manual_finalize_tape(
             operation_id: request.candidate_operation_id,
             projection,
         }));
+    }
+    if !had_existing_intent {
+        session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
     }
 
     let spec = TerminalFinalizeSpec::operator(request);
@@ -6417,27 +6428,29 @@ pub(crate) fn preflight_manual_finalize_tape(
         cfg.audit_append_lock,
         request,
     )?;
-    let projection = index
+    let projected_recovery_required = index
         .terminal_finalization(&request.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .is_some_and(|projection| {
+            projection.progress == intent.progress
+                && projection.outcome == TerminalFinalizationOutcome::RecoveryRequired
+        });
+    index
+        .project_terminal_finalization(TerminalFinalizationProjectionInput {
+            tape_uuid: request.tape_uuid,
+            trigger: intent.trigger,
+            operation_id: Some(request.candidate_operation_id),
+            progress: intent.progress,
+            edition_digest: intent.edition_digest,
+            layout_digest: intent.layout.layout_digest,
+            outcome: if intent.recovery_required || projected_recovery_required {
+                TerminalFinalizationOutcome::RecoveryRequired
+            } else {
+                TerminalFinalizationOutcome::InProgress
+            },
+            updated_at_utc: None,
+        })
         .map_err(crate::status_from_state_error)?;
-    if projection.is_none() {
-        index
-            .project_terminal_finalization(TerminalFinalizationProjectionInput {
-                tape_uuid: request.tape_uuid,
-                trigger: intent.trigger,
-                operation_id: Some(request.candidate_operation_id),
-                progress: intent.progress,
-                edition_digest: intent.edition_digest,
-                layout_digest: intent.layout.layout_digest,
-                outcome: if intent.recovery_required {
-                    TerminalFinalizationOutcome::RecoveryRequired
-                } else {
-                    TerminalFinalizationOutcome::InProgress
-                },
-                updated_at_utc: None,
-            })
-            .map_err(crate::status_from_state_error)?;
-    }
     if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
         let result = complete_terminal_finalization_host_only(
             index,
@@ -6459,6 +6472,7 @@ pub(crate) fn preflight_manual_finalize_tape(
             projection: result.projection,
         }));
     }
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
     Ok(None)
 }
 
@@ -11861,34 +11875,52 @@ mod tests {
                 updated_at_utc: None,
             })
             .expect("project post-C recovery classification");
-        let previous = checkpoint
-            .last_record_bounded()
-            .expect("read base checkpoint")
-            .expect("base checkpoint exists");
+        drop(checkpoint);
         let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
-        let finalized = complete_terminal_finalization_host_only(
+        let selected = SelectedTape {
+            pool_id: "host-authority-test".to_string(),
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::None,
+        };
+        let pool_cfg = TapePoolConfig {
+            id: selected.pool_id.clone(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        assert!(preflight_automatic_terminal_completion(
             &mut index,
-            TerminalFinalizeAuditConfig {
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &temp.path().join("checkpoints"),
                 audit_dir: temp.path(),
                 audit_fsync: false,
                 audit_append_lock: &audit_append_lock,
             },
-            &mut checkpoint,
-            &previous,
-            &spec,
-            None,
-            completed,
-            &plan,
-            None,
+            &selected,
+            &pool_cfg,
         )
-        .expect("complete host-only final checkpoint without media capability");
-        assert_eq!(
-            finalized.projection.outcome,
-            TerminalFinalizationOutcome::Finalized
-        );
+        .expect("automatic entry completes final checkpoint without media capability"));
+        let finalized = index
+            .terminal_finalization(&TAPE_UUID)
+            .expect("read finalized projection")
+            .expect("finalized projection");
+        assert_eq!(finalized.outcome, TerminalFinalizationOutcome::Finalized);
+        let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
+            temp.path().join("checkpoints"),
+            TAPE_UUID,
+        )
+        .expect("reopen finalized checkpoint journal");
         assert!(
-            finalized
-                .final_record
+            checkpoint_journal
+                .last()
+                .expect("read final checkpoint")
                 .expect("final record")
                 .sealed_after_write
         );
@@ -15090,6 +15122,52 @@ mod tests {
                 .expect("manual operation identity")
                 .reason,
             "ship partially filled copy offsite"
+        );
+
+        // Recreate the live post-sealed-checkpoint/pre-SQLite window without
+        // restarting the daemon. The durable sealed record must repair the
+        // stale projection before any fence or media-capable path is consulted.
+        let commands_before_host_repair = world.lock().expect("world lock").command_log.len();
+        let mut fenced_index = CatalogIndex::open(&index_path).expect("open fenced catalog");
+        fenced_index
+            .record_tape_io_fence(remanence_state::TapeIoFenceInput {
+                tape_uuid,
+                barcode: Some(barcode.to_string()),
+                reason: "post_replica_c_host_projection".to_string(),
+                evidence_json: None,
+            })
+            .expect("record post-C fence");
+        drop(fenced_index);
+        rusqlite::Connection::open(&index_path)
+            .expect("open raw projection fixture")
+            .execute(
+                "update tapes set state = 'finalizing', finalization_outcome = 'in_progress' where tape_uuid = ?1",
+                rusqlite::params![tape_uuid.to_vec()],
+            )
+            .expect("downgrade only the disposable SQLite projection");
+        let mut host_index = CatalogIndex::open(&index_path).expect("reopen stale projection");
+        let mut host_retry = request.clone();
+        let repaired = preflight_manual_finalize_tape(
+            &mut host_index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &checkpoint_dir,
+                audit_dir: &audit_dir,
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            Some(barcode),
+            &mut host_retry,
+        )
+        .expect("sealed checkpoint repairs stale SQLite despite active fence")
+        .expect("sealed retry completes in host preflight");
+        assert_eq!(
+            repaired.projection.outcome,
+            TerminalFinalizationOutcome::Finalized
+        );
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            commands_before_host_repair,
+            "sealed host repair must issue zero drive commands"
         );
     }
 
