@@ -56,6 +56,9 @@ pub enum StateError {
     /// A projection rebuild is already in progress.
     #[error("index rebuild in progress")]
     IndexRebuildInProgress,
+    /// A crash-safe catalog reset fence blocks ordinary state opens.
+    #[error("catalog reset in progress: {0}")]
+    CatalogResetInProgress(String),
     /// An idempotency key was reused for a different request.
     #[error("idempotency conflict: {0}")]
     IdempotencyConflict(String),

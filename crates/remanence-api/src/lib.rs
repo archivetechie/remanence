@@ -5436,6 +5436,8 @@ fn tape_to_proto(record: TapeRecord) -> pb::Tape {
         correlation_rollups: Vec::new(),
         // Barrier-proved measurement; absent stays absent on the wire.
         written_extent_lba: record.written_extent_lba,
+        kind: Some(record.kind),
+        scheme_id: record.scheme_id,
     }
 }
 

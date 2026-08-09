@@ -312,6 +312,20 @@ pub struct ProvisionTapeInput {
     pub force: bool,
 }
 
+/// Typed identity-only tape row carried across one explicitly scoped catalog
+/// reset. This type is intentionally crate-private: it is reset plumbing, not
+/// a general-purpose way to manufacture catalog authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CatalogResetPreservedTape {
+    pub(crate) tape_uuid: [u8; 16],
+    pub(crate) voltag: String,
+    pub(crate) kind: String,
+    pub(crate) pool_id: Option<String>,
+    assignment_generation: i64,
+    geometry: Option<ProvisionTapeGeometry>,
+    pub(crate) restore_ready: bool,
+}
+
 /// Request to permanently end one tape identity's life in the catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetireTapeInput {
@@ -1670,6 +1684,21 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("sqlite quick_check", err))
     }
 
+    /// Checkpoint every WAL frame into the main database and switch to a
+    /// single-file journal mode before an atomic catalog-reset swap.
+    pub(crate) fn prepare_catalog_reset_atomic_swap(&self) -> Result<(), StateError> {
+        let (_busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = self
+            .conn
+            .query_row("pragma wal_checkpoint(truncate)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|err| sqlite_error("checkpoint catalog reset sqlite WAL", err))?;
+        self.conn
+            .pragma_update(None, "journal_mode", "DELETE")
+            .map_err(|err| sqlite_error("set catalog reset sqlite journal mode", err))?;
+        Ok(())
+    }
+
     /// Index one fully replayed 3c committed state.
     pub fn index_committed_tape_journal(
         &mut self,
@@ -1799,6 +1828,278 @@ impl CatalogIndex {
         )?;
         tx.commit()
             .map_err(|err| sqlite_error("commit tape provisioning transaction", err))?;
+        Ok(())
+    }
+
+    /// Capture exactly one valid tape identity for every exact voltag selector.
+    ///
+    /// The caller must hold the state-owner lock. This read-only pass is
+    /// deliberately separate from reset mutation so every selector and every
+    /// source row is validated before audit, journal, cache, or SQLite state is
+    /// archived or removed.
+    pub(crate) fn capture_catalog_reset_tapes(
+        &self,
+        voltags: &[String],
+        pool_rules: &[TapePoolRuleConfig],
+    ) -> Result<Vec<CatalogResetPreservedTape>, StateError> {
+        voltags
+            .iter()
+            .map(|voltag| self.capture_catalog_reset_tape(voltag, pool_rules))
+            .collect()
+    }
+
+    /// Whether every authority/cache table that reset promises to clear is
+    /// empty. Used only to recognize the exact post-swap crash-resume state.
+    pub(crate) fn catalog_reset_output_is_clean(&self) -> Result<bool, StateError> {
+        let invalid_tape: bool = self
+            .conn
+            .query_row(
+                "select exists(
+                   select 1 from tapes
+                   where highest_protected_ordinal <> X'0000000000000000'
+                      or total_committed_ordinals <> X'0000000000000000'
+                      or last_committed_tape_file is not null
+                      or written_extent_lba is not null
+                      or finalization_progress is not null
+                      or finalization_trigger is not null
+                      or finalization_operation_id is not null
+                      or finalization_edition_digest is not null
+                      or finalization_layout_digest is not null
+                      or completed_replicas is not null
+                      or finalization_outcome is not null
+                      or (kind = 'cleaning' and (
+                           cleaning_uses is null or cleaning_uses <> 0
+                           or cleaning_state is null or cleaning_state <> 'unverified'
+                         ))
+                      or (kind = 'data' and (cleaning_uses is not null or cleaning_state is not null))
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| sqlite_error("validate reset tape authority", err))?;
+        if invalid_tape {
+            return Ok(false);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select name from sqlite_master
+                 where type = 'table' and name not like 'sqlite_%'
+                 order by name",
+            )
+            .map_err(|err| sqlite_error("list reset output tables", err))?;
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|err| sqlite_error("query reset output tables", err))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| sqlite_error("read reset output table", err))?;
+        for name in names {
+            if matches!(name.as_str(), "schema_meta" | "tapes" | "tape_pools") {
+                continue;
+            }
+            let quoted = name.replace('"', "\"\"");
+            let sql = format!("select exists(select 1 from \"{quoted}\")");
+            let has_rows: bool = self
+                .conn
+                .query_row(&sql, [], |row| row.get(0))
+                .map_err(|err| sqlite_error("inspect reset output table", err))?;
+            if has_rows {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn capture_catalog_reset_tape(
+        &self,
+        voltag: &str,
+        pool_rules: &[TapePoolRuleConfig],
+    ) -> Result<CatalogResetPreservedTape, StateError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "select tapes.tape_uuid, tapes.voltag, tapes.kind, tapes.pool_id,
+                        null,
+                        tapes.block_size, tapes.scheme_id,
+                        tapes.data_blocks_per_stripe, tapes.parity_blocks_per_stripe,
+                        tapes.stripes_per_neighborhood, tapes.last_committed_tape_file,
+                        tapes.total_committed_ordinals, tapes.written_extent_lba,
+                        tapes.state, tapes.updated_at_utc, tapes.assignment_generation,
+                        tapes.finalization_progress, tapes.finalization_trigger,
+                        tapes.finalization_operation_id, tapes.finalization_edition_digest,
+                        tapes.finalization_layout_digest, tapes.completed_replicas,
+                        tapes.finalization_outcome, tapes.highest_protected_ordinal,
+                        exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
+                          or exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                          or exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
+                          or exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid)
+                          or exists(select 1 from tape_io_fences
+                                    where tape_io_fences.tape_uuid = tapes.tape_uuid
+                                      and tape_io_fences.state = 'active')
+                          or exists(select 1 from sessions
+                                    where sessions.tape_uuid = tapes.tape_uuid
+                                      and sessions.state = 'open')
+                          or exists(select 1 from media_readiness_ops
+                                    where media_readiness_ops.barcode = tapes.voltag
+                                      and media_readiness_ops.state not in ('ready', 'released')
+                                      and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none')
+                 from tapes
+                 where tapes.voltag = ?1
+                 order by hex(tapes.tape_uuid)",
+            )
+            .map_err(|err| sqlite_error("prepare catalog reset tape capture", err))?;
+        let mut rows = stmt
+            .query(params![voltag])
+            .map_err(|err| sqlite_error("query catalog reset tape capture", err))?;
+        let first = rows
+            .next()
+            .map_err(|err| sqlite_error("iterate catalog reset tape capture", err))?
+            .ok_or_else(|| {
+                StateError::ConfigInvalid(format!(
+                    "catalog reset preserve selector {voltag:?} matches no tape"
+                ))
+            })?;
+        let tape = tape_from_row(first)?;
+        let highest_protected_ordinal =
+            row_get::<SqliteU64>(first, 23, "tapes.highest_protected_ordinal")?.get();
+        let has_dependent_rows: bool = row_get(first, 24, "tapes.has_dependent_rows")?;
+        if rows
+            .next()
+            .map_err(|err| sqlite_error("iterate catalog reset tape ambiguity", err))?
+            .is_some()
+        {
+            return Err(StateError::AmbiguousCatalogLookup(format!(
+                "catalog reset preserve selector {voltag:?} matches multiple tapes"
+            )));
+        }
+
+        let source_voltag = tape.voltag.as_deref().ok_or_else(|| {
+            StateError::IndexCorrupt(format!(
+                "catalog reset preserve selector {voltag:?} resolved to a tape without a voltag"
+            ))
+        })?;
+        if source_voltag != voltag || source_voltag.trim() != source_voltag {
+            return Err(StateError::IndexCorrupt(format!(
+                "catalog reset preserve selector {voltag:?} resolved to invalid voltag {source_voltag:?}"
+            )));
+        }
+        let tape_uuid: [u8; 16] = tape.tape_uuid.as_slice().try_into().map_err(|_| {
+            StateError::IndexCorrupt(format!(
+                "tape {source_voltag} uuid has length {}, expected 16",
+                tape.tape_uuid.len()
+            ))
+        })?;
+        if !matches!(tape.kind.as_str(), "data" | "cleaning") {
+            return Err(StateError::IndexCorrupt(format!(
+                "tape {source_voltag} has invalid kind {:?}",
+                tape.kind
+            )));
+        }
+        if !matches!(
+            tape.state.as_str(),
+            "ready"
+                | "ingested"
+                | "sealed"
+                | "retired"
+                | "finalizing"
+                | "finalized"
+                | "finalized_degraded"
+                | "recovery_required"
+        ) {
+            return Err(StateError::IndexCorrupt(format!(
+                "tape {source_voltag} has invalid state {:?}",
+                tape.state
+            )));
+        }
+        let geometry = catalog_reset_geometry(&tape)?;
+        if tape.kind == "data" && geometry.is_none() {
+            return Err(StateError::IndexCorrupt(format!(
+                "data tape {source_voltag} has no block geometry"
+            )));
+        }
+        let restore_ready = tape.state == "ready"
+            && tape.last_committed_tape_file.is_none()
+            && tape.total_committed_ordinals == 0
+            && tape.written_extent_lba.is_none()
+            && tape.terminal_finalization.is_none()
+            && highest_protected_ordinal == 0
+            && !has_dependent_rows;
+        let assignment_generation = tape
+            .assignment_generation
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| {
+                StateError::IndexCorrupt(format!(
+                    "tape {source_voltag} assignment generation cannot advance across reset"
+                ))
+            })?;
+
+        Ok(CatalogResetPreservedTape {
+            tape_uuid,
+            voltag: source_voltag.to_string(),
+            kind: tape.kind,
+            pool_id: derive_tape_pool_from_voltag(source_voltag, pool_rules).map(str::to_string),
+            assignment_generation,
+            geometry,
+            restore_ready,
+        })
+    }
+
+    /// Restore previously validated reset rows into a newly created empty
+    /// catalog. All counters and write/finalization projections remain clear.
+    pub(crate) fn restore_catalog_reset_tapes(
+        &mut self,
+        tapes: &[CatalogResetPreservedTape],
+    ) -> Result<(), StateError> {
+        let updated_at = now_utc()?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin catalog reset tape restore", err))?;
+        for tape in tapes {
+            let geometry = tape.geometry.as_ref();
+            tx.execute(
+                "insert into tapes(
+                   tape_uuid, voltag, pool_id, assignment_generation, kind,
+                   cleaning_uses, cleaning_state, block_size, scheme_id,
+                   data_blocks_per_stripe, parity_blocks_per_stripe,
+                   stripes_per_neighborhood, highest_protected_ordinal,
+                   total_committed_ordinals, last_committed_tape_file,
+                   written_extent_lba, finalization_progress, finalization_trigger,
+                   finalization_operation_id, finalization_edition_digest,
+                   finalization_layout_digest, completed_replicas,
+                   finalization_outcome, state, updated_at_utc
+                 ) values(
+                   ?1, ?2, ?3, ?4, ?5,
+                   case when ?5 = 'cleaning' then 0 else null end,
+                   case when ?5 = 'cleaning' then 'unverified' else null end,
+                   ?6, ?7, ?8, ?9, ?10,
+                   X'0000000000000000', X'0000000000000000', null,
+                   null, null, null, null, null, null, null, null, ?11, ?12
+                 )",
+                params![
+                    tape.tape_uuid.as_slice(),
+                    tape.voltag.as_str(),
+                    tape.pool_id.as_deref(),
+                    tape.assignment_generation,
+                    tape.kind.as_str(),
+                    geometry.map(|value| value.block_size),
+                    geometry.and_then(|value| value.scheme_id.as_deref()),
+                    geometry.and_then(|value| value.data_blocks_per_stripe),
+                    geometry.and_then(|value| value.parity_blocks_per_stripe),
+                    geometry.and_then(|value| value.stripes_per_neighborhood),
+                    if tape.restore_ready {
+                        "ready"
+                    } else {
+                        "recovery_required"
+                    },
+                    updated_at.as_str(),
+                ],
+            )
+            .map_err(|err| sqlite_error("restore catalog reset tape", err))?;
+        }
+        tx.commit()
+            .map_err(|err| sqlite_error("commit catalog reset tape restore", err))?;
         Ok(())
     }
 
@@ -5333,12 +5634,112 @@ impl ProvisionTapeGeometry {
     }
 }
 
+fn catalog_reset_geometry(tape: &TapeRecord) -> Result<Option<ProvisionTapeGeometry>, StateError> {
+    let geometry_present = tape.block_size.is_some()
+        || tape.scheme_id.is_some()
+        || tape.data_blocks_per_stripe.is_some()
+        || tape.parity_blocks_per_stripe.is_some()
+        || tape.stripes_per_neighborhood.is_some();
+    if !geometry_present {
+        return Ok(None);
+    }
+    let block_size = tape.block_size.ok_or_else(|| {
+        StateError::IndexCorrupt(format!(
+            "tape {:?} has parity geometry without a block size",
+            tape.voltag
+        ))
+    })?;
+    let block_size = u32::try_from(block_size).map_err(|_| {
+        StateError::IndexCorrupt(format!(
+            "tape {:?} block size {block_size} exceeds u32",
+            tape.voltag
+        ))
+    })?;
+    if block_size == 0 {
+        return Err(StateError::IndexCorrupt(format!(
+            "tape {:?} has zero block size",
+            tape.voltag
+        )));
+    }
+
+    let parity = match tape.scheme_id.as_deref() {
+        None => {
+            if tape.data_blocks_per_stripe.is_some()
+                || tape.parity_blocks_per_stripe.is_some()
+                || tape.stripes_per_neighborhood.is_some()
+            {
+                return Err(StateError::IndexCorrupt(format!(
+                    "tape {:?} has partial parity geometry without a scheme id",
+                    tape.voltag
+                )));
+            }
+            ParityConfig::None
+        }
+        Some(scheme_id) => {
+            if scheme_id.trim().is_empty() || scheme_id.trim() != scheme_id {
+                return Err(StateError::IndexCorrupt(format!(
+                    "tape {:?} has invalid parity scheme id {scheme_id:?}",
+                    tape.voltag
+                )));
+            }
+            let data_blocks_per_stripe =
+                u16::try_from(tape.data_blocks_per_stripe.ok_or_else(|| {
+                    StateError::IndexCorrupt(format!(
+                        "tape {:?} parity geometry is missing data blocks per stripe",
+                        tape.voltag
+                    ))
+                })?)
+                .map_err(|_| {
+                    StateError::IndexCorrupt(format!(
+                        "tape {:?} data blocks per stripe exceeds u16",
+                        tape.voltag
+                    ))
+                })?;
+            let parity_blocks_per_stripe =
+                u16::try_from(tape.parity_blocks_per_stripe.ok_or_else(|| {
+                    StateError::IndexCorrupt(format!(
+                        "tape {:?} parity geometry is missing parity blocks per stripe",
+                        tape.voltag
+                    ))
+                })?)
+                .map_err(|_| {
+                    StateError::IndexCorrupt(format!(
+                        "tape {:?} parity blocks per stripe exceeds u16",
+                        tape.voltag
+                    ))
+                })?;
+            let stripes_per_neighborhood = tape.stripes_per_neighborhood.ok_or_else(|| {
+                StateError::IndexCorrupt(format!(
+                    "tape {:?} parity geometry is missing stripes per neighborhood",
+                    tape.voltag
+                ))
+            })?;
+            let scheme = ParityScheme {
+                id: remanence_parity::SchemeId::new_owned(scheme_id.to_string()),
+                data_blocks_per_stripe,
+                parity_blocks_per_stripe,
+                stripes_per_neighborhood,
+            };
+            scheme.validate().map_err(|err| {
+                StateError::IndexCorrupt(format!(
+                    "tape {:?} has invalid parity geometry: {err}",
+                    tape.voltag
+                ))
+            })?;
+            ParityConfig::Scheme(scheme)
+        }
+    };
+    ProvisionTapeGeometry::from_parity(block_size, &parity).map(Some)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExistingProvisionedTape {
     tape_uuid: Vec<u8>,
     voltag: Option<String>,
     geometry: ProvisionTapeGeometry,
-    last_committed_tape_file: Option<SqliteU64>,
+    truly_unwritten: bool,
+    active_ownership_guard: bool,
+    assignment_generation: i64,
     state: String,
 }
 
@@ -5547,7 +5948,7 @@ fn query_text_column_tx(
 
 impl ExistingProvisionedTape {
     fn is_unwritten(&self) -> bool {
-        self.last_committed_tape_file.is_none()
+        self.truly_unwritten
     }
 }
 
@@ -5580,6 +5981,12 @@ fn provision_tape_tx(
         if same_uuid && same_geometry && same_voltag {
             return Ok(());
         }
+        if existing.active_ownership_guard {
+            return Err(StateError::TapeProvisionConflict(format!(
+                "tape {} has an active quarantine fence or open session; reprovision is forbidden",
+                hex_uuid_from_slice(existing.tape_uuid.as_slice())
+            )));
+        }
         if same_uuid && same_geometry {
             return update_provisioned_tape_voltag_tx(
                 tx,
@@ -5594,13 +6001,23 @@ fn provision_tape_tx(
                 hex_uuid_from_slice(existing.tape_uuid.as_slice())
             )));
         }
+        let next_assignment_generation =
+            existing
+                .assignment_generation
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt(format!(
+                        "tape {} assignment generation cannot advance during reprovision",
+                        hex_uuid_from_slice(existing.tape_uuid.as_slice())
+                    ))
+                })?;
         reprovision_tape_tx(
             tx,
             existing.tape_uuid.as_slice(),
             tape_uuid,
             voltag,
             geometry,
-            !existing.is_unwritten(),
+            next_assignment_generation,
             updated_at,
         )
     } else {
@@ -5617,7 +6034,30 @@ fn find_provisioned_tape_tx(
         tx,
         "select tape_uuid, voltag, block_size, scheme_id, data_blocks_per_stripe,
                 parity_blocks_per_stripe, stripes_per_neighborhood,
-                last_committed_tape_file, state
+                state,
+                state = 'ready'
+                  and highest_protected_ordinal = X'0000000000000000'
+                  and total_committed_ordinals = X'0000000000000000'
+                  and last_committed_tape_file is null
+                  and written_extent_lba is null
+                  and finalization_progress is null
+                  and finalization_trigger is null
+                  and finalization_operation_id is null
+                  and finalization_edition_digest is null
+                  and finalization_layout_digest is null
+                  and completed_replicas is null
+                  and finalization_outcome is null
+                  and not exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid),
+                exists(select 1 from tape_io_fences
+                       where tape_io_fences.tape_uuid = tapes.tape_uuid
+                         and tape_io_fences.state = 'active')
+                  or exists(select 1 from sessions
+                            where sessions.tape_uuid = tapes.tape_uuid
+                              and sessions.state = 'open'),
+                assignment_generation
          from tapes
          where tape_uuid = ?1",
         params![tape_uuid.to_vec()],
@@ -5629,7 +6069,30 @@ fn find_provisioned_tape_tx(
         tx,
         "select tape_uuid, voltag, block_size, scheme_id, data_blocks_per_stripe,
                 parity_blocks_per_stripe, stripes_per_neighborhood,
-                last_committed_tape_file, state
+                state,
+                state = 'ready'
+                  and highest_protected_ordinal = X'0000000000000000'
+                  and total_committed_ordinals = X'0000000000000000'
+                  and last_committed_tape_file is null
+                  and written_extent_lba is null
+                  and finalization_progress is null
+                  and finalization_trigger is null
+                  and finalization_operation_id is null
+                  and finalization_edition_digest is null
+                  and finalization_layout_digest is null
+                  and completed_replicas is null
+                  and finalization_outcome is null
+                  and not exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid),
+                exists(select 1 from tape_io_fences
+                       where tape_io_fences.tape_uuid = tapes.tape_uuid
+                         and tape_io_fences.state = 'active')
+                  or exists(select 1 from sessions
+                            where sessions.tape_uuid = tapes.tape_uuid
+                              and sessions.state = 'open'),
+                assignment_generation
          from tapes
          where voltag = ?1
          order by hex(tape_uuid)
@@ -5657,8 +6120,10 @@ where
                 parity_blocks_per_stripe: row.get(5)?,
                 stripes_per_neighborhood: row.get(6)?,
             },
-            last_committed_tape_file: row.get(7)?,
-            state: row.get(8)?,
+            state: row.get(7)?,
+            truly_unwritten: row.get(8)?,
+            active_ownership_guard: row.get(9)?,
+            assignment_generation: row.get(10)?,
         })
     })
     .optional()
@@ -5721,7 +6186,7 @@ fn reprovision_tape_tx(
     new_tape_uuid: [u8; 16],
     voltag: &str,
     geometry: &ProvisionTapeGeometry,
-    clear_committed_rows: bool,
+    assignment_generation: i64,
     updated_at: &str,
 ) -> Result<(), StateError> {
     tx.execute(
@@ -5733,11 +6198,21 @@ fn reprovision_tape_tx(
              data_blocks_per_stripe = ?6,
              parity_blocks_per_stripe = ?7,
              stripes_per_neighborhood = ?8,
+             pool_id = null,
+             assignment_generation = ?9,
              state = 'ready',
              highest_protected_ordinal = X'0000000000000000',
              total_committed_ordinals = X'0000000000000000',
              last_committed_tape_file = null,
-             updated_at_utc = ?9
+             written_extent_lba = null,
+             finalization_progress = null,
+             finalization_trigger = null,
+             finalization_operation_id = null,
+             finalization_edition_digest = null,
+             finalization_layout_digest = null,
+             completed_replicas = null,
+             finalization_outcome = null,
+             updated_at_utc = ?10
          where tape_uuid = ?1",
         params![
             old_tape_uuid,
@@ -5748,22 +6223,31 @@ fn reprovision_tape_tx(
             geometry.data_blocks_per_stripe,
             geometry.parity_blocks_per_stripe,
             geometry.stripes_per_neighborhood,
+            assignment_generation,
             updated_at,
         ],
     )
     .map_err(|err| sqlite_error("re-provision tape", err))?;
-    if clear_committed_rows {
-        tx.execute(
-            "delete from tape_files where tape_uuid = ?1",
-            params![old_tape_uuid],
-        )
-        .map_err(|err| sqlite_error("clear stale tape_files after re-provision", err))?;
-        tx.execute(
-            "delete from object_copies where tape_uuid = ?1",
-            params![old_tape_uuid],
-        )
-        .map_err(|err| sqlite_error("clear stale object_copies after re-provision", err))?;
-    }
+    tx.execute(
+        "delete from tape_files where tape_uuid = ?1",
+        params![old_tape_uuid],
+    )
+    .map_err(|err| sqlite_error("clear stale tape_files after re-provision", err))?;
+    tx.execute(
+        "delete from object_copies where tape_uuid = ?1",
+        params![old_tape_uuid],
+    )
+    .map_err(|err| sqlite_error("clear stale object_copies after re-provision", err))?;
+    tx.execute(
+        "delete from catalog_units where tape_uuid = ?1",
+        params![old_tape_uuid],
+    )
+    .map_err(|err| sqlite_error("clear stale catalog_units after re-provision", err))?;
+    tx.execute(
+        "delete from wrap_maps where tape_uuid = ?1",
+        params![old_tape_uuid],
+    )
+    .map_err(|err| sqlite_error("clear stale wrap_map after re-provision", err))?;
     Ok(())
 }
 
@@ -13263,7 +13747,6 @@ mod tests {
         index
             .index_committed_tape_journal(input, &state)
             .expect("mark tape written");
-
         index
             .provision_tape(ProvisionTapeInput {
                 tape_uuid,
@@ -13308,6 +13791,38 @@ mod tests {
         index
             .index_committed_tape_journal(input, &state)
             .expect("mark tape written");
+        for progress in [
+            TerminalFinalizationProgress::BeforeReplicaA,
+            TerminalFinalizationProgress::AfterReplicaA,
+            TerminalFinalizationProgress::AfterSeparationAb,
+            TerminalFinalizationProgress::AfterReplicaB,
+            TerminalFinalizationProgress::AfterSeparationBc,
+            TerminalFinalizationProgress::AfterReplicaC,
+        ] {
+            let outcome = if progress == TerminalFinalizationProgress::AfterReplicaC {
+                TerminalFinalizationOutcome::Finalized
+            } else {
+                TerminalFinalizationOutcome::InProgress
+            };
+            index
+                .project_terminal_finalization(terminal_projection(
+                    old_tape_uuid,
+                    progress,
+                    outcome,
+                ))
+                .expect("advance terminal finalization");
+        }
+        index
+            .conn
+            .execute(
+                "insert into catalog_units(
+                   unit_id, tape_uuid, origin_kind, format_id, adapter_state,
+                   created_at_utc
+                 ) values('stale-unit', ?1, 'foreign_scan', 'test', X'',
+                          '2026-08-09T00:00:00Z')",
+                params![old_tape_uuid.as_slice()],
+            )
+            .expect("insert stale catalog unit");
         assert_eq!(count_rows_for_tape(&index, "tape_files", old_tape_uuid), 4);
         assert_eq!(
             count_rows_for_tape(&index, "object_copies", old_tape_uuid),
@@ -13337,12 +13852,19 @@ mod tests {
         assert_eq!(tape.block_size, Some(8192));
         assert_eq!(tape.scheme_id, None);
         assert_eq!(tape.state, "ready");
+        assert_eq!(tape.assignment_generation, 1);
         assert_eq!(tape.last_committed_tape_file, None);
         assert_eq!(tape.total_committed_ordinals, 0);
+        assert_eq!(tape.written_extent_lba, None);
+        assert_eq!(tape.terminal_finalization, None);
         assert_eq!(highest_protected_ordinal(&index, new_tape_uuid), 0);
         assert_eq!(count_rows_for_tape(&index, "tape_files", old_tape_uuid), 0);
         assert_eq!(
             count_rows_for_tape(&index, "object_copies", old_tape_uuid),
+            0
+        );
+        assert_eq!(
+            count_rows_for_tape(&index, "catalog_units", old_tape_uuid),
             0
         );
     }
@@ -13395,6 +13917,235 @@ mod tests {
                 .expect("voltag row count"),
             1
         );
+    }
+
+    #[test]
+    fn reprovision_treats_extent_finalization_and_units_as_written_without_last_file() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-reprovision-authority")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let old_uuid = [0x39; 16];
+        let new_uuid = [0x3A; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: old_uuid,
+                voltag: "RMN039L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision old identity");
+        index
+            .upsert_tape_pool_projection(pool_projection("pool-a"))
+            .expect("project pool");
+        index
+            .project_tape_pool_membership(old_uuid, "pool-a")
+            .expect("assign source pool");
+        index
+            .project_terminal_finalization(terminal_projection(
+                old_uuid,
+                TerminalFinalizationProgress::BeforeReplicaA,
+                TerminalFinalizationOutcome::InProgress,
+            ))
+            .expect("project finalization evidence");
+        index
+            .conn
+            .execute(
+                "update tapes set written_extent_lba = X'0000000000000007',
+                                  last_committed_tape_file = null
+                 where tape_uuid = ?1",
+                params![old_uuid.as_slice()],
+            )
+            .expect("project extent without last file");
+        index
+            .conn
+            .execute(
+                "insert into catalog_units(
+                   unit_id, tape_uuid, origin_kind, format_id, adapter_state,
+                   created_at_utc
+                 ) values('authority-only-unit', ?1, 'foreign_scan', 'test', X'',
+                          '2026-08-09T00:00:00Z')",
+                params![old_uuid.as_slice()],
+            )
+            .expect("project dependent unit");
+
+        let refused = index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: new_uuid,
+                voltag: "RMN039L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect_err("authority evidence requires force even without a last file");
+        assert!(matches!(refused, StateError::TapeProvisionConflict(_)));
+
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: new_uuid,
+                voltag: "RMN039L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: true,
+            })
+            .expect("force new physical identity");
+        let reprovisioned = index
+            .get_tape(&new_uuid)
+            .expect("lookup new identity")
+            .expect("new identity");
+        assert_eq!(reprovisioned.pool_id, None);
+        assert_eq!(reprovisioned.assignment_generation, 2);
+        assert_eq!(reprovisioned.state, "ready");
+        assert_eq!(reprovisioned.written_extent_lba, None);
+        assert_eq!(reprovisioned.terminal_finalization, None);
+        assert_eq!(count_rows_for_tape(&index, "catalog_units", old_uuid), 0);
+
+        index
+            .reconcile_tape_pool_projection_from_rules(
+                &[pool_projection("pool-a")],
+                &[pool_rule("RMN", "pool-a")],
+            )
+            .expect("rederive current-config pool");
+        let reassigned = index
+            .get_tape(&new_uuid)
+            .expect("lookup reassigned identity")
+            .expect("reassigned identity");
+        assert_eq!(reassigned.pool_id.as_deref(), Some("pool-a"));
+        assert_eq!(reassigned.assignment_generation, 3);
+    }
+
+    #[test]
+    fn reprovision_generation_overflow_fails_before_identity_mutation() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-reprovision-generation")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let old_uuid = [0x3B; 16];
+        let new_uuid = [0x3C; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: old_uuid,
+                voltag: "RMN040L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision identity");
+        index
+            .conn
+            .execute(
+                "update tapes set assignment_generation = ?2 where tape_uuid = ?1",
+                params![old_uuid.as_slice(), i64::MAX],
+            )
+            .expect("exhaust generation");
+
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: new_uuid,
+                voltag: "RMN040L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: true,
+            })
+            .expect_err("generation overflow must fail");
+        assert!(index.get_tape(&old_uuid).expect("old lookup").is_some());
+        assert!(index.get_tape(&new_uuid).expect("new lookup").is_none());
+    }
+
+    #[test]
+    fn reprovision_refuses_active_ownership_guards_and_clears_stale_wrap_map() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-reprovision-guards")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let old_uuid = [0x3D; 16];
+        let new_uuid = [0x3E; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: old_uuid,
+                voltag: "RMN041L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision identity");
+        index
+            .conn
+            .execute(
+                "insert into wrap_maps(
+                   tape_uuid, descriptors_json, mapped_extent_lba, write_epoch,
+                   calibration_generation, harvested_at_utc
+                 ) values(?1, '[]', 0, 0, 1, '2026-08-09T00:00:00Z')",
+                params![old_uuid.as_slice()],
+            )
+            .expect("insert stale wrap map");
+        index
+            .conn
+            .execute(
+                "insert into tape_io_fences(
+                   tape_uuid, barcode, state, reason, quarantine_id,
+                   created_at_utc, updated_at_utc
+                 ) values(?1, 'RMN041L9', 'active', 'test', 'test-quarantine',
+                          '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+                params![old_uuid.as_slice()],
+            )
+            .expect("insert active quarantine");
+
+        let input = || ProvisionTapeInput {
+            tape_uuid: new_uuid,
+            voltag: "RMN041L9".to_string(),
+            block_size: 262_144,
+            parity: ParityConfig::None,
+            force: true,
+        };
+        let fenced = index
+            .provision_tape(input())
+            .expect_err("active quarantine forbids force reprovision");
+        assert!(matches!(fenced, StateError::TapeProvisionConflict(_)));
+        assert!(index.get_tape(&old_uuid).expect("old lookup").is_some());
+        assert!(index.get_tape(&new_uuid).expect("new lookup").is_none());
+
+        index
+            .conn
+            .execute(
+                "update tape_io_fences set state = 'released' where tape_uuid = ?1",
+                params![old_uuid.as_slice()],
+            )
+            .expect("release quarantine");
+        index
+            .conn
+            .execute(
+                "insert into sessions(
+                   session_id, session_kind, tape_uuid, state, opened_at_utc, updated_at_utc
+                 ) values('open-reprovision-test', 'write', ?1, 'open',
+                          '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z')",
+                params![old_uuid.as_slice()],
+            )
+            .expect("insert open session");
+        let open_session = index
+            .provision_tape(input())
+            .expect_err("open session forbids force reprovision");
+        assert!(matches!(open_session, StateError::TapeProvisionConflict(_)));
+        assert!(index.get_tape(&old_uuid).expect("old lookup").is_some());
+
+        index
+            .conn
+            .execute(
+                "update sessions set state = 'closed' where tape_uuid = ?1",
+                params![old_uuid.as_slice()],
+            )
+            .expect("close session");
+        index
+            .provision_tape(input())
+            .expect("reprovision after ownership guards clear");
+        assert!(index.get_tape(&old_uuid).expect("old lookup").is_none());
+        assert!(index.get_tape(&new_uuid).expect("new lookup").is_some());
+        assert_eq!(count_rows_for_tape(&index, "wrap_maps", old_uuid), 0);
+        assert_eq!(count_rows_for_tape(&index, "wrap_maps", new_uuid), 0);
     }
 
     #[test]
