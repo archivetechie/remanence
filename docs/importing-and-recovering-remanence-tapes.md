@@ -5,16 +5,54 @@ Remanence Bootstrap without rewriting the cartridge. This is useful after a
 catalog loss, when an offsite cartridge returns without its local SQLite row,
 or when a Remanence tape moves between sites.
 
-This workflow distinguishes two meanings of "foreign" that should not be
-mixed:
+## The short version
 
-- A **Rem-native, locally unknown tape** has a valid Remanence Bootstrap but no
-  matching identity in the current site's catalog. It may be imported through
-  the adoption workflow below.
-- A **foreign-format tape** was written in another on-tape format. A recognized
-  foreign signature, damaged Remanence Bootstrap, or unrecognized BOT data is
-  not adoptable as a Remanence identity. Reading it requires a separate,
-  format-specific adapter and import pipeline.
+Think of a Remanence tape as carrying its own identity card. The first record
+on the tape, called the **Bootstrap**, says which tape this is and how it was
+written. A Remanence installation also keeps a local SQLite catalog, which is
+more like the site's card index: it says which tapes and Objects that site
+knows about.
+
+Moving a cartridge to another site, or losing the SQLite database, can remove
+the card-index entry without erasing the identity card on the tape. The new
+recovery capability safely reads that on-tape identity and creates a minimal,
+conservative local record for it. It does not initialize the tape and does not
+write anything to it.
+
+Import and recovery then happen in three separate stages:
+
+| Stage | What Remanence learns | What it deliberately does not assume |
+|---|---|---|
+| **Probe** | Whether BOT contains a valid Remanence Bootstrap, plus its tape UUID and geometry | That the local catalog is correct or that the rest of the tape is healthy |
+| **Adopt** | The tape's identity, barcode, pool mapping, geometry, and a conservative lifecycle state | Which Objects are present or whether they were committed |
+| **Inventory/rebuild** | The recoverable tape contents, from terminal indexes, surviving journals, or a scan starting at BOT | That provisional scan output is already committed catalog authority |
+
+This separation is intentional. It lets Remanence recognize a cartridge
+without inventing a history for it. A finalized tape normally offers a fast
+terminal index. A partially written tape, or a tape whose terminal indexes are
+unreadable, may require a complete scan from the beginning instead.
+
+## What “foreign tape” means
+
+People use “foreign” for two quite different situations:
+
+| Cartridge | Supported by this workflow? | Correct path |
+|---|---:|---|
+| A Remanence tape written at another site | Yes | Probe, adopt its existing identity, then inventory and rebuild |
+| A Remanence tape whose local SQLite row was lost | Yes | The same probe-and-adopt workflow |
+| A Remanence tape with a damaged or unreadable Bootstrap | No | Do not adopt; preserve the cartridge for a deeper recovery procedure |
+| An LTFS, tar, Dwara, or other non-Remanence tape | No | Use a separately supplied, read-only foreign-format adapter |
+| A blank tape | No | Initialize it as new media instead of adopting it |
+
+The important supported case is therefore **foreign to this installation,
+but native to Remanence**. The adoption command recognizes the identity already
+on that tape; it does not convert another tape format into Remanence.
+
+Stock Remanence does not ship a concrete LTFS, tar, Dwara, or other legacy
+parser. Its core exposes the adapter interface, while separately versioned
+distributions may link supported read-only adapters. See
+[Foreign-format adapters](reference-foreign-format-adapters.md) for that
+separate path and its current availability.
 
 Adoption restores identity only. It does not claim that the site's catalog
 knows the tape's Objects, files, committed prefix, terminal indexes, or
@@ -24,7 +62,8 @@ For example, Site A can write a Remanence tape and send it to an offsite vault.
 If Site B later receives the cartridge without Site A's SQLite catalog, Site B
 can probe and adopt the Bootstrap identity, then inventory the terminal indexes
 and rebuild the authority that actually survives. An LTFS cartridge in the same
-shipment takes the separate LTFS import path; adoption will reject it.
+shipment needs a distribution with an LTFS adapter; the stock Remanence tools
+will reject it as unrecognized or unsupported rather than guessing.
 
 In plain terms, adoption records the native tape's identity, geometry, pool,
 and conservative lifecycle state. It does not rewrite the tape, decrypt or
@@ -179,6 +218,11 @@ rem rebuild-catalog-from-journals --config /path/to/config.toml
 Do not treat streamed inventory rows as committed catalog authority unless the
 documented inventory summary and subsequent recovery/rebuild procedure says
 they are authoritative.
+
+In practical terms, a successful adoption means “we now know exactly which
+tape this is.” It does not yet mean “this tape is ready for new writes.” A
+`recovery_required` tape stays fenced from normal write use until the inventory,
+commit history, and local catalog agree.
 
 ## Refusals to expect
 
