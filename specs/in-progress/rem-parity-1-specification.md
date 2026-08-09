@@ -521,9 +521,19 @@ may transition the tape back to `Open`. Successful component barriers advance
 only through `AfterReplicaA`, `AfterSeparationAb`, `AfterReplicaB`,
 `AfterSeparationBc`, and `AfterReplicaC`. Ordinary `Finalized`/sealed state
 requires `AfterReplicaC` and the required host persistence order.
+`Finalizing(AfterReplicaC)` is a valid resumable state: all three replicas are
+barrier-proved, while the sealed checkpoint or final SQLite projection is not
+yet durable. Restart MUST finish those host-only steps without repeating
+terminal media motion. A matching sealed checkpoint takes precedence over a
+stale companion intent left by interruption during its cleanup; a mismatch
+fails closed.
 
 A component failure or completion-unknown result enters or retains
-`RecoveryRequired`. From there a Writer may reconcile and repair only missing
+`RecoveryRequired`. That classification is part of the fsynced companion
+intent: restart MUST retain it at the same progress. A successful successor
+component transition clears it; at `AfterReplicaC`, proved host-authority
+alignment may clear it only as part of the no-media final checkpoint path.
+From there a Writer may reconcile and repair only missing
 terminal control components at proved locations under the medium's rewrite
 policy. It MUST NOT write an Object, remove the finalization fence, or append a
 second terminal triple. If the next component is proved torn on WORM media and
@@ -1222,10 +1232,10 @@ replica and it MUST report that terminal authority was not recovered.
   explicitly that position is indeterminate when the drive cannot report one.
   An operator who aborts is planning a next step and needs to know where the
   head is.
-- **Positioning-failure bound.** During a Strategy-5 walk, inter-file
-  positioning commands (SPACE, LOCATE issued between tape files) are governed
-  by this bullet and are exempt from Section 8.4 per-block rule 6; read
-  errors remain governed by the per-block rules unchanged. After
+- **Positioning-failure bound.** During this BOT structural walk, inter-file
+  positioning commands (SPACE and any LOCATE issued between tape files) are
+  governed by this bullet; a read failure remains a read failure and does not
+  consume this separate positioning-failure budget. After
   `WALK_MAX_CONSECUTIVE_POSITIONING_FAILURES` (8) consecutive positioning
   failures the walk MUST stop and report rather than continue commanding
   motion against a medium or drive that is refusing it.
@@ -1637,20 +1647,30 @@ structural damage; EOD at a file start ends the walk.
    frame's `block_size_bytes` equals the read size, the payload's
    `tape_uuid` equals the tape identity of Section 12.1, and the file measures
    exactly 1 block.
-2. **ParityMap**: a complete copy/header and payload validate, and the measured
+2. **TapeIndexReplica**: matching terminal-replica header magic commits the
+   tape file to this control type. The header and measured block count are
+   checked against the encoded component plan. A malformed frame or count
+   mismatch is reported as damaged terminal control; it MUST NOT fall through
+   to Object. When the head is unreadable, a matching, fully parsed terminal
+   footer may establish the same type after its measured count is checked.
+3. **IndexSeparationExtent**: matching separation-header magic commits the
+   tape file to this control type under the same malformed-control and measured
+   count rules. A matching, fully parsed footer may establish the type when the
+   head is unreadable.
+4. **ParityMap**: a complete copy/header and payload validate, and the measured
    block count agrees with its locator footer. It is classified as pre-tail
    parity-closeout metadata, not selected as terminal inventory authority.
-3. **Sidecar (primary)**: the primary header parses; the measured block
+5. **Sidecar (primary)**: the primary header parses; the measured block
    count MUST equal the header's `sidecar_total_block_count` (mismatch is a
    hard error).
-4. **Sidecar (footer/tail probe)**: read the file's last block; if it
+6. **Sidecar (footer/tail probe)**: read the file's last block; if it
    parses as a sidecar footer, the footer's total MUST equal the measured
    block count; then verify the tail header copy against the footer,
    field for field. Classification MAY fall back to footer fields alone if
    the tail copy is unreadable.
-5. **Object, by elimination** — never by reading object content.
+7. **Object, by elimination** — never by reading object content.
 
-In items 2 through 4, a count-mismatch “hard error” is scoped to that rung and
+In items 2 through 6, a count-mismatch “hard error” is scoped to that rung and
 that tape file's classification: the Scanner reports the failed
 classification and continues the walk with the next tape file. It MUST NOT
 abort the whole walk for that mismatch.
@@ -1674,15 +1694,22 @@ layout digest. Any disagreement is `TerminalIndexReplicaConflict`; it is not
 resolved by ordinal preference. A missing or corrupt member is reported as
 degraded evidence without invalidating an agreeing survivor.
 
-The Scanner reads each attempted body at most once and emits a bounded
-transactional stream. Every attempt starts with a unique `attempt_id`; its map
+On the ordinary healthy path, where the envelope evidence identifies one
+agreeing edition without conflict resolution, the Scanner reads each attempted
+body at most once and emits a bounded transactional stream. Every attempt
+starts with a unique `attempt_id`; its map
 and Object rows carry that identifier and remain provisional until the terminal
 summary selects the attempt. If validation fails after any rows, the Scanner
 emits an explicit rejection for that attempt before trying the next member.
 A Consumer MUST commit only the attempt named by the terminal summary and MUST
-discard rejected or unselected attempts. This permits C-to-B-to-A fallback with
-downstream backpressure and without a whole-index buffer or a second tape-body
-read. Cross-survivor comparison is reflected in the terminal summary.
+discard rejected or unselected attempts. This permits ordinary C-to-B-to-A
+fallback with downstream backpressure and without a whole-index buffer or a
+second tape-body read. When independently valid envelopes conflict, resolving
+which editions have payload-valid survivors may require a bounded replay of
+candidate bodies, and the selected transactional attempt may then replay the
+winner for its consumer. That exceptional conflict path remains streaming and
+bounded; it does not weaken the fail-closed cross-survivor comparison reflected
+in the terminal summary.
 
 If A, B, and C all fail, the Scanner returns an explicit
 `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk;
@@ -2301,24 +2328,54 @@ verifiable against any directory entry.
 
 The reference implementation uses two append-only per-tape records for a
 checkpointed write session. Its Layer 3c tape-file journal
-(`<tape-uuid>.remjournal`) is version 3. Version 3 adds a
-`checkpointed_through` watermark record so replay can discard physically
-written but uncheckpointed orphan bundles and truncate them before append. Its
+(`<tape-uuid>.remjournal`) is version 4. Version 3 added a
+`checkpointed_through` watermark record so ordinary replay can retain,
+physically reconcile, and then truncate uncheckpointed orphan bundles before
+append. Version 4 adds typed terminal-prefix and terminal-component
+transitions with their paired watermarks. Its
 checkpoint journal (`checkpoints/<tape-uuid>.remcheckpoint`) records each
 synchronized checkpoint's physical EOD and the batch projection needed to
 rebuild the catalog.
 
 For parity-enabled sessions these two journals are required commit authority
-in the sense of Section 3.4. Replay first discards Layer 3c bundles beyond the
-last `checkpointed_through` watermark. Before an append-positioning `LOCATE`,
-the reference Resumer then compares the journals' complete checkpointed
-histories, including tape-file map entries, object identities, parity
-watermarks, and terminal EOD. If either checkpointed history is missing an
-entry named by the other, is ahead of the other, or conflicts, resume fails
-closed. SQLite is a rebuildable projection, not commit authority. A
-bootstrap-only SQLite projection with no complete jointly authoritative
-off-tape commit record therefore represents an empty committed prefix and does
-not prevent the Writer from rewriting file 0 from BOT.
+in the sense of Section 3.4. During ordinary open-tape replay, Layer 3c bundles
+beyond the last `checkpointed_through` watermark are orphan evidence: they are
+discarded only after physical reconciliation authorizes their removal. Before
+an append-positioning `LOCATE`, the reference Resumer compares the journals'
+complete checkpointed histories, including tape-file map entries, object
+identities, parity watermarks, and terminal EOD. If either checkpointed history
+is missing an entry named by the other, is ahead of the other, or conflicts,
+resume fails closed.
+
+There is one narrower Finalizing-state exception. For each of the five planned
+terminal components, persistence order is: synchronizing media barrier; exact
+component record and its immediately following `checkpointed_through` record
+in the Layer 3c journal; terminal-progress fsync in the checkpoint journal;
+then SQLite projection. Before any terminal positioning or write on restart,
+the Resumer reconstructs the immutable final edition and compares every
+present terminal-component and watermark digest with that plan. It accepts
+only equal component counts or exactly one next canonical Layer 3c transition
+ahead. In that single crash window it completes a missing Layer 3c watermark
+if necessary, advances the checkpoint journal to that same component, and
+rebuilds SQLite, all before media motion. A skip, regression, non-next record,
+or conflicting digest fails closed. This exception promotes barrier-proved
+terminal progress; it never promotes an ordinary Object or parity bundle.
+`AfterReplicaC` remains `Finalizing` until its SQLite progress projection, a
+sealed checkpoint containing the exact completed intent, retirement of the
+matching companion intent, and the final SQLite projection complete in that
+order. If interruption leaves the sealed checkpoint with its exact companion
+intent, replay clears the stale companion and projects the sealed checkpoint;
+it does not regress to in-progress authority.
+
+The companion intent format is versioned independently from the tape format.
+A companion that carries the durable `RecoveryRequired` classification MUST
+use a format revision that older readers cannot silently treat as an ordinary
+in-progress intent; unsupported revisions fail closed.
+
+SQLite is a rebuildable projection, not commit authority. A bootstrap-only
+SQLite projection with no complete jointly authoritative off-tape commit
+record therefore represents an empty committed prefix and does not prevent the
+Writer from rewriting file 0 from BOT.
 
 Neither journal format is recorded on tape, and neither changes any
 REM-PARITY media byte.

@@ -22,7 +22,7 @@ use super::{
 };
 
 const FINALIZATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const FINALIZATION_JSON_SCHEMA: &str = "rem.tape.finalization.v1";
+const FINALIZATION_JSON_SCHEMA: &str = "rem.tape.finalization.v2";
 
 #[derive(Args, Clone, Debug)]
 pub(crate) struct TapeFinalizeArgs {
@@ -304,11 +304,17 @@ fn execute_with_transport<T: FinalizationTransport>(
     }
 }
 
+#[allow(deprecated)]
 fn validate_status(
     status: &pb::TapeFinalization,
     expected_tape_uuid: &[u8; 16],
     expected_operation_id: Option<&[u8; 16]>,
 ) -> Result<Option<[u8; 16]>, DaemonClientError> {
+    if !status.replica_health.is_empty() {
+        return Err(DaemonClientError::client(
+            "daemon returned deprecated finalization replica_health rows; upgrade the daemon",
+        ));
+    }
     let tape_uuid = <[u8; 16]>::try_from(status.tape_uuid.as_slice()).map_err(|_| {
         DaemonClientError::client(format!(
             "daemon returned tape_uuid with {} bytes; expected 16",
@@ -337,7 +343,7 @@ fn validate_status(
         if !status.operation_id.is_empty()
             || status.progress != pb::TapeFinalizationProgress::Unspecified as i32
             || status.completed_replicas != 0
-            || !status.replica_health.is_empty()
+            || !status.replica_progress.is_empty()
             || !status.edition_digest.is_empty()
             || !status.layout_digest.is_empty()
         {
@@ -347,9 +353,24 @@ fn validate_status(
         }
         return Ok(None);
     }
-    // Reject an unspecified or unknown outcome before validating the fields
+    // Reject unspecified or unknown state before validating the fields
     // required on every accepted operation.
     let _ = is_terminal(status.outcome)?;
+    let outcome = pb::TapeFinalizationOutcome::try_from(status.outcome).map_err(|_| {
+        DaemonClientError::client(format!(
+            "daemon returned unknown tape finalization outcome {}",
+            status.outcome
+        ))
+    })?;
+    let progress = pb::TapeFinalizationProgress::try_from(status.progress).map_err(|_| {
+        DaemonClientError::client(format!(
+            "daemon returned unknown tape finalization progress {}",
+            status.progress
+        ))
+    })?;
+    let expected_completed = completed_replicas_for_progress(progress).ok_or_else(|| {
+        DaemonClientError::client("daemon returned unspecified tape finalization progress")
+    })?;
     let operation_id = if status.operation_id.is_empty() {
         return Err(DaemonClientError::client(
             "daemon returned finalization status without an operation_id",
@@ -373,14 +394,32 @@ fn validate_status(
             "daemon changed the finalization operation_id while polling",
         ));
     }
-    if status.completed_replicas > 3 {
+    if status.completed_replicas != expected_completed {
         return Err(DaemonClientError::client(format!(
-            "daemon returned invalid completed_replicas {}",
-            status.completed_replicas
+            "daemon returned completed_replicas {} inconsistent with progress {} (expected {expected_completed})",
+            status.completed_replicas,
+            progress_name(status.progress),
         )));
     }
+    match outcome {
+        pb::TapeFinalizationOutcome::Finalized
+            if progress != pb::TapeFinalizationProgress::AfterReplicaC =>
+        {
+            return Err(DaemonClientError::client(
+                "daemon returned finalized outcome before replica C",
+            ));
+        }
+        pb::TapeFinalizationOutcome::FinalizedDegraded
+            if !(1..=2).contains(&expected_completed) =>
+        {
+            return Err(DaemonClientError::client(
+                "daemon returned finalized_degraded without exactly one or two barrier-proved replicas",
+            ));
+        }
+        _ => {}
+    }
     let mut ordinals = BTreeSet::new();
-    for replica in &status.replica_health {
+    for replica in &status.replica_progress {
         if !(1..=3).contains(&replica.replica_ordinal) {
             return Err(DaemonClientError::client(format!(
                 "daemon returned invalid replica ordinal {}",
@@ -393,10 +432,39 @@ fn validate_status(
                 replica.replica_ordinal
             )));
         }
+        let state =
+            pb::tape_index_replica_progress::State::try_from(replica.state).map_err(|_| {
+                DaemonClientError::client(format!(
+                    "daemon returned unknown progress state {} for replica {}",
+                    replica.state, replica.replica_ordinal
+                ))
+            })?;
+        if state == pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateUnspecified
+        {
+            return Err(DaemonClientError::client(format!(
+                "daemon returned unspecified progress state for replica {}",
+                replica.replica_ordinal
+            )));
+        }
+        let expected_state = expected_replica_progress_state(
+            replica.replica_ordinal,
+            expected_completed,
+            progress,
+            outcome,
+        );
+        if state != expected_state {
+            return Err(DaemonClientError::client(format!(
+                "daemon returned {} for replica {}, inconsistent with progress {} and outcome {}",
+                replica_progress_state_name(replica.state),
+                replica.replica_ordinal,
+                progress_name(status.progress),
+                outcome_name(status.outcome).unwrap_or("unknown"),
+            )));
+        }
     }
     if ordinals.len() != 3 {
         return Err(DaemonClientError::client(format!(
-            "daemon returned {} replica-health rows; expected ordinals 1, 2, and 3",
+            "daemon returned {} replica-progress rows; expected ordinals 1, 2, and 3",
             ordinals.len()
         )));
     }
@@ -412,6 +480,48 @@ fn validate_status(
         }
     }
     Ok(operation_id)
+}
+
+const fn completed_replicas_for_progress(progress: pb::TapeFinalizationProgress) -> Option<u32> {
+    match progress {
+        pb::TapeFinalizationProgress::BeforeReplicaA => Some(0),
+        pb::TapeFinalizationProgress::AfterReplicaA
+        | pb::TapeFinalizationProgress::AfterSeparationAb => Some(1),
+        pb::TapeFinalizationProgress::AfterReplicaB
+        | pb::TapeFinalizationProgress::AfterSeparationBc => Some(2),
+        pb::TapeFinalizationProgress::AfterReplicaC => Some(3),
+        pb::TapeFinalizationProgress::Unspecified => None,
+    }
+}
+
+fn expected_replica_progress_state(
+    ordinal: u32,
+    completed: u32,
+    progress: pb::TapeFinalizationProgress,
+    outcome: pb::TapeFinalizationOutcome,
+) -> pb::tape_index_replica_progress::State {
+    use pb::tape_index_replica_progress::State;
+    if ordinal <= completed {
+        return State::TapeIndexReplicaProgressStateBarrierProved;
+    }
+    let unknown = if outcome == pb::TapeFinalizationOutcome::RecoveryRequired {
+        match progress {
+            pb::TapeFinalizationProgress::BeforeReplicaA => Some(1),
+            pb::TapeFinalizationProgress::AfterSeparationAb => Some(2),
+            pb::TapeFinalizationProgress::AfterSeparationBc => Some(3),
+            pb::TapeFinalizationProgress::AfterReplicaA
+            | pb::TapeFinalizationProgress::AfterReplicaB
+            | pb::TapeFinalizationProgress::AfterReplicaC
+            | pb::TapeFinalizationProgress::Unspecified => None,
+        }
+    } else {
+        None
+    };
+    if unknown == Some(ordinal) {
+        State::TapeIndexReplicaProgressStateCompletionUnknown
+    } else {
+        State::TapeIndexReplicaProgressStatePending
+    }
 }
 
 fn is_terminal(outcome: i32) -> Result<bool, DaemonClientError> {
@@ -488,10 +598,10 @@ fn print_finalization(
         )
     )
     .map_err(|error| format!("write finalization status: {error}"))?;
-    if !finalization.replica_health.is_empty() {
-        writeln!(out, "replica_health:")
+    if !finalization.replica_progress.is_empty() {
+        writeln!(out, "replica_progress:")
             .map_err(|error| format!("write finalization status: {error}"))?;
-        for replica in ordered_replica_health(finalization) {
+        for replica in ordered_replica_progress(finalization) {
             let detail = if replica.detail.is_empty() {
                 String::new()
             } else {
@@ -501,7 +611,7 @@ fn print_finalization(
                 out,
                 "  replica {}: {}{}",
                 replica.replica_ordinal,
-                replica_state_name(replica.state),
+                replica_progress_state_name(replica.state),
                 detail
             )
             .map_err(|error| format!("write finalization status: {error}"))?;
@@ -532,12 +642,12 @@ fn print_finalization(
 
 fn finalization_json(finalization: &pb::TapeFinalization) -> Result<Value, String> {
     let terminal = is_terminal(finalization.outcome).map_err(|error| error.message)?;
-    let replica_health = ordered_replica_health(finalization)
+    let replica_progress = ordered_replica_progress(finalization)
         .into_iter()
         .map(|replica| {
             json!({
                 "replica_ordinal": replica.replica_ordinal,
-                "state": replica_state_name(replica.state),
+                "state": replica_progress_state_name(replica.state),
                 "detail": replica.detail,
             })
         })
@@ -554,7 +664,7 @@ fn finalization_json(finalization: &pb::TapeFinalization) -> Result<Value, Strin
         "progress": progress_name(finalization.progress),
         "completed_replicas": finalization.completed_replicas,
         "replica_count": 3,
-        "replica_health": replica_health,
+        "replica_progress": replica_progress,
         "edition_digest": digest_json(&finalization.edition_digest),
         "layout_digest": digest_json(&finalization.layout_digest),
         "terminal": terminal,
@@ -566,8 +676,10 @@ fn finalization_json(finalization: &pb::TapeFinalization) -> Result<Value, Strin
     }))
 }
 
-fn ordered_replica_health(finalization: &pb::TapeFinalization) -> Vec<&pb::TapeIndexReplicaHealth> {
-    let mut replicas = finalization.replica_health.iter().collect::<Vec<_>>();
+fn ordered_replica_progress(
+    finalization: &pb::TapeFinalization,
+) -> Vec<&pb::TapeIndexReplicaProgress> {
+    let mut replicas = finalization.replica_progress.iter().collect::<Vec<_>>();
     replicas.sort_unstable_by_key(|replica| replica.replica_ordinal);
     replicas
 }
@@ -610,21 +722,26 @@ fn outcome_name(outcome: i32) -> Result<&'static str, String> {
     }
 }
 
-fn replica_state_name(state: i32) -> &'static str {
-    match pb::tape_index_replica_health::State::try_from(state) {
-        Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStatePending) => "pending",
-        Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete) => "complete",
-        Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStateEnvelopeValid) => {
-            "envelope_valid"
+fn replica_progress_state_name(state: i32) -> &'static str {
+    match pb::tape_index_replica_progress::State::try_from(state) {
+        Ok(pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStatePending) => {
+            "pending"
         }
-        Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStateInvalid) => "invalid",
-        Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStateUnknown) => "unknown",
-        Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStateUnspecified) => "unspecified",
+        Ok(pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateBarrierProved) => {
+            "barrier_proved"
+        }
+        Ok(
+            pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateCompletionUnknown,
+        ) => "completion_unknown",
+        Ok(pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateUnspecified) => {
+            "unspecified"
+        }
         Err(_) => "unknown",
     }
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use std::collections::VecDeque;
 
@@ -644,16 +761,18 @@ mod tests {
     }
 
     fn status(outcome: pb::TapeFinalizationOutcome) -> pb::TapeFinalization {
-        pb::TapeFinalization {
+        let mut status = pb::TapeFinalization {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
             operation_id: Uuid::from_u128(3).as_bytes().to_vec(),
             progress: pb::TapeFinalizationProgress::BeforeReplicaA as i32,
             completed_replicas: 0,
-            replica_health: (1..=3)
-                .map(|replica_ordinal| pb::TapeIndexReplicaHealth {
+            replica_health: Vec::new(),
+            replica_progress: (1..=3)
+                .map(|replica_ordinal| pb::TapeIndexReplicaProgress {
                     replica_ordinal,
-                    state: pb::tape_index_replica_health::State::TapeIndexReplicaStatePending
-                        as i32,
+                    state:
+                        pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStatePending
+                            as i32,
                     detail: String::new(),
                 })
                 .collect(),
@@ -662,6 +781,27 @@ mod tests {
             outcome: outcome as i32,
             trigger: "operator_close_out".to_string(),
             detail: "accepted".to_string(),
+        };
+        set_status_progress(&mut status, pb::TapeFinalizationProgress::BeforeReplicaA);
+        status
+    }
+
+    fn set_status_progress(
+        status: &mut pb::TapeFinalization,
+        progress: pb::TapeFinalizationProgress,
+    ) {
+        status.progress = progress as i32;
+        status.completed_replicas =
+            completed_replicas_for_progress(progress).expect("test progress is specified");
+        let outcome =
+            pb::TapeFinalizationOutcome::try_from(status.outcome).expect("test outcome is known");
+        for replica in &mut status.replica_progress {
+            replica.state = expected_replica_progress_state(
+                replica.replica_ordinal,
+                status.completed_replicas,
+                progress,
+                outcome,
+            ) as i32;
         }
     }
 
@@ -672,6 +812,7 @@ mod tests {
             progress: pb::TapeFinalizationProgress::Unspecified as i32,
             completed_replicas: 0,
             replica_health: Vec::new(),
+            replica_progress: Vec::new(),
             edition_digest: Vec::new(),
             layout_digest: Vec::new(),
             outcome: pb::TapeFinalizationOutcome::Busy as i32,
@@ -833,7 +974,7 @@ mod tests {
         assert_eq!(value["data"]["operation_id"], Value::Null);
         assert_eq!(value["data"]["progress"], "unspecified");
         assert_eq!(value["data"]["completed_replicas"], 0);
-        assert_eq!(value["data"]["replica_health"], json!([]));
+        assert_eq!(value["data"]["replica_progress"], json!([]));
         assert_eq!(value["data"]["terminal"], true);
 
         let mut out = Vec::new();
@@ -842,7 +983,7 @@ mod tests {
         assert!(rendered.contains("operation_id: -\n"));
         assert!(rendered.contains("outcome: busy\n"));
         assert!(rendered.contains("progress: unspecified\n"));
-        assert!(!rendered.contains("replica_health:\n"));
+        assert!(!rendered.contains("replica_progress:\n"));
     }
 
     #[test]
@@ -910,7 +1051,7 @@ mod tests {
             .contains("BUSY with accepted-operation fields"));
 
         let mut invalid = busy_status();
-        invalid.replica_health = status(pb::TapeFinalizationOutcome::Finalizing).replica_health;
+        invalid.replica_progress = status(pb::TapeFinalizationOutcome::Finalizing).replica_progress;
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message
@@ -920,8 +1061,10 @@ mod tests {
     #[test]
     fn wait_polls_across_retryable_disconnect_without_resubmitting() {
         let mut final_status = status(pb::TapeFinalizationOutcome::Finalized);
-        final_status.progress = pb::TapeFinalizationProgress::AfterReplicaC as i32;
-        final_status.completed_replicas = 3;
+        set_status_progress(
+            &mut final_status,
+            pb::TapeFinalizationProgress::AfterReplicaC,
+        );
         let mut transport = MockTransport {
             finalize_response: Some(status(pb::TapeFinalizationOutcome::Finalizing)),
             polls: VecDeque::from([
@@ -953,10 +1096,12 @@ mod tests {
     #[test]
     fn json_status_has_stable_schema_and_typed_fields() {
         let mut final_status = status(pb::TapeFinalizationOutcome::FinalizedDegraded);
-        final_status.progress = pb::TapeFinalizationProgress::AfterReplicaB as i32;
-        final_status.completed_replicas = 2;
+        set_status_progress(
+            &mut final_status,
+            pb::TapeFinalizationProgress::AfterReplicaB,
+        );
         final_status.edition_digest = vec![0xab; 32];
-        final_status.replica_health.reverse();
+        final_status.replica_progress.reverse();
         let mut out = Vec::new();
         print_finalization(&final_status, true, &mut out).unwrap();
         let value: Value = serde_json::from_slice(&out).unwrap();
@@ -970,17 +1115,19 @@ mod tests {
         assert_eq!(value["data"]["operator_recovery_required"], false);
         assert_eq!(value["data"]["edition_digest"], "ab".repeat(32));
         assert_eq!(value["data"]["layout_digest"], Value::Null);
-        assert_eq!(value["data"]["replica_health"][0]["replica_ordinal"], 1);
-        assert_eq!(value["data"]["replica_health"][1]["replica_ordinal"], 2);
-        assert_eq!(value["data"]["replica_health"][2]["replica_ordinal"], 3);
+        assert_eq!(value["data"]["replica_progress"][0]["replica_ordinal"], 1);
+        assert_eq!(value["data"]["replica_progress"][1]["replica_ordinal"], 2);
+        assert_eq!(value["data"]["replica_progress"][2]["replica_ordinal"], 3);
     }
 
     #[test]
     fn human_status_has_stable_operator_fields() {
         let mut final_status = status(pb::TapeFinalizationOutcome::RecoveryRequired);
-        final_status.progress = pb::TapeFinalizationProgress::AfterSeparationAb as i32;
-        final_status.completed_replicas = 1;
-        final_status.replica_health[0].detail = "capsule B torn".to_string();
+        set_status_progress(
+            &mut final_status,
+            pb::TapeFinalizationProgress::AfterSeparationAb,
+        );
+        final_status.replica_progress[0].detail = "replica A barrier proved".to_string();
         let mut out = Vec::new();
         print_finalization(&final_status, false, &mut out).unwrap();
         assert_eq!(
@@ -993,9 +1140,9 @@ mod tests {
                 "progress: after_separation_ab\n",
                 "completed_replicas: 1/3\n",
                 "operator_recovery_required: true\n",
-                "replica_health:\n",
-                "  replica 1: pending (capsule B torn)\n",
-                "  replica 2: pending\n",
+                "replica_progress:\n",
+                "  replica 1: barrier_proved (replica A barrier proved)\n",
+                "  replica 2: completion_unknown\n",
                 "  replica 3: pending\n",
                 "detail: accepted\n",
             )
@@ -1028,6 +1175,50 @@ mod tests {
     fn status_validation_rejects_malformed_structured_fields() {
         let expected_tape = *Uuid::from_u128(1).as_bytes();
 
+        let mut resumable_after_c = status(pb::TapeFinalizationOutcome::Finalizing);
+        set_status_progress(
+            &mut resumable_after_c,
+            pb::TapeFinalizationProgress::AfterReplicaC,
+        );
+        validate_status(&resumable_after_c, &expected_tape, None)
+            .expect("replica C may be durable while host sealing remains in progress");
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.completed_replicas = 1;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("inconsistent with progress"));
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.replica_progress[0].state = 999;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("unknown progress state"));
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.replica_health.push(Default::default());
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("deprecated finalization replica_health"));
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.replica_progress[0].state =
+            pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateBarrierProved
+                as i32;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("inconsistent with progress"));
+
+        let invalid = status(pb::TapeFinalizationOutcome::Finalized);
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("finalized outcome before replica C"));
+
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalized);
         invalid.operation_id = Uuid::nil().as_bytes().to_vec();
         assert!(validate_status(&invalid, &expected_tape, None)
@@ -1036,6 +1227,7 @@ mod tests {
             .contains("nil finalization operation_id"));
 
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalized);
+        set_status_progress(&mut invalid, pb::TapeFinalizationProgress::AfterReplicaC);
         invalid.layout_digest = vec![0; 31];
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
@@ -1043,19 +1235,21 @@ mod tests {
             .contains("layout_digest with 31 bytes"));
 
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalized);
+        set_status_progress(&mut invalid, pb::TapeFinalizationProgress::AfterReplicaC);
         invalid
-            .replica_health
-            .push(invalid.replica_health[0].clone());
+            .replica_progress
+            .push(invalid.replica_progress[0].clone());
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message
             .contains("duplicate replica ordinal"));
 
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalized);
-        invalid.replica_health.pop();
+        set_status_progress(&mut invalid, pb::TapeFinalizationProgress::AfterReplicaC);
+        invalid.replica_progress.pop();
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message
-            .contains("2 replica-health rows"));
+            .contains("2 replica-progress rows"));
     }
 }

@@ -256,6 +256,26 @@ async fn open_write_session_reserved(
     };
     let select_elapsed = select_started.elapsed();
     let tape_uuid = selected.tape_uuid;
+    drop(index);
+    let mut host_index = CatalogIndex::open(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if crate::write_owner::preflight_automatic_terminal_completion(
+        &mut host_index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+            audit_dir: state.audit_dir.as_path(),
+            audit_fsync: state.audit_fsync,
+            audit_append_lock: &state.audit_append_lock,
+        },
+        &selected,
+        &pool_cfg,
+    )? {
+        return Err(Status::failed_precondition(format!(
+            "tape {} completed terminal finalization during host-only open recovery and cannot accept Objects",
+            Uuid::from_bytes(tape_uuid)
+        )));
+    }
+    drop(host_index);
     let open_started = Instant::now();
     let resolve_started = Instant::now();
     let (mount, drive_reservation) =
@@ -741,9 +761,31 @@ async fn run_manual_finalize_worker(
     state: ApiState,
     pool: crate::write_owner::DrivePool,
     _tape_reservation: crate::write_owner::TapeReservation,
-    actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
+    mut actor_request: crate::write_owner::ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
     let tape_uuid = actor_request.tape_uuid;
+    let mut index = CatalogIndex::open(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let barcode = index
+        .get_tape(&tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .and_then(|tape| tape.voltag);
+    if crate::write_owner::preflight_manual_finalize_tape(
+        &mut index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+            audit_dir: state.audit_dir.as_path(),
+            audit_fsync: state.audit_fsync,
+            audit_append_lock: &state.audit_append_lock,
+        },
+        barcode.as_deref(),
+        &mut actor_request,
+    )?
+    .is_some()
+    {
+        return Ok(());
+    }
+    drop(index);
     let library_serial = state
         .default_library_serial
         .as_deref()
@@ -942,6 +984,23 @@ async fn recover_automatic_terminal_tape(
         block_size,
         parity_config,
     };
+    drop(index);
+    let mut host_index = CatalogIndex::open(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if crate::write_owner::preflight_automatic_terminal_completion(
+        &mut host_index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+            audit_dir: state.audit_dir.as_path(),
+            audit_fsync: state.audit_fsync,
+            audit_append_lock: &state.audit_append_lock,
+        },
+        &selected,
+        &pool_cfg,
+    )? {
+        return Ok(());
+    }
+    drop(host_index);
     let library_serial = state
         .default_library_serial
         .as_deref()
@@ -2986,8 +3045,9 @@ mod tests {
 
         // Dropping the actor reply simulates a worker dispatch failure after
         // acceptance. Once its reservation is gone, an explicit same-key retry
-        // must start exactly one replacement worker rather than merely return a
-        // stale InProgress projection.
+        // must start exactly one replacement worker while retaining the
+        // recovery-required projection until physical reconciliation advances
+        // durable progress.
         drop(first_reply);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -3023,8 +3083,8 @@ mod tests {
         assert_eq!(retried.operation_id, accepted.operation_id);
         assert_eq!(
             retried.projection.outcome,
-            remanence_state::TerminalFinalizationOutcome::InProgress,
-            "an explicit repair retry must become pollable before redispatch"
+            remanence_state::TerminalFinalizationOutcome::RecoveryRequired,
+            "an explicit repair retry must retain the safety classification before redispatch"
         );
         let retried_command = tokio::time::timeout(Duration::from_secs(1), drive_rx.recv())
             .await

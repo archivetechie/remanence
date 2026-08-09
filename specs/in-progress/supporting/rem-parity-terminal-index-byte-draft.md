@@ -70,6 +70,16 @@ Tape-file numbers are dense. Logical start positions advance by
 `record_count + 1`, where the `1` is the actual trailing filemark. EOD is the
 start of C plus C's record count plus one filemark.
 
+The kind, replica/separation ordinal, replica/separation count, component
+count, and trailing-filemark count are **bounded topology discriminators**, not
+media-size counters. Their canonical on-media widths are the `u16`/`u32`
+widths shown here; Rust retains those bounded widths, protobuf transports them
+in `uint32`, and CLI JSON renders them as ordinary JSON integers. This is an
+explicit exception to the `u64` rule for scale-derived counts and positions.
+Tape-file numbers, LBAs, record counts, payload lengths, structural/Object row
+counts, and data/protected ordinals remain `u64` end to end (and use decimal
+strings on JSON surfaces whose integer-safety contract requires them).
+
 Each 32-byte component tuple is little-endian:
 
 ```text
@@ -342,10 +352,40 @@ All layout locations are committed plans calculated before terminal tape
 motion. Future entries in A or B do not prove that the later components exist.
 
 Each footer records the writer's local file/start/count observation and the
-header hash. A reader compares those fields with measured device positions and
-the planned tuple. A valid footer still does not prove its trailing filemark,
+header hash. A reader locates the frame from the immutable planned tuple,
+checks device-reported post-read positions for the addressed records and
+trailing filemark, and cross-checks the footer observation against that tuple.
+The footer's tape-file/start/count fields are writer observations, not an
+independent device tape-file counter. A valid footer still does not prove its trailing filemark,
 synchronous barrier, journal fsync, or host projection. Only reconciliation and
 the external authority order advance five-component progress.
+
+For each component, that authority order is: media barrier; exact component
+and watermark transition in the parity sink journal; progress fsync in the
+checkpoint journal; SQLite projection. Restart compares the two journals with
+the immutable final-edition plan before any terminal positioning or write. It
+may promote only one exact next, barrier-proved sink-journal transition; it
+first completes that transition's sink watermark if needed, then advances the
+checkpoint journal and rebuilds SQLite. Equality is idempotent. Every other
+skip, regression, or byte disagreement fails before media motion.
+
+After replica C follows that same SQLite progress projection, the writer
+fsyncs the sealed checkpoint, retires the matching companion intent, and only
+then publishes the final SQLite outcome. The sealed-fsync-to-intent-cleanup
+window is therefore separately restartable and tested.
+
+The run-to-completion writer performs one final, read-only position assertion
+against planned terminal EOD after the fifth barrier. Terminal component
+journal bundles use the edition digest as canonical metadata for A/B/C and the
+local separation descriptor digest for AB/BC; all five copy the same
+edition-scoped protected and total ordinal watermarks.
+
+The header is written before the streamed payload is replayed. A source replay
+failure can therefore leave a header-only or otherwise partial component at
+its planned start. Restart classifies that state as torn terminal control,
+never as an Object: a proved rewritable start may be rewritten from that
+component, while WORM media or an unproved start remains RecoveryRequired with
+no further motion.
 
 ### 5.1. Irreversible lifecycle invariant
 
@@ -366,8 +406,16 @@ error, restart, operator action, or degraded acceptance may return the tape to
 Successful barriers advance only through `AfterReplicaA`,
 `AfterSeparationAb`, `AfterReplicaB`, `AfterSeparationBc`, and
 `AfterReplicaC`; ordinary `Finalized`/sealed projection requires
-`AfterReplicaC` and the required host persistence order. A failure or
-completion-unknown outcome enters or retains `RecoveryRequired`. Recovery may
+`AfterReplicaC` and the required host persistence order.
+`Finalizing(AfterReplicaC)` is valid while the sealed checkpoint or final
+SQLite projection remains pending; restart completes those host-only steps
+without repeating terminal media motion. A matching sealed checkpoint wins
+over a stale companion intent left by interrupted cleanup, while a mismatch
+fails closed. A failure or completion-unknown outcome enters or retains
+`RecoveryRequired`; that classification is durable in the companion intent
+and restart cannot clear it at unchanged progress. A successful successor
+component clears it, while `AfterReplicaC` may clear it only in the no-media
+host completion path after host-authority alignment. Recovery may
 reconcile, rewrite, or append only missing terminal control components at a
 proved location under the medium's rewrite policy. It MUST NOT write an Object,
 remove the finalization fence, or construct a second terminal triple. A
@@ -385,13 +433,25 @@ Readers:
 3. check every size formula with overflow protection before allocation or seek;
 4. reconstruct and validate the five-component plan and its digest;
 5. recompute edition/local descriptor digests;
-6. use the footer's checked backward delta to locate the header and require the
-   complete header hash and common descriptor to agree;
+6. validate that the footer's backward delta names the same header start as
+   the discovered immutable layout, read that planned header coordinate, and
+   require the complete header hash and common descriptor to agree;
 7. compare declared locations/counts/filemark with device measurements;
 8. for a replica, stream-decode every fixed slot and validate the dense map,
    scope, deterministic CBOR, zero padding, exact map↔Object-row bijection,
    payload digest, and canonical-map digest;
 9. for a full separation verification, stream-check every interior byte zero.
+
+The replica's pre-A structural map is locally eligible only when all of these
+additional relationships hold:
+
+- a `ParityMap` row, when present, is the final structural row;
+- a final `ParityMap` is present if and only if at least one
+  `ParitySidecar` row is present;
+- when sidecars are present, `highest_protected_ordinal` equals
+  `total_data_ordinals`, so finalization left no Object ordinal unprotected;
+- `covered_prefix_tape_file_count`, `structural_entry_count`, and replica A's
+  planned tape-file number are equal.
 
 Fast inventory tries C, then B, then A. Any one independently valid replica is
 sufficient to return the complete inventory with degraded-replica evidence. If

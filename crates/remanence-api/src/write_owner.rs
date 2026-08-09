@@ -300,6 +300,23 @@ pub(crate) struct ManualFinalizePreflightConfig<'a> {
     pub(crate) audit_append_lock: &'a Arc<std::sync::Mutex<()>>,
 }
 
+#[derive(Clone, Copy)]
+struct TerminalFinalizeAuditConfig<'a> {
+    audit_dir: &'a Path,
+    audit_fsync: bool,
+    audit_append_lock: &'a Arc<std::sync::Mutex<()>>,
+}
+
+impl<'a> From<&'a WriteOwnerConfig> for TerminalFinalizeAuditConfig<'a> {
+    fn from(cfg: &'a WriteOwnerConfig) -> Self {
+        Self {
+            audit_dir: cfg.audit_dir.as_path(),
+            audit_fsync: cfg.audit_fsync,
+            audit_append_lock: &cfg.audit_append_lock,
+        }
+    }
+}
+
 struct ManualFinalizeTapeMountRequest {
     request: ManualFinalizeTapeActorRequest,
     needs_drive_load: bool,
@@ -491,26 +508,24 @@ impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
                 Some(commit.observed_position),
             )?;
         }
-        if next != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
-            if let Some(fault) = self.tix_fault {
-                fault.abort_component_if_matches(
-                    commit.component,
-                    crate::terminal_fault::TerminalFaultCut::BeforeSqliteProjection,
-                    Some(commit.observed_position),
-                )?;
-            }
-            self.index
-                .project_terminal_finalization(
-                    self.projection_input(next, TerminalFinalizationOutcome::InProgress),
-                )
-                .map_err(|error| format!("project terminal progress: {error}"))?;
-            if let Some(fault) = self.tix_fault {
-                fault.abort_component_if_matches(
-                    commit.component,
-                    crate::terminal_fault::TerminalFaultCut::AfterSqliteProjection,
-                    Some(commit.observed_position),
-                )?;
-            }
+        if let Some(fault) = self.tix_fault {
+            fault.abort_component_if_matches(
+                commit.component,
+                crate::terminal_fault::TerminalFaultCut::BeforeSqliteProjection,
+                Some(commit.observed_position),
+            )?;
+        }
+        self.index
+            .project_terminal_finalization(
+                self.projection_input(next, TerminalFinalizationOutcome::InProgress),
+            )
+            .map_err(|error| format!("project terminal progress: {error}"))?;
+        if let Some(fault) = self.tix_fault {
+            fault.abort_component_if_matches(
+                commit.component,
+                crate::terminal_fault::TerminalFaultCut::AfterSqliteProjection,
+                Some(commit.observed_position),
+            )?;
         }
         Ok(())
     }
@@ -542,6 +557,148 @@ const fn state_progress_from_parity(
         TerminalTailProgress::AfterSeparationBc => State::AfterSeparationBc,
         TerminalTailProgress::AfterReplicaC => State::AfterReplicaC,
     }
+}
+
+const fn completed_terminal_component_count(
+    progress: remanence_state::TerminalFinalizationProgress,
+) -> u8 {
+    use remanence_state::TerminalFinalizationProgress as State;
+    match progress {
+        State::BeforeReplicaA => 0,
+        State::AfterReplicaA => 1,
+        State::AfterSeparationAb => 2,
+        State::AfterReplicaB => 3,
+        State::AfterSeparationBc => 4,
+        State::AfterReplicaC => 5,
+    }
+}
+
+fn reconcile_terminal_component_host_authority(
+    index: &mut CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    spec: &TerminalFinalizeSpec,
+    mut intent: remanence_state::TerminalFinalizationIntent,
+    plan: &TerminalTripleWritePlan,
+    journal: &mut FileTapeFileJournal,
+) -> Result<remanence_state::TerminalFinalizationIntent, Status> {
+    let transitions = plan
+        .edition
+        .descriptor
+        .terminal_layout
+        .components
+        .iter()
+        .map(|component| {
+            let component =
+                remanence_parity::terminal_component_bundle(plan, *component).map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "build canonical terminal component authority: {error}"
+                    ))
+                })?;
+            let checkpoint = remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: component.highest_protected_ordinal,
+                total_committed_ordinals: component.total_committed_ordinals,
+            };
+            Ok((component, checkpoint))
+        })
+        .collect::<Result<Vec<_>, Status>>()?;
+    let relation = journal
+        .terminal_component_authority_relation(
+            completed_terminal_component_count(intent.progress),
+            &transitions,
+        )
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "terminal checkpoint/sink-journal authority disagreement before media motion: {error}"
+            ))
+        })?;
+    if relation == remanence_parity::TerminalComponentAuthorityRelation::Aligned {
+        // The checkpoint journal is commit authority; SQLite may be one step
+        // behind after a crash between its fsync and the projection update.
+        // Repair that cache before selecting or moving to another component.
+        index
+            .project_terminal_finalization(TerminalFinalizationProjectionInput {
+                tape_uuid: spec.tape_uuid,
+                trigger: spec.trigger,
+                operation_id: spec.operation_id,
+                progress: intent.progress,
+                edition_digest: intent.edition_digest,
+                layout_digest: intent.layout.layout_digest,
+                outcome: if intent.recovery_required {
+                    TerminalFinalizationOutcome::RecoveryRequired
+                } else {
+                    TerminalFinalizationOutcome::InProgress
+                },
+                updated_at_utc: None,
+            })
+            .map_err(crate::status_from_state_error)?;
+        return Ok(intent);
+    }
+
+    let previous = parity_progress_from_state(intent.progress);
+    let component_index = previous.next_component_index().ok_or_else(|| {
+        Status::failed_precondition(
+            "sink journal is ahead of already-complete terminal checkpoint progress",
+        )
+    })?;
+    let (component, sink_checkpoint) = transitions.get(component_index).ok_or_else(|| {
+        Status::internal("terminal authority relation selected an impossible component")
+    })?;
+    journal
+        .commit_terminal_component_transition(component, sink_checkpoint)
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "reconcile one-transition-ahead terminal sink journal: {error}"
+            ))
+        })?;
+    let next = previous.successor().ok_or_else(|| {
+        Status::internal("one-transition-ahead terminal authority has no successor")
+    })?;
+    let next_state = state_progress_from_parity(next);
+    intent = checkpoint
+        .advance_terminal_finalization(intent.progress, next_state)
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "reconcile terminal checkpoint progress from sink journal: {error}"
+            ))
+        })?;
+    index
+        .project_terminal_finalization(TerminalFinalizationProjectionInput {
+            tape_uuid: spec.tape_uuid,
+            trigger: spec.trigger,
+            operation_id: spec.operation_id,
+            progress: next_state,
+            edition_digest: intent.edition_digest,
+            layout_digest: intent.layout.layout_digest,
+            outcome: TerminalFinalizationOutcome::InProgress,
+            updated_at_utc: None,
+        })
+        .map_err(crate::status_from_state_error)?;
+    Ok(intent)
+}
+
+fn persist_terminal_recovery_required(
+    index: &mut CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    spec: &TerminalFinalizeSpec,
+) -> Result<remanence_state::TerminalFinalizationIntent, Status> {
+    let intent = checkpoint
+        .mark_terminal_recovery_required()
+        .map_err(crate::status_from_state_error)?;
+    index
+        .project_terminal_finalization(TerminalFinalizationProjectionInput {
+            tape_uuid: spec.tape_uuid,
+            trigger: spec.trigger,
+            operation_id: spec.operation_id,
+            progress: intent.progress,
+            edition_digest: intent.edition_digest,
+            layout_digest: intent.layout.layout_digest,
+            outcome: TerminalFinalizationOutcome::RecoveryRequired,
+            updated_at_utc: None,
+        })
+        .map_err(crate::status_from_state_error)?;
+    Ok(intent)
 }
 
 const fn terminal_reconciliation_outcome(
@@ -5126,7 +5283,11 @@ fn handle_drive_open_write(
                 progress: intent.progress,
                 edition_digest: intent.edition_digest,
                 layout_digest: intent.layout.layout_digest,
-                outcome: TerminalFinalizationOutcome::InProgress,
+                outcome: if intent.recovery_required {
+                    TerminalFinalizationOutcome::RecoveryRequired
+                } else {
+                    TerminalFinalizationOutcome::InProgress
+                },
                 updated_at_utc: None,
             })
         {
@@ -5927,6 +6088,7 @@ fn build_new_terminal_plan(
         trigger: spec.trigger,
         manual: spec.manual.clone(),
         progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+        recovery_required: false,
         edition_id: *edition_id.as_bytes(),
         edition_sequence,
         edition_digest: edition.edition_digest,
@@ -6086,7 +6248,7 @@ pub(crate) fn preflight_manual_finalize_tape(
         block_size: request.block_size,
         parity_config: request.parity_config.clone(),
     };
-    let intent = match existing_intent {
+    let (intent, plan) = match existing_intent {
         Some(intent) => {
             validate_manual_finalize_intent(request, &intent)?;
             match &request.parity_config {
@@ -6098,7 +6260,7 @@ pub(crate) fn preflight_manual_finalize_tape(
                     }
                     let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
                         .map_err(crate::status_from_state_error)?;
-                    source
+                    let edition = source
                         .reconstruct_final_edition(&intent)
                         .map_err(crate::status_from_state_error)?;
                     authorize_terminal_intent_capacity(
@@ -6108,6 +6270,10 @@ pub(crate) fn preflight_manual_finalize_tape(
                         &intent,
                         source.summary().counts,
                     )?;
+                    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+                        Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
+                    })?;
+                    (intent, plan)
                 }
                 remanence_parity::ParityConfig::Scheme(scheme) => {
                     let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
@@ -6122,7 +6288,7 @@ pub(crate) fn preflight_manual_finalize_tape(
                         "{}.remjournal",
                         crate::bytes_to_hex(&request.tape_uuid)
                     ));
-                    let journal = FileTapeFileJournal::open(
+                    let mut journal = FileTapeFileJournal::open(
                         path,
                         request.tape_uuid,
                         request.block_size,
@@ -6166,7 +6332,7 @@ pub(crate) fn preflight_manual_finalize_tape(
                         )
                     }
                     .map_err(crate::status_from_state_error)?;
-                    source
+                    let edition = source
                         .reconstruct_final_edition(&intent)
                         .map_err(crate::status_from_state_error)?;
                     authorize_terminal_intent_capacity(
@@ -6176,9 +6342,21 @@ pub(crate) fn preflight_manual_finalize_tape(
                         &intent,
                         source.summary().counts,
                     )?;
+                    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+                        Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
+                    })?;
+                    drop(source);
+                    let intent = reconcile_terminal_component_host_authority(
+                        index,
+                        &mut checkpoint,
+                        &spec,
+                        intent,
+                        &plan,
+                        &mut journal,
+                    )?;
+                    (intent, plan)
                 }
             }
-            intent
         }
         None => {
             let planned = match request.parity_config {
@@ -6225,7 +6403,7 @@ pub(crate) fn preflight_manual_finalize_tape(
                 request,
             )?;
             publish_terminal_intent(index, &mut checkpoint, &spec, &planned.0)?;
-            planned.0
+            planned
         }
     };
 
@@ -6242,9 +6420,7 @@ pub(crate) fn preflight_manual_finalize_tape(
     let projection = index
         .terminal_finalization(&request.tape_uuid)
         .map_err(crate::status_from_state_error)?;
-    if projection.is_none_or(|projection| {
-        projection.outcome == TerminalFinalizationOutcome::RecoveryRequired
-    }) {
+    if projection.is_none() {
         index
             .project_terminal_finalization(TerminalFinalizationProjectionInput {
                 tape_uuid: request.tape_uuid,
@@ -6253,12 +6429,200 @@ pub(crate) fn preflight_manual_finalize_tape(
                 progress: intent.progress,
                 edition_digest: intent.edition_digest,
                 layout_digest: intent.layout.layout_digest,
-                outcome: TerminalFinalizationOutcome::InProgress,
+                outcome: if intent.recovery_required {
+                    TerminalFinalizationOutcome::RecoveryRequired
+                } else {
+                    TerminalFinalizationOutcome::InProgress
+                },
                 updated_at_utc: None,
             })
             .map_err(crate::status_from_state_error)?;
     }
+    if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        let result = complete_terminal_finalization_host_only(
+            index,
+            TerminalFinalizeAuditConfig {
+                audit_dir: cfg.audit_dir,
+                audit_fsync: cfg.audit_fsync,
+                audit_append_lock: cfg.audit_append_lock,
+            },
+            &mut checkpoint,
+            &previous,
+            &spec,
+            Some(request),
+            intent,
+            &plan,
+            tix_fault.as_ref(),
+        )?;
+        return Ok(Some(ManualFinalizeTapeActorReply {
+            operation_id: request.candidate_operation_id,
+            projection: result.projection,
+        }));
+    }
     Ok(None)
+}
+
+/// Complete an automatic finalization whose terminal media tail is already
+/// durable, without acquiring any drive or changer capability.
+pub(crate) fn preflight_automatic_terminal_completion(
+    index: &mut CatalogIndex,
+    cfg: ManualFinalizePreflightConfig<'_>,
+    selected: &SelectedTape,
+    pool_cfg: &TapePoolConfig,
+) -> Result<bool, Status> {
+    let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
+        cfg.checkpoint_journal_dir,
+        selected.tape_uuid,
+    )
+    .map_err(crate::status_from_state_error)?;
+    let Some(pending) = checkpoint_journal
+        .terminal_finalization_intent()
+        .map_err(crate::status_from_state_error)?
+    else {
+        return Ok(false);
+    };
+    if pending.manual.is_some() {
+        return Ok(false);
+    }
+    let mut checkpoint = checkpoint_journal
+        .acquire_exclusive_for_terminal_recovery()
+        .map_err(crate::status_from_state_error)?;
+    let intent = checkpoint
+        .terminal_finalization_intent()
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::internal("automatic terminal intent disappeared in preflight"))?;
+    let previous = checkpoint
+        .last_record_bounded()
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "automatic terminal completion requires checkpoint authority",
+            )
+        })?;
+    let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, pool_cfg);
+    let (intent, plan) = match &selected.parity_config {
+        remanence_parity::ParityConfig::None => {
+            if intent.terminal_prefix.is_some() {
+                return Err(Status::failed_precondition(
+                    "parity-off finalization intent unexpectedly has a parity prefix",
+                ));
+            }
+            let mut source =
+                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
+                    &checkpoint,
+                )
+                .map_err(crate::status_from_state_error)?;
+            let edition = source
+                .reconstruct_final_edition(&intent)
+                .map_err(crate::status_from_state_error)?;
+            authorize_terminal_intent_capacity(
+                index,
+                &spec,
+                selected,
+                &intent,
+                source.summary().counts,
+            )?;
+            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
+            })?;
+            (intent, plan)
+        }
+        remanence_parity::ParityConfig::Scheme(scheme) => {
+            let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
+                Status::failed_precondition("parity finalization intent has no prefix plan")
+            })?;
+            let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
+                Status::internal("checkpoint journal directory has no parent for parity journal")
+            })?;
+            let mut journal = FileTapeFileJournal::open(
+                journal_dir.join(format!(
+                    "{}.remjournal",
+                    crate::bytes_to_hex(&selected.tape_uuid)
+                )),
+                selected.tape_uuid,
+                selected.block_size,
+                scheme.clone(),
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("open parity journal: {error}"))
+            })?;
+            let prefix =
+                TerminalPrefixPlan::try_from(persisted).map_err(crate::status_from_state_error)?;
+            let prefix_checkpoint = remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
+                total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
+            };
+            let prefix_is_durable = journal
+                .terminal_prefix_transition_is_durable(&prefix.committed_bundle, &prefix_checkpoint)
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "inspect terminal-prefix journal transition: {error}"
+                    ))
+                })?;
+            let mut source = if prefix_is_durable {
+                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+                    &checkpoint,
+                    &journal,
+                    persisted,
+                )
+            } else {
+                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                    &checkpoint,
+                    &journal,
+                    persisted,
+                )
+            }
+            .map_err(crate::status_from_state_error)?;
+            let edition = source
+                .reconstruct_final_edition(&intent)
+                .map_err(crate::status_from_state_error)?;
+            authorize_terminal_intent_capacity(
+                index,
+                &spec,
+                selected,
+                &intent,
+                source.summary().counts,
+            )?;
+            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
+            })?;
+            drop(source);
+            let intent = reconcile_terminal_component_host_authority(
+                index,
+                &mut checkpoint,
+                &spec,
+                intent,
+                &plan,
+                &mut journal,
+            )?;
+            (intent, plan)
+        }
+    };
+    if intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        return Ok(false);
+    }
+    let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(selected.tape_uuid)
+        .map_err(|error| {
+            Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+        })?;
+    complete_terminal_finalization_host_only(
+        index,
+        TerminalFinalizeAuditConfig {
+            audit_dir: cfg.audit_dir,
+            audit_fsync: cfg.audit_fsync,
+            audit_append_lock: cfg.audit_append_lock,
+        },
+        &mut checkpoint,
+        &previous,
+        &spec,
+        None,
+        intent,
+        &plan,
+        tix_fault.as_ref(),
+    )?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6278,9 +6642,6 @@ fn finalize_terminal_no_parity(
         .map_err(|error| {
             Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
         })?;
-    drive
-        .locate(previous.eod_lba)
-        .map_err(|error| Status::unavailable(format!("locate checkpoint EOD: {error}")))?;
     let mut source =
         remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
             checkpoint,
@@ -6329,6 +6690,23 @@ fn finalize_terminal_no_parity(
     if let Some(request) = manual_request {
         record_manual_finalize_request(index, cfg, request)?;
     }
+    if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        drop(source);
+        return complete_terminal_finalization_host_only(
+            index,
+            TerminalFinalizeAuditConfig::from(cfg),
+            checkpoint,
+            previous,
+            spec,
+            manual_request,
+            intent,
+            &plan,
+            tix_fault.as_ref(),
+        );
+    }
+    drive
+        .locate(previous.eod_lba)
+        .map_err(|error| Status::unavailable(format!("locate checkpoint EOD: {error}")))?;
     finish_terminal_tail(
         index,
         cfg,
@@ -6509,8 +6887,34 @@ fn finalize_terminal_with_parity(
             )
         }
     };
+    // Before any terminal-prefix/component positioning or write, require the
+    // checkpoint intent and sink journal to name the same canonical component
+    // history. The only admissible crash skew is one exact barrier-proved sink
+    // transition ahead, which is reconciled entirely in host durability first.
+    let intent = reconcile_terminal_component_host_authority(
+        index,
+        checkpoint,
+        spec,
+        intent,
+        &plan,
+        &mut journal,
+    )?;
     if let Some(request) = manual_request {
         record_manual_finalize_request(index, cfg, request)?;
+    }
+    if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        drop(source);
+        return complete_terminal_finalization_host_only(
+            index,
+            TerminalFinalizeAuditConfig::from(cfg),
+            checkpoint,
+            previous,
+            spec,
+            manual_request,
+            intent,
+            &plan,
+            tix_fault.as_ref(),
+        );
     }
 
     let prefix_checkpoint = remanence_parity::CommittedBundle {
@@ -6564,6 +6968,7 @@ fn finalize_terminal_with_parity(
     };
     if prefix_already_journaled {
         if prefix_evidence != TerminalPrefixReconcileEvidence::Complete {
+            persist_terminal_recovery_required(index, checkpoint, spec)?;
             return Err(Status::failed_precondition(format!(
                 "parity journal records a complete terminal prefix, but media reconciliation found {prefix_evidence:?}"
             )));
@@ -6578,14 +6983,19 @@ fn finalize_terminal_with_parity(
             tix_fault.as_ref(),
             &prefix,
         );
-        let prefix_result = remanence_parity::close_checkpointed_terminal_index_prefix(
+        let prefix_result = match remanence_parity::close_checkpointed_terminal_index_prefix(
             &mut faulting,
             &mut journal,
             snapshot,
             &prefix,
             prefix_evidence,
-        )
-        .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                persist_terminal_recovery_required(index, checkpoint, spec)?;
+                return Err(status_from_parity_error(&error, error.to_string()));
+            }
+        };
         if let Some(fault) = tix_fault.as_ref() {
             fault
                 .abort_prefix_if_matches(
@@ -6615,6 +7025,137 @@ fn finalize_terminal_with_parity(
         rewritable,
         tix_fault.as_ref(),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_terminal_finalization_host_only(
+    index: &mut CatalogIndex,
+    audit: TerminalFinalizeAuditConfig<'_>,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    previous: &remanence_state::CheckpointJournalRecord,
+    spec: &TerminalFinalizeSpec,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    mut intent: remanence_state::TerminalFinalizationIntent,
+    plan: &TerminalTripleWritePlan,
+    tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
+) -> Result<TerminalFinalizeResult, Status> {
+    if intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        return Err(Status::internal(
+            "host-only terminal completion requires durable replica C progress",
+        ));
+    }
+    if intent.recovery_required {
+        intent = checkpoint
+            .clear_terminal_recovery_required_after_replica_c()
+            .map_err(crate::status_from_state_error)?;
+    }
+    let replica_c = plan.edition.descriptor.terminal_layout.components[4];
+    let final_bundle = remanence_parity::terminal_component_bundle(plan, replica_c)
+        .map_err(|error| Status::internal(format!("build final C authority: {error}")))?;
+    let final_record = remanence_state::CheckpointJournalRecord {
+        ordinal: previous
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("terminal checkpoint ordinal overflows u64"))?,
+        committed_object_count: previous.committed_object_count,
+        eod_partition: plan.edition.descriptor.terminal_layout.partition,
+        eod_lba: plan.edition.descriptor.terminal_layout.expected_eod_lba,
+        tape_uuid: spec.tape_uuid,
+        batch_id: intent.edition_id,
+        next_tape_file_number: replica_c
+            .planned_tape_file_number
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("terminal next tape-file number overflows u64"))?,
+        block_size: spec.block_size,
+        objects: Vec::new(),
+        scheme: previous.scheme.clone(),
+        object_tape_file_bundles: Vec::new(),
+        barrier_bundle: Some(final_bundle),
+        terminal_finalization: Some(intent),
+        sealed_after_write: true,
+    };
+    if let Some(fault) = tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::BeforeFinalCheckpointFsync,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    checkpoint
+        .append_terminal_finalization_with_after_fsync(std::slice::from_ref(&final_record), || {
+            if let Some(fault) = tix_fault {
+                fault
+                    .abort_if_matches(
+                        "final_projection",
+                        crate::terminal_fault::TerminalFaultCut::AfterFinalCheckpointFsync,
+                        Some(PhysicalPositionHint {
+                            partition: final_record.eod_partition,
+                            lba: final_record.eod_lba,
+                        }),
+                        None,
+                    )
+                    .map_err(remanence_state::StateError::JournalReplayFailed)?;
+            }
+            Ok(())
+        })
+        .map_err(crate::status_from_state_error)?;
+    if let Some(fault) = tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::BeforeFinalSqliteProjection,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    index
+        .project_checkpoint_record(&final_record)
+        .map_err(crate::status_from_state_error)?;
+    if let Some(fault) = tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::AfterFinalSqliteProjection,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    record_terminal_finalize_event_with(
+        index,
+        audit,
+        manual_request,
+        AuditEvent::OperationFinished,
+        remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+        None,
+    )?;
+    let projection = index
+        .terminal_finalization(&spec.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::internal("terminal projection disappeared after completion"))?;
+    Ok(TerminalFinalizeResult {
+        projection,
+        final_record: Some(final_record),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6671,6 +7212,10 @@ fn finish_terminal_tail(
         let step = match step_result {
             Ok(step) => step,
             Err(error) => {
+                authority.intent = authority
+                    .checkpoint
+                    .mark_terminal_recovery_required()
+                    .map_err(crate::status_from_state_error)?;
                 let state_progress = authority.intent.progress;
                 let detail = error.to_string();
                 let status = status_from_terminal_tail_error(&error);
@@ -6711,6 +7256,15 @@ fn finish_terminal_tail(
                 evidence,
             } => {
                 let state_progress = state_progress_from_parity(progress);
+                authority.intent = authority
+                    .checkpoint
+                    .mark_terminal_recovery_required()
+                    .map_err(crate::status_from_state_error)?;
+                if authority.intent.progress != state_progress {
+                    return Err(Status::internal(
+                        "terminal recovery evidence disagrees with durable checkpoint progress",
+                    ));
+                }
                 let outcome = terminal_reconciliation_outcome(state_progress, evidence);
                 authority
                     .index
@@ -6745,126 +7299,28 @@ fn finish_terminal_tail(
         }
     }
 
-    authority.intent = authority
+    let completed_intent = authority
         .checkpoint
         .terminal_finalization_intent()
         .map_err(crate::status_from_state_error)?
         .ok_or_else(|| Status::internal("completed terminal tail lost its durable intent"))?;
-    if authority.intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+    if completed_intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
         return Err(Status::internal(
             "terminal writer returned complete before replica C became durable",
         ));
     }
-    let replica_c = plan.edition.descriptor.terminal_layout.components[4];
-    let final_bundle = remanence_parity::terminal_component_bundle(&plan, replica_c)
-        .map_err(|error| Status::internal(format!("build final C authority: {error}")))?;
-    let final_record = remanence_state::CheckpointJournalRecord {
-        ordinal: previous
-            .ordinal
-            .checked_add(1)
-            .ok_or_else(|| Status::internal("terminal checkpoint ordinal overflows u64"))?,
-        committed_object_count: previous.committed_object_count,
-        eod_partition: plan.edition.descriptor.terminal_layout.partition,
-        eod_lba: plan.edition.descriptor.terminal_layout.expected_eod_lba,
-        tape_uuid: spec.tape_uuid,
-        batch_id: authority.intent.edition_id,
-        next_tape_file_number: replica_c
-            .planned_tape_file_number
-            .checked_add(1)
-            .ok_or_else(|| Status::internal("terminal next tape-file number overflows u64"))?,
-        block_size: spec.block_size,
-        objects: Vec::new(),
-        scheme: previous.scheme.clone(),
-        object_tape_file_bundles: Vec::new(),
-        barrier_bundle: Some(final_bundle),
-        terminal_finalization: Some(authority.intent.clone()),
-        sealed_after_write: true,
-    };
-    if let Some(fault) = authority.tix_fault {
-        fault
-            .abort_if_matches(
-                "final_projection",
-                crate::terminal_fault::TerminalFaultCut::BeforeFinalCheckpointFsync,
-                Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
-                }),
-                None,
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
-            })?;
-    }
-    authority
-        .checkpoint
-        .append_terminal_finalization(std::slice::from_ref(&final_record))
-        .map_err(crate::status_from_state_error)?;
-    if let Some(fault) = authority.tix_fault {
-        fault
-            .abort_if_matches(
-                "final_projection",
-                crate::terminal_fault::TerminalFaultCut::AfterFinalCheckpointFsync,
-                Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
-                }),
-                None,
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
-            })?;
-    }
-    if let Some(fault) = authority.tix_fault {
-        fault
-            .abort_if_matches(
-                "final_projection",
-                crate::terminal_fault::TerminalFaultCut::BeforeFinalSqliteProjection,
-                Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
-                }),
-                None,
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
-            })?;
-    }
-    authority
-        .index
-        .project_checkpoint_record(&final_record)
-        .map_err(crate::status_from_state_error)?;
-    if let Some(fault) = authority.tix_fault {
-        fault
-            .abort_if_matches(
-                "final_projection",
-                crate::terminal_fault::TerminalFaultCut::AfterFinalSqliteProjection,
-                Some(PhysicalPositionHint {
-                    partition: final_record.eod_partition,
-                    lba: final_record.eod_lba,
-                }),
-                None,
-            )
-            .map_err(|error| {
-                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
-            })?;
-    }
-    record_terminal_finalize_event(
-        authority.index,
-        cfg,
+    drop(authority);
+    complete_terminal_finalization_host_only(
+        index,
+        TerminalFinalizeAuditConfig::from(cfg),
+        checkpoint,
+        previous,
+        spec,
         manual_request,
-        AuditEvent::OperationFinished,
-        remanence_state::TerminalFinalizationProgress::AfterReplicaC,
-        None,
-    )?;
-    let projection = authority
-        .index
-        .terminal_finalization(&spec.tape_uuid)
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::internal("terminal projection disappeared after completion"))?;
-    Ok(TerminalFinalizeResult {
-        projection,
-        final_record: Some(final_record),
-    })
+        completed_intent,
+        &plan,
+        tix_fault,
+    )
 }
 
 fn status_from_terminal_tail_error(error: &TerminalTailWriteError) -> Status {
@@ -7046,15 +7502,33 @@ fn record_terminal_finalize_event(
     progress: remanence_state::TerminalFinalizationProgress,
     detail_text: Option<(&str, String)>,
 ) -> Result<(), Status> {
+    record_terminal_finalize_event_with(
+        index,
+        TerminalFinalizeAuditConfig::from(cfg),
+        manual_request,
+        event,
+        progress,
+        detail_text,
+    )
+}
+
+fn record_terminal_finalize_event_with(
+    index: &mut CatalogIndex,
+    audit: TerminalFinalizeAuditConfig<'_>,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    event: AuditEvent,
+    progress: remanence_state::TerminalFinalizationProgress,
+    detail_text: Option<(&str, String)>,
+) -> Result<(), Status> {
     let Some(request) = manual_request else {
         return Ok(());
     };
-    record_manual_finalize_event(index, cfg, request, event, progress, detail_text)
+    record_manual_finalize_event_with(index, audit, request, event, progress, detail_text)
 }
 
-fn record_manual_finalize_event(
+fn record_manual_finalize_event_with(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    audit: TerminalFinalizeAuditConfig<'_>,
     request: &ManualFinalizeTapeActorRequest,
     event: AuditEvent,
     progress: remanence_state::TerminalFinalizationProgress,
@@ -7079,9 +7553,9 @@ fn record_manual_finalize_event(
     }
     crate::append_operation_audit(
         index,
-        cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
-        &cfg.audit_append_lock,
+        audit.audit_dir,
+        audit.audit_fsync,
+        audit.audit_append_lock,
         crate::OperationAuditInput {
             actor: AuditActor::System,
             operation_id: request.candidate_operation_id,
@@ -10766,6 +11240,27 @@ mod tests {
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
 
     #[test]
+    fn parity_and_checkpoint_terminal_progress_are_exhaustive_bijections() {
+        use remanence_state::TerminalFinalizationProgress as State;
+
+        for progress in [
+            State::BeforeReplicaA,
+            State::AfterReplicaA,
+            State::AfterSeparationAb,
+            State::AfterReplicaB,
+            State::AfterSeparationBc,
+            State::AfterReplicaC,
+        ] {
+            let parity = parity_progress_from_state(progress);
+            assert_eq!(state_progress_from_parity(parity), progress);
+            assert_eq!(
+                usize::from(completed_terminal_component_count(progress)),
+                parity.next_component_index().unwrap_or(5),
+            );
+        }
+    }
+
+    #[test]
     fn terminal_inventory_status_distinguishes_media_conflict_transport_and_geometry() {
         let conflict = status_from_terminal_inventory_read_error(
             remanence_parity::TerminalInventoryReadError::TerminalIndexReplicaConflict { count: 2 },
@@ -10812,6 +11307,13 @@ mod tests {
             remanence_parity::TerminalIndexVerificationError::ConflictingLayouts { count: 2 },
         );
         assert_eq!(conflict.code(), tonic::Code::DataLoss);
+
+        let editions = status_from_terminal_index_verification_error(
+            remanence_parity::TerminalIndexVerificationError::ConflictingReplicaEditions {
+                count: 2,
+            },
+        );
+        assert_eq!(editions.code(), tonic::Code::DataLoss);
 
         let source = status_from_terminal_index_verification_error(
             remanence_parity::TerminalIndexVerificationError::Source {
@@ -10867,6 +11369,528 @@ mod tests {
                 TerminalComponentReconcileEvidence::TornWorm,
             ),
             TerminalFinalizationOutcome::RecoveryRequired,
+        );
+    }
+
+    #[test]
+    fn one_transition_ahead_sink_journal_reconciles_before_media_is_available() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        const TAPE_UUID: [u8; 16] = [0x8A; 16];
+
+        struct PrefixRows;
+        impl remanence_parity::TapeIndexReplicaRecordSource for PrefixRows {
+            fn visit_structural_entries(
+                &mut self,
+                visitor: &mut dyn FnMut(
+                    &remanence_parity::TapeIndexReplicaMapEntry,
+                ) -> Result<(), ParityError>,
+            ) -> Result<(), ParityError> {
+                visitor(&remanence_parity::TapeIndexReplicaMapEntry {
+                    tape_file_number: 0,
+                    kind: remanence_parity::TapeIndexReplicaFileKind::Bootstrap,
+                    block_count: 1,
+                    first_parity_data_ordinal: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    epoch_id: None,
+                })?;
+                visitor(&remanence_parity::TapeIndexReplicaMapEntry {
+                    tape_file_number: 1,
+                    kind: remanence_parity::TapeIndexReplicaFileKind::Object,
+                    block_count: 1,
+                    first_parity_data_ordinal: Some(0),
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    epoch_id: None,
+                })
+            }
+
+            fn visit_object_rows(
+                &mut self,
+                visitor: &mut dyn FnMut(
+                    &remanence_parity::TapeIndexReplicaObjectRow,
+                ) -> Result<(), ParityError>,
+            ) -> Result<(), ParityError> {
+                visitor(&remanence_parity::TapeIndexReplicaObjectRow {
+                    tape_file_number: 1,
+                    stored_block_count: 1,
+                    object_id: b"8e8e8e8e-8e8e-8e8e-8e8e-8e8e8e8e8e8e".to_vec(),
+                    representation: remanence_parity::ObjectRecoveryRepresentation::Plaintext {
+                        manifest_first_chunk_lba: 0,
+                        manifest_size_bytes: 1,
+                        manifest_chunk_count: 1,
+                        manifest_sha256: [0x8D; 32],
+                    },
+                })
+            }
+        }
+
+        let replica_layout = remanence_parity::checked_tape_index_replica_layout(
+            BLOCK_SIZE,
+            remanence_parity::TapeIndexReplicaCounts {
+                structural_entry_count: 2,
+                object_row_count: 1,
+            },
+        )
+        .expect("replica layout");
+        let layout = remanence_parity::TerminalTailLayout::new(
+            0,
+            BLOCK_SIZE,
+            2,
+            4,
+            replica_layout.replica_record_count,
+            remanence_parity::index_separation_records(
+                BLOCK_SIZE,
+                remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+            )
+            .expect("default separation records"),
+        )
+        .expect("terminal layout");
+        let mut rows = PrefixRows;
+        let edition = remanence_parity::plan_tape_index_edition(
+            remanence_parity::TapeIndexEditionDescriptor {
+                tape_uuid: TAPE_UUID,
+                edition_id: [0x8B; 16],
+                edition_sequence: 2,
+                scope: remanence_parity::TapeIndexReplicaScope {
+                    covered_prefix_tape_file_count: 2,
+                    total_data_ordinals: 1,
+                    highest_protected_ordinal: 0,
+                },
+                counts: remanence_parity::TapeIndexReplicaCounts {
+                    structural_entry_count: 2,
+                    object_row_count: 1,
+                },
+                block_size: BLOCK_SIZE,
+                compression_enabled: false,
+                writer_version: "host-authority-test".to_string(),
+                write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+                terminal_layout: layout,
+            },
+            &mut rows,
+        )
+        .expect("edition plan");
+        let plan = TerminalTripleWritePlan::new(edition.clone()).expect("terminal writer plan");
+        let intent = remanence_state::TerminalFinalizationIntent {
+            tape_uuid: TAPE_UUID,
+            trigger: remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark,
+            manual: None,
+            progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+            recovery_required: false,
+            edition_id: edition.descriptor.edition_id,
+            edition_sequence: edition.descriptor.edition_sequence,
+            edition_digest: edition.edition_digest,
+            writer_version: edition.descriptor.writer_version.clone(),
+            write_timestamp: edition.descriptor.write_timestamp.clone(),
+            terminal_prefix: None,
+            layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
+                .expect("persist terminal layout"),
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
+            temp.path().join("checkpoints"),
+            TAPE_UUID,
+        )
+        .expect("checkpoint journal");
+        let object_uuid = Uuid::from_bytes([0x8E; 16]);
+        checkpoint_journal
+            .append(&remanence_state::CheckpointJournalRecord {
+                ordinal: 1,
+                committed_object_count: 1,
+                eod_partition: 0,
+                eod_lba: 4,
+                tape_uuid: TAPE_UUID,
+                batch_id: [0x8C; 16],
+                next_tape_file_number: 2,
+                block_size: BLOCK_SIZE,
+                objects: vec![remanence_state::CheckpointObjectProjection {
+                    object: NativeObjectProjectionInput {
+                        object_id: object_uuid.to_string(),
+                        caller_object_id: Some("host-authority-object".to_string()),
+                        body_format: "rem-object-v1".to_string(),
+                        logical_size_bytes: Some(1),
+                        content_hash: Some(vec![0x8F; 32]),
+                        metadata_hash: Some(vec![0x90; 32]),
+                        created_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
+                    },
+                    files: Vec::new(),
+                    copy: NativeObjectCopyProjectionInput {
+                        object_id: object_uuid.to_string(),
+                        tape_uuid: TAPE_UUID,
+                        tape_file_number: 1,
+                        first_body_lba: 2,
+                        first_parity_data_ordinal: None,
+                        protected_until_ordinal: None,
+                        status: "committed".to_string(),
+                        representation: "plaintext".to_string(),
+                        recipient_epoch_ids: None,
+                        metadata_frame_len: None,
+                        plaintext_digest: Some(vec![0x91; 32]),
+                        stored_digest: Some(vec![0x91; 32]),
+                    },
+                    block_size: BLOCK_SIZE,
+                    block_count: 1,
+                    fresh_tape: true,
+                    total_committed_ordinals: 1,
+                    object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
+                        tape_file_number: 1,
+                        stored_block_count: 1,
+                        object_id: b"8e8e8e8e-8e8e-8e8e-8e8e-8e8e8e8e8e8e".to_vec(),
+                        representation:
+                            remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
+                                manifest_first_chunk_lba: 0,
+                                manifest_size_bytes: 1,
+                                manifest_chunk_count: 1,
+                                manifest_sha256: [0x8D; 32],
+                            },
+                    },
+                }],
+                scheme: None,
+                object_tape_file_bundles: Vec::new(),
+                barrier_bundle: None,
+                terminal_finalization: None,
+                sealed_after_write: false,
+            })
+            .expect("append base checkpoint");
+        let mut checkpoint = checkpoint_journal
+            .acquire_exclusive()
+            .expect("checkpoint lease");
+        checkpoint
+            .begin_terminal_finalization(&intent)
+            .expect("publish terminal intent");
+
+        let mut index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open catalog");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: TAPE_UUID,
+                voltag: "AUTH01L9".to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        project_checkpoint_authority_bounded(&mut index, &checkpoint)
+            .expect("project base checkpoint authority");
+        index
+            .project_terminal_finalization(TerminalFinalizationProjectionInput {
+                tape_uuid: TAPE_UUID,
+                trigger: intent.trigger,
+                operation_id: None,
+                progress: intent.progress,
+                edition_digest: intent.edition_digest,
+                layout_digest: intent.layout.layout_digest,
+                outcome: TerminalFinalizationOutcome::InProgress,
+                updated_at_utc: None,
+            })
+            .expect("project initial finalization");
+
+        let scheme = remanence_parity::default_scheme();
+        let mut journal = FileTapeFileJournal::open(
+            temp.path().join("tape.remjournal"),
+            TAPE_UUID,
+            BLOCK_SIZE,
+            scheme,
+        )
+        .expect("open sink journal");
+        let bot_bundle = CommittedBundle {
+            kind: CommittedBundleKind::BotBootstrap,
+            entries: vec![TapeFileEntry {
+                tape_file_number: 0,
+                kind: TapeFileKind::Bootstrap,
+                block_count: 1,
+                physical_start_hint: Some(0),
+                object_id: None,
+                first_parity_data_ordinal: None,
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                object_recovery_row: None,
+            }],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 0,
+        };
+        let object_bundle = CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries: vec![TapeFileEntry {
+                tape_file_number: 1,
+                kind: TapeFileKind::Object,
+                block_count: 1,
+                physical_start_hint: Some(2),
+                object_id: Some(object_uuid.to_string()),
+                first_parity_data_ordinal: Some(0),
+                epoch_id: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                canonical_metadata_hash: None,
+                object_recovery_row: Some(remanence_parity::ObjectRecoveryRow {
+                    tape_file_number: 1,
+                    stored_block_count: 1,
+                    object_id: Some(b"8e8e8e8e-8e8e-8e8e-8e8e-8e8e8e8e8e8e".to_vec()),
+                    representation: remanence_parity::ObjectRecoveryRepresentation::Plaintext {
+                        manifest_first_chunk_lba: 0,
+                        manifest_size_bytes: 1,
+                        manifest_chunk_count: 1,
+                        manifest_sha256: [0x8D; 32],
+                    },
+                }),
+            }],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 1,
+        };
+        let object_checkpoint = CommittedBundle {
+            kind: CommittedBundleKind::CheckpointedThrough,
+            entries: Vec::new(),
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 1,
+        };
+        let sink_checkpoint = CommittedBundle {
+            kind: CommittedBundleKind::CheckpointedThrough,
+            entries: Vec::new(),
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 1,
+        };
+        journal.commit_bundle(&bot_bundle).expect("journal BOT");
+        journal
+            .commit_bundle(&object_bundle)
+            .expect("journal Object");
+        journal
+            .commit_bundle(&object_checkpoint)
+            .expect("journal Object checkpoint");
+        journal
+            .commit_terminal_prefix_transition(
+                &CommittedBundle {
+                    kind: CommittedBundleKind::TerminalPrefix,
+                    entries: Vec::new(),
+                    highest_protected_ordinal: 0,
+                    total_committed_ordinals: 1,
+                },
+                &sink_checkpoint,
+            )
+            .expect("journal terminal prefix");
+        let replica_a = remanence_parity::terminal_component_bundle(&plan, layout.components[0])
+            .expect("replica A bundle");
+        journal
+            .commit_bundle(&replica_a)
+            .expect("simulate crash after sink component fsync");
+
+        let spec = TerminalFinalizeSpec {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            pool_config: None,
+            trigger: intent.trigger,
+            operation_id: None,
+            manual: None,
+        };
+        let reconciled = reconcile_terminal_component_host_authority(
+            &mut index,
+            &mut checkpoint,
+            &spec,
+            intent,
+            &plan,
+            &mut journal,
+        )
+        .expect("host-only one-transition reconciliation");
+        assert_eq!(
+            reconciled.progress,
+            remanence_state::TerminalFinalizationProgress::AfterReplicaA
+        );
+        let transitions = layout
+            .components
+            .iter()
+            .map(|component| {
+                let bundle = remanence_parity::terminal_component_bundle(&plan, *component)
+                    .expect("component bundle");
+                (bundle, sink_checkpoint.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journal
+                .terminal_component_authority_relation(1, &transitions)
+                .expect("host authorities aligned after reconciliation"),
+            remanence_parity::TerminalComponentAuthorityRelation::Aligned
+        );
+        assert_eq!(
+            checkpoint
+                .terminal_finalization_intent()
+                .expect("read durable progress")
+                .expect("pending intent")
+                .progress,
+            remanence_state::TerminalFinalizationProgress::AfterReplicaA
+        );
+        assert_eq!(
+            index
+                .terminal_finalization(&TAPE_UUID)
+                .expect("read projection")
+                .expect("finalization projection")
+                .progress,
+            remanence_state::TerminalFinalizationProgress::AfterReplicaA
+        );
+
+        // Simulate the separate crash window after the next external
+        // checkpoint fsync but before its SQLite projection. Both durable
+        // journals agree; restart must repair the cache before media motion.
+        journal
+            .commit_terminal_component_transition(&transitions[1].0, &transitions[1].1)
+            .expect("journal separation AB transition");
+        let checkpoint_intent = checkpoint
+            .advance_terminal_finalization(
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+            )
+            .expect("advance external checkpoint without SQLite projection");
+        assert_eq!(
+            index
+                .terminal_finalization(&TAPE_UUID)
+                .expect("read deliberately stale projection")
+                .expect("stale finalization projection")
+                .progress,
+            remanence_state::TerminalFinalizationProgress::AfterReplicaA
+        );
+        let reconciled = reconcile_terminal_component_host_authority(
+            &mut index,
+            &mut checkpoint,
+            &spec,
+            checkpoint_intent,
+            &plan,
+            &mut journal,
+        )
+        .expect("aligned journals repair SQLite before media");
+        assert_eq!(
+            reconciled.progress,
+            remanence_state::TerminalFinalizationProgress::AfterSeparationAb
+        );
+        assert_eq!(
+            index
+                .terminal_finalization(&TAPE_UUID)
+                .expect("read repaired projection")
+                .expect("repaired finalization projection")
+                .progress,
+            remanence_state::TerminalFinalizationProgress::AfterSeparationAb
+        );
+
+        let mut current = reconciled;
+        for (component_index, expected_progress) in [
+            (
+                2,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+            ),
+            (
+                3,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+            ),
+        ] {
+            journal
+                .commit_bundle(&transitions[component_index].0)
+                .expect("simulate the next sink component one transition ahead");
+            current = reconcile_terminal_component_host_authority(
+                &mut index,
+                &mut checkpoint,
+                &spec,
+                current,
+                &plan,
+                &mut journal,
+            )
+            .expect("promote one exact sink transition before media");
+            assert_eq!(current.progress, expected_progress);
+            assert_eq!(
+                index
+                    .terminal_finalization(&TAPE_UUID)
+                    .expect("read promoted projection")
+                    .expect("promoted finalization projection")
+                    .progress,
+                expected_progress
+            );
+        }
+
+        // Replica C is the same host-authority rule even though all three
+        // index copies are now barrier-proved: the sealed checkpoint remains
+        // a later step, so Finalizing(AfterReplicaC) is restartable.
+        journal
+            .commit_terminal_component_transition(&transitions[4].0, &transitions[4].1)
+            .expect("journal replica C transition");
+        let completed = checkpoint
+            .advance_terminal_finalization(
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+            )
+            .expect("advance replica C checkpoint without SQLite projection");
+        assert_eq!(
+            index
+                .terminal_finalization(&TAPE_UUID)
+                .expect("read stale pre-C projection")
+                .expect("stale pre-C finalization projection")
+                .progress,
+            remanence_state::TerminalFinalizationProgress::AfterSeparationBc
+        );
+        let completed = reconcile_terminal_component_host_authority(
+            &mut index,
+            &mut checkpoint,
+            &spec,
+            completed,
+            &plan,
+            &mut journal,
+        )
+        .expect("aligned replica C authority repairs SQLite before media");
+        assert_eq!(
+            completed.progress,
+            remanence_state::TerminalFinalizationProgress::AfterReplicaC
+        );
+        let projected = index
+            .terminal_finalization(&TAPE_UUID)
+            .expect("read repaired replica C projection")
+            .expect("replica C finalization projection");
+        assert_eq!(
+            projected.progress,
+            remanence_state::TerminalFinalizationProgress::AfterReplicaC
+        );
+        assert_eq!(projected.outcome, TerminalFinalizationOutcome::InProgress);
+
+        let completed = checkpoint
+            .mark_terminal_recovery_required()
+            .expect("persist post-C recovery classification");
+        index
+            .project_terminal_finalization(TerminalFinalizationProjectionInput {
+                tape_uuid: TAPE_UUID,
+                trigger: completed.trigger,
+                operation_id: None,
+                progress: completed.progress,
+                edition_digest: completed.edition_digest,
+                layout_digest: completed.layout.layout_digest,
+                outcome: TerminalFinalizationOutcome::RecoveryRequired,
+                updated_at_utc: None,
+            })
+            .expect("project post-C recovery classification");
+        let previous = checkpoint
+            .last_record_bounded()
+            .expect("read base checkpoint")
+            .expect("base checkpoint exists");
+        let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
+        let finalized = complete_terminal_finalization_host_only(
+            &mut index,
+            TerminalFinalizeAuditConfig {
+                audit_dir: temp.path(),
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            &mut checkpoint,
+            &previous,
+            &spec,
+            None,
+            completed,
+            &plan,
+            None,
+        )
+        .expect("complete host-only final checkpoint without media capability");
+        assert_eq!(
+            finalized.projection.outcome,
+            TerminalFinalizationOutcome::Finalized
+        );
+        assert!(
+            finalized
+                .final_record
+                .expect("final record")
+                .sealed_after_write
         );
     }
 

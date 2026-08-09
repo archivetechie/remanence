@@ -45,7 +45,8 @@ use remanence_state::{
     effective_tape_pool_capacity_bytes, validate_tape_pool_capacity_invariant,
     watermark_floor_bytes, CatalogIndex, NativeObjectCopyProjectionInput, NativeObjectCopyRecord,
     NativeObjectFileProjectionInput, NativeObjectProjectionInput, NativeObjectRecord, StateError,
-    TapeJournalIndexInput, TapePoolConfig, TapeRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+    TapeJournalIndexInput, TapePoolConfig, TapeRecord, TerminalFinalizationOutcome,
+    TerminalFinalizationProjectionInput, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
     OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
@@ -1777,6 +1778,7 @@ fn build_direct_terminal_plan(
         trigger,
         manual: None,
         progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+        recovery_required: false,
         edition_id,
         edition_sequence,
         edition_digest: edition.edition_digest,
@@ -1887,14 +1889,56 @@ fn execute_direct_terminal_tail(
     })();
     match execution {
         Ok(record) => Ok(record),
-        Err(error) if write_attempted.get() => Err(fence_after_terminal_motion(
-            state,
-            selected,
-            "terminal_finalization",
-            error,
-        )),
+        Err(error) if write_attempted.get() => {
+            let recovery = (|| -> Result<(), PoolWriteError> {
+                let intent = checkpoint.mark_terminal_recovery_required()?;
+                state.project_terminal_finalization(TerminalFinalizationProjectionInput {
+                    tape_uuid: selected.tape_uuid,
+                    trigger: intent.trigger,
+                    operation_id: None,
+                    progress: intent.progress,
+                    edition_digest: intent.edition_digest,
+                    layout_digest: intent.layout.layout_digest,
+                    outcome: TerminalFinalizationOutcome::RecoveryRequired,
+                    updated_at_utc: None,
+                })?;
+                Ok(())
+            })();
+            let error = match recovery {
+                Ok(()) => error,
+                Err(recovery_error) => PoolWriteError::InvalidInput(format!(
+                    "{error}; failed to persist terminal recovery-required authority: {recovery_error}"
+                )),
+            };
+            Err(fence_after_terminal_motion(
+                state,
+                selected,
+                "terminal_finalization",
+                error,
+            ))
+        }
         Err(error) => Err(error),
     }
+}
+
+fn publish_direct_terminal_intent(
+    state: &mut CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    selected: &SelectedTape,
+    intent: &remanence_state::TerminalFinalizationIntent,
+) -> Result<(), PoolWriteError> {
+    checkpoint.begin_terminal_finalization(intent)?;
+    state.project_terminal_finalization(TerminalFinalizationProjectionInput {
+        tape_uuid: selected.tape_uuid,
+        trigger: intent.trigger,
+        operation_id: None,
+        progress: intent.progress,
+        edition_digest: intent.edition_digest,
+        layout_digest: intent.layout.layout_digest,
+        outcome: TerminalFinalizationOutcome::InProgress,
+        updated_at_utc: None,
+    })?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1939,7 +1983,7 @@ fn finalize_direct_checkpoint_prefix(
                 None,
                 trigger,
             )?;
-            checkpoint.begin_terminal_finalization(&intent)?;
+            publish_direct_terminal_intent(state, checkpoint, selected, &intent)?;
             execute_direct_terminal_tail(
                 state,
                 sink,
@@ -1983,7 +2027,7 @@ fn finalize_direct_checkpoint_prefix(
                 Some(&prefix),
                 trigger,
             )?;
-            checkpoint.begin_terminal_finalization(&intent)?;
+            publish_direct_terminal_intent(state, checkpoint, selected, &intent)?;
             execute_direct_terminal_tail(
                 state,
                 sink,
@@ -11289,11 +11333,18 @@ mod tests {
                 .map(|intent| intent.progress),
             Some(remanence_state::TerminalFinalizationProgress::BeforeReplicaA)
         );
+        assert_eq!(
+            recovery_authority
+                .finalization_intent
+                .as_ref()
+                .map(|intent| intent.recovery_required),
+            Some(true)
+        );
         let tape = index
             .get_tape(&tape_uuid)
             .expect("query tape")
             .expect("tape exists");
-        assert_eq!(tape.state, "ready");
+        assert_eq!(tape.state, "recovery_required");
         let fences = index
             .tape_io_admission_conflicts(&tape_uuid, Some("TER001L9"))
             .expect("query terminal fence");

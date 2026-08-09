@@ -2289,7 +2289,11 @@ fn replay_checkpoint_journal_projections(
                         progress: intent.progress,
                         edition_digest: intent.edition_digest,
                         layout_digest: intent.layout.layout_digest,
-                        outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+                        outcome: if intent.recovery_required {
+                            remanence_state::TerminalFinalizationOutcome::RecoveryRequired
+                        } else {
+                            remanence_state::TerminalFinalizationOutcome::InProgress
+                        },
                         updated_at_utc: None,
                     },
                 )
@@ -2702,6 +2706,7 @@ impl pb::catalog_server::Catalog for CatalogService {
         }
     }
 
+    #[allow(deprecated)]
     async fn finalize_tape(
         &self,
         request: Request<pb::FinalizeTapeRequest>,
@@ -2760,6 +2765,7 @@ impl pb::catalog_server::Catalog for CatalogService {
                 progress: pb::TapeFinalizationProgress::Unspecified as i32,
                 completed_replicas: 0,
                 replica_health: Vec::new(),
+                replica_progress: Vec::new(),
                 edition_digest: Vec::new(),
                 layout_digest: Vec::new(),
                 outcome: pb::TapeFinalizationOutcome::Busy as i32,
@@ -5501,6 +5507,7 @@ fn tape_state(value: &str) -> pb::tape::State {
     }
 }
 
+#[allow(deprecated)]
 fn tape_finalization_to_proto(
     tape_uuid: [u8; 16],
     operation_id: Option<Uuid>,
@@ -5533,18 +5540,29 @@ fn tape_finalization_to_proto(
         StateTrigger::NoPendingObjectFits => "no_pending_object_fits",
     };
     let completed = projection.completed_replicas;
-    let replica_health = (1u8..=3)
+    let completion_unknown_ordinal = if matches!(projection.outcome, StateOutcome::RecoveryRequired)
+    {
+        match projection.progress {
+            StateProgress::BeforeReplicaA => Some(1),
+            StateProgress::AfterSeparationAb => Some(2),
+            StateProgress::AfterSeparationBc => Some(3),
+            StateProgress::AfterReplicaA
+            | StateProgress::AfterReplicaB
+            | StateProgress::AfterReplicaC => None,
+        }
+    } else {
+        None
+    };
+    let replica_progress = (1u8..=3)
         .map(|ordinal| {
             let state = if ordinal <= completed {
-                pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete
-            } else if matches!(projection.outcome, StateOutcome::RecoveryRequired)
-                && ordinal == completed.saturating_add(1)
-            {
-                pb::tape_index_replica_health::State::TapeIndexReplicaStateUnknown
+                pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateBarrierProved
+            } else if completion_unknown_ordinal == Some(ordinal) {
+                pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStateCompletionUnknown
             } else {
-                pb::tape_index_replica_health::State::TapeIndexReplicaStatePending
+                pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStatePending
             };
-            pb::TapeIndexReplicaHealth {
+            pb::TapeIndexReplicaProgress {
                 replica_ordinal: u32::from(ordinal),
                 state: state as i32,
                 detail: String::new(),
@@ -5558,7 +5576,8 @@ fn tape_finalization_to_proto(
             .unwrap_or_default(),
         progress: progress as i32,
         completed_replicas: u32::from(completed),
-        replica_health,
+        replica_health: Vec::new(),
+        replica_progress,
         edition_digest: projection.edition_digest.to_vec(),
         layout_digest: projection.layout_digest.to_vec(),
         outcome: outcome as i32,
@@ -6128,6 +6147,104 @@ mod tests {
     const OPERATION_ID_TEXT: &str = "22222222-2222-2222-2222-222222222222";
     const TAPE_UUID: [u8; 16] = [3u8; 16];
     const POOL_WRITE_TAPE_UUID: [u8; 16] = [4u8; 16];
+
+    #[test]
+    fn finalization_progress_uses_wire_tag_11_not_legacy_health_tag_5() {
+        use prost::Message as _;
+
+        let encoded = pb::TapeFinalization {
+            replica_progress: vec![pb::TapeIndexReplicaProgress {
+                replica_ordinal: 1,
+                state: pb::tape_index_replica_progress::State::TapeIndexReplicaProgressStatePending
+                    as i32,
+                detail: String::new(),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(encoded.first(), Some(&0x5A), "field 11 wire key");
+        assert!(!encoded.contains(&0x2A), "legacy field 5 wire key");
+    }
+
+    #[test]
+    fn recovery_progress_marks_only_the_replica_currently_in_flight_unknown() {
+        use pb::tape_index_replica_progress::State as ReplicaState;
+        use remanence_state::{
+            TerminalFinalizationOutcome, TerminalFinalizationProgress,
+            TerminalFinalizationProjection, TerminalFinalizationTrigger,
+        };
+
+        let cases = [
+            (
+                TerminalFinalizationProgress::BeforeReplicaA,
+                [
+                    ReplicaState::TapeIndexReplicaProgressStateCompletionUnknown,
+                    ReplicaState::TapeIndexReplicaProgressStatePending,
+                    ReplicaState::TapeIndexReplicaProgressStatePending,
+                ],
+            ),
+            (
+                TerminalFinalizationProgress::AfterReplicaA,
+                [
+                    ReplicaState::TapeIndexReplicaProgressStateBarrierProved,
+                    ReplicaState::TapeIndexReplicaProgressStatePending,
+                    ReplicaState::TapeIndexReplicaProgressStatePending,
+                ],
+            ),
+            (
+                TerminalFinalizationProgress::AfterSeparationAb,
+                [
+                    ReplicaState::TapeIndexReplicaProgressStateBarrierProved,
+                    ReplicaState::TapeIndexReplicaProgressStateCompletionUnknown,
+                    ReplicaState::TapeIndexReplicaProgressStatePending,
+                ],
+            ),
+            (
+                TerminalFinalizationProgress::AfterReplicaB,
+                [
+                    ReplicaState::TapeIndexReplicaProgressStateBarrierProved,
+                    ReplicaState::TapeIndexReplicaProgressStateBarrierProved,
+                    ReplicaState::TapeIndexReplicaProgressStatePending,
+                ],
+            ),
+            (
+                TerminalFinalizationProgress::AfterSeparationBc,
+                [
+                    ReplicaState::TapeIndexReplicaProgressStateBarrierProved,
+                    ReplicaState::TapeIndexReplicaProgressStateBarrierProved,
+                    ReplicaState::TapeIndexReplicaProgressStateCompletionUnknown,
+                ],
+            ),
+            (
+                TerminalFinalizationProgress::AfterReplicaC,
+                [ReplicaState::TapeIndexReplicaProgressStateBarrierProved; 3],
+            ),
+        ];
+        for (progress, expected) in cases {
+            let status = tape_finalization_to_proto(
+                TAPE_UUID,
+                None,
+                TerminalFinalizationProjection {
+                    trigger: TerminalFinalizationTrigger::ReachedLowWatermark,
+                    operation_id: None,
+                    progress,
+                    edition_digest: [0xA1; 32],
+                    layout_digest: [0xA2; 32],
+                    completed_replicas: progress.completed_replicas(),
+                    outcome: TerminalFinalizationOutcome::RecoveryRequired,
+                },
+            );
+            assert_eq!(
+                status
+                    .replica_progress
+                    .iter()
+                    .map(|row| ReplicaState::try_from(row.state).expect("known replica progress"))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{progress:?}",
+            );
+        }
+    }
 
     #[test]
     fn native_file_proto_preserves_u64_chunk_count() {
@@ -7900,7 +8017,7 @@ BCw3Wyv2UWY=
     }
 
     #[test]
-    fn startup_replay_restores_pending_automatic_finalization_fence() {
+    fn startup_replay_restores_pending_automatic_finalization_through_replica_c() {
         const TERMINAL_BLOCK_SIZE: u32 = 256 * 1024;
         let temp = tempfile::Builder::new()
             .prefix("remanence-checkpoint-terminal-restart")
@@ -7942,11 +8059,12 @@ BCw3Wyv2UWY=
             .expect("gap records"),
         )
         .expect("terminal layout");
-        let mut intent = remanence_state::TerminalFinalizationIntent {
+        let intent = remanence_state::TerminalFinalizationIntent {
             tape_uuid,
             trigger: remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark,
             manual: None,
             progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+            recovery_required: false,
             edition_id: [0x24; 16],
             edition_sequence: 2,
             edition_digest: [0x25; 32],
@@ -7962,18 +8080,35 @@ BCw3Wyv2UWY=
         lease
             .begin_terminal_finalization(&intent)
             .expect("persist terminal intent");
-        lease
-            .advance_terminal_finalization(
+        for (expected, next) in [
+            (
                 remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
                 remanence_state::TerminalFinalizationProgress::AfterReplicaA,
-            )
-            .expect("advance through replica A");
-        intent = lease
-            .advance_terminal_finalization(
+            ),
+            (
                 remanence_state::TerminalFinalizationProgress::AfterReplicaA,
                 remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
-            )
-            .expect("advance through separation AB");
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterReplicaB,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+            ),
+            (
+                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+            ),
+        ] {
+            lease
+                .advance_terminal_finalization(expected, next)
+                .expect("advance durable terminal progress");
+        }
+        let mut intent = lease
+            .mark_terminal_recovery_required()
+            .expect("persist recovery-required state before restart");
         drop(lease);
         drop(index);
 
@@ -7984,15 +8119,99 @@ BCw3Wyv2UWY=
             .get_tape(&tape_uuid)
             .expect("read tape")
             .expect("known tape");
-        assert_eq!(tape.state, "finalizing");
+        assert_eq!(tape.state, "recovery_required");
         let projection = tape.terminal_finalization.expect("terminal projection");
         assert_eq!(projection.progress, intent.progress);
-        assert_eq!(projection.completed_replicas, 1);
+        assert_eq!(projection.completed_replicas, 3);
         assert_eq!(projection.edition_digest, intent.edition_digest);
         assert_eq!(projection.layout_digest, intent.layout.layout_digest);
+        assert_eq!(
+            projection.outcome,
+            remanence_state::TerminalFinalizationOutcome::RecoveryRequired
+        );
 
         replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
             .expect("pending finalization replay is idempotent");
+
+        let mut lease = journal
+            .acquire_exclusive_for_terminal_recovery()
+            .expect("acquire host-only recovery clear");
+        intent = lease
+            .clear_terminal_recovery_required_after_replica_c()
+            .expect("clear recovery after durable replica C authority");
+        drop(lease);
+
+        let replica_c = intent.layout.components[4];
+        let terminal = remanence_state::CheckpointJournalRecord {
+            ordinal: checkpoint.ordinal + 1,
+            committed_object_count: checkpoint.committed_object_count,
+            eod_partition: intent.layout.partition,
+            eod_lba: intent.layout.expected_eod_lba,
+            tape_uuid,
+            batch_id: intent.edition_id,
+            next_tape_file_number: replica_c
+                .tape_file_number
+                .checked_add(1)
+                .expect("replica C next file"),
+            block_size: intent.layout.block_size,
+            objects: Vec::new(),
+            scheme: checkpoint.scheme.clone(),
+            object_tape_file_bundles: Vec::new(),
+            barrier_bundle: Some(remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::TerminalComponent,
+                entries: vec![remanence_parity::TapeFileEntry {
+                    tape_file_number: replica_c.tape_file_number,
+                    kind: remanence_parity::TapeFileKind::TapeIndexReplica,
+                    block_count: replica_c.record_count,
+                    physical_start_hint: Some(replica_c.start_lba),
+                    object_id: None,
+                    first_parity_data_ordinal: None,
+                    epoch_id: None,
+                    protected_ordinal_start: None,
+                    protected_ordinal_end_exclusive: None,
+                    canonical_metadata_hash: Some(intent.edition_digest),
+                    object_recovery_row: None,
+                }],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 3,
+            }),
+            terminal_finalization: Some(intent.clone()),
+            sealed_after_write: true,
+        };
+        let mut lease = journal
+            .acquire_exclusive_for_terminal_recovery()
+            .expect("acquire final host recovery");
+        let interrupted = lease
+            .append_terminal_finalization_with_after_fsync(std::slice::from_ref(&terminal), || {
+                Err(remanence_state::StateError::JournalReplayFailed(
+                    "simulated sealed-checkpoint cleanup interruption".to_string(),
+                ))
+            })
+            .expect_err("leave exact intent beside sealed checkpoint");
+        assert!(interrupted.to_string().contains("cleanup interruption"));
+        drop(lease);
+        drop(index);
+
+        let mut index = CatalogIndex::open(&index_path).expect("restart after sealed checkpoint");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("sealed checkpoint wins over its stale matching intent");
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("read sealed tape")
+            .expect("known sealed tape");
+        assert_eq!(tape.state, "sealed");
+        assert_eq!(
+            tape.terminal_finalization
+                .expect("sealed finalization projection")
+                .outcome,
+            remanence_state::TerminalFinalizationOutcome::Finalized
+        );
+        assert_eq!(
+            journal
+                .terminal_finalization_intent()
+                .expect("read cleaned companion intent"),
+            None
+        );
     }
 
     fn project_no_parity_tape_with_block_size(

@@ -178,6 +178,19 @@ content that must be inventoried before normal use.
 
 ## Crash recovery and natural idempotency
 
+Terminal finalization has a useful no-media recovery boundary. Once the
+checkpoint and parity journal prove that replica C completed its synchronizing
+barrier, all three full indexes are already on tape. A restart completes the
+remaining sealed-checkpoint, intent cleanup, SQLite projection, and audit work
+without loading, locating, reading, or writing the cartridge. This applies to
+automatic finalization and to an operator-requested close-out.
+
+Before that boundary, a failed or uncertain component is recorded durably as
+`recovery_required`. Restart does not quietly turn that state back into ordinary
+`finalizing`; it must reconcile the next physical component first. This
+distinction prevents a host metadata failure after a proved replica C from
+causing needless tape motion while still fencing genuinely uncertain media.
+
 If the process stops after the audit append but before the SQLite projection, a
 later invocation replays the audit first and repairs the missing projection.
 Internally, one operation UUID cannot be rebound to a different tape or changed

@@ -1,17 +1,69 @@
-case_id	present_components	filemarks	barriers	expected_progress	expected_next
-before-a				BeforeReplicaA	replica-a.bin
-after-a-footer	replica-a.bin			BeforeReplicaA	reconcile-replica-a
-after-a-filemark	replica-a.bin	replica-a.bin		BeforeReplicaA	reconcile-replica-a
-after-a-barrier	replica-a.bin	replica-a.bin	replica-a.bin	AfterReplicaA	gap-ab.bin
-after-gap-ab-footer	replica-a.bin,gap-ab.bin	replica-a.bin	replica-a.bin	AfterReplicaA	reconcile-gap-ab
-after-gap-ab-filemark	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	replica-a.bin	AfterReplicaA	reconcile-gap-ab
-complete-gap-before-b	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	AfterSeparationAb	replica-b.bin
-after-b-footer	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	AfterSeparationAb	reconcile-replica-b
-after-b-filemark	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin	AfterSeparationAb	reconcile-replica-b
-after-b-barrier	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	AfterReplicaB	gap-bc.bin
-after-gap-bc-footer	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	AfterReplicaB	reconcile-gap-bc
-after-gap-bc-filemark	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin	AfterReplicaB	reconcile-gap-bc
-after-gap-bc-barrier	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	AfterSeparationBc	replica-c.bin
-after-c-footer	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	AfterSeparationBc	reconcile-replica-c
-after-c-filemark	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	AfterSeparationBc	reconcile-replica-c
-after-c-barrier	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	AfterReplicaC	none
+case_id	phase	component	cut	prefix_parity_map_blocks_accepted	prefix_parity_map_filemark_accepted	prefix_media_barrier_proved	prefix_sink_journal	prefix_sink_checkpoint	component_block_streams_accepted	component_filemark_commands_accepted	component_media_barriers_proved	sink_journal_components	checkpoint_components	sqlite_components	sealed_checkpoint	intent_present	final_sqlite	expected_checkpoint_progress	expected_completed_replicas	expected_resume
+terminal_prefix-before_terminal_prefix	prefix	parity_closeout	before_terminal_prefix	0	0	0	0	0	0	0	0	0	0	0	0	1	0	BeforeReplicaA	0	finish-terminal-prefix
+terminal_prefix-before_final_parity_map	prefix	parity_closeout	before_final_parity_map	0	0	0	0	0	0	0	0	0	0	0	0	1	0	BeforeReplicaA	0	finish-terminal-prefix
+terminal_prefix-after_final_parity_map	prefix	parity_closeout	after_final_parity_map	1	1	0	0	0	0	0	0	0	0	0	0	1	0	BeforeReplicaA	0	finish-terminal-prefix
+terminal_prefix-after_terminal_prefix	prefix	parity_closeout	after_terminal_prefix	1	1	1	1	1	0	0	0	0	0	0	0	1	0	BeforeReplicaA	0	replica_a
+replica_a-before_footer	component	replica_a	before_footer	1	1	1	1	1	0	0	0	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-after_footer	component	replica_a	after_footer	1	1	1	1	1	1	0	0	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-before_filemark	component	replica_a	before_filemark	1	1	1	1	1	1	0	0	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-after_filemark	component	replica_a	after_filemark	1	1	1	1	1	1	1	0	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-before_barrier	component	replica_a	before_barrier	1	1	1	1	1	1	1	0	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-after_barrier	component	replica_a	after_barrier	1	1	1	1	1	1	1	1	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-before_parity_journal_fsync	component	replica_a	before_parity_journal_fsync	1	1	1	1	1	1	1	1	0	0	0	0	1	0	BeforeReplicaA	0	reconcile-current
+replica_a-after_parity_journal_fsync	component	replica_a	after_parity_journal_fsync	1	1	1	1	1	1	1	1	1	0	0	0	1	0	BeforeReplicaA	0	promote-sink-transition
+replica_a-before_checkpoint_journal_fsync	component	replica_a	before_checkpoint_journal_fsync	1	1	1	1	1	1	1	1	1	0	0	0	1	0	BeforeReplicaA	0	promote-sink-transition
+replica_a-after_checkpoint_journal_fsync	component	replica_a	after_checkpoint_journal_fsync	1	1	1	1	1	1	1	1	1	1	0	0	1	0	AfterReplicaA	1	repair-sqlite-then-continue
+replica_a-before_sqlite_projection	component	replica_a	before_sqlite_projection	1	1	1	1	1	1	1	1	1	1	0	0	1	0	AfterReplicaA	1	repair-sqlite-then-continue
+replica_a-after_sqlite_projection	component	replica_a	after_sqlite_projection	1	1	1	1	1	1	1	1	1	1	1	0	1	0	AfterReplicaA	1	continue
+separation_ab-before_footer	component	separation_ab	before_footer	1	1	1	1	1	1	1	1	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-after_footer	component	separation_ab	after_footer	1	1	1	1	1	2	1	1	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-before_filemark	component	separation_ab	before_filemark	1	1	1	1	1	2	1	1	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-after_filemark	component	separation_ab	after_filemark	1	1	1	1	1	2	2	1	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-before_barrier	component	separation_ab	before_barrier	1	1	1	1	1	2	2	1	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-after_barrier	component	separation_ab	after_barrier	1	1	1	1	1	2	2	2	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-before_parity_journal_fsync	component	separation_ab	before_parity_journal_fsync	1	1	1	1	1	2	2	2	1	1	1	0	1	0	AfterReplicaA	1	reconcile-current
+separation_ab-after_parity_journal_fsync	component	separation_ab	after_parity_journal_fsync	1	1	1	1	1	2	2	2	2	1	1	0	1	0	AfterReplicaA	1	promote-sink-transition
+separation_ab-before_checkpoint_journal_fsync	component	separation_ab	before_checkpoint_journal_fsync	1	1	1	1	1	2	2	2	2	1	1	0	1	0	AfterReplicaA	1	promote-sink-transition
+separation_ab-after_checkpoint_journal_fsync	component	separation_ab	after_checkpoint_journal_fsync	1	1	1	1	1	2	2	2	2	2	1	0	1	0	AfterSeparationAb	1	repair-sqlite-then-continue
+separation_ab-before_sqlite_projection	component	separation_ab	before_sqlite_projection	1	1	1	1	1	2	2	2	2	2	1	0	1	0	AfterSeparationAb	1	repair-sqlite-then-continue
+separation_ab-after_sqlite_projection	component	separation_ab	after_sqlite_projection	1	1	1	1	1	2	2	2	2	2	2	0	1	0	AfterSeparationAb	1	continue
+replica_b-before_footer	component	replica_b	before_footer	1	1	1	1	1	2	2	2	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-after_footer	component	replica_b	after_footer	1	1	1	1	1	3	2	2	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-before_filemark	component	replica_b	before_filemark	1	1	1	1	1	3	2	2	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-after_filemark	component	replica_b	after_filemark	1	1	1	1	1	3	3	2	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-before_barrier	component	replica_b	before_barrier	1	1	1	1	1	3	3	2	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-after_barrier	component	replica_b	after_barrier	1	1	1	1	1	3	3	3	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-before_parity_journal_fsync	component	replica_b	before_parity_journal_fsync	1	1	1	1	1	3	3	3	2	2	2	0	1	0	AfterSeparationAb	1	reconcile-current
+replica_b-after_parity_journal_fsync	component	replica_b	after_parity_journal_fsync	1	1	1	1	1	3	3	3	3	2	2	0	1	0	AfterSeparationAb	1	promote-sink-transition
+replica_b-before_checkpoint_journal_fsync	component	replica_b	before_checkpoint_journal_fsync	1	1	1	1	1	3	3	3	3	2	2	0	1	0	AfterSeparationAb	1	promote-sink-transition
+replica_b-after_checkpoint_journal_fsync	component	replica_b	after_checkpoint_journal_fsync	1	1	1	1	1	3	3	3	3	3	2	0	1	0	AfterReplicaB	2	repair-sqlite-then-continue
+replica_b-before_sqlite_projection	component	replica_b	before_sqlite_projection	1	1	1	1	1	3	3	3	3	3	2	0	1	0	AfterReplicaB	2	repair-sqlite-then-continue
+replica_b-after_sqlite_projection	component	replica_b	after_sqlite_projection	1	1	1	1	1	3	3	3	3	3	3	0	1	0	AfterReplicaB	2	continue
+separation_bc-before_footer	component	separation_bc	before_footer	1	1	1	1	1	3	3	3	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-after_footer	component	separation_bc	after_footer	1	1	1	1	1	4	3	3	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-before_filemark	component	separation_bc	before_filemark	1	1	1	1	1	4	3	3	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-after_filemark	component	separation_bc	after_filemark	1	1	1	1	1	4	4	3	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-before_barrier	component	separation_bc	before_barrier	1	1	1	1	1	4	4	3	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-after_barrier	component	separation_bc	after_barrier	1	1	1	1	1	4	4	4	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-before_parity_journal_fsync	component	separation_bc	before_parity_journal_fsync	1	1	1	1	1	4	4	4	3	3	3	0	1	0	AfterReplicaB	2	reconcile-current
+separation_bc-after_parity_journal_fsync	component	separation_bc	after_parity_journal_fsync	1	1	1	1	1	4	4	4	4	3	3	0	1	0	AfterReplicaB	2	promote-sink-transition
+separation_bc-before_checkpoint_journal_fsync	component	separation_bc	before_checkpoint_journal_fsync	1	1	1	1	1	4	4	4	4	3	3	0	1	0	AfterReplicaB	2	promote-sink-transition
+separation_bc-after_checkpoint_journal_fsync	component	separation_bc	after_checkpoint_journal_fsync	1	1	1	1	1	4	4	4	4	4	3	0	1	0	AfterSeparationBc	2	repair-sqlite-then-continue
+separation_bc-before_sqlite_projection	component	separation_bc	before_sqlite_projection	1	1	1	1	1	4	4	4	4	4	3	0	1	0	AfterSeparationBc	2	repair-sqlite-then-continue
+separation_bc-after_sqlite_projection	component	separation_bc	after_sqlite_projection	1	1	1	1	1	4	4	4	4	4	4	0	1	0	AfterSeparationBc	2	continue
+replica_c-before_footer	component	replica_c	before_footer	1	1	1	1	1	4	4	4	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-after_footer	component	replica_c	after_footer	1	1	1	1	1	5	4	4	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-before_filemark	component	replica_c	before_filemark	1	1	1	1	1	5	4	4	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-after_filemark	component	replica_c	after_filemark	1	1	1	1	1	5	5	4	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-before_barrier	component	replica_c	before_barrier	1	1	1	1	1	5	5	4	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-after_barrier	component	replica_c	after_barrier	1	1	1	1	1	5	5	5	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-before_parity_journal_fsync	component	replica_c	before_parity_journal_fsync	1	1	1	1	1	5	5	5	4	4	4	0	1	0	AfterSeparationBc	2	reconcile-current
+replica_c-after_parity_journal_fsync	component	replica_c	after_parity_journal_fsync	1	1	1	1	1	5	5	5	5	4	4	0	1	0	AfterSeparationBc	2	promote-sink-transition
+replica_c-before_checkpoint_journal_fsync	component	replica_c	before_checkpoint_journal_fsync	1	1	1	1	1	5	5	5	5	4	4	0	1	0	AfterSeparationBc	2	promote-sink-transition
+replica_c-after_checkpoint_journal_fsync	component	replica_c	after_checkpoint_journal_fsync	1	1	1	1	1	5	5	5	5	5	4	0	1	0	AfterReplicaC	3	repair-sqlite-then-finish-final-projection
+replica_c-before_sqlite_projection	component	replica_c	before_sqlite_projection	1	1	1	1	1	5	5	5	5	5	4	0	1	0	AfterReplicaC	3	repair-sqlite-then-finish-final-projection
+replica_c-after_sqlite_projection	component	replica_c	after_sqlite_projection	1	1	1	1	1	5	5	5	5	5	5	0	1	0	AfterReplicaC	3	finish-final-projection
+final_projection-before_final_checkpoint_fsync	final_projection	final_projection	before_final_checkpoint_fsync	1	1	1	1	1	5	5	5	5	5	5	0	1	0	AfterReplicaC	3	finish-final-projection
+final_projection-after_final_checkpoint_fsync	final_projection	final_projection	after_final_checkpoint_fsync	1	1	1	1	1	5	5	5	5	5	5	1	1	0	AfterReplicaC	3	replay-sealed-completion
+final_projection-before_final_sqlite_projection	final_projection	final_projection	before_final_sqlite_projection	1	1	1	1	1	5	5	5	5	5	5	1	0	0	AfterReplicaC	3	replay-sealed-completion
+final_projection-after_final_sqlite_projection	final_projection	final_projection	after_final_sqlite_projection	1	1	1	1	1	5	5	5	5	5	5	1	0	1	AfterReplicaC	3	none

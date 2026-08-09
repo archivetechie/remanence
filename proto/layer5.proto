@@ -828,6 +828,26 @@ message TapeIndexReplicaHealth {
   string detail = 3;
 }
 
+// Historical write-progress evidence. This does not claim that a replica is
+// readable or healthy at the time the status is queried; only inventory or
+// full verification may make that observation-backed claim.
+message TapeIndexReplicaProgress {
+  uint32 replica_ordinal = 1;
+  enum State {
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_UNSPECIFIED = 0;
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_PENDING = 1;
+    // The replica's trailing filemark, zero-count barrier, and external
+    // checkpoint progress were durably proved in the finalization history.
+    // Parity-enabled histories additionally prove the sink-journal transition.
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_BARRIER_PROVED = 2;
+    // Finalization stopped at or immediately before this replica and current
+    // completion cannot be inferred from historical progress alone.
+    TAPE_INDEX_REPLICA_PROGRESS_STATE_COMPLETION_UNKNOWN = 3;
+  }
+  State state = 2;
+  string detail = 3;
+}
+
 message TapeInventoryRequest {
   // Exact 16-byte Remanence tape UUID. Voltags are deliberately not accepted.
   bytes tape_uuid = 1;
@@ -1025,12 +1045,16 @@ message TapeFinalization {
   bytes operation_id = 2;
   TapeFinalizationProgress progress = 3;
   uint32 completed_replicas = 4;
-  repeated TapeIndexReplicaHealth replica_health = 5;
+  // Deprecated draft field. Finalization no longer claims observation-backed
+  // media health; servers leave this empty. Retaining tag 5 prevents older
+  // clients from decoding progress states as health states.
+  repeated TapeIndexReplicaHealth replica_health = 5 [deprecated = true];
   bytes edition_digest = 6;
   bytes layout_digest = 7;
   TapeFinalizationOutcome outcome = 8;
   string trigger = 9;
   string detail = 10;
+  repeated TapeIndexReplicaProgress replica_progress = 11;
 }
 
 // A daemon-local tape eligibility group. Sutradhara decides the policy that maps

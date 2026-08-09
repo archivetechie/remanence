@@ -54,12 +54,26 @@ const DIAGNOSTIC_LENGTHS_OFFSET: usize = 0x1F0;
 const WRITER_VERSION_OFFSET: usize = 0x1F8;
 const WRITE_TIMESTAMP_OFFSET: usize = 0x278;
 const HEADER_SHA256_OFFSET: usize = 0x2B8;
+const _: () = assert!(
+    WRITER_VERSION_OFFSET + WRITER_VERSION_MAX_BYTES == WRITE_TIMESTAMP_OFFSET,
+    "writer-version bound must exactly match its fixed frame slot"
+);
+const _: () = assert!(
+    WRITE_TIMESTAMP_OFFSET + WRITE_TIMESTAMP_MAX_BYTES == HEADER_SHA256_OFFSET,
+    "write-timestamp bound must exactly match its fixed frame slot"
+);
 const OBSERVED_TAPE_FILE_OFFSET: usize = 0x2D8;
 const OBSERVED_START_LBA_OFFSET: usize = 0x2E0;
 const OBSERVED_RECORD_COUNT_OFFSET: usize = 0x2E8;
 const OBSERVED_FOOTER_LBA_OFFSET: usize = 0x2F0;
 const BACKWARD_START_DELTA_OFFSET: usize = 0x2F8;
 const FIXED_RESERVED_OFFSET: usize = 0x300;
+const _: () = assert!(
+    BACKWARD_START_DELTA_OFFSET + size_of::<u64>() == FIXED_RESERVED_OFFSET
+        && FIXED_RESERVED_OFFSET <= TAPE_INDEX_REPLICA_CRC_OFFSET
+        && TAPE_INDEX_REPLICA_CRC_OFFSET + size_of::<u64>() == TAPE_INDEX_REPLICA_FRAME_LEN,
+    "fixed fields, reserved bytes, and CRC must remain inside the replica frame"
+);
 
 /// Exact counts that determine the streamed payload size.
 pub type TapeIndexReplicaCounts = TapeIndexPayloadCounts;

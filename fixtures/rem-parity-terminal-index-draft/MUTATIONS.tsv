@@ -24,6 +24,7 @@ replica-wrong-observed-count	replica	multi-256k	replica-a.bin	wrong-observed-cou
 replica-payload-corrupt	replica	multi-256k	replica-a.bin	payload-corrupt		payload-digest
 replica-slot-truncated	replica	multi-256k	replica-a.bin	slot-length		slot-length
 replica-map-row-mismatch	replica	multi-256k	replica-a.bin	swap-object-rows		map-row-bijection
+replica-metadata-frame-too-short	replica	multi-256k	replica-a.bin	metadata-frame-too-short		map-row-bijection
 replica-payload-padding	replica	multi-256k	replica-a.bin	payload-padding		payload-padding
 replica-frame-padding	replica	multi-256k	replica-a.bin	frame-padding		frame-padding
 replica-reserved-nonzero	replica	multi-256k	replica-a.bin	reserved-nonzero		reserved-nonzero
