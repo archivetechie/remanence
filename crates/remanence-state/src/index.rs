@@ -312,6 +312,56 @@ pub struct ProvisionTapeInput {
     pub force: bool,
 }
 
+/// Conservative lifecycle state for an identity reconstructed from BOT.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptedTapeState {
+    /// Physical layout is exactly Bootstrap, filemark, EOD.
+    Ready,
+    /// Bootstrap identity is valid, but the following layout is not exact.
+    RecoveryRequired,
+}
+
+impl AdoptedTapeState {
+    /// Stable catalog spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::RecoveryRequired => "recovery_required",
+        }
+    }
+}
+
+/// Exact identity-only catalog row reconstructed from a physical Bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptBootstrapIdentityInput {
+    /// Invocation UUID generated before hardware motion.
+    pub operation_id: Uuid,
+    /// UUID parsed from the checksum-valid Bootstrap.
+    pub tape_uuid: [u8; 16],
+    /// Exact physical barcode observed by the changer.
+    pub voltag: String,
+    /// Fixed block size from the Bootstrap.
+    pub block_size: u32,
+    /// Exact parity geometry from the Bootstrap.
+    pub parity: ParityConfig,
+}
+
+/// Result of one idempotent identity-only catalog adoption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptBootstrapIdentityOutcome {
+    /// True only when this invocation inserted the identity row.
+    pub newly_adopted: bool,
+    /// Exact resulting pool assignment generation.
+    pub assignment_generation: u64,
+    /// Exact resulting lifecycle state.
+    pub state: AdoptedTapeState,
+    /// Invocation UUID echoed for this result. A fresh-UUID no-op does not
+    /// append a second adoption authority record.
+    pub operation_id: Uuid,
+    /// Immutable fingerprint of identity, geometry, placement, and tail facts.
+    pub request_fingerprint: [u8; 32],
+}
+
 /// Typed identity-only tape row carried across one explicitly scoped catalog
 /// reset. This type is intentionally crate-private: it is reset plumbing, not
 /// a general-purpose way to manufacture catalog authority.
@@ -1829,6 +1879,83 @@ impl CatalogIndex {
         tx.commit()
             .map_err(|err| sqlite_error("commit tape provisioning transaction", err))?;
         Ok(())
+    }
+
+    /// Adopt one checksum-validated Bootstrap as identity-only catalog state.
+    ///
+    /// This never manufactures tape-file, Object, extent, wrap-map, or
+    /// finalization authority. UUID and barcode conflicts are checked across
+    /// all tape kinds in the same transaction that inserts the row and its
+    /// derived pool assignment.
+    pub(crate) fn adopt_bootstrap_identity(
+        &mut self,
+        input: AdoptBootstrapIdentityInput,
+        pool_id: &str,
+        state: AdoptedTapeState,
+        request_fingerprint: [u8; 32],
+    ) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
+        let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
+        let voltag = input.voltag.trim().to_string();
+        if voltag.is_empty() || voltag != input.voltag {
+            return Err(StateError::ConfigInvalid(
+                "bootstrap adoption requires a non-empty trimmed voltag".to_string(),
+            ));
+        }
+        let pool_id = normalize_pool_id(pool_id)?;
+        let updated_at = now_utc()?;
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|err| sqlite_error("begin bootstrap identity adoption", err))?;
+        let outcome = adopt_bootstrap_identity_tx(
+            &tx,
+            BootstrapAdoptionCatalogFacts {
+                tape_uuid: input.tape_uuid,
+                voltag: voltag.as_str(),
+                geometry: &geometry,
+                pool_id: pool_id.as_str(),
+                state,
+                operation_id: input.operation_id,
+                request_fingerprint,
+            },
+            updated_at.as_str(),
+        )?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit bootstrap identity adoption", err))?;
+        Ok(outcome)
+    }
+
+    /// Validate a Bootstrap identity adoption without changing catalog state.
+    ///
+    /// The state owner uses this before durably appending adoption evidence;
+    /// the mutating transaction repeats the same checks before insertion.
+    pub(crate) fn preview_bootstrap_identity_adoption(
+        &self,
+        input: &AdoptBootstrapIdentityInput,
+        pool_id: &str,
+        state: AdoptedTapeState,
+        request_fingerprint: [u8; 32],
+    ) -> Result<Option<AdoptBootstrapIdentityOutcome>, StateError> {
+        let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
+        let voltag = input.voltag.trim();
+        if voltag.is_empty() || voltag != input.voltag {
+            return Err(StateError::ConfigInvalid(
+                "bootstrap adoption requires a non-empty trimmed voltag".to_string(),
+            ));
+        }
+        let pool_id = normalize_pool_id(pool_id)?;
+        validate_bootstrap_identity_adoption_conn(
+            &self.conn,
+            BootstrapAdoptionCatalogFacts {
+                tape_uuid: input.tape_uuid,
+                voltag,
+                geometry: &geometry,
+                pool_id: pool_id.as_str(),
+                state,
+                operation_id: input.operation_id,
+                request_fingerprint,
+            },
+        )
     }
 
     /// Capture exactly one valid tape identity for every exact voltag selector.
@@ -5743,6 +5870,29 @@ struct ExistingProvisionedTape {
     state: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExistingAdoptedTape {
+    tape_uuid: Vec<u8>,
+    voltag: Option<String>,
+    pool_id: Option<String>,
+    assignment_generation: i64,
+    kind: String,
+    geometry: Option<ProvisionTapeGeometry>,
+    state: String,
+    identity_only: bool,
+}
+
+#[derive(Clone, Copy)]
+struct BootstrapAdoptionCatalogFacts<'a> {
+    tape_uuid: [u8; 16],
+    voltag: &'a str,
+    geometry: &'a ProvisionTapeGeometry,
+    pool_id: &'a str,
+    state: AdoptedTapeState,
+    operation_id: Uuid,
+    request_fingerprint: [u8; 32],
+}
+
 #[derive(Clone, Debug)]
 struct PreservedTapeRow {
     tape_uuid: Vec<u8>,
@@ -5793,6 +5943,7 @@ impl PreservedEvidenceKeys {
         for record in records {
             match record.event {
                 AuditEvent::TapeProvisioned
+                | AuditEvent::TapeIdentityAdopted
                 | AuditEvent::TapeRetired
                 | AuditEvent::TapeSealed
                 | AuditEvent::CleaningCartridgeExpired
@@ -5800,7 +5951,10 @@ impl PreservedEvidenceKeys {
                     if let Some(id) = audit_tape_identity(record) {
                         tape_lifecycle.insert(id);
                     }
-                    if matches!(record.event, AuditEvent::TapeProvisioned) {
+                    if matches!(
+                        record.event,
+                        AuditEvent::TapeProvisioned | AuditEvent::TapeIdentityAdopted
+                    ) {
                         if detail_text(record, "voltag").is_some() {
                             if let Some(id) = audit_tape_identity(record) {
                                 tape_barcode_binding.insert(id);
@@ -6023,6 +6177,198 @@ fn provision_tape_tx(
     } else {
         insert_provisioned_tape_tx(tx, tape_uuid, voltag, geometry, updated_at)
     }
+}
+
+fn adopt_bootstrap_identity_tx(
+    tx: &rusqlite::Transaction<'_>,
+    facts: BootstrapAdoptionCatalogFacts<'_>,
+    updated_at: &str,
+) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
+    if let Some(outcome) = validate_bootstrap_identity_adoption_conn(tx, facts)? {
+        return Ok(outcome);
+    }
+
+    let pool_exists: bool = tx
+        .query_row(
+            "select exists(select 1 from tape_pools where pool_id = ?1)",
+            params![facts.pool_id],
+            |row| row.get(0),
+        )
+        .map_err(|err| sqlite_error("validate bootstrap adoption pool", err))?;
+    if !pool_exists {
+        return Err(StateError::TapeProvisionConflict(format!(
+            "bootstrap adoption pool {:?} is not projected",
+            facts.pool_id
+        )));
+    }
+
+    tx.execute(
+        "insert into tapes(
+           tape_uuid, voltag, pool_id, assignment_generation, kind,
+           block_size, scheme_id, data_blocks_per_stripe,
+           parity_blocks_per_stripe, stripes_per_neighborhood,
+           highest_protected_ordinal, total_committed_ordinals,
+           last_committed_tape_file, state, updated_at_utc
+         ) values(
+           ?1, ?2, ?3, 1, 'data', ?4, ?5, ?6, ?7, ?8,
+           X'0000000000000000', X'0000000000000000', null, ?9, ?10
+         )",
+        params![
+            facts.tape_uuid.to_vec(),
+            facts.voltag,
+            facts.pool_id,
+            facts.geometry.block_size,
+            facts.geometry.scheme_id.as_deref(),
+            facts.geometry.data_blocks_per_stripe,
+            facts.geometry.parity_blocks_per_stripe,
+            facts.geometry.stripes_per_neighborhood,
+            facts.state.as_str(),
+            updated_at,
+        ],
+    )
+    .map_err(|err| sqlite_error("insert adopted Bootstrap identity", err))?;
+
+    Ok(AdoptBootstrapIdentityOutcome {
+        newly_adopted: true,
+        assignment_generation: 1,
+        state: facts.state,
+        operation_id: facts.operation_id,
+        request_fingerprint: facts.request_fingerprint,
+    })
+}
+
+fn validate_bootstrap_identity_adoption_conn(
+    conn: &rusqlite::Connection,
+    facts: BootstrapAdoptionCatalogFacts<'_>,
+) -> Result<Option<AdoptBootstrapIdentityOutcome>, StateError> {
+    if facts.operation_id.is_nil() {
+        return Err(StateError::TapeProvisionConflict(
+            "Bootstrap adoption operation_id must not be nil".to_string(),
+        ));
+    }
+    if facts.tape_uuid[6] >> 4 != 4 || facts.tape_uuid[8] & 0xc0 != 0x80 {
+        return Err(StateError::TapeProvisionConflict(
+            "Bootstrap tape UUID must be an RFC 4122 UUIDv4".to_string(),
+        ));
+    }
+    let by_uuid = query_adopted_tape_conn(
+        conn,
+        "where tapes.tape_uuid = ?1",
+        params![facts.tape_uuid.to_vec()],
+    )?;
+    let by_voltag =
+        query_adopted_tape_conn(conn, "where tapes.voltag = ?1", params![facts.voltag])?;
+
+    if let (Some(by_uuid), Some(by_voltag)) = (&by_uuid, &by_voltag) {
+        if by_uuid.tape_uuid != by_voltag.tape_uuid {
+            return Err(StateError::TapeProvisionConflict(format!(
+                "Bootstrap UUID {} and barcode {:?} resolve to different catalog identities",
+                hex_uuid(facts.tape_uuid),
+                facts.voltag
+            )));
+        }
+    }
+
+    let Some(existing) = by_uuid.or(by_voltag) else {
+        return Ok(None);
+    };
+    if existing.state == "retired" {
+        return Err(StateError::TapeProvisionConflict(format!(
+            "Bootstrap identity {} is retired; retired identities are permanent",
+            hex_uuid_from_slice(existing.tape_uuid.as_slice())
+        )));
+    }
+    let exact_identity = existing.tape_uuid == facts.tape_uuid.to_vec()
+        && existing.voltag.as_deref() == Some(facts.voltag)
+        && existing.kind == "data"
+        && existing.geometry.as_ref() == Some(facts.geometry)
+        && existing.pool_id.as_deref() == Some(facts.pool_id)
+        && existing.state == facts.state.as_str()
+        && existing.identity_only;
+    if !exact_identity {
+        return Err(StateError::TapeProvisionConflict(format!(
+            "Bootstrap identity {} barcode {:?} conflicts with existing {} catalog row",
+            hex_uuid(facts.tape_uuid),
+            facts.voltag,
+            existing.kind
+        )));
+    }
+
+    Ok(Some(AdoptBootstrapIdentityOutcome {
+        newly_adopted: false,
+        assignment_generation: i64_to_u64(existing.assignment_generation, "assignment_generation")?,
+        state: facts.state,
+        operation_id: facts.operation_id,
+        request_fingerprint: facts.request_fingerprint,
+    }))
+}
+
+fn query_adopted_tape_conn<P>(
+    conn: &rusqlite::Connection,
+    predicate: &str,
+    params: P,
+) -> Result<Option<ExistingAdoptedTape>, StateError>
+where
+    P: rusqlite::Params,
+{
+    let sql = format!(
+        "select tapes.tape_uuid, tapes.voltag, tapes.pool_id,
+                tapes.assignment_generation, tapes.kind,
+                tapes.block_size, tapes.scheme_id,
+                tapes.data_blocks_per_stripe, tapes.parity_blocks_per_stripe,
+                tapes.stripes_per_neighborhood, tapes.state,
+                tapes.highest_protected_ordinal = X'0000000000000000'
+                  and tapes.total_committed_ordinals = X'0000000000000000'
+                  and tapes.last_committed_tape_file is null
+                  and tapes.written_extent_lba is null
+                  and tapes.finalization_progress is null
+                  and tapes.finalization_trigger is null
+                  and tapes.finalization_operation_id is null
+                  and tapes.finalization_edition_digest is null
+                  and tapes.finalization_layout_digest is null
+                  and tapes.completed_replicas is null
+                  and tapes.finalization_outcome is null
+                  and not exists(select 1 from tape_files where tape_files.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from object_copies where object_copies.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from catalog_units where catalog_units.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from wrap_maps where wrap_maps.tape_uuid = tapes.tape_uuid)
+                  and not exists(select 1 from tape_io_fences
+                                 where tape_io_fences.tape_uuid = tapes.tape_uuid
+                                   and tape_io_fences.state = 'active')
+                  and not exists(select 1 from sessions
+                                 where sessions.tape_uuid = tapes.tape_uuid
+                                   and sessions.state = 'open')
+                  and not exists(select 1 from media_readiness_ops
+                                 where media_readiness_ops.barcode = tapes.voltag
+                                   and media_readiness_ops.state not in ('ready', 'released')
+                                   and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none')
+         from tapes {predicate} order by hex(tapes.tape_uuid) limit 1"
+    );
+    conn.query_row(sql.as_str(), params, |row| {
+        let block_size = row.get::<_, Option<i64>>(5)?;
+        let scheme_id = row.get(6)?;
+        let data_blocks_per_stripe = row.get(7)?;
+        let parity_blocks_per_stripe = row.get(8)?;
+        let stripes_per_neighborhood = row.get(9)?;
+        Ok(ExistingAdoptedTape {
+            tape_uuid: row.get(0)?,
+            voltag: row.get(1)?,
+            pool_id: row.get(2)?,
+            assignment_generation: row.get(3)?,
+            kind: row.get(4)?,
+            geometry: block_size.map(|block_size| ProvisionTapeGeometry {
+                block_size,
+                scheme_id,
+                data_blocks_per_stripe,
+                parity_blocks_per_stripe,
+                stripes_per_neighborhood,
+            }),
+            state: row.get(10)?,
+            identity_only: row.get(11)?,
+        })
+    })
+    .optional()
+    .map_err(|err| sqlite_error("query Bootstrap adoption conflict", err))
 }
 
 fn find_provisioned_tape_tx(
@@ -8576,6 +8922,9 @@ fn project_catalog_evidence_record(
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
     match record.event {
+        AuditEvent::TapeIdentityAdopted => {
+            project_tape_identity_adopted_record(tx, record, divergences)?;
+        }
         AuditEvent::TapeProvisioned => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
                 divergences.push(format!(
@@ -8821,6 +9170,246 @@ fn project_catalog_evidence_record(
             project_drive_health_record(tx, record, divergences)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+fn project_tape_identity_adopted_record(
+    tx: &rusqlite::Transaction<'_>,
+    record: &AuditRecord,
+    divergences: &mut Vec<String>,
+) -> Result<(), StateError> {
+    let Some(operation_id) = record.operation_id else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no operation_id",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    if record.idempotency_key != Some(operation_id) {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted does not bind idempotency_key to operation_id",
+            record.record_uuid
+        ));
+        return Ok(());
+    }
+    if detail_bytes(record, "request_fingerprint").is_none_or(|fingerprint| fingerprint.len() != 32)
+    {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no valid request_fingerprint",
+            record.record_uuid
+        ));
+        return Ok(());
+    }
+    let Some(tape_uuid) = audit_tape_uuid(record) else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no valid tape identity",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Ok(tape_uuid_array) = <[u8; 16]>::try_from(tape_uuid.as_slice()) else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has an invalid tape UUID length",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    if tape_uuid_array[6] >> 4 != 4 || tape_uuid_array[8] & 0xc0 != 0x80 {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has a non-v4 tape UUID",
+            record.record_uuid
+        ));
+        return Ok(());
+    }
+    let Some(voltag) = detail_text(record, "voltag") else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no voltag",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(pool_id) = detail_text(record, "pool_id") else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no pool_id",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(block_size) = detail_i64(record, "block_size").filter(|value| *value > 0) else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no valid block_size",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(assignment_generation) =
+        detail_i64(record, "assignment_generation").filter(|value| *value > 0)
+    else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no valid assignment_generation",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let Some(state) = detail_text(record, "state")
+        .filter(|value| matches!(value.as_str(), "ready" | "recovery_required"))
+    else {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has no valid state",
+            record.record_uuid
+        ));
+        return Ok(());
+    };
+    let expected_state = match detail_text(record, "physical_tail").as_deref() {
+        Some("exact_bootstrap_filemark_eod") => "ready",
+        Some("data_after_bootstrap" | "missing_filemark" | "extra_filemark" | "ambiguous") => {
+            "recovery_required"
+        }
+        _ => {
+            divergences.push(format!(
+                "record {} TapeIdentityAdopted has no valid physical_tail",
+                record.record_uuid
+            ));
+            return Ok(());
+        }
+    };
+    if state != expected_state {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted state {state:?} disagrees with physical_tail",
+            record.record_uuid
+        ));
+        return Ok(());
+    }
+    let provenance_is_valid = ["library_serial", "library_revision", "drive_serial"]
+        .into_iter()
+        .all(|field| {
+            detail_text(record, field)
+                .is_some_and(|value| !value.trim().is_empty() && value.trim() == value.as_str())
+        })
+        && ["home_slot", "drive_element"].into_iter().all(|field| {
+            detail_i64(record, field).is_some_and(|value| u16::try_from(value).is_ok())
+        })
+        && matches!(
+            record.detail.get("identity_only"),
+            Some(ciborium::value::Value::Bool(true))
+        );
+    if !provenance_is_valid {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has invalid physical provenance",
+            record.record_uuid
+        ));
+        return Ok(());
+    }
+    let geometry = audit_tape_geometry(record);
+    let canonical = remanence_parity::default_scheme_for_block_size(1024 * 1024);
+    if block_size != 1024 * 1024
+        || geometry.scheme_id.as_deref() != Some(canonical.id.as_str())
+        || geometry.data_blocks_per_stripe != Some(i64::from(canonical.data_blocks_per_stripe))
+        || geometry.parity_blocks_per_stripe != Some(i64::from(canonical.parity_blocks_per_stripe))
+        || geometry.stripes_per_neighborhood != Some(i64::from(canonical.stripes_per_neighborhood))
+        || !matches!(
+            record.detail.get("bootstrap_drive_compression"),
+            Some(ciborium::value::Value::Bool(false))
+        )
+        || !matches!(
+            record.detail.get("configured_drive_compression"),
+            Some(ciborium::value::Value::Bool(false))
+        )
+    {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted has non-canonical adoption geometry",
+            record.record_uuid
+        ));
+        return Ok(());
+    }
+
+    let expected_geometry = ProvisionTapeGeometry {
+        block_size,
+        scheme_id: geometry.scheme_id.clone(),
+        data_blocks_per_stripe: geometry.data_blocks_per_stripe,
+        parity_blocks_per_stripe: geometry.parity_blocks_per_stripe,
+        stripes_per_neighborhood: geometry.stripes_per_neighborhood,
+    };
+    if let Some(existing) = query_adopted_tape_conn(
+        tx,
+        "where tapes.tape_uuid = ?1",
+        params![tape_uuid.as_slice()],
+    )? {
+        let exact_adoption_projection = existing.tape_uuid == tape_uuid
+            && existing.voltag.as_deref() == Some(voltag.as_str())
+            && existing.pool_id.as_deref() == Some(pool_id.as_str())
+            && existing.assignment_generation == assignment_generation
+            && existing.kind == "data"
+            && existing.geometry.as_ref() == Some(&expected_geometry)
+            && existing.state == state
+            && existing.identity_only;
+        if !exact_adoption_projection {
+            divergences.push(format!(
+                "record {} TapeIdentityAdopted conflicts with evolved {} tape row {}",
+                record.record_uuid,
+                existing.kind,
+                hex_uuid_from_slice(tape_uuid.as_slice())
+            ));
+        }
+        return Ok(());
+    }
+
+    if let Some(conflicting_uuid) = tx
+        .query_row(
+            "select tape_uuid from tapes where voltag = ?1 and tape_uuid != ?2",
+            params![voltag.as_str(), tape_uuid.as_slice()],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|err| sqlite_error("compare adopted barcode replay", err))?
+    {
+        divergences.push(format!(
+            "adopted barcode binding voltag={voltag}: cache_tape_uuid={} ledger_tape_uuid={}",
+            hex_uuid_from_slice(conflicting_uuid.as_slice()),
+            hex_uuid_from_slice(tape_uuid.as_slice())
+        ));
+        // Adoption authority can reconstruct only its own missing projection.
+        // It must never detach a barcode from a different current identity:
+        // that row may carry newer lifecycle or written-media authority which
+        // an older adoption record is not authorized to supersede.
+        return Ok(());
+    }
+
+    let inserted = tx
+        .execute(
+            "insert into tapes(
+           tape_uuid, voltag, pool_id, assignment_generation, kind,
+           block_size, scheme_id, data_blocks_per_stripe,
+           parity_blocks_per_stripe, stripes_per_neighborhood,
+           highest_protected_ordinal, total_committed_ordinals,
+           last_committed_tape_file, state, updated_at_utc
+         ) values(
+           ?1, ?2, ?3, ?4, 'data', ?5, ?6, ?7, ?8, ?9,
+           X'0000000000000000', X'0000000000000000', null, ?10, ?11
+         )
+         on conflict(tape_uuid) do nothing",
+            params![
+                tape_uuid.as_slice(),
+                voltag,
+                pool_id,
+                assignment_generation,
+                block_size,
+                geometry.scheme_id,
+                geometry.data_blocks_per_stripe,
+                geometry.parity_blocks_per_stripe,
+                geometry.stripes_per_neighborhood,
+                state,
+                record.timestamp_utc.as_str(),
+            ],
+        )
+        .map_err(|err| sqlite_error("project TapeIdentityAdopted audit record", err))?;
+    if inserted == 0 {
+        divergences.push(format!(
+            "record {} TapeIdentityAdopted raced with an evolved tape row {}",
+            record.record_uuid,
+            hex_uuid_from_slice(tape_uuid.as_slice())
+        ));
     }
     Ok(())
 }

@@ -1,0 +1,25 @@
+{
+  "schema": "rem.tape.bot-probe.v1",
+  "ok": true,
+  "physical_disposition": "bootstrap_valid",
+  "library_serial": "LIB001",
+  "library_revision": "D.00",
+  "barcode": "ACM901L9",
+  "source_slot": 1025,
+  "drive_element": 257,
+  "drive_serial": "DRV001",
+  "configured_drive_compression": false,
+  "bootstrap_drive_compression": false,
+  "tape_uuid": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+  "geometry": {
+    "block_size_bytes": 1048576,
+    "drive_compression": false,
+    "no_parity": false,
+    "scheme_id": "rs-cauchy-gf256-v1",
+    "data_blocks_per_stripe": 128,
+    "parity_blocks_per_stripe": 4,
+    "stripes_per_neighborhood": 128
+  },
+  "canonical_adoption_geometry": true,
+  "detail": null
+}

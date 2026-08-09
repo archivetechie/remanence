@@ -1,0 +1,44 @@
+{
+  "schema": "rem.tape.adopt-bootstrap.v1",
+  "ok": true,
+  "physical_disposition": "bootstrap_adopted",
+  "physical_tail": "exact_bootstrap_filemark_eod",
+  "newly_adopted": true,
+  "operation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "idempotency_fingerprint": "abababababababababababababababababababababababababababababababab",
+  "library_serial": "LIB001",
+  "library_revision": "D.00",
+  "barcode": "ACM901L9",
+  "source_slot": 1025,
+  "drive_element": 257,
+  "drive_serial": "DRV001",
+  "bootstrap_drive_compression": false,
+  "configured_drive_compression": false,
+  "tape_uuid": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+  "geometry": {
+    "block_size_bytes": 1048576,
+    "drive_compression": false,
+    "no_parity": false,
+    "scheme_id": "rs-cauchy-gf256-v1",
+    "data_blocks_per_stripe": 128,
+    "parity_blocks_per_stripe": 4,
+    "stripes_per_neighborhood": 128
+  },
+  "catalog": {
+    "tape_uuid": "10111213-1415-4617-8819-1a1b1c1d1e1f",
+    "voltag": "ACM901L9",
+    "kind": "data",
+    "pool_id": "camera.copy-a",
+    "state": "ready",
+    "assignment_generation": 1,
+    "geometry": {
+      "block_size_bytes": 1048576,
+      "drive_compression": false,
+      "no_parity": false,
+      "scheme_id": "rs-cauchy-gf256-v1",
+      "data_blocks_per_stripe": 128,
+      "parity_blocks_per_stripe": 4,
+      "stripes_per_neighborhood": 128
+    }
+  }
+}

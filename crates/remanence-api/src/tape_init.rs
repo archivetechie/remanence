@@ -6,14 +6,80 @@
 //! unit-tested without a drive.
 
 use remanence_parity::{
-    bootstrap::{parse_bootstrap_block, BootstrapPayload},
-    ParityConfig, ParityScheme, SchemeId,
+    bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload},
+    default_scheme_for_block_size, ParityConfig, ParityScheme, SchemeId,
 };
 use remanence_state::{CatalogIndex, StateError, TapeRecord};
 
 use crate::{build_tape_bootstrap, write_tape_bootstrap, PoolWriteError, TapeUuid};
 
 const BOT_CLASSIFY_READ_BYTES: usize = 1024 * 1024;
+
+/// Canonical fixed block size used by the identity-only bootstrap adoption
+/// ceremony.
+pub const CANONICAL_ADOPTION_BLOCK_SIZE_BYTES: u32 = 1024 * 1024;
+
+/// Typed result of one BOT-only physical identity probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BotIdentityClassification {
+    /// The drive reported BLANK CHECK/EOD immediately at BOT.
+    BlankCheckEod,
+    /// A checksum-valid native Bootstrap was decoded.
+    ValidRemBootstrap {
+        /// Complete decoded Bootstrap payload.
+        payload: BootstrapPayload,
+        /// Exact physical record length returned by READ.
+        physical_record_bytes: u32,
+        /// Whether the payload has the canonical 1 MiB default parity geometry.
+        canonical_adoption_geometry: bool,
+    },
+    /// Native Bootstrap magic was present, but its framing or checksum failed.
+    DamagedRemBootstrap {
+        /// Bounded parser diagnostic.
+        detail: String,
+    },
+    /// BOT matched a known non-native format.
+    ForeignFormat {
+        /// Stable format name.
+        name: String,
+    },
+    /// BOT returned data with no recognized signature.
+    UnrecognizedData,
+    /// Positioning or reading BOT failed, so identity is unknown.
+    ReadError {
+        /// Bounded physical diagnostic.
+        detail: String,
+    },
+}
+
+/// Physical layout immediately following one checksum-valid BOT Bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BootstrapTailClassification {
+    /// Exactly one Bootstrap data block, its required filemark, then EOD.
+    ExactBootstrapFilemarkEod,
+    /// A data record followed the Bootstrap instead of its filemark.
+    DataAfterBootstrap,
+    /// EOD immediately followed the Bootstrap; the required filemark is absent.
+    MissingFilemark,
+    /// Another filemark followed the required Bootstrap filemark.
+    ExtraFilemark,
+    /// The first record was not a checksum-valid native Bootstrap.
+    InvalidBot(BotIdentityClassification),
+    /// BOT was valid, but the following physical boundary could not be proved.
+    Ambiguous {
+        /// Bounded physical diagnostic.
+        detail: String,
+    },
+}
+
+/// Result of the adoption command's independent physical recheck.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapAdoptionProjection {
+    /// Decoded Bootstrap when BOT identity is valid.
+    pub payload: Option<BootstrapPayload>,
+    /// Exact or conservative physical-tail classification.
+    pub tail: BootstrapTailClassification,
+}
 
 /// Physical tape geometry carried by a Remanence bootstrap.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,6 +391,143 @@ pub fn classify_bot_bytes(bot_bytes: &[u8]) -> BotClassification {
         },
         None => BotClassification::UnrecognizedData,
     }
+}
+
+/// Classify exactly one readable BOT record without consulting catalog state.
+pub fn classify_bot_identity_bytes(bot_bytes: &[u8]) -> BotIdentityClassification {
+    match parse_bootstrap_block(bot_bytes) {
+        Ok(payload) if !is_uuid_v4(payload.tape_uuid) => {
+            BotIdentityClassification::DamagedRemBootstrap {
+                detail: "Bootstrap tape UUID is not an RFC 4122 UUIDv4".to_string(),
+            }
+        }
+        Ok(payload) if usize::try_from(payload.block_size_bytes).ok() == Some(bot_bytes.len()) => {
+            BotIdentityClassification::ValidRemBootstrap {
+                physical_record_bytes: payload.block_size_bytes,
+                canonical_adoption_geometry: has_canonical_adoption_geometry(&payload),
+                payload,
+            }
+        }
+        Ok(payload) => BotIdentityClassification::DamagedRemBootstrap {
+            detail: format!(
+                "Bootstrap block-size claim {} disagrees with physical record length {}",
+                payload.block_size_bytes,
+                bot_bytes.len()
+            ),
+        },
+        Err(error) if has_bootstrap_magic(bot_bytes) => {
+            BotIdentityClassification::DamagedRemBootstrap {
+                detail: bounded_detail(error.to_string()),
+            }
+        }
+        Err(_) => match sniff(bot_bytes) {
+            Some(format) if format != FormatId::RemanenceBootstrap => {
+                BotIdentityClassification::ForeignFormat {
+                    name: format.as_str().to_string(),
+                }
+            }
+            _ => BotIdentityClassification::UnrecognizedData,
+        },
+    }
+}
+
+/// Perform the advisory BOT-only probe used by offline ownership tooling.
+///
+/// This issues one LOCATE(0) and at most one READ. It never checks the next
+/// record, spaces the tape, seeks EOD, or consults the catalog.
+pub fn probe_bot_identity_from_source(
+    source: &mut dyn remanence_library::BlockSource,
+) -> BotIdentityClassification {
+    if let Err(error) = source.locate(0) {
+        return BotIdentityClassification::ReadError {
+            detail: bounded_detail(format!("locate BOT: {error}")),
+        };
+    }
+    let mut block = vec![0u8; BOT_CLASSIFY_READ_BYTES];
+    match source.read_block(&mut block) {
+        Ok(read) => classify_bot_identity_bytes(&block[..read]),
+        Err(error) if is_blank_check_eod(&error) => BotIdentityClassification::BlankCheckEod,
+        Err(error) => BotIdentityClassification::ReadError {
+            detail: bounded_detail(format!("read BOT: {error}")),
+        },
+    }
+}
+
+/// Re-read BOT and classify the complete identity-only physical tape file.
+///
+/// A writable `ready` catalog identity may be reconstructed only from the
+/// exact sequence Bootstrap data, one filemark, then EOD. Once BOT itself is
+/// checksum-valid, every other tail is conservative evidence for an
+/// identity-only `recovery_required` row. This function deliberately uses
+/// sequential READs and never SPACE or SPACE(EOD).
+pub fn classify_bootstrap_adoption_from_source(
+    source: &mut dyn remanence_library::BlockSource,
+) -> BootstrapAdoptionProjection {
+    let bot = probe_bot_identity_from_source(source);
+    let BotIdentityClassification::ValidRemBootstrap { payload, .. } = bot else {
+        return BootstrapAdoptionProjection {
+            payload: None,
+            tail: BootstrapTailClassification::InvalidBot(bot),
+        };
+    };
+
+    let mut next = vec![0u8; BOT_CLASSIFY_READ_BYTES];
+    let tail = match source.read_block(&mut next) {
+        Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
+        Err(remanence_library::TapeIoError::FilemarkEncountered) => {
+            match source.read_block(&mut next) {
+                Ok(_) => BootstrapTailClassification::DataAfterBootstrap,
+                Err(remanence_library::TapeIoError::FilemarkEncountered) => {
+                    BootstrapTailClassification::ExtraFilemark
+                }
+                Err(error) if is_blank_check_eod(&error) => {
+                    BootstrapTailClassification::ExactBootstrapFilemarkEod
+                }
+                Err(error) => BootstrapTailClassification::Ambiguous {
+                    detail: bounded_detail(format!("read after Bootstrap filemark: {error}")),
+                },
+            }
+        }
+        Err(error) if is_blank_check_eod(&error) => BootstrapTailClassification::MissingFilemark,
+        Err(error) => BootstrapTailClassification::Ambiguous {
+            detail: bounded_detail(format!("read Bootstrap tail: {error}")),
+        },
+    };
+    BootstrapAdoptionProjection {
+        payload: Some(payload),
+        tail,
+    }
+}
+
+/// Whether one decoded Bootstrap has the clean-break adoption geometry.
+pub fn has_canonical_adoption_geometry(payload: &BootstrapPayload) -> bool {
+    if !is_uuid_v4(payload.tape_uuid)
+        || payload.block_size_bytes != CANONICAL_ADOPTION_BLOCK_SIZE_BYTES
+        || payload.no_parity_flag
+        || payload.drive_compression
+    {
+        return false;
+    }
+    let expected = default_scheme_for_block_size(CANONICAL_ADOPTION_BLOCK_SIZE_BYTES);
+    payload.scheme.as_ref().is_some_and(|scheme| {
+        !scheme.no_parity_flag
+            && scheme.id == expected.id.as_str()
+            && scheme.data_blocks_per_stripe == expected.data_blocks_per_stripe
+            && scheme.parity_blocks_per_stripe == expected.parity_blocks_per_stripe
+            && scheme.stripes_per_neighborhood == expected.stripes_per_neighborhood
+    })
+}
+
+fn is_uuid_v4(bytes: [u8; 16]) -> bool {
+    bytes[6] >> 4 == 4 && bytes[8] & 0xc0 == 0x80
+}
+
+fn bounded_detail(detail: String) -> String {
+    const MAX_CHARS: usize = 512;
+    if detail.chars().count() <= MAX_CHARS {
+        return detail;
+    }
+    detail.chars().take(MAX_CHARS).collect()
 }
 
 /// Project Layer 4 catalog state into the reviewed tape-init decision inputs.
@@ -774,7 +977,12 @@ fn parity_config_from_bootstrap(payload: &BootstrapPayload) -> ParityConfig {
 
 #[cfg(test)]
 mod tests {
-    use remanence_library::{VecBlockSink, VecBlockSource};
+    use std::collections::VecDeque;
+
+    use remanence_library::{
+        BlockRead, BlockSource, SpaceKind, SpaceResult, TapeIoError, TapePosition, VecBlockSink,
+        VecBlockSource,
+    };
     use remanence_parity::bootstrap::write_bootstrap_block;
 
     use super::*;
@@ -783,6 +991,95 @@ mod tests {
     const OTHER_UUID: TapeUuid = [2; 16];
     const POOL_A: &str = "camera.copy-a";
     const POOL_B: &str = "camera.copy-b";
+    const ADOPTION_UUID: TapeUuid = [
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x46, 0x17, 0x88, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f,
+    ];
+
+    enum ScriptRead {
+        Data(Vec<u8>),
+        Filemark,
+        Eod,
+        Error(String),
+    }
+
+    struct ScriptedSource {
+        reads: VecDeque<ScriptRead>,
+        calls: Vec<&'static str>,
+    }
+
+    impl ScriptedSource {
+        fn new(reads: impl IntoIterator<Item = ScriptRead>) -> Self {
+            Self {
+                reads: reads.into_iter().collect(),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl BlockRead for ScriptedSource {
+        fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+            self.calls.push("read");
+            match self.reads.pop_front().expect("scripted read") {
+                ScriptRead::Data(data) => {
+                    buf[..data.len()].copy_from_slice(&data);
+                    Ok(data.len())
+                }
+                ScriptRead::Filemark => Err(TapeIoError::FilemarkEncountered),
+                ScriptRead::Eod => {
+                    let mut sense = vec![0u8; 14];
+                    sense[0] = 0x70;
+                    sense[2] = 0x08;
+                    sense[12] = 0x00;
+                    sense[13] = 0x05;
+                    Err(TapeIoError::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense,
+                            bytes_transferred: 0,
+                        },
+                    ))
+                }
+                ScriptRead::Error(detail) => Err(TapeIoError::OperationFailed(detail)),
+            }
+        }
+    }
+
+    impl BlockSource for ScriptedSource {
+        fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+            assert_eq!(lba, 0);
+            self.calls.push("locate");
+            Ok(TapePosition {
+                lba,
+                partition: 0,
+                beginning_of_partition: true,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            })
+        }
+
+        fn space(&mut self, _count: i64, _kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
+            panic!("identity probes must never SPACE")
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            panic!("identity probes must not issue READ POSITION")
+        }
+    }
+
+    fn canonical_adoption_block(tape_uuid: TapeUuid) -> Vec<u8> {
+        let payload = build_tape_bootstrap(
+            tape_uuid,
+            CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            ParityConfig::Scheme(default_scheme_for_block_size(
+                CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            )),
+            "2026-08-09T00:00:00Z",
+            "adoption-test",
+        );
+        let mut block = vec![0; CANONICAL_ADOPTION_BLOCK_SIZE_BYTES as usize];
+        write_bootstrap_block(&payload, &mut block).expect("encode canonical bootstrap");
+        block
+    }
 
     fn geometry() -> TapeInitGeometry {
         TapeInitGeometry {
@@ -1261,6 +1558,83 @@ mod tests {
             classify_bot_bytes(&[0; 4096]),
             BotClassification::UnrecognizedData
         );
+    }
+
+    #[test]
+    fn advisory_bot_probe_is_exactly_locate_then_one_read() {
+        let mut source =
+            ScriptedSource::new([ScriptRead::Data(canonical_adoption_block(ADOPTION_UUID))]);
+
+        let result = probe_bot_identity_from_source(&mut source);
+
+        assert!(matches!(
+            result,
+            BotIdentityClassification::ValidRemBootstrap {
+                payload: BootstrapPayload {
+                    tape_uuid: ADOPTION_UUID,
+                    ..
+                },
+                physical_record_bytes: CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+                canonical_adoption_geometry: true,
+            }
+        ));
+        assert_eq!(source.calls, ["locate", "read"]);
+    }
+
+    #[test]
+    fn adoption_recheck_proves_exact_bootstrap_filemark_eod_without_space() {
+        let mut source = ScriptedSource::new([
+            ScriptRead::Data(canonical_adoption_block(ADOPTION_UUID)),
+            ScriptRead::Filemark,
+            ScriptRead::Eod,
+        ]);
+
+        let result = classify_bootstrap_adoption_from_source(&mut source);
+
+        assert_eq!(
+            result.payload.expect("valid payload").tape_uuid,
+            ADOPTION_UUID
+        );
+        assert_eq!(
+            result.tail,
+            BootstrapTailClassification::ExactBootstrapFilemarkEod
+        );
+        assert_eq!(source.calls, ["locate", "read", "read", "read"]);
+    }
+
+    #[test]
+    fn valid_bootstrap_tail_ambiguity_preserves_only_identity() {
+        let mut source = ScriptedSource::new([
+            ScriptRead::Data(canonical_adoption_block(ADOPTION_UUID)),
+            ScriptRead::Filemark,
+            ScriptRead::Error("completion unknown".to_string()),
+        ]);
+
+        let result = classify_bootstrap_adoption_from_source(&mut source);
+
+        assert_eq!(
+            result.payload.expect("valid payload").tape_uuid,
+            ADOPTION_UUID
+        );
+        assert!(matches!(
+            result.tail,
+            BootstrapTailClassification::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn short_physical_record_and_non_v4_uuid_are_not_adoptable() {
+        let block = canonical_adoption_block(ADOPTION_UUID);
+        assert!(matches!(
+            classify_bot_identity_bytes(&block[..4096]),
+            BotIdentityClassification::DamagedRemBootstrap { .. }
+        ));
+
+        let non_v4 = canonical_adoption_block([1; 16]);
+        assert!(matches!(
+            classify_bot_identity_bytes(&non_v4),
+            BotIdentityClassification::DamagedRemBootstrap { .. }
+        ));
     }
 
     #[test]

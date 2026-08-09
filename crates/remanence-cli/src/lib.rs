@@ -687,6 +687,12 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::Unlock { serial } => Some(serial.as_str()),
         Command::Archive { command } => command.tape_target(),
         Command::Dev { command } => Some(command.tape_target()),
+        Command::Tape {
+            command: TapeCommand::BotProbe(args),
+        } => Some(args.library.as_str()),
+        Command::Tape {
+            command: TapeCommand::AdoptBootstrap(args),
+        } => Some(args.library.as_str()),
         // `put` writes, but through the daemon, which owns its own admission
         // control (pool policy, fences, destructive-safety gauntlets). The
         // `--allow` gate covers direct SCSI mutation only, like the other
@@ -1562,6 +1568,14 @@ impl From<RemTapeCommand> for TapeCommand {
 
 #[derive(Subcommand, Debug)]
 enum TapeCommand {
+    /// Read only the first BOT record and report physical tape identity.
+    #[command(name = "bot-probe")]
+    BotProbe(TapeBotProbeArgs),
+
+    /// Adopt a checksum-valid existing Bootstrap without writing tape.
+    #[command(name = "adopt-bootstrap")]
+    AdoptBootstrap(TapeAdoptBootstrapArgs),
+
     /// Emit a catalog-less terminal-index object recovery report.
     RecoveryReport(TapeRecoveryReportArgs),
 
@@ -1596,6 +1610,8 @@ impl TapeCommand {
     fn validate_before_discovery(&self) -> Result<(), String> {
         match self {
             Self::RecoveryReport(args) => args.validate_before_discovery(),
+            Self::BotProbe(args) => args.validate_before_discovery(),
+            Self::AdoptBootstrap(args) => args.validate_before_discovery(),
             Self::FreezeDrill(args) => args.validate_before_discovery(),
             Self::TerminalIndexDrill(args) => args.validate_before_discovery(),
             Self::Alerts(args) => args.validate_before_discovery(),
@@ -1605,6 +1621,404 @@ impl TapeCommand {
             Self::Retire(args) => args.validate_before_discovery(),
         }
     }
+}
+
+#[derive(Args, Debug)]
+struct TapeBotProbeArgs {
+    /// Exact barcode.
+    target: String,
+    /// Path to `/etc/rem/config.toml`.
+    #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+    config: PathBuf,
+    /// Select a configured library when the target is not globally unique.
+    #[arg(long, value_name = "SERIAL")]
+    library: String,
+    /// Exact expected storage/home element.
+    #[arg(long, value_parser = parse_element_addr)]
+    expected_home_slot: u16,
+    /// Emit the stable typed JSON envelope (the only supported rendering).
+    #[arg(long, required = true)]
+    json: bool,
+}
+
+impl TapeBotProbeArgs {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        if self.library.trim().is_empty() {
+            return Err("tape bot-probe --library cannot be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Args, Debug)]
+struct TapeAdoptBootstrapArgs {
+    /// Exact barcode.
+    target: String,
+    /// Tape UUID expected from the advisory probe.
+    #[arg(long, value_name = "UUID")]
+    expected_existing_tape_uuid: Uuid,
+    /// Exact expected storage/home element.
+    #[arg(long, value_parser = parse_element_addr)]
+    expected_home_slot: u16,
+    /// Path to `/etc/rem/config.toml`.
+    #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
+    config: PathBuf,
+    /// Select a configured library when the target is not globally unique.
+    #[arg(long, value_name = "SERIAL")]
+    library: String,
+    /// Emit the stable typed JSON envelope (the only supported rendering).
+    #[arg(long, required = true)]
+    json: bool,
+}
+
+impl TapeAdoptBootstrapArgs {
+    fn validate_before_discovery(&self) -> Result<(), String> {
+        if self.library.trim().is_empty() {
+            return Err("tape adopt-bootstrap --library cannot be empty".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn select_read_compatible_drive(
+    library: &Library,
+    candidate: &TapeInitCandidate,
+    tape_generation: remanence_api::LtoGen,
+) -> Result<u16, String> {
+    if candidate.location == TapeInitLocation::Drive {
+        let bay = library
+            .drive_bays
+            .iter()
+            .find(|bay| bay.element_address == candidate.element_address)
+            .ok_or_else(|| format!("unknown drive element 0x{:04x}", candidate.element_address))?;
+        if bay.loaded
+            && bay.loaded_tape == candidate.voltag
+            && drive_can_read_tape(bay, tape_generation)
+        {
+            return Ok(bay.element_address);
+        }
+        return Err(format!(
+            "loaded drive 0x{:04x} is not read-compatible with {tape_generation}",
+            candidate.element_address
+        ));
+    }
+    library
+        .drive_bays
+        .iter()
+        .filter(|bay| !bay.loaded)
+        .find(|bay| drive_can_read_tape(bay, tape_generation))
+        .map(|bay| bay.element_address)
+        .ok_or_else(|| {
+            format!(
+                "no free drive in library {} is read-compatible with {tape_generation}",
+                library.serial
+            )
+        })
+}
+
+fn drive_can_read_tape(bay: &DriveBay, tape_generation: remanence_api::LtoGen) -> bool {
+    bay.installed
+        .as_ref()
+        .and_then(|drive| drive.product.as_deref())
+        .and_then(remanence_api::lto_generation_from_drive_product)
+        .is_some_and(|drive_generation| remanence_api::can_read(drive_generation, tape_generation))
+}
+
+fn require_selected_read_compatible_drive<'a>(
+    library: &'a Library,
+    candidate: &TapeInitCandidate,
+    tape_generation: remanence_api::LtoGen,
+    drive_element: u16,
+) -> Result<&'a DriveBay, String> {
+    let bay = library
+        .drive_bays
+        .iter()
+        .find(|bay| bay.element_address == drive_element)
+        .ok_or_else(|| format!("selected drive 0x{drive_element:04x} disappeared"))?;
+    let placement_matches = if candidate.location == TapeInitLocation::Drive {
+        candidate.element_address == drive_element
+            && bay.loaded
+            && bay.loaded_tape == candidate.voltag
+    } else {
+        !bay.loaded
+    };
+    if !placement_matches || !drive_can_read_tape(bay, tape_generation) {
+        return Err(format!(
+            "selected drive 0x{drive_element:04x} is no longer available and read-compatible with {tape_generation}"
+        ));
+    }
+    Ok(bay)
+}
+
+trait BotDriveConfigOps {
+    fn bot_read_config(&mut self) -> Result<TapeConfig, String>;
+    fn bot_write_config(&mut self, config: TapeConfig) -> Result<(), String>;
+}
+
+impl BotDriveConfigOps for DriveHandle {
+    fn bot_read_config(&mut self) -> Result<TapeConfig, String> {
+        self.read_config().map_err(|error| error.to_string())
+    }
+
+    fn bot_write_config(&mut self, config: TapeConfig) -> Result<(), String> {
+        self.write_config(config).map_err(|error| error.to_string())
+    }
+}
+
+fn with_temporary_bot_read_config<D, T>(
+    drive: &mut D,
+    operation: impl FnOnce(&mut D) -> Result<T, String>,
+) -> Result<T, String>
+where
+    D: BotDriveConfigOps,
+{
+    let current = drive
+        .bot_read_config()
+        .map_err(|error| format!("read drive config: {error}"))?;
+    if current.max_block_size_bytes < remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES {
+        return Err(format!(
+            "drive maximum block size {} is smaller than canonical adoption block size {}",
+            current.max_block_size_bytes,
+            remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES
+        ));
+    }
+    let configured_for_bot = TapeConfig {
+        block_size: BlockSize::Fixed {
+            size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+        },
+        compression: false,
+        max_block_size_bytes: current.max_block_size_bytes,
+        write_protected: current.write_protected,
+        worm: current.worm,
+    };
+    if let Err(error) = drive.bot_write_config(configured_for_bot) {
+        let primary = format!("configure fixed 1 MiB BOT read: {error}");
+        return match restore_prior_bot_drive_config(drive, current) {
+            Ok(()) => Err(primary),
+            Err(restore) => Err(format!("{primary}; additionally failed to {restore}")),
+        };
+    }
+    let primary = (|| {
+        let verified = drive
+            .bot_read_config()
+            .map_err(|error| format!("verify fixed 1 MiB BOT read config: {error}"))?;
+        if verified.block_size != configured_for_bot.block_size || verified.compression {
+            return Err(format!(
+                "drive did not verify fixed 1 MiB/compression-off BOT read config: {verified:?}"
+            ));
+        }
+        operation(drive)
+    })();
+    let restore = restore_prior_bot_drive_config(drive, current);
+    match (primary, restore) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(restore)) => Err(format!("physical BOT identity read succeeded; {restore}")),
+        (Err(error), Err(restore)) => Err(format!("{error}; additionally failed to {restore}")),
+    }
+}
+
+fn restore_prior_bot_drive_config<D>(drive: &mut D, current: TapeConfig) -> Result<(), String>
+where
+    D: BotDriveConfigOps,
+{
+    drive
+        .bot_write_config(current)
+        .map_err(|error| format!("restore prior drive config: {error}"))
+        .and_then(|()| {
+            let restored = drive
+                .bot_read_config()
+                .map_err(|error| format!("verify restored drive config: {error}"))?;
+            if restored.block_size != current.block_size
+                || restored.compression != current.compression
+            {
+                return Err(format!(
+                    "restored drive config does not match prior block/compression mode: prior={current:?} restored={restored:?}"
+                ));
+            }
+            Ok(())
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn run_bot_identity_hardware(
+    library: &Library,
+    policy: &StaticAllowlist,
+    candidate: TapeInitCandidate,
+    drive_element: u16,
+    mode: BotIdentityReadMode,
+    expected_home_slot: u16,
+) -> Result<PhysicalBotIdentityResult, String> {
+    let voltag = candidate
+        .voltag
+        .clone()
+        .ok_or_else(|| format!("{} has no readable barcode", candidate.label()))?;
+    let generation = remanence_api::lto_generation_from_voltag(voltag.as_str())
+        .ok_or_else(|| format!("barcode {voltag:?} has no known LTO generation suffix"))?;
+    let mut handle = open_library_handle(library, policy)
+        .map_err(|error| format!("opening library: {error}"))?;
+    handle
+        .refresh()
+        .map_err(|error| format!("refresh live library inventory before BOT read: {error}"))?;
+    let live_library = handle.library();
+    let bay = require_selected_read_compatible_drive(
+        live_library,
+        &candidate,
+        generation,
+        drive_element,
+    )?;
+    let home_slot = if candidate.location == TapeInitLocation::Slot {
+        let slot = live_library
+            .slots
+            .iter()
+            .find(|slot| slot.element_address == candidate.element_address)
+            .ok_or_else(|| {
+                format!(
+                    "storage element 0x{:04x} disappeared from live inventory",
+                    candidate.element_address
+                )
+            })?;
+        if !slot.full || slot.cartridge.as_deref() != Some(voltag.as_str()) {
+            return Err(format!(
+                "live inventory no longer binds barcode {voltag:?} to storage element 0x{:04x}",
+                candidate.element_address
+            ));
+        }
+        candidate.element_address
+    } else {
+        bay.source_slot.ok_or_else(|| {
+            format!(
+                "loaded tape {voltag:?} in drive 0x{drive_element:04x} has no exact source/home slot"
+            )
+        })?
+    };
+    if expected_home_slot != home_slot {
+        return Err(format!(
+            "command expected home slot 0x{:04x}, but live inventory resolved 0x{home_slot:04x}",
+            expected_home_slot
+        ));
+    }
+    let drive_serial = bay
+        .installed
+        .as_ref()
+        .map(|drive| drive.serial.clone())
+        .filter(|serial| !serial.trim().is_empty())
+        .ok_or_else(|| format!("drive 0x{drive_element:04x} has no stable serial"))?;
+    let library_serial = live_library.serial.clone();
+    let library_revision = live_library
+        .changer_inquiry
+        .revision_str()
+        .trim()
+        .to_string();
+    if library_revision.is_empty() {
+        return Err(format!("library {library_serial} has no inquiry revision"));
+    }
+    if candidate.location == TapeInitLocation::Slot {
+        handle
+            .move_medium(candidate.element_address, drive_element, policy)
+            .map_err(|error| {
+                format!(
+                    "move slot 0x{:04x} to drive 0x{drive_element:04x}: {error}",
+                    candidate.element_address
+                )
+            })?;
+    }
+
+    let physical_result = (|| {
+        let mut drive = handle
+            .open_drive(drive_element, policy)
+            .map_err(|error| format!("open drive 0x{drive_element:04x}: {error}"))?;
+        let initial = drive.probe_media_readiness(media_family_for_init_generation(generation));
+        let readiness = drive
+            .wait_for_media_readiness(
+                media_family_for_init_generation(generation),
+                Some(initial),
+                MediaReadinessWaitOptions {
+                    wait: true,
+                    timeout: MEDIA_CONDITIONING_TIMEOUT,
+                    poll_interval: MEDIA_CONDITIONING_STEADY_POLL,
+                },
+                || None,
+                |_| Ok(()),
+            )
+            .map_err(|error| format!("wait for media readiness: {error}"))?;
+        if !readiness.readiness.is_ready() {
+            return Err(format!(
+                "media in drive 0x{drive_element:04x} is not ready: {}",
+                describe_media_readiness(&readiness.readiness)
+            ));
+        }
+        with_temporary_bot_read_config(&mut drive, |drive| {
+            let (classification, adoption) = match mode {
+                BotIdentityReadMode::Probe => {
+                    let mut source = DriveHandleSource(drive);
+                    (
+                        remanence_api::probe_bot_identity_from_source(&mut source),
+                        None,
+                    )
+                }
+                BotIdentityReadMode::Adoption => {
+                    let mut source = DriveHandleSource(drive);
+                    let projection =
+                        remanence_api::classify_bootstrap_adoption_from_source(&mut source);
+                    let classification = match &projection.tail {
+                        remanence_api::BootstrapTailClassification::InvalidBot(classification) => {
+                            classification.clone()
+                        }
+                        _ => {
+                            let payload = projection.payload.as_ref().ok_or_else(|| {
+                                "valid Bootstrap tail classification lost its payload".to_string()
+                            })?;
+                            remanence_api::BotIdentityClassification::ValidRemBootstrap {
+                                payload: payload.clone(),
+                                physical_record_bytes: payload.block_size_bytes,
+                                canonical_adoption_geometry:
+                                    remanence_api::has_canonical_adoption_geometry(payload),
+                            }
+                        }
+                    };
+                    (classification, Some(projection))
+                }
+            };
+            Ok(PhysicalBotIdentityResult {
+                library_serial,
+                library_revision,
+                voltag,
+                home_slot,
+                drive_element,
+                drive_serial,
+                configured_drive_compression: false,
+                classification,
+                adoption,
+            })
+        })
+    })();
+
+    let park_result = handle
+        .unload(drive_element, Some(home_slot), policy)
+        .map_err(|error| {
+            format!(
+                "park tape from drive 0x{drive_element:04x} to exact home 0x{home_slot:04x}: {error}"
+            )
+        });
+    match (physical_result, park_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(park)) => Err(park),
+        (Err(error), Err(park)) => Err(format!("{error}; additionally failed to {park}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_bot_identity_hardware(
+    _library: &Library,
+    _policy: &StaticAllowlist,
+    _candidate: TapeInitCandidate,
+    _drive_element: u16,
+    _mode: BotIdentityReadMode,
+    _expected_home_slot: u16,
+) -> Result<PhysicalBotIdentityResult, String> {
+    Err("BOT identity commands require Linux SG_IO access".to_string())
 }
 
 #[derive(Args, Debug)]
@@ -6323,6 +6737,7 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "written_extent_lba": tape.written_extent_lba.map(|value| value.to_string()),
         "kind": tape.kind,
         "scheme_id": tape.scheme_id,
+        "assignment_generation": tape.assignment_generation,
         "state": tape_state_name(tape.state),
         "updated_at": timestamp_value(tape.updated_at.as_ref()),
         "pool_id": tape.pool_id,
@@ -6675,6 +7090,12 @@ fn tape_state_name(value: i32) -> &'static str {
         2 => "ready",
         3 => "degraded",
         4 => "failed",
+        5 => "sealed",
+        6 => "finalizing",
+        7 => "finalized_degraded",
+        8 => "completion_unknown",
+        9 => "recovery_required",
+        10 => "retired",
         _ => "unspecified",
     }
 }
@@ -7929,6 +8350,8 @@ fn run_tape_command(
     err: &mut dyn Write,
 ) -> ExitCode {
     match command {
+        TapeCommand::BotProbe(args) => run_tape_bot_probe(report, args, out, err),
+        TapeCommand::AdoptBootstrap(args) => run_tape_adopt_bootstrap(report, args, out, err),
         TapeCommand::RecoveryReport(_) => {
             unreachable!("tape recovery report dispatched pre-discovery")
         }
@@ -9532,6 +9955,444 @@ fn print_tape_alerts(library_serial: &str, bay: u16, alerts: &TapeAlerts, out: &
     });
     if let Ok(line) = serde_json::to_string(&envelope) {
         let _ = writeln!(out, "{line}");
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BotIdentityReadMode {
+    Probe,
+    Adoption,
+}
+
+struct PhysicalBotIdentityResult {
+    library_serial: String,
+    library_revision: String,
+    voltag: String,
+    home_slot: u16,
+    drive_element: u16,
+    drive_serial: String,
+    configured_drive_compression: bool,
+    classification: remanence_api::BotIdentityClassification,
+    adoption: Option<remanence_api::BootstrapAdoptionProjection>,
+}
+
+#[cfg(target_os = "linux")]
+fn fresh_bot_identity_discovery() -> Result<DiscoveryReport, String> {
+    cli_discover().map_err(|error| format!("fresh BOT identity discovery: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fresh_bot_identity_discovery() -> Result<DiscoveryReport, String> {
+    Err("fresh BOT identity discovery requires Linux SG_IO access".to_string())
+}
+
+fn resolve_bot_identity_command<'a>(
+    report: &'a DiscoveryReport,
+    config: &remanence_state::RemConfig,
+    requested_library: Option<&str>,
+    target: &str,
+) -> Result<(TapeInitCandidate, &'a Library), String> {
+    let target = parse_tape_init_target(target)?;
+    if !matches!(target, TapeInitTarget::Voltag(_)) {
+        return Err("BOT identity commands require one exact barcode".to_string());
+    }
+    let mut candidates = resolve_tape_init_candidates(report, config, requested_library, &target)?;
+    let candidate = candidates
+        .pop()
+        .ok_or_else(|| "BOT identity target resolved no media".to_string())?;
+    let library = report
+        .library(candidate.library_serial.as_str())
+        .ok_or_else(|| {
+            format!(
+                "library {:?} disappeared from discovery",
+                candidate.library_serial
+            )
+        })?;
+    Ok((candidate, library))
+}
+
+fn run_tape_bot_probe(
+    report: &DiscoveryReport,
+    args: &TapeBotProbeArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let config = match remanence_state::load_config(&args.config) {
+        Ok(config) => config,
+        Err(error) => return print_command_error(error.to_string(), report, err),
+    };
+    let fresh_report = match fresh_bot_identity_discovery() {
+        Ok(report) => report,
+        Err(error) => return print_command_error(error, report, err),
+    };
+    let (candidate, library) = match resolve_bot_identity_command(
+        &fresh_report,
+        &config,
+        Some(args.library.as_str()),
+        args.target.as_str(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return print_command_error(error, &fresh_report, err),
+    };
+    let generation = match candidate
+        .voltag
+        .as_deref()
+        .and_then(remanence_api::lto_generation_from_voltag)
+    {
+        Some(generation) => generation,
+        None => {
+            return print_command_error(
+                format!(
+                    "barcode {:?} has no known LTO generation suffix",
+                    candidate.voltag
+                ),
+                &fresh_report,
+                err,
+            )
+        }
+    };
+    let drive_element = match select_read_compatible_drive(library, &candidate, generation) {
+        Ok(drive_element) => drive_element,
+        Err(error) => return print_command_error(error, &fresh_report, err),
+    };
+    let policy = configured_library_policy(&config);
+    match run_bot_identity_hardware(
+        library,
+        &policy,
+        candidate,
+        drive_element,
+        BotIdentityReadMode::Probe,
+        args.expected_home_slot,
+    ) {
+        Ok(result) => {
+            let line = bot_probe_json(&result);
+            let _ = writeln!(out, "{line}");
+            print_warnings(&fresh_report, err);
+            ExitCode::SUCCESS
+        }
+        Err(error) => print_command_error(error, &fresh_report, err),
+    }
+}
+
+fn run_tape_adopt_bootstrap(
+    report: &DiscoveryReport,
+    args: &TapeAdoptBootstrapArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
+    let config = match remanence_state::load_config(&args.config) {
+        Ok(config) => config,
+        Err(error) => return print_command_error(error.to_string(), report, err),
+    };
+    let paths = remanence_state::StatePaths::from_config(&args.config, &config);
+    let mut state = match remanence_state::StateHandle::open_with_config(paths, config.clone()) {
+        Ok(state) => state,
+        Err(error) => return print_command_error(error.to_string(), report, err),
+    };
+    let operation_id = Uuid::new_v4();
+    let fresh_report = match fresh_bot_identity_discovery() {
+        Ok(report) => report,
+        Err(error) => return print_command_error(error, report, err),
+    };
+    let (candidate, library) = match resolve_bot_identity_command(
+        &fresh_report,
+        &config,
+        Some(args.library.as_str()),
+        args.target.as_str(),
+    ) {
+        Ok(value) => value,
+        Err(error) => return print_command_error(error, &fresh_report, err),
+    };
+    let voltag = match candidate.voltag.as_deref() {
+        Some(voltag) => voltag,
+        None => {
+            return print_command_error(
+                "exact barcode resolution returned no voltag".to_string(),
+                &fresh_report,
+                err,
+            )
+        }
+    };
+    let generation = match remanence_api::lto_generation_from_voltag(voltag) {
+        Some(generation) => generation,
+        None => {
+            return print_command_error(
+                format!("barcode {voltag:?} has no known LTO generation suffix"),
+                &fresh_report,
+                err,
+            )
+        }
+    };
+    let drive_element = match select_read_compatible_drive(library, &candidate, generation) {
+        Ok(drive_element) => drive_element,
+        Err(error) => return print_command_error(error, &fresh_report, err),
+    };
+    let conflicts = match state.catalog_index().media_readiness_admission_conflicts(
+        library.serial.as_str(),
+        Some(drive_element),
+        Some(voltag),
+        candidate.location == TapeInitLocation::Slot,
+    ) {
+        Ok(conflicts) => conflicts,
+        Err(error) => return print_command_error(error.to_string(), &fresh_report, err),
+    };
+    if !conflicts.is_empty() {
+        return print_command_error(
+            media_readiness_admission_error("tape adopt-bootstrap", &conflicts),
+            &fresh_report,
+            err,
+        );
+    }
+    let policy = configured_library_policy(&config);
+    let physical = match run_bot_identity_hardware(
+        library,
+        &policy,
+        candidate,
+        drive_element,
+        BotIdentityReadMode::Adoption,
+        args.expected_home_slot,
+    ) {
+        Ok(result) => result,
+        Err(error) => return print_command_error(error, &fresh_report, err),
+    };
+    let adoption = match physical.adoption.as_ref() {
+        Some(adoption) => adoption,
+        None => {
+            return print_command_error(
+                "adoption read returned no tail projection".to_string(),
+                &fresh_report,
+                err,
+            )
+        }
+    };
+    let payload =
+        match adoption.payload.as_ref() {
+            Some(payload) if remanence_api::has_canonical_adoption_geometry(payload) => payload,
+            Some(_) => return print_command_error(
+                "valid Bootstrap does not have canonical 1 MiB default parity adoption geometry"
+                    .to_string(),
+                &fresh_report,
+                err,
+            ),
+            None => {
+                return print_command_error(
+                    format!("BOT is not adoptable: {:?}", adoption.tail),
+                    &fresh_report,
+                    err,
+                )
+            }
+        };
+    if payload.tape_uuid != *args.expected_existing_tape_uuid.as_bytes() {
+        return print_command_error(
+            format!(
+                "command expected tape UUID {}, but BOT contains {}",
+                args.expected_existing_tape_uuid,
+                Uuid::from_bytes(payload.tape_uuid)
+            ),
+            &fresh_report,
+            err,
+        );
+    }
+    let tail = match &adoption.tail {
+        remanence_api::BootstrapTailClassification::ExactBootstrapFilemarkEod => {
+            remanence_state::BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod
+        }
+        remanence_api::BootstrapTailClassification::DataAfterBootstrap => {
+            remanence_state::BootstrapAdoptionTailEvidence::DataAfterBootstrap
+        }
+        remanence_api::BootstrapTailClassification::MissingFilemark => {
+            remanence_state::BootstrapAdoptionTailEvidence::MissingFilemark
+        }
+        remanence_api::BootstrapTailClassification::ExtraFilemark => {
+            remanence_state::BootstrapAdoptionTailEvidence::ExtraFilemark
+        }
+        remanence_api::BootstrapTailClassification::Ambiguous { .. } => {
+            remanence_state::BootstrapAdoptionTailEvidence::Ambiguous
+        }
+        remanence_api::BootstrapTailClassification::InvalidBot(_) => {
+            return print_command_error(
+                "BOT became invalid during adoption".to_string(),
+                &fresh_report,
+                err,
+            )
+        }
+    };
+    let parity = payload
+        .scheme
+        .as_ref()
+        .map(|scheme| {
+            remanence_api::ParityConfig::Scheme(remanence_parity::ParityScheme {
+                id: remanence_parity::SchemeId::new_owned(scheme.id.clone()),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            })
+        })
+        .unwrap_or(remanence_api::ParityConfig::None);
+    let outcome = match state.adopt_bootstrap_identity(
+        remanence_state::AdoptBootstrapIdentityInput {
+            operation_id,
+            tape_uuid: payload.tape_uuid,
+            voltag: physical.voltag.clone(),
+            block_size: payload.block_size_bytes,
+            parity,
+        },
+        remanence_state::BootstrapAdoptionEvidence {
+            library_serial: physical.library_serial.clone(),
+            library_revision: physical.library_revision.clone(),
+            home_slot: physical.home_slot,
+            drive_element: physical.drive_element,
+            drive_serial: physical.drive_serial.clone(),
+            bootstrap_drive_compression: payload.drive_compression,
+            configured_drive_compression: physical.configured_drive_compression,
+            physical_tail: tail,
+        },
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => return print_command_error(error.to_string(), &fresh_report, err),
+    };
+    let Some(pool_id) = remanence_state::derive_tape_pool_from_voltag(
+        physical.voltag.as_str(),
+        &config.tape_pool_rules,
+    ) else {
+        return print_command_error(
+            "adopted barcode no longer derives a configured pool".to_string(),
+            &fresh_report,
+            err,
+        );
+    };
+    let line = adopt_bootstrap_json(&physical, adoption, payload, &outcome, pool_id);
+    let _ = writeln!(out, "{line}");
+    print_warnings(&fresh_report, err);
+    ExitCode::SUCCESS
+}
+
+fn adopt_bootstrap_json(
+    physical: &PhysicalBotIdentityResult,
+    adoption: &remanence_api::BootstrapAdoptionProjection,
+    payload: &remanence_parity::BootstrapPayload,
+    outcome: &remanence_state::AdoptBootstrapIdentityOutcome,
+    pool_id: &str,
+) -> Value {
+    json!({
+        "schema": "rem.tape.adopt-bootstrap.v1",
+        "ok": true,
+        "physical_disposition": if outcome.newly_adopted { "bootstrap_adopted" } else { "bootstrap_already_adopted" },
+        "physical_tail": bootstrap_tail_name(&adoption.tail),
+        "newly_adopted": outcome.newly_adopted,
+        "operation_id": outcome.operation_id,
+        "idempotency_fingerprint": bytes_to_hex(&outcome.request_fingerprint),
+        "library_serial": physical.library_serial,
+        "library_revision": physical.library_revision,
+        "barcode": physical.voltag,
+        "source_slot": physical.home_slot,
+        "drive_element": physical.drive_element,
+        "drive_serial": physical.drive_serial,
+        "bootstrap_drive_compression": payload.drive_compression,
+        "configured_drive_compression": physical.configured_drive_compression,
+        "tape_uuid": Uuid::from_bytes(payload.tape_uuid),
+        "geometry": bootstrap_geometry_json(payload),
+        "catalog": {
+            "tape_uuid": Uuid::from_bytes(payload.tape_uuid),
+            "voltag": physical.voltag,
+            "kind": "data",
+            "pool_id": pool_id,
+            "state": outcome.state.as_str(),
+            "assignment_generation": outcome.assignment_generation,
+            "geometry": bootstrap_geometry_json(payload),
+        },
+    })
+}
+
+fn print_command_error(message: String, report: &DiscoveryReport, err: &mut dyn Write) -> ExitCode {
+    let _ = writeln!(err, "error: {message}");
+    print_setcap_hint_if_error_text_matches(&message, err);
+    print_warnings(report, err);
+    ExitCode::from(1)
+}
+
+fn bot_probe_json(result: &PhysicalBotIdentityResult) -> Value {
+    let (physical_disposition, tape_uuid, geometry, canonical, detail) =
+        match &result.classification {
+            remanence_api::BotIdentityClassification::BlankCheckEod => {
+                ("blank_check_eod", None, None, None, None)
+            }
+            remanence_api::BotIdentityClassification::ValidRemBootstrap {
+                payload,
+                canonical_adoption_geometry,
+                ..
+            } => (
+                "bootstrap_valid",
+                Some(Uuid::from_bytes(payload.tape_uuid).to_string()),
+                Some(bootstrap_geometry_json(payload)),
+                Some(*canonical_adoption_geometry),
+                None,
+            ),
+            remanence_api::BotIdentityClassification::DamagedRemBootstrap { detail } => (
+                "bootstrap_damaged",
+                None,
+                None,
+                Some(false),
+                Some(detail.clone()),
+            ),
+            remanence_api::BotIdentityClassification::ForeignFormat { name } => (
+                "foreign_format",
+                None,
+                None,
+                Some(false),
+                Some(name.clone()),
+            ),
+            remanence_api::BotIdentityClassification::UnrecognizedData => {
+                ("unrecognized_data", None, None, Some(false), None)
+            }
+            remanence_api::BotIdentityClassification::ReadError { detail } => {
+                ("read_error", None, None, Some(false), Some(detail.clone()))
+            }
+        };
+    json!({
+        "schema": "rem.tape.bot-probe.v1",
+        "ok": true,
+        "physical_disposition": physical_disposition,
+        "library_serial": result.library_serial,
+        "library_revision": result.library_revision,
+        "barcode": result.voltag,
+        "source_slot": result.home_slot,
+        "drive_element": result.drive_element,
+        "drive_serial": result.drive_serial,
+        "configured_drive_compression": result.configured_drive_compression,
+        "bootstrap_drive_compression": match &result.classification {
+            remanence_api::BotIdentityClassification::ValidRemBootstrap { payload, .. } => Some(payload.drive_compression),
+            _ => None,
+        },
+        "tape_uuid": tape_uuid,
+        "geometry": geometry,
+        "canonical_adoption_geometry": canonical,
+        "detail": detail,
+    })
+}
+
+fn bootstrap_geometry_json(payload: &remanence_parity::BootstrapPayload) -> Value {
+    json!({
+        "block_size_bytes": payload.block_size_bytes,
+        "drive_compression": payload.drive_compression,
+        "no_parity": payload.no_parity_flag,
+        "scheme_id": payload.scheme.as_ref().map(|scheme| scheme.id.as_str()),
+        "data_blocks_per_stripe": payload.scheme.as_ref().map(|scheme| scheme.data_blocks_per_stripe),
+        "parity_blocks_per_stripe": payload.scheme.as_ref().map(|scheme| scheme.parity_blocks_per_stripe),
+        "stripes_per_neighborhood": payload.scheme.as_ref().map(|scheme| scheme.stripes_per_neighborhood),
+    })
+}
+
+fn bootstrap_tail_name(tail: &remanence_api::BootstrapTailClassification) -> &'static str {
+    match tail {
+        remanence_api::BootstrapTailClassification::ExactBootstrapFilemarkEod => {
+            "exact_bootstrap_filemark_eod"
+        }
+        remanence_api::BootstrapTailClassification::DataAfterBootstrap => "data_after_bootstrap",
+        remanence_api::BootstrapTailClassification::MissingFilemark => "missing_filemark",
+        remanence_api::BootstrapTailClassification::ExtraFilemark => "extra_filemark",
+        remanence_api::BootstrapTailClassification::Ambiguous { .. } => "ambiguous",
+        remanence_api::BootstrapTailClassification::InvalidBot(_) => "invalid_bot",
     }
 }
 
@@ -15926,6 +16787,320 @@ mod tests {
         ])
         .into();
         assert!(rem_only_reason(&hidden_debug_audit.command).is_some());
+    }
+
+    #[test]
+    fn bot_identity_commands_parse_exact_identity_contract_and_require_allow() {
+        let probe: ParsedCli = DebugCli::parse_from([
+            "rem-debug",
+            "--allow",
+            "LIB001",
+            "tape",
+            "bot-probe",
+            "ACM901L9",
+            "--library",
+            "LIB001",
+            "--expected-home-slot",
+            "0x0401",
+            "--json",
+        ])
+        .into();
+        assert_eq!(state_changing_target(&probe.command), Some("LIB001"));
+
+        let tape_uuid = Uuid::new_v4();
+        let adopt: ParsedCli = DebugCli::parse_from([
+            "rem-debug",
+            "--allow",
+            "LIB001",
+            "tape",
+            "adopt-bootstrap",
+            "ACM901L9",
+            "--library",
+            "LIB001",
+            "--expected-home-slot",
+            "0x0401",
+            "--expected-existing-tape-uuid",
+            tape_uuid.to_string().as_str(),
+            "--json",
+        ])
+        .into();
+        assert_eq!(state_changing_target(&adopt.command), Some("LIB001"));
+
+        assert!(DebugCli::try_parse_from([
+            "rem-debug",
+            "--allow",
+            "LIB001",
+            "tape",
+            "adopt-bootstrap",
+            "ACM901L9",
+            "--library",
+            "LIB001",
+            "--expected-home-slot",
+            "0x0401",
+            "--expected-existing-tape-uuid",
+            tape_uuid.to_string().as_str(),
+            "--operation-id",
+            Uuid::new_v4().to_string().as_str(),
+            "--json",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn bot_probe_json_has_stable_nested_geometry_contract() {
+        let tape_uuid = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x46, 0x17, 0x88, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
+        let payload = remanence_api::build_tape_bootstrap(
+            tape_uuid,
+            remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            remanence_api::ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(
+                remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            )),
+            "2026-08-09T00:00:00Z",
+            "cli-test",
+        );
+        let report = bot_probe_json(&PhysicalBotIdentityResult {
+            library_serial: "LIB001".to_string(),
+            library_revision: "D.00".to_string(),
+            voltag: "ACM901L9".to_string(),
+            home_slot: 0x0401,
+            drive_element: 0x0101,
+            drive_serial: "DRV001".to_string(),
+            configured_drive_compression: false,
+            classification: remanence_api::BotIdentityClassification::ValidRemBootstrap {
+                payload,
+                physical_record_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+                canonical_adoption_geometry: true,
+            },
+            adoption: None,
+        });
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../testdata/cli/tape-bot-probe-v1.json"))
+                .expect("parse BOT probe fixture");
+        assert_eq!(report, fixture);
+    }
+
+    #[test]
+    fn adopt_bootstrap_json_matches_authoritative_literal_fixture() {
+        let tape_uuid = [
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x46, 0x17, 0x88, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+            0x1e, 0x1f,
+        ];
+        let payload = remanence_api::build_tape_bootstrap(
+            tape_uuid,
+            remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            remanence_api::ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(
+                remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            )),
+            "2026-08-09T00:00:00Z",
+            "cli-test",
+        );
+        let adoption = remanence_api::BootstrapAdoptionProjection {
+            payload: Some(payload.clone()),
+            tail: remanence_api::BootstrapTailClassification::ExactBootstrapFilemarkEod,
+        };
+        let physical = PhysicalBotIdentityResult {
+            library_serial: "LIB001".to_string(),
+            library_revision: "D.00".to_string(),
+            voltag: "ACM901L9".to_string(),
+            home_slot: 0x0401,
+            drive_element: 0x0101,
+            drive_serial: "DRV001".to_string(),
+            configured_drive_compression: false,
+            classification: remanence_api::BotIdentityClassification::ValidRemBootstrap {
+                payload: payload.clone(),
+                physical_record_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+                canonical_adoption_geometry: true,
+            },
+            adoption: Some(adoption.clone()),
+        };
+        let outcome = remanence_state::AdoptBootstrapIdentityOutcome {
+            newly_adopted: true,
+            assignment_generation: 1,
+            state: remanence_state::AdoptedTapeState::Ready,
+            operation_id: Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
+            request_fingerprint: [0xab; 32],
+        };
+        let report =
+            adopt_bootstrap_json(&physical, &adoption, &payload, &outcome, "camera.copy-a");
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../testdata/cli/tape-adopt-bootstrap-v1.json"
+        ))
+        .expect("parse adoption fixture");
+        assert_eq!(report, fixture);
+
+        let already = remanence_state::AdoptBootstrapIdentityOutcome {
+            newly_adopted: false,
+            ..outcome.clone()
+        };
+        let already_fixture: Value = serde_json::from_str(include_str!(
+            "../../../testdata/cli/tape-adopt-bootstrap-already-v1.json"
+        ))
+        .expect("parse already-adopted fixture");
+        assert_eq!(
+            adopt_bootstrap_json(&physical, &adoption, &payload, &already, "camera.copy-a",),
+            already_fixture
+        );
+
+        let ambiguous = remanence_api::BootstrapAdoptionProjection {
+            payload: Some(payload.clone()),
+            tail: remanence_api::BootstrapTailClassification::Ambiguous {
+                detail: "completion unknown".to_string(),
+            },
+        };
+        let ambiguous_outcome = remanence_state::AdoptBootstrapIdentityOutcome {
+            newly_adopted: true,
+            assignment_generation: 1,
+            state: remanence_state::AdoptedTapeState::RecoveryRequired,
+            operation_id: outcome.operation_id,
+            request_fingerprint: [0xcd; 32],
+        };
+        let ambiguous_fixture: Value = serde_json::from_str(include_str!(
+            "../../../testdata/cli/tape-adopt-bootstrap-ambiguous-v1.json"
+        ))
+        .expect("parse ambiguous adoption fixture");
+        assert_eq!(
+            adopt_bootstrap_json(
+                &physical,
+                &ambiguous,
+                &payload,
+                &ambiguous_outcome,
+                "camera.copy-a",
+            ),
+            ambiguous_fixture
+        );
+    }
+
+    #[test]
+    fn tape_json_preserves_assignment_generation_and_new_lifecycle_states() {
+        let tape = pb::Tape {
+            assignment_generation: 11,
+            state: pb::tape::State::TapeStateRecoveryRequired as i32,
+            ..pb::Tape::default()
+        };
+        let rendered = tape_json(&tape);
+        assert_eq!(rendered["assignment_generation"], 11);
+        assert_eq!(rendered["state"], "recovery_required");
+    }
+
+    #[derive(Default)]
+    struct BotConfigSpy {
+        reads: VecDeque<Result<TapeConfig, String>>,
+        writes: VecDeque<Result<(), String>>,
+        calls: Vec<&'static str>,
+    }
+
+    impl BotDriveConfigOps for BotConfigSpy {
+        fn bot_read_config(&mut self) -> Result<TapeConfig, String> {
+            self.calls.push("read_config");
+            self.reads.pop_front().expect("scripted config read")
+        }
+
+        fn bot_write_config(&mut self, _config: TapeConfig) -> Result<(), String> {
+            self.calls.push("write_config");
+            self.writes.pop_front().expect("scripted config write")
+        }
+    }
+
+    fn bot_test_config(block_size: BlockSize, compression: bool) -> TapeConfig {
+        TapeConfig {
+            block_size,
+            compression,
+            max_block_size_bytes: 8 * 1024 * 1024,
+            write_protected: false,
+            worm: WormMediaState::NotWorm,
+        }
+    }
+
+    #[test]
+    fn temporary_bot_config_restores_after_success_and_primary_failure() {
+        let prior = bot_test_config(BlockSize::Variable, true);
+        let selected = bot_test_config(
+            BlockSize::Fixed {
+                size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            },
+            false,
+        );
+        for primary_ok in [true, false] {
+            let mut spy = BotConfigSpy {
+                reads: VecDeque::from([Ok(prior), Ok(selected), Ok(prior)]),
+                writes: VecDeque::from([Ok(()), Ok(())]),
+                calls: Vec::new(),
+            };
+            let result = with_temporary_bot_read_config(&mut spy, |spy| {
+                spy.calls.push("physical_read");
+                primary_ok
+                    .then_some(())
+                    .ok_or_else(|| "physical read failed".to_string())
+            });
+            assert_eq!(result.is_ok(), primary_ok);
+            assert_eq!(
+                spy.calls,
+                [
+                    "read_config",
+                    "write_config",
+                    "read_config",
+                    "physical_read",
+                    "write_config",
+                    "read_config",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_bot_config_restores_after_verification_failure_and_surfaces_restore_failure() {
+        let prior = bot_test_config(BlockSize::Variable, true);
+        let wrong = bot_test_config(BlockSize::Variable, false);
+        let mut verification_failure = BotConfigSpy {
+            reads: VecDeque::from([Ok(prior), Ok(wrong), Ok(prior)]),
+            writes: VecDeque::from([Ok(()), Ok(())]),
+            calls: Vec::new(),
+        };
+        let error = with_temporary_bot_read_config(&mut verification_failure, |_| Ok(()))
+            .expect_err("verification must fail");
+        assert!(error.contains("did not verify"));
+        assert_eq!(
+            verification_failure.calls,
+            [
+                "read_config",
+                "write_config",
+                "read_config",
+                "write_config",
+                "read_config",
+            ]
+        );
+
+        let selected = bot_test_config(
+            BlockSize::Fixed {
+                size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
+            },
+            false,
+        );
+        let mut restore_failure = BotConfigSpy {
+            reads: VecDeque::from([Ok(prior), Ok(selected)]),
+            writes: VecDeque::from([Ok(()), Err("mode select failed".to_string())]),
+            calls: Vec::new(),
+        };
+        let error = with_temporary_bot_read_config(&mut restore_failure, |_| Ok(()))
+            .expect_err("restore failure must fail command");
+        assert!(error.contains("physical BOT identity read succeeded"));
+        assert!(error.contains("restore prior drive config"));
+
+        let mut configure_failure = BotConfigSpy {
+            reads: VecDeque::from([Ok(prior), Ok(prior)]),
+            writes: VecDeque::from([Err("completion unknown".to_string()), Ok(())]),
+            calls: Vec::new(),
+        };
+        let error = with_temporary_bot_read_config(&mut configure_failure, |_| Ok(()))
+            .expect_err("configure failure must still attempt restoration");
+        assert!(error.contains("configure fixed 1 MiB BOT read"));
+        assert_eq!(
+            configure_failure.calls,
+            ["read_config", "write_config", "write_config", "read_config",]
+        );
     }
 
     #[test]

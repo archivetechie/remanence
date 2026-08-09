@@ -750,6 +750,7 @@ message Tape {
     TAPE_STATE_FINALIZING  = 6;
     TAPE_STATE_FINALIZED_DEGRADED = 7;
     TAPE_STATE_COMPLETION_UNKNOWN = 8;
+    TAPE_STATE_RECOVERY_REQUIRED = 9;
   }
   State state                  = 9;  // NOT NULL; UNSPECIFIED already says "unknown"
   google.protobuf.Timestamp updated_at = 10;
@@ -768,6 +769,8 @@ message Tape {
   // Stable parity implementation identifier; widths alone do not identify the
   // codec. Absent on no-parity or not-yet-inventoried rows.
   optional string scheme_id = 15;
+  // Monotonic exact pool-assignment generation from the catalog row.
+  uint64 assignment_generation = 16;
 }
 
 message FinalizeTapeRequest {

@@ -154,6 +154,7 @@ snapshots, clean runs, alarms).
 
 The state lock is **not** taken by `rem-daemon` itself — only
 `StateHandle`-based `rem-debug` state-mutating subcommands (tape init,
+existing-Bootstrap identity adoption,
 pool ops, catalog reset, and similar offline operations) acquire the
 kernel `flock` on `<state_dir>/state.lock`, which serializes those
 commands against each other and is released automatically if the
@@ -164,6 +165,9 @@ that exact path is a hard error, a stale socket file is unlinked and
 reused). Two daemons configured with different socket paths but the same
 `state_dir` are not stopped from both starting — this is a known gap,
 not a documented safety property.
+
+The recovery/import boundary and its deliberately identity-only authority are
+described in [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
 <!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ f643f8c2 -->
 ## Layer 5: daemon and API

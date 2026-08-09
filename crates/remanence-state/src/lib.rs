@@ -56,8 +56,9 @@ pub use config::{
 };
 pub use error::StateError;
 pub use index::{
-    AlarmRecord, AuditReplayReport, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord,
-    DriveAnnotationInput, DriveCorrelationRollupRecord, DriveEventRecord, DriveHealthSnapshotInput,
+    AdoptBootstrapIdentityInput, AdoptBootstrapIdentityOutcome, AdoptedTapeState, AlarmRecord,
+    AuditReplayReport, CatalogIndex, CatalogUnitFilter, CatalogUnitRecord, DriveAnnotationInput,
+    DriveCorrelationRollupRecord, DriveEventRecord, DriveHealthSnapshotInput,
     DriveHealthSnapshotRecord, DriveObservationInput, DriveObservationOutcome, DriveRecord,
     ForeignArchiveProjectionInput, IdempotencyRegistration, IdempotencyScopeRecord,
     MediaReadinessOperationInput, MediaReadinessOperationRecord, MediaReadinessTransitionInput,
@@ -75,7 +76,8 @@ pub use index::{
 pub use lock::StateLockGuard;
 pub use paths::StatePaths;
 pub use state::{
-    CatalogResetPathEvidence, CatalogResetPreflightPaths, CatalogResetPreflightReport,
-    CatalogResetPreflightTape, CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState,
-    StartupReplayReport, StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
+    BootstrapAdoptionEvidence, BootstrapAdoptionTailEvidence, CatalogResetPathEvidence,
+    CatalogResetPreflightPaths, CatalogResetPreflightReport, CatalogResetPreflightTape,
+    CatalogResetReport, CatalogResetTapeReport, CatalogResetTapeState, StartupReplayReport,
+    StateConfigWarning, StateHandle, TapeJournalIngestionOutcome,
 };
