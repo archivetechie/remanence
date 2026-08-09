@@ -14,7 +14,8 @@ pool-admission kernels.
 
 The trust anchor for local proof claims is the Lean type checker accepting the
 project with no local `sorry`, `axiom`, or `admit` in the target proof files.
-Leanstral, Claude, and Codex are proof-search or editing aids only.
+Automated proof-search and editing tools are aids only; they are not part of
+the trusted proof base.
 
 Each proof area has two layers:
 
@@ -79,7 +80,7 @@ These are intentionally outside the current formal proof surface:
 - AEAD cryptographic security and keyed authentication.
 - REM-OBJECT key-frame geometry and header/key-frame codec proofs, tracked as
   **REM-OBJECT-FORMAL-PREFIX** and **REM-OBJECT-FORMAL-HEADER-KEY-FRAME**.
-- End-to-end write/read/verify scenarios in `~/system`.
+- End-to-end write/read/verify scenarios in the sibling integration harness.
 
 Those areas remain covered by Rust unit tests, integration tests, system
 scenarios, code review, and operational runbooks.
