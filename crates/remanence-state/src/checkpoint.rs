@@ -5284,6 +5284,17 @@ mod tests {
                     .progress,
                 next
             );
+            drop(recovery);
+            let error = journal
+                .acquire_exclusive()
+                .expect_err("every persisted terminal progress state fences Object admission");
+            assert!(
+                error.to_string().contains("terminal finalization"),
+                "{next:?}: {error}"
+            );
+            recovery = journal
+                .acquire_exclusive_for_terminal_recovery()
+                .expect("reacquire terminal recovery after Object-refusal proof");
         }
         assert!(recovery
             .advance_terminal_finalization(

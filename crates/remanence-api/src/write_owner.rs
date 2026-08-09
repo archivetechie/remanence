@@ -678,6 +678,28 @@ fn reconcile_terminal_component_host_authority(
     Ok(intent)
 }
 
+fn reconcile_and_authorize_parity_resume(
+    index: &mut CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    intent: remanence_state::TerminalFinalizationIntent,
+    plan: &TerminalTripleWritePlan,
+    journal: &mut FileTapeFileJournal,
+) -> Result<remanence_state::TerminalFinalizationIntent, Status> {
+    let intent = reconcile_terminal_component_host_authority(
+        index, checkpoint, spec, intent, plan, journal,
+    )?;
+    authorize_terminal_intent_capacity(
+        index,
+        spec,
+        selected,
+        &intent,
+        plan.edition.descriptor.counts,
+    )?;
+    Ok(intent)
+}
+
 fn persist_terminal_recovery_required(
     index: &mut CatalogIndex,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
@@ -6353,21 +6375,15 @@ pub(crate) fn preflight_manual_finalize_tape(
                     let edition = source
                         .reconstruct_final_edition(&intent)
                         .map_err(crate::status_from_state_error)?;
-                    authorize_terminal_intent_capacity(
-                        index,
-                        &spec,
-                        &selected,
-                        &intent,
-                        source.summary().counts,
-                    )?;
                     let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
                         Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
                     })?;
                     drop(source);
-                    let intent = reconcile_terminal_component_host_authority(
+                    let intent = reconcile_and_authorize_parity_resume(
                         index,
                         &mut checkpoint,
                         &spec,
+                        &selected,
                         intent,
                         &plan,
                         &mut journal,
@@ -6520,6 +6536,18 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 "automatic terminal completion requires checkpoint authority",
             )
         })?;
+    if previous.sealed_after_write {
+        // A crash after sealed-checkpoint fsync may leave the exact companion
+        // behind. Project first so a catalog failure retains retry routing;
+        // exact recovery replay then retires only the matching companion.
+        index
+            .project_checkpoint_record(&previous)
+            .map_err(crate::status_from_state_error)?;
+        checkpoint
+            .replay_for_terminal_recovery()
+            .map_err(crate::status_from_state_error)?;
+        return Ok(true);
+    }
     let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, pool_cfg);
     let (intent, plan) = match &selected.parity_config {
         remanence_parity::ParityConfig::None => {
@@ -6599,21 +6627,15 @@ pub(crate) fn preflight_automatic_terminal_completion(
             let edition = source
                 .reconstruct_final_edition(&intent)
                 .map_err(crate::status_from_state_error)?;
-            authorize_terminal_intent_capacity(
-                index,
-                &spec,
-                selected,
-                &intent,
-                source.summary().counts,
-            )?;
             let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
                 Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
             })?;
             drop(source);
-            let intent = reconcile_terminal_component_host_authority(
+            let intent = reconcile_and_authorize_parity_resume(
                 index,
                 &mut checkpoint,
                 &spec,
+                selected,
                 intent,
                 &plan,
                 &mut journal,
@@ -6779,6 +6801,7 @@ fn finalize_terminal_with_parity(
         scheme.clone(),
     )
     .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
+    let resuming_existing_intent = existing_intent.is_some();
     let (prefix, intent, plan, source, prefix_snapshot, mut journal) = match existing_intent {
         Some(intent) => {
             let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
@@ -6816,13 +6839,6 @@ fn finalize_terminal_with_parity(
             let edition = source
                 .reconstruct_final_edition(&intent)
                 .map_err(crate::status_from_state_error)?;
-            authorize_terminal_intent_capacity(
-                index,
-                spec,
-                selected,
-                &intent,
-                source.summary().counts,
-            )?;
             let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
                 Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
             })?;
@@ -6912,14 +6928,26 @@ fn finalize_terminal_with_parity(
     // checkpoint intent and sink journal to name the same canonical component
     // history. The only admissible crash skew is one exact barrier-proved sink
     // transition ahead, which is reconciled entirely in host durability first.
-    let intent = reconcile_terminal_component_host_authority(
-        index,
-        checkpoint,
-        spec,
-        intent,
-        &plan,
-        &mut journal,
-    )?;
+    let intent = if resuming_existing_intent {
+        reconcile_and_authorize_parity_resume(
+            index,
+            checkpoint,
+            spec,
+            selected,
+            intent,
+            &plan,
+            &mut journal,
+        )?
+    } else {
+        reconcile_terminal_component_host_authority(
+            index,
+            checkpoint,
+            spec,
+            intent,
+            &plan,
+            &mut journal,
+        )?
+    };
     if let Some(request) = manual_request {
         record_manual_finalize_request(index, cfg, request)?;
     }
@@ -11610,7 +11638,7 @@ mod tests {
             temp.path().join("tape.remjournal"),
             TAPE_UUID,
             BLOCK_SIZE,
-            scheme,
+            scheme.clone(),
         )
         .expect("open sink journal");
         let bot_bundle = CommittedBundle {
@@ -11824,18 +11852,50 @@ mod tests {
             );
         }
 
-        // Replica C is the same host-authority rule even though all three
-        // index copies are now barrier-proved: the sealed checkpoint remains
-        // a later step, so Finalizing(AfterReplicaC) is restartable.
+        // Replica C may be barrier-proved in the sink journal one host fsync
+        // before checkpoint progress. A newly lowered cap would reject the
+        // stale pre-C view, so recovery must reconcile first and then observe
+        // that no tape capacity remains to authorize.
         journal
             .commit_terminal_component_transition(&transitions[4].0, &transitions[4].1)
             .expect("journal replica C transition");
-        let completed = checkpoint
-            .advance_terminal_finalization(
-                remanence_state::TerminalFinalizationProgress::AfterSeparationBc,
-                remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+        let lowered_pool = TapePoolConfig {
+            id: "host-authority-test".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            capacity_cap_bytes: Some(u64::from(BLOCK_SIZE)),
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let selected = SelectedTape {
+            pool_id: lowered_pool.id.clone(),
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::Scheme(scheme),
+        };
+        let lowered_spec = TerminalFinalizeSpec {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            pool_config: Some(lowered_pool),
+            trigger: current.trigger,
+            operation_id: None,
+            manual: None,
+        };
+        assert!(
+            authorize_terminal_intent_capacity(
+                &index,
+                &lowered_spec,
+                &selected,
+                &current,
+                plan.edition.descriptor.counts,
             )
-            .expect("advance replica C checkpoint without SQLite projection");
+            .is_err(),
+            "the deliberately stale pre-C checkpoint view must still see the lowered cap"
+        );
         assert_eq!(
             index
                 .terminal_finalization(&TAPE_UUID)
@@ -11844,15 +11904,16 @@ mod tests {
                 .progress,
             remanence_state::TerminalFinalizationProgress::AfterSeparationBc
         );
-        let completed = reconcile_terminal_component_host_authority(
+        let completed = reconcile_and_authorize_parity_resume(
             &mut index,
             &mut checkpoint,
-            &spec,
-            completed,
+            &lowered_spec,
+            &selected,
+            current,
             &plan,
             &mut journal,
         )
-        .expect("aligned replica C authority repairs SQLite before media");
+        .expect("replica-C sink proof must reconcile before changed-cap authorization");
         assert_eq!(
             completed.progress,
             remanence_state::TerminalFinalizationProgress::AfterReplicaC

@@ -642,6 +642,19 @@ pub struct SelectedTape {
     pub parity_config: ParityConfig,
 }
 
+/// Result of pinned-tape admission before a write session resolves media actors.
+///
+/// The recovery-only variant deliberately remains distinct from an ordinarily
+/// writable selection so an `AfterReplicaC` companion can reach host preflight
+/// without ever becoming authority to mount or write the tape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PinnedWriteDisposition {
+    /// The tape passed ordinary Object-write admission.
+    Writable(SelectedTape),
+    /// The tape may be used only to finish terminal host bookkeeping.
+    HostOnlyTerminalRecovery(SelectedTape),
+}
+
 /// LTO cartridge generation parsed from a barcode media-type suffix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LtoGen {
@@ -1263,7 +1276,7 @@ pub fn admit_pinned_tape_for_write_session(
     required_pool_id: &str,
     pool_cfg: &TapePoolConfig,
     checkpoint_journal_dir: &Path,
-) -> Result<SelectedTape, PinnedTapeError> {
+) -> Result<PinnedWriteDisposition, PinnedTapeError> {
     let uuid_text = Uuid::from_bytes(tape_uuid);
     let tape = state
         .get_tape(&tape_uuid)?
@@ -1338,7 +1351,12 @@ pub fn admit_pinned_tape_for_write_session(
             tape_uuid: uuid_text,
         });
     }
-    Ok(selected_tape_from_record(tape, required_pool_id)?)
+    let selected = selected_tape_from_record(tape, required_pool_id)?;
+    if host_only_after_replica_c {
+        Ok(PinnedWriteDisposition::HostOnlyTerminalRecovery(selected))
+    } else {
+        Ok(PinnedWriteDisposition::Writable(selected))
+    }
 }
 
 /// Select an eligible tape from a pool using a caller-supplied pure policy.
@@ -11584,9 +11602,10 @@ mod tests {
             &checkpoint_dir,
         )
         .expect("pool selector admits a parity BOT without an object checkpoint");
-        let fresh_pinned =
+        let fresh_pinned = writable_pinned_disposition(
             admit_pinned_tape_for_write_session(&index, tape_uuid, pool_id, &cfg, &checkpoint_dir)
-                .expect("pinned selector admits a parity BOT without an object checkpoint");
+                .expect("pinned selector admits a parity BOT without an object checkpoint"),
+        );
         assert_eq!(fresh_pinned.tape_uuid, tape_uuid);
 
         let payload_path = temp.path().join("payload.bin");
@@ -11717,9 +11736,10 @@ mod tests {
         .expect("daemon selector admits checkpointed parity tape");
         assert_eq!(admitted.tape_uuid, tape_uuid);
 
-        let pinned =
+        let pinned = writable_pinned_disposition(
             admit_pinned_tape_for_write_session(&index, tape_uuid, pool_id, &cfg, &checkpoint_dir)
-                .expect("pinned selector admits checkpoint-authorized parity tape");
+                .expect("pinned selector admits checkpoint-authorized parity tape"),
+        );
         assert_eq!(pinned.tape_uuid, tape_uuid);
 
         let committed = FileTapeFileJournal::open(
@@ -12023,13 +12043,27 @@ mod tests {
         tape_uuid: TapeUuid,
         guard: &str,
     ) -> Result<SelectedTape, PinnedTapeError> {
-        admit_pinned_tape_for_write_session(
+        match admit_pinned_tape_for_write_session(
             &fixture.index,
             tape_uuid,
             guard,
             &fixture.pool_cfg,
             &fixture.journal_dir,
-        )
+        )? {
+            PinnedWriteDisposition::Writable(selected) => Ok(selected),
+            PinnedWriteDisposition::HostOnlyTerminalRecovery(_) => {
+                panic!("ordinary pinned-admission helper received recovery-only disposition")
+            }
+        }
+    }
+
+    fn writable_pinned_disposition(disposition: PinnedWriteDisposition) -> SelectedTape {
+        match disposition {
+            PinnedWriteDisposition::Writable(selected) => selected,
+            PinnedWriteDisposition::HostOnlyTerminalRecovery(_) => {
+                panic!("expected ordinary writable pinned disposition")
+            }
+        }
     }
 
     #[test]
