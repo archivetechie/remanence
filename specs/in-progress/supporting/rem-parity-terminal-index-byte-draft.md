@@ -2,8 +2,8 @@
 
 **Status:** in-progress byte candidate for independent review; not frozen.
 **Date:** 2026-08-09.
-**Architecture authority:**
-`~/system/journal/remanence/design-object-index-v0.6.md`.
+**Architecture:** terminal triple-index replacement with three complete final
+replicas and two typed separation extents.
 **Implementation anchors:** `terminal_tail.rs`, `tape_index_replica.rs`, and
 `index_separation.rs` in `crates/remanence-parity/src/`.
 

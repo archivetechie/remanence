@@ -325,8 +325,9 @@ For the minimal config above, a running daemon owns:
 On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are
 both required while the tape is open and during terminal repair. In addition
 to the open prefix, they record the immutable terminal plan and the last
-barrier-proved progress state: `BeforeReplicaA`, `AfterReplicaA`, `AfterGapAB`,
-`AfterReplicaB`, `AfterGapBC`, or `AfterReplicaC`. Once finalization begins,
+barrier-proved progress state: `BeforeReplicaA`, `AfterReplicaA`,
+`AfterSeparationAb`, `AfterReplicaB`, `AfterSeparationBc`, or
+`AfterReplicaC`. Once finalization begins,
 Object admission is permanently disabled. A failure enters
 `RecoveryRequired`; only missing terminal control components may be written at
 their proved positions, never a new Object or a second terminal triple. SQLite
