@@ -102,12 +102,15 @@ pub use pool_write::{write_object_to_pool, write_to_selected_tape};
 pub use read_plan::ReadPlanApi;
 pub use remanence_library::{resolve_load_target, LoadError, LoadPlan};
 pub use tape_init::{
-    classify_bot_bytes, classify_bot_from_source, decide_tape_init,
-    maybe_write_tape_init_bootstrap, project_tape_init_catalog_inputs, sniff,
-    BarcodeLifecycleState, BotClassification, BotInitProjection, CatalogBarcodeRelation,
-    CatalogRowDisposition, CatalogTapeInitRow, CommittedCopyState, FormatId, InitDecision,
-    TapeInitCatalogProjection, TapeInitError, TapeInitGeometry, TapeInitWriteAction,
-    TapeInitWriteError, TapeInitWriteOptions,
+    classify_bootstrap_adoption_from_source, classify_bot_bytes, classify_bot_from_source,
+    classify_bot_identity_bytes, decide_tape_init, has_canonical_adoption_geometry,
+    maybe_write_tape_init_bootstrap, probe_bot_identity_from_source,
+    project_tape_init_catalog_inputs, sniff, BarcodeLifecycleState, BootstrapAdoptionProjection,
+    BootstrapTailClassification, BotClassification, BotIdentityClassification, BotInitProjection,
+    CatalogBarcodeRelation, CatalogRowDisposition, CatalogTapeInitRow, CommittedCopyState,
+    FormatId, InitDecision, TapeInitCatalogProjection, TapeInitError, TapeInitGeometry,
+    TapeInitWriteAction, TapeInitWriteError, TapeInitWriteOptions,
+    CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
 };
 
 const CATALOG_STREAM_BUFFER: usize = 32;
@@ -3852,6 +3855,7 @@ fn audit_event_name(event: &AuditEvent) -> &'static str {
         AuditEvent::AuditWriteFailed => "AuditWriteFailed",
         AuditEvent::TapeRetired => "TapeRetired",
         AuditEvent::TapeProvisioned => "TapeProvisioned",
+        AuditEvent::TapeIdentityAdopted => "TapeIdentityAdopted",
         AuditEvent::TapePoolAssigned => "TapePoolAssigned",
         AuditEvent::TapeSealed => "TapeSealed",
         AuditEvent::DriveRetired => "DriveRetired",
@@ -5438,6 +5442,7 @@ fn tape_to_proto(record: TapeRecord) -> pb::Tape {
         written_extent_lba: record.written_extent_lba,
         kind: Some(record.kind),
         scheme_id: record.scheme_id,
+        assignment_generation: record.assignment_generation,
     }
 }
 
@@ -5485,13 +5490,13 @@ fn tape_state(value: &str) -> pb::tape::State {
         "finalized" => pb::tape::State::TapeStateSealed,
         "finalizing" => pb::tape::State::TapeStateFinalizing,
         "finalized_degraded" => pb::tape::State::TapeStateFinalizedDegraded,
-        "recovery_required" | "completion_unknown" => pb::tape::State::TapeStateCompletionUnknown,
+        "recovery_required" => pb::tape::State::TapeStateRecoveryRequired,
+        "completion_unknown" => pb::tape::State::TapeStateCompletionUnknown,
         "ingestion_pending" => pb::tape::State::TapeStateInventoried,
         "degraded" => pb::tape::State::TapeStateDegraded,
         "failed" => pb::tape::State::TapeStateFailed,
         // `retired` intentionally maps to UNSPECIFIED until the proto enum
-        // gains an explicit value; add it alongside the missing
-        // ready/sealed-adjacent states when the enum is next revised.
+        // gains an explicit value; adoption does not change retire semantics.
         _ => pb::tape::State::TapeStateUnspecified,
     }
 }
@@ -8047,6 +8052,19 @@ BCw3Wyv2UWY=
             state: "ready".to_string(),
             updated_at_utc: "2026-05-29T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn tape_proto_preserves_adoption_state_and_assignment_generation() {
+        let mut record = writable_tape_record();
+        record.assignment_generation = 7;
+        record.state = "recovery_required".to_string();
+        let projected = tape_to_proto(record);
+        assert_eq!(projected.assignment_generation, 7);
+        assert_eq!(
+            projected.state,
+            pb::tape::State::TapeStateRecoveryRequired as i32
+        );
     }
 
     #[test]

@@ -126,6 +126,8 @@ pub enum AuditEvent {
     TapeRetired,
     /// A tape was provisioned after a bootstrap write.
     TapeProvisioned,
+    /// A checksum-valid existing Bootstrap was adopted without writing tape.
+    TapeIdentityAdopted,
     /// A tape was assigned to an operator-defined pool.
     TapePoolAssigned,
     /// A tape was sealed against future appends.
@@ -1254,6 +1256,7 @@ impl AuditEvent {
             AuditEvent::AuditWriteFailed => "AuditWriteFailed",
             AuditEvent::TapeRetired => "TapeRetired",
             AuditEvent::TapeProvisioned => "TapeProvisioned",
+            AuditEvent::TapeIdentityAdopted => "TapeIdentityAdopted",
             AuditEvent::TapePoolAssigned => "TapePoolAssigned",
             AuditEvent::TapeSealed => "TapeSealed",
             AuditEvent::DriveRetired => "DriveRetired",
@@ -1302,6 +1305,7 @@ impl AuditEvent {
             "AuditWriteFailed" => Ok(Self::AuditWriteFailed),
             "TapeRetired" => Ok(Self::TapeRetired),
             "TapeProvisioned" => Ok(Self::TapeProvisioned),
+            "TapeIdentityAdopted" => Ok(Self::TapeIdentityAdopted),
             "TapePoolAssigned" => Ok(Self::TapePoolAssigned),
             "TapeSealed" => Ok(Self::TapeSealed),
             "DriveRetired" => Ok(Self::DriveRetired),

@@ -23,6 +23,9 @@ format specifications — and their plain-language companion — live in
   terms and the operational tradeoffs for Object and bundle size.
 - [guide-troubleshooting.md](guide-troubleshooting.md) — failure modes
   and their remedies.
+- [importing-and-recovering-remanence-tapes.md](importing-and-recovering-remanence-tapes.md)
+  — safely reconstruct a locally unknown Remanence tape identity before
+  inventory and catalog recovery.
 - [reference-glossary.md](reference-glossary.md) — project and tape
   vocabulary.
 - [reference-extended-attributes.md](reference-extended-attributes.md) —

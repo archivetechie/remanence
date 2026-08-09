@@ -16,9 +16,13 @@ use crate::audit::{
     AuditActor, AuditEvent, AuditEventRecord, AuditSink, AuditSubject, FileAuditLog, SourceLayer,
 };
 use crate::calibration::CalibrationControlStore;
-use crate::config::{load_config, parse_config_toml, validate_trusted_volume_paths, RemConfig};
+use crate::config::{
+    derive_tape_pool_from_voltag, load_config, parse_config_toml, validate_trusted_volume_paths,
+    RemConfig,
+};
 use crate::error::StateError;
 use crate::index::{
+    AdoptBootstrapIdentityInput, AdoptBootstrapIdentityOutcome, AdoptedTapeState,
     AuditReplayReport, CatalogIndex, CatalogResetPreservedTape, ProvisionTapeInput, RebuildReport,
     RebuildTapeJournalInput, RetireTapeInput, RetireTapeOutcome, TapeIoFenceRecord,
     TapeJournalIndexInput, TapeJournalIndexReport, TapeKindFilter, TapePoolProjectionInput,
@@ -56,6 +60,64 @@ pub enum TapeJournalIngestionOutcome {
     Indexed(TapeJournalIndexReport),
     /// A live append session owns the 3c journal lock; retry later.
     Pending(TapeJournalIndexReport),
+}
+
+/// Exact physical provenance recorded for one BOT identity adoption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootstrapAdoptionEvidence {
+    /// Inquiry serial of the selected library.
+    pub library_serial: String,
+    /// Inquiry revision of the selected library.
+    pub library_revision: String,
+    /// Exact storage element to which the medium was returned.
+    pub home_slot: u16,
+    /// Exact drive element used throughout the physical recheck.
+    pub drive_element: u16,
+    /// Inquiry serial of the selected drive.
+    pub drive_serial: String,
+    /// Exact Bootstrap hardware-compression flag (must be false).
+    pub bootstrap_drive_compression: bool,
+    /// Verified drive configuration used for the physical read (must be false).
+    pub configured_drive_compression: bool,
+    /// Typed observed post-Bootstrap layout.
+    pub physical_tail: BootstrapAdoptionTailEvidence,
+}
+
+/// Valid-BOT tail evidence accepted by the durable adoption boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapAdoptionTailEvidence {
+    /// Exactly one filemark then EOD follows Bootstrap.
+    ExactBootstrapFilemarkEod,
+    /// A data record follows Bootstrap or its first filemark.
+    DataAfterBootstrap,
+    /// Bootstrap is followed immediately by EOD.
+    MissingFilemark,
+    /// More than one filemark follows Bootstrap.
+    ExtraFilemark,
+    /// A read error made the valid Bootstrap tail unknowable.
+    Ambiguous,
+}
+
+impl BootstrapAdoptionTailEvidence {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactBootstrapFilemarkEod => "exact_bootstrap_filemark_eod",
+            Self::DataAfterBootstrap => "data_after_bootstrap",
+            Self::MissingFilemark => "missing_filemark",
+            Self::ExtraFilemark => "extra_filemark",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+
+    const fn adopted_state(self) -> AdoptedTapeState {
+        match self {
+            Self::ExactBootstrapFilemarkEod => AdoptedTapeState::Ready,
+            Self::DataAfterBootstrap
+            | Self::MissingFilemark
+            | Self::ExtraFilemark
+            | Self::Ambiguous => AdoptedTapeState::RecoveryRequired,
+        }
+    }
 }
 
 /// Report from startup replay and restart cleanup.
@@ -603,6 +665,247 @@ impl StateHandle {
         Ok(())
     }
 
+    /// Durably adopt a checksum-valid BOT Bootstrap as identity-only state.
+    ///
+    /// Existing adoption audit is replayed before preview. An exact
+    /// identity-only projection may be returned as a no-op even when a later
+    /// physical recheck uses a fresh operation UUID. Reusing one operation UUID
+    /// for changed facts still conflicts. For a new identity, the audit record
+    /// is fsynced before the SQLite projection; a crash in between is completed
+    /// by the same replay-before-preview sequence on the next invocation. No
+    /// tape-file or Object authority is created.
+    pub fn adopt_bootstrap_identity(
+        &mut self,
+        input: AdoptBootstrapIdentityInput,
+        evidence: BootstrapAdoptionEvidence,
+    ) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
+        if input.operation_id.is_nil() {
+            return Err(StateError::ConfigInvalid(
+                "bootstrap adoption operation_id must not be nil".to_string(),
+            ));
+        }
+        if input.tape_uuid[6] >> 4 != 4 || input.tape_uuid[8] & 0xc0 != 0x80 {
+            return Err(StateError::TapeProvisionConflict(
+                "Bootstrap tape UUID must be an RFC 4122 UUIDv4".to_string(),
+            ));
+        }
+        let canonical_parity = remanence_parity::ParityConfig::Scheme(
+            remanence_parity::default_scheme_for_block_size(1024 * 1024),
+        );
+        if input.block_size != 1024 * 1024
+            || input.parity != canonical_parity
+            || evidence.bootstrap_drive_compression
+            || evidence.configured_drive_compression
+        {
+            return Err(StateError::TapeProvisionConflict(
+                "bootstrap adoption requires canonical 1 MiB default parity geometry with drive compression disabled"
+                    .to_string(),
+            ));
+        }
+        for (name, value) in [
+            ("library_serial", evidence.library_serial.as_str()),
+            ("library_revision", evidence.library_revision.as_str()),
+            ("drive_serial", evidence.drive_serial.as_str()),
+        ] {
+            if value.trim().is_empty() || value.trim() != value {
+                return Err(StateError::ConfigInvalid(format!(
+                    "bootstrap adoption {name} must be non-empty and trimmed"
+                )));
+            }
+        }
+        let state = evidence.physical_tail.adopted_state();
+        let pool_id =
+            derive_tape_pool_from_voltag(input.voltag.as_str(), &self.config.tape_pool_rules)
+                .ok_or_else(|| {
+                    StateError::TapeProvisionConflict(format!(
+                        "bootstrap barcode {:?} does not match any locked tape_pool_rule",
+                        input.voltag
+                    ))
+                })?
+                .to_string();
+        if !self.config.tape_pools.iter().any(|pool| pool.id == pool_id) {
+            return Err(StateError::TapeProvisionConflict(format!(
+                "bootstrap barcode {:?} derives unconfigured pool {pool_id:?}",
+                input.voltag
+            )));
+        }
+        let geometry = match &input.parity {
+            remanence_parity::ParityConfig::None => "no-parity".to_string(),
+            remanence_parity::ParityConfig::Scheme(scheme) => format!(
+                "scheme={} data={} parity={} stripes={}",
+                scheme.id.as_str(),
+                scheme.data_blocks_per_stripe,
+                scheme.parity_blocks_per_stripe,
+                scheme.stripes_per_neighborhood
+            ),
+        };
+        let request_fingerprint = bootstrap_adoption_request_fingerprint(
+            &input,
+            &evidence,
+            pool_id.as_str(),
+            state,
+            geometry.as_str(),
+        );
+        let records = FileAuditLog::replay(&self.paths.audit_dir)?;
+        self.index.replay_audit_records(&records)?;
+        let tape_subject = hex_tape_uuid(input.tape_uuid);
+        let mut matching_operation_authority = false;
+        let mut tape_adoption_authority = false;
+        let mut tape_adoption_generation = None;
+        for record in &records {
+            let operation_match = record.operation_id == Some(input.operation_id);
+            let tape_match = record.event == AuditEvent::TapeIdentityAdopted
+                && record.subject.kind == "tape"
+                && record.subject.id.as_deref() == Some(tape_subject.as_str());
+            if tape_match {
+                tape_adoption_authority = true;
+                let recorded_generation = record
+                    .detail
+                    .get("assignment_generation")
+                    .and_then(|value| match value {
+                        CborValue::Integer(value) => u64::try_from(i128::from(*value)).ok(),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        StateError::IndexCorrupt(format!(
+                            "TapeIdentityAdopted record {} has no valid assignment generation",
+                            record.record_uuid
+                        ))
+                    })?;
+                if tape_adoption_generation
+                    .replace(recorded_generation)
+                    .is_some_and(|prior| prior != recorded_generation)
+                {
+                    return Err(StateError::IndexCorrupt(format!(
+                        "tape {tape_subject} has conflicting adoption assignment generations"
+                    )));
+                }
+            }
+            if !operation_match {
+                continue;
+            }
+            if record.event != AuditEvent::TapeIdentityAdopted || !tape_match {
+                return Err(StateError::TapeProvisionConflict(format!(
+                    "operation {} is already bound to different {:?} authority",
+                    input.operation_id, record.event
+                )));
+            }
+            let recorded_fingerprint = record
+                .detail
+                .get("request_fingerprint")
+                .and_then(|value| match value {
+                    CborValue::Bytes(bytes) => <[u8; 32]>::try_from(bytes.as_slice()).ok(),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt(format!(
+                        "TapeIdentityAdopted record {} has no valid request fingerprint",
+                        record.record_uuid
+                    ))
+                })?;
+            if recorded_fingerprint != request_fingerprint {
+                return Err(StateError::TapeProvisionConflict(format!(
+                    "bootstrap adoption operation {} was reused with changed immutable facts",
+                    input.operation_id
+                )));
+            }
+            matching_operation_authority = true;
+        }
+        let preview = self.index.preview_bootstrap_identity_adoption(
+            &input,
+            pool_id.as_str(),
+            state,
+            request_fingerprint,
+        )?;
+        if matching_operation_authority || tape_adoption_authority {
+            let outcome = preview.ok_or_else(|| {
+                StateError::IndexCorrupt(format!(
+                    "adoption audit for tape {tape_subject} did not project its identity"
+                ))
+            })?;
+            if tape_adoption_generation != Some(outcome.assignment_generation) {
+                return Err(StateError::TapeProvisionConflict(format!(
+                    "Bootstrap identity {tape_subject} assignment generation evolved after adoption"
+                )));
+            }
+            return Ok(outcome);
+        }
+        let projected_assignment_generation = preview
+            .as_ref()
+            .map(|outcome| outcome.assignment_generation)
+            .unwrap_or(1);
+        let mut detail = BTreeMap::from([
+            ("voltag".to_string(), CborValue::Text(input.voltag.clone())),
+            ("pool_id".to_string(), CborValue::Text(pool_id.clone())),
+            (
+                "block_size".to_string(),
+                CborValue::Integer(input.block_size.into()),
+            ),
+            ("geometry".to_string(), CborValue::Text(geometry)),
+            (
+                "request_fingerprint".to_string(),
+                CborValue::Bytes(request_fingerprint.to_vec()),
+            ),
+            (
+                "state".to_string(),
+                CborValue::Text(state.as_str().to_string()),
+            ),
+            (
+                "assignment_generation".to_string(),
+                CborValue::Integer(projected_assignment_generation.into()),
+            ),
+            (
+                "library_serial".to_string(),
+                CborValue::Text(evidence.library_serial),
+            ),
+            (
+                "library_revision".to_string(),
+                CborValue::Text(evidence.library_revision),
+            ),
+            (
+                "home_slot".to_string(),
+                CborValue::Integer(evidence.home_slot.into()),
+            ),
+            (
+                "drive_element".to_string(),
+                CborValue::Integer(evidence.drive_element.into()),
+            ),
+            (
+                "drive_serial".to_string(),
+                CborValue::Text(evidence.drive_serial),
+            ),
+            (
+                "bootstrap_drive_compression".to_string(),
+                CborValue::Bool(evidence.bootstrap_drive_compression),
+            ),
+            (
+                "configured_drive_compression".to_string(),
+                CborValue::Bool(evidence.configured_drive_compression),
+            ),
+            (
+                "physical_tail".to_string(),
+                CborValue::Text(evidence.physical_tail.as_str().to_string()),
+            ),
+        ]);
+        detail.insert("identity_only".to_string(), CborValue::Bool(true));
+        self.audit.append(AuditEventRecord {
+            actor: AuditActor::local_user(),
+            source_layer: SourceLayer::Layer4,
+            operation_id: Some(input.operation_id),
+            session_id: None,
+            idempotency_key: Some(input.operation_id),
+            event: AuditEvent::TapeIdentityAdopted,
+            subject: AuditSubject {
+                kind: "tape".to_string(),
+                id: Some(tape_subject),
+            },
+            detail,
+        })?;
+
+        self.index
+            .adopt_bootstrap_identity(input, pool_id.as_str(), state, request_fingerprint)
+    }
+
     /// Return the durable calibration-control store (cloneable
     /// handle). This is the authority on wrap-map servability; it
     /// survives projection rebuild and catalog reset.
@@ -988,6 +1291,63 @@ fn tape_record_matches_provision_geometry(tape: &TapeRecord, input: &ProvisionTa
                 && tape.stripes_per_neighborhood == Some(scheme.stripes_per_neighborhood)
         }
     }
+}
+
+fn bootstrap_adoption_request_fingerprint(
+    input: &AdoptBootstrapIdentityInput,
+    evidence: &BootstrapAdoptionEvidence,
+    pool_id: &str,
+    state: AdoptedTapeState,
+    geometry: &str,
+) -> [u8; 32] {
+    fn field(hash: &mut Sha256, name: &str, value: &[u8]) {
+        hash.update((name.len() as u64).to_be_bytes());
+        hash.update(name.as_bytes());
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value);
+    }
+
+    let mut hash = Sha256::new();
+    hash.update(b"remanence.bootstrap-adoption-request.v1\0");
+    field(&mut hash, "tape_uuid", input.tape_uuid.as_slice());
+    field(&mut hash, "voltag", input.voltag.as_bytes());
+    field(&mut hash, "block_size", &input.block_size.to_be_bytes());
+    field(&mut hash, "geometry", geometry.as_bytes());
+    field(&mut hash, "pool_id", pool_id.as_bytes());
+    field(&mut hash, "state", state.as_str().as_bytes());
+    field(
+        &mut hash,
+        "library_serial",
+        evidence.library_serial.as_bytes(),
+    );
+    field(
+        &mut hash,
+        "library_revision",
+        evidence.library_revision.as_bytes(),
+    );
+    field(&mut hash, "home_slot", &evidence.home_slot.to_be_bytes());
+    field(
+        &mut hash,
+        "drive_element",
+        &evidence.drive_element.to_be_bytes(),
+    );
+    field(&mut hash, "drive_serial", evidence.drive_serial.as_bytes());
+    field(
+        &mut hash,
+        "bootstrap_drive_compression",
+        &[u8::from(evidence.bootstrap_drive_compression)],
+    );
+    field(
+        &mut hash,
+        "configured_drive_compression",
+        &[u8::from(evidence.configured_drive_compression)],
+    );
+    field(
+        &mut hash,
+        "physical_tail",
+        evidence.physical_tail.as_str().as_bytes(),
+    );
+    hash.finalize().into()
 }
 
 fn validate_catalog_reset_selectors(
@@ -2137,6 +2497,34 @@ pool_id = "camera.copy-a"
         config_text(root).replace("camera.copy-a", "camera.copy-b")
     }
 
+    fn adoption_input(operation_id: Uuid) -> AdoptBootstrapIdentityInput {
+        AdoptBootstrapIdentityInput {
+            operation_id,
+            tape_uuid: [
+                0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x46, 0x17, 0x88, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+                0x1e, 0x1f,
+            ],
+            voltag: "ACM901L9".to_string(),
+            block_size: 1024 * 1024,
+            parity: ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(
+                1024 * 1024,
+            )),
+        }
+    }
+
+    fn adoption_evidence(tail: BootstrapAdoptionTailEvidence) -> BootstrapAdoptionEvidence {
+        BootstrapAdoptionEvidence {
+            library_serial: "LIB001".to_string(),
+            library_revision: "D.00".to_string(),
+            home_slot: 0x0401,
+            drive_element: 0x0101,
+            drive_serial: "DRV001".to_string(),
+            bootstrap_drive_compression: false,
+            configured_drive_compression: false,
+            physical_tail: tail,
+        }
+    }
+
     #[test]
     fn open_from_config_file_acquires_state_owner() {
         let temp = tempfile::Builder::new()
@@ -2173,6 +2561,406 @@ pool_id = "camera.copy-a"
                 .display_name
                 .as_deref(),
             Some("Camera copy A")
+        );
+    }
+
+    #[test]
+    fn bootstrap_adoption_is_audited_identity_only_and_idempotent() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-bootstrap")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let operation_id = Uuid::new_v4();
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+
+        let first = handle
+            .adopt_bootstrap_identity(
+                adoption_input(operation_id),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect("adopt Bootstrap");
+        let second = handle
+            .adopt_bootstrap_identity(
+                adoption_input(operation_id),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect("repeat adoption");
+        let fresh_operation_id = Uuid::new_v4();
+        let mut fresh_evidence =
+            adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
+        fresh_evidence.home_slot = 0x0402;
+        let fresh_operation = handle
+            .adopt_bootstrap_identity(adoption_input(fresh_operation_id), fresh_evidence)
+            .expect("fresh operation may confirm exact identity-only adoption");
+
+        assert!(first.newly_adopted);
+        assert!(!second.newly_adopted);
+        assert!(!fresh_operation.newly_adopted);
+        assert_eq!(first.operation_id, operation_id);
+        assert_eq!(first.request_fingerprint, second.request_fingerprint);
+        assert_eq!(fresh_operation.operation_id, fresh_operation_id);
+        assert_ne!(
+            first.request_fingerprint,
+            fresh_operation.request_fingerprint
+        );
+        assert_eq!(first.assignment_generation, 1);
+        assert_eq!(first.state, AdoptedTapeState::Ready);
+        let tape = handle
+            .catalog_index()
+            .get_tape(&adoption_input(operation_id).tape_uuid)
+            .expect("lookup")
+            .expect("adopted row");
+        assert_eq!(tape.state, "ready");
+        assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
+        assert_eq!(tape.total_committed_ordinals, 0);
+        assert!(handle
+            .catalog_index()
+            .list_tape_files(&adoption_input(operation_id).tape_uuid)
+            .expect("list tape files")
+            .is_empty());
+        let records = FileAuditLog::replay(&handle.paths().audit_dir).expect("replay audit");
+        let adoption_records: Vec<_> = records
+            .iter()
+            .filter(|record| record.event == AuditEvent::TapeIdentityAdopted)
+            .collect();
+        assert_eq!(adoption_records.len(), 1);
+        assert_eq!(adoption_records[0].operation_id, Some(operation_id));
+        assert_eq!(adoption_records[0].idempotency_key, Some(operation_id));
+
+        handle
+            .catalog_index()
+            .record_media_readiness_operation(crate::index::MediaReadinessOperationInput {
+                operation_id: Uuid::new_v4(),
+                run_id: None,
+                library_serial: "LIB001".to_string(),
+                changer_sg: None,
+                drive_element: 0x0101,
+                drive_sg: None,
+                drive_serial: Some("DRV001".to_string()),
+                barcode: Some("ACM901L9".to_string()),
+                source_slot: Some(0x0401),
+                media_generation: Some(9),
+                phase: "planned".to_string(),
+                state: "planned".to_string(),
+                dirty_scope: Some("drive+tape".to_string()),
+                deadline_at_utc: None,
+                evidence_path: None,
+            })
+            .expect("record active physical operation guard");
+        let guarded = handle
+            .adopt_bootstrap_identity(
+                adoption_input(Uuid::new_v4()),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("active physical operation evidence must forbid adoption no-op");
+        assert!(guarded.to_string().contains("conflicts with existing"));
+    }
+
+    #[test]
+    fn bootstrap_adoption_recovers_audit_before_projection_crash_cut() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-crash-cut")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let operation_id = Uuid::new_v4();
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .adopt_bootstrap_identity(
+                    adoption_input(operation_id),
+                    adoption_evidence(BootstrapAdoptionTailEvidence::DataAfterBootstrap),
+                )
+                .expect("initial adoption");
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.execute(
+            "delete from tapes where tape_uuid = ?1",
+            rusqlite::params![adoption_input(operation_id).tape_uuid.to_vec()],
+        )
+        .expect("simulate missing projection");
+        drop(conn);
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let recovery_operation_id = Uuid::new_v4();
+        let outcome = handle
+            .adopt_bootstrap_identity(
+                adoption_input(recovery_operation_id),
+                adoption_evidence(BootstrapAdoptionTailEvidence::DataAfterBootstrap),
+            )
+            .expect("resume adoption");
+        assert!(!outcome.newly_adopted);
+        assert_eq!(outcome.operation_id, recovery_operation_id);
+        assert_eq!(outcome.state, AdoptedTapeState::RecoveryRequired);
+        assert_eq!(
+            handle
+                .catalog_index()
+                .get_tape(&adoption_input(operation_id).tape_uuid)
+                .expect("lookup")
+                .expect("reprojected row")
+                .state,
+            "recovery_required"
+        );
+    }
+
+    #[test]
+    fn bootstrap_adoption_replay_preserves_newer_conflicting_barcode_authority() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-replay-barcode-conflict")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let original_operation_id = Uuid::new_v4();
+        let original = adoption_input(original_operation_id);
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .adopt_bootstrap_identity(
+                    original.clone(),
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                )
+                .expect("initial adoption");
+        }
+
+        let conflicting_uuid = *Uuid::new_v4().as_bytes();
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.execute(
+            "delete from tapes where tape_uuid = ?1",
+            rusqlite::params![original.tape_uuid.to_vec()],
+        )
+        .expect("simulate missing original projection");
+        conn.execute(
+            "insert into tapes(
+               tape_uuid, voltag, pool_id, assignment_generation, kind,
+               block_size, highest_protected_ordinal, total_committed_ordinals,
+               written_extent_lba, state, updated_at_utc
+             ) values(
+               ?1, ?2, 'camera.copy-a', 2, 'data', 1048576,
+               X'0000000000000000', X'0000000000000000',
+               X'0000000000000001', 'ready', '2026-08-09T00:00:00Z'
+             )",
+            rusqlite::params![conflicting_uuid.to_vec(), original.voltag.as_str()],
+        )
+        .expect("insert newer conflicting barcode authority");
+        drop(conn);
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let error = handle
+            .adopt_bootstrap_identity(
+                adoption_input(Uuid::new_v4()),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("old adoption replay must not displace newer barcode authority");
+        assert!(error.to_string().contains("conflicts with existing"));
+
+        let conflicting = handle
+            .catalog_index()
+            .get_tape(&conflicting_uuid)
+            .expect("lookup conflicting row")
+            .expect("conflicting row remains");
+        assert_eq!(
+            conflicting.voltag.as_deref(),
+            Some(original.voltag.as_str())
+        );
+        assert_eq!(conflicting.written_extent_lba, Some(1));
+        assert!(handle
+            .catalog_index()
+            .get_tape(&original.tape_uuid)
+            .expect("lookup original projection")
+            .is_none());
+    }
+
+    #[test]
+    fn bootstrap_adoption_refuses_reused_operation_and_non_v4_identity() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-conflict")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let operation_id = Uuid::new_v4();
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+        handle
+            .adopt_bootstrap_identity(
+                adoption_input(operation_id),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect("initial adoption");
+
+        let changed = handle
+            .adopt_bootstrap_identity(
+                adoption_input(operation_id),
+                adoption_evidence(BootstrapAdoptionTailEvidence::DataAfterBootstrap),
+            )
+            .expect_err("changed tail under operation must fail");
+        assert!(changed.to_string().contains("changed immutable facts"));
+
+        let mut changed_drive =
+            adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
+        changed_drive.drive_element = 0x0102;
+        changed_drive.drive_serial = "DRV002".to_string();
+        let changed_drive = handle
+            .adopt_bootstrap_identity(adoption_input(operation_id), changed_drive)
+            .expect_err("changed drive provenance under operation must fail");
+        assert!(changed_drive
+            .to_string()
+            .contains("changed immutable facts"));
+
+        let changed_under_fresh_operation = handle
+            .adopt_bootstrap_identity(
+                adoption_input(Uuid::new_v4()),
+                adoption_evidence(BootstrapAdoptionTailEvidence::DataAfterBootstrap),
+            )
+            .expect_err("fresh operation cannot change the tail-derived catalog state");
+        assert!(changed_under_fresh_operation
+            .to_string()
+            .contains("conflicts with existing"));
+
+        let mut different_tape_same_operation = adoption_input(operation_id);
+        different_tape_same_operation.tape_uuid[15] ^= 0x01;
+        different_tape_same_operation.voltag = "ACM902L9".to_string();
+        let different_tape_same_operation = handle
+            .adopt_bootstrap_identity(
+                different_tape_same_operation,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("one operation UUID cannot bind a different tape");
+        assert!(different_tape_same_operation
+            .to_string()
+            .contains("different TapeIdentityAdopted authority"));
+
+        let mut invalid = adoption_input(Uuid::new_v4());
+        invalid.tape_uuid = [0; 16];
+        let invalid = handle
+            .adopt_bootstrap_identity(
+                invalid,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("nil identity must fail");
+        assert!(invalid.to_string().contains("UUIDv4"));
+    }
+
+    #[test]
+    fn bootstrap_adoption_refuses_after_catalog_authority_evolves() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-evolved")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let operation_id = Uuid::new_v4();
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .adopt_bootstrap_identity(
+                    adoption_input(operation_id),
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                )
+                .expect("initial adoption");
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.execute(
+            "update tapes set written_extent_lba = X'0000000000000001' where tape_uuid = ?1",
+            rusqlite::params![adoption_input(operation_id).tape_uuid.to_vec()],
+        )
+        .expect("simulate later physical prefix authority");
+        drop(conn);
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let error = handle
+            .adopt_bootstrap_identity(
+                adoption_input(Uuid::new_v4()),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("evolved prefix authority must forbid re-adoption");
+        assert!(error.to_string().contains("conflicts with existing"));
+        assert_eq!(
+            handle
+                .catalog_index()
+                .get_tape(&adoption_input(operation_id).tape_uuid)
+                .expect("lookup")
+                .expect("evolved row")
+                .written_extent_lba,
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn bootstrap_adoption_refuses_after_assignment_generation_evolves() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-generation-evolved")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        let operation_id = Uuid::new_v4();
+        {
+            let mut handle = StateHandle::open_from_config_file(&config_path).expect("open state");
+            handle
+                .adopt_bootstrap_identity(
+                    adoption_input(operation_id),
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+                )
+                .expect("initial adoption");
+        }
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.execute(
+            "update tapes set assignment_generation = 2 where tape_uuid = ?1",
+            rusqlite::params![adoption_input(operation_id).tape_uuid.to_vec()],
+        )
+        .expect("simulate later assignment authority");
+        drop(conn);
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let error = handle
+            .adopt_bootstrap_identity(
+                adoption_input(Uuid::new_v4()),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("evolved assignment generation must forbid re-adoption");
+        assert!(error.to_string().contains("assignment generation evolved"));
+    }
+
+    #[test]
+    fn bootstrap_adoption_checks_uuid_and_barcode_conflicts_across_tape_kinds() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-adopt-kind-conflict")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        {
+            StateHandle::open_from_config_file(&config_path).expect("initialize state");
+        }
+        let input = adoption_input(Uuid::new_v4());
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open sqlite");
+        conn.execute(
+            "insert into tapes(tape_uuid, voltag, kind, cleaning_uses, cleaning_state, state, updated_at_utc)
+             values(?1, ?2, 'cleaning', 0, 'unverified', 'ready', '2026-08-09T00:00:00Z')",
+            rusqlite::params![input.tape_uuid.to_vec(), input.voltag.as_str()],
+        )
+        .expect("insert conflicting cleaning identity");
+        drop(conn);
+
+        let mut handle = StateHandle::open_from_config_file(&config_path).expect("reopen state");
+        let error = handle
+            .adopt_bootstrap_identity(
+                input,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .expect_err("cleaning identity conflict must fail");
+        assert!(
+            error.to_string().contains("cleaning catalog row"),
+            "{error}"
         );
     }
 
