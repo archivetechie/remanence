@@ -203,6 +203,14 @@ pub struct TapePoolConfig {
     /// Usable capacity cap, below physical end-of-media.
     #[serde(default = "default_watermark_high")]
     pub watermark_high: f64,
+    /// Optional conservative capacity basis. When set, it must be nonzero and
+    /// strictly below each selected cartridge's detected raw capacity.
+    #[serde(
+        default,
+        rename = "capacity_cap",
+        deserialize_with = "deserialize_optional_byte_size"
+    )]
+    pub capacity_cap_bytes: Option<u64>,
     /// Fixed tape block size to record when initializing fresh tapes in this pool.
     #[serde(
         default = "default_tape_block_size",
@@ -728,6 +736,12 @@ pub fn validate_tape_pool_selection_config(pool: &TapePoolConfig) -> Result<(), 
             pool.id
         )));
     }
+    if pool.capacity_cap_bytes == Some(0) {
+        return Err(StateError::ConfigInvalid(format!(
+            "tape pool {} capacity_cap must be greater than zero",
+            pool.id
+        )));
+    }
     Ok(())
 }
 
@@ -778,6 +792,7 @@ pub fn validate_tape_pool_capacity_invariant(
     pool: &TapePoolConfig,
     capacity_bytes: u64,
 ) -> Result<(), StateError> {
+    let capacity_bytes = effective_tape_pool_capacity_bytes(pool, capacity_bytes)?;
     let low_bytes = watermark_floor_bytes(capacity_bytes, pool.watermark_low)?;
     let high_bytes = watermark_floor_bytes(capacity_bytes, pool.watermark_high)?;
     let band_bytes = high_bytes.saturating_sub(low_bytes);
@@ -788,6 +803,31 @@ pub fn validate_tape_pool_capacity_invariant(
         )));
     }
     Ok(())
+}
+
+/// Resolve the single conservative capacity basis `C` for one pool/cartridge.
+///
+/// A configured cap is deliberately downward-only. Equality and upward caps
+/// are rejected instead of being silently treated as no-ops, so a test or
+/// operator profile cannot overclaim that it exercised a reduced capacity.
+pub fn effective_tape_pool_capacity_bytes(
+    pool: &TapePoolConfig,
+    raw_capacity_bytes: u64,
+) -> Result<u64, StateError> {
+    match pool.capacity_cap_bytes {
+        None => Ok(raw_capacity_bytes),
+        Some(0) => Err(StateError::ConfigInvalid(format!(
+            "tape pool {} capacity_cap must be greater than zero",
+            pool.id
+        ))),
+        Some(capacity_cap_bytes) if capacity_cap_bytes >= raw_capacity_bytes => {
+            Err(StateError::ConfigInvalid(format!(
+                "tape pool {} capacity_cap {capacity_cap_bytes} must be strictly below detected raw capacity {raw_capacity_bytes}",
+                pool.id
+            )))
+        }
+        Some(capacity_cap_bytes) => Ok(raw_capacity_bytes.min(capacity_cap_bytes)),
+    }
 }
 
 /// Convert a capacity fraction into the byte threshold used by selection.
@@ -1445,6 +1485,7 @@ content_class = "camera"
 selection_policy = "fill-oldest"
 watermark_low = 0.90
 watermark_high = 0.95
+capacity_cap = "5TiB"
 block_size = "512KiB"
 min_object_size = "2GiB"
 
@@ -1473,6 +1514,10 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(config.tape_pools[0].watermark_low, 0.90);
         assert_eq!(config.tape_pools[0].watermark_high, 0.95);
+        assert_eq!(
+            config.tape_pools[0].capacity_cap_bytes,
+            Some(5 * 1024_u64.pow(4))
+        );
         assert_eq!(config.tape_pools[0].block_size_bytes, 512 * 1024);
         assert_eq!(
             config.tape_pools[0].min_object_size_bytes,
@@ -1598,8 +1643,34 @@ id = "camera.copy-a"
         );
         assert_eq!(pool.watermark_low, default_watermark_low());
         assert_eq!(pool.watermark_high, default_watermark_high());
+        assert_eq!(pool.capacity_cap_bytes, None);
         assert_eq!(pool.block_size_bytes, DEFAULT_TAPE_BLOCK_SIZE_BYTES);
         assert_eq!(pool.min_object_size_bytes, 0);
+    }
+
+    #[test]
+    fn capacity_cap_is_strictly_downward_and_defines_effective_c() {
+        let mut text = valid_config();
+        text.push_str("\n[[tape_pools]]\nid = \"capacity.test\"\n");
+        let config = parse_config_toml(&text).expect("default pool config");
+        let mut pool = config.tape_pools[0].clone();
+        let raw_capacity = 18_000_000_000_000;
+
+        assert_eq!(
+            effective_tape_pool_capacity_bytes(&pool, raw_capacity).expect("uncapped C"),
+            raw_capacity
+        );
+        pool.capacity_cap_bytes = Some(6_000_000_000_000);
+        assert_eq!(
+            effective_tape_pool_capacity_bytes(&pool, raw_capacity).expect("downward C"),
+            6_000_000_000_000
+        );
+        pool.capacity_cap_bytes = Some(0);
+        assert!(effective_tape_pool_capacity_bytes(&pool, raw_capacity).is_err());
+        pool.capacity_cap_bytes = Some(raw_capacity);
+        assert!(effective_tape_pool_capacity_bytes(&pool, raw_capacity).is_err());
+        pool.capacity_cap_bytes = Some(raw_capacity + 1);
+        assert!(effective_tape_pool_capacity_bytes(&pool, raw_capacity).is_err());
     }
 
     #[test]

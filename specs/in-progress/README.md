@@ -41,7 +41,7 @@ way — see the Status section of the document in question.
 
 | Document | Preparing | Published | Items closed in the preparing copy |
 | --- | --- | --- | --- |
-| REM-PARITY | 1.0.0-draft.3 | 1.0.0-draft.1 | RP-2 — length and charset bounds on writer-supplied text (§8.2, §10.4, §16.2); durable multi-record commit-authority agreement and committed-prefix clarification (§3.1, §3.4, §14, Appendix B.12) |
+| REM-PARITY | 1.0.0-draft.4 (clean replacement in progress) | 1.0.0-draft.1 | Terminal triple index: three complete final replicas, two typed separation extents, no intermediate indexes, exact close reserve, irreversible finalization/recovery authority, and manual early finalization. Candidate byte tables are in `supporting/rem-parity-terminal-index-byte-draft.md`; review-only minimal and multi-object vectors at every legal block size are under `../../fixtures/rem-parity-terminal-index-draft/`. Older bootstrap/index prose in the preparing copy is being replaced and is not compatibility authority. |
 
 REM-OBJECT and REM-ENCRYPT have no revision in preparation; their published
 copies are current.

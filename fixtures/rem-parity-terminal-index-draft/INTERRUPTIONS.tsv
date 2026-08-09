@@ -1,0 +1,17 @@
+case_id	present_components	filemarks	barriers	expected_progress	expected_next
+before-a				BeforeReplicaA	replica-a.bin
+after-a-footer	replica-a.bin			BeforeReplicaA	reconcile-replica-a
+after-a-filemark	replica-a.bin	replica-a.bin		BeforeReplicaA	reconcile-replica-a
+after-a-barrier	replica-a.bin	replica-a.bin	replica-a.bin	AfterReplicaA	gap-ab.bin
+after-gap-ab-footer	replica-a.bin,gap-ab.bin	replica-a.bin	replica-a.bin	AfterReplicaA	reconcile-gap-ab
+after-gap-ab-filemark	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	replica-a.bin	AfterReplicaA	reconcile-gap-ab
+complete-gap-before-b	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	AfterSeparationAb	replica-b.bin
+after-b-footer	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin	replica-a.bin,gap-ab.bin	AfterSeparationAb	reconcile-replica-b
+after-b-filemark	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin	AfterSeparationAb	reconcile-replica-b
+after-b-barrier	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	AfterReplicaB	gap-bc.bin
+after-gap-bc-footer	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin	replica-a.bin,gap-ab.bin,replica-b.bin	AfterReplicaB	reconcile-gap-bc
+after-gap-bc-filemark	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin	AfterReplicaB	reconcile-gap-bc
+after-gap-bc-barrier	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	AfterSeparationBc	replica-c.bin
+after-c-footer	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	AfterSeparationBc	reconcile-replica-c
+after-c-filemark	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin	AfterSeparationBc	reconcile-replica-c
+after-c-barrier	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	replica-a.bin,gap-ab.bin,replica-b.bin,gap-bc.bin,replica-c.bin	AfterReplicaC	none

@@ -1,9 +1,9 @@
 //! Filemark-map structures for Layer 3c v0.4.4.
 //!
 //! The filemark map is the structural catalog of physical tape files:
-//! object archives, parity sidecars, and bootstraps. It provides the
-//! canonical SHA-256 projection carried by bootstraps for catalog-less
-//! validation, plus local lookups from tape-file coordinates to parity
+//! object archives and structural control files. It provides the
+//! canonical SHA-256 projection used by BOT, catalog, and ParityMap authority,
+//! plus local lookups from tape-file coordinates to parity
 //! data ordinals and physical block-position hints.
 
 use ciborium::value::Value as CborValue;
@@ -14,28 +14,27 @@ use crate::error::ParityError;
 use crate::parity_map::SidecarEpochDirectory;
 use crate::raw::PhysicalPositionHint;
 
-/// Digest payload stored in bootstrap CBOR for validating a filemark-map
-/// prefix.
+/// Digest metadata for validating a filemark map or a covered prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilemarkMapDigest {
     /// SHA-256 over the canonical map projection.
     pub map_sha256: [u8; 32],
     /// Number of leading tape files covered by this digest.
-    pub tape_file_count: u32,
+    pub tape_file_count: u64,
     /// Total object-data ordinals described by the covered prefix.
     pub map_total_data_ordinals: u64,
     /// Highest object-data ordinal protected by committed sidecars in the
     /// covered prefix.
     pub highest_protected_ordinal: u64,
-    /// True only for a final bootstrap whose digest covers the whole map.
-    pub is_final_map: bool,
+    /// Whether this authority covers the complete supplied structural map.
+    pub covers_complete_map: bool,
 }
 
 /// Logical tape-file address used by the filemark map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TapeFilePosition {
     /// Filemark-delimited tape file number, dense from BOT.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Fixed-block offset inside that tape file.
     pub block_within_file: u64,
 }
@@ -52,6 +51,10 @@ pub enum TapeFileKind {
     ParityMap,
     /// Bootstrap tape file.
     Bootstrap,
+    /// Complete terminal tape-index replica.
+    TapeIndexReplica,
+    /// Typed terminal index separation extent.
+    IndexSeparationExtent,
 }
 
 impl TapeFileKind {
@@ -61,6 +64,8 @@ impl TapeFileKind {
             Self::ParitySidecar => 1,
             Self::Bootstrap => 2,
             Self::ParityMap => 3,
+            Self::TapeIndexReplica => 4,
+            Self::IndexSeparationExtent => 5,
         }
     }
 }
@@ -69,7 +74,7 @@ impl TapeFileKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TapeFileMapEntry {
     /// Dense tape-file number from BOT.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Tape-file kind.
     pub kind: TapeFileKind,
     /// Count of fixed-size data records before the trailing filemark.
@@ -84,20 +89,9 @@ pub struct TapeFileMapEntry {
     pub epoch_id: Option<u64>,
 }
 
-/// Result of appending a bootstrap tape-file entry to a
-/// [`FilemarkMapBuilder`] and computing the bootstrap digest over the map
-/// including that newly assigned entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BootstrapMapCommit {
-    /// Structural map entry assigned to the bootstrap tape file.
-    pub entry: TapeFileMapEntry,
-    /// Digest metadata to embed in that bootstrap's CBOR payload.
-    pub digest: FilemarkMapDigest,
-}
-
 impl TapeFileMapEntry {
     /// Construct an object tape-file entry.
-    pub fn object(tape_file_number: u32, block_count: u64, first_parity_data_ordinal: u64) -> Self {
+    pub fn object(tape_file_number: u64, block_count: u64, first_parity_data_ordinal: u64) -> Self {
         Self {
             tape_file_number,
             kind: TapeFileKind::Object,
@@ -111,7 +105,7 @@ impl TapeFileMapEntry {
 
     /// Construct a parity-sidecar tape-file entry.
     pub fn parity_sidecar(
-        tape_file_number: u32,
+        tape_file_number: u64,
         block_count: u64,
         epoch_id: u64,
         protected_ordinal_start: u64,
@@ -129,7 +123,7 @@ impl TapeFileMapEntry {
     }
 
     /// Construct a bootstrap tape-file entry.
-    pub fn bootstrap(tape_file_number: u32, block_count: u64) -> Self {
+    pub fn bootstrap(tape_file_number: u64, block_count: u64) -> Self {
         Self {
             tape_file_number,
             kind: TapeFileKind::Bootstrap,
@@ -142,10 +136,40 @@ impl TapeFileMapEntry {
     }
 
     /// Construct a parity-map control tape-file entry.
-    pub fn parity_map(tape_file_number: u32, block_count: u64) -> Self {
+    pub fn parity_map(tape_file_number: u64, block_count: u64) -> Self {
         Self {
             tape_file_number,
             kind: TapeFileKind::ParityMap,
+            block_count,
+            first_parity_data_ordinal: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            epoch_id: None,
+        }
+    }
+
+    /// Construct a terminal tape-index replica control-file entry.
+    pub fn tape_index_replica(tape_file_number: u64, block_count: u64) -> Self {
+        Self::structural_control(
+            tape_file_number,
+            TapeFileKind::TapeIndexReplica,
+            block_count,
+        )
+    }
+
+    /// Construct a typed terminal index separation-extent entry.
+    pub fn index_separation_extent(tape_file_number: u64, block_count: u64) -> Self {
+        Self::structural_control(
+            tape_file_number,
+            TapeFileKind::IndexSeparationExtent,
+            block_count,
+        )
+    }
+
+    fn structural_control(tape_file_number: u64, kind: TapeFileKind, block_count: u64) -> Self {
+        Self {
+            tape_file_number,
+            kind,
             block_count,
             first_parity_data_ordinal: None,
             protected_ordinal_start: None,
@@ -206,14 +230,16 @@ impl TapeFileMapEntry {
                     )));
                 }
             }
-            TapeFileKind::ParityMap => {
+            TapeFileKind::ParityMap
+            | TapeFileKind::TapeIndexReplica
+            | TapeFileKind::IndexSeparationExtent => {
                 if self.first_parity_data_ordinal.is_some()
                     || self.protected_ordinal_start.is_some()
                     || self.protected_ordinal_end_exclusive.is_some()
                     || self.epoch_id.is_some()
                 {
                     return Err(filemark_map_error(format!(
-                        "parity-map tape file {} has invalid kind-specific fields",
+                        "structural control tape file {} has invalid kind-specific fields",
                         self.tape_file_number
                     )));
                 }
@@ -233,7 +259,7 @@ impl TapeFileMapEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilemarkMap {
     entries: Vec<TapeFileMapEntry>,
-    tape_file_count: u32,
+    tape_file_count: u64,
 }
 
 impl FilemarkMap {
@@ -266,7 +292,7 @@ impl FilemarkMap {
     }
 
     /// Number of tape files in the map.
-    pub fn tape_file_count(&self) -> u32 {
+    pub fn tape_file_count(&self) -> u64 {
         self.tape_file_count
     }
 
@@ -290,7 +316,7 @@ impl FilemarkMap {
 
     /// Return a validated prefix containing the first `tape_file_count`
     /// entries.
-    pub fn truncate_to_tape_files(&self, tape_file_count: u32) -> Result<Self, ParityError> {
+    pub fn truncate_to_tape_files(&self, tape_file_count: u64) -> Result<Self, ParityError> {
         let end = usize::try_from(tape_file_count).map_err(|_| {
             filemark_map_error(format!(
                 "prefix tape_file_count {tape_file_count} does not fit usize"
@@ -336,14 +362,14 @@ impl FilemarkMap {
         Ok(digest.into())
     }
 
-    /// Build the bootstrap digest metadata for this map or prefix.
-    pub fn digest(&self, is_final_map: bool) -> Result<FilemarkMapDigest, ParityError> {
+    /// Build digest metadata for this map or prefix.
+    pub fn digest(&self, covers_complete_map: bool) -> Result<FilemarkMapDigest, ParityError> {
         Ok(FilemarkMapDigest {
             map_sha256: self.canonical_digest()?,
             tape_file_count: self.tape_file_count(),
             map_total_data_ordinals: self.total_data_ordinals(),
             highest_protected_ordinal: self.max_sidecar_end_exclusive(),
-            is_final_map,
+            covers_complete_map,
         })
     }
 
@@ -401,13 +427,20 @@ impl FilemarkMap {
             )));
         }
 
-        let prefix_blocks_and_filemarks = self.entries[..position.tape_file_number as usize]
-            .iter()
-            .try_fold(0u64, |acc, prior| {
-                acc.checked_add(prior.block_count)
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or_else(|| filemark_map_error("physical position overflows u64"))
-            })?;
+        let tape_file_index = usize::try_from(position.tape_file_number).map_err(|_| {
+            filemark_map_error(format!(
+                "tape file {} does not fit the host lookup domain",
+                position.tape_file_number
+            ))
+        })?;
+        let prefix_blocks_and_filemarks =
+            self.entries[..tape_file_index]
+                .iter()
+                .try_fold(0u64, |acc, prior| {
+                    acc.checked_add(prior.block_count)
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or_else(|| filemark_map_error("physical position overflows u64"))
+                })?;
         let lba = prefix_blocks_and_filemarks
             .checked_add(position.block_within_file)
             .ok_or_else(|| filemark_map_error("physical position overflows u64"))?;
@@ -428,9 +461,14 @@ impl FilemarkMap {
         Ok(PhysicalPositionHint::new(lba))
     }
 
-    fn entry(&self, tape_file_number: u32) -> Result<&TapeFileMapEntry, ParityError> {
+    fn entry(&self, tape_file_number: u64) -> Result<&TapeFileMapEntry, ParityError> {
+        let index = usize::try_from(tape_file_number).map_err(|_| {
+            filemark_map_error(format!(
+                "tape file {tape_file_number} does not fit the host lookup domain"
+            ))
+        })?;
         self.entries
-            .get(tape_file_number as usize)
+            .get(index)
             .filter(|entry| entry.tape_file_number == tape_file_number)
             .ok_or_else(|| {
                 filemark_map_error(format!(
@@ -440,14 +478,21 @@ impl FilemarkMap {
     }
 }
 
-fn checked_tape_file_count(entry_count: usize) -> Result<u32, ParityError> {
-    u32::try_from(entry_count).map_err(|_| filemark_map_error("tape file count exceeds u32::MAX"))
+/// Canonical key-2 digest carried by the sole parity-enabled BOT Bootstrap.
+pub fn sole_bot_filemark_map_digest() -> Result<FilemarkMapDigest, ParityError> {
+    FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])?.digest(false)
+}
+
+fn checked_tape_file_count(entry_count: usize) -> Result<u64, ParityError> {
+    u64::try_from(entry_count).map_err(|_| filemark_map_error("tape file count exceeds u64::MAX"))
 }
 
 /// Incremental builder used by writers and tests as tape files are emitted.
 #[derive(Clone, Debug, Default)]
 pub struct FilemarkMapBuilder {
     entries: Vec<TapeFileMapEntry>,
+    base_tape_file_count: u64,
+    base_total_data_ordinals: u64,
 }
 
 impl FilemarkMapBuilder {
@@ -474,11 +519,45 @@ impl FilemarkMapBuilder {
     pub fn from_committed_prefix(prefix: &FilemarkMap) -> Self {
         Self {
             entries: prefix.entries.clone(),
+            base_tape_file_count: 0,
+            base_total_data_ordinals: 0,
         }
+    }
+
+    /// Seed an append-only builder from bounded replay scalars.
+    pub fn from_bounded_prefix(tape_file_count: u64, total_data_ordinals: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            base_tape_file_count: tape_file_count,
+            base_total_data_ordinals: total_data_ordinals,
+        }
+    }
+
+    /// Total prefix plus live-session structural row count.
+    pub fn tape_file_count(&self) -> Result<u64, ParityError> {
+        self.base_tape_file_count
+            .checked_add(checked_tape_file_count(self.entries.len())?)
+            .ok_or_else(|| filemark_map_error("tape file count overflows u64"))
+    }
+
+    /// Borrow live-session entries beginning at an absolute tape-file number.
+    pub fn session_entries_from(
+        &self,
+        tape_file_number: u64,
+    ) -> Result<&[TapeFileMapEntry], ParityError> {
+        let offset = tape_file_number
+            .checked_sub(self.base_tape_file_count)
+            .ok_or_else(|| filemark_map_error("requested row precedes bounded session base"))?;
+        let offset = usize::try_from(offset)
+            .map_err(|_| filemark_map_error("session row offset does not fit usize"))?;
+        self.entries
+            .get(offset..)
+            .ok_or_else(|| filemark_map_error("session row offset exceeds live rows"))
     }
 
     /// Append an object tape file and return its assigned map entry.
     pub fn push_object(&mut self, block_count: u64) -> Result<TapeFileMapEntry, ParityError> {
+        self.require_bot_authority()?;
         let tape_file_number = self.next_tape_file_number()?;
         let first_ordinal = self.current_total_data_ordinals()?;
         let entry = TapeFileMapEntry::object(tape_file_number, block_count, first_ordinal);
@@ -495,6 +574,7 @@ impl FilemarkMapBuilder {
         protected_ordinal_start: u64,
         protected_ordinal_end_exclusive: u64,
     ) -> Result<TapeFileMapEntry, ParityError> {
+        self.require_bot_authority()?;
         let tape_file_number = self.next_tape_file_number()?;
         let entry = TapeFileMapEntry::parity_sidecar(
             tape_file_number,
@@ -508,13 +588,13 @@ impl FilemarkMapBuilder {
         Ok(entry)
     }
 
-    /// Append a bootstrap tape file and return its assigned map entry.
-    ///
-    /// This is useful for reconstructing existing maps. Writer code that is
-    /// about to encode a bootstrap should use
-    /// [`Self::push_bootstrap_and_digest`] so the bootstrap carries a digest
-    /// over the map including its own entry.
+    /// Append the sole tape-file-0 BOT Bootstrap map entry.
     pub fn push_bootstrap(&mut self) -> Result<TapeFileMapEntry, ParityError> {
+        if self.base_tape_file_count != 0 || !self.entries.is_empty() {
+            return Err(filemark_map_error(
+                "schema-major 2 permits a Bootstrap only as tape file 0",
+            ));
+        }
         let tape_file_number = self.next_tape_file_number()?;
         let entry = TapeFileMapEntry::bootstrap(tape_file_number, 1);
         entry.validate()?;
@@ -524,6 +604,7 @@ impl FilemarkMapBuilder {
 
     /// Append a parity-map control tape file and return its assigned map entry.
     pub fn push_parity_map(&mut self, block_count: u64) -> Result<TapeFileMapEntry, ParityError> {
+        self.require_bot_authority()?;
         let tape_file_number = self.next_tape_file_number()?;
         let entry = TapeFileMapEntry::parity_map(tape_file_number, block_count);
         entry.validate()?;
@@ -531,29 +612,30 @@ impl FilemarkMapBuilder {
         Ok(entry)
     }
 
-    /// Append a bootstrap tape file and compute the digest that bootstrap
-    /// must carry.
-    ///
-    /// Layer 3c v0.4.4 §7.3.1 requires a bootstrap's filemark-map digest to
-    /// include the bootstrap's own structural entry. This method makes that
-    /// order explicit: it assigns the next tape-file number, validates the
-    /// resulting map prefix, computes the digest over that prefix, and only
-    /// then commits the new entry to the builder.
-    pub fn push_bootstrap_and_digest(
+    /// Append a terminal tape-index replica and return its assigned map entry.
+    pub fn push_tape_index_replica(
         &mut self,
-        is_final_map: bool,
-    ) -> Result<BootstrapMapCommit, ParityError> {
+        block_count: u64,
+    ) -> Result<TapeFileMapEntry, ParityError> {
+        self.require_bot_authority()?;
         let tape_file_number = self.next_tape_file_number()?;
-        let entry = TapeFileMapEntry::bootstrap(tape_file_number, 1);
+        let entry = TapeFileMapEntry::tape_index_replica(tape_file_number, block_count);
         entry.validate()?;
+        self.entries.push(entry.clone());
+        Ok(entry)
+    }
 
-        let mut entries = self.entries.clone();
-        entries.push(entry.clone());
-        let map = FilemarkMap::new(entries.clone())?;
-        let digest = map.digest(is_final_map)?;
-        self.entries = entries;
-
-        Ok(BootstrapMapCommit { entry, digest })
+    /// Append a typed terminal index separation extent.
+    pub fn push_index_separation_extent(
+        &mut self,
+        block_count: u64,
+    ) -> Result<TapeFileMapEntry, ParityError> {
+        self.require_bot_authority()?;
+        let tape_file_number = self.next_tape_file_number()?;
+        let entry = TapeFileMapEntry::index_separation_extent(tape_file_number, block_count);
+        entry.validate()?;
+        self.entries.push(entry.clone());
+        Ok(entry)
     }
 
     /// Compute the digest for the current map plus already-numbered
@@ -565,11 +647,16 @@ impl FilemarkMapBuilder {
     pub fn projected_digest(
         &self,
         provisional_entries: &[TapeFileMapEntry],
-        is_final_map: bool,
+        covers_complete_map: bool,
     ) -> Result<FilemarkMapDigest, ParityError> {
+        if self.base_tape_file_count != 0 {
+            return Err(filemark_map_error(
+                "bounded-prefix digest requires journal replay authority",
+            ));
+        }
         let mut entries = self.entries.clone();
         entries.extend_from_slice(provisional_entries);
-        FilemarkMap::new(entries)?.digest(is_final_map)
+        FilemarkMap::new(entries)?.digest(covers_complete_map)
     }
 
     /// Finish into a validated [`FilemarkMap`].
@@ -578,37 +665,57 @@ impl FilemarkMapBuilder {
     }
 
     /// Next tape-file number that would be assigned by an append operation.
-    pub fn next_tape_file_number(&self) -> Result<u32, ParityError> {
-        u32::try_from(self.entries.len())
-            .map_err(|_| filemark_map_error("tape file count exceeds u32::MAX"))
+    pub fn next_tape_file_number(&self) -> Result<u64, ParityError> {
+        self.tape_file_count()
     }
 
     fn current_total_data_ordinals(&self) -> Result<u64, ParityError> {
-        self.entries.iter().try_fold(0u64, |total, entry| {
-            if entry.kind == TapeFileKind::Object {
-                total.checked_add(entry.block_count).ok_or_else(|| {
-                    filemark_map_error("total data ordinals overflow while building map")
-                })
-            } else {
-                Ok(total)
-            }
-        })
+        self.entries
+            .iter()
+            .try_fold(self.base_total_data_ordinals, |total, entry| {
+                if entry.kind == TapeFileKind::Object {
+                    total.checked_add(entry.block_count).ok_or_else(|| {
+                        filemark_map_error("total data ordinals overflow while building map")
+                    })
+                } else {
+                    Ok(total)
+                }
+            })
+    }
+
+    fn require_bot_authority(&self) -> Result<(), ParityError> {
+        if self.base_tape_file_count > 0 {
+            return Ok(());
+        }
+        if matches!(
+            self.entries.first(),
+            Some(entry)
+                if entry.tape_file_number == 0
+                    && entry.kind == TapeFileKind::Bootstrap
+                    && entry.block_count == 1
+        ) {
+            Ok(())
+        } else {
+            Err(filemark_map_error(
+                "schema-major 2 writers must commit the sole tape-file-0 BOT Bootstrap before body files",
+            ))
+        }
     }
 }
 
-/// Filemark map plus the authenticated recovery scope.
+/// Filemark map plus its digest-checked recovery scope.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopedFilemarkMap {
     /// Full catalog or scan-reconstructed map. In the prefix case, suffix
     /// entries are navigational only and not authoritative.
     pub map: FilemarkMap,
     /// `None` means the full map is validated; `Some(n)` means only tape
-    /// files `0..n` were authenticated by the bootstrap digest.
-    pub validated_prefix_tape_files: Option<u32>,
-    /// Recovery scope carried by the catalog or bootstrap digest.
+    /// files `0..n` were validated by the selected digest authority.
+    pub validated_prefix_tape_files: Option<u64>,
+    /// Recovery scope carried by the selected catalog or on-media authority.
     pub scope: MapScope,
-    /// Authoritative sidecar epoch directory, when one was available from the
-    /// bootstrap. REM-PARITY 13.3 step 3 uses it to locate and validate a
+    /// Authoritative sidecar epoch directory, when one was available from a
+    /// ParityMap. REM-PARITY 13.3 step 3 uses it to locate and validate a
     /// sidecar's tail metadata copy when both the primary header and the footer
     /// are lost; without it that rescue is not possible and the epoch is
     /// declared metadata-unavailable.
@@ -637,12 +744,12 @@ impl ScopedFilemarkMap {
         self
     }
 
-    /// Validate a scan-reconstructed map against a bootstrap digest.
+    /// Validate a scan-reconstructed map against digest authority.
     pub fn validate_against_digest(
         full_map: FilemarkMap,
         digest: &FilemarkMapDigest,
     ) -> Result<Self, ParityError> {
-        let validated = if digest.is_final_map {
+        let validated = if digest.covers_complete_map {
             full_map.clone()
         } else {
             full_map.truncate_to_tape_files(digest.tape_file_count)?
@@ -658,7 +765,7 @@ impl ScopedFilemarkMap {
             });
         }
 
-        let (validated_prefix_tape_files, scope) = if digest.is_final_map {
+        let (validated_prefix_tape_files, scope) = if digest.covers_complete_map {
             (
                 None,
                 MapScope::Complete {
@@ -683,8 +790,8 @@ impl ScopedFilemarkMap {
         })
     }
 
-    /// Whether a tape-file number is inside the authenticated prefix.
-    pub fn is_validated(&self, tape_file_number: u32) -> bool {
+    /// Whether a tape-file number is inside the digest-checked prefix.
+    pub fn is_validated(&self, tape_file_number: u64) -> bool {
         match self.validated_prefix_tape_files {
             None => true,
             Some(prefix) => tape_file_number < prefix,
@@ -692,17 +799,17 @@ impl ScopedFilemarkMap {
     }
 }
 
-/// Authenticated recovery scope for a filemark map.
+/// Digest-checked recovery scope for a filemark map.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MapScope {
-    /// Whole-map scope from a catalog map or final bootstrap.
+    /// Whole-map scope from a catalog or complete ParityMap authority.
     Complete {
         /// Highest protected ordinal.
         highest_protected_ordinal: u64,
     },
-    /// Prefix scope from an intermediate bootstrap.
+    /// Prefix scope from a bounded digest authority.
     Prefix {
-        /// Total object-data ordinals named by the authenticated prefix.
+        /// Total object-data ordinals named by the digest-checked prefix.
         map_total_data_ordinals: u64,
         /// Highest protected ordinal.
         highest_protected_ordinal: u64,
@@ -751,10 +858,20 @@ impl MapScope {
 }
 
 fn validate_entries(entries: &[TapeFileMapEntry]) -> Result<(), ParityError> {
+    let Some(bot) = entries.first() else {
+        return Err(filemark_map_error(
+            "schema-major 2 filemark maps require the sole tape-file-0 BOT Bootstrap",
+        ));
+    };
+    if bot.tape_file_number != 0 || bot.kind != TapeFileKind::Bootstrap || bot.block_count != 1 {
+        return Err(filemark_map_error(
+            "schema-major 2 filemark maps require a one-block Bootstrap at tape file 0",
+        ));
+    }
     let mut next_object_ordinal = 0u64;
     for (index, entry) in entries.iter().enumerate() {
-        let expected_file_number = u32::try_from(index)
-            .map_err(|_| filemark_map_error("tape file count exceeds u32::MAX"))?;
+        let expected_file_number = u64::try_from(index)
+            .map_err(|_| filemark_map_error("tape file count exceeds u64::MAX"))?;
         if entry.tape_file_number != expected_file_number {
             return Err(filemark_map_error(format!(
                 "tape file numbers must be dense from 0: expected {expected_file_number}, got {}",
@@ -763,6 +880,11 @@ fn validate_entries(entries: &[TapeFileMapEntry]) -> Result<(), ParityError> {
         }
 
         entry.validate()?;
+        if index != 0 && entry.kind == TapeFileKind::Bootstrap {
+            return Err(filemark_map_error(
+                "schema-major 2 filemark maps forbid Bootstrap outside tape file 0",
+            ));
+        }
         if entry.kind == TapeFileKind::Object {
             let first = entry
                 .first_parity_data_ordinal
@@ -828,7 +950,7 @@ mod tests {
             TapeFileMapEntry::object(1, 3, 0),
             TapeFileMapEntry::parity_sidecar(2, 2, 7, 0, 3),
             TapeFileMapEntry::object(3, 2, 3),
-            TapeFileMapEntry::bootstrap(4, 1),
+            TapeFileMapEntry::parity_map(4, 1),
         ];
         let ordered = FilemarkMap::new(entries.clone()).expect("ordered map validates");
         let unordered = FilemarkMap::from_unordered_entries(vec![
@@ -872,6 +994,27 @@ mod tests {
     }
 
     #[test]
+    fn map_requires_exactly_one_sole_bot_bootstrap() {
+        let missing = FilemarkMap::new(vec![TapeFileMapEntry::object(0, 1, 0)])
+            .expect_err("missing BOT Bootstrap must fail");
+        assert!(missing.to_string().contains("one-block Bootstrap"));
+
+        let nonzero = FilemarkMap::new(vec![
+            TapeFileMapEntry::object(0, 1, 0),
+            TapeFileMapEntry::bootstrap(1, 1),
+        ])
+        .expect_err("nonzero Bootstrap must fail");
+        assert!(nonzero.to_string().contains("one-block Bootstrap"));
+
+        let duplicate = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::bootstrap(1, 1),
+        ])
+        .expect_err("duplicate Bootstrap must fail");
+        assert!(duplicate.to_string().contains("forbid Bootstrap"));
+    }
+
+    #[test]
     fn builder_assigns_object_ordinals_and_tape_file_numbers() {
         let mut builder = FilemarkMapBuilder::new();
         assert_eq!(builder.push_bootstrap().unwrap().tape_file_number, 0);
@@ -892,16 +1035,82 @@ mod tests {
 
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn tape_file_count_rejects_a_count_that_cannot_be_authenticated_as_u32() {
+    fn tape_file_count_preserves_values_beyond_u32() {
         let entry_count =
             usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit usize represents u32::MAX + 1");
-        let err = checked_tape_file_count(entry_count).unwrap_err();
+        assert_eq!(
+            checked_tape_file_count(entry_count).expect("u64 count preserves the full usize value"),
+            u64::from(u32::MAX) + 1
+        );
+    }
 
-        match err {
-            ParityError::FilemarkMapReconstruct(message) => {
-                assert!(message.contains("exceeds u32::MAX"), "{message}");
-            }
-            other => panic!("expected filemark map error, got {other:?}"),
+    #[test]
+    fn terminal_structural_kinds_have_stable_codes_and_no_ordinal_fields() {
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::tape_index_replica(1, 3),
+            TapeFileMapEntry::index_separation_extent(2, 4),
+        ])
+        .expect("terminal structural kinds validate");
+
+        assert_eq!(TapeFileKind::TapeIndexReplica.projection_code(), 4);
+        assert_eq!(TapeFileKind::IndexSeparationExtent.projection_code(), 5);
+        for entry in &map.entries()[1..] {
+            assert_eq!(entry.first_parity_data_ordinal, None);
+            assert_eq!(entry.protected_ordinal_start, None);
+            assert_eq!(entry.protected_ordinal_end_exclusive, None);
+            assert_eq!(entry.epoch_id, None);
+        }
+        assert_eq!(map.tape_file_count(), 3);
+        assert_eq!(
+            map.ordinal_at(TapeFilePosition {
+                tape_file_number: 2,
+                block_within_file: 0,
+            })
+            .expect("terminal control lookup"),
+            None
+        );
+
+        let mut builder = FilemarkMapBuilder::new();
+        builder.push_bootstrap().expect("BOT Bootstrap");
+        assert_eq!(
+            builder.push_tape_index_replica(3).expect("replica entry"),
+            TapeFileMapEntry::tape_index_replica(1, 3)
+        );
+        assert_eq!(
+            builder
+                .push_index_separation_extent(4)
+                .expect("separation entry"),
+            TapeFileMapEntry::index_separation_extent(2, 4)
+        );
+
+        let mut invalid = TapeFileMapEntry::tape_index_replica(0, 2);
+        invalid.first_parity_data_ordinal = Some(0);
+        assert!(
+            FilemarkMap::new(vec![invalid]).is_err(),
+            "terminal structural kinds must reject Object ordinal fields"
+        );
+    }
+
+    #[test]
+    fn u64_tape_file_lookup_boundaries_fail_closed_without_narrowing() {
+        let map = sample_map();
+        for tape_file_number in [
+            u64::from(u32::MAX) + 1,
+            (1u64 << 53) + 1,
+            i64::MAX as u64 + 1,
+            u64::MAX,
+        ] {
+            let error = map
+                .ordinal_at(TapeFilePosition {
+                    tape_file_number,
+                    block_within_file: 0,
+                })
+                .expect_err("out-of-map u64 file identity must reject");
+            assert!(
+                matches!(error, ParityError::FilemarkMapReconstruct(_)),
+                "unexpected error for tape file {tape_file_number}: {error}"
+            );
         }
     }
 
@@ -912,7 +1121,6 @@ mod tests {
             TapeFileMapEntry::parity_map(1, 3),
             TapeFileMapEntry::object(2, 2, 0),
             TapeFileMapEntry::parity_sidecar(3, 5, 0, 0, 2),
-            TapeFileMapEntry::bootstrap(4, 1),
         ])
         .expect("parity-map structural entry validates");
 
@@ -949,23 +1157,37 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_commit_digest_includes_its_own_map_entry() {
+    fn sole_bot_builder_rejects_a_later_bootstrap() {
         let mut builder = FilemarkMapBuilder::new();
         builder.push_bootstrap().unwrap();
         builder.push_object(3).unwrap();
-        let pre_bootstrap_digest = builder.clone().build().unwrap().digest(false).unwrap();
+        let error = builder
+            .push_bootstrap()
+            .expect_err("a later Bootstrap must be rejected");
+        assert!(error.to_string().contains("only as tape file 0"));
+    }
 
-        let commit = builder.push_bootstrap_and_digest(false).unwrap();
+    #[test]
+    fn builder_requires_bot_before_body_and_bounded_append_cannot_add_bootstrap() {
+        let mut fresh = FilemarkMapBuilder::new();
+        for error in [
+            fresh.push_object(1).unwrap_err(),
+            fresh.push_parity_map(1).unwrap_err(),
+            fresh.push_tape_index_replica(1).unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("before body files"), "{error}");
+        }
 
-        assert_eq!(commit.entry, TapeFileMapEntry::bootstrap(2, 1));
-        assert!(!commit.digest.is_final_map);
-        assert_eq!(commit.digest.tape_file_count, 3);
-        assert_eq!(commit.digest.map_total_data_ordinals, 3);
-        assert_eq!(commit.digest.highest_protected_ordinal, 0);
-        assert_ne!(commit.digest.map_sha256, pre_bootstrap_digest.map_sha256);
-
-        let committed_map = builder.build().unwrap();
-        assert_eq!(commit.digest, committed_map.digest(false).unwrap());
+        let mut append = FilemarkMapBuilder::from_bounded_prefix(7, 11);
+        let object = append
+            .push_object(2)
+            .expect("nonempty bounded prefix carries BOT authority");
+        assert_eq!(object.tape_file_number, 7);
+        assert_eq!(object.first_parity_data_ordinal, Some(11));
+        let error = append
+            .push_bootstrap()
+            .expect_err("bounded append must never emit another Bootstrap");
+        assert!(error.to_string().contains("only as tape file 0"), "{error}");
     }
 
     #[test]
@@ -974,29 +1196,13 @@ mod tests {
 
         let mut builder = FilemarkMapBuilder::new();
         builder.push_bootstrap().unwrap();
-        builder.push_object(3).unwrap();
-        builder.push_parity_sidecar(2, 7, 0, 3).unwrap();
+        let map = builder.build().unwrap();
+        let digest = map.digest(false).unwrap();
 
-        let final_commit = builder.push_bootstrap_and_digest(true).unwrap();
-        assert_eq!(final_commit.entry, TapeFileMapEntry::bootstrap(3, 1));
-        assert!(final_commit.digest.is_final_map);
-        assert_eq!(final_commit.digest.tape_file_count, 4);
-
-        let map_after_final_bootstrap = builder.build().unwrap();
-        assert_eq!(
-            final_commit.digest,
-            map_after_final_bootstrap.digest(true).unwrap()
-        );
-
-        let payload_a = bootstrap_payload(
-            final_commit.digest.clone(),
-            3,
-            "writer-a",
-            "2026-05-23T03:15:00Z",
-        );
+        let payload_a = bootstrap_payload(digest.clone(), 0, "writer-a", "2026-05-23T03:15:00Z");
         let payload_b = bootstrap_payload(
-            final_commit.digest.clone(),
-            4,
+            digest.clone(),
+            0,
             "writer-b-with-different-cbor",
             "2026-05-23T03:16:00Z",
         );
@@ -1013,18 +1219,9 @@ mod tests {
 
         let parsed_a = parse_bootstrap_block(&block_a).unwrap();
         let parsed_b = parse_bootstrap_block(&block_b).unwrap();
-        assert_eq!(
-            parsed_a.filemark_map_digest,
-            Some(final_commit.digest.clone())
-        );
-        assert_eq!(
-            parsed_b.filemark_map_digest,
-            Some(final_commit.digest.clone())
-        );
-        assert_eq!(
-            map_after_final_bootstrap.canonical_digest().unwrap(),
-            final_commit.digest.map_sha256
-        );
+        assert_eq!(parsed_a.filemark_map_digest, Some(digest.clone()));
+        assert_eq!(parsed_b.filemark_map_digest, Some(digest.clone()));
+        assert_eq!(map.canonical_digest().unwrap(), digest.map_sha256);
     }
 
     #[test]
@@ -1033,7 +1230,7 @@ mod tests {
             TapeFileMapEntry::bootstrap(0, 1),
             TapeFileMapEntry::object(1, 5, 0),
             TapeFileMapEntry::parity_sidecar(2, 2, 0, 0, 3),
-            TapeFileMapEntry::bootstrap(3, 1),
+            TapeFileMapEntry::parity_map(3, 1),
         ])
         .expect("open-epoch map validates");
         let digest = map.digest(true).unwrap();
@@ -1183,7 +1380,11 @@ mod tests {
 
     #[test]
     fn map_rejects_non_dense_tape_file_numbers() {
-        let err = FilemarkMap::new(vec![TapeFileMapEntry::object(1, 3, 0)]).unwrap_err();
+        let err = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(2, 3, 0),
+        ])
+        .unwrap_err();
         match err {
             ParityError::FilemarkMapReconstruct(message) => {
                 assert!(message.contains("dense from 0"), "{message}");
@@ -1198,7 +1399,7 @@ mod tests {
 
     fn bootstrap_payload(
         digest: FilemarkMapDigest,
-        sequence: u32,
+        sequence: u64,
         written_by_version: &str,
         written_at: &str,
     ) -> BootstrapPayload {
@@ -1218,9 +1419,6 @@ mod tests {
             sequence,
             block_size_bytes: 512,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         }
     }
 }

@@ -2,75 +2,75 @@
   "report_version": 1,
   "tape_uuid": "524d444c-3121-4a3f-be0f-82988dc40335",
   "block_size_bytes": 262144,
-  "data_mib": 512,
-  "data_bytes": 536870912,
+  "data_mib": "512",
+  "data_bytes": "536870912",
   "damage_plan": "combined",
   "faulted_blocks": [
     {
-      "lba": 1030,
+      "lba": "1030",
       "role": "sidecar_head"
     },
     {
-      "lba": 3082,
-      "role": "checkpoint_bootstrap"
+      "lba": "3082",
+      "role": "terminal_replica_c"
     },
     {
-      "lba": 3085,
+      "lba": "3085",
       "role": "object_span"
     },
     {
-      "lba": 3086,
+      "lba": "3086",
       "role": "object_span"
     },
     {
-      "lba": 3087,
+      "lba": "3087",
       "role": "object_span"
     },
     {
-      "lba": 3088,
+      "lba": "3088",
       "role": "object_span"
     }
   ],
   "observed_fault_lbas": [
-    1030,
-    3082,
-    3085,
-    3086,
-    3087,
-    3088
+    "1030",
+    "3082",
+    "3085",
+    "3086",
+    "3087",
+    "3088"
   ],
   "scan": {
-    "bootstrap_generation_used": 2,
-    "bootstrap_tape_file_number": 6,
-    "overlay_source": "bootstrap_inline_directory",
-    "retyping_performed": true,
+    "bootstrap_generation_used": "0",
+    "bootstrap_tape_file_number": "0",
+    "overlay_source": "terminal_index_replica_b",
+    "terminal_replica_fallback_performed": true,
     "damaged_regions": [
       {
-        "start_lba": 1030,
-        "block_count": 1,
+        "start_lba": "1030",
+        "block_count": "1",
         "kind": "unreadable_tape_file_head"
       },
       {
-        "start_lba": 3082,
-        "block_count": 1,
-        "kind": "unreadable_tape_file_head"
+        "start_lba": "3082",
+        "block_count": "1",
+        "kind": "invalid_terminal_control"
       }
     ]
   },
-  "blocks_reconstructed": 4,
+  "blocks_reconstructed": "4",
   "objects": {
-    "total": 2,
-    "verified": 2,
-    "failed": 0,
+    "total": "2",
+    "verified": "2",
+    "failed": "0",
     "failures": []
   },
   "expectations_met": true,
   "expectation_failures": [],
   "wall_clock_ms": {
-    "write": 8072,
-    "damage": 5,
-    "recovery": 1016,
-    "total": 9094
+    "write": "8072",
+    "damage": "5",
+    "recovery": "1016",
+    "total": "9094"
   },
   "success": true
 }

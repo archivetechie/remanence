@@ -82,6 +82,7 @@ mod pool_write;
 pub mod read_core;
 mod read_plan;
 mod tape_init;
+mod terminal_fault;
 mod write_owner;
 
 pub use library::LibraryServiceApi;
@@ -92,9 +93,9 @@ pub use pool_write::{
     seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
     verify_tape_identity, write_object_to_pool_checkpointed, write_tape_bootstrap,
     write_to_selected_tape_checkpointed, LtoGen, PoolWriteError, PoolWriteObjectCopyRecord,
-    PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult, SelectTapeError, SelectedTape,
-    StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid,
-    WritabilityError, WriteObjectSource, WriteObjectToPoolRequest,
+    PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResources, PoolWriteResult,
+    SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
+    TapeSealReason, TapeUuid, WritabilityError, WriteObjectSource, WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
@@ -115,6 +116,8 @@ type BytesChunkStream =
     Pin<Box<dyn Stream<Item = Result<pb::BytesChunk, Status>> + Send + 'static>>;
 type AuditEntryStream =
     Pin<Box<dyn Stream<Item = Result<pb::AuditEntry, Status>> + Send + 'static>>;
+type TapeInventoryItemStream =
+    Pin<Box<dyn Stream<Item = Result<pb::TapeInventoryStreamItem, Status>> + Send + 'static>>;
 
 fn tape_io_runtime_config(config: &TapeIoConfig) -> remanence_library::TapeIoRuntimeConfig {
     remanence_library::TapeIoRuntimeConfig {
@@ -777,6 +780,7 @@ impl ApiState {
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
         crate::mount::register_startup_seated_cartridges(&state, &report);
+        crate::mount::spawn_startup_automatic_terminal_recoveries(state.clone());
         spawn_drive_collection_workers(
             index_path,
             report,
@@ -2249,9 +2253,43 @@ fn replay_checkpoint_journal_projections(
             .map_err(status_from_state_error)?;
         let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
             .map_err(status_from_state_error)?;
-        for record in journal.replay().map_err(status_from_state_error)? {
+        let pending_intent = journal
+            .terminal_finalization_intent()
+            .map_err(status_from_state_error)?;
+        let (records, pending_intent) = if pending_intent.is_some() {
+            let mut lease = journal
+                .acquire_exclusive_for_terminal_recovery()
+                .map_err(status_from_state_error)?;
+            let authority = lease
+                .replay_for_terminal_recovery()
+                .map_err(status_from_state_error)?;
+            (authority.records, authority.finalization_intent)
+        } else {
+            (journal.replay().map_err(status_from_state_error)?, None)
+        };
+        for record in records {
             index
                 .project_checkpoint_record(&record)
+                .map_err(status_from_state_error)?;
+        }
+        if let Some(intent) = pending_intent {
+            let operation_id = intent
+                .manual
+                .as_ref()
+                .map(|manual| Uuid::from_bytes(manual.operation_id));
+            index
+                .project_terminal_finalization(
+                    remanence_state::TerminalFinalizationProjectionInput {
+                        tape_uuid,
+                        trigger: intent.trigger,
+                        operation_id,
+                        progress: intent.progress,
+                        edition_digest: intent.edition_digest,
+                        layout_digest: intent.layout.layout_digest,
+                        outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+                        updated_at_utc: None,
+                    },
+                )
                 .map_err(status_from_state_error)?;
         }
     }
@@ -2516,6 +2554,28 @@ impl pb::catalog_server::Catalog for CatalogService {
         Ok(Response::new(tape_to_proto_with_rollups(tape, rollups)))
     }
 
+    type GetTapeInventoryStream = TapeInventoryItemStream;
+
+    async fn get_tape_inventory(
+        &self,
+        request: Request<pb::TapeInventoryRequest>,
+    ) -> Result<Response<Self::GetTapeInventoryStream>, Status> {
+        authorize_request(&request, AuthPermission::ReadTape)?;
+        let tape_uuid = decode_uuid_bytes(request.into_inner().tape_uuid.as_slice(), "tape_uuid")?;
+        let inventory = crate::mount::tape_inventory(&self.state, tape_uuid).await?;
+        Ok(Response::new(Box::pin(inventory)))
+    }
+
+    async fn verify_tape_index(
+        &self,
+        request: Request<pb::VerifyTapeIndexRequest>,
+    ) -> Result<Response<pb::TapeIndexVerification>, Status> {
+        authorize_request(&request, AuthPermission::ReadTape)?;
+        let tape_uuid = decode_uuid_bytes(request.into_inner().tape_uuid.as_slice(), "tape_uuid")?;
+        let verification = crate::mount::verify_tape_index(&self.state, tape_uuid).await?;
+        Ok(Response::new(verification))
+    }
+
     async fn list_tape_files(
         &self,
         request: Request<pb::ListTapeFilesRequest>,
@@ -2637,6 +2697,99 @@ impl pb::catalog_server::Catalog for CatalogService {
                 Err(Status::unavailable(error))
             }
         }
+    }
+
+    async fn finalize_tape(
+        &self,
+        request: Request<pb::FinalizeTapeRequest>,
+    ) -> Result<Response<pb::TapeFinalization>, Status> {
+        let actor = authorize_request(&request, AuthPermission::OperationControl)?;
+        let request = request.into_inner();
+        let tape_uuid = decode_uuid_bytes(request.tape_uuid.as_slice(), "tape_uuid")?;
+        let expected_pool_id = request
+            .expected_pool_id
+            .map(|value| {
+                if value.trim().is_empty() || value.trim() != value {
+                    return Err(Status::invalid_argument(
+                        "expected_pool_id must be non-empty canonical text without surrounding whitespace",
+                    ));
+                }
+                Ok(value)
+            })
+            .transpose()?;
+        if request.reason.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "reason must contain at least one non-whitespace character",
+            ));
+        }
+        let idempotency_key =
+            decode_required_idempotency(request.idempotency_key.as_ref(), "FinalizeTape")?;
+        if idempotency_key.is_nil() {
+            return Err(Status::invalid_argument(
+                "FinalizeTape idempotency_key must not be the nil UUID",
+            ));
+        }
+        let actor_fingerprint = audit_actor_fingerprint(&actor);
+        let request_fingerprint = manual_finalize_request_fingerprint(
+            tape_uuid,
+            expected_pool_id.as_deref(),
+            actor_fingerprint.as_str(),
+            request.reason.as_bytes(),
+        );
+        let result = crate::mount::manual_finalize_tape(
+            &self.state,
+            crate::mount::ManualFinalizeTapeAdmission {
+                candidate_operation_id: Uuid::new_v4(),
+                actor,
+                actor_fingerprint,
+                idempotency_key,
+                request_fingerprint,
+                tape_uuid,
+                expected_pool_id,
+                reason: request.reason,
+            },
+        )
+        .await?;
+        let response = match result {
+            crate::write_owner::ManualFinalizeTapeResult::Busy => pb::TapeFinalization {
+                tape_uuid: tape_uuid.to_vec(),
+                operation_id: Vec::new(),
+                progress: pb::TapeFinalizationProgress::Unspecified as i32,
+                completed_replicas: 0,
+                replica_health: Vec::new(),
+                edition_digest: Vec::new(),
+                layout_digest: Vec::new(),
+                outcome: pb::TapeFinalizationOutcome::Busy as i32,
+                trigger: "operator_close_out".to_string(),
+                detail: "tape has an in-flight owner; no state or media motion occurred"
+                    .to_string(),
+            },
+            crate::write_owner::ManualFinalizeTapeResult::Accepted(reply) => {
+                tape_finalization_to_proto(tape_uuid, Some(reply.operation_id), reply.projection)
+            }
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn get_tape_finalization(
+        &self,
+        request: Request<pb::GetTapeFinalizationRequest>,
+    ) -> Result<Response<pb::TapeFinalization>, Status> {
+        authorize_request(&request, AuthPermission::Read)?;
+        let tape_uuid = decode_uuid_bytes(request.into_inner().tape_uuid.as_slice(), "tape_uuid")?;
+        let index = self.state.index()?;
+        let tape = index
+            .get_tape(&tape_uuid)
+            .map_err(status_from_state_error)?
+            .ok_or_else(|| Status::not_found("tape not found"))?;
+        let projection = tape
+            .terminal_finalization
+            .ok_or_else(|| Status::not_found("tape has no terminal-finalization authority"))?;
+        Ok(Response::new(tape_finalization_to_proto(
+            tape_uuid,
+            projection.operation_id,
+            projection,
+        )))
     }
 
     async fn list_files_in_object(
@@ -4521,6 +4674,10 @@ pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
 pub(crate) fn status_from_state_error(err: StateError) -> Status {
     match err {
         StateError::ConfigInvalid(_) => Status::invalid_argument(err.to_string()),
+        StateError::IdempotencyConflict(_) => Status::already_exists(err.to_string()),
+        StateError::TapePoolAssignmentConflict(_)
+        | StateError::TapeProvisionConflict(_)
+        | StateError::JournalReplayFailed(_) => Status::failed_precondition(err.to_string()),
         _ => Status::internal(err.to_string()),
     }
 }
@@ -5323,6 +5480,10 @@ fn tape_state(value: &str) -> pb::tape::State {
         "ingested" => pb::tape::State::TapeStateReady,
         "ready" => pb::tape::State::TapeStateReady,
         "sealed" => pb::tape::State::TapeStateSealed,
+        "finalized" => pb::tape::State::TapeStateSealed,
+        "finalizing" => pb::tape::State::TapeStateFinalizing,
+        "finalized_degraded" => pb::tape::State::TapeStateFinalizedDegraded,
+        "recovery_required" | "completion_unknown" => pb::tape::State::TapeStateCompletionUnknown,
         "ingestion_pending" => pb::tape::State::TapeStateInventoried,
         "degraded" => pb::tape::State::TapeStateDegraded,
         "failed" => pb::tape::State::TapeStateFailed,
@@ -5333,6 +5494,72 @@ fn tape_state(value: &str) -> pb::tape::State {
     }
 }
 
+fn tape_finalization_to_proto(
+    tape_uuid: [u8; 16],
+    operation_id: Option<Uuid>,
+    projection: remanence_state::TerminalFinalizationProjection,
+) -> pb::TapeFinalization {
+    use remanence_state::{
+        TerminalFinalizationOutcome as StateOutcome, TerminalFinalizationProgress as StateProgress,
+        TerminalFinalizationTrigger as StateTrigger,
+    };
+
+    let progress = match projection.progress {
+        StateProgress::BeforeReplicaA => pb::TapeFinalizationProgress::BeforeReplicaA,
+        StateProgress::AfterReplicaA => pb::TapeFinalizationProgress::AfterReplicaA,
+        StateProgress::AfterSeparationAb => pb::TapeFinalizationProgress::AfterSeparationAb,
+        StateProgress::AfterReplicaB => pb::TapeFinalizationProgress::AfterReplicaB,
+        StateProgress::AfterSeparationBc => pb::TapeFinalizationProgress::AfterSeparationBc,
+        StateProgress::AfterReplicaC => pb::TapeFinalizationProgress::AfterReplicaC,
+    };
+    let outcome = match projection.outcome {
+        StateOutcome::InProgress => pb::TapeFinalizationOutcome::Finalizing,
+        StateOutcome::Finalized => pb::TapeFinalizationOutcome::Finalized,
+        StateOutcome::FinalizedDegraded => pb::TapeFinalizationOutcome::FinalizedDegraded,
+        StateOutcome::RecoveryRequired => pb::TapeFinalizationOutcome::RecoveryRequired,
+    };
+    let trigger = match projection.trigger {
+        StateTrigger::ReachedLowWatermark => "reached_low_watermark",
+        StateTrigger::HardwareEarlyWarning => "hardware_early_warning",
+        StateTrigger::OperatorCloseOut => "operator_close_out",
+        StateTrigger::PoolCloseOut => "pool_close_out",
+        StateTrigger::NoPendingObjectFits => "no_pending_object_fits",
+    };
+    let completed = projection.completed_replicas;
+    let replica_health = (1u8..=3)
+        .map(|ordinal| {
+            let state = if ordinal <= completed {
+                pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete
+            } else if matches!(projection.outcome, StateOutcome::RecoveryRequired)
+                && ordinal == completed.saturating_add(1)
+            {
+                pb::tape_index_replica_health::State::TapeIndexReplicaStateUnknown
+            } else {
+                pb::tape_index_replica_health::State::TapeIndexReplicaStatePending
+            };
+            pb::TapeIndexReplicaHealth {
+                replica_ordinal: u32::from(ordinal),
+                state: state as i32,
+                detail: String::new(),
+            }
+        })
+        .collect();
+    pb::TapeFinalization {
+        tape_uuid: tape_uuid.to_vec(),
+        operation_id: operation_id
+            .map(|operation_id| operation_id.as_bytes().to_vec())
+            .unwrap_or_default(),
+        progress: progress as i32,
+        completed_replicas: u32::from(completed),
+        replica_health,
+        edition_digest: projection.edition_digest.to_vec(),
+        layout_digest: projection.layout_digest.to_vec(),
+        outcome: outcome as i32,
+        trigger: trigger.to_string(),
+        detail: String::new(),
+    }
+}
+
 fn tape_file_to_proto(record: TapeFileRecord) -> Result<pb::TapeFile, Status> {
     let canonical_metadata_digest = catalog_digest_to_proto(
         record.canonical_metadata_hash_algorithm,
@@ -5340,7 +5567,7 @@ fn tape_file_to_proto(record: TapeFileRecord) -> Result<pb::TapeFile, Status> {
     );
     Ok(pb::TapeFile {
         tape_uuid: record.tape_uuid,
-        tape_file_number: u64::from(record.tape_file_number),
+        tape_file_number: record.tape_file_number,
         kind: record.kind,
         block_count: record.block_count,
         object_id: record
@@ -5365,8 +5592,7 @@ fn native_object_file_to_proto(record: NativeObjectFileRecord) -> Result<pb::Fil
         size_bytes: record.size_bytes,
         file_sha256: record.file_sha256,
         first_chunk_body_lba: record.first_chunk_lba,
-        chunk_count: u32::try_from(record.chunk_count)
-            .map_err(|_| Status::internal("object file chunk_count does not fit u32"))?,
+        chunk_count: record.chunk_count,
         file_digest,
     })
 }
@@ -5419,7 +5645,7 @@ fn object_copy_to_proto(copy: &NativeObjectCopyRecord) -> pb::ObjectCopy {
     };
     pb::ObjectCopy {
         tape_uuid: copy.tape_uuid.clone(),
-        tape_file_number: u64::from(copy.tape_file_number),
+        tape_file_number: copy.tape_file_number,
         first_body_lba: copy.first_body_lba,
         last_verified_at: None,
         health: health as i32,
@@ -5458,7 +5684,7 @@ pub(crate) fn append_mode_for_tape_file_number(tape_file_number: u64) -> pb::App
 }
 
 fn append_commit_info_from_native_copy(copy: &NativeObjectCopyRecord) -> pb::AppendCommitInfo {
-    let tape_file_number = u64::from(copy.tape_file_number);
+    let tape_file_number = copy.tape_file_number;
     pb::AppendCommitInfo {
         append_mode: append_mode_for_tape_file_number(tape_file_number) as i32,
         tape_uuid: copy.tape_uuid.clone(),
@@ -5742,6 +5968,56 @@ fn decode_optional_idempotency(value: Option<&pb::IdempotencyKey>) -> Result<Opt
         .map(|uuid| uuid.map(Uuid::from_bytes))
 }
 
+fn decode_required_idempotency(
+    value: Option<&pb::IdempotencyKey>,
+    rpc: &str,
+) -> Result<Uuid, Status> {
+    decode_optional_idempotency(value)?.ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "{rpc} requires a non-empty 16-byte idempotency_key"
+        ))
+    })
+}
+
+fn audit_actor_fingerprint(actor: &AuditActor) -> String {
+    match actor {
+        AuditActor::System => "system".to_string(),
+        AuditActor::User(identity) => format!("user:{identity}"),
+        AuditActor::Service(identity) => format!("service:{identity}"),
+    }
+}
+
+/// Hash the exact state-changing request independently of its retry key.
+/// Length-prefixing prevents optional/present-empty and concatenation aliases;
+/// pool identifiers are canonicalized by validation, while reason bytes are
+/// deliberately preserved exactly for audit and retry conflict detection.
+fn manual_finalize_request_fingerprint(
+    tape_uuid: [u8; 16],
+    expected_pool_id: Option<&str>,
+    actor_fingerprint: &str,
+    reason: &[u8],
+) -> [u8; 32] {
+    const DOMAIN: &[u8] = b"REM-FINALIZE-TAPE-REQUEST-V1\0";
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN);
+    hasher.update(tape_uuid);
+    match expected_pool_id {
+        Some(pool_id) => {
+            hasher.update([1]);
+            hasher.update((pool_id.len() as u64).to_be_bytes());
+            hasher.update(pool_id.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    // Stable code for TerminalFinalizationTrigger::OperatorCloseOut.
+    hasher.update([4]);
+    hasher.update((actor_fingerprint.len() as u64).to_be_bytes());
+    hasher.update(actor_fingerprint.as_bytes());
+    hasher.update((reason.len() as u64).to_be_bytes());
+    hasher.update(reason);
+    hasher.finalize().into()
+}
+
 pub(crate) fn reject_unimplemented_idempotency(
     value: Option<&pb::IdempotencyKey>,
     rpc: &str,
@@ -5845,6 +6121,27 @@ mod tests {
     const OPERATION_ID_TEXT: &str = "22222222-2222-2222-2222-222222222222";
     const TAPE_UUID: [u8; 16] = [3u8; 16];
     const POOL_WRITE_TAPE_UUID: [u8; 16] = [4u8; 16];
+
+    #[test]
+    fn native_file_proto_preserves_u64_chunk_count() {
+        let chunk_count = u64::from(u32::MAX) + 1;
+        let record = NativeObjectFileRecord {
+            object_id: OBJECT_ID_TEXT.to_string(),
+            file_id: "large-file".to_string(),
+            path: "large.bin".to_string(),
+            size_bytes: 0,
+            file_sha256: vec![0x5a; 32],
+            file_digest_algorithm: "sha256".to_string(),
+            first_chunk_lba: Some(0),
+            chunk_count,
+            mtime: None,
+            executable: None,
+        };
+
+        let proto = native_object_file_to_proto(record).expect("valid file record");
+
+        assert_eq!(proto.chunk_count, chunk_count);
+    }
 
     #[test]
     fn rolling_drive_rate_uses_only_the_last_five_seconds() {
@@ -6866,6 +7163,53 @@ mod tests {
     }
 
     #[test]
+    fn manual_finalize_fingerprint_binds_presence_actor_and_exact_reason() {
+        let tape_uuid = [0x11; 16];
+        let baseline = manual_finalize_request_fingerprint(
+            tape_uuid,
+            Some("slow-pool"),
+            "service:operator-a",
+            b"ship copy offsite",
+        );
+        assert_ne!(
+            baseline,
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                None,
+                "service:operator-a",
+                b"ship copy offsite",
+            )
+        );
+        assert_ne!(
+            baseline,
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                Some("slow-pool"),
+                "service:operator-b",
+                b"ship copy offsite",
+            )
+        );
+        assert_ne!(
+            baseline,
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                Some("slow-pool"),
+                "service:operator-a",
+                b" ship copy offsite ",
+            )
+        );
+        assert_eq!(
+            baseline,
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                Some("slow-pool"),
+                "service:operator-a",
+                b"ship copy offsite",
+            )
+        );
+    }
+
+    #[test]
     fn auth_role_parser_accepts_spec_roles_and_subject_prefixes() {
         assert_eq!(parse_client_role("readonly"), Some(ClientRole::Readonly));
         assert_eq!(
@@ -7193,6 +7537,7 @@ BCw3Wyv2UWY=
             selection_policy: PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.92,
             watermark_high: 0.97,
+            capacity_cap_bytes: None,
             block_size_bytes: u64::from(API_SESSION_BLOCK_SIZE),
             min_object_size_bytes: 0,
         }
@@ -7218,6 +7563,7 @@ BCw3Wyv2UWY=
             selection_policy: PoolSelectionPolicyName::CompleteOrFill,
             watermark_low,
             watermark_high,
+            capacity_cap_bytes: None,
             block_size_bytes: u64::from(API_SESSION_BLOCK_SIZE),
             min_object_size_bytes,
         }
@@ -7230,6 +7576,28 @@ BCw3Wyv2UWY=
             tape_uuid,
             format!("RMN{:03}L9", tape_uuid[0]).as_str(),
         );
+    }
+
+    fn project_eligible_tape_with_block_size(
+        index: &mut CatalogIndex,
+        pool_id: &str,
+        tape_uuid: [u8; 16],
+        block_size: u32,
+    ) {
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: format!("RMN{:03}L9", tape_uuid[0]),
+                block_size,
+                parity: ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(
+                    block_size,
+                )),
+                force: false,
+            })
+            .expect("provision parity tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("project tape pool membership");
     }
 
     fn project_eligible_tape_with_voltag(
@@ -7278,7 +7646,7 @@ BCw3Wyv2UWY=
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals,
@@ -7300,10 +7668,10 @@ BCw3Wyv2UWY=
                 ordinal: 1,
                 committed_object_count: 1,
                 eod_partition: 0,
-                eod_lba: 8,
+                eod_lba: 6,
                 tape_uuid,
                 batch_id: [0x42; 16],
-                checkpoint_tape_file_number: 2,
+                next_tape_file_number: 2,
                 block_size: API_SESSION_BLOCK_SIZE,
                 objects: vec![remanence_state::CheckpointObjectProjection {
                     object: NativeObjectProjectionInput {
@@ -7334,12 +7702,12 @@ BCw3Wyv2UWY=
                     block_count: 3,
                     fresh_tape: true,
                     total_committed_ordinals: 3,
-                    bootstrap_object_row: remanence_state::CheckpointBootstrapObjectRow {
+                    object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
                         tape_file_number: 1,
                         stored_block_count: 3,
                         object_id: object_uuid.to_string().into_bytes(),
                         representation:
-                            remanence_state::CheckpointBootstrapObjectRepresentation::Plaintext {
+                            remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
                                 manifest_first_chunk_lba: 1,
                                 manifest_size_bytes: 1,
                                 manifest_chunk_count: 1,
@@ -7349,7 +7717,8 @@ BCw3Wyv2UWY=
                 }],
                 scheme: None,
                 object_tape_file_bundles: Vec::new(),
-                checkpoint_bundle: None,
+                barrier_bundle: None,
+                terminal_finalization: None,
                 sealed_after_write: false,
             })
             .expect("append checkpoint record");
@@ -7359,7 +7728,7 @@ BCw3Wyv2UWY=
         tape_uuid: [u8; 16],
         ordinal: u64,
         object_byte: u8,
-        object_tape_file: u32,
+        object_tape_file: u64,
         block_count: u64,
         total_committed_ordinals: u64,
     ) -> remanence_state::CheckpointJournalRecord {
@@ -7368,10 +7737,10 @@ BCw3Wyv2UWY=
             ordinal,
             committed_object_count: ordinal,
             eod_partition: 0,
-            eod_lba: total_committed_ordinals + u64::from(object_tape_file) + ordinal + 3,
+            eod_lba: total_committed_ordinals + ordinal + 2,
             tape_uuid,
             batch_id: [0x60 + ordinal as u8; 16],
-            checkpoint_tape_file_number: object_tape_file + 1,
+            next_tape_file_number: object_tape_file + 1,
             block_size: API_SESSION_BLOCK_SIZE,
             objects: vec![remanence_state::CheckpointObjectProjection {
                 object: NativeObjectProjectionInput {
@@ -7402,12 +7771,12 @@ BCw3Wyv2UWY=
                 block_count,
                 fresh_tape: ordinal == 1,
                 total_committed_ordinals,
-                bootstrap_object_row: remanence_state::CheckpointBootstrapObjectRow {
+                object_recovery_row: remanence_state::CheckpointObjectRecoveryRow {
                     tape_file_number: object_tape_file,
                     stored_block_count: block_count,
                     object_id: object_uuid.to_string().into_bytes(),
                     representation:
-                        remanence_state::CheckpointBootstrapObjectRepresentation::Plaintext {
+                        remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
                             manifest_first_chunk_lba: 1,
                             manifest_size_bytes: 1,
                             manifest_chunk_count: 1,
@@ -7417,7 +7786,8 @@ BCw3Wyv2UWY=
             }],
             scheme: None,
             object_tape_file_bundles: Vec::new(),
-            checkpoint_bundle: None,
+            barrier_bundle: None,
+            terminal_finalization: None,
             sealed_after_write: false,
         }
     }
@@ -7455,41 +7825,13 @@ BCw3Wyv2UWY=
             .expect("startup replay after first kill");
 
         // Append again, then preserve the same independently compatible views found in the
-        // field evidence before killing mid-projection: object metadata and the checkpoint
-        // bootstrap are visible, while the copy, object tape-file, and catalog unit are absent.
-        let second = restart_cycle_checkpoint_record(tape_uuid, 2, 0x72, 3, 2, 5);
+        // field evidence before killing mid-projection: object metadata is visible,
+        // while the copy, object tape-file, and catalog unit are absent.
+        let second = restart_cycle_checkpoint_record(tape_uuid, 2, 0x72, 2, 2, 5);
         journal.append(&second).expect("fsync second checkpoint");
         index
             .upsert_native_object_projection(second.objects[0].object.clone(), &[])
             .expect("project independently visible object metadata");
-        index
-            .project_committed_tape_file_bundle(
-                TapeJournalIndexInput {
-                    tape_uuid,
-                    block_size: API_SESSION_BLOCK_SIZE,
-                    scheme: None,
-                    journal_offset_bytes: 0,
-                },
-                &CommittedBundle {
-                    kind: CommittedBundleKind::Control,
-                    entries: vec![TapeFileEntry {
-                        tape_file_number: second.checkpoint_tape_file_number,
-                        kind: TapeFileKind::Bootstrap,
-                        block_count: 1,
-                        physical_start_hint: None,
-                        object_id: None,
-                        first_parity_data_ordinal: None,
-                        epoch_id: None,
-                        protected_ordinal_start: None,
-                        protected_ordinal_end_exclusive: None,
-                        canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
-                    }],
-                    highest_protected_ordinal: 0,
-                    total_committed_ordinals: second.objects[0].total_committed_ordinals,
-                },
-            )
-            .expect("project independently visible checkpoint bootstrap");
         drop(index);
 
         let mut index = CatalogIndex::open(&index_path).expect("restart after projection kill");
@@ -7501,18 +7843,15 @@ BCw3Wyv2UWY=
             .expect("query repaired copy");
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].tape_uuid, tape_uuid);
-        assert_eq!(copies[0].tape_file_number, 3);
+        assert_eq!(copies[0].tape_file_number, 2);
         let tape_files = index
             .list_tape_files(&tape_uuid)
             .expect("query repaired tape files");
         assert!(tape_files.iter().any(|entry| {
-            entry.tape_file_number == 3
+            entry.tape_file_number == 2
                 && entry.kind == "object"
                 && entry.object_id.as_deref() == Some(second_object_id)
         }));
-        assert!(tape_files
-            .iter()
-            .any(|entry| entry.tape_file_number == 4 && entry.kind == "bootstrap"));
 
         index
             .retire_tape(RetireTapeInput {
@@ -7553,6 +7892,102 @@ BCw3Wyv2UWY=
         assert!(message.contains("sqlite="), "{message}");
     }
 
+    #[test]
+    fn startup_replay_restores_pending_automatic_finalization_fence() {
+        const TERMINAL_BLOCK_SIZE: u32 = 256 * 1024;
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-checkpoint-terminal-restart")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let tape_uuid = [0x92; 16];
+        let mut index = CatalogIndex::open(&index_path).expect("open index");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RST002L9".to_string(),
+                block_size: TERMINAL_BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision restart-cycle tape");
+        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+            .expect("open checkpoint journal");
+        let mut checkpoint = restart_cycle_checkpoint_record(tape_uuid, 1, 0x73, 1, 3, 3);
+        checkpoint.block_size = TERMINAL_BLOCK_SIZE;
+        checkpoint.objects[0].block_size = TERMINAL_BLOCK_SIZE;
+        checkpoint.objects[0].object.logical_size_bytes = Some(3 * u64::from(TERMINAL_BLOCK_SIZE));
+        journal.append(&checkpoint).expect("fsync checkpoint");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("project ordinary checkpoint");
+
+        let parity_layout = remanence_parity::TerminalTailLayout::new(
+            0,
+            TERMINAL_BLOCK_SIZE,
+            checkpoint.next_tape_file_number,
+            checkpoint.eod_lba,
+            3,
+            remanence_parity::index_separation_records(
+                TERMINAL_BLOCK_SIZE,
+                remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+            )
+            .expect("gap records"),
+        )
+        .expect("terminal layout");
+        let mut intent = remanence_state::TerminalFinalizationIntent {
+            tape_uuid,
+            trigger: remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark,
+            manual: None,
+            progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+            edition_id: [0x24; 16],
+            edition_sequence: 2,
+            edition_digest: [0x25; 32],
+            writer_version: "restart-test".to_string(),
+            write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+            terminal_prefix: None,
+            layout: remanence_state::TerminalFinalizationLayout::try_from(parity_layout)
+                .expect("persisted layout"),
+        };
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("exclusive checkpoint owner");
+        lease
+            .begin_terminal_finalization(&intent)
+            .expect("persist terminal intent");
+        lease
+            .advance_terminal_finalization(
+                remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+            )
+            .expect("advance through replica A");
+        intent = lease
+            .advance_terminal_finalization(
+                remanence_state::TerminalFinalizationProgress::AfterReplicaA,
+                remanence_state::TerminalFinalizationProgress::AfterSeparationAb,
+            )
+            .expect("advance through separation AB");
+        drop(lease);
+        drop(index);
+
+        let mut index = CatalogIndex::open(&index_path).expect("restart index");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("restore pending finalization");
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("read tape")
+            .expect("known tape");
+        assert_eq!(tape.state, "finalizing");
+        let projection = tape.terminal_finalization.expect("terminal projection");
+        assert_eq!(projection.progress, intent.progress);
+        assert_eq!(projection.completed_replicas, 1);
+        assert_eq!(projection.edition_digest, intent.edition_digest);
+        assert_eq!(projection.layout_digest, intent.layout.layout_digest);
+
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("pending finalization replay is idempotent");
+    }
+
     fn project_no_parity_tape_with_block_size(
         index: &mut CatalogIndex,
         pool_id: &str,
@@ -7584,9 +8019,6 @@ BCw3Wyv2UWY=
             sequence: 0,
             block_size_bytes: API_SESSION_BLOCK_SIZE,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
         let mut block = vec![0u8; API_SESSION_BLOCK_SIZE as usize];
         write_bootstrap_block(&payload, &mut block).expect("write no-parity bootstrap");
@@ -7599,6 +8031,7 @@ BCw3Wyv2UWY=
             voltag: Some("RMN001L9".to_string()),
             kind: "data".to_string(),
             pool_id: Some("camera.copy-a".to_string()),
+            assignment_generation: 0,
             body_format: None,
             block_size: Some(API_SESSION_BLOCK_SIZE as u64),
             scheme_id: None,
@@ -7608,6 +8041,7 @@ BCw3Wyv2UWY=
             last_committed_tape_file: None,
             total_committed_ordinals: 0,
             written_extent_lba: None,
+            terminal_finalization: None,
             state: "ready".to_string(),
             updated_at_utc: "2026-05-29T00:00:00Z".to_string(),
         }
@@ -7648,7 +8082,10 @@ BCw3Wyv2UWY=
         assert_eq!(parsed.block_size_bytes, API_SESSION_BLOCK_SIZE);
         assert!(!parsed.no_parity_flag);
         assert!(parsed.scheme.is_some());
-        assert!(parsed.filemark_map_digest.is_some());
+        assert_eq!(
+            parsed.filemark_map_digest,
+            Some(remanence_parity::sole_bot_filemark_map_digest().expect("sole BOT digest"))
+        );
     }
 
     #[test]
@@ -7799,7 +8236,7 @@ BCw3Wyv2UWY=
                             protected_ordinal_start: None,
                             protected_ordinal_end_exclusive: None,
                             canonical_metadata_hash: None,
-                            bootstrap_object_row: None,
+                            object_recovery_row: None,
                         },
                         TapeFileEntry {
                             tape_file_number: 5,
@@ -7812,7 +8249,7 @@ BCw3Wyv2UWY=
                             protected_ordinal_start: Some(0),
                             protected_ordinal_end_exclusive: Some(5),
                             canonical_metadata_hash: Some([9u8; 32]),
-                            bootstrap_object_row: None,
+                            object_recovery_row: None,
                         },
                         TapeFileEntry {
                             tape_file_number: 6,
@@ -7825,7 +8262,7 @@ BCw3Wyv2UWY=
                             protected_ordinal_start: Some(0),
                             protected_ordinal_end_exclusive: Some(5),
                             canonical_metadata_hash: Some([8u8; 32]),
-                            bootstrap_object_row: None,
+                            object_recovery_row: None,
                         },
                         TapeFileEntry {
                             tape_file_number: 7,
@@ -7838,7 +8275,7 @@ BCw3Wyv2UWY=
                             protected_ordinal_start: None,
                             protected_ordinal_end_exclusive: None,
                             canonical_metadata_hash: Some([7u8; 32]),
-                            bootstrap_object_row: None,
+                            object_recovery_row: None,
                         },
                     ],
                     highest_protected_ordinal: 5,
@@ -7941,7 +8378,7 @@ BCw3Wyv2UWY=
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 5,
                     total_committed_ordinals: 5,
@@ -9221,9 +9658,15 @@ BCw3Wyv2UWY=
 
     #[test]
     fn write_object_to_pool_returns_locator_commits_catalog_and_round_trips_payload() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
         let mut index = test_index();
         project_pool(&mut index, "camera.copy-a");
-        project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+        project_eligible_tape_with_block_size(
+            &mut index,
+            "camera.copy-a",
+            POOL_WRITE_TAPE_UUID,
+            BLOCK_SIZE,
+        );
         let source_dir = temp_dir("remanence-api-pool-write-src");
         let restore_dir = temp_dir("remanence-api-pool-write-restore");
         let source_path = source_dir.join("payload.bin");
@@ -9231,7 +9674,7 @@ BCw3Wyv2UWY=
         std::fs::write(&source_path, &payload).expect("write source payload");
         let expected_hash = sha256_bytes(&payload);
         let mut tape_sink = VecBlockSink::new();
-        let cfg = pool_config("camera.copy-a");
+        let cfg = pool_config_with_block_size("camera.copy-a", BLOCK_SIZE);
 
         let result = write_object_to_pool(
             &mut index,
@@ -9258,7 +9701,7 @@ BCw3Wyv2UWY=
         assert_eq!(copy.pool_id, "camera.copy-a");
         assert_eq!(
             copy.tape_file_number,
-            u64::from(result.expect_write_report().object_close.tape_file_number)
+            result.expect_write_report().object_close.tape_file_number
         );
         assert_eq!(
             copy.first_body_lba,
@@ -9315,7 +9758,7 @@ BCw3Wyv2UWY=
         let mut object_source = VecBlockSource::new(object_blocks);
         let restore = restore_object_to_directory(
             &mut object_source,
-            API_SESSION_BLOCK_SIZE as usize,
+            BLOCK_SIZE as usize,
             result.expect_write_report().layout.projected_size_blocks,
             &restore_dir,
             FilesystemRestoreOptions::default(),
@@ -9798,25 +10241,6 @@ BCw3Wyv2UWY=
         let metadata_frame_len = result.object.copies[0]
             .metadata_frame_len
             .expect("metadata frame length");
-        let bootstrap_row = result
-            .expect_write_report()
-            .object_close
-            .bootstrap_object_row
-            .as_ref()
-            .expect("encrypted bootstrap row");
-        match &bootstrap_row.representation {
-            remanence_parity::bootstrap::BootstrapObjectRepresentation::Encrypted {
-                recipient_epoch_ids: row_recipient_epoch_ids,
-                metadata_frame_len: row_metadata_frame_len,
-                key_frame_len,
-            } => {
-                assert_eq!(row_recipient_epoch_ids, &vec![[0x42; 16], [0x43; 16]]);
-                assert_eq!(*row_metadata_frame_len, metadata_frame_len);
-                assert!(*key_frame_len > 0);
-            }
-            other => panic!("unexpected bootstrap row representation: {other:?}"),
-        }
-
         let committed = index
             .get_native_object(result.object.object_id_text().as_str())
             .expect("query encrypted object")
@@ -10731,15 +11155,21 @@ BCw3Wyv2UWY=
 
     #[test]
     fn write_to_selected_tape_rejects_second_parity_object_before_tape_io() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
         let mut index = test_index();
         project_pool(&mut index, "scenario-a");
-        project_eligible_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        project_eligible_tape_with_block_size(
+            &mut index,
+            "scenario-a",
+            POOL_WRITE_TAPE_UUID,
+            BLOCK_SIZE,
+        );
         let source_dir = temp_dir("remanence-api-parity-reuse-src");
         let first_path = source_dir.join("first.bin");
         let second_path = source_dir.join("second.bin");
         std::fs::write(&first_path, b"first parity payload").expect("write first payload");
         std::fs::write(&second_path, b"second parity payload").expect("write second payload");
-        let cfg = pool_config("scenario-a");
+        let cfg = pool_config_with_block_size("scenario-a", BLOCK_SIZE);
         let selected =
             select_tape_in_pool(&index, &cfg, 123, &HashSet::new()).expect("select parity tape");
         let mut first_sink = VecBlockSink::new();
@@ -12294,6 +12724,31 @@ BCw3Wyv2UWY=
         assert_eq!(files.tape_files[1].kind, "parity_sidecar");
         assert_eq!(files.tape_files[2].kind, "parity_map");
         assert_eq!(files.tape_files[3].kind, "bootstrap");
+    }
+
+    #[tokio::test]
+    async fn terminal_inventory_rpcs_require_an_exact_tape_uuid_before_mounting() {
+        let service = populated_state().catalog_service();
+        let inventory = pb::catalog_server::Catalog::get_tape_inventory(
+            &service,
+            Request::new(pb::TapeInventoryRequest {
+                tape_uuid: vec![0x11; 15],
+            }),
+        )
+        .await
+        .err()
+        .expect("short tape UUID must fail before drive ownership");
+        assert_eq!(inventory.code(), tonic::Code::InvalidArgument);
+
+        let verify = pb::catalog_server::Catalog::verify_tape_index(
+            &service,
+            Request::new(pb::VerifyTapeIndexRequest {
+                tape_uuid: vec![0x22; 17],
+            }),
+        )
+        .await
+        .expect_err("long tape UUID must fail before drive ownership");
+        assert_eq!(verify.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

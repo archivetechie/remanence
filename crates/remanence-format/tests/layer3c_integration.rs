@@ -13,15 +13,16 @@ use remanence_format::{
 };
 use remanence_library::{scsi::ScsiError, TapeIoError, VecBlockSink, VecBlockSource};
 use remanence_parity::{
-    BlockSinkRawTapeSink, BootstrapObjectRepresentation, BootstrapObjectRow,
-    BootstrapObjectRowAdmission, CapacityReserveInput, CommittedBundle, CommittedBundleKind,
-    CommittedState, FilemarkMap, JournalError, ObjectParitySource, OpenTrust, ParityError,
-    ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource, SchemeId,
-    ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileJournal, TapeFileMapEntry, TapeFilePosition,
+    BlockSinkRawTapeSink, CommittedBundle, CommittedBundleKind, CommittedState, FilemarkMap,
+    JournalError, ObjectParitySource, ObjectRecoveryRepresentation, ObjectRecoveryRow, OpenTrust,
+    ParityError, ParityScheme, ParitySink, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    SchemeId, ScopedFilemarkMap, SpaceFilemarksOutcome, TapeFileJournal, TapeFileMapEntry,
+    TapeFilePosition, TerminalTripleCloseInput, TerminalTripleObjectReservation,
+    DEFAULT_INDEX_SEPARATION_BYTES,
 };
 use sha2::{Digest, Sha256};
 
-const BLOCK_SIZE: u32 = 4096;
+const BLOCK_SIZE: u32 = 256 * 1024;
 const TAPE_UUID: [u8; 16] = [0x3B; 16];
 
 #[derive(Default)]
@@ -99,7 +100,7 @@ fn rem_tar_writer_composes_with_parity_sink_and_reads_back_object_blocks() {
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
-                .begin_object_with_capacity_reserve(capacity_input(
+                .begin_object_with_terminal_triple_reservation(capacity_input(
                     planned_layout.projected_size_blocks
                 ))
                 .expect("object reserve fits")
@@ -171,7 +172,7 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
-                .begin_object_with_capacity_reserve(capacity_input(
+                .begin_object_with_terminal_triple_reservation(capacity_input(
                     planned_layout.projected_size_blocks
                 ))
                 .expect("object reserve fits")
@@ -305,28 +306,15 @@ fn encrypted_rem_object_ciphertext_recovers_through_parity_before_keyed_open() {
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
-                .begin_object_with_capacity_reserve_and_bootstrap_object_row(
-                    capacity_input(planned_report.envelope.stored_size_blocks),
-                    BootstrapObjectRowAdmission::EncryptedRemObject,
-                )
+                .begin_object_with_terminal_triple_reservation(capacity_input(
+                    planned_report.envelope.stored_size_blocks,
+                ))
                 .expect("object reserve fits")
                 .0,
             1
         );
         report = write_encrypted_rem_object(&mut parity, &opts, &files, &recipients)
             .expect("encrypted REM-OBJECT writes through parity sink");
-        parity
-            .record_bootstrap_object_row(
-                BootstrapObjectRow::encrypted(
-                    1,
-                    report.envelope.stored_size_blocks,
-                    vec![[0x24; 16], [0x25; 16]],
-                    report.envelope.metadata_frame_len,
-                    report.envelope.header.key_frame_len,
-                )
-                .with_object_id([0x77; 16]),
-            )
-            .expect("encrypted bootstrap row records");
         close = parity.finish_object().expect("parity object closes");
     }
 
@@ -335,17 +323,21 @@ fn encrypted_rem_object_ciphertext_recovers_through_parity_before_keyed_open() {
         planned_report.envelope.stored_size_blocks
     );
     assert_eq!(close.data_block_count, report.envelope.stored_size_blocks);
-    let bootstrap_object_row = close
-        .bootstrap_object_row
-        .as_ref()
-        .expect("encrypted parity close carries bootstrap row");
-    assert_eq!(bootstrap_object_row.tape_file_number, 1);
+    let object_recovery_row = ObjectRecoveryRow::encrypted(
+        1,
+        report.envelope.stored_size_blocks,
+        vec![[0x24; 16], [0x25; 16]],
+        report.envelope.metadata_frame_len,
+        report.envelope.header.key_frame_len,
+    )
+    .with_object_id([0x77; 16]);
+    assert_eq!(object_recovery_row.tape_file_number, 1);
     assert_eq!(
-        bootstrap_object_row.stored_block_count,
+        object_recovery_row.stored_block_count,
         report.envelope.stored_size_blocks
     );
-    match &bootstrap_object_row.representation {
-        BootstrapObjectRepresentation::Encrypted {
+    match &object_recovery_row.representation {
+        ObjectRecoveryRepresentation::Encrypted {
             recipient_epoch_ids,
             metadata_frame_len,
             key_frame_len,
@@ -354,8 +346,8 @@ fn encrypted_rem_object_ciphertext_recovers_through_parity_before_keyed_open() {
             assert_eq!(*metadata_frame_len, report.envelope.metadata_frame_len);
             assert_eq!(*key_frame_len, report.envelope.header.key_frame_len);
         }
-        BootstrapObjectRepresentation::Plaintext { .. } => {
-            panic!("encrypted parity write emitted plaintext bootstrap row")
+        ObjectRecoveryRepresentation::Plaintext { .. } => {
+            panic!("encrypted parity write emitted plaintext recovery row")
         }
     }
     assert!(
@@ -466,25 +458,34 @@ fn scheme() -> ParityScheme {
     }
 }
 
-fn capacity_input(projected_object_blocks: u64) -> CapacityReserveInput {
-    CapacityReserveInput {
+fn capacity_input(projected_object_blocks: u64) -> TerminalTripleObjectReservation {
+    TerminalTripleCloseInput {
+        projected_object_present: true,
         projected_object_blocks,
-        block_size_bytes: BLOCK_SIZE as u64,
+        block_size_bytes: BLOCK_SIZE,
         current_epoch_fill_blocks: 0,
         data_shards_per_epoch: 4,
         parity_shards_per_epoch: 2,
-        sidecar_index_block_count: 1,
+        pending_completed_sidecars: 0,
+        sidecar_entries_before_object: 0,
+        structural_entries_before_object: 1,
+        object_rows_before_object: 0,
         object_filemark_blocks: 1,
         sidecar_filemark_blocks: 1,
-        bootstrap_filemark_blocks: 1,
-        pending_completed_sidecars: 0,
-        remaining_bootstrap_count: 1,
+        parity_map_filemark_blocks: 1,
+        replica_filemark_blocks: 1,
+        gap_filemark_blocks: 1,
+        gap_nominal_bytes: DEFAULT_INDEX_SEPARATION_BYTES,
         safety_margin_blocks: 4,
         remaining_tape_blocks: 10_000,
-        empty_tape_usable_blocks: 10_000,
+        capacity_basis_blocks: 10_002,
+        low_watermark_blocks: 0,
+        high_watermark_blocks: 1,
         pending_completed_epoch_parity_bytes: 0,
-        remaining_spool_bytes: 10_000_000,
+        remaining_spool_bytes: u64::MAX,
     }
+    .reserve_object()
+    .expect("format integration exact terminal reservation")
 }
 
 fn file_spec(
@@ -522,12 +523,6 @@ fn scoped_map_from_close(close: &remanence_parity::ObjectWriteSummary) -> Scoped
             .sidecars_emitted
             .iter()
             .map(|sidecar| sidecar.tape_file_entry().to_map_entry()),
-    );
-    entries.extend(
-        close
-            .control_tape_files_emitted
-            .iter()
-            .map(|entry| entry.to_map_entry()),
     );
     let map = FilemarkMap::new(entries).expect("filemark map from close summary validates");
     ScopedFilemarkMap::from_catalog(map, close.highest_protected_ordinal)
@@ -612,6 +607,11 @@ impl RawTapeSource for PhysicalVecTapeSource {
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         self.cursor_lba = hint.lba;
         Ok(())
+    }
+
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.cursor_lba = self.end_lba;
+        Ok(PhysicalPositionHint::new(self.cursor_lba))
     }
 
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {

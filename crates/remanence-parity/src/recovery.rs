@@ -1,7 +1,7 @@
 //! Sidecar-aware recovery primitives for Layer 3c v0.4.4.
 //!
 //! The public helper in this module reconstructs one protected
-//! `ParityDataOrdinal` from the authenticated filemark map, the epoch sidecar,
+//! `ParityDataOrdinal` from the digest-validated filemark map, the epoch sidecar,
 //! verified data peers, and verified parity shards. It is intentionally below
 //! the future object-scoped `ObjectParitySource` surface: callers provide the
 //! failed ordinal directly, and this code performs the core sidecar/CRC/RS work
@@ -35,7 +35,7 @@ pub struct SidecarRecoveryResult {
     /// Epoch/stripe/data-index coordinates for `failed_ordinal`.
     pub stripe: StripeAddress,
     /// Tape-file number of the sidecar used for this reconstruction.
-    pub sidecar_tape_file_number: u32,
+    pub sidecar_tape_file_number: u64,
     /// Health of the replicated sidecar metadata copies observed while
     /// preparing this recovery.
     pub sidecar_metadata_health: SidecarMetadataHealth,
@@ -115,7 +115,7 @@ pub fn recover_object_region_from_sidecar(
     scheme: &ParityScheme,
     tape_uuid: [u8; 16],
     block_size: u32,
-    tape_file_number: u32,
+    tape_file_number: u64,
     start_body_lba: u64,
     block_count: u64,
     max_stripes_per_window: u64,
@@ -211,7 +211,7 @@ pub fn recover_object_region_from_sidecar(
 ///
 /// This is the object-addressed bridge that `ObjectParitySource::recover_block_at`
 /// will call: it resolves `(tape_file_number, body_lba)` to a
-/// `ParityDataOrdinal` through the authenticated filemark map, rejects
+/// `ParityDataOrdinal` through the digest-validated filemark map, rejects
 /// unvalidated-prefix recovery before any tape I/O, and then delegates to the
 /// sidecar-aware ordinal recovery core.
 pub fn recover_object_block_from_sidecar(
@@ -220,7 +220,7 @@ pub fn recover_object_block_from_sidecar(
     scheme: &ParityScheme,
     tape_uuid: [u8; 16],
     block_size: u32,
-    tape_file_number: u32,
+    tape_file_number: u64,
     body_lba: u64,
 ) -> Result<SidecarRecoveryResult, ParityError> {
     let read_boundary = DurableBoundaryState::from_scoped_map(scoped_map)?;
@@ -251,7 +251,7 @@ pub fn recover_object_block_from_sidecar(
 /// catalog or authoritative bootstrap. This function enforces the scoped
 /// per-block recoverability check before touching tape:
 ///
-/// - prefix scope: `failed_ordinal` must be inside the authenticated prefix;
+/// - prefix scope: `failed_ordinal` must be inside the digest-validated prefix;
 /// - protection watermark: `failed_ordinal` must be below the highest
 ///   committed sidecar ordinal.
 ///
@@ -807,7 +807,7 @@ fn outside_validated_prefix_error(scoped_map: &ScopedFilemarkMap, ordinal: u64) 
 fn ensure_inside_durable_recovery_boundary(
     scoped_map: &ScopedFilemarkMap,
     read_boundary: &DurableBoundaryState,
-    tape_file_number: u32,
+    tape_file_number: u64,
     ordinal: u64,
 ) -> Result<(), ParityError> {
     if read_boundary.contains_committed_tape_file(tape_file_number) {
@@ -1053,8 +1053,8 @@ fn rescue_tail_sidecar_index_with_directory(
             entry.sidecar_total_block_count, sidecar_entry.block_count
         )));
     }
-    let h = u64::from(entry.sidecar_header_block_count);
-    let parity = u64::from(entry.parity_shard_block_count);
+    let h = entry.sidecar_header_block_count;
+    let parity = entry.parity_shard_block_count;
     if h == 0 {
         return Err(ParityError::SidecarParse(
             "sidecar directory records a zero header block count".into(),
@@ -1138,7 +1138,7 @@ fn read_primary_sidecar_index_without_footer(
         .map_err(|_| ParityError::Invariant("sidecar index block count overflows usize"))?;
     let mut blocks = Vec::with_capacity(h);
     blocks.push(block0);
-    for block_within_file in 1..u64::from(header.shard_index_block_count) {
+    for block_within_file in 1..header.shard_index_block_count {
         blocks.push(read_sidecar_block(
             source,
             scoped_map,
@@ -1191,7 +1191,7 @@ fn read_sidecar_index_copy(
     let h = usize::try_from(footer.sidecar_header_block_count)
         .map_err(|_| ParityError::Invariant("sidecar index block count overflows usize"))?;
     let mut blocks = Vec::with_capacity(h);
-    for offset in 0..u64::from(footer.sidecar_header_block_count) {
+    for offset in 0..footer.sidecar_header_block_count {
         let block_within_file = start_block
             .checked_add(offset)
             .ok_or(ParityError::Invariant(
@@ -1491,6 +1491,11 @@ mod tests {
             self.cursor = usize::try_from(hint.lba)
                 .map_err(|_| ParityError::Invariant("test LBA overflows usize"))?;
             Ok(())
+        }
+
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.cursor = self.records.len();
+            Ok(PhysicalPositionHint::new(self.cursor as u64))
         }
 
         fn space_filemarks(
@@ -1834,7 +1839,7 @@ mod tests {
                 third_epoch_start,
                 total_object_blocks,
             ),
-            TapeFileMapEntry::bootstrap(7, 1),
+            TapeFileMapEntry::parity_map(7, 1),
         ])
         .unwrap();
         ScopedFilemarkMap::from_catalog(map, total_object_blocks)
@@ -2008,7 +2013,7 @@ mod tests {
 
     fn object_damage_lbas(
         scoped: &ScopedFilemarkMap,
-        tape_file_number: u32,
+        tape_file_number: u64,
         start_body_lba: u64,
         len: u64,
     ) -> Vec<usize> {
@@ -2042,7 +2047,7 @@ mod tests {
 
     fn parity_lba_for_shard(
         scoped: &ScopedFilemarkMap,
-        sidecar_tape_file_number: u32,
+        sidecar_tape_file_number: u64,
         sidecar: &crate::sidecar::EncodedSidecarTapeFile,
         stripe_index: u32,
         parity_index: u16,
@@ -2199,10 +2204,10 @@ mod tests {
         let object_blocks = vec![block(51), block(52), block(53)];
         let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
         let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
-        let first_parity_block = u64::from(sidecar.header.shard_index_block_count);
+        let first_parity_block = sidecar.header.shard_index_block_count;
         assert_eq!(
             sidecar.header.parity_block_count,
-            u32::from(scheme.parity_blocks_per_stripe)
+            u64::from(scheme.parity_blocks_per_stripe)
         );
 
         let header_lba = scoped
@@ -2219,7 +2224,7 @@ mod tests {
                     .map
                     .physical_position(TapeFilePosition {
                         tape_file_number: 2,
-                        block_within_file: first_parity_block + u64::from(offset),
+                        block_within_file: first_parity_block + offset,
                     })
                     .unwrap()
                     .lba
@@ -2284,7 +2289,7 @@ mod tests {
             .map
             .physical_position(TapeFilePosition {
                 tape_file_number: 2,
-                block_within_file: u64::from(sidecar.header.shard_index_block_count),
+                block_within_file: sidecar.header.shard_index_block_count,
             })
             .unwrap()
             .lba;
@@ -2333,7 +2338,7 @@ mod tests {
             "fixture must spill the sidecar index across multiple post-header blocks"
         );
 
-        let final_index_block = u64::from(sidecar.header.shard_index_block_count - 1);
+        let final_index_block = sidecar.header.shard_index_block_count - 1;
         let final_index_lba = scoped
             .map
             .physical_position(TapeFilePosition {
@@ -2346,7 +2351,7 @@ mod tests {
             .map
             .physical_position(TapeFilePosition {
                 tape_file_number: 2,
-                block_within_file: u64::from(sidecar.header.shard_index_block_count),
+                block_within_file: sidecar.header.shard_index_block_count,
             })
             .unwrap()
             .lba;
@@ -2832,7 +2837,7 @@ mod tests {
         assert_eq!(epoch_data_shards, 20);
         assert_eq!(sidecar.header.logical_shard_count, epoch_data_shards);
         assert_eq!(sidecar.header.real_data_shard_count, real_data_shards);
-        assert_eq!(sidecar.header.data_crc_count, real_data_shards as u32);
+        assert_eq!(sidecar.header.data_crc_count, real_data_shards);
         assert_eq!(
             sidecar.header.protected_ordinal_end_exclusive,
             real_data_shards
@@ -2890,7 +2895,7 @@ mod tests {
         assert_eq!(epoch_data_shards, 20);
         assert_eq!(sidecar.header.logical_shard_count, epoch_data_shards);
         assert_eq!(sidecar.header.real_data_shard_count, real_data_shards);
-        assert_eq!(sidecar.header.data_crc_count, real_data_shards as u32);
+        assert_eq!(sidecar.header.data_crc_count, real_data_shards);
 
         let failed_ordinal = 0;
         let real_peer_ordinal = 5;
@@ -3016,7 +3021,7 @@ mod tests {
                 case.name
             );
             assert_eq!(
-                sidecar.header.data_crc_count, case.real_data_shards as u32,
+                sidecar.header.data_crc_count, case.real_data_shards,
                 "{}",
                 case.name
             );
@@ -3172,7 +3177,7 @@ mod tests {
         );
         assert_eq!(
             partial_sidecar.header.data_crc_count,
-            final_partial_real_shards as u32
+            final_partial_real_shards
         );
 
         let epoch0_failed_ordinal = 5;
@@ -3352,7 +3357,7 @@ mod tests {
         );
         assert_eq!(
             partial_sidecar.header.data_crc_count,
-            final_partial_real_shards as u32
+            final_partial_real_shards
         );
 
         let epoch0_tail_position = scoped
@@ -5993,7 +5998,7 @@ mod tests {
     }
 
     /// Extends the epoch-boundary recovery gate to a longer chain:
-    /// BOT bootstrap, three object/sidecar epoch pairs, and a final bootstrap.
+    /// BOT Bootstrap, three object/sidecar epoch pairs, and a final ParityMap.
     /// The global damage crosses two object/epoch boundaries, but each
     /// epoch-local stripe remains at or below the RS limit.
     #[test]
@@ -6034,7 +6039,7 @@ mod tests {
         let entries = scoped.map.entries();
         assert_eq!(entries.len(), 8);
         assert_eq!(entries[0].kind, TapeFileKind::Bootstrap);
-        assert_eq!(entries[7].kind, TapeFileKind::Bootstrap);
+        assert_eq!(entries[7].kind, TapeFileKind::ParityMap);
         for (ordinal, expected_tape_file) in [
             (epoch_data_shards - 1, 1),
             (epoch_data_shards, 3),
@@ -6168,7 +6173,7 @@ mod tests {
         let object_blocks = (1..=6).map(block).collect::<Vec<_>>();
         let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
         let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
-        let h = u64::from(sidecar.header.shard_index_block_count);
+        let h = sidecar.header.shard_index_block_count;
         let recoverable_len = u64::from(scheme.parity_blocks_per_stripe)
             * u64::from(scheme.stripes_per_neighborhood)
             + h
@@ -6258,7 +6263,7 @@ mod tests {
         let object_blocks = (31..33).map(block).collect::<Vec<_>>();
         let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
         let scoped = scoped_map(sidecar.blocks.len() as u64, real_data_shards);
-        let h = u64::from(sidecar.header.shard_index_block_count);
+        let h = sidecar.header.shard_index_block_count;
         let unrecoverable_len = u64::from(scheme.parity_blocks_per_stripe - 1)
             * u64::from(scheme.stripes_per_neighborhood)
             + real_data_shards

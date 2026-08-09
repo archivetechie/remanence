@@ -17,22 +17,22 @@ namespace parity_sidecar_layout_verif
 /-- [parity_sidecar_layout_verif::SIDECAR_HEADER_LEN]
     Source: 'src/lib.rs', lines 10:0-10:41
     Visibility: public -/
-@[global_simps, irreducible] def SIDECAR_HEADER_LEN : Std.U64 := 184#u64
+@[global_simps, irreducible] def SIDECAR_HEADER_LEN : Std.U64 := 200#u64
 
 /-- [parity_sidecar_layout_verif::SIDECAR_HEADER_CRC_OFFSET]
     Source: 'src/lib.rs', lines 11:0-11:48
     Visibility: public -/
-@[global_simps, irreducible] def SIDECAR_HEADER_CRC_OFFSET : Std.U64 := 176#u64
+@[global_simps, irreducible] def SIDECAR_HEADER_CRC_OFFSET : Std.U64 := 192#u64
 
 /-- [parity_sidecar_layout_verif::SIDECAR_FOOTER_LEN]
     Source: 'src/lib.rs', lines 12:0-12:41
     Visibility: public -/
-@[global_simps, irreducible] def SIDECAR_FOOTER_LEN : Std.U64 := 128#u64
+@[global_simps, irreducible] def SIDECAR_FOOTER_LEN : Std.U64 := 136#u64
 
 /-- [parity_sidecar_layout_verif::SIDECAR_FOOTER_CRC_OFFSET]
     Source: 'src/lib.rs', lines 13:0-13:48
     Visibility: public -/
-@[global_simps, irreducible] def SIDECAR_FOOTER_CRC_OFFSET : Std.U64 := 120#u64
+@[global_simps, irreducible] def SIDECAR_FOOTER_CRC_OFFSET : Std.U64 := 128#u64
 
 /-- [parity_sidecar_layout_verif::PARITY_INDEX_ENTRY_LEN]
     Source: 'src/lib.rs', lines 14:0-14:43
@@ -52,7 +52,7 @@ namespace parity_sidecar_layout_verif
 /-- [parity_sidecar_layout_verif::MIN_HEADER_BLOCK_SIZE]
     Source: 'src/lib.rs', lines 18:0-18:44
     Visibility: public -/
-@[global_simps, irreducible] def MIN_HEADER_BLOCK_SIZE : Std.U64 := 192#u64
+@[global_simps, irreducible] def MIN_HEADER_BLOCK_SIZE : Std.U64 := 208#u64
 
 /-- [parity_sidecar_layout_verif::LayoutError]
     Source: 'src/lib.rs', lines 21:0-25:1
@@ -1126,19 +1126,19 @@ def header_block_layout
       let br9 ← range 56#u64 64#u64
       let br10 ← range 64#u64 72#u64
       let br11 ← range 72#u64 80#u64
-      let br12 ← range 80#u64 84#u64
-      let br13 ← range 84#u64 88#u64
-      let br14 ← range 88#u64 92#u64
-      let br15 ← range 92#u64 96#u64
-      let br16 ← range 96#u64 104#u64
-      let br17 ← range 104#u64 112#u64
-      let br18 ← range 112#u64 120#u64
-      let br19 ← range 120#u64 128#u64
-      let br20 ← range 128#u64 130#u64
-      let br21 ← range 130#u64 132#u64
-      let br22 ← range 132#u64 136#u64
-      let br23 ← range 136#u64 168#u64
-      let br24 ← range 168#u64 SIDECAR_HEADER_CRC_OFFSET
+      let br12 ← range 80#u64 88#u64
+      let br13 ← range 88#u64 96#u64
+      let br14 ← range 96#u64 104#u64
+      let br15 ← range 104#u64 112#u64
+      let br16 ← range 112#u64 120#u64
+      let br17 ← range 120#u64 128#u64
+      let br18 ← range 128#u64 136#u64
+      let br19 ← range 136#u64 144#u64
+      let br20 ← range 144#u64 146#u64
+      let br21 ← range 146#u64 148#u64
+      let br22 ← range 148#u64 152#u64
+      let br23 ← range 152#u64 184#u64
+      let br24 ← range 184#u64 SIDECAR_HEADER_CRC_OFFSET
       let br25 ← range SIDECAR_HEADER_CRC_OFFSET SIDECAR_HEADER_LEN
       let br26 ← range SIDECAR_HEADER_LEN val
       let br27 ← range 0#u64 SIDECAR_HEADER_CRC_OFFSET
@@ -1199,12 +1199,12 @@ def footer_block_layout
     let br5 ← range 32#u64 40#u64
     let br6 ← range 40#u64 48#u64
     let br7 ← range 48#u64 56#u64
-    let br8 ← range 56#u64 60#u64
-    let br9 ← range 60#u64 64#u64
-    let br10 ← range 64#u64 72#u64
-    let br11 ← range 72#u64 80#u64
-    let br12 ← range 80#u64 88#u64
-    let br13 ← range 88#u64 SIDECAR_FOOTER_CRC_OFFSET
+    let br8 ← range 56#u64 64#u64
+    let br9 ← range 64#u64 72#u64
+    let br10 ← range 72#u64 80#u64
+    let br11 ← range 80#u64 88#u64
+    let br12 ← range 88#u64 96#u64
+    let br13 ← range 96#u64 SIDECAR_FOOTER_CRC_OFFSET
     let br14 ← range SIDECAR_FOOTER_CRC_OFFSET SIDECAR_FOOTER_LEN
     let br15 ← range 0#u64 SIDECAR_FOOTER_CRC_OFFSET
     let br16 ← range SIDECAR_FOOTER_LEN block_size

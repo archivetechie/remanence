@@ -4,7 +4,7 @@
 //! mount. It tells the reader the parity scheme (so a
 //! [`ObjectParitySource`](crate::ObjectParitySource) can be constructed),
 //! the tape UUID (which derives the per-tape parity magic), and
-//! the filemark-map digest that authenticates catalog-less
+//! the filemark-map digest that validates catalog-less
 //! reconstruction.
 //!
 //! On-tape layout per `docs/layer3c-design.md` v0.4.4 §5.6: a
@@ -16,7 +16,6 @@
 //! fixed-block reads rather than buffer-size changes.
 
 use remanence_library::{scsi::decode_sense, TapeIoError};
-use serde::{Deserialize, Serialize};
 
 use crate::cbor::IntegerMapKeyTracker;
 use crate::diagnostic_text::{
@@ -24,12 +23,7 @@ use crate::diagnostic_text::{
     validate_writer_version,
 };
 use crate::error::ParityError;
-use crate::filemark_map::FilemarkMapDigest;
-use crate::parity_map::{
-    decode_parity_map_reference_cbor, decode_sidecar_epoch_directory_cbor,
-    encode_parity_map_reference_cbor, encode_sidecar_epoch_directory_cbor, ParityMapReference,
-    SidecarEpochDirectory,
-};
+use crate::filemark_map::{sole_bot_filemark_map_digest, FilemarkMapDigest};
 use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
 use crate::sidecar::crc64_xz;
 
@@ -39,7 +33,7 @@ pub const BOOTSTRAP_MAGIC: [u8; 8] = *b"REM\x00BOO\x01";
 /// Schema-major version this writer emits / this reader
 /// accepts. Major bumps require an explicit migration plan
 /// documented in `docs/layer3c-design.md`.
-pub const BOOTSTRAP_SCHEMA_MAJOR: u16 = 1;
+pub const BOOTSTRAP_SCHEMA_MAJOR: u16 = 2;
 
 /// Schema-minor version this writer emits. Reader accepts
 /// minors `<= BOOTSTRAP_SCHEMA_MINOR` written by older
@@ -54,18 +48,15 @@ pub const BOOTSTRAP_SCHEMA_MINOR: u16 = 3;
 pub const FLAG_NO_PARITY: u32 = 1 << 0;
 
 /// Byte offset of the bootstrap header CRC-64/XZ field.
-pub const BOOTSTRAP_HEADER_CRC_OFFSET: usize = 0x2C;
+pub const BOOTSTRAP_HEADER_CRC_OFFSET: usize = 0x30;
 
 /// Size of the fixed bootstrap header, through the header CRC field.
-pub const BOOTSTRAP_HEADER_LEN: usize = 0x34;
+pub const BOOTSTRAP_HEADER_LEN: usize = 0x38;
 
 const BOOTSTRAP_PAYLOAD_CRC_LEN: usize = 8;
-const OBJECT_ROWS_KEY: u64 = 30;
-const OBJECT_ROW_METADATA_FRAME_MIN_LEN: u64 = 17;
-const OBJECT_ROW_METADATA_FRAME_MAX_LEN: u64 = 16 * 1024 * 1024;
-const OBJECT_ROW_KEY_FRAME_MIN_LEN: u32 = 1191;
-const OBJECT_ROW_KEY_FRAME_MAX_LEN: u32 = 16_384;
-const OBJECT_ROW_MAX_RECIPIENTS: usize = 8;
+const LEGACY_INLINE_DIRECTORY_KEY: i128 = 20;
+const LEGACY_PARITY_MAP_REFERENCE_KEY: i128 = 21;
+const LEGACY_OBJECT_ROWS_KEY: i128 = 30;
 
 /// Decoded bootstrap-block payload.
 ///
@@ -101,9 +92,9 @@ pub struct BootstrapPayload {
     /// RFC3339 timestamp of when this bootstrap copy was
     /// written. Use [`Self::escaped_written_at`] for display.
     pub written_at: String,
-    /// Bootstrap sequence number (0 at LBA 0; subsequent
-    /// copies increment).
-    pub sequence: u32,
+    /// Bootstrap sequence number. Schema-major 2 permits only the sole BOT
+    /// Bootstrap, so this is always zero.
+    pub sequence: u64,
     /// Tape block size in bytes that the writer used. Pinned
     /// so future readers can verify continuity without
     /// MODE SENSE. Also the size the writer expects the
@@ -115,14 +106,6 @@ pub struct BootstrapPayload {
     /// parity tape has non-authoritative physical geometry and is refused for
     /// Layer 3c recovery.
     pub drive_compression: bool,
-    /// Inline sidecar epoch directory, when it fits in this bootstrap block.
-    pub sidecar_epoch_directory: Option<SidecarEpochDirectory>,
-    /// Reference to an external `parity_map` tape file carrying the directory.
-    pub parity_map_reference: Option<ParityMapReference>,
-    /// Optional REM-OBJECT-binding per-object rows carried by checkpoint/final
-    /// bootstraps. The parity layer treats object bytes as opaque; higher
-    /// layers supply these rows when they have representation-specific anchors.
-    pub object_rows: Vec<BootstrapObjectRow>,
 }
 
 impl BootstrapPayload {
@@ -135,99 +118,6 @@ impl BootstrapPayload {
     pub fn escaped_written_at(&self) -> String {
         escape_member_name(self.written_at.as_bytes())
     }
-}
-
-/// One object row carried in a bootstrap payload's object directory.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct BootstrapObjectRow {
-    /// Filemark-delimited tape-file number of the object copy.
-    pub tape_file_number: u32,
-    /// Number of fixed-size tape blocks occupied by the stored copy.
-    pub stored_block_count: u64,
-    /// Verbatim 1–64-byte REM-OBJECT object identifier. Schema minors 0..=2 may
-    /// decode this as absent.
-    pub object_id: Option<Vec<u8>>,
-    /// Representation-specific recovery anchors for the copy.
-    pub representation: BootstrapObjectRepresentation,
-}
-
-impl BootstrapObjectRow {
-    /// Construct a plaintext REM-OBJECT object row with manifest anchors.
-    pub fn plaintext(
-        tape_file_number: u32,
-        stored_block_count: u64,
-        manifest_first_chunk_lba: u64,
-        manifest_size_bytes: u64,
-        manifest_chunk_count: u64,
-        manifest_sha256: [u8; 32],
-    ) -> Self {
-        Self {
-            tape_file_number,
-            stored_block_count,
-            object_id: None,
-            representation: BootstrapObjectRepresentation::Plaintext {
-                manifest_first_chunk_lba,
-                manifest_size_bytes,
-                manifest_chunk_count,
-                manifest_sha256,
-            },
-        }
-    }
-
-    /// Construct an encrypted REM-OBJECT object row with envelope fields only.
-    pub fn encrypted(
-        tape_file_number: u32,
-        stored_block_count: u64,
-        recipient_epoch_ids: Vec<[u8; 16]>,
-        metadata_frame_len: u64,
-        key_frame_len: u32,
-    ) -> Self {
-        Self {
-            tape_file_number,
-            stored_block_count,
-            object_id: None,
-            representation: BootstrapObjectRepresentation::Encrypted {
-                recipient_epoch_ids,
-                metadata_frame_len,
-                key_frame_len,
-            },
-        }
-    }
-
-    /// Bind this recovery row to the verbatim REM-OBJECT object identifier bytes.
-    ///
-    /// The row validator rejects empty, over-64-byte, or NUL-containing
-    /// values before encoding or admission.
-    pub fn with_object_id(mut self, object_id: impl Into<Vec<u8>>) -> Self {
-        self.object_id = Some(object_id.into());
-        self
-    }
-}
-
-/// Representation-specific payload for one bootstrap object row.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum BootstrapObjectRepresentation {
-    /// Plaintext REM-OBJECT representation: bootstrap row carries manifest anchors.
-    Plaintext {
-        /// Object-local body LBA of the generated manifest.
-        manifest_first_chunk_lba: u64,
-        /// Manifest byte length.
-        manifest_size_bytes: u64,
-        /// Number of object-local chunks occupied by the manifest.
-        manifest_chunk_count: u64,
-        /// SHA-256 digest of the manifest CBOR bytes.
-        manifest_sha256: [u8; 32],
-    },
-    /// Encrypted REM-OBJECT representation: bootstrap row carries envelope fields
-    /// only and deliberately omits plaintext manifest anchors.
-    Encrypted {
-        /// Recipient epoch ids from the key-frame slots.
-        recipient_epoch_ids: Vec<[u8; 16]>,
-        /// REM-OBJECT encrypted metadata frame length.
-        metadata_frame_len: u64,
-        /// Serialized key-frame length.
-        key_frame_len: u32,
-    },
 }
 
 /// Decoded parity-scheme record from a bootstrap payload. Distinguished from
@@ -290,26 +180,26 @@ pub fn write_bootstrap_block(
             "BootstrapPayload: parity bootstrap requires filemark_map_digest",
         ));
     }
+    if let Some(digest) = payload.filemark_map_digest.as_ref() {
+        validate_sole_bot_map_digest(digest).map_err(ParityError::Invariant)?;
+    }
     if !payload.no_parity_flag && payload.drive_compression {
         return Err(ParityError::DriveCompressionEnabled);
     }
-    if payload.sidecar_epoch_directory.is_some() && payload.parity_map_reference.is_some() {
+    if payload.sequence != 0 {
         return Err(ParityError::Invariant(
-            "BootstrapPayload: sidecar_epoch_directory and parity_map_reference are mutually exclusive",
+            "schema-major 2 permits only the sequence-0 BOT Bootstrap",
         ));
     }
-    if payload
-        .object_rows
-        .iter()
-        .any(|row| row.object_id.is_none())
-    {
+    if payload.written_by_version.is_empty() {
         return Err(ParityError::Invariant(
-            "schema-minor 3 bootstrap object rows require REM-OBJECT object_id",
+            "BootstrapPayload: written_by_version key 3 is required for writers",
         ));
     }
-    validate_bootstrap_object_rows(&payload.object_rows, Some(payload.block_size_bytes))?;
 
-    let block_size = payload.block_size_bytes as usize;
+    let block_size = usize::try_from(payload.block_size_bytes).map_err(|_| {
+        ParityError::Invariant("payload.block_size_bytes does not fit the host address space")
+    })?;
     if buf.len() < block_size {
         return Err(ParityError::Invariant(
             "bootstrap buffer shorter than payload.block_size_bytes",
@@ -352,11 +242,11 @@ pub fn write_bootstrap_block(
     buf[12..16].copy_from_slice(&flags.to_be_bytes());
     buf[16..32].copy_from_slice(&payload.tape_uuid);
     buf[32..36].copy_from_slice(&payload.block_size_bytes.to_be_bytes());
-    buf[36..40].copy_from_slice(&payload.sequence.to_be_bytes());
-    buf[40..44].copy_from_slice(&payload_len_u32.to_le_bytes());
-    // Header CRC covers bytes 0..0x2C, including cbor_payload_len.
+    buf[36..44].copy_from_slice(&payload.sequence.to_be_bytes());
+    buf[44..48].copy_from_slice(&payload_len_u32.to_le_bytes());
+    // Header CRC covers bytes 0..0x30, including cbor_payload_len.
     let crc_header = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
-    buf[44..52].copy_from_slice(&crc_header.to_le_bytes());
+    buf[48..56].copy_from_slice(&crc_header.to_le_bytes());
 
     // 3. Append CBOR + payload CRC.
     let cbor_end = BOOTSTRAP_HEADER_LEN + cbor_bytes.len();
@@ -397,8 +287,8 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
         )));
     }
 
-    // Header CRC validates bytes 0..0x2C against bytes 0x2C..0x34.
-    let stored_header_crc = u64::from_le_bytes(buf[44..52].try_into().unwrap());
+    // Header CRC validates bytes 0..0x30 against bytes 0x30..0x38.
+    let stored_header_crc = u64::from_le_bytes(buf[48..56].try_into().unwrap());
     let computed_header_crc = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
     if stored_header_crc != computed_header_crc {
         return Err(ParityError::BootstrapParse(format!(
@@ -422,8 +312,16 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
     let mut tape_uuid = [0u8; 16];
     tape_uuid.copy_from_slice(&buf[16..32]);
     let block_size_bytes = u32::from_be_bytes(buf[32..36].try_into().unwrap());
-    let sequence = u32::from_be_bytes(buf[36..40].try_into().unwrap());
-    let payload_len = u32::from_le_bytes(buf[40..44].try_into().unwrap()) as usize;
+    let sequence = u64::from_be_bytes(buf[36..44].try_into().unwrap());
+    if sequence != 0 {
+        return Err(ParityError::BootstrapParse(
+            "schema-major 2 permits only the sequence-0 BOT Bootstrap".into(),
+        ));
+    }
+    let payload_len = usize::try_from(u32::from_le_bytes(buf[44..48].try_into().unwrap()))
+        .map_err(|_| {
+            ParityError::BootstrapParse("payload_len does not fit host address space".into())
+        })?;
 
     let cbor_end = BOOTSTRAP_HEADER_LEN
         .checked_add(payload_len)
@@ -447,7 +345,7 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
         )));
     }
 
-    let decoded = decode_cbor_payload(cbor_bytes, no_parity, block_size_bytes, minor)?;
+    let decoded = decode_cbor_payload(cbor_bytes, no_parity)?;
 
     // Codex idref=794a16ac Medium: scheme record is optional
     // only when FLAG_NO_PARITY is set. Reject a missing scheme
@@ -462,6 +360,10 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
             "CBOR payload missing filemark map digest (and FLAG_NO_PARITY not set)".into(),
         ));
     }
+    if let Some(digest) = decoded.filemark_map_digest.as_ref() {
+        validate_sole_bot_map_digest(digest)
+            .map_err(|message| ParityError::BootstrapParse(message.to_string()))?;
+    }
 
     Ok(BootstrapPayload {
         scheme: decoded.scheme_record,
@@ -473,10 +375,17 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
         sequence,
         block_size_bytes,
         drive_compression: decoded.drive_compression,
-        sidecar_epoch_directory: decoded.sidecar_epoch_directory,
-        parity_map_reference: decoded.parity_map_reference,
-        object_rows: decoded.object_rows,
     })
+}
+
+fn validate_sole_bot_map_digest(digest: &FilemarkMapDigest) -> Result<(), &'static str> {
+    let Ok(expected) = sole_bot_filemark_map_digest() else {
+        return Err("could not derive the canonical sole-BOT filemark map digest");
+    };
+    if digest != &expected {
+        return Err("filemark map digest must describe exactly the sole tape-file-0 BOT Bootstrap");
+    }
+    Ok(())
 }
 
 /// Cheap magic-only check used by the discovery scanner before
@@ -486,32 +395,19 @@ pub fn has_bootstrap_magic(buf: &[u8]) -> bool {
     buf.len() >= BOOTSTRAP_MAGIC.len() && buf[0..BOOTSTRAP_MAGIC.len()] == BOOTSTRAP_MAGIC
 }
 
-/// Max blocks to scan forward from each candidate position
-/// looking for bootstrap magic. Picked to comfortably exceed
-/// typical inter-bootstrap object spacing (~1 GiB ≈ 1024 blocks
-/// at 1 MiB).
-pub const MAX_BOOTSTRAP_SCAN_BLOCKS: u32 = 1024;
-
 /// Candidate fixed block sizes used when the caller has no catalog
 /// or operator-provided block-size hint. The normal path should use
 /// [`discover_bootstrap_with_block_size`].
 pub const DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES: &[u32] = &[256 * 1024, 512 * 1024, 1024 * 1024];
 
-/// Find a valid bootstrap block on the tape. Per design §8.1:
-/// the writer always places copy 0 at LBA 0; subsequent copies
-/// land at writer-policy LBAs that the design recommends near
-/// ~5%, ~10%, ... of tape capacity. The reader tries each
-/// expected position in order and scans forward up to
-/// [`MAX_BOOTSTRAP_SCAN_BLOCKS`] looking for bootstrap magic.
+/// Find the sole valid schema-major 2 Bootstrap block at LBA 0.
 ///
 /// Used at tape-mount time before constructing a
 /// [`ObjectParitySource`](crate::ObjectParitySource) — the source needs the
 /// scheme, which only the bootstrap can provide.
 ///
-/// `tape_total_blocks_hint` lets the scanner compute fractional
-/// positions. `None` skips the fractional fallbacks and only
-/// checks LBA 0; that's the common case for healthy tapes and
-/// the cheapest path.
+/// The tape-size hint is accepted for caller symmetry but does not alter the
+/// sole-BOT lookup.
 pub fn discover_bootstrap(
     source: &mut dyn RawTapeSource,
     tape_total_blocks_hint: Option<u64>,
@@ -527,89 +423,21 @@ pub fn discover_bootstrap(
 /// known from the catalog, operator config, or Layer 3a setup.
 pub fn discover_bootstrap_with_block_size(
     source: &mut dyn RawTapeSource,
-    tape_total_blocks_hint: Option<u64>,
+    _tape_total_blocks_hint: Option<u64>,
     block_size: u32,
 ) -> Result<BootstrapPayload, ParityError> {
     source.configure_fixed_block_size(block_size)?;
-    let mut first_parse_error = None;
-    for pos in expected_bootstrap_positions(tape_total_blocks_hint) {
-        match try_read_bootstrap_at(source, pos, block_size) {
-            Ok(bp) => return Ok(bp),
-            Err(err) => {
-                if bootstrap_probe_can_continue(&err) {
-                    if first_parse_error.is_none() && matches!(err, ParityError::BootstrapParse(_))
-                    {
-                        first_parse_error = Some(err);
-                    }
-                    continue;
-                }
-                return Err(err);
+    match try_read_bootstrap_at(source, 0, block_size) {
+        Ok(payload) => Ok(payload),
+        Err(err) if bootstrap_probe_can_continue(&err) => {
+            if matches!(err, ParityError::BootstrapParse(_)) {
+                Err(err)
+            } else {
+                Err(ParityError::NoBootstrapFound)
             }
         }
+        Err(err) => Err(err),
     }
-    Err(first_parse_error.unwrap_or(ParityError::NoBootstrapFound))
-}
-
-/// Discover the authoritative bootstrap copy when the fixed block size is
-/// already known.
-///
-/// Layer 3c v0.4.4 §8.1 deliberately separates "first valid bootstrap" from
-/// "authoritative bootstrap": the BOT copy is enough to learn the scheme and
-/// block size, but a later bootstrap may carry a wider filemark-map digest.
-/// This helper probes every expected bootstrap region at `block_size`, accepts
-/// only fully parsed bootstrap blocks, and returns the copy with the widest
-/// map scope: final map first, otherwise highest sequence, otherwise largest
-/// mapped ordinal count.
-pub fn discover_authoritative_bootstrap_with_block_size(
-    source: &mut dyn RawTapeSource,
-    tape_total_blocks_hint: Option<u64>,
-    block_size: u32,
-) -> Result<BootstrapPayload, ParityError> {
-    source.configure_fixed_block_size(block_size)?;
-    let mut best: Option<BootstrapPayload> = None;
-    let mut first_parse_error = None;
-    for pos in expected_bootstrap_positions(tape_total_blocks_hint) {
-        match try_read_bootstrap_at(source, pos, block_size) {
-            Ok(bp) => {
-                best = Some(match best {
-                    None => bp,
-                    Some(prev) => choose_wider_map_scope(prev, bp),
-                });
-            }
-            Err(err) => {
-                if bootstrap_probe_can_continue(&err) {
-                    if first_parse_error.is_none() && matches!(err, ParityError::BootstrapParse(_))
-                    {
-                        first_parse_error = Some(err);
-                    }
-                    continue;
-                }
-                return Err(err);
-            }
-        }
-    }
-    match best {
-        Some(payload) => Ok(payload),
-        None => Err(first_parse_error.unwrap_or(ParityError::NoBootstrapFound)),
-    }
-}
-
-/// Discover the authoritative bootstrap copy when the fixed block size may be
-/// unknown.
-///
-/// The first valid bootstrap found through the normal candidate-size fallback
-/// supplies the block size; then the tape is rescanned at that exact size to
-/// select the highest-scope bootstrap copy for filemark-map validation.
-pub fn discover_authoritative_bootstrap(
-    source: &mut dyn RawTapeSource,
-    tape_total_blocks_hint: Option<u64>,
-) -> Result<BootstrapPayload, ParityError> {
-    let first_valid = discover_bootstrap(source, tape_total_blocks_hint)?;
-    discover_authoritative_bootstrap_with_block_size(
-        source,
-        tape_total_blocks_hint,
-        first_valid.block_size_bytes,
-    )
 }
 
 /// Discover a bootstrap for a catalog-less tape whose block size is
@@ -618,17 +446,15 @@ pub fn discover_authoritative_bootstrap(
 /// whose header records the same size wins.
 pub fn discover_bootstrap_with_candidate_block_sizes(
     source: &mut dyn RawTapeSource,
-    tape_total_blocks_hint: Option<u64>,
+    _tape_total_blocks_hint: Option<u64>,
     candidate_block_sizes: &[u32],
 ) -> Result<BootstrapPayload, ParityError> {
     for block_size in candidate_block_sizes {
         source.configure_fixed_block_size(*block_size)?;
-        for pos in expected_bootstrap_positions(tape_total_blocks_hint) {
-            match try_read_bootstrap_at(source, pos, *block_size) {
-                Ok(bp) => return Ok(bp),
-                Err(err) if bootstrap_probe_can_continue(&err) => continue,
-                Err(err) => return Err(err),
-            }
+        match try_read_bootstrap_at(source, 0, *block_size) {
+            Ok(payload) => return Ok(payload),
+            Err(err) if bootstrap_probe_can_continue(&err) => continue,
+            Err(err) => return Err(err),
         }
     }
     Err(ParityError::NoBootstrapFound)
@@ -641,41 +467,9 @@ fn bootstrap_probe_can_continue(err: &ParityError) -> bool {
     )
 }
 
-/// Compute the sequence of LBAs the discovery scanner will try.
-/// LBA 0 always first (§7.3 invariant); fractional positions
-/// follow if a tape-size hint is supplied.
-pub fn expected_bootstrap_positions(tape_total_blocks_hint: Option<u64>) -> Vec<u64> {
-    let mut positions = vec![0u64];
-    if let Some(total) = tape_total_blocks_hint {
-        // Per §7.3 default policy: bootstrap copies land at
-        // ~5% intervals. Try every 5% mark; the scan window
-        // tolerates jitter caused by writer-policy object
-        // alignment.
-        for pct in 1u64..=19 {
-            let target = total * (pct * 5) / 100;
-            if target > 0 && target < total {
-                positions.push(target);
-            }
-        }
-    }
-    positions
-}
-
-fn choose_wider_map_scope(a: BootstrapPayload, b: BootstrapPayload) -> BootstrapPayload {
-    if bootstrap_scope_key(&b) > bootstrap_scope_key(&a) {
-        b
-    } else {
-        a
-    }
-}
-
-pub(crate) fn bootstrap_scope_key(payload: &BootstrapPayload) -> (bool, u32, u64) {
-    let digest = payload.filemark_map_digest.as_ref();
-    (
-        digest.map(|d| d.is_final_map).unwrap_or(false),
-        payload.sequence,
-        digest.map(|d| d.map_total_data_ordinals).unwrap_or(0),
-    )
+/// Return the sole schema-major 2 Bootstrap position.
+pub fn expected_bootstrap_positions(_tape_total_blocks_hint: Option<u64>) -> Vec<u64> {
+    vec![0]
 }
 
 fn try_read_bootstrap_at(
@@ -686,10 +480,12 @@ fn try_read_bootstrap_at(
     if block_size == 0 {
         return Err(ParityError::Invariant("bootstrap block size is zero"));
     }
-    let block_size = block_size as usize;
+    let block_size = usize::try_from(block_size).map_err(|_| {
+        ParityError::Invariant("bootstrap block size does not fit the host address space")
+    })?;
     source.locate_physical(PhysicalPositionHint::new(target_lba))?;
     let mut buf = vec![0u8; block_size];
-    for _ in 0..MAX_BOOTSTRAP_SCAN_BLOCKS {
+    for _ in 0..1 {
         match source.read_record(&mut buf) {
             Ok(RawReadOutcome::Block { bytes, .. }) if bytes != block_size => {
                 return Err(ParityError::BootstrapParse(format!(
@@ -706,7 +502,14 @@ fn try_read_bootstrap_at(
                     // window might be a valid bootstrap.
                     match parse_bootstrap_block(&buf) {
                         Ok(bp) => {
-                            if bp.block_size_bytes as usize != block_size {
+                            let bootstrap_block_size = usize::try_from(bp.block_size_bytes)
+                                .map_err(|_| {
+                                    ParityError::BootstrapParse(
+                                        "bootstrap block_size does not fit host address space"
+                                            .into(),
+                                    )
+                                })?;
+                            if bootstrap_block_size != block_size {
                                 return Err(ParityError::BootstrapParse(format!(
                                     "bootstrap block_size {} does not match read size {block_size}",
                                     bp.block_size_bytes
@@ -837,39 +640,6 @@ fn encode_cbor_payload(payload: &BootstrapPayload) -> Result<Vec<u8>, ParityErro
         CborValue::Bool(payload.drive_compression),
     ));
 
-    // Tag 20: inline sidecar epoch directory, when the directory fits in the
-    // bootstrap block. Tag 21 is used instead when an external parity_map
-    // control file carries the directory.
-    if let Some(directory) = payload.sidecar_epoch_directory.as_ref() {
-        entries.push((
-            CborValue::Integer(20.into()),
-            encode_sidecar_epoch_directory_cbor(directory)?,
-        ));
-    }
-
-    // Tag 21: external parity_map reference.
-    if let Some(reference) = payload.parity_map_reference.as_ref() {
-        reference.validate()?;
-        entries.push((
-            CborValue::Integer(21.into()),
-            encode_parity_map_reference_cbor(reference),
-        ));
-    }
-
-    // Tag 30: REM-OBJECT-binding object rows. Older readers ignore this unknown key;
-    // schema-minor 3 readers also bind every row to its REM-OBJECT object UUID.
-    if !payload.object_rows.is_empty() {
-        let rows = payload
-            .object_rows
-            .iter()
-            .map(encode_bootstrap_object_row_cbor)
-            .collect::<Result<Vec<_>, _>>()?;
-        entries.push((
-            CborValue::Integer(OBJECT_ROWS_KEY.into()),
-            CborValue::Array(rows),
-        ));
-    }
-
     let payload_cbor = CborValue::Map(entries);
     let mut buf = Vec::new();
     ciborium::into_writer(&payload_cbor, &mut buf)
@@ -884,16 +654,11 @@ struct DecodedBootstrapCbor {
     written_by_version: String,
     written_at: String,
     drive_compression: bool,
-    sidecar_epoch_directory: Option<SidecarEpochDirectory>,
-    parity_map_reference: Option<ParityMapReference>,
-    object_rows: Vec<BootstrapObjectRow>,
 }
 
 fn decode_cbor_payload(
     bytes: &[u8],
     no_parity_flag: bool,
-    block_size_bytes: u32,
-    schema_minor: u16,
 ) -> Result<DecodedBootstrapCbor, ParityError> {
     let value: CborValue = ciborium::from_reader(bytes)
         .map_err(|e| ParityError::BootstrapParse(format!("CBOR decode failed: {e}")))?;
@@ -911,9 +676,6 @@ fn decode_cbor_payload(
     let mut written_by_version = String::new();
     let mut written_at = String::new();
     let mut drive_compression = false;
-    let mut sidecar_epoch_directory: Option<SidecarEpochDirectory> = None;
-    let mut parity_map_reference: Option<ParityMapReference> = None;
-    let mut object_rows = Vec::new();
     let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
@@ -963,15 +725,12 @@ fn decode_cbor_payload(
                     ))
                 }
             },
-            20 => {
-                sidecar_epoch_directory = Some(decode_sidecar_epoch_directory_cbor(value)?);
-            }
-            21 => {
-                parity_map_reference = Some(decode_parity_map_reference_cbor(value)?);
-            }
-            key if key == i128::from(OBJECT_ROWS_KEY) => {
-                object_rows =
-                    decode_bootstrap_object_rows_cbor(value, Some(block_size_bytes), schema_minor)?;
+            LEGACY_INLINE_DIRECTORY_KEY
+            | LEGACY_PARITY_MAP_REFERENCE_KEY
+            | LEGACY_OBJECT_ROWS_KEY => {
+                return Err(ParityError::BootstrapParse(format!(
+                    "schema-major 2 Bootstrap forbids legacy payload key {key_i}"
+                )))
             }
             _ => {
                 // Forward-compatible: ignore unknown integer
@@ -980,11 +739,6 @@ fn decode_cbor_payload(
         }
     }
 
-    if sidecar_epoch_directory.is_some() && parity_map_reference.is_some() {
-        return Err(ParityError::BootstrapParse(
-            "CBOR payload carries both inline sidecar directory and parity_map reference".into(),
-        ));
-    }
     if !no_parity_flag && drive_compression {
         return Err(ParityError::DriveCompressionEnabled);
     }
@@ -995,418 +749,7 @@ fn decode_cbor_payload(
         written_by_version,
         written_at,
         drive_compression,
-        sidecar_epoch_directory,
-        parity_map_reference,
-        object_rows,
     })
-}
-
-pub(crate) fn encode_bootstrap_object_row_cbor(
-    row: &BootstrapObjectRow,
-) -> Result<CborValue, ParityError> {
-    validate_bootstrap_object_row(row, None)?;
-    let mut entries = vec![
-        (
-            CborValue::Integer(1.into()),
-            CborValue::Integer(row.tape_file_number.into()),
-        ),
-        (
-            CborValue::Integer(3.into()),
-            CborValue::Integer(row.stored_block_count.into()),
-        ),
-    ];
-    if let Some(object_id) = row.object_id.as_ref() {
-        entries.push((
-            CborValue::Integer(4.into()),
-            CborValue::Bytes(object_id.clone()),
-        ));
-    }
-    match &row.representation {
-        BootstrapObjectRepresentation::Plaintext {
-            manifest_first_chunk_lba,
-            manifest_size_bytes,
-            manifest_chunk_count,
-            manifest_sha256,
-        } => {
-            entries.insert(
-                1,
-                (
-                    CborValue::Integer(2.into()),
-                    CborValue::Text("plaintext".to_string()),
-                ),
-            );
-            entries.extend([
-                (
-                    CborValue::Integer(10.into()),
-                    CborValue::Integer((*manifest_first_chunk_lba).into()),
-                ),
-                (
-                    CborValue::Integer(11.into()),
-                    CborValue::Integer((*manifest_size_bytes).into()),
-                ),
-                (
-                    CborValue::Integer(12.into()),
-                    CborValue::Integer((*manifest_chunk_count).into()),
-                ),
-                (
-                    CborValue::Integer(13.into()),
-                    CborValue::Bytes(manifest_sha256.to_vec()),
-                ),
-            ]);
-        }
-        BootstrapObjectRepresentation::Encrypted {
-            recipient_epoch_ids,
-            metadata_frame_len,
-            key_frame_len,
-        } => {
-            entries.insert(
-                1,
-                (
-                    CborValue::Integer(2.into()),
-                    CborValue::Text("encrypted".to_string()),
-                ),
-            );
-            entries.extend([
-                (
-                    CborValue::Integer(21.into()),
-                    CborValue::Integer((*metadata_frame_len).into()),
-                ),
-                (
-                    CborValue::Integer(22.into()),
-                    CborValue::Array(
-                        recipient_epoch_ids
-                            .iter()
-                            .map(|epoch_id| CborValue::Bytes(epoch_id.to_vec()))
-                            .collect(),
-                    ),
-                ),
-                (
-                    CborValue::Integer(23.into()),
-                    CborValue::Integer((*key_frame_len).into()),
-                ),
-            ]);
-        }
-    }
-    Ok(CborValue::Map(entries))
-}
-
-pub(crate) fn decode_bootstrap_object_row_cbor(
-    value: CborValue,
-    block_size_bytes: Option<u32>,
-    schema_minor: u16,
-) -> Result<BootstrapObjectRow, ParityError> {
-    let map = match value {
-        CborValue::Map(map) => map,
-        _ => {
-            return Err(ParityError::BootstrapParse(
-                "bootstrap object row is not a map".into(),
-            ))
-        }
-    };
-
-    let mut tape_file_number = None;
-    let mut representation = None;
-    let mut stored_block_count = None;
-    let mut object_id = None;
-    let mut manifest_first_chunk_lba = None;
-    let mut manifest_size_bytes = None;
-    let mut manifest_chunk_count = None;
-    let mut manifest_sha256 = None;
-    let mut recipient_epoch_ids = None;
-    let mut metadata_frame_len = None;
-    let mut key_frame_len = None;
-    let mut key_order = IntegerMapKeyTracker::default();
-
-    for (key, value) in map {
-        let key_i = key_order
-            .next(key, "bootstrap object row")
-            .map_err(ParityError::BootstrapParse)?;
-        match (key_i, value) {
-            (1, CborValue::Integer(i)) => {
-                tape_file_number = Some(int_to_u32(i, "object_row.tape_file_number")?)
-            }
-            (2, CborValue::Text(value)) => representation = Some(value),
-            (3, CborValue::Integer(i)) => {
-                stored_block_count = Some(int_to_u64(i, "object_row.stored_block_count")?)
-            }
-            (4, CborValue::Bytes(bytes)) => {
-                object_id = Some(bytes);
-            }
-            (10, CborValue::Integer(i)) => {
-                manifest_first_chunk_lba =
-                    Some(int_to_u64(i, "object_row.manifest_first_chunk_lba")?)
-            }
-            (11, CborValue::Integer(i)) => {
-                manifest_size_bytes = Some(int_to_u64(i, "object_row.manifest_size_bytes")?)
-            }
-            (12, CborValue::Integer(i)) => {
-                manifest_chunk_count = Some(int_to_u64(i, "object_row.manifest_chunk_count")?)
-            }
-            (13, CborValue::Bytes(bytes)) => {
-                manifest_sha256 = Some(bytes.try_into().map_err(|bytes: Vec<u8>| {
-                    ParityError::BootstrapParse(format!(
-                        "object_row.manifest_sha256 has length {}, expected 32",
-                        bytes.len()
-                    ))
-                })?)
-            }
-            (21, CborValue::Integer(i)) => {
-                metadata_frame_len = Some(int_to_u64(i, "object_row.metadata_frame_len")?)
-            }
-            (22, CborValue::Array(values)) => {
-                let mut ids = Vec::with_capacity(values.len());
-                for value in values {
-                    let CborValue::Bytes(bytes) = value else {
-                        return Err(ParityError::BootstrapParse(
-                            "object_row.recipient_epoch_ids entry is not bytes".into(),
-                        ));
-                    };
-                    ids.push(bytes.try_into().map_err(|bytes: Vec<u8>| {
-                        ParityError::BootstrapParse(format!(
-                            "object_row.recipient_epoch_id has length {}, expected 16",
-                            bytes.len()
-                        ))
-                    })?);
-                }
-                recipient_epoch_ids = Some(ids);
-            }
-            (23, CborValue::Integer(i)) => {
-                key_frame_len = Some(int_to_u32(i, "object_row.key_frame_len")?)
-            }
-            _ => {}
-        }
-    }
-
-    let tape_file_number = tape_file_number
-        .ok_or_else(|| ParityError::BootstrapParse("object row missing tape_file_number".into()))?;
-    let stored_block_count = stored_block_count.ok_or_else(|| {
-        ParityError::BootstrapParse("object row missing stored_block_count".into())
-    })?;
-    let representation = representation
-        .ok_or_else(|| ParityError::BootstrapParse("object row missing representation".into()))?;
-    if schema_minor >= 3 && object_id.is_none() {
-        return Err(ParityError::BootstrapParse(
-            "schema-minor 3 object row missing object_id".into(),
-        ));
-    }
-    let mut row = match representation.as_str() {
-        "plaintext" => {
-            if recipient_epoch_ids.is_some()
-                || metadata_frame_len.is_some()
-                || key_frame_len.is_some()
-            {
-                return Err(ParityError::BootstrapParse(
-                    "plaintext object row carries encrypted envelope fields".into(),
-                ));
-            }
-            BootstrapObjectRow::plaintext(
-                tape_file_number,
-                stored_block_count,
-                manifest_first_chunk_lba.ok_or_else(|| {
-                    ParityError::BootstrapParse(
-                        "plaintext object row missing manifest_first_chunk_lba".into(),
-                    )
-                })?,
-                manifest_size_bytes.ok_or_else(|| {
-                    ParityError::BootstrapParse(
-                        "plaintext object row missing manifest_size_bytes".into(),
-                    )
-                })?,
-                manifest_chunk_count.ok_or_else(|| {
-                    ParityError::BootstrapParse(
-                        "plaintext object row missing manifest_chunk_count".into(),
-                    )
-                })?,
-                manifest_sha256.ok_or_else(|| {
-                    ParityError::BootstrapParse(
-                        "plaintext object row missing manifest_sha256".into(),
-                    )
-                })?,
-            )
-        }
-        "encrypted" => {
-            if manifest_first_chunk_lba.is_some()
-                || manifest_size_bytes.is_some()
-                || manifest_chunk_count.is_some()
-                || manifest_sha256.is_some()
-            {
-                return Err(ParityError::BootstrapParse(
-                    "encrypted object row carries plaintext manifest anchors".into(),
-                ));
-            }
-            BootstrapObjectRow::encrypted(
-                tape_file_number,
-                stored_block_count,
-                recipient_epoch_ids.ok_or_else(|| {
-                    ParityError::BootstrapParse(
-                        "encrypted object row missing recipient_epoch_ids".into(),
-                    )
-                })?,
-                metadata_frame_len.ok_or_else(|| {
-                    ParityError::BootstrapParse(
-                        "encrypted object row missing metadata_frame_len".into(),
-                    )
-                })?,
-                key_frame_len.ok_or_else(|| {
-                    ParityError::BootstrapParse("encrypted object row missing key_frame_len".into())
-                })?,
-            )
-        }
-        other => {
-            return Err(ParityError::BootstrapParse(format!(
-                "unsupported object row representation {other}"
-            )))
-        }
-    };
-    row.object_id = object_id;
-    validate_bootstrap_object_row(&row, block_size_bytes)?;
-    Ok(row)
-}
-
-fn decode_bootstrap_object_rows_cbor(
-    value: CborValue,
-    block_size_bytes: Option<u32>,
-    schema_minor: u16,
-) -> Result<Vec<BootstrapObjectRow>, ParityError> {
-    let rows = match value {
-        CborValue::Array(rows) => rows,
-        _ => {
-            return Err(ParityError::BootstrapParse(
-                "bootstrap object rows are not an array".into(),
-            ))
-        }
-    };
-    let rows = rows
-        .into_iter()
-        .map(|row| decode_bootstrap_object_row_cbor(row, block_size_bytes, schema_minor))
-        .collect::<Result<Vec<_>, _>>()?;
-    validate_bootstrap_object_rows(&rows, block_size_bytes)?;
-    Ok(rows)
-}
-
-pub(crate) fn validate_bootstrap_object_rows(
-    rows: &[BootstrapObjectRow],
-    block_size_bytes: Option<u32>,
-) -> Result<(), ParityError> {
-    let mut previous_tape_file_number = None;
-    for row in rows {
-        validate_bootstrap_object_row(row, block_size_bytes)?;
-        if let Some(previous) = previous_tape_file_number {
-            if row.tape_file_number <= previous {
-                return Err(ParityError::BootstrapParse(
-                    "bootstrap object rows must be in strictly increasing tape-file order".into(),
-                ));
-            }
-        }
-        previous_tape_file_number = Some(row.tape_file_number);
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_bootstrap_object_row(
-    row: &BootstrapObjectRow,
-    block_size_bytes: Option<u32>,
-) -> Result<(), ParityError> {
-    validate_object_recovery_row_fields(
-        row.stored_block_count,
-        row.object_id.as_deref(),
-        &row.representation,
-        block_size_bytes,
-    )
-}
-
-pub(crate) fn validate_object_recovery_row_fields(
-    stored_block_count: u64,
-    object_id: Option<&[u8]>,
-    representation: &BootstrapObjectRepresentation,
-    block_size_bytes: Option<u32>,
-) -> Result<(), ParityError> {
-    if stored_block_count == 0 {
-        return Err(ParityError::BootstrapParse(
-            "object row stored_block_count must be positive".into(),
-        ));
-    }
-    if let Some(object_id) = object_id {
-        if !(1..=64).contains(&object_id.len()) || object_id.contains(&0) {
-            return Err(ParityError::BootstrapParse(
-                "object row object_id must contain 1..=64 non-NUL bytes".into(),
-            ));
-        }
-    }
-    match representation {
-        BootstrapObjectRepresentation::Plaintext {
-            manifest_first_chunk_lba,
-            manifest_size_bytes,
-            manifest_chunk_count,
-            ..
-        } => {
-            if *manifest_size_bytes == 0 || *manifest_chunk_count == 0 {
-                return Err(ParityError::BootstrapParse(
-                    "plaintext object row manifest size/count must be positive".into(),
-                ));
-            }
-            let manifest_end = manifest_first_chunk_lba
-                .checked_add(*manifest_chunk_count)
-                .ok_or_else(|| {
-                    ParityError::BootstrapParse("plaintext manifest chunk range overflows".into())
-                })?;
-            if manifest_end > stored_block_count {
-                return Err(ParityError::BootstrapParse(
-                    "plaintext manifest chunk range exceeds stored block count".into(),
-                ));
-            }
-            if let Some(block_size_bytes) = block_size_bytes {
-                let manifest_capacity = manifest_chunk_count
-                    .checked_mul(u64::from(block_size_bytes))
-                    .ok_or_else(|| {
-                        ParityError::BootstrapParse(
-                            "plaintext manifest byte capacity overflows".into(),
-                        )
-                    })?;
-                if *manifest_size_bytes > manifest_capacity {
-                    return Err(ParityError::BootstrapParse(
-                        "plaintext manifest size exceeds manifest chunk capacity".into(),
-                    ));
-                }
-            }
-        }
-        BootstrapObjectRepresentation::Encrypted {
-            recipient_epoch_ids,
-            metadata_frame_len,
-            key_frame_len,
-        } => {
-            if recipient_epoch_ids.is_empty()
-                || recipient_epoch_ids.len() > OBJECT_ROW_MAX_RECIPIENTS
-                || recipient_epoch_ids
-                    .iter()
-                    .any(|epoch_id| epoch_id.iter().all(|byte| *byte == 0))
-                || recipient_epoch_ids
-                    .iter()
-                    .enumerate()
-                    .any(|(index, epoch_id)| recipient_epoch_ids[..index].contains(epoch_id))
-            {
-                return Err(ParityError::BootstrapParse(
-                    "encrypted object row recipient_epoch_ids must contain 1..=8 distinct nonzero ids"
-                        .into(),
-                ));
-            }
-            if !(OBJECT_ROW_METADATA_FRAME_MIN_LEN..=OBJECT_ROW_METADATA_FRAME_MAX_LEN)
-                .contains(metadata_frame_len)
-            {
-                return Err(ParityError::BootstrapParse(
-                    "encrypted object row metadata_frame_len is outside REM-OBJECT bounds".into(),
-                ));
-            }
-            if !(OBJECT_ROW_KEY_FRAME_MIN_LEN..=OBJECT_ROW_KEY_FRAME_MAX_LEN)
-                .contains(key_frame_len)
-            {
-                return Err(ParityError::BootstrapParse(
-                    "encrypted object row key_frame_len is outside REM-OBJECT bounds".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
 }
 
 fn encode_filemark_map_digest(digest: &FilemarkMapDigest) -> CborValue {
@@ -1429,7 +772,7 @@ fn encode_filemark_map_digest(digest: &FilemarkMapDigest) -> CborValue {
         ),
         (
             CborValue::Integer(5.into()),
-            CborValue::Bool(digest.is_final_map),
+            CborValue::Bool(digest.covers_complete_map),
         ),
     ])
 }
@@ -1445,10 +788,10 @@ fn decode_filemark_map_digest(value: CborValue) -> Result<FilemarkMapDigest, Par
     };
 
     let mut map_sha256: Option<[u8; 32]> = None;
-    let mut tape_file_count: Option<u32> = None;
+    let mut tape_file_count: Option<u64> = None;
     let mut map_total_data_ordinals: Option<u64> = None;
     let mut highest_protected_ordinal: Option<u64> = None;
-    let mut is_final_map: Option<bool> = None;
+    let mut covers_complete_map: Option<bool> = None;
     let mut key_order = IntegerMapKeyTracker::default();
 
     for (key, value) in map {
@@ -1464,14 +807,14 @@ fn decode_filemark_map_digest(value: CborValue) -> Result<FilemarkMapDigest, Par
                     ))
                 })?);
             }
-            (2, CborValue::Integer(i)) => tape_file_count = Some(int_to_u32(i, "tape_file_count")?),
+            (2, CborValue::Integer(i)) => tape_file_count = Some(int_to_u64(i, "tape_file_count")?),
             (3, CborValue::Integer(i)) => {
                 map_total_data_ordinals = Some(int_to_u64(i, "map_total_data_ordinals")?)
             }
             (4, CborValue::Integer(i)) => {
                 highest_protected_ordinal = Some(int_to_u64(i, "highest_protected_ordinal")?)
             }
-            (5, CborValue::Bool(v)) => is_final_map = Some(v),
+            (5, CborValue::Bool(v)) => covers_complete_map = Some(v),
             _ => {}
         }
     }
@@ -1493,8 +836,8 @@ fn decode_filemark_map_digest(value: CborValue) -> Result<FilemarkMapDigest, Par
                 "filemark map digest missing highest_protected_ordinal".into(),
             )
         })?,
-        is_final_map: is_final_map.ok_or_else(|| {
-            ParityError::BootstrapParse("filemark map digest missing is_final_map".into())
+        covers_complete_map: covers_complete_map.ok_or_else(|| {
+            ParityError::BootstrapParse("filemark map digest missing completeness flag".into())
         })?,
     })
 }
@@ -1572,11 +915,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::parity_map::{
-        parse_parity_map_tape_file, ParityMapReference, SidecarEpochDirectory,
-        SidecarEpochDirectoryEntry, SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD,
-        SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
-    };
+    use crate::parity_map::parse_parity_map_tape_file;
 
     const PUBLICATION_POSITIVE_PREFIX: &str = "rem-parity-1/positive/";
 
@@ -1619,13 +958,12 @@ mod tests {
     }
 
     fn sample_digest() -> FilemarkMapDigest {
-        FilemarkMapDigest {
-            map_sha256: [0xA5; 32],
-            tape_file_count: 3,
-            map_total_data_ordinals: 128,
-            highest_protected_ordinal: 64,
-            is_final_map: false,
-        }
+        sole_bot_filemark_map_digest().expect("canonical sole-BOT digest")
+    }
+
+    /// Convert a test fixture's on-tape block size at the host allocation boundary.
+    fn test_block_size(block_size_bytes: u32) -> usize {
+        usize::try_from(block_size_bytes).expect("test block size fits host address space")
     }
 
     fn sample_payload() -> BootstrapPayload {
@@ -1648,35 +986,11 @@ mod tests {
             sequence: 0,
             block_size_bytes: 1_048_576,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
-        }
-    }
-
-    fn sample_sidecar_directory() -> SidecarEpochDirectory {
-        SidecarEpochDirectory {
-            directory_scope_tape_file_count: 4,
-            directory_scope_total_data_ordinals: 3,
-            directory_scope_highest_protected_ordinal: 3,
-            is_final_directory: true,
-            entries: vec![SidecarEpochDirectoryEntry {
-                tape_file_number: 2,
-                epoch_id: 0,
-                protected_ordinal_start: 0,
-                protected_ordinal_end_exclusive: 3,
-                sidecar_total_block_count: 9,
-                sidecar_header_block_count: 2,
-                parity_shard_block_count: 4,
-                canonical_metadata_hash: [0x33; 32],
-                flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
-                    | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
-            }],
         }
     }
 
     fn encode_bootstrap_block_unchecked_for_test(payload: &BootstrapPayload) -> Vec<u8> {
-        let block_size = payload.block_size_bytes as usize;
+        let block_size = test_block_size(payload.block_size_bytes);
         let cbor_bytes = encode_cbor_payload(payload).expect("payload CBOR encodes");
         let payload_len_u32: u32 = cbor_bytes.len().try_into().expect("payload length fits");
         let total_len = BOOTSTRAP_HEADER_LEN + cbor_bytes.len() + BOOTSTRAP_PAYLOAD_CRC_LEN;
@@ -1694,10 +1008,10 @@ mod tests {
         buf[12..16].copy_from_slice(&flags.to_be_bytes());
         buf[16..32].copy_from_slice(&payload.tape_uuid);
         buf[32..36].copy_from_slice(&payload.block_size_bytes.to_be_bytes());
-        buf[36..40].copy_from_slice(&payload.sequence.to_be_bytes());
-        buf[40..44].copy_from_slice(&payload_len_u32.to_le_bytes());
+        buf[36..44].copy_from_slice(&payload.sequence.to_be_bytes());
+        buf[44..48].copy_from_slice(&payload_len_u32.to_le_bytes());
         let crc_header = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
-        buf[44..52].copy_from_slice(&crc_header.to_le_bytes());
+        buf[48..56].copy_from_slice(&crc_header.to_le_bytes());
 
         let cbor_end = BOOTSTRAP_HEADER_LEN + cbor_bytes.len();
         buf[BOOTSTRAP_HEADER_LEN..cbor_end].copy_from_slice(&cbor_bytes);
@@ -1729,11 +1043,12 @@ mod tests {
     ) -> Result<DecodedBootstrapCbor, ParityError> {
         let mut bytes = Vec::new();
         ciborium::into_writer(value, &mut bytes).expect("test CBOR value encodes");
-        decode_cbor_payload(&bytes, false, 1_048_576, BOOTSTRAP_SCHEMA_MINOR)
+        decode_cbor_payload(&bytes, false)
     }
 
     fn replace_bootstrap_text_key(block: &mut [u8], key: i128, replacement: &str) {
-        let old_cbor_len = u32::from_le_bytes(block[40..44].try_into().unwrap()) as usize;
+        let old_cbor_len = usize::try_from(u32::from_le_bytes(block[44..48].try_into().unwrap()))
+            .expect("CBOR length fits host address space");
         let old_cbor = &block[BOOTSTRAP_HEADER_LEN..BOOTSTRAP_HEADER_LEN + old_cbor_len];
         let mut value: CborValue = ciborium::from_reader(old_cbor).expect("bootstrap CBOR decodes");
         let CborValue::Map(entries) = &mut value else {
@@ -1754,9 +1069,9 @@ mod tests {
         let crc_end = cbor_end + BOOTSTRAP_PAYLOAD_CRC_LEN;
         assert!(crc_end <= block.len(), "modified bootstrap fits block");
 
-        block[40..44].copy_from_slice(&new_cbor_len.to_le_bytes());
+        block[44..48].copy_from_slice(&new_cbor_len.to_le_bytes());
         let header_crc = crc64_xz(&block[..BOOTSTRAP_HEADER_CRC_OFFSET]);
-        block[44..52].copy_from_slice(&header_crc.to_le_bytes());
+        block[48..56].copy_from_slice(&header_crc.to_le_bytes());
         block[BOOTSTRAP_HEADER_LEN..cbor_end].copy_from_slice(&new_cbor);
         let payload_crc = crc64_xz(&new_cbor);
         block[cbor_end..crc_end].copy_from_slice(&payload_crc.to_le_bytes());
@@ -1791,7 +1106,7 @@ mod tests {
         for invalid_version in ["v".repeat(129), "writer\x1b[2J".to_string()] {
             let mut payload = sample_payload();
             payload.written_by_version = invalid_version;
-            let mut block = vec![0u8; payload.block_size_bytes as usize];
+            let mut block = vec![0u8; test_block_size(payload.block_size_bytes)];
             let error = write_bootstrap_block(&payload, &mut block)
                 .expect_err("invalid bootstrap key 3 must not be written");
             assert!(
@@ -1803,7 +1118,7 @@ mod tests {
         for invalid_timestamp in ["x".repeat(65), "2026-01-01\x1b".to_string()] {
             let mut payload = sample_payload();
             payload.written_at = invalid_timestamp;
-            let mut block = vec![0u8; payload.block_size_bytes as usize];
+            let mut block = vec![0u8; test_block_size(payload.block_size_bytes)];
             let error = write_bootstrap_block(&payload, &mut block)
                 .expect_err("invalid bootstrap key 4 must not be written");
             assert!(
@@ -1814,9 +1129,27 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_writer_requires_version_but_reader_tolerates_its_absence() {
+        let mut payload = sample_payload();
+        payload.written_by_version.clear();
+        let mut block = vec![0u8; test_block_size(payload.block_size_bytes)];
+        let error = write_bootstrap_block(&payload, &mut block)
+            .expect_err("writer must emit required key 3");
+        assert!(matches!(
+            error,
+            ParityError::Invariant(message) if message.contains("written_by_version key 3")
+        ));
+
+        let block = encode_bootstrap_block_unchecked_for_test(&payload);
+        let parsed = parse_bootstrap_block(&block)
+            .expect("reader remains tolerant of an absent diagnostic key 3");
+        assert!(parsed.written_by_version.is_empty());
+    }
+
+    #[test]
     fn bootstrap_reader_treats_invalid_writer_version_as_absent() {
         let payload = sample_payload();
-        let mut block = vec![0u8; payload.block_size_bytes as usize];
+        let mut block = vec![0u8; test_block_size(payload.block_size_bytes)];
         write_bootstrap_block(&payload, &mut block).expect("valid bootstrap writes");
         replace_bootstrap_text_key(&mut block, 3, "writer\x1b[2J");
 
@@ -1830,7 +1163,7 @@ mod tests {
     #[test]
     fn bootstrap_reader_treats_invalid_write_timestamp_as_absent() {
         let payload = sample_payload();
-        let mut block = vec![0u8; payload.block_size_bytes as usize];
+        let mut block = vec![0u8; test_block_size(payload.block_size_bytes)];
         write_bootstrap_block(&payload, &mut block).expect("valid bootstrap writes");
         replace_bootstrap_text_key(&mut block, 4, "not a timestamp");
 
@@ -1852,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn every_published_positive_cbor_frame_still_decodes() {
+    fn legacy_published_narrow_frames_fail_closed() {
         let members = publication_archive_members();
         let positive_vectors = members
             .iter()
@@ -1876,27 +1209,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut vector_geometry = BTreeMap::new();
-        let mut decoded_vectors = BTreeSet::new();
         for member in bootstrap_members {
             let bytes = read_publication_archive_member(member);
-            let payload = parse_bootstrap_block(&bytes)
-                .unwrap_or_else(|error| panic!("pinned {member} must decode: {error}"));
             let vector = member
                 .strip_prefix(PUBLICATION_POSITIVE_PREFIX)
                 .and_then(|relative| relative.split('/').next())
                 .expect("positive bootstrap member has a vector directory");
-            decoded_vectors.insert(vector.to_string());
-            if let Some((tape_uuid, block_size)) = vector_geometry.insert(
-                vector.to_string(),
-                (payload.tape_uuid, payload.block_size_bytes),
-            ) {
-                assert_eq!(tape_uuid, payload.tape_uuid, "{member} tape UUID");
-                assert_eq!(block_size, payload.block_size_bytes, "{member} block size");
-            }
+            let tape_uuid: [u8; 16] = bytes[16..32].try_into().expect("legacy UUID field exists");
+            let block_size = u32::from_be_bytes(
+                bytes[32..36]
+                    .try_into()
+                    .expect("legacy block-size field exists"),
+            );
+            vector_geometry.insert(vector.to_string(), (tape_uuid, block_size));
+            let error = parse_bootstrap_block(&bytes)
+                .expect_err("legacy narrow bootstrap authority must fail closed");
+            assert!(matches!(&error, ParityError::BootstrapParse(_)), "{error}");
         }
         assert_eq!(
-            decoded_vectors, positive_vectors,
-            "every positive REM-PARITY vector must contain a decodable bootstrap"
+            vector_geometry.keys().cloned().collect::<BTreeSet<_>>(),
+            positive_vectors,
+            "every legacy positive vector must contain a rejected narrow bootstrap"
         );
 
         let parity_map_members = members
@@ -1929,8 +1262,9 @@ mod tests {
                 .chunks_exact(block_size)
                 .map(<[u8]>::to_vec)
                 .collect::<Vec<_>>();
-            parse_parity_map_tape_file(&blocks, tape_uuid)
-                .unwrap_or_else(|error| panic!("pinned {member} must decode: {error}"));
+            let error = parse_parity_map_tape_file(&blocks, tape_uuid)
+                .expect_err("legacy narrow parity-map authority must fail closed");
+            assert!(error.to_string().contains("footer version"), "{error}");
         }
     }
 
@@ -1999,32 +1333,46 @@ mod tests {
     }
 
     #[test]
-    fn object_row_map_enforces_order_and_ignores_ordered_unknown_key() {
-        let row = BootstrapObjectRow::encrypted(1, 6, vec![[0x24; 16]], 66, 1191)
-            .with_object_id([0x33; 16]);
-        let canonical = encode_bootstrap_object_row_cbor(&row).expect("object row encodes");
+    fn filemark_digest_tape_file_count_preserves_the_full_u64_range() {
+        for tape_file_count in [u64::from(u32::MAX) + 1, u64::MAX] {
+            let digest = FilemarkMapDigest {
+                tape_file_count,
+                ..sample_digest()
+            };
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&encode_filemark_map_digest(&digest), &mut cbor)
+                .expect("digest CBOR encodes");
+            let cbor_value: CborValue =
+                ciborium::from_reader(cbor.as_slice()).expect("digest CBOR decodes");
 
-        assert_eq!(
-            decode_bootstrap_object_row_cbor(
-                canonical.clone(),
-                Some(4096),
-                BOOTSTRAP_SCHEMA_MINOR,
-            )
-            .expect("canonical object row decodes"),
-            row
-        );
+            assert_eq!(
+                decode_filemark_map_digest(cbor_value).expect("u64 tape-file count decodes"),
+                digest
+            );
+        }
+    }
 
-        let transposed = transpose_first_two_cbor_map_entries(canonical.clone());
-        let error =
-            decode_bootstrap_object_row_cbor(transposed, Some(4096), BOOTSTRAP_SCHEMA_MINOR)
-                .expect_err("transposed object-row keys must reject");
-        assert_bootstrap_key_order_error(error, 1, 2);
+    #[test]
+    fn filemark_digest_rejects_negative_tape_file_count() {
+        let mut digest = encode_filemark_map_digest(&sample_digest());
+        let CborValue::Map(entries) = &mut digest else {
+            panic!("filemark digest encodes as a map");
+        };
+        let tape_file_count = entries
+            .iter_mut()
+            .find(|(key, _)| matches!(key, CborValue::Integer(value) if i128::from(*value) == 2))
+            .expect("digest has tape-file-count key");
+        tape_file_count.1 = CborValue::Integer((-1_i64).into());
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&digest, &mut cbor).expect("negative digest CBOR encodes");
+        let cbor_value: CborValue =
+            ciborium::from_reader(cbor.as_slice()).expect("negative digest CBOR decodes");
 
-        let extended = append_unknown_cbor_map_key(canonical);
-        assert_eq!(
-            decode_bootstrap_object_row_cbor(extended, Some(4096), BOOTSTRAP_SCHEMA_MINOR,)
-                .expect("ordered unknown object-row key is ignored"),
-            row
+        let error = decode_filemark_map_digest(cbor_value)
+            .expect_err("negative tape-file count must be rejected");
+        assert!(
+            matches!(error, ParityError::BootstrapParse(ref message) if message.contains("tape_file_count") && message.contains("out of u64 range")),
+            "{error}"
         );
     }
 
@@ -2078,228 +1426,36 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_payload_with_inline_sidecar_directory() {
+    fn schema_major_two_rejects_legacy_extended_payload_keys() {
+        for key in [20, 21, 30] {
+            let encoded = encode_cbor_payload(&sample_payload()).expect("encode base payload");
+            let mut value: CborValue =
+                ciborium::from_reader(encoded.as_slice()).expect("decode payload value");
+            let CborValue::Map(ref mut entries) = value else {
+                panic!("payload map");
+            };
+            entries.push((CborValue::Integer(key.into()), CborValue::Null));
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&value, &mut bytes).expect("encode forbidden-key payload");
+            let error =
+                decode_cbor_payload(&bytes, false).expect_err("legacy key must fail closed");
+            assert!(error
+                .to_string()
+                .contains(&format!("forbids legacy payload key {key}")));
+        }
+    }
+
+    #[test]
+    fn schema_major_two_writer_rejects_nonzero_sequence() {
         let mut payload = sample_payload();
-        payload.sidecar_epoch_directory = Some(sample_sidecar_directory());
-        let mut buf = vec![0u8; 1_048_576];
-
-        write_bootstrap_block(&payload, &mut buf).expect("write ok");
-        let parsed = parse_bootstrap_block(&buf).expect("parse ok");
-
-        assert_eq!(parsed, payload);
-        assert!(parsed.sidecar_epoch_directory.is_some());
-        assert!(parsed.parity_map_reference.is_none());
+        payload.sequence = 1;
+        let mut block = vec![0; 1_048_576];
+        let error = write_bootstrap_block(&payload, &mut block).expect_err("non-BOT copy rejected");
+        assert!(error.to_string().contains("sequence-0 BOT Bootstrap"));
     }
 
     #[test]
-    fn roundtrip_payload_with_parity_map_reference() {
-        let mut payload = sample_payload();
-        payload.parity_map_reference = Some(ParityMapReference {
-            tape_file_number: 4,
-            block_count: 7,
-            directory_scope_tape_file_count: 5,
-            directory_scope_total_data_ordinals: 3,
-            directory_scope_highest_protected_ordinal: 3,
-            is_final_directory: true,
-            parity_map_payload_sha256: [0x44; 32],
-            canonical_map_digest: [0x55; 32],
-        });
-        let mut buf = vec![0u8; 1_048_576];
-
-        write_bootstrap_block(&payload, &mut buf).expect("write ok");
-        let parsed = parse_bootstrap_block(&buf).expect("parse ok");
-
-        assert_eq!(parsed, payload);
-        assert!(parsed.sidecar_epoch_directory.is_none());
-        assert!(parsed.parity_map_reference.is_some());
-    }
-
-    #[test]
-    fn roundtrip_payload_with_object_rows() {
-        let mut payload = sample_payload();
-        payload.object_rows = vec![
-            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]).with_object_id([0x11; 16]),
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16], [0x25; 16]], 66, 2377)
-                .with_object_id([0x33; 16]),
-        ];
-        let mut buf = vec![0xCC; payload.block_size_bytes as usize];
-
-        write_bootstrap_block(&payload, &mut buf).expect("write ok");
-        let parsed = parse_bootstrap_block(&buf).expect("parse ok");
-
-        assert_eq!(parsed.object_rows, payload.object_rows);
-        assert_eq!(parsed, payload);
-    }
-
-    #[test]
-    fn encrypted_object_row_writer_uses_deterministic_cbor_key_order() {
-        let row = BootstrapObjectRow::encrypted(1, 6, vec![[0x24; 16]], 66, 1191)
-            .with_object_id([0x33; 16]);
-        let encoded = encode_bootstrap_object_row_cbor(&row).expect("encrypted row encodes");
-        let CborValue::Map(entries) = encoded else {
-            panic!("encrypted object row must encode as a CBOR map");
-        };
-        let keys = entries
-            .into_iter()
-            .map(|(key, _value)| key)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            keys,
-            [1, 2, 3, 4, 21, 22, 23]
-                .into_iter()
-                .map(|key| CborValue::Integer(key.into()))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn object_row_variable_length_object_ids_round_trip_verbatim() {
-        let uuid_string = b"123e4567-e89b-12d3-a456-426614174000".to_vec();
-        let max_length_id = vec![b'x'; 64];
-        assert_eq!(uuid_string.len(), 36);
-        let mut payload = sample_payload();
-        payload.object_rows = vec![
-            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32])
-                .with_object_id(uuid_string.clone()),
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 1191)
-                .with_object_id(max_length_id.clone()),
-        ];
-        let mut buf = vec![0u8; payload.block_size_bytes as usize];
-
-        write_bootstrap_block(&payload, &mut buf).expect("variable object ids encode");
-        let parsed = parse_bootstrap_block(&buf).expect("variable object ids decode");
-
-        assert_eq!(parsed.object_rows[0].object_id.as_ref(), Some(&uuid_string));
-        assert_eq!(
-            parsed.object_rows[1].object_id.as_ref(),
-            Some(&max_length_id)
-        );
-    }
-
-    #[test]
-    fn object_row_rejects_object_id_longer_than_64_bytes() {
-        let mut payload = sample_payload();
-        payload.object_rows = vec![BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32])
-            .with_object_id(vec![b'x'; 65])];
-        let mut buf = vec![0u8; payload.block_size_bytes as usize];
-
-        let err = write_bootstrap_block(&payload, &mut buf)
-            .expect_err("65-byte object id must not be encoded");
-
-        assert!(
-            matches!(err, ParityError::BootstrapParse(message) if message.contains("1..=64 non-NUL"))
-        );
-    }
-
-    #[test]
-    fn object_row_id_is_required_at_minor_three_but_absent_is_legacy_compatible() {
-        let legacy = BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]);
-        let encoded = encode_bootstrap_object_row_cbor(&legacy).expect("encode legacy row");
-
-        let decoded = decode_bootstrap_object_row_cbor(encoded.clone(), Some(4096), 2)
-            .expect("minor-two row without object id remains readable");
-        assert_eq!(decoded.object_id, None);
-
-        let err = decode_bootstrap_object_row_cbor(encoded, Some(4096), 3)
-            .expect_err("minor-three row without object id must reject");
-        assert!(err.to_string().contains("missing object_id"), "{err}");
-    }
-
-    #[test]
-    fn encrypted_object_row_rejects_plaintext_manifest_anchors() {
-        let row = CborValue::Map(vec![
-            (CborValue::Integer(1.into()), CborValue::Integer(1.into())),
-            (
-                CborValue::Integer(2.into()),
-                CborValue::Text("encrypted".to_string()),
-            ),
-            (CborValue::Integer(3.into()), CborValue::Integer(4.into())),
-            (CborValue::Integer(10.into()), CborValue::Integer(2.into())),
-            (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
-            (
-                CborValue::Integer(22.into()),
-                CborValue::Array(vec![CborValue::Bytes(vec![0x24; 16])]),
-            ),
-            (
-                CborValue::Integer(23.into()),
-                CborValue::Integer(1191.into()),
-            ),
-        ]);
-
-        let err = decode_bootstrap_object_row_cbor(row, Some(4096), 2).unwrap_err();
-        assert!(
-            err.to_string().contains("plaintext manifest anchors"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn object_row_decoder_rejects_duplicate_keys() {
-        let row = CborValue::Map(vec![
-            (CborValue::Integer(1.into()), CborValue::Integer(1.into())),
-            (CborValue::Integer(1.into()), CborValue::Integer(2.into())),
-            (
-                CborValue::Integer(2.into()),
-                CborValue::Text("encrypted".to_string()),
-            ),
-            (CborValue::Integer(3.into()), CborValue::Integer(4.into())),
-            (
-                CborValue::Integer(22.into()),
-                CborValue::Array(vec![CborValue::Bytes(vec![0x24; 16])]),
-            ),
-            (CborValue::Integer(21.into()), CborValue::Integer(66.into())),
-            (
-                CborValue::Integer(23.into()),
-                CborValue::Integer(1191.into()),
-            ),
-        ]);
-
-        let err = decode_bootstrap_object_row_cbor(row, Some(4096), 2).unwrap_err();
-
-        assert!(err.to_string().contains("duplicate CBOR map key"), "{err}");
-    }
-
-    #[test]
-    fn writer_rejects_unsorted_object_rows() {
-        let mut payload = sample_payload();
-        payload.object_rows = vec![
-            BootstrapObjectRow::encrypted(3, 11, vec![[0x24; 16]], 66, 1191)
-                .with_object_id([0x33; 16]),
-            BootstrapObjectRow::plaintext(1, 8, 6, 1234, 1, [0xA1; 32]).with_object_id([0x11; 16]),
-        ];
-        let mut buf = vec![0; payload.block_size_bytes as usize];
-
-        let err = write_bootstrap_block(&payload, &mut buf).unwrap_err();
-        assert!(err.to_string().contains("strictly increasing"), "{err}");
-    }
-
-    #[test]
-    fn writer_rejects_both_inline_directory_and_parity_map_reference() {
-        let mut payload = sample_payload();
-        payload.sidecar_epoch_directory = Some(sample_sidecar_directory());
-        payload.parity_map_reference = Some(ParityMapReference {
-            tape_file_number: 4,
-            block_count: 7,
-            directory_scope_tape_file_count: 5,
-            directory_scope_total_data_ordinals: 3,
-            directory_scope_highest_protected_ordinal: 3,
-            is_final_directory: true,
-            parity_map_payload_sha256: [0x44; 32],
-            canonical_map_digest: [0x55; 32],
-        });
-        let mut buf = vec![0u8; 1_048_576];
-
-        let err = write_bootstrap_block(&payload, &mut buf).unwrap_err();
-
-        assert!(matches!(
-            err,
-            ParityError::Invariant(message) if message.contains("mutually exclusive")
-        ));
-    }
-
-    #[test]
-    fn header_offsets_and_crc64_ranges_match_v044_table() {
+    fn header_offsets_and_crc64_ranges_match_v2_table() {
         let mut buf = vec![0u8; 1_048_576];
         let payload = sample_payload();
         let written = write_bootstrap_block(&payload, &mut buf).expect("write ok");
@@ -2320,13 +1476,14 @@ mod tests {
             payload.block_size_bytes
         );
         assert_eq!(
-            u32::from_be_bytes(buf[0x24..0x28].try_into().unwrap()),
+            u64::from_be_bytes(buf[0x24..0x2C].try_into().unwrap()),
             payload.sequence
         );
 
-        let payload_len = u32::from_le_bytes(buf[0x28..0x2C].try_into().unwrap()) as usize;
-        let stored_header_crc = u64::from_le_bytes(buf[0x2C..0x34].try_into().unwrap());
-        assert_eq!(stored_header_crc, crc64_xz(&buf[0x00..0x2C]));
+        let payload_len = usize::try_from(u32::from_le_bytes(buf[0x2C..0x30].try_into().unwrap()))
+            .expect("CBOR length fits host address space");
+        let stored_header_crc = u64::from_le_bytes(buf[0x30..0x38].try_into().unwrap());
+        assert_eq!(stored_header_crc, crc64_xz(&buf[0x00..0x30]));
 
         let payload_start = BOOTSTRAP_HEADER_LEN;
         let payload_end = payload_start + payload_len;
@@ -2449,7 +1606,7 @@ mod tests {
         // is now false.
         buf[12..16].copy_from_slice(&0u32.to_be_bytes());
         let new_crc = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
-        buf[44..52].copy_from_slice(&new_crc.to_le_bytes());
+        buf[48..56].copy_from_slice(&new_crc.to_le_bytes());
         let err = parse_bootstrap_block(&buf[..]).unwrap_err();
         match err {
             ParityError::BootstrapParse(msg) => {
@@ -2460,16 +1617,27 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_filemark_map_digest() {
-        let mut payload = sample_payload();
-        payload.filemark_map_digest = Some(FilemarkMapDigest {
-            is_final_map: true,
-            ..sample_digest()
-        });
-        let mut buf = vec![0u8; 1_048_576];
-        write_bootstrap_block(&payload, &mut buf).expect("write ok");
-        let parsed = parse_bootstrap_block(&buf[..]).expect("parse ok");
-        assert_eq!(parsed.filemark_map_digest, payload.filemark_map_digest);
+    fn writer_and_parser_reject_noncanonical_bot_map_digest() {
+        let mut wrong_complete = sample_digest();
+        wrong_complete.covers_complete_map = true;
+        let mut wrong_count = sample_digest();
+        wrong_count.tape_file_count = 2;
+        let mut wrong_hash = sample_digest();
+        wrong_hash.map_sha256[0] ^= 0x80;
+
+        for invalid in [wrong_complete, wrong_count, wrong_hash] {
+            let mut payload = sample_payload();
+            payload.filemark_map_digest = Some(invalid);
+            let mut buf = vec![0u8; test_block_size(payload.block_size_bytes)];
+            let write_error = write_bootstrap_block(&payload, &mut buf)
+                .expect_err("writer must reject noncanonical BOT key 2");
+            assert!(write_error.to_string().contains("sole tape-file-0 BOT"));
+
+            let block = encode_bootstrap_block_unchecked_for_test(&payload);
+            let parse_error = parse_bootstrap_block(&block)
+                .expect_err("parser must reject noncanonical BOT key 2");
+            assert!(parse_error.to_string().contains("sole tape-file-0 BOT"));
+        }
     }
 
     #[test]
@@ -2553,7 +1721,7 @@ mod tests {
         let payload = sample_payload();
         let mut buf = vec![0u8; 1_048_576];
         write_bootstrap_block(&payload, &mut buf).expect("write ok");
-        buf[40] ^= 0x80; // cbor_payload_len is covered by crc64_header.
+        buf[44] ^= 0x80; // cbor_payload_len is covered by crc64_header.
         let err = parse_bootstrap_block(&buf[..]).unwrap_err();
         match err {
             ParityError::BootstrapParse(msg) => assert!(msg.contains("header CRC"), "{msg}"),
@@ -2587,12 +1755,28 @@ mod tests {
         // Recompute header CRC so we hit the version check, not
         // the CRC check.
         let new_crc = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
-        buf[44..52].copy_from_slice(&new_crc.to_le_bytes());
+        buf[48..56].copy_from_slice(&new_crc.to_le_bytes());
         let err = parse_bootstrap_block(&buf[..]).unwrap_err();
         match err {
             ParityError::BootstrapParse(msg) => assert!(msg.contains("major")),
             other => panic!("expected BootstrapParse, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_narrow_major_version_rejected() {
+        let payload = sample_payload();
+        let mut buf = vec![0u8; 1_048_576];
+        write_bootstrap_block(&payload, &mut buf).expect("write ok");
+        buf[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        let new_crc = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
+        buf[48..56].copy_from_slice(&new_crc.to_le_bytes());
+
+        let error = parse_bootstrap_block(&buf).expect_err("major 1 authority must fail closed");
+        assert!(
+            error.to_string().contains("schema major version"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2604,7 +1788,7 @@ mod tests {
         write_bootstrap_block(&payload, &mut buf).expect("write ok");
         buf[10..12].copy_from_slice(&99u16.to_be_bytes());
         let new_crc = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
-        buf[44..52].copy_from_slice(&new_crc.to_le_bytes());
+        buf[48..56].copy_from_slice(&new_crc.to_le_bytes());
         let parsed = parse_bootstrap_block(&buf[..]).expect("forward-compat minor");
         assert_eq!(parsed, payload);
     }
@@ -2677,6 +1861,12 @@ mod tests {
             Ok(())
         }
 
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.cursor = u64::try_from(self.blocks.len())
+                .map_err(|_| ParityError::Invariant("test block count exceeds u64"))?;
+            Ok(PhysicalPositionHint::new(self.cursor))
+        }
+
         fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
             Ok(SpaceFilemarksOutcome {
                 filemarks_spaced: count,
@@ -2687,7 +1877,10 @@ mod tests {
 
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
             let lba = self.cursor;
-            let Some(block) = self.blocks.get(lba as usize) else {
+            let Some(block) = usize::try_from(lba)
+                .ok()
+                .and_then(|index| self.blocks.get(index))
+            else {
                 self.calls.push(RecordingRawSourceCall::ReadRecord {
                     lba,
                     requested: buf.len(),
@@ -2707,8 +1900,12 @@ mod tests {
                 });
                 return Err(ParityError::TapeIo(
                     remanence_library::TapeIoError::ReadBufferTooSmall {
-                        actual: block.len() as u32,
-                        provided: buf.len() as u32,
+                        actual: u32::try_from(block.len()).map_err(|_| {
+                            ParityError::Invariant("test block length exceeds u32 host boundary")
+                        })?,
+                        provided: u32::try_from(buf.len()).map_err(|_| {
+                            ParityError::Invariant("test buffer length exceeds u32 host boundary")
+                        })?,
                     },
                 ));
             }
@@ -2746,6 +1943,10 @@ mod tests {
             Err(TapeIoError::OperationFailed("synthetic locate failure".into()).into())
         }
 
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            Err(TapeIoError::OperationFailed("synthetic EOD locate failure".into()).into())
+        }
+
         fn space_filemarks(&mut self, _count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
             unreachable!("bootstrap discovery does not space filemarks")
         }
@@ -2773,6 +1974,10 @@ mod tests {
             Ok(())
         }
 
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            Ok(PhysicalPositionHint::new(0))
+        }
+
         fn space_filemarks(&mut self, _count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
             unreachable!("bootstrap discovery does not space filemarks")
         }
@@ -2786,114 +1991,6 @@ mod tests {
         }
     }
 
-    struct MediumErrorThenBootstrapRawSource {
-        bootstrap: Vec<u8>,
-        cursor: u64,
-        returned_medium_error: bool,
-        error: fn() -> TapeIoError,
-    }
-
-    impl MediumErrorThenBootstrapRawSource {
-        fn new(bootstrap: Vec<u8>) -> Self {
-            Self::with_error(bootstrap, medium_error)
-        }
-
-        fn with_error(bootstrap: Vec<u8>, error: fn() -> TapeIoError) -> Self {
-            Self {
-                bootstrap,
-                cursor: 0,
-                returned_medium_error: false,
-                error,
-            }
-        }
-    }
-
-    impl RawTapeSource for MediumErrorThenBootstrapRawSource {
-        fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
-            if block_size == 0 {
-                return Err(ParityError::Invariant("fixed block size is zero"));
-            }
-            Ok(())
-        }
-
-        fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
-            self.cursor = hint.lba;
-            Ok(())
-        }
-
-        fn space_filemarks(&mut self, _count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
-            unreachable!("bootstrap discovery does not space filemarks")
-        }
-
-        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-            if !self.returned_medium_error {
-                self.returned_medium_error = true;
-                self.cursor = self.cursor.saturating_add(1);
-                return Err((self.error)().into());
-            }
-            buf[..self.bootstrap.len()].copy_from_slice(&self.bootstrap);
-            self.cursor = self.cursor.saturating_add(1);
-            Ok(RawReadOutcome::Block {
-                bytes: self.bootstrap.len(),
-                position_after: PhysicalPositionHint::new(self.cursor),
-            })
-        }
-
-        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
-            Ok(PhysicalPositionHint::new(self.cursor))
-        }
-    }
-
-    fn medium_error() -> TapeIoError {
-        let mut sense = vec![0u8; 18];
-        sense[0] = 0x70;
-        sense[2] = 0x03;
-        sense[7] = 10;
-        sense[12] = 0x11;
-        TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        })
-    }
-
-    fn descriptor_medium_error() -> TapeIoError {
-        let mut sense = vec![0u8; 8];
-        sense[0] = 0x72;
-        sense[1] = 0x03;
-        sense[2] = 0x11;
-        TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
-            sense,
-            bytes_transferred: 0,
-        })
-    }
-
-    fn payload_with_scope(
-        sequence: u32,
-        block_size_bytes: u32,
-        map_total_data_ordinals: u64,
-        highest_protected_ordinal: u64,
-        is_final_map: bool,
-    ) -> BootstrapPayload {
-        let mut payload = sample_payload();
-        payload.sequence = sequence;
-        payload.block_size_bytes = block_size_bytes;
-        payload.filemark_map_digest = Some(FilemarkMapDigest {
-            map_sha256: [sequence as u8; 32],
-            tape_file_count: sequence + 1,
-            map_total_data_ordinals,
-            highest_protected_ordinal,
-            is_final_map,
-        });
-        payload.object_rows = Vec::new();
-        payload
-    }
-
-    fn encode_payload_block(payload: &BootstrapPayload) -> Vec<u8> {
-        let mut buf = vec![0u8; payload.block_size_bytes as usize];
-        write_bootstrap_block(payload, &mut buf).expect("bootstrap encodes");
-        buf
-    }
-
     #[test]
     fn expected_positions_starts_at_zero() {
         let p = expected_bootstrap_positions(None);
@@ -2902,15 +1999,9 @@ mod tests {
     }
 
     #[test]
-    fn expected_positions_with_hint_includes_fractional_marks() {
+    fn expected_positions_with_hint_still_names_only_bot() {
         let p = expected_bootstrap_positions(Some(1000));
-        // LBA 0 plus ~5% intervals: 50, 100, 150, ..., 950.
-        assert_eq!(p[0], 0);
-        assert!(p.contains(&50));
-        assert!(p.contains(&500));
-        assert!(p.contains(&950));
-        // No position equals the total (would be past-EOD).
-        assert!(!p.contains(&1000));
+        assert_eq!(p, vec![0]);
     }
 
     #[test]
@@ -2944,7 +2035,7 @@ mod tests {
     fn discover_candidate_fallback_finds_256k_bootstrap_after_wrong_size() {
         let mut payload = sample_payload();
         payload.block_size_bytes = 256 * 1024;
-        let mut buf = vec![0u8; payload.block_size_bytes as usize];
+        let mut buf = vec![0u8; test_block_size(payload.block_size_bytes)];
         write_bootstrap_block(&payload, &mut buf).expect("write ok");
         let mut src = RecordingRawSource::new(vec![buf]);
 
@@ -2974,26 +2065,6 @@ mod tests {
                     returned: 256 * 1024,
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn configured_block_size_discovery_continues_past_bad_copy() {
-        const BLOCK_SIZE: u32 = 1024;
-        let payload = payload_with_scope(1, BLOCK_SIZE, 8, 8, false);
-
-        let mut blocks = vec![vec![0xCC; BLOCK_SIZE as usize]; 101];
-        blocks[0] = vec![0xAA; (BLOCK_SIZE / 2) as usize];
-        blocks[50] = encode_payload_block(&payload);
-        let mut source = RecordingRawSource::new(blocks);
-
-        let parsed = discover_bootstrap_with_block_size(&mut source, Some(1000), BLOCK_SIZE)
-            .expect("bad first copy must not abort configured-size discovery");
-
-        assert_eq!(parsed, payload);
-        assert!(
-            source.calls.contains(&RecordingRawSourceCall::Locate(50)),
-            "discovery should probe the later bootstrap region"
         );
     }
 
@@ -3028,100 +2099,10 @@ mod tests {
     }
 
     #[test]
-    fn discover_skips_medium_error_read_and_finds_later_bootstrap() {
-        let payload = sample_payload();
-        let block = encode_payload_block(&payload);
-        let mut source = MediumErrorThenBootstrapRawSource::new(block);
-
-        let parsed = discover_bootstrap_with_candidate_block_sizes(
-            &mut source,
-            None,
-            &[payload.block_size_bytes],
-        )
-        .expect("medium error block is skipped and later bootstrap is parsed");
-
-        assert_eq!(parsed, payload);
-        assert_eq!(source.cursor, 2);
-    }
-
-    #[test]
-    fn discover_skips_descriptor_format_medium_error_read() {
-        let payload = sample_payload();
-        let block = encode_payload_block(&payload);
-        let mut source =
-            MediumErrorThenBootstrapRawSource::with_error(block, descriptor_medium_error);
-
-        let parsed = discover_bootstrap_with_candidate_block_sizes(
-            &mut source,
-            None,
-            &[payload.block_size_bytes],
-        )
-        .expect("descriptor-format medium error block is skipped");
-
-        assert_eq!(parsed, payload);
-        assert_eq!(source.cursor, 2);
-    }
-
-    #[test]
-    fn authoritative_discovery_prefers_final_map_over_first_valid_bot_copy() {
-        const BLOCK_SIZE: u32 = 1024;
-        let bot = payload_with_scope(0, BLOCK_SIZE, 0, 0, false);
-        let final_copy = payload_with_scope(2, BLOCK_SIZE, 8, 8, true);
-
-        let mut blocks = vec![vec![0xCC; BLOCK_SIZE as usize]; 101];
-        blocks[0] = encode_payload_block(&bot);
-        blocks[50] = vec![0xAA; (BLOCK_SIZE / 2) as usize];
-        blocks[100] = encode_payload_block(&final_copy);
-
-        let mut first_src = RecordingRawSource::new(blocks.clone());
-        let first = discover_bootstrap_with_block_size(&mut first_src, Some(1000), BLOCK_SIZE)
-            .expect("first valid bootstrap discovers BOT copy");
-        assert_eq!(first.sequence, 0);
-        assert!(!first.filemark_map_digest.unwrap().is_final_map);
-
-        let mut authoritative_src = RecordingRawSource::new(blocks);
-        let authoritative = discover_authoritative_bootstrap_with_block_size(
-            &mut authoritative_src,
-            Some(1000),
-            BLOCK_SIZE,
-        )
-        .expect("authoritative discovery scans all expected regions");
-
-        assert_eq!(authoritative, final_copy);
-        assert!(authoritative.filemark_map_digest.unwrap().is_final_map);
-    }
-
-    #[test]
-    fn bootstrap_scope_selection_uses_final_then_sequence_then_ordinal_count() {
-        const BLOCK_SIZE: u32 = 1024;
-
-        let nonfinal_higher_sequence = payload_with_scope(9, BLOCK_SIZE, 128, 64, false);
-        let final_lower_sequence = payload_with_scope(1, BLOCK_SIZE, 32, 32, true);
-        assert_eq!(
-            choose_wider_map_scope(nonfinal_higher_sequence, final_lower_sequence.clone()),
-            final_lower_sequence
-        );
-
-        let older_larger_prefix = payload_with_scope(2, BLOCK_SIZE, 128, 64, false);
-        let newer_smaller_prefix = payload_with_scope(3, BLOCK_SIZE, 16, 16, false);
-        assert_eq!(
-            choose_wider_map_scope(older_larger_prefix, newer_smaller_prefix.clone()),
-            newer_smaller_prefix
-        );
-
-        let tie_smaller_prefix = payload_with_scope(4, BLOCK_SIZE, 16, 16, false);
-        let tie_larger_prefix = payload_with_scope(4, BLOCK_SIZE, 32, 32, false);
-        assert_eq!(
-            choose_wider_map_scope(tie_smaller_prefix, tie_larger_prefix.clone()),
-            tie_larger_prefix
-        );
-    }
-
-    #[test]
     fn discover_with_wrong_configured_size_reports_short_fixed_block_read() {
         let mut payload = sample_payload();
         payload.block_size_bytes = 256 * 1024;
-        let mut buf = vec![0u8; payload.block_size_bytes as usize];
+        let mut buf = vec![0u8; test_block_size(payload.block_size_bytes)];
         write_bootstrap_block(&payload, &mut buf).expect("write ok");
         let mut src = VecBlockSource::new(vec![buf]);
 
@@ -3148,58 +2129,6 @@ mod tests {
     }
 
     #[test]
-    fn discover_falls_back_to_fractional_position_when_lba0_corrupt() {
-        // Set up a tape with a corrupt LBA 0 (garbage) and a
-        // valid bootstrap at LBA 50 (5% of 1000).
-        let payload = sample_payload();
-        let mut bootstrap_buf = vec![0u8; 1_048_576];
-        write_bootstrap_block(&payload, &mut bootstrap_buf).expect("write ok");
-        let mut blocks: Vec<Vec<u8>> = (0..1000)
-            .map(|i| {
-                if i == 50 {
-                    bootstrap_buf.clone()
-                } else {
-                    vec![0xCCu8; 1_048_576] // garbage
-                }
-            })
-            .collect();
-        // Make sure LBA 0 is garbage (the loop above did, but
-        // explicit for clarity).
-        blocks[0] = vec![0xCCu8; 1_048_576];
-        let mut src = VecBlockSource::new(blocks);
-        let parsed = {
-            let mut raw = BlockSourceRawTapeSource::new(&mut src);
-            discover_bootstrap(&mut raw, Some(1000)).expect("discover ok")
-        };
-        assert_eq!(parsed, payload);
-    }
-
-    #[test]
-    fn discover_keeps_scanning_window_past_a_bad_magic_hit() {
-        // A block at LBA 0 starts with the bootstrap magic but
-        // is otherwise garbage (parse-fails). The valid bootstrap
-        // lives a few blocks later in the same scan window. The
-        // scanner should keep scanning forward through magic hits
-        // whose parse fails, not abandon the window.
-        let payload = sample_payload();
-        let mut good = vec![0u8; 1_048_576];
-        write_bootstrap_block(&payload, &mut good).expect("write ok");
-
-        let mut bad_magic = vec![0xFFu8; 1_048_576];
-        bad_magic[..BOOTSTRAP_MAGIC.len()].copy_from_slice(&BOOTSTRAP_MAGIC);
-        // The CRC slot won't match, so parse_bootstrap_block
-        // returns BootstrapParse / CrcHeaderMismatch.
-
-        let blocks = vec![bad_magic.clone(), bad_magic.clone(), good];
-        let mut src = VecBlockSource::new(blocks);
-        let parsed = {
-            let mut raw = BlockSourceRawTapeSource::new(&mut src);
-            discover_bootstrap(&mut raw, None).expect("scanner walks past bad magic")
-        };
-        assert_eq!(parsed, payload);
-    }
-
-    #[test]
     fn unknown_cbor_fields_are_ignored_on_decode() {
         // Forward-compat: a future writer adds a field at tag 99.
         // Today's reader should ignore it cleanly.
@@ -3208,7 +2137,8 @@ mod tests {
         write_bootstrap_block(&payload, &mut buf).expect("write ok");
 
         // Decode CBOR, add a field, re-encode, re-frame.
-        let cbor_len = u32::from_le_bytes(buf[40..44].try_into().unwrap()) as usize;
+        let cbor_len = usize::try_from(u32::from_le_bytes(buf[44..48].try_into().unwrap()))
+            .expect("CBOR length fits host address space");
         let cbor_bytes = &buf[BOOTSTRAP_HEADER_LEN..BOOTSTRAP_HEADER_LEN + cbor_len];
         let mut value: CborValue = ciborium::from_reader(cbor_bytes).expect("decode");
         if let CborValue::Map(ref mut m) = value {
@@ -3219,11 +2149,11 @@ mod tests {
         }
         let mut new_cbor = Vec::new();
         ciborium::into_writer(&value, &mut new_cbor).expect("re-encode");
-        let new_len: u32 = new_cbor.len() as u32;
+        let new_len: u32 = new_cbor.len().try_into().expect("CBOR length fits u32");
         // Rewrite buf with the extended CBOR.
-        buf[40..44].copy_from_slice(&new_len.to_le_bytes());
+        buf[44..48].copy_from_slice(&new_len.to_le_bytes());
         let new_crc_header = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
-        buf[44..52].copy_from_slice(&new_crc_header.to_le_bytes());
+        buf[48..56].copy_from_slice(&new_crc_header.to_le_bytes());
         // payload area starts right after header.
         let cbor_end = BOOTSTRAP_HEADER_LEN + new_cbor.len();
         buf[BOOTSTRAP_HEADER_LEN..cbor_end].copy_from_slice(&new_cbor);

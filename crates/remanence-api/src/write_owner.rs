@@ -21,16 +21,24 @@ use remanence_library::{
     TapePosition,
 };
 use remanence_parity::{
-    committed_prefix_from_journal, plan_resume_append_from_committed_prefix,
-    scan_reconstruct_filemark_map, CloseReason, DriveHandleRawSink, DriveHandleRawSource,
-    FileTapeFileJournal, FilemarkMap, ParityError, ParitySink, ParitySinkSessionState,
-    PhysicalPositionHint, RawTapeSink, RawWriteOutcome, ResumeWriterSeed, TapeFileEntry,
-    TapeFileJournal, TapeFileKind,
+    checked_bounded_resume_summary, read_terminal_index_inventory_streamed,
+    reconcile_terminal_prefix, reconcile_terminal_tail_next, recover_terminal_inventory_from_bot,
+    scan_reconstruct_filemark_map, verify_terminal_index_full, BotStructuralRecoveryReason,
+    BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink,
+    DriveHandleRawSource, FileTapeFileJournal, FileTapeFileJournalCommittedSnapshot, FilemarkMap,
+    ParityError, ParitySink, ParitySinkSessionState, PhysicalPositionHint, RawTapeSink,
+    RawWriteOutcome, TapeFileEntry, TapeFileJournal, TapeFileKind, TerminalComponentCommit,
+    TerminalComponentReconcileEvidence, TerminalInventoryOutcome, TerminalInventoryStreamEvent,
+    TerminalPrefixPlan, TerminalPrefixReconcileEvidence, TerminalReplicaEvidence,
+    TerminalReplicaFailureKind, TerminalTailAuthority, TerminalTailProgress,
+    TerminalTailStepOutcome, TerminalTailWriteError, TerminalTripleWritePlan,
 };
 use remanence_state::{
     AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
     CleaningConfig, DriveHealthSnapshotInput, DriveHealthSnapshotRecord, FileAuditLog,
     NativeObjectFileRecord, SourceLayer, TapeIoConfig, TapeIoFenceRecord, TapePoolConfig,
+    TerminalFinalizationOutcome, TerminalFinalizationProjection,
+    TerminalFinalizationProjectionInput,
 };
 use remanence_stream::StreamingError;
 use time::format_description::well_known::Rfc3339;
@@ -46,6 +54,7 @@ use crate::{
 };
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
+const FINALIZE_TAPE_OPERATION_KIND: &str = "finalize_tape";
 const LOAD_READY_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
 const LOAD_READY_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 
@@ -136,6 +145,35 @@ pub(crate) enum DriveCommand {
         daemon_epoch: u64,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
+    TapeInventory {
+        tape_uuid: [u8; 16],
+        needs_drive_load: bool,
+        library_serial: String,
+        barcode: Option<String>,
+        source_slot: Option<u16>,
+        drive_serial: Option<String>,
+        stream_tx: mpsc::Sender<Result<pb::TapeInventoryStreamItem, Status>>,
+        reply: oneshot::Sender<Result<(), Status>>,
+    },
+    VerifyTapeIndex {
+        tape_uuid: [u8; 16],
+        needs_drive_load: bool,
+        library_serial: String,
+        barcode: Option<String>,
+        source_slot: Option<u16>,
+        drive_serial: Option<String>,
+        reply: oneshot::Sender<Result<pb::TapeIndexVerification, Status>>,
+    },
+    FinalizeTape {
+        request: ManualFinalizeTapeActorRequest,
+        needs_drive_load: bool,
+        library_serial: String,
+        barcode: Option<String>,
+        source_slot: Option<u16>,
+        drive_uuid: Option<Vec<u8>>,
+        drive_serial: Option<String>,
+        reply: oneshot::Sender<Result<ManualFinalizeTapeActorReply, Status>>,
+    },
     Unload {
         reply: oneshot::Sender<Result<StdDuration, Status>>,
     },
@@ -209,6 +247,312 @@ pub(crate) enum DriveCommand {
         session_id: Uuid,
         reply: oneshot::Sender<Result<pb::ReadSession, Status>>,
     },
+}
+
+/// Fully authenticated manual close-out request dispatched under one tape owner.
+///
+/// The request bypasses only automatic low-watermark eligibility. The drive
+/// actor still proves catalog assignment, checkpoint/tape-tail agreement,
+/// terminal fit, and the immutable A/gap/B/gap/C layout before publishing the
+/// durable `BeforeReplicaA` intent.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ManualFinalizeTapeActorRequest {
+    pub(crate) candidate_operation_id: Uuid,
+    pub(crate) actor: AuditActor,
+    pub(crate) actor_fingerprint: String,
+    pub(crate) idempotency_key: Uuid,
+    pub(crate) request_fingerprint: [u8; 32],
+    pub(crate) tape_uuid: TapeUuid,
+    pub(crate) expected_pool_id: Option<String>,
+    pub(crate) assignment_generation: u64,
+    pub(crate) reason: String,
+    pub(crate) block_size: u32,
+    pub(crate) parity_config: remanence_parity::ParityConfig,
+    /// Exact assigned pool policy captured only after the assignment guard.
+    /// `None` is the supported unpooled close-only profile.
+    pub(crate) pool_config: Option<TapePoolConfig>,
+}
+
+/// Durable status returned after the drive actor has accepted or joined a close-out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManualFinalizeTapeActorReply {
+    pub(crate) operation_id: Uuid,
+    pub(crate) projection: TerminalFinalizationProjection,
+}
+
+/// Result of manual close-out admission under the exact-tape owner.
+///
+/// `Busy` is deliberately not an error: it is the typed, zero-side-effect
+/// outcome when an Object/read owner or another tape reservation is active.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ManualFinalizeTapeResult {
+    Busy,
+    Accepted(ManualFinalizeTapeActorReply),
+}
+
+/// Filesystem and audit authority needed by the no-motion manual-finalize
+/// preflight. Keeping this smaller than `WriteOwnerConfig` makes it explicit
+/// that admission has no drive or changer capability.
+pub(crate) struct ManualFinalizePreflightConfig<'a> {
+    pub(crate) checkpoint_journal_dir: &'a Path,
+    pub(crate) audit_dir: &'a Path,
+    pub(crate) audit_fsync: bool,
+    pub(crate) audit_append_lock: &'a Arc<std::sync::Mutex<()>>,
+}
+
+struct ManualFinalizeTapeMountRequest {
+    request: ManualFinalizeTapeActorRequest,
+    needs_drive_load: bool,
+    library_serial: String,
+    barcode: Option<String>,
+    source_slot: Option<u16>,
+    drive_uuid: Option<Vec<u8>>,
+    drive_serial: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalFinalizeSpec {
+    tape_uuid: TapeUuid,
+    block_size: u32,
+    pool_config: Option<TapePoolConfig>,
+    trigger: remanence_state::TerminalFinalizationTrigger,
+    operation_id: Option<Uuid>,
+    manual: Option<remanence_state::ManualTerminalFinalizationIdentity>,
+}
+
+impl TerminalFinalizeSpec {
+    fn operator(request: &ManualFinalizeTapeActorRequest) -> Self {
+        Self {
+            tape_uuid: request.tape_uuid,
+            block_size: request.block_size,
+            pool_config: request.pool_config.clone(),
+            trigger: remanence_state::TerminalFinalizationTrigger::OperatorCloseOut,
+            operation_id: Some(request.candidate_operation_id),
+            manual: Some(remanence_state::ManualTerminalFinalizationIdentity {
+                operation_id: *request.candidate_operation_id.as_bytes(),
+                operation_kind: FINALIZE_TAPE_OPERATION_KIND.to_string(),
+                actor_fingerprint: request.actor_fingerprint.clone(),
+                idempotency_key: *request.idempotency_key.as_bytes(),
+                request_fingerprint: request.request_fingerprint,
+                assigned_pool_id: request.expected_pool_id.clone(),
+                expected_pool_id: request.expected_pool_id.clone(),
+                assignment_generation: request.assignment_generation,
+                reason: request.reason.clone(),
+            }),
+        }
+    }
+
+    fn automatic(
+        selected: &SelectedTape,
+        pool_config: &TapePoolConfig,
+        trigger: remanence_state::TerminalFinalizationTrigger,
+    ) -> Self {
+        debug_assert_ne!(
+            trigger,
+            remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+        );
+        Self {
+            tape_uuid: selected.tape_uuid,
+            block_size: selected.block_size,
+            pool_config: Some(pool_config.clone()),
+            trigger,
+            operation_id: None,
+            manual: None,
+        }
+    }
+
+    fn resume(
+        intent: &remanence_state::TerminalFinalizationIntent,
+        block_size: u32,
+        pool_config: &TapePoolConfig,
+    ) -> Self {
+        Self {
+            tape_uuid: intent.tape_uuid,
+            block_size,
+            pool_config: Some(pool_config.clone()),
+            trigger: intent.trigger,
+            operation_id: intent
+                .manual
+                .as_ref()
+                .map(|manual| Uuid::from_bytes(manual.operation_id)),
+            manual: intent.manual.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TerminalFinalizeResult {
+    projection: TerminalFinalizationProjection,
+    final_record: Option<remanence_state::CheckpointJournalRecord>,
+}
+
+struct TerminalTailCatalogAuthority<'a> {
+    checkpoint: &'a mut remanence_state::FileCheckpointJournalLease,
+    parity_journal: Option<&'a mut FileTapeFileJournal>,
+    index: &'a mut CatalogIndex,
+    spec: &'a TerminalFinalizeSpec,
+    intent: remanence_state::TerminalFinalizationIntent,
+    tix_fault: Option<&'a crate::terminal_fault::TerminalFaultPlan>,
+    reconciliation: Option<(
+        TerminalTailProgress,
+        remanence_parity::TerminalTailComponentPlan,
+        TerminalComponentReconcileEvidence,
+    )>,
+}
+
+impl TerminalTailCatalogAuthority<'_> {
+    fn set_reconciliation(
+        &mut self,
+        progress: TerminalTailProgress,
+        component: remanence_parity::TerminalTailComponentPlan,
+        evidence: TerminalComponentReconcileEvidence,
+    ) {
+        self.reconciliation = Some((progress, component, evidence));
+    }
+
+    fn projection_input(
+        &self,
+        progress: remanence_state::TerminalFinalizationProgress,
+        outcome: TerminalFinalizationOutcome,
+    ) -> TerminalFinalizationProjectionInput {
+        TerminalFinalizationProjectionInput {
+            tape_uuid: self.spec.tape_uuid,
+            trigger: self.spec.trigger,
+            operation_id: self.spec.operation_id,
+            progress,
+            edition_digest: self.intent.edition_digest,
+            layout_digest: self.intent.layout.layout_digest,
+            outcome,
+            updated_at_utc: None,
+        }
+    }
+}
+
+impl TerminalTailAuthority for TerminalTailCatalogAuthority<'_> {
+    fn load_progress(&mut self) -> Result<TerminalTailProgress, String> {
+        Ok(parity_progress_from_state(self.intent.progress))
+    }
+
+    fn reconcile_next(
+        &mut self,
+        progress: TerminalTailProgress,
+        component: remanence_parity::TerminalTailComponentPlan,
+    ) -> Result<TerminalComponentReconcileEvidence, String> {
+        let Some((expected_progress, expected_component, evidence)) = self.reconciliation.take()
+        else {
+            return Err("terminal-tail reconciliation was not supplied by the drive owner".into());
+        };
+        if expected_progress != progress || expected_component != component {
+            return Err("terminal-tail reconciliation does not match the requested step".into());
+        }
+        Ok(evidence)
+    }
+
+    fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String> {
+        if let Some(journal) = self.parity_journal.as_deref_mut() {
+            if let Some(fault) = self.tix_fault {
+                fault.abort_component_if_matches(
+                    commit.component,
+                    crate::terminal_fault::TerminalFaultCut::BeforeParityJournalFsync,
+                    Some(commit.observed_position),
+                )?;
+            }
+            journal
+                .commit_terminal_component_transition(
+                    &commit.journal_bundle,
+                    &commit.checkpoint_bundle,
+                )
+                .map_err(|error| format!("commit terminal component journal: {error}"))?;
+            if let Some(fault) = self.tix_fault {
+                fault.abort_component_if_matches(
+                    commit.component,
+                    crate::terminal_fault::TerminalFaultCut::AfterParityJournalFsync,
+                    Some(commit.observed_position),
+                )?;
+            }
+        }
+        let expected = state_progress_from_parity(commit.previous_progress);
+        let next = state_progress_from_parity(commit.next_progress);
+        if let Some(fault) = self.tix_fault {
+            fault.abort_component_if_matches(
+                commit.component,
+                crate::terminal_fault::TerminalFaultCut::BeforeCheckpointJournalFsync,
+                Some(commit.observed_position),
+            )?;
+        }
+        self.intent = self
+            .checkpoint
+            .advance_terminal_finalization(expected, next)
+            .map_err(|error| format!("advance terminal checkpoint progress: {error}"))?;
+        if let Some(fault) = self.tix_fault {
+            fault.abort_component_if_matches(
+                commit.component,
+                crate::terminal_fault::TerminalFaultCut::AfterCheckpointJournalFsync,
+                Some(commit.observed_position),
+            )?;
+        }
+        if next != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+            if let Some(fault) = self.tix_fault {
+                fault.abort_component_if_matches(
+                    commit.component,
+                    crate::terminal_fault::TerminalFaultCut::BeforeSqliteProjection,
+                    Some(commit.observed_position),
+                )?;
+            }
+            self.index
+                .project_terminal_finalization(
+                    self.projection_input(next, TerminalFinalizationOutcome::InProgress),
+                )
+                .map_err(|error| format!("project terminal progress: {error}"))?;
+            if let Some(fault) = self.tix_fault {
+                fault.abort_component_if_matches(
+                    commit.component,
+                    crate::terminal_fault::TerminalFaultCut::AfterSqliteProjection,
+                    Some(commit.observed_position),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+const fn parity_progress_from_state(
+    progress: remanence_state::TerminalFinalizationProgress,
+) -> TerminalTailProgress {
+    use remanence_state::TerminalFinalizationProgress as State;
+    match progress {
+        State::BeforeReplicaA => TerminalTailProgress::BeforeReplicaA,
+        State::AfterReplicaA => TerminalTailProgress::AfterReplicaA,
+        State::AfterSeparationAb => TerminalTailProgress::AfterSeparationAb,
+        State::AfterReplicaB => TerminalTailProgress::AfterReplicaB,
+        State::AfterSeparationBc => TerminalTailProgress::AfterSeparationBc,
+        State::AfterReplicaC => TerminalTailProgress::AfterReplicaC,
+    }
+}
+
+const fn state_progress_from_parity(
+    progress: TerminalTailProgress,
+) -> remanence_state::TerminalFinalizationProgress {
+    use remanence_state::TerminalFinalizationProgress as State;
+    match progress {
+        TerminalTailProgress::BeforeReplicaA => State::BeforeReplicaA,
+        TerminalTailProgress::AfterReplicaA => State::AfterReplicaA,
+        TerminalTailProgress::AfterSeparationAb => State::AfterSeparationAb,
+        TerminalTailProgress::AfterReplicaB => State::AfterReplicaB,
+        TerminalTailProgress::AfterSeparationBc => State::AfterSeparationBc,
+        TerminalTailProgress::AfterReplicaC => State::AfterReplicaC,
+    }
+}
+
+const fn terminal_reconciliation_outcome(
+    _progress: remanence_state::TerminalFinalizationProgress,
+    _evidence: TerminalComponentReconcileEvidence,
+) -> TerminalFinalizationOutcome {
+    // Reconciliation proves media facts; it does not supply the distinct,
+    // audited operator decision required to accept reduced redundancy as a
+    // terminal outcome. Until that decision exists, every non-repairable or
+    // completion-unknown tail remains recovery-required.
+    TerminalFinalizationOutcome::RecoveryRequired
 }
 
 #[derive(Debug)]
@@ -1037,6 +1381,84 @@ fn drive_loop(
                     reply,
                 },
             ),
+            DriveCommand::TapeInventory {
+                tape_uuid,
+                needs_drive_load,
+                library_serial,
+                barcode,
+                source_slot,
+                drive_serial,
+                stream_tx,
+                reply,
+            } => {
+                let result = handle_drive_tape_inventory(
+                    bay,
+                    &mut index,
+                    drive,
+                    tape_uuid,
+                    needs_drive_load,
+                    library_serial.as_str(),
+                    barcode.as_deref(),
+                    source_slot,
+                    drive_serial.as_deref(),
+                    &stream_tx,
+                );
+                if let Err(error) = &result {
+                    let _ = stream_tx
+                        .blocking_send(Err(Status::new(error.code(), error.message().to_string())));
+                }
+                let _ = reply.send(result);
+            }
+            DriveCommand::VerifyTapeIndex {
+                tape_uuid,
+                needs_drive_load,
+                library_serial,
+                barcode,
+                source_slot,
+                drive_serial,
+                reply,
+            } => {
+                let result = handle_drive_verify_tape_index(
+                    bay,
+                    &mut index,
+                    drive,
+                    tape_uuid,
+                    needs_drive_load,
+                    library_serial.as_str(),
+                    barcode.as_deref(),
+                    source_slot,
+                    drive_serial.as_deref(),
+                );
+                let _ = reply.send(result);
+            }
+            DriveCommand::FinalizeTape {
+                request,
+                needs_drive_load,
+                library_serial,
+                barcode,
+                source_slot,
+                drive_uuid,
+                drive_serial,
+                reply,
+            } => {
+                let result = handle_drive_finalize_tape(
+                    bay,
+                    &mut index,
+                    &cfg,
+                    drive,
+                    &mut snapshot_misses,
+                    ManualFinalizeTapeMountRequest {
+                        request,
+                        needs_drive_load,
+                        library_serial,
+                        barcode,
+                        source_slot,
+                        drive_uuid,
+                        drive_serial,
+                    },
+                );
+                let _ = reply.send(result);
+            }
             DriveCommand::Unload { reply } => {
                 let started = Instant::now();
                 let result = drive
@@ -1114,6 +1536,15 @@ fn drain_failed_drive_commands(mut rx: mpsc::Receiver<DriveCommand>, message: St
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::OpenRead { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::TapeInventory { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::VerifyTapeIndex { reply, .. } => {
+                let _ = reply.send(Err(Status::internal(message.clone())));
+            }
+            DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::internal(message.clone())));
             }
             DriveCommand::Unload { reply } => {
@@ -1585,13 +2016,13 @@ struct ParityActorSession {
 
 struct ParityActorAuthority {
     scheme: remanence_parity::ParityScheme,
-    committed: remanence_parity::CommittedState,
+    snapshot: FileTapeFileJournalCommittedSnapshot,
+    summary: BoundedResumeSummary,
     journal: FileTapeFileJournal,
 }
 
-/// Records entry into the direct parity raw-write boundary. The append source's
-/// overlap control cannot observe this path, so actor failure containment must
-/// use the Layer 3c emission boundary itself.
+/// Records entry into a direct parity raw-write boundary. Position-only
+/// validation does not mark media dirty; the first write command does.
 struct ActivityTrackingRawTapeSink<'a> {
     inner: &'a mut dyn RawTapeSink,
     write_attempted: &'a mut bool,
@@ -1654,6 +2085,7 @@ fn parity_journal_path(cfg: &WriteOwnerConfig, tape_uuid: TapeUuid) -> Result<Pa
 fn validate_parity_actor_authority(
     cfg: &WriteOwnerConfig,
     selected: &SelectedTape,
+    checkpoint: &remanence_state::FileCheckpointJournalLease,
     checkpoints: &[remanence_state::CheckpointJournalRecord],
 ) -> Result<ParityActorAuthority, Status> {
     let scheme = match &selected.parity_config {
@@ -1679,20 +2111,32 @@ fn validate_parity_actor_authority(
             "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
         );
     }
-    let committed = journal
-        .load_committed()
-        .map_err(|err| Status::internal(format!("replay parity tape journal: {err}")))?;
-    remanence_state::validate_parity_resume_authority(
-        checkpoints,
-        &committed,
-        selected.tape_uuid,
-        selected.block_size,
-        &scheme,
-    )
-    .map_err(|err| Status::failed_precondition(err.to_string()))?;
+    if checkpoints.is_empty() {
+        if journal.orphaned_bundles_preserved_on_open() != 0 {
+            return Err(Status::failed_precondition(
+                "parity journal has orphan rows but checkpoint authority is empty",
+            ));
+        }
+    } else {
+        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
+            checkpoint, &journal,
+        )
+        .map_err(crate::status_from_state_error)?;
+    }
+    let snapshot = journal
+        .committed_snapshot_bounded()
+        .map_err(|err| Status::internal(format!("freeze parity tape journal: {err}")))?;
+    let summary = checked_bounded_resume_summary(&snapshot)
+        .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
+    if checkpoints.is_empty() && summary.committed_tape_file_count != 0 {
+        return Err(Status::failed_precondition(
+            "parity journal has a committed prefix but checkpoint authority is empty",
+        ));
+    }
     Ok(ParityActorAuthority {
         scheme,
-        committed,
+        snapshot,
+        summary,
         journal,
     })
 }
@@ -1707,23 +2151,23 @@ fn open_parity_actor_session(
 ) -> Result<ParityActorSession, Status> {
     let ParityActorAuthority {
         scheme,
-        committed,
+        snapshot,
+        summary,
         mut journal,
     } = authority;
-    let sink_state = if committed.entries.is_empty() {
+    let sink_state = if summary.committed_tape_file_count == 0 {
         let preflight_state = {
             let mut raw = DriveHandleRawSink::new(drive);
             let mut write_attempted = false;
             let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut write_attempted);
             (|| -> Result<ParitySinkSessionState, ParityError> {
-                let mut sink = ParitySink::new_with_journal(
+                let sink = ParitySink::new_with_journal(
                     &mut tracked,
                     &mut journal,
                     scheme.clone(),
                     selected.tape_uuid,
                     selected.block_size,
                 )?;
-                sink.reserve_checkpoint_batch_object_rows(cfg.checkpoint_max_objects)?;
                 sink.into_session_state()
             })()
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?
@@ -1744,12 +2188,10 @@ fn open_parity_actor_session(
         };
         match opened {
             Ok(state) => {
-                crate::pool_write::project_fresh_parity_bootstrap_bundle(
-                    index, selected, &scheme, &journal,
-                )
-                .map_err(|err| {
-                    Status::internal(format!("project fresh parity bootstrap: {err}"))
-                })?;
+                crate::pool_write::project_fresh_parity_bootstrap_bundle(index, selected, &scheme)
+                    .map_err(|err| {
+                        Status::internal(format!("project fresh parity bootstrap: {err}"))
+                    })?;
                 state
             }
             Err(err) => {
@@ -1780,9 +2222,8 @@ fn open_parity_actor_session(
         drive
             .locate(checkpoint.eod_lba)
             .map_err(|err| Status::unavailable(format!("locate parity checkpoint EOD: {err}")))?;
-        let (_, prefix) = committed_prefix_from_journal(&journal, &scheme)
-            .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-        let plan = plan_resume_append_from_committed_prefix(&prefix, &scheme)
+        let plan = summary
+            .append_plan(&scheme)
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
         if !plan.sidecars_to_emit.is_empty()
             || plan.highest_protected_ordinal_before_rebuild != plan.next_data_ordinal
@@ -1794,36 +2235,18 @@ fn open_parity_actor_session(
         let resume_result = plan
             .complete(Vec::new())
             .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-        let directory =
-            remanence_parity::sidecar_directory_from_committed_state(&committed, &scheme)
-                .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-        let object_rows = committed
-            .entries
-            .iter()
-            .filter_map(|entry| entry.bootstrap_object_row.clone())
-            .collect();
-        let next_bootstrap_sequence = u32::try_from(
-            committed
-                .entries
-                .iter()
-                .filter(|entry| entry.kind == TapeFileKind::Bootstrap)
-                .count(),
-        )
-        .map_err(|_| Status::internal("bootstrap count overflows u32"))?;
         let mut raw = DriveHandleRawSink::new(drive);
-        let sink = ParitySink::new_sidecar_only_from_resume(
+        let sink = ParitySink::new_sidecar_only_from_bounded_resume(
             &mut raw,
             &mut journal,
             scheme.clone(),
             selected.tape_uuid,
             selected.block_size,
-            ResumeWriterSeed {
-                committed_prefix: &prefix,
-                committed_prefix_sidecar_directory_entries: directory,
-                committed_prefix_object_rows: object_rows,
+            BoundedResumeWriterSeed {
+                committed_prefix_snapshot: snapshot,
+                committed_prefix_summary: summary,
                 resume_result: &resume_result,
                 live_epoch: None,
-                next_bootstrap_sequence,
             },
         )
         .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
@@ -1879,10 +2302,29 @@ fn extend_durable_checkpoint_records(
     records: &mut Vec<remanence_state::CheckpointJournalRecord>,
     outcome: &BarrierOutcome,
 ) {
-    records.push(outcome.checkpoint_record.clone());
-    if let Some(terminal_record) = &outcome.terminal_checkpoint_record {
-        records.push(terminal_record.clone());
-    }
+    records.clear();
+    records.push(
+        outcome
+            .terminal_checkpoint_record
+            .as_ref()
+            .unwrap_or(&outcome.checkpoint_record)
+            .clone(),
+    );
+}
+
+/// Rebuild the catalog projection by streaming checkpoint authority while
+/// retaining only the final record needed by the live writer actor.
+fn project_checkpoint_authority_bounded(
+    index: &mut CatalogIndex,
+    lease: &remanence_state::FileCheckpointJournalLease,
+) -> Result<Vec<remanence_state::CheckpointJournalRecord>, remanence_state::StateError> {
+    let mut last = None;
+    lease.for_each_record_bounded(|record| {
+        index.project_checkpoint_record(record)?;
+        last = Some(record.clone());
+        Ok(())
+    })?;
+    Ok(last.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -1969,12 +2411,11 @@ fn perform_checkpoint_barrier(
     index: &mut CatalogIndex,
     drive: &mut DriveHandle,
     journal: &mut remanence_state::FileCheckpointJournalLease,
-    prior_records: &[remanence_state::CheckpointJournalRecord],
     tape_uuid: TapeUuid,
     checkpoint_ordinal: &mut u64,
     tape_committed_object_count: &mut u64,
     batch: &PendingCheckpointBatch,
-    mut parity_session: Option<&mut ParityActorSession>,
+    parity_session: Option<&mut ParityActorSession>,
     selected: &SelectedTape,
     pool_cfg: &TapePoolConfig,
     cfg: &WriteOwnerConfig,
@@ -2027,13 +2468,13 @@ fn perform_checkpoint_barrier(
         Vec::new()
     };
     let (
-        checkpoint_tape_file_number,
+        next_tape_file_number,
         checkpoint_block_size,
         sync,
-        checkpoint_bundle,
+        barrier_bundle,
         scheme,
         parity_early_warning,
-    ) = if let Some(parity_session) = parity_session.as_deref_mut() {
+    ) = if let Some(parity_session) = parity_session {
         let state = parity_session.sink_state.take().ok_or_else(|| {
             CheckpointBarrierFailure::before_journal(Status::internal(
                 "parity sink session state is unavailable",
@@ -2080,42 +2521,14 @@ fn perform_checkpoint_barrier(
         let parity_early_warning = sink_state.hardware_early_warning_seen();
         parity_session.sink_state = Some(sink_state);
         (
-            closed.bootstrap_tape_file_number,
+            closed.next_tape_file_number,
             objects[0].block_size,
             closed.barrier_outcome,
-            Some(closed.committed_bundle),
+            closed.committed_bundle,
             Some(parity_session.scheme.clone()),
             parity_early_warning,
         )
     } else {
-        let checkpoint_bootstrap = crate::pool_write::build_no_parity_checkpoint_bootstrap(
-                tape_uuid,
-                next_ordinal,
-                prior_records,
-                &objects,
-                now_rfc3339().unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
-            )
-            .map_err(|err| {
-                CheckpointBarrierFailure::before_journal(Status::internal(format!(
-                    "checkpoint batch {} bootstrap preparation failed; re-send all {} WRITTEN objects: {err}",
-                    batch.batch_id,
-                    batch.objects.len()
-                )))
-            })?;
-        drive.write_block(&checkpoint_bootstrap.block).map_err(|err| {
-                CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
-                    "checkpoint batch {} on-tape bootstrap write failed; re-send all {} WRITTEN objects: {err}",
-                    batch.batch_id,
-                    batch.objects.len()
-                )))
-            })?;
-        drive.write_filemarks_immediate(1).map_err(|err| {
-                CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
-                    "checkpoint batch {} bootstrap delimiter failed; re-send all {} WRITTEN objects: {err}",
-                    batch.batch_id,
-                    batch.objects.len()
-                )))
-            })?;
         let sync = drive.write_filemarks(0).map_err(|err| {
             CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
                 "checkpoint batch {} barrier failed; re-send all {} WRITTEN objects: {err}",
@@ -2123,9 +2536,19 @@ fn perform_checkpoint_barrier(
                 batch.objects.len()
             )))
         })?;
+        let last = objects.last().ok_or_else(|| {
+            CheckpointBarrierFailure::before_journal(Status::internal(
+                "parity-off checkpoint batch has no Object projection",
+            ))
+        })?;
+        let next_tape_file_number = last.copy.tape_file_number.checked_add(1).ok_or_else(|| {
+            CheckpointBarrierFailure::before_journal(Status::internal(
+                "checkpoint next tape-file number overflows u64",
+            ))
+        })?;
         (
-            checkpoint_bootstrap.tape_file_number,
-            checkpoint_bootstrap.block_size,
+            next_tape_file_number,
+            last.block_size,
             sync,
             None,
             None,
@@ -2161,12 +2584,13 @@ fn perform_checkpoint_barrier(
         eod_lba: captured.lba,
         tape_uuid,
         batch_id: *batch.batch_id.as_bytes(),
-        checkpoint_tape_file_number,
+        next_tape_file_number,
         block_size: checkpoint_block_size,
         objects,
         scheme,
         object_tape_file_bundles,
-        checkpoint_bundle,
+        barrier_bundle,
+        terminal_finalization: None,
         sealed_after_write: false,
     };
     let barrier_used_bytes = captured
@@ -2188,153 +2612,16 @@ fn perform_checkpoint_barrier(
         },
     )
     .map_err(|err| CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err)))?;
-    let sealed_after_write = seal_reason.is_some();
-    let terminal_checkpoint_record = if sealed_after_write {
-        let mut authority_records = prior_records.to_vec();
-        authority_records.push(record.clone());
-        journal.begin_terminal_transition().map_err(|err| {
-            CheckpointBarrierFailure::before_journal(status_from_state_error(err))
-        })?;
-        let (terminal_bundle, terminal_sync) = if let Some(parity_session) = parity_session {
-            let mut raw_write_attempted = false;
-            let terminal_result = (|| -> Result<_, ParityError> {
-                let state = parity_session
-                    .sink_state
-                    .take()
-                    .ok_or(ParityError::Invariant(
-                        "parity sink session state is unavailable at seal",
-                    ))?;
-                let mut raw = DriveHandleRawSink::new(drive);
-                let mut tracked =
-                    ActivityTrackingRawTapeSink::new(&mut raw, &mut raw_write_attempted);
-                let mut sink = ParitySink::from_session_state(
-                    &mut tracked,
-                    &mut parity_session.journal,
-                    state,
-                )?;
-                let closed = sink.close_open_epoch(CloseReason::Finish)?;
-                parity_session.sink_state = Some(sink.into_session_state()?);
-                Ok((closed.committed_bundle, closed.barrier_outcome))
-            })();
-            match terminal_result {
-                Ok(terminal) => terminal,
-                Err(err) => {
-                    let error = err.to_string();
-                    let status = status_from_parity_error(&err, error.clone());
-                    if raw_write_attempted {
-                        let fenced = fence_failed_parity_raw_write(
-                            index,
-                            cfg,
-                            selected,
-                            "terminal_seal",
-                            None,
-                            Some(batch),
-                            error.as_str(),
-                            status,
-                        );
-                        return Err(CheckpointBarrierFailure::before_journal_with_fence_handled(
-                            fenced.0,
-                        ));
-                    }
-                    return Err(CheckpointBarrierFailure::before_journal(status));
-                }
-            }
-        } else {
-            let terminal = crate::pool_write::build_no_parity_terminal_bootstrap(
-                tape_uuid,
-                &authority_records,
-                now_rfc3339().map_err(|err| {
-                    CheckpointBarrierFailure::before_journal(Status::internal(format!(
-                        "prepare terminal bootstrap timestamp: {err}"
-                    )))
-                })?,
-            )
-            .map_err(|err| {
-                CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err))
-            })?;
-            drive.write_block(&terminal.block).map_err(|err| {
-                CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
-                    "terminal bootstrap write failed before checkpoint authority advanced: {err}"
-                )))
-            })?;
-            drive.write_filemarks_immediate(1).map_err(|err| {
-                CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
-                    "terminal bootstrap delimiter failed before checkpoint authority advanced: {err}"
-                )))
-            })?;
-            let terminal_sync = drive.write_filemarks(0).map_err(|err| {
-                CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
-                    "terminal bootstrap barrier failed before checkpoint authority advanced: {err}"
-                )))
-            })?;
-            let total_committed_ordinals = record
-                .objects
-                .last()
-                .map_or(0, |object| object.total_committed_ordinals);
-            let terminal_bundle = crate::pool_write::build_no_parity_terminal_bundle(
-                &terminal,
-                terminal_sync.position_after.lba,
-                total_committed_ordinals,
-            )
-            .map_err(|err| {
-                CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err))
-            })?;
-            (terminal_bundle, terminal_sync)
-        };
-        let terminal_captured = drive.position().map_err(|err| {
-            CheckpointBarrierFailure::before_journal(Status::unavailable(format!(
-                "terminal bootstrap READ POSITION failed before checkpoint authority advanced: {err}"
-            )))
-        })?;
-        if terminal_captured.partition != terminal_sync.position_after.partition
-            || terminal_captured.lba != terminal_sync.position_after.lba
-        {
-            return Err(CheckpointBarrierFailure::before_journal(
-                Status::unavailable(format!(
-                    "terminal barrier position proof mismatch: synchronous barrier reported partition {} lba {}, daemon READ POSITION observed partition {} lba {}",
-                    terminal_sync.position_after.partition,
-                    terminal_sync.position_after.lba,
-                    terminal_captured.partition,
-                    terminal_captured.lba,
-                )),
-            ));
-        }
-        Some(
-            crate::pool_write::build_terminal_checkpoint_record(
-                &authority_records,
-                tape_uuid,
-                *batch.batch_id.as_bytes(),
-                checkpoint_block_size,
-                record.scheme.clone(),
-                terminal_bundle,
-                terminal_captured.partition,
-                terminal_captured.lba,
-            )
-            .map_err(|err| {
-                CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err))
-            })?,
-        )
-    } else {
-        None
-    };
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
-    let append_result = match &terminal_checkpoint_record {
-        Some(terminal_record) => {
-            journal.append_terminal_transition(&[record.clone(), terminal_record.clone()])
-        }
-        None => journal.append(&record),
-    };
-    append_result.map_err(|err| {
+    journal.append(&record).map_err(|err| {
         CheckpointBarrierFailure::before_journal(Status::internal(format!(
             "checkpoint batch {} journal fsync failed; re-send all {} WRITTEN objects: {err}",
             batch.batch_id,
             batch.objects.len(),
         )))
     })?;
-    *checkpoint_ordinal = terminal_checkpoint_record
-        .as_ref()
-        .map_or(next_ordinal, |terminal| terminal.ordinal);
+    *checkpoint_ordinal = next_ordinal;
     *tape_committed_object_count = next_committed_count;
     index
         .project_checkpoint_record(&record)
@@ -2343,15 +2630,66 @@ fn perform_checkpoint_barrier(
                 "checkpoint is durable in the journal but SQLite projection failed; close the session and retry after journal replay: {err}"
             )))
         })?;
-    if let Some(terminal_record) = &terminal_checkpoint_record {
-        index
-            .project_checkpoint_record(terminal_record)
-            .map_err(|err| {
-                CheckpointBarrierFailure::after_journal(Status::internal(format!(
-                    "terminal seal is durable in the journal but SQLite projection failed; close the session and retry after journal replay: {err}"
-                )))
-            })?;
-    }
+    let terminal_checkpoint_record = if let Some(reason) = seal_reason {
+        let trigger = match reason {
+            crate::pool_write::TapeSealReason::ReachedLowWatermark => {
+                remanence_state::TerminalFinalizationTrigger::ReachedLowWatermark
+            }
+            crate::pool_write::TapeSealReason::HardwareEarlyWarning => {
+                remanence_state::TerminalFinalizationTrigger::HardwareEarlyWarning
+            }
+            crate::pool_write::TapeSealReason::OperatorCloseOut => {
+                remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+            }
+            crate::pool_write::TapeSealReason::PoolCloseOut => {
+                remanence_state::TerminalFinalizationTrigger::PoolCloseOut
+            }
+            crate::pool_write::TapeSealReason::NoPendingObjectFits => {
+                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits
+            }
+        };
+        if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
+            return Err(CheckpointBarrierFailure::after_journal(Status::internal(
+                "automatic checkpoint seal unexpectedly carried an operator trigger",
+            )));
+        }
+        let drive_config = drive.read_config().map_err(|error| {
+            CheckpointBarrierFailure::after_journal(Status::unavailable(format!(
+                "read terminal-finalization drive config: {error}"
+            )))
+        })?;
+        if drive_config.write_protected {
+            return Err(CheckpointBarrierFailure::after_journal(
+                Status::failed_precondition(
+                    "tape became write-protected before terminal finalization",
+                ),
+            ));
+        }
+        let rewritable = matches!(
+            drive_config.worm,
+            remanence_library::WormMediaState::NotWorm
+        );
+        let spec = TerminalFinalizeSpec::automatic(selected, pool_cfg, trigger);
+        let result = match &selected.parity_config {
+            remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
+            ),
+            remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
+                index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
+            ),
+        }
+        .map_err(CheckpointBarrierFailure::after_journal)?;
+        let final_record = result.final_record.ok_or_else(|| {
+            CheckpointBarrierFailure::after_journal(Status::unavailable(
+                "automatic terminal finalization requires recovery before sealing can complete",
+            ))
+        })?;
+        *checkpoint_ordinal = final_record.ordinal;
+        Some(final_record)
+    } else {
+        None
+    };
+    let sealed_after_write = terminal_checkpoint_record.is_some();
     if sealed_after_write {
         if let Err(err) = append_tape_sealed_evidence(index, cfg, selected.tape_uuid) {
             tracing::warn!(error = %err, "failed to append tape sealing evidence");
@@ -3541,26 +3879,47 @@ fn handle_drive_open_write(
             return;
         }
     };
-    let mut checkpoint_lease = match checkpoint_journal.acquire_exclusive() {
-        Ok(lease) => lease,
+    let pending_terminal_intent = match checkpoint_journal.terminal_finalization_intent() {
+        Ok(intent) => intent,
         Err(err) => {
             let _ = reply.send(Err(status_from_state_error(err)));
             return;
         }
     };
-    let mut durable_checkpoint_records = match checkpoint_lease.replay() {
-        Ok(records) => records,
-        Err(err) => {
-            let _ = reply.send(Err(status_from_state_error(err)));
-            return;
-        }
+    let (mut checkpoint_lease, pending_terminal_intent) = if pending_terminal_intent.is_some() {
+        let lease = match checkpoint_journal.acquire_exclusive_for_terminal_recovery() {
+            Ok(lease) => lease,
+            Err(err) => {
+                let _ = reply.send(Err(status_from_state_error(err)));
+                return;
+            }
+        };
+        let intent = match lease.terminal_finalization_intent() {
+            Ok(intent) => intent,
+            Err(err) => {
+                let _ = reply.send(Err(status_from_state_error(err)));
+                return;
+            }
+        };
+        (lease, intent)
+    } else {
+        let lease = match checkpoint_journal.acquire_exclusive() {
+            Ok(lease) => lease,
+            Err(err) => {
+                let _ = reply.send(Err(status_from_state_error(err)));
+                return;
+            }
+        };
+        (lease, None)
     };
-    for record in &durable_checkpoint_records {
-        if let Err(err) = index.project_checkpoint_record(record) {
-            let _ = reply.send(Err(status_from_state_error(err)));
-            return;
-        }
-    }
+    let mut durable_checkpoint_records =
+        match project_checkpoint_authority_bounded(index, &checkpoint_lease) {
+            Ok(records) => records,
+            Err(err) => {
+                let _ = reply.send(Err(status_from_state_error(err)));
+                return;
+            }
+        };
     if durable_checkpoint_records
         .last()
         .is_some_and(|record| record.sealed_after_write)
@@ -3571,25 +3930,33 @@ fn handle_drive_open_write(
         ))));
         return;
     }
-    if let Err(err) = crate::pool_write::ensure_empty_checkpoint_matches_catalog_freshness(
-        index,
-        &selected,
-        &durable_checkpoint_records,
-    ) {
-        let _ = reply.send(Err(status_from_pool_write_error(err)));
-        return;
+    if pending_terminal_intent.is_none() {
+        if let Err(err) = crate::pool_write::ensure_empty_checkpoint_matches_catalog_freshness(
+            index,
+            &selected,
+            &durable_checkpoint_records,
+        ) {
+            let _ = reply.send(Err(status_from_pool_write_error(err)));
+            return;
+        }
+        if let Err(err) = crate::pool_write::ensure_selected_tape_accepts_session_write(
+            index, &pool_cfg, &selected,
+        ) {
+            let _ = reply.send(Err(status_from_pool_write_error(err)));
+            return;
+        }
     }
-    if let Err(err) =
-        crate::pool_write::ensure_selected_tape_accepts_session_write(index, &pool_cfg, &selected)
-    {
-        let _ = reply.send(Err(status_from_pool_write_error(err)));
-        return;
-    }
-    let parity_authority = if matches!(
-        selected.parity_config,
-        remanence_parity::ParityConfig::Scheme(_)
-    ) {
-        match validate_parity_actor_authority(cfg, &selected, &durable_checkpoint_records) {
+    let parity_authority = if pending_terminal_intent.is_none()
+        && matches!(
+            selected.parity_config,
+            remanence_parity::ParityConfig::Scheme(_)
+        ) {
+        match validate_parity_actor_authority(
+            cfg,
+            &selected,
+            &checkpoint_lease,
+            &durable_checkpoint_records,
+        ) {
             Ok(authority) => Some(authority),
             Err(status) => {
                 let _ = reply.send(Err(status));
@@ -3631,6 +3998,101 @@ fn handle_drive_open_write(
     // of the load can dispatch.
     if needs_drive_load {
         run_load_calibration_harvest(index, drive, cfg, &tape_uuid, barcode.as_deref());
+    }
+    if let Some(intent) = pending_terminal_intent {
+        if intent.manual.is_some() {
+            let _ = reply.send(Err(Status::failed_precondition(format!(
+                "tape {} has an operator-owned terminal finalization in progress; retry FinalizeTape with its original idempotency key",
+                Uuid::from_bytes(tape_uuid)
+            ))));
+            return;
+        }
+        let drive_config = match drive.read_config() {
+            Ok(config) => config,
+            Err(error) => {
+                let _ = reply.send(Err(Status::unavailable(format!(
+                    "read automatic terminal-recovery drive config: {error}"
+                ))));
+                return;
+            }
+        };
+        if drive_config.write_protected {
+            let _ = reply.send(Err(Status::failed_precondition(
+                "tape is write-protected and automatic terminal recovery cannot continue",
+            )));
+            return;
+        }
+        let rewritable = matches!(
+            drive_config.worm,
+            remanence_library::WormMediaState::NotWorm
+        );
+        let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, &pool_cfg);
+        if let Err(error) =
+            index.project_terminal_finalization(TerminalFinalizationProjectionInput {
+                tape_uuid,
+                trigger: intent.trigger,
+                operation_id: None,
+                progress: intent.progress,
+                edition_digest: intent.edition_digest,
+                layout_digest: intent.layout.layout_digest,
+                outcome: TerminalFinalizationOutcome::InProgress,
+                updated_at_utc: None,
+            })
+        {
+            let _ = reply.send(Err(status_from_state_error(error)));
+            return;
+        }
+        let result = match &selected.parity_config {
+            remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+                index,
+                cfg,
+                drive,
+                &mut checkpoint_lease,
+                durable_checkpoint_records
+                    .last()
+                    .expect("pending terminal intent requires checkpoint authority"),
+                Some(intent),
+                &spec,
+                &selected,
+                None,
+                rewritable,
+            ),
+            remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
+                index,
+                cfg,
+                drive,
+                &mut checkpoint_lease,
+                durable_checkpoint_records
+                    .last()
+                    .expect("pending terminal intent requires checkpoint authority"),
+                Some(intent),
+                &spec,
+                &selected,
+                None,
+                rewritable,
+            ),
+        };
+        match result {
+            Ok(result) if result.final_record.is_some() => {
+                if let Err(error) = append_tape_sealed_evidence(index, cfg, tape_uuid) {
+                    tracing::warn!(error = %error, "failed to append recovered tape sealing evidence");
+                }
+                let _ = reply.send(Err(Status::failed_precondition(format!(
+                    "tape {} completed terminal finalization during open recovery and cannot accept Objects",
+                    Uuid::from_bytes(tape_uuid)
+                ))));
+            }
+            Ok(_) => {
+                let _ = reply.send(Err(Status::unavailable(format!(
+                    "tape {} still requires terminal recovery and cannot accept Objects",
+                    Uuid::from_bytes(tape_uuid)
+                ))));
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+        return;
     }
     tracing::info!(
         target: "remanence_write_diag",
@@ -3815,63 +4277,21 @@ fn handle_drive_open_write(
                     Ok(Some(result)) => Ok(result),
                     Ok(None) => {
                         if let Some(parity_session) = parity_session.as_mut() {
-                            let sink_state = parity_session.sink_state.take().ok_or_else(|| {
-                                PoolWriteError::InvalidInput(
-                                    "parity sink session state is unavailable".to_string(),
-                                )
-                            });
-                            match sink_state {
-                                Ok(mut sink_state) => {
-                                    let reserve_result = if pending_batch.is_none()
-                                        && sink_state.reserved_checkpoint_batch_object_rows() == 0
-                                    {
-                                        sink_state.reserve_checkpoint_batch_object_rows(
-                                            cfg.checkpoint_max_objects,
-                                        )
-                                    } else if pending_batch.is_none()
-                                        && sink_state.reserved_checkpoint_batch_object_rows()
-                                            != cfg.checkpoint_max_objects
-                                    {
-                                        Err(ParityError::Invariant(
-                                            "checkpoint batch row reservation does not match daemon configuration",
-                                        ))
-                                    } else {
-                                        Ok(())
-                                    };
-                                    if let Err(err) = reserve_result {
-                                        parity_session.sink_state = Some(sink_state);
-                                        Err(PoolWriteError::from(err))
-                                    } else {
-                                        let mut raw = DriveHandleRawSink::new(drive);
-                                        let mut tracked = ActivityTrackingRawTapeSink::new(
-                                            &mut raw,
-                                            &mut parity_raw_write_attempted,
-                                        );
-                                        crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
-                                            index,
-                                            &mut tracked,
-                                            &mut parity_session.journal,
-                                            sink_state,
-                                            &pool_cfg,
-                                            request,
-                                            selected.clone(),
-                                        )
-                                        .map(|(state, result)| {
-                                            parity_session.sink_state = Some(state);
-                                            result
-                                        })
-                                    }
-                                }
-                                Err(err) => Err(err),
-                            }
+                            let mut raw = DriveHandleRawSink::new(drive);
+                            crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
+                                index,
+                                &mut raw,
+                                &mut parity_session.journal,
+                                &mut parity_session.sink_state,
+                                &pool_cfg,
+                                request,
+                                selected.clone(),
+                                &cfg.io_memory,
+                                &mut parity_raw_write_attempted,
+                            )
                         } else {
                             let mut sink = DriveHandleSink(drive);
                             if let Some(append) = next_batched_append.clone() {
-                                let append = if pending_batch.is_none() {
-                                    append.with_batch_headroom_objects(cfg.checkpoint_max_objects)
-                                } else {
-                                    append
-                                };
                                 next_batched_append = Some(append.clone());
                                 crate::pool_write::write_batched_to_selected_tape_after_replay_check(
                                     index,
@@ -3954,7 +4374,6 @@ fn handle_drive_open_write(
                                     index,
                                     drive,
                                     &mut checkpoint_lease,
-                                    &durable_checkpoint_records,
                                     tape_uuid,
                                     &mut checkpoint_ordinal,
                                     &mut tape_committed_object_count,
@@ -4074,191 +4493,119 @@ fn handle_drive_open_write(
                         }));
                     }
                     Err(err) => {
-                        let directory_ceiling = matches!(
-                            &err,
-                            PoolWriteError::Parity(ParityError::BootstrapPayloadTooLarge { .. })
-                        ) && pending_batch.is_none();
-                        if directory_ceiling {
+                        let terminal_trigger = match &err {
+                            PoolWriteError::TerminalCloseRequired { .. } => Some(
+                                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits,
+                            ),
+                            _ => None,
+                        };
+                        if let Some(terminal_trigger) =
+                            terminal_trigger.filter(|_| pending_batch.is_none())
+                        {
                             let original_error = err.to_string();
+                            let terminal_reason = match terminal_trigger {
+                                remanence_state::TerminalFinalizationTrigger::NoPendingObjectFits => {
+                                    "whole-Object terminal-capacity rollover"
+                                }
+                                _ => "automatic terminal finalization",
+                            };
                             if durable_checkpoint_records.is_empty() {
                                 let status = Status::resource_exhausted(format!(
-                                    "object metadata cannot fit in a fresh tape checkpoint; no Object was written and the tape may accept a smaller object: {original_error}"
+                                    "{terminal_reason} rejected the Object on a fresh tape; no Object was written and the tape may accept a smaller object: {original_error}"
                                 ));
                                 let _ = reply.send(Err(status));
                                 continue;
                             }
-                            if let Err(intent_err) = checkpoint_lease.begin_terminal_transition() {
-                                append_gate.record_failure();
-                                let _ = reply.send(Err(status_from_state_error(intent_err)));
-                                continue;
-                            }
-                            let mut terminal_media_write_attempted = false;
-                            let terminal_result = (|| -> Result<_, PoolWriteError> {
-                                let (terminal_bundle, terminal_sync, scheme) = if let Some(
-                                    parity_session,
-                                ) =
-                                    parity_session.as_mut()
-                                {
-                                    let state =
-                                        parity_session.sink_state.take().ok_or_else(|| {
-                                            PoolWriteError::InvalidInput(
-                                                "parity state unavailable at directory ceiling"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                    let mut raw = DriveHandleRawSink::new(drive);
-                                    let mut tracked = ActivityTrackingRawTapeSink::new(
-                                        &mut raw,
-                                        &mut terminal_media_write_attempted,
-                                    );
-                                    let mut sink = ParitySink::from_session_state(
-                                        &mut tracked,
-                                        &mut parity_session.journal,
-                                        state,
-                                    )?;
-                                    let closed = sink.close_open_epoch(CloseReason::Finish)?;
-                                    parity_session.sink_state = Some(sink.into_session_state()?);
-                                    (
-                                        closed.committed_bundle,
-                                        closed.barrier_outcome,
-                                        Some(parity_session.scheme.clone()),
-                                    )
-                                } else {
-                                    let last_checkpoint = durable_checkpoint_records
-                                        .last()
-                                        .ok_or_else(|| {
-                                            PoolWriteError::InvalidInput(
-                                                "directory ceiling has no committed checkpoint boundary"
-                                                    .to_string(),
-                                            )
-                                        })?;
-                                    let located = drive.locate(last_checkpoint.eod_lba)?;
-                                    if located.partition != last_checkpoint.eod_partition
-                                        || located.lba != last_checkpoint.eod_lba
-                                    {
-                                        return Err(PoolWriteError::TapeIo(
-                                            TapeIoError::OperationFailed(format!(
-                                                "directory-ceiling locate reported partition {} lba {}, expected partition {} lba {}",
-                                                located.partition,
-                                                located.lba,
-                                                last_checkpoint.eod_partition,
-                                                last_checkpoint.eod_lba,
-                                            )),
-                                        ));
-                                    }
-                                    let terminal =
-                                        crate::pool_write::build_no_parity_terminal_bootstrap(
-                                            selected.tape_uuid,
-                                            &durable_checkpoint_records,
-                                            now_rfc3339()?,
-                                        )?;
-                                    terminal_media_write_attempted = true;
-                                    drive.write_block(&terminal.block)?;
-                                    drive.write_filemarks_immediate(1)?;
-                                    let terminal_sync = drive.write_filemarks(0)?;
-                                    let total_committed_ordinals = last_checkpoint
-                                        .objects
-                                        .last()
-                                        .map_or(0, |object| object.total_committed_ordinals);
-                                    let terminal_bundle =
-                                        crate::pool_write::build_no_parity_terminal_bundle(
-                                            &terminal,
-                                            terminal_sync.position_after.lba,
-                                            total_committed_ordinals,
-                                        )?;
-                                    (terminal_bundle, terminal_sync, None)
-                                };
-                                let captured = drive.position()?;
-                                if captured.partition != terminal_sync.position_after.partition
-                                    || captured.lba != terminal_sync.position_after.lba
-                                {
-                                    return Err(PoolWriteError::TapeIo(
-                                        TapeIoError::OperationFailed(format!(
-                                            "directory-ceiling terminal position proof mismatch: barrier reported partition {} lba {}, READ POSITION observed partition {} lba {}",
-                                            terminal_sync.position_after.partition,
-                                            terminal_sync.position_after.lba,
-                                            captured.partition,
-                                            captured.lba,
-                                        )),
-                                    ));
-                                }
-                                crate::pool_write::build_terminal_checkpoint_record(
-                                    &durable_checkpoint_records,
-                                    selected.tape_uuid,
-                                    *Uuid::new_v4().as_bytes(),
-                                    selected.block_size,
-                                    scheme,
-                                    terminal_bundle,
-                                    captured.partition,
-                                    captured.lba,
-                                )
-                            })();
-                            let terminal_record = match terminal_result {
-                                Ok(record) => record,
-                                Err(terminal_err) => {
-                                    let terminal_error = terminal_err.to_string();
-                                    let status = if terminal_media_write_attempted {
-                                        let fenced = fence_failed_parity_raw_write(
-                                            index,
-                                            cfg,
-                                            &selected,
-                                            "terminal_directory_ceiling",
-                                            None,
-                                            None,
-                                            terminal_error.as_str(),
-                                            status_from_pool_write_error(terminal_err),
-                                        );
-                                        fenced.0
-                                    } else {
-                                        status_from_pool_write_error(terminal_err)
-                                    };
+                            let drive_config = match drive.read_config() {
+                                Ok(config) => config,
+                                Err(error) => {
                                     append_gate.record_failure();
-                                    let _ = reply.send(Err(status));
+                                    let _ = reply.send(Err(Status::unavailable(format!(
+                                        "read {terminal_reason} drive config: {error}"
+                                    ))));
                                     continue;
                                 }
                             };
-                            if let Err(journal_err) = checkpoint_lease
-                                .append_terminal_transition(std::slice::from_ref(&terminal_record))
-                            {
-                                let status = Status::internal(format!(
-                                    "terminal media is durable but terminal seal journal fsync failed; tape requires reconciliation before reuse: {journal_err}"
-                                ));
-                                let status_message = status.message().to_string();
-                                let fenced = fence_failed_parity_raw_write(
-                                    index,
-                                    cfg,
-                                    &selected,
-                                    "terminal_authority_gap",
-                                    None,
-                                    None,
-                                    status_message.as_str(),
-                                    status,
-                                );
+                            if drive_config.write_protected {
                                 append_gate.record_failure();
-                                let _ = reply.send(Err(fenced.0));
-                                continue;
-                            }
-                            checkpoint_ordinal = terminal_record.ordinal;
-                            if let Err(projection_err) =
-                                index.project_checkpoint_record(&terminal_record)
-                            {
-                                append_gate.record_failure();
-                                let _ = reply.send(Err(Status::internal(format!(
-                                    "terminal seal is durable in the journal but SQLite projection failed; close the session and retry after journal replay: {projection_err}"
+                                let _ = reply.send(Err(Status::failed_precondition(format!(
+                                    "tape is write-protected and cannot complete {terminal_reason} finalization"
                                 ))));
                                 continue;
                             }
-                            durable_checkpoint_records.push(terminal_record);
-                            if let Err(evidence_err) =
-                                append_tape_sealed_evidence(index, cfg, selected.tape_uuid)
-                            {
-                                tracing::warn!(error = %evidence_err, "failed to append directory-ceiling seal evidence");
+                            let rewritable = matches!(
+                                drive_config.worm,
+                                remanence_library::WormMediaState::NotWorm
+                            );
+                            let spec = TerminalFinalizeSpec::automatic(
+                                &selected,
+                                &pool_cfg,
+                                terminal_trigger,
+                            );
+                            let terminal_result = match &selected.parity_config {
+                                remanence_parity::ParityConfig::None => {
+                                    finalize_terminal_no_parity(
+                                        index,
+                                        cfg,
+                                        drive,
+                                        &mut checkpoint_lease,
+                                        durable_checkpoint_records.last().expect(
+                                            "automatic finalization requires checkpoint authority",
+                                        ),
+                                        None,
+                                        &spec,
+                                        &selected,
+                                        None,
+                                        rewritable,
+                                    )
+                                }
+                                remanence_parity::ParityConfig::Scheme(_) => {
+                                    finalize_terminal_with_parity(
+                                        index,
+                                        cfg,
+                                        drive,
+                                        &mut checkpoint_lease,
+                                        durable_checkpoint_records.last().expect(
+                                            "automatic finalization requires checkpoint authority",
+                                        ),
+                                        None,
+                                        &spec,
+                                        &selected,
+                                        None,
+                                        rewritable,
+                                    )
+                                }
+                            };
+                            match terminal_result {
+                                Ok(result) => {
+                                    append_gate.record_sealed();
+                                    if let Some(record) = result.final_record {
+                                        checkpoint_ordinal = record.ordinal;
+                                        durable_checkpoint_records.clear();
+                                        durable_checkpoint_records.push(record);
+                                        if let Err(error) = append_tape_sealed_evidence(
+                                            index,
+                                            cfg,
+                                            selected.tape_uuid,
+                                        ) {
+                                            tracing::warn!(%error, %terminal_reason, "failed to append automatic terminal seal evidence");
+                                        }
+                                        let _ = reply.send(Err(Status::resource_exhausted(
+                                            format!(
+                                                "{terminal_reason} was reached before Object tape motion; selected tape was terminally finalized, reopen against the pool to roll placement: {original_error}"
+                                            ),
+                                        )));
+                                    } else {
+                                        let _ = reply.send(Err(Status::unavailable(format!(
+                                            "{terminal_reason} permanently closed Object admission, but the terminal tail requires recovery: {original_error}"
+                                        ))));
+                                    }
+                                }
+                                Err(error) => {
+                                    append_gate.record_sealed();
+                                    let _ = reply.send(Err(error));
+                                }
                             }
-                            append_gate.record_sealed();
-                            let status = Status::resource_exhausted(format!(
-                                "checkpoint directory ceiling reached before object tape motion; selected tape was finalized and sealed, reopen against the pool to roll placement: {original_error}"
-                            ));
-                            let _ = reply.send(Err(status));
                             continue;
                         }
                         let tape_started = if parity_session.is_some() {
@@ -4402,7 +4749,6 @@ fn handle_drive_open_write(
                     index,
                     drive,
                     &mut checkpoint_lease,
-                    &durable_checkpoint_records,
                     tape_uuid,
                     &mut checkpoint_ordinal,
                     &mut tape_committed_object_count,
@@ -4585,7 +4931,6 @@ fn handle_drive_open_write(
                         index,
                         drive,
                         &mut checkpoint_lease,
-                        &durable_checkpoint_records,
                         tape_uuid,
                         &mut checkpoint_ordinal,
                         &mut tape_committed_object_count,
@@ -4762,6 +5107,20 @@ fn handle_drive_open_write(
                 )));
             }
             DriveCommand::OpenRead { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "write session already active",
+                )));
+            }
+            DriveCommand::TapeInventory { reply, .. } => {
+                let message = "write session already active";
+                let _ = reply.send(Err(Status::failed_precondition(message)));
+            }
+            DriveCommand::VerifyTapeIndex { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "write session already active",
+                )));
+            }
+            DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "write session already active",
                 )));
@@ -5019,6 +5378,1550 @@ fn prepare_drive_for_write(
     Ok(())
 }
 
+fn handle_drive_finalize_tape(
+    bay: u16,
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    snapshot_misses: &mut u32,
+    mounted: ManualFinalizeTapeMountRequest,
+) -> Result<ManualFinalizeTapeActorReply, Status> {
+    let ManualFinalizeTapeMountRequest {
+        request,
+        needs_drive_load,
+        library_serial,
+        barcode,
+        source_slot,
+        drive_uuid,
+        drive_serial,
+    } = mounted;
+    validate_manual_finalize_owned_request(index, &request)?;
+    session_open_reject_tape_io_fences(
+        index,
+        &request.tape_uuid,
+        barcode.as_deref(),
+        "finalize tape",
+    )?;
+
+    let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
+        cfg.checkpoint_journal_dir.as_path(),
+        request.tape_uuid,
+    )
+    .map_err(crate::status_from_state_error)?;
+    let pending_intent = checkpoint_journal
+        .terminal_finalization_intent()
+        .map_err(crate::status_from_state_error)?;
+    let (mut checkpoint_lease, existing_intent) = if pending_intent.is_some() {
+        let lease = checkpoint_journal
+            .acquire_exclusive_for_terminal_recovery()
+            .map_err(crate::status_from_state_error)?;
+        let intent = lease
+            .terminal_finalization_intent()
+            .map_err(crate::status_from_state_error)?;
+        (lease, intent)
+    } else {
+        let lease = checkpoint_journal
+            .acquire_exclusive()
+            .map_err(crate::status_from_state_error)?;
+        (lease, None)
+    };
+    let records = project_checkpoint_authority_bounded(index, &checkpoint_lease)
+        .map_err(crate::status_from_state_error)?;
+    if records
+        .last()
+        .is_some_and(|record| record.sealed_after_write)
+    {
+        let projection = index
+            .terminal_finalization(&request.tape_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "sealed checkpoint authority has no terminal-finalization projection",
+                )
+            })?;
+        if projection.operation_id != Some(request.candidate_operation_id) {
+            return Err(Status::already_exists(
+                "tape was finalized by a different operation",
+            ));
+        }
+        return Ok(ManualFinalizeTapeActorReply {
+            operation_id: request.candidate_operation_id,
+            projection,
+        });
+    }
+    if records.is_empty() {
+        return Err(Status::failed_precondition(
+            "manual finalization requires at least one durable checkpoint",
+        ));
+    }
+    let accepted_intent = existing_intent.as_ref().ok_or_else(|| {
+        Status::failed_precondition(
+            "FinalizeTape drive dispatch is missing its durable BeforeReplicaA intent",
+        )
+    })?;
+    validate_manual_finalize_intent(&request, accepted_intent)?;
+    require_manual_finalize_preflight_binding(index, &request)?;
+    session_open_short_probe_or_load(
+        index,
+        drive,
+        SessionOpenReadinessContext {
+            action: "finalize tape",
+            bay,
+            library_serial: library_serial.as_str(),
+            barcode: barcode.as_deref(),
+            source_slot,
+            drive_serial: drive_serial.as_deref(),
+            needs_drive_load,
+        },
+    )?;
+    prepare_drive_for_write(
+        drive,
+        &request.tape_uuid,
+        request.block_size,
+        request.candidate_operation_id,
+    )?;
+    if needs_drive_load {
+        run_load_calibration_harvest(index, drive, cfg, &request.tape_uuid, barcode.as_deref());
+    }
+    let drive_config = drive
+        .read_config()
+        .map_err(|error| Status::unavailable(format!("read finalization drive config: {error}")))?;
+    if drive_config.write_protected {
+        return Err(Status::failed_precondition(
+            "tape is write-protected and cannot be finalized",
+        ));
+    }
+    let rewritable = matches!(
+        drive_config.worm,
+        remanence_library::WormMediaState::NotWorm
+    );
+    let selected = SelectedTape {
+        pool_id: request
+            .expected_pool_id
+            .clone()
+            .unwrap_or_else(|| "(unpooled)".to_string()),
+        tape_uuid: request.tape_uuid,
+        block_size: request.block_size,
+        parity_config: request.parity_config.clone(),
+    };
+    let spec = TerminalFinalizeSpec::operator(&request);
+
+    let result = match request.parity_config {
+        remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
+            index,
+            cfg,
+            drive,
+            &mut checkpoint_lease,
+            records
+                .last()
+                .expect("manual finalization requires checkpoint authority"),
+            existing_intent,
+            &spec,
+            &selected,
+            Some(&request),
+            rewritable,
+        ),
+        remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
+            index,
+            cfg,
+            drive,
+            &mut checkpoint_lease,
+            records
+                .last()
+                .expect("manual finalization requires checkpoint authority"),
+            existing_intent,
+            &spec,
+            &selected,
+            Some(&request),
+            rewritable,
+        ),
+    };
+
+    record_session_close_snapshot(
+        index,
+        cfg,
+        drive,
+        drive_uuid,
+        request.candidate_operation_id,
+        request.tape_uuid,
+        snapshot_misses,
+    );
+    result.map(|result| ManualFinalizeTapeActorReply {
+        operation_id: request.candidate_operation_id,
+        projection: result.projection,
+    })
+}
+
+fn validate_manual_finalize_intent(
+    request: &ManualFinalizeTapeActorRequest,
+    intent: &remanence_state::TerminalFinalizationIntent,
+) -> Result<(), Status> {
+    let manual = intent.manual.as_ref().ok_or_else(|| {
+        Status::failed_precondition("pending terminal finalization is not an operator close-out")
+    })?;
+    if intent.tape_uuid != request.tape_uuid
+        || intent.trigger != remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+        || manual.operation_id != *request.candidate_operation_id.as_bytes()
+        || manual.operation_kind != FINALIZE_TAPE_OPERATION_KIND
+        || manual.actor_fingerprint != request.actor_fingerprint
+        || manual.idempotency_key != *request.idempotency_key.as_bytes()
+        || manual.request_fingerprint != request.request_fingerprint
+        || manual.assigned_pool_id != request.expected_pool_id
+        || manual.expected_pool_id != request.expected_pool_id
+        || manual.assignment_generation != request.assignment_generation
+        || manual.reason != request.reason
+    {
+        return Err(Status::already_exists(
+            "pending terminal finalization belongs to a different exact request",
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_terminal_intent_capacity(
+    index: &CatalogIndex,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    intent: &remanence_state::TerminalFinalizationIntent,
+    counts: remanence_parity::TapeIndexReplicaCounts,
+) -> Result<(), Status> {
+    crate::pool_write::authorize_terminal_close_only_plan(
+        index,
+        spec.pool_config.as_ref(),
+        selected,
+        intent.layout.components[0].start_lba,
+        counts,
+        intent.layout.expected_eod_lba,
+    )
+    .map_err(status_from_pool_write_error)?;
+    Ok(())
+}
+
+fn plan_terminal_prefix_without_motion(
+    index: &CatalogIndex,
+    selected: &SelectedTape,
+    checkpoint: &remanence_state::FileCheckpointJournalLease,
+    checkpoint_journal_dir: &Path,
+    previous: &remanence_state::CheckpointJournalRecord,
+    request: &ManualFinalizeTapeActorRequest,
+    spec: &TerminalFinalizeSpec,
+) -> Result<
+    (
+        remanence_state::TerminalFinalizationIntent,
+        TerminalTripleWritePlan,
+    ),
+    Status,
+> {
+    let scheme = match &request.parity_config {
+        remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
+        remanence_parity::ParityConfig::None => {
+            return Err(Status::internal(
+                "parity terminal-prefix preflight called for parity-off tape",
+            ));
+        }
+    };
+    let journal_dir = checkpoint_journal_dir.parent().ok_or_else(|| {
+        Status::internal("checkpoint journal directory has no parent for the parity journal")
+    })?;
+    let journal_path = journal_dir.join(format!(
+        "{}.remjournal",
+        crate::bytes_to_hex(&request.tape_uuid)
+    ));
+    let journal = FileTapeFileJournal::open(
+        journal_path,
+        request.tape_uuid,
+        request.block_size,
+        scheme.clone(),
+    )
+    .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
+
+    // Prove the checkpoint/parity bijection and reject every orphan before a
+    // drive or changer handle is even selected. The close seed retains only
+    // one length-bounded bundle plus epoch-directory metadata.
+    let base_authority = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
+        checkpoint, &journal,
+    )
+    .map_err(crate::status_from_state_error)?;
+    if base_authority
+        .summary()
+        .scope
+        .covered_prefix_tape_file_count
+        == 0
+    {
+        return Err(Status::failed_precondition(
+            "checkpointed parity tape has no replayable committed prefix",
+        ));
+    }
+    let snapshot = journal
+        .committed_snapshot_bounded()
+        .map_err(|error| Status::failed_precondition(format!("replay parity journal: {error}")))?;
+    let prefix = remanence_parity::plan_checkpointed_terminal_index_close(&snapshot)
+        .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+    let expected_start_file = previous.next_tape_file_number;
+    if prefix.start_tape_file_number != expected_start_file || prefix.start_lba != previous.eod_lba
+    {
+        return Err(Status::failed_precondition(format!(
+            "bounded terminal close seed starts at tape file {}/LBA {}, expected {expected_start_file}/{}",
+            prefix.start_tape_file_number, prefix.start_lba, previous.eod_lba
+        )));
+    }
+    let persisted = remanence_state::TerminalFinalizationPrefixPlan::from(&prefix);
+    let source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+        checkpoint,
+        &journal,
+        &persisted,
+    )
+    .map_err(crate::status_from_state_error)?;
+    let mut source = source;
+    build_new_terminal_plan(
+        index,
+        selected,
+        spec,
+        previous,
+        &mut source,
+        TerminalPlanPosition {
+            first_tape_file_number: prefix.tail_start_tape_file_number,
+            first_start_lba: prefix.tail_start_lba,
+            terminal_prefix: Some(&prefix),
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct TerminalPlanPosition<'a> {
+    first_tape_file_number: u64,
+    first_start_lba: u64,
+    terminal_prefix: Option<&'a TerminalPrefixPlan>,
+}
+
+fn build_new_terminal_plan(
+    index: &CatalogIndex,
+    selected: &SelectedTape,
+    spec: &TerminalFinalizeSpec,
+    previous: &remanence_state::CheckpointJournalRecord,
+    source: &mut remanence_state::CheckpointTerminalIndexRecordSource<'_>,
+    position: TerminalPlanPosition<'_>,
+) -> Result<
+    (
+        remanence_state::TerminalFinalizationIntent,
+        TerminalTripleWritePlan,
+    ),
+    Status,
+> {
+    let TerminalPlanPosition {
+        first_tape_file_number,
+        first_start_lba,
+        terminal_prefix,
+    } = position;
+    let summary = source.summary();
+    let replica =
+        remanence_parity::checked_tape_index_replica_layout(spec.block_size, summary.counts)
+            .map_err(|error| {
+                Status::failed_precondition(format!("plan terminal replica: {error}"))
+            })?;
+    let separation_records = remanence_parity::index_separation_records(
+        spec.block_size,
+        remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+    )
+    .map_err(|error| Status::failed_precondition(format!("plan terminal separation: {error}")))?;
+    let layout = remanence_parity::TerminalTailLayout::new(
+        0,
+        spec.block_size,
+        first_tape_file_number,
+        first_start_lba,
+        replica.replica_record_count,
+        separation_records,
+    )
+    .map_err(|error| Status::failed_precondition(format!("plan terminal layout: {error}")))?;
+    crate::pool_write::authorize_terminal_close_only_plan(
+        index,
+        spec.pool_config.as_ref(),
+        selected,
+        first_start_lba,
+        summary.counts,
+        layout.expected_eod_lba,
+    )
+    .map_err(status_from_pool_write_error)?;
+    let edition_sequence = previous
+        .ordinal
+        .checked_add(1)
+        .ok_or_else(|| Status::failed_precondition("terminal edition sequence overflows u64"))?;
+    let edition_id = Uuid::new_v4();
+    let writer_version = format!("remanence-api/{}", env!("CARGO_PKG_VERSION"));
+    let write_timestamp = now_rfc3339()
+        .map_err(|error| Status::internal(format!("format terminal timestamp: {error}")))?;
+    let edition = remanence_parity::plan_tape_index_edition(
+        remanence_parity::TapeIndexEditionDescriptor {
+            tape_uuid: spec.tape_uuid,
+            edition_id: *edition_id.as_bytes(),
+            edition_sequence,
+            scope: summary.scope,
+            counts: summary.counts,
+            block_size: spec.block_size,
+            compression_enabled: false,
+            writer_version: writer_version.clone(),
+            write_timestamp: write_timestamp.clone(),
+            terminal_layout: layout,
+        },
+        source,
+    )
+    .map_err(|error| Status::failed_precondition(format!("plan terminal edition: {error}")))?;
+    let intent = remanence_state::TerminalFinalizationIntent {
+        tape_uuid: spec.tape_uuid,
+        trigger: spec.trigger,
+        manual: spec.manual.clone(),
+        progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+        edition_id: *edition_id.as_bytes(),
+        edition_sequence,
+        edition_digest: edition.edition_digest,
+        writer_version,
+        write_timestamp,
+        terminal_prefix: terminal_prefix.map(remanence_state::TerminalFinalizationPrefixPlan::from),
+        layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
+            .map_err(crate::status_from_state_error)?,
+    };
+    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+        Status::failed_precondition(format!("plan terminal triple writer: {error}"))
+    })?;
+    Ok((intent, plan))
+}
+
+fn publish_terminal_intent(
+    index: &mut CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    spec: &TerminalFinalizeSpec,
+    intent: &remanence_state::TerminalFinalizationIntent,
+) -> Result<(), Status> {
+    checkpoint
+        .begin_terminal_finalization(intent)
+        .map_err(crate::status_from_state_error)?;
+    index
+        .project_terminal_finalization(TerminalFinalizationProjectionInput {
+            tape_uuid: spec.tape_uuid,
+            trigger: spec.trigger,
+            operation_id: spec.operation_id,
+            progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+            edition_digest: intent.edition_digest,
+            layout_digest: intent.layout.layout_digest,
+            outcome: TerminalFinalizationOutcome::InProgress,
+            updated_at_utc: None,
+        })
+        .map_err(crate::status_from_state_error)?;
+    Ok(())
+}
+
+/// Complete manual close-out admission without possessing any changer or drive
+/// capability. Every request-dependent rejection therefore precedes robotics,
+/// LOAD, rewind, locate, mode-page configuration, and tape writes.
+pub(crate) fn preflight_manual_finalize_tape(
+    index: &mut CatalogIndex,
+    cfg: ManualFinalizePreflightConfig<'_>,
+    barcode: Option<&str>,
+    request: &mut ManualFinalizeTapeActorRequest,
+) -> Result<Option<ManualFinalizeTapeActorReply>, Status> {
+    let checkpoint_journal =
+        remanence_state::FileCheckpointJournal::open(cfg.checkpoint_journal_dir, request.tape_uuid)
+            .map_err(crate::status_from_state_error)?;
+    let pending_intent = checkpoint_journal
+        .terminal_finalization_intent()
+        .map_err(crate::status_from_state_error)?;
+    let (mut checkpoint, existing_intent) = if pending_intent.is_some() {
+        let lease = checkpoint_journal
+            .acquire_exclusive_for_terminal_recovery()
+            .map_err(crate::status_from_state_error)?;
+        let intent = lease
+            .terminal_finalization_intent()
+            .map_err(crate::status_from_state_error)?;
+        (lease, intent)
+    } else {
+        let lease = checkpoint_journal
+            .acquire_exclusive()
+            .map_err(crate::status_from_state_error)?;
+        (lease, None)
+    };
+
+    // The checkpoint intent is the crash-recovery authority. If the process
+    // stopped after that fsync but before the audit projection, recover the
+    // original operation id directly from the exact actor/kind/key binding.
+    if let Some(intent) = existing_intent.as_ref() {
+        if let Some(manual) = intent.manual.as_ref() {
+            if manual.operation_kind == FINALIZE_TAPE_OPERATION_KIND
+                && manual.actor_fingerprint == request.actor_fingerprint
+                && manual.idempotency_key == *request.idempotency_key.as_bytes()
+            {
+                if manual.request_fingerprint != request.request_fingerprint {
+                    return Err(Status::already_exists(
+                        "FinalizeTape idempotency key is already bound to a different request",
+                    ));
+                }
+                request.candidate_operation_id = Uuid::from_bytes(manual.operation_id);
+            }
+        }
+    }
+    if let Some(scope) = index
+        .idempotency_scope_record(
+            request.actor_fingerprint.as_str(),
+            FINALIZE_TAPE_OPERATION_KIND,
+            request.idempotency_key,
+        )
+        .map_err(crate::status_from_state_error)?
+    {
+        if scope.request_fingerprint.as_slice() != request.request_fingerprint {
+            return Err(Status::already_exists(
+                "FinalizeTape idempotency key is already bound to a different request",
+            ));
+        }
+        request.candidate_operation_id = scope.operation_id;
+    }
+
+    let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(request.tape_uuid)
+        .map_err(|error| {
+            Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+        })?;
+    if let Some(fault) = tix_fault.as_ref() {
+        fault
+            .clear_assignment_before_reread(
+                index,
+                request.tape_uuid,
+                request.assignment_generation,
+                request.expected_pool_id.as_deref(),
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX assignment-race hook: {error}"))
+            })?;
+    }
+    validate_manual_finalize_owned_request(index, request)?;
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
+    let previous = checkpoint
+        .last_record_bounded()
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "manual finalization requires at least one durable checkpoint",
+            )
+        })?;
+    if previous.sealed_after_write {
+        let projection = index
+            .terminal_finalization(&request.tape_uuid)
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| {
+                Status::failed_precondition(
+                    "sealed checkpoint authority has no terminal-finalization projection",
+                )
+            })?;
+        if projection.operation_id != Some(request.candidate_operation_id) {
+            return Err(Status::already_exists(
+                "tape was finalized by a different operation",
+            ));
+        }
+        return Ok(Some(ManualFinalizeTapeActorReply {
+            operation_id: request.candidate_operation_id,
+            projection,
+        }));
+    }
+
+    let spec = TerminalFinalizeSpec::operator(request);
+    let selected = SelectedTape {
+        pool_id: request
+            .expected_pool_id
+            .clone()
+            .unwrap_or_else(|| "(unpooled)".to_string()),
+        tape_uuid: request.tape_uuid,
+        block_size: request.block_size,
+        parity_config: request.parity_config.clone(),
+    };
+    let intent = match existing_intent {
+        Some(intent) => {
+            validate_manual_finalize_intent(request, &intent)?;
+            match &request.parity_config {
+                remanence_parity::ParityConfig::None => {
+                    if intent.terminal_prefix.is_some() {
+                        return Err(Status::failed_precondition(
+                            "parity-off finalization intent unexpectedly has a parity prefix",
+                        ));
+                    }
+                    let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
+                        .map_err(crate::status_from_state_error)?;
+                    source
+                        .reconstruct_final_edition(&intent)
+                        .map_err(crate::status_from_state_error)?;
+                    authorize_terminal_intent_capacity(
+                        index,
+                        &spec,
+                        &selected,
+                        &intent,
+                        source.summary().counts,
+                    )?;
+                }
+                remanence_parity::ParityConfig::Scheme(scheme) => {
+                    let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
+                        Status::failed_precondition("parity finalization intent has no prefix plan")
+                    })?;
+                    let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
+                        Status::internal(
+                            "checkpoint journal directory has no parent for the parity journal",
+                        )
+                    })?;
+                    let path = journal_dir.join(format!(
+                        "{}.remjournal",
+                        crate::bytes_to_hex(&request.tape_uuid)
+                    ));
+                    let journal = FileTapeFileJournal::open(
+                        path,
+                        request.tape_uuid,
+                        request.block_size,
+                        scheme.clone(),
+                    )
+                    .map_err(|error| {
+                        Status::failed_precondition(format!("open parity journal: {error}"))
+                    })?;
+                    let mut source = if journal
+                        .terminal_prefix_transition_is_durable(
+                            &TerminalPrefixPlan::try_from(persisted)
+                                .map_err(crate::status_from_state_error)?
+                                .committed_bundle,
+                            &remanence_parity::CommittedBundle {
+                                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+                                entries: Vec::new(),
+                                highest_protected_ordinal: persisted
+                                    .committed_bundle
+                                    .highest_protected_ordinal,
+                                total_committed_ordinals: persisted
+                                    .committed_bundle
+                                    .total_committed_ordinals,
+                            },
+                        )
+                        .map_err(|error| {
+                            Status::failed_precondition(format!(
+                                "inspect terminal-prefix journal transition: {error}"
+                            ))
+                        })?
+                    {
+                        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+                            &checkpoint,
+                            &journal,
+                            persisted,
+                        )
+                    } else {
+                        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                            &checkpoint,
+                            &journal,
+                            persisted,
+                        )
+                    }
+                    .map_err(crate::status_from_state_error)?;
+                    source
+                        .reconstruct_final_edition(&intent)
+                        .map_err(crate::status_from_state_error)?;
+                    authorize_terminal_intent_capacity(
+                        index,
+                        &spec,
+                        &selected,
+                        &intent,
+                        source.summary().counts,
+                    )?;
+                }
+            }
+            intent
+        }
+        None => {
+            let planned = match request.parity_config {
+                remanence_parity::ParityConfig::None => {
+                    let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
+                        .map_err(crate::status_from_state_error)?;
+                    let first_file = source.summary().scope.covered_prefix_tape_file_count;
+                    build_new_terminal_plan(
+                        index,
+                        &selected,
+                        &spec,
+                        &previous,
+                        &mut source,
+                        TerminalPlanPosition {
+                            first_tape_file_number: first_file,
+                            first_start_lba: previous.eod_lba,
+                            terminal_prefix: None,
+                        },
+                    )?
+                }
+                remanence_parity::ParityConfig::Scheme(_) => plan_terminal_prefix_without_motion(
+                    index,
+                    &selected,
+                    &checkpoint,
+                    cfg.checkpoint_journal_dir,
+                    &previous,
+                    request,
+                    &spec,
+                )?,
+            };
+            // Planning may stream a large authority. Re-read the conditional
+            // pool generation at the acceptance edge while the exact-tape
+            // owner is still held.
+            validate_manual_finalize_owned_request(index, request)?;
+            // Establish the global actor/kind/key binding before publishing a
+            // tape-local intent. A crash here is recoverable by idempotency
+            // replay, and a cross-tape same-key race cannot orphan a second
+            // tape's terminal intent.
+            record_manual_finalize_request_with(
+                index,
+                cfg.audit_dir,
+                cfg.audit_fsync,
+                cfg.audit_append_lock,
+                request,
+            )?;
+            publish_terminal_intent(index, &mut checkpoint, &spec, &planned.0)?;
+            planned.0
+        }
+    };
+
+    // Existing checkpoint intents from a crash or upgrade may predate their
+    // audit projection. Repair that projection before physical dispatch.
+    validate_manual_finalize_owned_request(index, request)?;
+    record_manual_finalize_request_with(
+        index,
+        cfg.audit_dir,
+        cfg.audit_fsync,
+        cfg.audit_append_lock,
+        request,
+    )?;
+    if index
+        .terminal_finalization(&request.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .is_none()
+    {
+        index
+            .project_terminal_finalization(TerminalFinalizationProjectionInput {
+                tape_uuid: request.tape_uuid,
+                trigger: intent.trigger,
+                operation_id: Some(request.candidate_operation_id),
+                progress: intent.progress,
+                edition_digest: intent.edition_digest,
+                layout_digest: intent.layout.layout_digest,
+                outcome: TerminalFinalizationOutcome::InProgress,
+                updated_at_utc: None,
+            })
+            .map_err(crate::status_from_state_error)?;
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_terminal_no_parity(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    previous: &remanence_state::CheckpointJournalRecord,
+    existing_intent: Option<remanence_state::TerminalFinalizationIntent>,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    rewritable: bool,
+) -> Result<TerminalFinalizeResult, Status> {
+    let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
+        .map_err(|error| {
+            Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+        })?;
+    drive
+        .locate(previous.eod_lba)
+        .map_err(|error| Status::unavailable(format!("locate checkpoint EOD: {error}")))?;
+    let mut source =
+        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(
+            checkpoint,
+        )
+        .map_err(crate::status_from_state_error)?;
+    let (intent, plan) = match existing_intent {
+        Some(intent) => {
+            if intent.terminal_prefix.is_some() {
+                return Err(Status::failed_precondition(
+                    "parity-off finalization intent unexpectedly has a parity prefix",
+                ));
+            }
+            let edition = source
+                .reconstruct_final_edition(&intent)
+                .map_err(crate::status_from_state_error)?;
+            authorize_terminal_intent_capacity(
+                index,
+                spec,
+                selected,
+                &intent,
+                source.summary().counts,
+            )?;
+            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
+            })?;
+            (intent, plan)
+        }
+        None => {
+            let first_file = source.summary().scope.covered_prefix_tape_file_count;
+            let planned = build_new_terminal_plan(
+                index,
+                selected,
+                spec,
+                previous,
+                &mut source,
+                TerminalPlanPosition {
+                    first_tape_file_number: first_file,
+                    first_start_lba: previous.eod_lba,
+                    terminal_prefix: None,
+                },
+            )?;
+            publish_terminal_intent(index, checkpoint, spec, &planned.0)?;
+            planned
+        }
+    };
+    if let Some(request) = manual_request {
+        record_manual_finalize_request(index, cfg, request)?;
+    }
+    finish_terminal_tail(
+        index,
+        cfg,
+        drive,
+        checkpoint,
+        previous,
+        spec,
+        selected,
+        manual_request,
+        intent,
+        plan,
+        source,
+        None,
+        rewritable,
+        tix_fault.as_ref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_terminal_with_parity(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    previous: &remanence_state::CheckpointJournalRecord,
+    existing_intent: Option<remanence_state::TerminalFinalizationIntent>,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    rewritable: bool,
+) -> Result<TerminalFinalizeResult, Status> {
+    let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
+        .map_err(|error| {
+            Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+        })?;
+    let scheme = match &selected.parity_config {
+        remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
+        remanence_parity::ParityConfig::None => {
+            return Err(Status::internal(
+                "parity finalization called for parity-off tape",
+            ));
+        }
+    };
+    let journal_path = parity_journal_path(cfg, spec.tape_uuid)?;
+    let journal = FileTapeFileJournal::open(
+        journal_path,
+        spec.tape_uuid,
+        spec.block_size,
+        scheme.clone(),
+    )
+    .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
+    let (prefix, intent, plan, source, prefix_snapshot, mut journal) = match existing_intent {
+        Some(intent) => {
+            let persisted = intent.terminal_prefix.as_ref().ok_or_else(|| {
+                Status::failed_precondition("parity finalization intent has no prefix plan")
+            })?;
+            let prefix =
+                TerminalPrefixPlan::try_from(persisted).map_err(crate::status_from_state_error)?;
+            let prefix_checkpoint = remanence_parity::CommittedBundle {
+                kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
+                total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
+            };
+            let prefix_is_durable = journal
+                .terminal_prefix_transition_is_durable(&prefix.committed_bundle, &prefix_checkpoint)
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "inspect terminal-prefix journal transition: {error}"
+                    ))
+                })?;
+            let mut source = if prefix_is_durable {
+                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_after_terminal_prefix(
+                    checkpoint,
+                    &journal,
+                    persisted,
+                )
+            } else {
+                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                    checkpoint,
+                    &journal,
+                    persisted,
+                )
+            }
+            .map_err(crate::status_from_state_error)?;
+            let edition = source
+                .reconstruct_final_edition(&intent)
+                .map_err(crate::status_from_state_error)?;
+            authorize_terminal_intent_capacity(
+                index,
+                spec,
+                selected,
+                &intent,
+                source.summary().counts,
+            )?;
+            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
+                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
+            })?;
+            let (prefix_snapshot, journal) = if prefix_is_durable {
+                (None, journal)
+            } else {
+                let snapshot = journal
+                    .planned_terminal_prefix_base_snapshot_bounded(&prefix.committed_bundle)
+                    .map_err(|error| {
+                        Status::failed_precondition(format!("freeze terminal-prefix base: {error}"))
+                    })?;
+                let reconstructed =
+                    remanence_parity::plan_checkpointed_terminal_index_close(&snapshot)
+                        .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+                if reconstructed != prefix {
+                    return Err(Status::failed_precondition(
+                        "bounded terminal close seed conflicts with persisted prefix plan",
+                    ));
+                }
+                (Some(snapshot), journal)
+            };
+            (prefix, intent, plan, source, prefix_snapshot, journal)
+        }
+        None => {
+            // Validate the checkpoint/parity bijection before the resume
+            // session performs even positioning motion.
+            let base_authority =
+                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
+                    checkpoint, &journal,
+                )
+                .map_err(crate::status_from_state_error)?;
+            if base_authority
+                .summary()
+                .scope
+                .covered_prefix_tape_file_count
+                == 0
+            {
+                return Err(Status::failed_precondition(
+                    "checkpointed parity tape has no replayable committed prefix",
+                ));
+            }
+            let snapshot = journal.committed_snapshot_bounded().map_err(|error| {
+                Status::failed_precondition(format!("freeze parity journal: {error}"))
+            })?;
+            let prefix = remanence_parity::plan_checkpointed_terminal_index_close(&snapshot)
+                .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+            let expected_start_file = previous.next_tape_file_number;
+            if prefix.start_tape_file_number != expected_start_file
+                || prefix.start_lba != previous.eod_lba
+            {
+                return Err(Status::failed_precondition(format!(
+                    "bounded terminal close seed starts at tape file {}/LBA {}, expected {expected_start_file}/{}",
+                    prefix.start_tape_file_number, prefix.start_lba, previous.eod_lba
+                )));
+            }
+            let persisted = remanence_state::TerminalFinalizationPrefixPlan::from(&prefix);
+            let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_with_planned_terminal_prefix(
+                checkpoint,
+                &journal,
+                &persisted,
+            )
+            .map_err(crate::status_from_state_error)?;
+            let planned = build_new_terminal_plan(
+                index,
+                selected,
+                spec,
+                previous,
+                &mut source,
+                TerminalPlanPosition {
+                    first_tape_file_number: prefix.tail_start_tape_file_number,
+                    first_start_lba: prefix.tail_start_lba,
+                    terminal_prefix: Some(&prefix),
+                },
+            )?;
+            publish_terminal_intent(index, checkpoint, spec, &planned.0)?;
+            (
+                prefix,
+                planned.0,
+                planned.1,
+                source,
+                Some(snapshot),
+                journal,
+            )
+        }
+    };
+    if let Some(request) = manual_request {
+        record_manual_finalize_request(index, cfg, request)?;
+    }
+
+    let prefix_evidence = {
+        let mut raw = DriveHandleRawSource::new(drive);
+        reconcile_terminal_prefix(
+            &mut raw,
+            &prefix,
+            &spec.tape_uuid,
+            spec.block_size,
+            rewritable,
+        )
+    };
+    let prefix_checkpoint = remanence_parity::CommittedBundle {
+        kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+        entries: Vec::new(),
+        highest_protected_ordinal: prefix.committed_bundle.highest_protected_ordinal,
+        total_committed_ordinals: prefix.committed_bundle.total_committed_ordinals,
+    };
+    let prefix_already_journaled = journal
+        .terminal_prefix_transition_is_durable(&prefix.committed_bundle, &prefix_checkpoint)
+        .map_err(|error| {
+            Status::failed_precondition(format!(
+                "inspect terminal-prefix journal transition: {error}"
+            ))
+        })?;
+    if prefix_already_journaled {
+        if prefix_evidence != TerminalPrefixReconcileEvidence::Complete {
+            return Err(Status::failed_precondition(format!(
+                "parity journal records a complete terminal prefix, but media reconciliation found {prefix_evidence:?}"
+            )));
+        }
+    } else {
+        let snapshot = prefix_snapshot.as_ref().ok_or_else(|| {
+            Status::internal("bounded parity prefix authority snapshot is missing")
+        })?;
+        let mut raw = DriveHandleRawSink::new(drive);
+        let prefix_result = remanence_parity::close_checkpointed_terminal_index_prefix(
+            &mut raw,
+            &mut journal,
+            snapshot,
+            &prefix,
+            prefix_evidence,
+        )
+        .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+        if let Some(fault) = tix_fault.as_ref() {
+            fault
+                .abort_if_matches(
+                    "parity_closeout",
+                    crate::terminal_fault::TerminalFaultCut::AfterTerminalPrefix,
+                    Some(PhysicalPositionHint::new(prefix_result.used_tape_blocks)),
+                    None,
+                )
+                .map_err(|error| {
+                    Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+                })?;
+        }
+    }
+
+    finish_terminal_tail(
+        index,
+        cfg,
+        drive,
+        checkpoint,
+        previous,
+        spec,
+        selected,
+        manual_request,
+        intent,
+        plan,
+        source,
+        Some(&mut journal),
+        rewritable,
+        tix_fault.as_ref(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_terminal_tail(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    previous: &remanence_state::CheckpointJournalRecord,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    intent: remanence_state::TerminalFinalizationIntent,
+    plan: TerminalTripleWritePlan,
+    mut source: remanence_state::CheckpointTerminalIndexRecordSource<'_>,
+    parity_journal: Option<&mut FileTapeFileJournal>,
+    rewritable: bool,
+    tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
+) -> Result<TerminalFinalizeResult, Status> {
+    let mut authority = TerminalTailCatalogAuthority {
+        checkpoint,
+        parity_journal,
+        index,
+        spec,
+        intent,
+        tix_fault,
+        reconciliation: None,
+    };
+    loop {
+        let progress = parity_progress_from_state(authority.intent.progress);
+        let Some(component_index) = progress.next_component_index() else {
+            break;
+        };
+        let component = plan.edition.descriptor.terminal_layout.components[component_index];
+        let evidence = {
+            let mut raw = DriveHandleRawSource::new(drive);
+            reconcile_terminal_tail_next(&mut raw, &plan, progress, rewritable)
+        };
+        authority.set_reconciliation(progress, component, evidence);
+        let step_result = {
+            let mut raw = DriveHandleRawSink::new(drive);
+            let mut faulting = crate::terminal_fault::TerminalFaultSink::new(
+                &mut raw,
+                authority.tix_fault,
+                component,
+            );
+            remanence_parity::write_terminal_tail_step(
+                &mut faulting,
+                &mut source,
+                &mut authority,
+                &plan,
+            )
+        };
+        let step = match step_result {
+            Ok(step) => step,
+            Err(error) => {
+                let state_progress = authority.intent.progress;
+                let detail = error.to_string();
+                let status = status_from_terminal_tail_error(&error);
+                authority
+                    .index
+                    .project_terminal_finalization(authority.projection_input(
+                        state_progress,
+                        TerminalFinalizationOutcome::RecoveryRequired,
+                    ))
+                    .map_err(crate::status_from_state_error)?;
+                record_terminal_finalize_event(
+                    authority.index,
+                    cfg,
+                    manual_request,
+                    AuditEvent::CompletionUnknown,
+                    state_progress,
+                    Some(("recovery_detail", detail.clone())),
+                )?;
+                let (status, _) = fence_failed_parity_raw_write(
+                    authority.index,
+                    cfg,
+                    selected,
+                    "terminal_tail",
+                    None,
+                    None,
+                    detail.as_str(),
+                    status,
+                );
+                return Err(status);
+            }
+        };
+        match step {
+            TerminalTailStepOutcome::Advanced(_) => {}
+            TerminalTailStepOutcome::AlreadyComplete => break,
+            TerminalTailStepOutcome::RecoveryRequired {
+                progress,
+                component,
+                evidence,
+            } => {
+                let state_progress = state_progress_from_parity(progress);
+                let outcome = terminal_reconciliation_outcome(state_progress, evidence);
+                authority
+                    .index
+                    .project_terminal_finalization(
+                        authority.projection_input(state_progress, outcome),
+                    )
+                    .map_err(crate::status_from_state_error)?;
+                record_terminal_finalize_event(
+                    authority.index,
+                    cfg,
+                    manual_request,
+                    AuditEvent::CompletionUnknown,
+                    state_progress,
+                    Some((
+                        "recovery_detail",
+                        format!(
+                            "component {:?}/{} at file {} requires recovery: {evidence:?}",
+                            component.kind, component.ordinal, component.planned_tape_file_number
+                        ),
+                    )),
+                )?;
+                let projection = authority
+                    .index
+                    .terminal_finalization(&spec.tape_uuid)
+                    .map_err(crate::status_from_state_error)?
+                    .ok_or_else(|| Status::internal("recovery projection disappeared"))?;
+                return Ok(TerminalFinalizeResult {
+                    projection,
+                    final_record: None,
+                });
+            }
+        }
+    }
+
+    authority.intent = authority
+        .checkpoint
+        .terminal_finalization_intent()
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::internal("completed terminal tail lost its durable intent"))?;
+    if authority.intent.progress != remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        return Err(Status::internal(
+            "terminal writer returned complete before replica C became durable",
+        ));
+    }
+    let replica_c = plan.edition.descriptor.terminal_layout.components[4];
+    let final_bundle = remanence_parity::terminal_component_bundle(&plan, replica_c)
+        .map_err(|error| Status::internal(format!("build final C authority: {error}")))?;
+    let final_record = remanence_state::CheckpointJournalRecord {
+        ordinal: previous
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("terminal checkpoint ordinal overflows u64"))?,
+        committed_object_count: previous.committed_object_count,
+        eod_partition: plan.edition.descriptor.terminal_layout.partition,
+        eod_lba: plan.edition.descriptor.terminal_layout.expected_eod_lba,
+        tape_uuid: spec.tape_uuid,
+        batch_id: authority.intent.edition_id,
+        next_tape_file_number: replica_c
+            .planned_tape_file_number
+            .checked_add(1)
+            .ok_or_else(|| Status::internal("terminal next tape-file number overflows u64"))?,
+        block_size: spec.block_size,
+        objects: Vec::new(),
+        scheme: previous.scheme.clone(),
+        object_tape_file_bundles: Vec::new(),
+        barrier_bundle: Some(final_bundle),
+        terminal_finalization: Some(authority.intent.clone()),
+        sealed_after_write: true,
+    };
+    if let Some(fault) = authority.tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::BeforeFinalCheckpointFsync,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    authority
+        .checkpoint
+        .append_terminal_finalization(std::slice::from_ref(&final_record))
+        .map_err(crate::status_from_state_error)?;
+    if let Some(fault) = authority.tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::AfterFinalCheckpointFsync,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    if let Some(fault) = authority.tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::BeforeFinalSqliteProjection,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    authority
+        .index
+        .project_checkpoint_record(&final_record)
+        .map_err(crate::status_from_state_error)?;
+    if let Some(fault) = authority.tix_fault {
+        fault
+            .abort_if_matches(
+                "final_projection",
+                crate::terminal_fault::TerminalFaultCut::AfterFinalSqliteProjection,
+                Some(PhysicalPositionHint {
+                    partition: final_record.eod_partition,
+                    lba: final_record.eod_lba,
+                }),
+                None,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+    record_terminal_finalize_event(
+        authority.index,
+        cfg,
+        manual_request,
+        AuditEvent::OperationFinished,
+        remanence_state::TerminalFinalizationProgress::AfterReplicaC,
+        None,
+    )?;
+    let projection = authority
+        .index
+        .terminal_finalization(&spec.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::internal("terminal projection disappeared after completion"))?;
+    Ok(TerminalFinalizeResult {
+        projection,
+        final_record: Some(final_record),
+    })
+}
+
+fn status_from_terminal_tail_error(error: &TerminalTailWriteError) -> Status {
+    let message = format!("terminal tape write failed: {error}");
+    match error {
+        TerminalTailWriteError::Media(parity) => status_from_parity_error(parity, message),
+        TerminalTailWriteError::Layout(_)
+        | TerminalTailWriteError::Replica(_)
+        | TerminalTailWriteError::Separation(_)
+        | TerminalTailWriteError::PlanMismatch(_) => Status::failed_precondition(message),
+        TerminalTailWriteError::Authority(_)
+        | TerminalTailWriteError::PositionMismatch { .. }
+        | TerminalTailWriteError::ShortWrite { .. }
+        | TerminalTailWriteError::EndOfMedium => Status::unavailable(message),
+    }
+}
+
+fn validate_manual_finalize_owned_request(
+    index: &CatalogIndex,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    let assignment = index
+        .get_tape_assignment_snapshot(&request.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape disappeared while finalization owner was held"))?;
+    if assignment.assignment_generation != request.assignment_generation
+        || assignment.pool_id != request.expected_pool_id
+    {
+        return Err(Status::failed_precondition(format!(
+            "tape assignment changed before terminal finalization: expected generation {} pool {:?}, found generation {} pool {:?}",
+            request.assignment_generation,
+            request.expected_pool_id,
+            assignment.assignment_generation,
+            assignment.pool_id
+        )));
+    }
+    match (&request.expected_pool_id, &request.pool_config) {
+        (Some(expected), Some(pool_config)) if pool_config.id == *expected => {}
+        (None, None) => {}
+        _ => {
+            return Err(Status::failed_precondition(
+                "manual terminal finalization pool policy does not match the guarded assignment",
+            ));
+        }
+    }
+
+    if let Some(scope) = index
+        .idempotency_scope_record(
+            request.actor_fingerprint.as_str(),
+            FINALIZE_TAPE_OPERATION_KIND,
+            request.idempotency_key,
+        )
+        .map_err(crate::status_from_state_error)?
+    {
+        if scope.request_fingerprint.as_slice() != request.request_fingerprint {
+            return Err(Status::already_exists(
+                "FinalizeTape idempotency key is already bound to a different request",
+            ));
+        }
+        if scope.operation_id != request.candidate_operation_id {
+            return Err(Status::failed_precondition(format!(
+                "FinalizeTape owner received operation {}, but durable idempotency authority names {}",
+                request.candidate_operation_id, scope.operation_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_manual_finalize_preflight_binding(
+    index: &CatalogIndex,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    let scope = index
+        .idempotency_scope_record(
+            request.actor_fingerprint.as_str(),
+            FINALIZE_TAPE_OPERATION_KIND,
+            request.idempotency_key,
+        )
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| {
+            Status::failed_precondition(
+                "FinalizeTape drive dispatch is missing its durable preflight binding",
+            )
+        })?;
+    if scope.operation_id != request.candidate_operation_id
+        || scope.request_fingerprint.as_slice() != request.request_fingerprint
+    {
+        return Err(Status::already_exists(
+            "FinalizeTape drive dispatch does not match its durable preflight binding",
+        ));
+    }
+    Ok(())
+}
+
+fn record_manual_finalize_request(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    record_manual_finalize_request_with(
+        index,
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        request,
+    )
+}
+
+fn record_manual_finalize_request_with(
+    index: &mut CatalogIndex,
+    audit_dir: &Path,
+    audit_fsync: bool,
+    audit_append_lock: &Arc<std::sync::Mutex<()>>,
+    request: &ManualFinalizeTapeActorRequest,
+) -> Result<(), Status> {
+    if index
+        .idempotency_scope_record(
+            request.actor_fingerprint.as_str(),
+            FINALIZE_TAPE_OPERATION_KIND,
+            request.idempotency_key,
+        )
+        .map_err(crate::status_from_state_error)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let mut detail = BTreeMap::from([
+        (
+            "tape_uuid".to_string(),
+            CborValue::Bytes(request.tape_uuid.to_vec()),
+        ),
+        (
+            "actor_fingerprint".to_string(),
+            CborValue::Text(request.actor_fingerprint.clone()),
+        ),
+        (
+            "request_fingerprint".to_string(),
+            CborValue::Bytes(request.request_fingerprint.to_vec()),
+        ),
+        (
+            "assignment_generation".to_string(),
+            CborValue::Integer(request.assignment_generation.into()),
+        ),
+        (
+            "reason".to_string(),
+            CborValue::Text(request.reason.clone()),
+        ),
+    ]);
+    if let Some(pool_id) = request.expected_pool_id.as_ref() {
+        detail.insert(
+            "expected_pool_id".to_string(),
+            CborValue::Text(pool_id.clone()),
+        );
+    }
+    crate::append_operation_audit(
+        index,
+        audit_dir,
+        audit_fsync,
+        audit_append_lock,
+        crate::OperationAuditInput {
+            actor: request.actor.clone(),
+            operation_id: request.candidate_operation_id,
+            operation_kind: FINALIZE_TAPE_OPERATION_KIND,
+            event: AuditEvent::RequestReceived,
+            subject_kind: "tape",
+            subject_id: Some(Uuid::from_bytes(request.tape_uuid).to_string()),
+            idempotency_key: Some(request.idempotency_key),
+            detail,
+        },
+    )
+}
+
+fn record_terminal_finalize_event(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    event: AuditEvent,
+    progress: remanence_state::TerminalFinalizationProgress,
+    detail_text: Option<(&str, String)>,
+) -> Result<(), Status> {
+    let Some(request) = manual_request else {
+        return Ok(());
+    };
+    record_manual_finalize_event(index, cfg, request, event, progress, detail_text)
+}
+
+fn record_manual_finalize_event(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    request: &ManualFinalizeTapeActorRequest,
+    event: AuditEvent,
+    progress: remanence_state::TerminalFinalizationProgress,
+    detail_text: Option<(&str, String)>,
+) -> Result<(), Status> {
+    let mut detail = BTreeMap::from([
+        (
+            "tape_uuid".to_string(),
+            CborValue::Bytes(request.tape_uuid.to_vec()),
+        ),
+        (
+            "actor_fingerprint".to_string(),
+            CborValue::Text(request.actor_fingerprint.clone()),
+        ),
+        (
+            "finalization_progress".to_string(),
+            CborValue::Text(manual_finalize_progress_name(progress).to_string()),
+        ),
+    ]);
+    if let Some((key, value)) = detail_text {
+        detail.insert(key.to_string(), CborValue::Text(value));
+    }
+    crate::append_operation_audit(
+        index,
+        cfg.audit_dir.as_path(),
+        cfg.audit_fsync,
+        &cfg.audit_append_lock,
+        crate::OperationAuditInput {
+            actor: AuditActor::System,
+            operation_id: request.candidate_operation_id,
+            operation_kind: FINALIZE_TAPE_OPERATION_KIND,
+            event,
+            subject_kind: "tape",
+            subject_id: Some(Uuid::from_bytes(request.tape_uuid).to_string()),
+            idempotency_key: Some(request.idempotency_key),
+            detail,
+        },
+    )
+}
+
+const fn manual_finalize_progress_name(
+    progress: remanence_state::TerminalFinalizationProgress,
+) -> &'static str {
+    use remanence_state::TerminalFinalizationProgress as Progress;
+    match progress {
+        Progress::BeforeReplicaA => "before_replica_a",
+        Progress::AfterReplicaA => "after_replica_a",
+        Progress::AfterSeparationAb => "after_separation_ab",
+        Progress::AfterReplicaB => "after_replica_b",
+        Progress::AfterSeparationBc => "after_separation_bc",
+        Progress::AfterReplicaC => "after_replica_c",
+    }
+}
+
 fn fixed_no_compression_config(current_cfg: TapeConfig, block_size: u32) -> TapeConfig {
     TapeConfig {
         block_size: BlockSize::Fixed {
@@ -5037,6 +6940,11 @@ fn prepare_drive_for_read(
     tape_uuid: &TapeUuid,
     session_id: Uuid,
 ) -> Result<(), Status> {
+    let block_size = catalog_tape_block_size(index, tape_uuid)?;
+    prepare_drive_for_fixed_read(drive, tape_uuid, block_size, session_id)
+}
+
+fn catalog_tape_block_size(index: &CatalogIndex, tape_uuid: &TapeUuid) -> Result<u32, Status> {
     let tape = index
         .get_tape(tape_uuid)
         .map_err(status_from_state_error)?
@@ -5044,8 +6952,15 @@ fn prepare_drive_for_read(
     let block_size = tape
         .block_size
         .ok_or_else(|| Status::failed_precondition("tape block_size is missing"))?;
-    let block_size = u32::try_from(block_size)
-        .map_err(|_| Status::internal("tape block size does not fit u32"))?;
+    u32::try_from(block_size).map_err(|_| Status::internal("tape block size does not fit u32"))
+}
+
+fn prepare_drive_for_fixed_read(
+    drive: &mut DriveHandle,
+    tape_uuid: &TapeUuid,
+    block_size: u32,
+    session_id: Uuid,
+) -> Result<(), Status> {
     let started = Instant::now();
     let current_cfg = drive
         .read_config()
@@ -5076,6 +6991,626 @@ fn prepare_drive_for_read(
         "remanence_read_diag",
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_drive_tape_inventory(
+    bay: u16,
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    tape_uuid: TapeUuid,
+    needs_drive_load: bool,
+    library_serial: &str,
+    barcode: Option<&str>,
+    source_slot: Option<u16>,
+    drive_serial: Option<&str>,
+    stream_tx: &mpsc::Sender<Result<pb::TapeInventoryStreamItem, Status>>,
+) -> Result<(), Status> {
+    session_open_short_probe_or_load(
+        index,
+        drive,
+        SessionOpenReadinessContext {
+            action: "read terminal tape inventory",
+            bay,
+            library_serial,
+            barcode,
+            source_slot,
+            drive_serial,
+            needs_drive_load,
+        },
+    )?;
+    session_open_reject_tape_io_fences(index, &tape_uuid, barcode, "read terminal tape inventory")?;
+    verify_loaded_tape_identity(drive, &tape_uuid)?;
+    let block_size = catalog_tape_block_size(index, &tape_uuid)?;
+    prepare_drive_for_fixed_read(drive, &tape_uuid, block_size, Uuid::new_v4())?;
+
+    let outcome = {
+        let mut source = DriveHandleRawSource::new(drive);
+        read_terminal_index_inventory_streamed(&mut source, &tape_uuid, block_size, |event| {
+            send_inventory_stream_item(stream_tx, terminal_inventory_event_to_proto(event))
+                .map_err(|error| error.message().to_string())
+        })
+        .map_err(status_from_terminal_inventory_read_error)?
+    };
+    if matches!(
+        outcome,
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)
+    ) {
+        let summary = {
+            let mut source = DriveHandleRawSource::new(drive);
+            recover_terminal_inventory_from_bot(&mut source, &tape_uuid, block_size, |object| {
+                send_inventory_stream_item(stream_tx, bot_recovered_object_to_proto(object))
+                    .map_err(|error| error.message().to_string())
+            })
+            .map_err(status_from_bot_structural_recovery_error)?
+        };
+        send_inventory_stream_item(
+            stream_tx,
+            pb::TapeInventoryStreamItem {
+                item: Some(pb::tape_inventory_stream_item::Item::Summary(
+                    bot_structural_recovery_to_proto(tape_uuid, summary),
+                )),
+            },
+        )?;
+        return Ok(());
+    }
+    send_inventory_stream_item(
+        stream_tx,
+        pb::TapeInventoryStreamItem {
+            item: Some(pb::tape_inventory_stream_item::Item::Summary(
+                terminal_inventory_to_proto(tape_uuid, outcome),
+            )),
+        },
+    )
+}
+
+fn status_from_terminal_inventory_read_error(
+    error: remanence_parity::TerminalInventoryReadError,
+) -> Status {
+    match error {
+        remanence_parity::TerminalInventoryReadError::BlockSize(_) => {
+            Status::failed_precondition(format!("read terminal tape inventory: {error}"))
+        }
+        remanence_parity::TerminalInventoryReadError::Source { .. } => {
+            Status::unavailable(format!("read terminal tape inventory: {error}"))
+        }
+        remanence_parity::TerminalInventoryReadError::SelectedReplica { .. }
+        | remanence_parity::TerminalInventoryReadError::TerminalIndexReplicaConflict { .. } => {
+            Status::data_loss(format!("read terminal tape inventory: {error}"))
+        }
+        remanence_parity::TerminalInventoryReadError::StreamVisitor { .. } => {
+            Status::cancelled("terminal inventory receiver closed")
+        }
+    }
+}
+
+fn send_inventory_stream_item(
+    stream_tx: &mpsc::Sender<Result<pb::TapeInventoryStreamItem, Status>>,
+    item: pb::TapeInventoryStreamItem,
+) -> Result<(), Status> {
+    stream_tx
+        .blocking_send(Ok(item))
+        .map_err(|_| Status::cancelled("terminal inventory receiver closed"))
+}
+
+fn terminal_inventory_event_to_proto(
+    event: TerminalInventoryStreamEvent,
+) -> pb::TapeInventoryStreamItem {
+    use pb::tape_inventory_stream_item::Item;
+    let item = match event {
+        TerminalInventoryStreamEvent::ReplicaAttemptStarted {
+            attempt_id,
+            replica_ordinal,
+        } => Item::ReplicaAttemptStarted(pb::TapeInventoryReplicaAttemptStarted {
+            attempt_id,
+            replica_ordinal: u32::from(replica_ordinal),
+        }),
+        TerminalInventoryStreamEvent::StructuralEntry {
+            attempt_id,
+            replica_ordinal,
+            entry,
+        } => Item::StructuralEntry(terminal_structural_entry_to_proto(
+            attempt_id,
+            replica_ordinal,
+            entry,
+        )),
+        TerminalInventoryStreamEvent::ObjectRow {
+            attempt_id,
+            replica_ordinal,
+            row,
+        } => Item::ObjectRow(terminal_object_row_to_proto(
+            attempt_id,
+            replica_ordinal,
+            row,
+        )),
+        TerminalInventoryStreamEvent::ReplicaAttemptRejected {
+            attempt_id,
+            replica_ordinal,
+            failure,
+        } => Item::ReplicaAttemptRejected(pb::TapeInventoryReplicaAttemptRejected {
+            attempt_id,
+            replica_ordinal: u32::from(replica_ordinal),
+            failure_kind: terminal_replica_failure_kind_name(failure.kind).to_string(),
+            detail: failure.detail,
+        }),
+    };
+    pb::TapeInventoryStreamItem { item: Some(item) }
+}
+
+fn terminal_structural_entry_to_proto(
+    attempt_id: u64,
+    replica_ordinal: u16,
+    entry: remanence_parity::TapeIndexReplicaMapEntry,
+) -> pb::TapeInventoryStructuralEntry {
+    let kind = match entry.kind {
+        remanence_parity::TapeIndexReplicaFileKind::Object => {
+            pb::TapeInventoryStructuralKind::Object
+        }
+        remanence_parity::TapeIndexReplicaFileKind::ParitySidecar => {
+            pb::TapeInventoryStructuralKind::ParitySidecar
+        }
+        remanence_parity::TapeIndexReplicaFileKind::Bootstrap => {
+            pb::TapeInventoryStructuralKind::Bootstrap
+        }
+        remanence_parity::TapeIndexReplicaFileKind::ParityMap => {
+            pb::TapeInventoryStructuralKind::ParityMap
+        }
+        remanence_parity::TapeIndexReplicaFileKind::TapeIndexReplica => {
+            pb::TapeInventoryStructuralKind::TapeIndexReplica
+        }
+        remanence_parity::TapeIndexReplicaFileKind::IndexSeparationExtent => {
+            pb::TapeInventoryStructuralKind::IndexSeparationExtent
+        }
+    };
+    pb::TapeInventoryStructuralEntry {
+        attempt_id,
+        replica_ordinal: u32::from(replica_ordinal),
+        tape_file_number: entry.tape_file_number,
+        kind: kind as i32,
+        block_count: entry.block_count,
+        first_parity_data_ordinal: entry.first_parity_data_ordinal,
+        protected_ordinal_start: entry.protected_ordinal_start,
+        protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive,
+        epoch_id: entry.epoch_id,
+    }
+}
+
+fn terminal_object_row_to_proto(
+    attempt_id: u64,
+    replica_ordinal: u16,
+    row: remanence_parity::TapeIndexReplicaObjectRow,
+) -> pb::TapeInventoryObjectRow {
+    use pb::tape_inventory_object_row::Representation;
+    let representation = match row.representation {
+        remanence_parity::ObjectRecoveryRepresentation::Plaintext {
+            manifest_first_chunk_lba,
+            manifest_size_bytes,
+            manifest_chunk_count,
+            manifest_sha256,
+        } => Representation::Plaintext(pb::TapeInventoryPlaintextRecovery {
+            manifest_first_chunk_lba,
+            manifest_size_bytes,
+            manifest_chunk_count,
+            manifest_sha256: manifest_sha256.to_vec(),
+        }),
+        remanence_parity::ObjectRecoveryRepresentation::Encrypted {
+            recipient_epoch_ids,
+            metadata_frame_len,
+            key_frame_len,
+        } => Representation::Encrypted(pb::TapeInventoryEncryptedRecovery {
+            recipient_epoch_ids: recipient_epoch_ids
+                .into_iter()
+                .map(|epoch_id| epoch_id.to_vec())
+                .collect(),
+            metadata_frame_len,
+            key_frame_len,
+        }),
+    };
+    pb::TapeInventoryObjectRow {
+        attempt_id,
+        replica_ordinal: u32::from(replica_ordinal),
+        tape_file_number: row.tape_file_number,
+        stored_block_count: row.stored_block_count,
+        object_id: row.object_id,
+        representation: Some(representation),
+    }
+}
+
+fn bot_recovered_object_to_proto(
+    object: &remanence_parity::BotRecoveredObject,
+) -> pb::TapeInventoryStreamItem {
+    let state = match object.state {
+        remanence_parity::BotRecoveredObjectState::Recovered => {
+            pb::TapeInventoryBotObjectState::Recovered
+        }
+        remanence_parity::BotRecoveredObjectState::Unknown => {
+            pb::TapeInventoryBotObjectState::Unknown
+        }
+        remanence_parity::BotRecoveredObjectState::Incomplete => {
+            pb::TapeInventoryBotObjectState::Incomplete
+        }
+    };
+    pb::TapeInventoryStreamItem {
+        item: Some(pb::tape_inventory_stream_item::Item::BotObject(
+            pb::TapeInventoryBotObject {
+                tape_file_number: object.tape_file_number,
+                stored_block_count: object.stored_block_count,
+                object_id: object.object_id.clone(),
+                state: state as i32,
+            },
+        )),
+    }
+}
+
+fn terminal_replica_failure_kind_name(kind: TerminalReplicaFailureKind) -> &'static str {
+    match kind {
+        TerminalReplicaFailureKind::Missing => "missing",
+        TerminalReplicaFailureKind::HeaderRead => "header_read",
+        TerminalReplicaFailureKind::HeaderInvalid => "header_invalid",
+        TerminalReplicaFailureKind::FooterRead => "footer_read",
+        TerminalReplicaFailureKind::FooterInvalid => "footer_invalid",
+        TerminalReplicaFailureKind::LocalBinding => "local_binding",
+        TerminalReplicaFailureKind::TrailingFilemark => "trailing_filemark",
+        TerminalReplicaFailureKind::PayloadInvalid => "payload_invalid",
+        TerminalReplicaFailureKind::CrossSurvivorConflict => "cross_survivor_conflict",
+    }
+}
+
+fn status_from_bot_structural_recovery_error(
+    error: remanence_parity::BotStructuralRecoveryError,
+) -> Status {
+    match &error {
+        remanence_parity::BotStructuralRecoveryError::Scan { .. } => {
+            Status::unavailable(format!("BOT structural tape recovery failed: {error}"))
+        }
+        remanence_parity::BotStructuralRecoveryError::Visitor { .. } => {
+            Status::cancelled("terminal inventory receiver closed")
+        }
+        remanence_parity::BotStructuralRecoveryError::TapeIdentityMismatch => {
+            Status::failed_precondition(format!(
+                "BOT structural tape recovery refused the physical identity: {error}"
+            ))
+        }
+        remanence_parity::BotStructuralRecoveryError::ConflictingObjectAuthority { .. }
+        | remanence_parity::BotStructuralRecoveryError::ArithmeticOverflow { .. } => {
+            Status::data_loss(format!("BOT structural tape recovery failed: {error}"))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_drive_verify_tape_index(
+    bay: u16,
+    index: &mut CatalogIndex,
+    drive: &mut DriveHandle,
+    tape_uuid: TapeUuid,
+    needs_drive_load: bool,
+    library_serial: &str,
+    barcode: Option<&str>,
+    source_slot: Option<u16>,
+    drive_serial: Option<&str>,
+) -> Result<pb::TapeIndexVerification, Status> {
+    session_open_short_probe_or_load(
+        index,
+        drive,
+        SessionOpenReadinessContext {
+            action: "fully verify terminal tape index",
+            bay,
+            library_serial,
+            barcode,
+            source_slot,
+            drive_serial,
+            needs_drive_load,
+        },
+    )?;
+    session_open_reject_tape_io_fences(
+        index,
+        &tape_uuid,
+        barcode,
+        "fully verify terminal tape index",
+    )?;
+    verify_loaded_tape_identity(drive, &tape_uuid)?;
+    let block_size = catalog_tape_block_size(index, &tape_uuid)?;
+    prepare_drive_for_fixed_read(drive, &tape_uuid, block_size, Uuid::new_v4())?;
+
+    let outcome = {
+        let mut source = DriveHandleRawSource::new(drive);
+        verify_terminal_index_full(&mut source, &tape_uuid, block_size)
+            .map_err(status_from_terminal_index_verification_error)?
+    };
+    Ok(terminal_verification_to_proto(tape_uuid, outcome))
+}
+
+fn terminal_verification_to_proto(
+    tape_uuid: TapeUuid,
+    outcome: remanence_parity::TerminalIndexVerificationOutcome,
+) -> pb::TapeIndexVerification {
+    use remanence_parity::TerminalIndexVerificationOutcome as Outcome;
+    match outcome {
+        Outcome::VerifiedComplete(verified) => {
+            terminal_verified_to_proto(tape_uuid, *verified, true)
+        }
+        Outcome::VerifiedDegraded(verified) => {
+            terminal_verified_to_proto(tape_uuid, *verified, false)
+        }
+        Outcome::RecoveryRequired(recovery) => pb::TapeIndexVerification {
+            tape_uuid: tape_uuid.to_vec(),
+            state: pb::TapeIndexVerificationState::RecoveryRequired as i32,
+            fast_inventory: None,
+            detail: recovery.detail,
+            replica_health: recovery
+                .replicas
+                .iter()
+                .enumerate()
+                .map(|(index, evidence)| terminal_replica_health(index, evidence))
+                .collect(),
+            separation_health: (1u32..=2)
+                .map(|separation_ordinal| pb::TapeIndexSeparationHealth {
+                    separation_ordinal,
+                    state: pb::tape_index_separation_health::State::TapeIndexSeparationStateUnknown
+                        as i32,
+                    verified_interior_record_count: 0,
+                    detail: "canonical prefix authority unavailable".to_string(),
+                })
+                .collect(),
+            measured_eod_lba: recovery.measured_eod.lba,
+            verified_prefix_tape_file_count: 0,
+            verified_prefix_record_count: 0,
+            measured_tape_file_count: recovery.bot_recovery.structural_entry_count,
+            edition_digest: Vec::new(),
+            layout_digest: Vec::new(),
+            payload_digest: Vec::new(),
+            canonical_map_digest: Vec::new(),
+            verification_basis: "bot_structural_recovery".to_string(),
+            recovery_inventory: Some(bot_structural_recovery_to_proto(
+                tape_uuid,
+                recovery.bot_recovery,
+            )),
+        },
+    }
+}
+
+fn terminal_verified_to_proto(
+    tape_uuid: TapeUuid,
+    verified: remanence_parity::TerminalIndexVerification,
+    complete: bool,
+) -> pb::TapeIndexVerification {
+    pb::TapeIndexVerification {
+        tape_uuid: tape_uuid.to_vec(),
+        state: if complete {
+            pb::TapeIndexVerificationState::VerifiedComplete as i32
+        } else {
+            pb::TapeIndexVerificationState::VerifiedDegraded as i32
+        },
+        fast_inventory: None,
+        detail: if complete {
+            "physical prefix, A/B/C, AB/BC, and terminal EOD validated".to_string()
+        } else {
+            "canonical physical prefix verified from a surviving replica; degraded terminal component evidence is attached".to_string()
+        },
+        replica_health: verified
+            .replicas
+            .iter()
+            .enumerate()
+            .map(|(index, evidence)| terminal_replica_health(index, evidence))
+            .collect(),
+        separation_health: terminal_separation_health(&verified.separations),
+        measured_eod_lba: verified.measured_eod.lba,
+        verified_prefix_tape_file_count: verified.verified_prefix_tape_file_count,
+        verified_prefix_record_count: verified.verified_prefix_record_count,
+        measured_tape_file_count: verified.measured_tape_file_count,
+        edition_digest: verified.edition.edition_digest.to_vec(),
+        layout_digest: verified.edition.layout_digest.to_vec(),
+        payload_digest: verified.selected_payload.payload_sha256.to_vec(),
+        canonical_map_digest: verified.selected_payload.canonical_map_sha256.to_vec(),
+        verification_basis: "measured_full_physical".to_string(),
+        recovery_inventory: None,
+    }
+}
+
+fn terminal_separation_health(
+    evidence: &[remanence_parity::TerminalSeparationEvidence; 2],
+) -> Vec<pb::TapeIndexSeparationHealth> {
+    evidence
+        .iter()
+        .enumerate()
+        .map(|(index, evidence)| {
+            let (state, verified_interior_record_count, detail) = match evidence {
+                remanence_parity::TerminalSeparationEvidence::Valid {
+                    interior_record_count,
+                } => (
+                    pb::tape_index_separation_health::State::TapeIndexSeparationStateValid,
+                    *interior_record_count,
+                    "header_footer_zero_fill_and_filemark_valid".to_string(),
+                ),
+                remanence_parity::TerminalSeparationEvidence::Invalid { detail } => (
+                    pb::tape_index_separation_health::State::TapeIndexSeparationStateInvalid,
+                    0,
+                    detail.clone(),
+                ),
+            };
+            pb::TapeIndexSeparationHealth {
+                separation_ordinal: u32::try_from(index + 1)
+                    .expect("two separation ordinals fit u32"),
+                state: state as i32,
+                verified_interior_record_count,
+                detail,
+            }
+        })
+        .collect()
+}
+
+fn status_from_terminal_index_verification_error(
+    error: remanence_parity::TerminalIndexVerificationError,
+) -> Status {
+    match error {
+        remanence_parity::TerminalIndexVerificationError::Source { .. }
+        | remanence_parity::TerminalIndexVerificationError::PrefixWalk { .. } => {
+            Status::unavailable(format!("full terminal index verification failed: {error}"))
+        }
+        _ => Status::data_loss(format!("full terminal index verification failed: {error}")),
+    }
+}
+
+fn bot_structural_recovery_to_proto(
+    tape_uuid: TapeUuid,
+    summary: remanence_parity::BotStructuralRecoverySummary,
+) -> pb::TapeInventory {
+    pb::TapeInventory {
+        tape_uuid: tape_uuid.to_vec(),
+        outcome: pb::TapeInventoryOutcome::BotStructuralRecovered as i32,
+        selected_replica_ordinal: 0,
+        replica_health: (1u32..=3)
+            .map(|replica_ordinal| pb::TapeIndexReplicaHealth {
+                replica_ordinal,
+                state: pb::tape_index_replica_health::State::TapeIndexReplicaStateInvalid as i32,
+                detail: "terminal replica unavailable; BOT structural recovery used".to_string(),
+            })
+            .collect(),
+        structural_entry_count: summary.structural_entry_count,
+        object_row_count: summary.complete_object_count,
+        edition_digest: Vec::new(),
+        layout_digest: Vec::new(),
+        payload_digest: Vec::new(),
+        canonical_map_digest: summary.canonical_map_digest.to_vec(),
+        inventory_basis: "bot_structural_recovery".to_string(),
+        detail: format!(
+            "terminal index unavailable; BOT recovery classified {} recovered, {} unknown, and {} incomplete Object candidates",
+            summary.recovered_object_count,
+            summary.unknown_object_count,
+            summary.incomplete_object_count
+        ),
+        recovered_object_count: summary.recovered_object_count,
+        unknown_object_count: summary.unknown_object_count,
+        incomplete_object_count: summary.incomplete_object_count,
+        damaged_region_count: summary.damaged_region_count,
+        selected_attempt_id: 0,
+    }
+}
+
+fn terminal_inventory_to_proto(
+    tape_uuid: TapeUuid,
+    outcome: TerminalInventoryOutcome,
+) -> pb::TapeInventory {
+    match outcome {
+        TerminalInventoryOutcome::Inventory(selection) => {
+            let outcome = if selection.is_degraded() {
+                pb::TapeInventoryOutcome::Degraded
+            } else {
+                pb::TapeInventoryOutcome::Complete
+            };
+            let replica_health = selection
+                .replicas
+                .iter()
+                .enumerate()
+                .map(|(index, evidence)| terminal_replica_health(index, evidence))
+                .collect();
+            pb::TapeInventory {
+                tape_uuid: tape_uuid.to_vec(),
+                outcome: outcome as i32,
+                selected_replica_ordinal: u32::from(selection.selected_replica_ordinal),
+                replica_health,
+                structural_entry_count: selection.payload.structural_entry_count,
+                object_row_count: selection.payload.object_row_count,
+                edition_digest: selection.edition.edition_digest.to_vec(),
+                layout_digest: selection.edition.layout_digest.to_vec(),
+                payload_digest: selection.payload.payload_sha256.to_vec(),
+                canonical_map_digest: selection.payload.canonical_map_sha256.to_vec(),
+                inventory_basis: "terminal_index_fast".to_string(),
+                detail: if selection.is_degraded() {
+                    format!(
+                        "terminal inventory selected replica {}; degraded replica evidence is present",
+                        selection.selected_replica_ordinal
+                    )
+                } else {
+                    "terminal inventory selected replica C; all replica envelopes agree".to_string()
+                },
+                recovered_object_count: 0,
+                unknown_object_count: 0,
+                incomplete_object_count: 0,
+                damaged_region_count: 0,
+                selected_attempt_id: selection.selected_attempt_id,
+            }
+        }
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
+            let detail = match recovery.reason {
+                BotStructuralRecoveryReason::NoUsableTerminalLayout => {
+                    "no usable terminal layout; structural recovery from BOT is required"
+                }
+                BotStructuralRecoveryReason::AllMembersInvalid => {
+                    "terminal replicas A, B, and C are invalid; structural recovery from BOT is required"
+                }
+            };
+            pb::TapeInventory {
+                tape_uuid: tape_uuid.to_vec(),
+                outcome: pb::TapeInventoryOutcome::BotStructuralRecoveryRequired as i32,
+                selected_replica_ordinal: 0,
+                replica_health: recovery
+                    .replicas
+                    .iter()
+                    .enumerate()
+                    .map(|(index, evidence)| terminal_replica_health(index, evidence))
+                    .collect(),
+                structural_entry_count: 0,
+                object_row_count: 0,
+                edition_digest: Vec::new(),
+                layout_digest: Vec::new(),
+                payload_digest: Vec::new(),
+                canonical_map_digest: Vec::new(),
+                inventory_basis: "terminal_index_fast".to_string(),
+                detail: detail.to_string(),
+                recovered_object_count: 0,
+                unknown_object_count: 0,
+                incomplete_object_count: 0,
+                damaged_region_count: 0,
+                selected_attempt_id: 0,
+            }
+        }
+    }
+}
+
+fn terminal_replica_health(
+    index: usize,
+    evidence: &TerminalReplicaEvidence,
+) -> pb::TapeIndexReplicaHealth {
+    let replica_ordinal = u32::try_from(index + 1).expect("three replica indexes fit u32");
+    let (state, detail) = match evidence {
+        TerminalReplicaEvidence::Valid { .. } => (
+            pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete,
+            "payload_valid".to_string(),
+        ),
+        TerminalReplicaEvidence::ConsistentEnvelope => (
+            pb::tape_index_replica_health::State::TapeIndexReplicaStateEnvelopeValid,
+            "envelope_valid_payload_not_read".to_string(),
+        ),
+        TerminalReplicaEvidence::Invalid(failure) => (
+            pb::tape_index_replica_health::State::TapeIndexReplicaStateInvalid,
+            format!(
+                "{}: {}",
+                terminal_replica_failure_name(failure.kind),
+                failure.detail
+            ),
+        ),
+    };
+    pb::TapeIndexReplicaHealth {
+        replica_ordinal,
+        state: state as i32,
+        detail,
+    }
+}
+
+const fn terminal_replica_failure_name(kind: TerminalReplicaFailureKind) -> &'static str {
+    match kind {
+        TerminalReplicaFailureKind::Missing => "missing",
+        TerminalReplicaFailureKind::HeaderRead => "header_read",
+        TerminalReplicaFailureKind::HeaderInvalid => "header_invalid",
+        TerminalReplicaFailureKind::FooterRead => "footer_read",
+        TerminalReplicaFailureKind::FooterInvalid => "footer_invalid",
+        TerminalReplicaFailureKind::LocalBinding => "local_binding",
+        TerminalReplicaFailureKind::TrailingFilemark => "trailing_filemark",
+        TerminalReplicaFailureKind::PayloadInvalid => "payload_invalid",
+        TerminalReplicaFailureKind::CrossSurvivorConflict => "cross_survivor_conflict",
+    }
 }
 
 fn handle_drive_open_read(
@@ -5377,6 +7912,20 @@ fn handle_drive_open_read(
                 )));
             }
             DriveCommand::OpenRead { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::TapeInventory { reply, .. } => {
+                let message = "read session already active";
+                let _ = reply.send(Err(Status::failed_precondition(message)));
+            }
+            DriveCommand::VerifyTapeIndex { reply, .. } => {
+                let _ = reply.send(Err(Status::failed_precondition(
+                    "read session already active",
+                )));
+            }
+            DriveCommand::FinalizeTape { reply, .. } => {
                 let _ = reply.send(Err(Status::failed_precondition(
                     "read session already active",
                 )));
@@ -7425,9 +9974,9 @@ fn file_range_read_request(
 /// `None` so the range reader uses its logical REWIND/SPACE fallback.
 fn derive_physical_file_start_lba(
     tape_files: &[remanence_state::TapeFileRecord],
-    target_file_number: u32,
+    target_file_number: u64,
 ) -> Option<u64> {
-    let mut expected_file_number = 0u32;
+    let mut expected_file_number = 0u64;
     let mut next_file_lba = 0u64;
     for tape_file in tape_files {
         if tape_file.tape_file_number != expected_file_number {
@@ -7805,8 +10354,10 @@ fn position_read_resume_from_source(
         )));
     }
 
+    let tape_file_spacing = i64::try_from(request.tape_file_number)
+        .map_err(|_| Status::invalid_argument("tape file number exceeds SPACE range"))?;
     let mut positioned = source
-        .space(i64::from(request.tape_file_number), SpaceKind::Filemarks)
+        .space(tape_file_spacing, SpaceKind::Filemarks)
         .map_err(|err| Status::internal(format!("space to resume object: {err}")))?
         .position_after;
     let skip_blocks = i64::try_from(first_chunk_lba.0)
@@ -7920,13 +10471,14 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         PoolWriteError::SelectedTapeInsufficientCapacity { .. } => {
             Status::failed_precondition(message)
         }
-        PoolWriteError::CheckpointDirectoryCeiling { .. } => Status::resource_exhausted(message),
+        PoolWriteError::TerminalCloseRequired { .. } => Status::resource_exhausted(message),
         PoolWriteError::ContentHashMismatch { .. } => Status::failed_precondition(message),
         PoolWriteError::CallerObjectIdConflict { .. } => Status::already_exists(message),
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
-        PoolWriteError::Io { .. }
+        PoolWriteError::PhysicalUsedBytesOverflow { .. }
+        | PoolWriteError::Io { .. }
         | PoolWriteError::TapeIo(_)
         | PoolWriteError::TransferWithSecondary { .. }
         | PoolWriteError::TimeFormat(_) => Status::internal(message),
@@ -8025,6 +10577,183 @@ mod tests {
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    #[test]
+    fn terminal_inventory_status_distinguishes_media_conflict_transport_and_geometry() {
+        let conflict = status_from_terminal_inventory_read_error(
+            remanence_parity::TerminalInventoryReadError::TerminalIndexReplicaConflict { count: 2 },
+        );
+        assert_eq!(conflict.code(), tonic::Code::DataLoss);
+        assert!(conflict.message().contains("conflicting replica editions"));
+
+        let selected_replica = status_from_terminal_inventory_read_error(
+            remanence_parity::TerminalInventoryReadError::SelectedReplica {
+                ordinal: 3,
+                source: remanence_parity::TapeIndexReplicaError::DigestMismatch {
+                    field: "payload",
+                },
+            },
+        );
+        assert_eq!(selected_replica.code(), tonic::Code::DataLoss);
+
+        let source = status_from_terminal_inventory_read_error(
+            remanence_parity::TerminalInventoryReadError::Source {
+                operation: "READ",
+                message: "transport unavailable".to_string(),
+            },
+        );
+        assert_eq!(source.code(), tonic::Code::Unavailable);
+
+        let geometry = status_from_terminal_inventory_read_error(
+            remanence_parity::TerminalInventoryReadError::BlockSize(
+                remanence_parity::TerminalTailLayoutError::UnsupportedBlockSize { block_size: 512 },
+            ),
+        );
+        assert_eq!(geometry.code(), tonic::Code::FailedPrecondition);
+
+        let visitor = status_from_terminal_inventory_read_error(
+            remanence_parity::TerminalInventoryReadError::StreamVisitor {
+                message: "receiver closed".to_string(),
+            },
+        );
+        assert_eq!(visitor.code(), tonic::Code::Cancelled);
+    }
+
+    #[test]
+    fn terminal_verification_cross_layout_conflict_is_data_loss() {
+        let conflict = status_from_terminal_index_verification_error(
+            remanence_parity::TerminalIndexVerificationError::ConflictingLayouts { count: 2 },
+        );
+        assert_eq!(conflict.code(), tonic::Code::DataLoss);
+
+        let source = status_from_terminal_index_verification_error(
+            remanence_parity::TerminalIndexVerificationError::Source {
+                operation: "READ",
+                message: "transport unavailable".to_string(),
+            },
+        );
+        assert_eq!(source.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn proved_worm_tail_with_surviving_replicas_requires_explicit_degraded_acceptance() {
+        use remanence_state::TerminalFinalizationProgress as Progress;
+
+        for progress in [
+            Progress::AfterReplicaA,
+            Progress::AfterSeparationAb,
+            Progress::AfterReplicaB,
+            Progress::AfterSeparationBc,
+        ] {
+            assert_eq!(
+                terminal_reconciliation_outcome(
+                    progress,
+                    TerminalComponentReconcileEvidence::TornWorm,
+                ),
+                TerminalFinalizationOutcome::RecoveryRequired,
+                "{progress:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_zero_replica_tail_remains_recovery_required() {
+        use remanence_state::TerminalFinalizationProgress as Progress;
+
+        assert_eq!(
+            terminal_reconciliation_outcome(
+                Progress::BeforeReplicaA,
+                TerminalComponentReconcileEvidence::TornWorm,
+            ),
+            TerminalFinalizationOutcome::RecoveryRequired,
+        );
+        assert_eq!(
+            terminal_reconciliation_outcome(
+                Progress::AfterReplicaB,
+                TerminalComponentReconcileEvidence::Unproved,
+            ),
+            TerminalFinalizationOutcome::RecoveryRequired,
+        );
+        assert_eq!(
+            terminal_reconciliation_outcome(
+                Progress::AfterReplicaC,
+                TerminalComponentReconcileEvidence::TornWorm,
+            ),
+            TerminalFinalizationOutcome::RecoveryRequired,
+        );
+    }
+
+    #[test]
+    fn all_invalid_terminal_inventory_projects_explicit_bot_recovery() {
+        let replicas = std::array::from_fn(|_| {
+            remanence_parity::TerminalReplicaEvidence::Invalid(
+                remanence_parity::TerminalReplicaFailure {
+                    kind: remanence_parity::TerminalReplicaFailureKind::Missing,
+                    detail: "test member missing".to_string(),
+                },
+            )
+        });
+        let projected = terminal_inventory_to_proto(
+            RANGE_TAPE_UUID,
+            remanence_parity::TerminalInventoryOutcome::BotStructuralRecoveryRequired(Box::new(
+                remanence_parity::BotStructuralRecoveryRequired {
+                    reason: remanence_parity::BotStructuralRecoveryReason::AllMembersInvalid,
+                    replicas,
+                },
+            )),
+        );
+        assert_eq!(
+            projected.outcome,
+            pb::TapeInventoryOutcome::BotStructuralRecoveryRequired as i32
+        );
+        assert_eq!(projected.selected_replica_ordinal, 0);
+        assert_eq!(projected.structural_entry_count, 0);
+        assert_eq!(projected.object_row_count, 0);
+        assert_eq!(projected.replica_health.len(), 3);
+        assert!(projected.detail.contains("structural recovery from BOT"));
+    }
+
+    #[test]
+    fn recovery_required_verification_projects_measured_bot_evidence() {
+        let replicas = std::array::from_fn(|_| {
+            remanence_parity::TerminalReplicaEvidence::Invalid(
+                remanence_parity::TerminalReplicaFailure {
+                    kind: remanence_parity::TerminalReplicaFailureKind::PayloadInvalid,
+                    detail: "test payload invalid".to_string(),
+                },
+            )
+        });
+        let projected = terminal_verification_to_proto(
+            RANGE_TAPE_UUID,
+            remanence_parity::TerminalIndexVerificationOutcome::RecoveryRequired(Box::new(
+                remanence_parity::TerminalIndexRecoveryRequired {
+                    measured_eod: remanence_parity::PhysicalPositionHint::new(123),
+                    bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+                        structural_entry_count: 7,
+                        complete_object_count: 4,
+                        recovered_object_count: 2,
+                        unknown_object_count: 2,
+                        incomplete_object_count: 1,
+                        canonical_map_digest: [0x44; 32],
+                        damaged_region_count: 1,
+                    },
+                    replicas,
+                    detail: "no canonical survivor".to_string(),
+                },
+            )),
+        );
+
+        assert_eq!(
+            projected.state,
+            pb::TapeIndexVerificationState::RecoveryRequired as i32
+        );
+        assert_eq!(projected.measured_eod_lba, 123);
+        assert_eq!(projected.measured_tape_file_count, 7);
+        assert_eq!(
+            projected.recovery_inventory.as_ref().map(|row| row.outcome),
+            Some(pb::TapeInventoryOutcome::BotStructuralRecovered as i32)
+        );
+    }
 
     struct ShortFirstModelWriteTransport {
         inner: ModelTransport,
@@ -8578,6 +11307,7 @@ mod tests {
             selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.9,
             watermark_high: 0.95,
+            capacity_cap_bytes: None,
             block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
@@ -8662,7 +11392,7 @@ mod tests {
                         journal_offset_bytes: 0,
                     },
                     &CommittedBundle {
-                        kind: CommittedBundleKind::Control,
+                        kind: CommittedBundleKind::BotBootstrap,
                         entries: vec![TapeFileEntry {
                             tape_file_number: 0,
                             kind: TapeFileKind::Bootstrap,
@@ -8674,7 +11404,7 @@ mod tests {
                             protected_ordinal_start: None,
                             protected_ordinal_end_exclusive: None,
                             canonical_metadata_hash: None,
-                            bootstrap_object_row: None,
+                            object_recovery_row: None,
                         }],
                         highest_protected_ordinal: 0,
                         total_committed_ordinals: 0,
@@ -8722,6 +11452,7 @@ mod tests {
                         selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
                         watermark_low: 0.9,
                         watermark_high: 0.95,
+                        capacity_cap_bytes: None,
                         block_size_bytes: u64::from(BLOCK_SIZE),
                         min_object_size_bytes: 0,
                     },
@@ -8757,143 +11488,6 @@ mod tests {
                 "{case}: missing authority must reject before any drive command"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn daemon_rejects_terminal_checkpoint_authority_before_any_drive_command() {
-        const BLOCK_SIZE: u32 = 1024;
-        const BARCODE: &str = "PARSEA01";
-
-        let temp = tempfile::Builder::new()
-            .prefix("remanence-terminal-authority-before-motion-")
-            .tempdir()
-            .expect("tempdir");
-        let index_path = temp.path().join("rem-state.sqlite");
-        let tape_uuid = [0x49; 16];
-        let scheme = remanence_parity::default_scheme_for_block_size(BLOCK_SIZE);
-        let mut index = CatalogIndex::open(&index_path).expect("open test index");
-        index
-            .provision_tape(remanence_state::ProvisionTapeInput {
-                tape_uuid,
-                voltag: BARCODE.to_string(),
-                block_size: BLOCK_SIZE,
-                parity: ParityConfig::Scheme(scheme.clone()),
-                force: false,
-            })
-            .expect("provision parity tape");
-        drop(index);
-
-        let mut world = VirtualWorld::single_drive(
-            "LIB-TERMINAL-AUTHORITY",
-            0x0100,
-            "DRV-TERMINAL-AUTHORITY",
-            0x0400,
-            1,
-        );
-        world.put_tape_in_drive(
-            0x0100,
-            BARCODE,
-            Some(0x0400),
-            VirtualTape::empty(1024 * 1024, BLOCK_SIZE),
-        );
-        let world = Arc::new(Mutex::new(world));
-        let mut library = open_model_library(Arc::clone(&world));
-        let snapshot = library_snapshot_cell(library.library().clone());
-        let audit_dir = temp.path().join("audit");
-        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
-        let mut cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
-        cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
-        let terminal_bundle = CommittedBundle {
-            kind: remanence_parity::CommittedBundleKind::Finish,
-            entries: vec![TapeFileEntry {
-                tape_file_number: 0,
-                kind: TapeFileKind::Bootstrap,
-                block_count: 1,
-                physical_start_hint: Some(0),
-                object_id: None,
-                first_parity_data_ordinal: None,
-                epoch_id: None,
-                protected_ordinal_start: None,
-                protected_ordinal_end_exclusive: None,
-                canonical_metadata_hash: None,
-                bootstrap_object_row: None,
-            }],
-            highest_protected_ordinal: 0,
-            total_committed_ordinals: 0,
-        };
-        let terminal_record = crate::pool_write::build_terminal_checkpoint_record(
-            &[],
-            tape_uuid,
-            [0x4A; 16],
-            BLOCK_SIZE,
-            Some(scheme.clone()),
-            terminal_bundle,
-            0,
-            2,
-        )
-        .expect("build terminal checkpoint authority");
-        let checkpoint_journal =
-            remanence_state::FileCheckpointJournal::open(&cfg.checkpoint_journal_dir, tape_uuid)
-                .expect("open checkpoint authority");
-        let mut checkpoint_lease = checkpoint_journal
-            .acquire_exclusive()
-            .expect("acquire checkpoint authority");
-        checkpoint_lease
-            .begin_terminal_transition()
-            .expect("begin terminal checkpoint transition");
-        checkpoint_lease
-            .append_terminal_transition(std::slice::from_ref(&terminal_record))
-            .expect("append terminal checkpoint authority");
-        drop(checkpoint_lease);
-
-        let serial = library.library().serial.clone();
-        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
-        let drive = library
-            .open_drive(0x0100, &policy)
-            .expect("open model drive");
-        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
-        let command_start = world.lock().expect("world lock").command_log.len();
-        let (open_tx, open_rx) = oneshot::channel();
-        drive_tx
-            .send(DriveCommand::OpenWrite {
-                pool_cfg: TapePoolConfig {
-                    id: "terminal.authority".to_string(),
-                    display_name: None,
-                    copy_class: None,
-                    content_class: None,
-                    selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
-                    watermark_low: 0.9,
-                    watermark_high: 0.95,
-                    block_size_bytes: u64::from(BLOCK_SIZE),
-                    min_object_size_bytes: 0,
-                },
-                selected: SelectedTape {
-                    pool_id: "terminal.authority".to_string(),
-                    tape_uuid,
-                    block_size: BLOCK_SIZE,
-                    parity_config: ParityConfig::Scheme(scheme),
-                },
-                target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
-                needs_drive_load: false,
-                library_serial: serial,
-                barcode: Some(BARCODE.to_string()),
-                source_slot: None,
-                drive_uuid: None,
-                drive_serial: Some("DRV-TERMINAL-AUTHORITY".to_string()),
-                reply: open_tx,
-            })
-            .await
-            .expect("send terminal-authority write open");
-        let status = open_rx
-            .await
-            .expect("terminal-authority open reply")
-            .expect_err("terminal checkpoint authority must reject the session");
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert!(status.message().contains("terminal and sealed"), "{status}");
-        assert!(
-            world.lock().expect("world lock").command_log[command_start..].is_empty(),
-            "terminal authority must reject before LOAD, rewind, locate, or drive configuration"
-        );
     }
 
     #[tokio::test]
@@ -8953,6 +11547,7 @@ mod tests {
                     selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
                     watermark_low: 0.9,
                     watermark_high: 0.95,
+                    capacity_cap_bytes: None,
                     block_size_bytes: u64::from(BLOCK_SIZE),
                     min_object_size_bytes: 0,
                 },
@@ -9043,35 +11638,18 @@ mod tests {
         };
 
         let mut drive = library.open_drive(0x0100, &policy).expect("open drive");
-        let command_start = world.lock().expect("world lock").command_log.len();
-        let preflight_status = {
-            let authority = validate_parity_actor_authority(&cfg, &selected, &[])
-                .expect("validate fresh parity authority");
-            match open_parity_actor_session(&mut index, &mut drive, &cfg, &selected, &[], authority)
-            {
-                Ok(_) => panic!("oversized fresh checkpoint reservation must reject"),
-                Err(status) => status,
-            }
-        };
-        assert_eq!(preflight_status.code(), tonic::Code::ResourceExhausted);
-        assert!(
-            world.lock().expect("world lock").command_log[command_start..].is_empty(),
-            "fresh directory reservation must reject before locate or tape modification"
-        );
-        let journal_path = parity_journal_path(&cfg, tape_uuid).expect("parity journal path");
-        let journal =
-            FileTapeFileJournal::open(&journal_path, tape_uuid, BLOCK_SIZE, scheme.clone())
-                .expect("reopen empty parity journal");
-        let committed = journal.load_committed().expect("load empty parity journal");
-        assert!(committed.entries.is_empty());
-        assert!(committed.orphaned_bundles.is_empty());
-        drop(journal);
-
-        cfg.checkpoint_max_objects = 1;
-
         let status = {
-            let authority = validate_parity_actor_authority(&cfg, &selected, &[])
-                .expect("validate fresh parity authority");
+            let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
+                &cfg.checkpoint_journal_dir,
+                tape_uuid,
+            )
+            .expect("open fresh checkpoint journal");
+            let checkpoint_lease = checkpoint_journal
+                .acquire_exclusive()
+                .expect("acquire fresh checkpoint lease");
+            let authority =
+                validate_parity_actor_authority(&cfg, &selected, &checkpoint_lease, &[])
+                    .expect("validate fresh parity authority");
             match open_parity_actor_session(&mut index, &mut drive, &cfg, &selected, &[], authority)
             {
                 Ok(_) => panic!("short bootstrap completion must fail closed"),
@@ -9199,7 +11777,7 @@ mod tests {
     #[tokio::test]
     async fn partial_epoch_checkpoint_projects_replays_and_first_post_checkpoint_short_write_fences(
     ) {
-        const BLOCK_SIZE: u32 = 4096;
+        const BLOCK_SIZE: u32 = 256 * 1024;
         const POOL_ID: &str = "parity-actor-fence";
         const BARCODE: &str = "PAF001L9";
 
@@ -9262,22 +11840,15 @@ mod tests {
                 no_parity_flag: false,
             }),
             no_parity_flag: false,
-            filemark_map_digest: Some(remanence_parity::FilemarkMapDigest {
-                map_sha256: [0; 32],
-                tape_file_count: 1,
-                map_total_data_ordinals: 0,
-                highest_protected_ordinal: 0,
-                is_final_map: false,
-            }),
+            filemark_map_digest: Some(
+                remanence_parity::sole_bot_filemark_map_digest().expect("sole BOT digest"),
+            ),
             tape_uuid,
             written_by_version: "test".to_string(),
             written_at: "2026-08-08T00:00:00Z".to_string(),
             sequence: 0,
             block_size_bytes: BLOCK_SIZE,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
         let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
         write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode parity bootstrap");
@@ -9340,6 +11911,7 @@ mod tests {
             selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.9,
             watermark_high: 0.95,
+            capacity_cap_bytes: None,
             block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
@@ -9439,30 +12011,32 @@ mod tests {
                 < u64::from(scheme.data_blocks_per_stripe),
             "the regression must close a genuinely partial parity epoch"
         );
-        let checkpoint_bundle = record
-            .checkpoint_bundle
+        let barrier_bundle = record
+            .barrier_bundle
             .as_ref()
-            .expect("parity checkpoint Control bundle");
+            .expect("parity checkpoint sidecar bundle");
         assert_eq!(
-            checkpoint_bundle
+            barrier_bundle
                 .entries
                 .iter()
                 .map(|entry| entry.kind)
                 .collect::<Vec<_>>(),
-            vec![TapeFileKind::ParitySidecar, TapeFileKind::Bootstrap],
-            "the barrier must journal the short sidecar before its terminal Bootstrap"
+            vec![TapeFileKind::ParitySidecar],
+            "the barrier must journal exactly the short sidecar"
         );
         assert_eq!(
-            checkpoint_bundle
+            barrier_bundle
                 .entries
                 .last()
-                .expect("terminal Bootstrap")
-                .tape_file_number,
-            record.checkpoint_tape_file_number
+                .expect("checkpoint sidecar")
+                .tape_file_number
+                .checked_add(1)
+                .expect("next tape-file number"),
+            record.next_tape_file_number,
         );
         assert_eq!(
-            checkpoint_bundle.highest_protected_ordinal,
-            checkpoint_bundle.total_committed_ordinals
+            barrier_bundle.highest_protected_ordinal,
+            barrier_bundle.total_committed_ordinals
         );
         let mut replay_index = CatalogIndex::open(&index_path).expect("open replay projection");
         replay_index
@@ -10206,6 +12780,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_actor_deduplicates_in_batch_and_holds_until_checkpoint() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
         let temp = tempfile::Builder::new()
             .prefix("remanence-batched-actor")
             .tempdir()
@@ -10226,7 +12801,7 @@ mod tests {
             .provision_tape(ProvisionTapeInput {
                 tape_uuid,
                 voltag: "CHK002L9".to_string(),
-                block_size: 4096,
+                block_size: BLOCK_SIZE,
                 parity: ParityConfig::None,
                 force: false,
             })
@@ -10258,17 +12833,14 @@ mod tests {
             written_by_version: "test".to_string(),
             written_at: "2026-07-21T00:00:00Z".to_string(),
             sequence: 0,
-            block_size_bytes: 4096,
+            block_size_bytes: BLOCK_SIZE,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
-        let mut bootstrap_block = vec![0u8; 4096];
+        let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
         write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
-        let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE);
         tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
-        tape.written_bytes = 4096;
+        tape.written_bytes = u64::from(BLOCK_SIZE);
         let mut world =
             VirtualWorld::single_drive("LIB-CHECKPOINT", 0x0100, "DRV-CHECKPOINT", 0x0400, 1);
         world.put_tape_in_drive(0x0100, "CHK002L9", Some(0x0400), tape);
@@ -10296,7 +12868,8 @@ mod tests {
             selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.9,
             watermark_high: 0.95,
-            block_size_bytes: 4096,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
         let (open_tx, open_rx) = oneshot::channel();
@@ -10306,7 +12879,7 @@ mod tests {
                 selected: SelectedTape {
                     pool_id: "checkpoint-test".to_string(),
                     tape_uuid,
-                    block_size: 4096,
+                    block_size: BLOCK_SIZE,
                     parity_config: ParityConfig::None,
                 },
                 target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPool,
@@ -10487,7 +13060,7 @@ mod tests {
         );
         assert_eq!(third.copies.len(), 1);
         assert_eq!(third.copies[0].tape_uuid, tape_uuid);
-        assert_eq!(third.copies[0].tape_file_number, 4);
+        assert_eq!(third.copies[0].tape_file_number, 3);
 
         let (receipt_tx, receipt_rx) = oneshot::channel();
         drive_tx
@@ -10521,7 +13094,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             threshold_copy_placements,
-            vec![(tape_uuid.to_vec(), 3), (tape_uuid.to_vec(), 4)]
+            vec![(tape_uuid.to_vec(), 2), (tape_uuid.to_vec(), 3)]
         );
         let fourth = append_actor_test_file(
             &drive_tx,
@@ -10564,7 +13137,7 @@ mod tests {
         );
         assert_eq!(closed.session.committed_copies.len(), 1);
         assert_eq!(closed.session.committed_copies[0].tape_uuid, tape_uuid);
-        assert_eq!(closed.session.committed_copies[0].tape_file_number, 6);
+        assert_eq!(closed.session.committed_copies[0].tape_file_number, 4);
         let journal = remanence_state::FileCheckpointJournal::open(
             temp.path().join("checkpoints"),
             tape_uuid,
@@ -10587,62 +13160,47 @@ mod tests {
         assert_eq!(
             records
                 .iter()
-                .map(|record| record.checkpoint_tape_file_number)
+                .map(|record| record.next_tape_file_number)
                 .collect::<Vec<_>>(),
-            vec![2, 5, 7],
-            "every barrier consumes one checkpoint-bootstrap tape file"
+            vec![2, 4, 5],
+            "each checkpoint names the first free dense tape file"
         );
         let read_only = CatalogIndex::open_read_only(&index_path).expect("open final projection");
         let tape_files = read_only
             .list_tape_files(&tape_uuid)
             .expect("list tape files");
-        assert_eq!(tape_files.len(), 8);
-        assert_eq!(tape_files.last().expect("last tape file").kind, "bootstrap");
+        assert_eq!(tape_files.len(), 5);
+        assert_eq!(tape_files.last().expect("last tape file").kind, "object");
         drop(read_only);
 
         let world = world.lock().expect("world lock");
         let tape = world.tapes.get("CHK002L9").expect("checkpoint tape");
-        let checkpoint_bootstraps = tape
+        let bootstraps = tape
             .records
             .iter()
             .filter_map(|record| match record {
                 Record::Block(block) => parse_bootstrap_block(block).ok(),
-                Record::Filemark => None,
+                Record::ZeroBlock(_) | Record::Filemark => None,
             })
-            .filter(|payload| payload.sequence > 0)
             .collect::<Vec<_>>();
-        assert_eq!(checkpoint_bootstraps.len(), 3);
-        for (payload, record) in checkpoint_bootstraps.iter().zip(&records) {
-            assert_eq!(payload.sequence, record.ordinal as u32);
-            assert_eq!(
-                payload.object_rows.len() as u64,
-                record.committed_object_count,
-                "checkpoint bootstrap carries every committed-prefix REM-OBJECT row"
-            );
-            assert!(payload
-                .object_rows
+        assert_eq!(bootstraps.len(), 1, "only the BOT Bootstrap is physical");
+        assert_eq!(bootstraps[0].sequence, 0);
+        for record in &records {
+            assert!(record
+                .objects
                 .iter()
-                .all(|row| row.object_id.is_some()));
-            let digest = payload
-                .filemark_map_digest
-                .as_ref()
-                .expect("checkpoint bootstrap map digest");
-            assert!(!digest.is_final_map);
-            assert_eq!(
-                digest.tape_file_count,
-                record.checkpoint_tape_file_number + 1
-            );
+                .all(|object| !object.object_recovery_row.object_id.is_empty()));
         }
         assert_eq!(
             records.last().expect("last record").eod_lba as usize,
             tape.records.len(),
-            "journal EOD names the physical boundary after the checkpoint bootstrap"
+            "journal EOD names the physical Object boundary"
         );
     }
 
     #[tokio::test]
     async fn daemon_watermark_terminalization_is_atomic_and_terminal_failure_stays_fenced() {
-        const BLOCK_SIZE: u32 = 4096;
+        const BLOCK_SIZE: u32 = 256 * 1024;
 
         for reject_terminal in [false, true] {
             let case = if reject_terminal {
@@ -10716,13 +13274,10 @@ mod tests {
                 sequence: 0,
                 block_size_bytes: BLOCK_SIZE,
                 drive_compression: false,
-                sidecar_epoch_directory: None,
-                parity_map_reference: None,
-                object_rows: Vec::new(),
             };
             let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
             write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
-            let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE);
+            let mut tape = VirtualTape::empty(3 * 1024 * 1024 * 1024, BLOCK_SIZE);
             tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
             tape.written_bytes = u64::from(BLOCK_SIZE);
             let mut world = VirtualWorld::single_drive(
@@ -10779,6 +13334,7 @@ mod tests {
                 selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
                 watermark_low: 0.000_000_000_001,
                 watermark_high: 0.95,
+                capacity_cap_bytes: None,
                 block_size_bytes: u64::from(BLOCK_SIZE),
                 min_object_size_bytes: 0,
             };
@@ -10806,14 +13362,12 @@ mod tests {
                 let status = match first {
                     Err(status) => status,
                     Ok(outcome) => panic!(
-                        "short terminal bootstrap must fail append; observed {} WRITE CDBs: {outcome:?}",
+                        "short terminal component must fail append; observed {} WRITE CDBs: {outcome:?}",
                         write_count.load(Ordering::SeqCst)
                     ),
                 };
                 assert!(
-                    status.message().contains(
-                        "terminal bootstrap write failed before checkpoint authority advanced"
-                    ),
+                    status.message().contains("terminal tape write failed"),
                     "{status}"
                 );
             } else {
@@ -10873,21 +13427,23 @@ mod tests {
             if reject_terminal {
                 let error = checkpoint
                     .replay()
-                    .expect_err("terminal failure retains Sealing intent");
+                    .expect_err("terminal failure retains finalization intent");
                 assert!(
-                    error.to_string().contains("pending Sealing intent"),
+                    error
+                        .to_string()
+                        .contains("pending terminal finalization intent"),
                     "{error}"
                 );
-                assert_eq!(tape.state, "ready");
+                assert_eq!(tape.state, "recovery_required");
                 assert!(read_only
                     .get_native_object_by_caller_object_id("terminal-caller")
-                    .expect("query failed object")
-                    .is_none());
+                    .expect("query committed object")
+                    .is_some());
                 let fences = read_only
                     .tape_io_admission_conflicts(&tape_uuid, Some(barcode))
                     .expect("query terminal failure fence");
                 assert_eq!(fences.len(), 1);
-                assert_eq!(fences[0].reason, "checkpoint_barrier_failed");
+                assert_eq!(fences[0].reason, "transfer_error");
             } else {
                 let records = checkpoint.replay().expect("replay terminal authority");
                 assert_eq!(records.len(), 2);
@@ -10908,10 +13464,429 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn manual_finalize_closes_below_low_and_same_key_replay_moves_no_tape() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-manual-terminal-below-low-")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let tape_uuid = [0x7D; 16];
+        let barcode = "TRMOP1L9";
+        let pool_id = "terminal.operator";
+        let library_serial = "LIB-TERMINAL-OPERATOR";
+        let drive_serial = "DRV-TERMINAL-OPERATOR";
+        let mut index = CatalogIndex::open(&index_path).expect("open catalog");
+        index
+            .upsert_tape_pool_projection(TapePoolProjectionInput {
+                pool_id: pool_id.to_string(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: barcode.to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign pool");
+        let assignment_generation = index
+            .get_tape_assignment_snapshot(&tape_uuid)
+            .expect("assignment query")
+            .expect("assignment exists")
+            .assignment_generation;
+        let drive_uuid = index
+            .observe_drive(DriveObservationInput {
+                serial: drive_serial.to_string(),
+                identity_source: "DvcidAndInquiry".to_string(),
+                vendor: Some("IBM".to_string()),
+                product: Some("ULT3580".to_string()),
+                firmware_rev: Some("A1".to_string()),
+                managed: "rem".to_string(),
+                library_serial: Some(library_serial.to_string()),
+                element_address: Some(0x0100),
+                observed_at_utc: Some("2026-08-09T00:00:00Z".to_string()),
+            })
+            .expect("observe drive")
+            .drive_uuid;
+        drop(index);
+
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-08-09T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: BLOCK_SIZE,
+            drive_compression: false,
+        };
+        let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+        let mut tape = VirtualTape::empty(3 * 1024 * 1024 * 1024, BLOCK_SIZE);
+        tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
+        tape.written_bytes = u64::from(BLOCK_SIZE);
+        let mut world = VirtualWorld::single_drive(library_serial, 0x0100, drive_serial, 0x0400, 1);
+        world.put_tape_in_drive(0x0100, barcode, Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let library_model = world.lock().expect("world lock").library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new([library_serial]);
+        let transport_world = Arc::clone(&world);
+        let mut library = library_model
+            .open_with(&policy, move |path| {
+                let role = transport_world
+                    .lock()
+                    .expect("world lock")
+                    .role_for_path(path)
+                    .expect("known model path");
+                Ok::<_, remanence_library::IoErrorKind>(Box::new(ModelTransport::new(
+                    Arc::clone(&transport_world),
+                    role,
+                )) as Box<dyn SgTransport>)
+            })
+            .expect("open model library");
+        let snapshot = library_snapshot_cell(library.library().clone());
+        let audit_dir = temp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).expect("create audit dir");
+        let mut cfg =
+            test_write_owner_config(index_path.clone(), audit_dir.clone(), &library, snapshot);
+        let checkpoint_dir = temp.path().join("checkpoints");
+        cfg.checkpoint_journal_dir = checkpoint_dir.clone();
+        cfg.checkpoint_max_objects = 1;
+        cfg.checkpoint_max_age_seconds = 3600;
+        let audit_append_lock = Arc::clone(&cfg.audit_append_lock);
+        let drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let drive_tx = spawn_drive_actor(0x0100, drive, cfg);
+        let pool_cfg = TapePoolConfig {
+            id: pool_id.to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.97,
+            watermark_high: 0.98,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let session_id = open_actor_test_write_session(
+            &drive_tx,
+            &pool_cfg,
+            tape_uuid,
+            library_serial,
+            barcode,
+            &drive_uuid,
+            drive_serial,
+        )
+        .await;
+        let object_payload = vec![0x7d; 64 * BLOCK_SIZE as usize];
+        append_actor_test_file_result(
+            &drive_tx,
+            session_id,
+            temp.path().join("operator-terminal-source.bin"),
+            "operator-terminal.bin",
+            "operator-terminal-caller",
+            &object_payload,
+        )
+        .await
+        .expect("checkpoint one Object below low watermark");
+        let (close_tx, close_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::Close {
+                session_id,
+                reply: close_tx,
+            })
+            .await
+            .expect("send close");
+        close_rx
+            .await
+            .expect("close reply")
+            .expect("close below-low write session without finalizing");
+
+        let checkpoint = remanence_state::FileCheckpointJournal::open(
+            temp.path().join("checkpoints"),
+            tape_uuid,
+        )
+        .expect("open checkpoint journal");
+        let records = checkpoint.replay().expect("replay pre-final checkpoint");
+        assert_eq!(records.len(), 1);
+        assert!(!records[0].sealed_after_write);
+        let capacity_blocks =
+            crate::pool_write::raw_capacity_bytes(crate::pool_write::LtoGen::Lto9)
+                / u64::from(BLOCK_SIZE);
+        let low_watermark_blocks =
+            remanence_state::watermark_floor_bytes(capacity_blocks, pool_cfg.watermark_low)
+                .expect("low watermark");
+        assert!(records[0].eod_lba < low_watermark_blocks);
+
+        let operation_id = Uuid::from_u128(0x7d01);
+        let request = ManualFinalizeTapeActorRequest {
+            candidate_operation_id: operation_id,
+            actor: AuditActor::User("operator@example.invalid".to_string()),
+            actor_fingerprint: "sha256:operator-test".to_string(),
+            idempotency_key: Uuid::from_u128(0x7d02),
+            request_fingerprint: [0x7D; 32],
+            tape_uuid,
+            expected_pool_id: Some(pool_id.to_string()),
+            assignment_generation,
+            reason: "ship partially filled copy offsite".to_string(),
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::None,
+            pool_config: Some(pool_cfg.clone()),
+        };
+        let mut impossible = request.clone();
+        impossible.candidate_operation_id = Uuid::from_u128(0x7d03);
+        impossible.idempotency_key = Uuid::from_u128(0x7d04);
+        impossible.request_fingerprint = [0x7E; 32];
+        let impossible_policy = impossible.pool_config.as_mut().expect("pooled request");
+        impossible_policy.watermark_low = 0.0001;
+        impossible_policy.watermark_high = 0.0002;
+        impossible_policy.capacity_cap_bytes = Some(8_241 * u64::from(BLOCK_SIZE));
+        let commands_before_rejection = world.lock().expect("world lock").command_log.len();
+        let mut rejected_index = CatalogIndex::open(&index_path).expect("open writable catalog");
+        let rejected = preflight_manual_finalize_tape(
+            &mut rejected_index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &checkpoint_dir,
+                audit_dir: &audit_dir,
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            Some(barcode),
+            &mut impossible,
+        )
+        .expect_err("exact close that cannot fit must fail");
+        assert_eq!(
+            rejected.code(),
+            tonic::Code::ResourceExhausted,
+            "{rejected:?}"
+        );
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            commands_before_rejection,
+            "fit rejection must precede every drive command"
+        );
+        assert!(rejected_index
+            .idempotency_scope_record(
+                impossible.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                impossible.idempotency_key,
+            )
+            .expect("query rejected idempotency scope")
+            .is_none());
+        assert!(checkpoint
+            .terminal_finalization_intent()
+            .expect("query rejected terminal intent")
+            .is_none());
+
+        // Crash cut: the globally scoped audit/idempotency binding commits,
+        // then checkpoint-intent publication fails. No drive command is
+        // possible because preflight owns neither a drive nor a changer. The
+        // retry must recover the original operation id from the binding and
+        // publish the exact BeforeReplicaA plan.
+        let mut blocked_intent_path = checkpoint.path().as_os_str().to_os_string();
+        blocked_intent_path.push(".finalizing.new");
+        let blocked_intent_path = std::path::PathBuf::from(blocked_intent_path);
+        std::fs::create_dir(&blocked_intent_path).expect("block intent temporary file creation");
+        let commands_before_crash_cut = world.lock().expect("world lock").command_log.len();
+        let mut crash_index = CatalogIndex::open(&index_path).expect("open crash-cut catalog");
+        let crash_error = preflight_manual_finalize_tape(
+            &mut crash_index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &checkpoint_dir,
+                audit_dir: &audit_dir,
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            Some(barcode),
+            &mut request.clone(),
+        )
+        .expect_err("intent cut fails after durable idempotency binding");
+        assert_eq!(crash_error.code(), tonic::Code::Internal);
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            commands_before_crash_cut,
+            "crash cut before intent must issue zero drive commands"
+        );
+        assert!(checkpoint
+            .terminal_finalization_intent()
+            .expect("read crash-cut intent")
+            .is_none());
+        let crash_scope = crash_index
+            .idempotency_scope_record(
+                request.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                request.idempotency_key,
+            )
+            .expect("read crash-cut idempotency binding")
+            .expect("idempotency binding survives intent failure");
+        assert_eq!(crash_scope.operation_id, operation_id);
+        std::fs::remove_dir(&blocked_intent_path).expect("unblock intent publication");
+
+        let mut recovered_request = request.clone();
+        recovered_request.candidate_operation_id = Uuid::from_u128(0x7d05);
+        let mut retry_index = CatalogIndex::open(&index_path).expect("open retry catalog");
+        assert!(preflight_manual_finalize_tape(
+            &mut retry_index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &checkpoint_dir,
+                audit_dir: &audit_dir,
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            Some(barcode),
+            &mut recovered_request,
+        )
+        .expect("identical crash retry rejoins")
+        .is_none());
+        assert_eq!(recovered_request.candidate_operation_id, operation_id);
+        let durable = checkpoint
+            .terminal_finalization_intent()
+            .expect("read retry intent")
+            .expect("retry published BeforeReplicaA intent");
+        assert_eq!(
+            durable.progress,
+            remanence_state::TerminalFinalizationProgress::BeforeReplicaA
+        );
+        assert_eq!(
+            durable
+                .manual
+                .as_ref()
+                .expect("manual identity")
+                .operation_id,
+            *operation_id.as_bytes()
+        );
+        assert_eq!(
+            durable
+                .manual
+                .as_ref()
+                .expect("manual identity")
+                .operation_kind,
+            FINALIZE_TAPE_OPERATION_KIND
+        );
+        let mut changed_request = recovered_request.clone();
+        changed_request.reason = "different exact reason bytes".to_string();
+        changed_request.request_fingerprint = [0x7F; 32];
+        let changed = preflight_manual_finalize_tape(
+            &mut retry_index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &checkpoint_dir,
+                audit_dir: &audit_dir,
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            Some(barcode),
+            &mut changed_request,
+        )
+        .expect_err("changed request conflicts with durable binding");
+        assert_eq!(changed.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            commands_before_crash_cut,
+            "changed retry conflict must issue zero drive commands"
+        );
+
+        let (finalize_tx, finalize_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::FinalizeTape {
+                request: recovered_request.clone(),
+                needs_drive_load: false,
+                library_serial: library_serial.to_string(),
+                barcode: Some(barcode.to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid.clone()),
+                drive_serial: Some(drive_serial.to_string()),
+                reply: finalize_tx,
+            })
+            .await
+            .expect("send manual finalize");
+        let first = finalize_rx
+            .await
+            .expect("manual finalize reply")
+            .expect("manual finalization below low succeeds");
+        assert_eq!(first.operation_id, operation_id);
+        assert_eq!(
+            first.projection.outcome,
+            TerminalFinalizationOutcome::Finalized
+        );
+        assert_eq!(
+            first.projection.trigger,
+            remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+        );
+        let records_after_first = world
+            .lock()
+            .expect("world lock")
+            .tapes
+            .get(barcode)
+            .expect("virtual tape")
+            .records
+            .len();
+
+        let (replay_tx, replay_rx) = oneshot::channel();
+        drive_tx
+            .send(DriveCommand::FinalizeTape {
+                request: recovered_request,
+                needs_drive_load: false,
+                library_serial: library_serial.to_string(),
+                barcode: Some(barcode.to_string()),
+                source_slot: None,
+                drive_uuid: Some(drive_uuid),
+                drive_serial: Some(drive_serial.to_string()),
+                reply: replay_tx,
+            })
+            .await
+            .expect("send idempotent replay");
+        let replay = replay_rx
+            .await
+            .expect("idempotent replay reply")
+            .expect("same-key replay returns completed operation");
+        assert_eq!(replay, first);
+        assert_eq!(
+            world
+                .lock()
+                .expect("world lock")
+                .tapes
+                .get(barcode)
+                .expect("virtual tape")
+                .records
+                .len(),
+            records_after_first,
+            "same-key replay must not append another terminal component"
+        );
+
+        let final_records = checkpoint.replay().expect("replay sealed checkpoint");
+        assert_eq!(final_records.len(), 2);
+        assert!(final_records[1].sealed_after_write);
+        assert_eq!(
+            final_records[1]
+                .terminal_finalization
+                .as_ref()
+                .expect("durable terminal intent")
+                .manual
+                .as_ref()
+                .expect("manual operation identity")
+                .reason,
+            "ship partially filled copy offsite"
+        );
+    }
+
     /// Mount-dispatched explicit checkpoints must return catalog-projected copies after reopening
     /// a session, including a catalog replay whose append acknowledgement is already durable.
     #[tokio::test]
     async fn sequential_sessions_and_replay_return_catalog_copies_through_mount() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
         let temp = tempfile::Builder::new()
             .prefix("remanence-sequential-batch-one")
             .tempdir()
@@ -10932,7 +13907,7 @@ mod tests {
             .provision_tape(ProvisionTapeInput {
                 tape_uuid,
                 voltag: "CHK003L9".to_string(),
-                block_size: 4096,
+                block_size: BLOCK_SIZE,
                 parity: ParityConfig::None,
                 force: false,
             })
@@ -10964,17 +13939,14 @@ mod tests {
             written_by_version: "test".to_string(),
             written_at: "2026-07-21T00:00:00Z".to_string(),
             sequence: 0,
-            block_size_bytes: 4096,
+            block_size_bytes: BLOCK_SIZE,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
-        let mut bootstrap_block = vec![0u8; 4096];
+        let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
         write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
-        let mut tape = VirtualTape::empty(64 * 1024 * 1024, 4096);
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE);
         tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
-        tape.written_bytes = 4096;
+        tape.written_bytes = u64::from(BLOCK_SIZE);
         let mut world =
             VirtualWorld::single_drive("LIB-BATCH-ONE", 0x0100, "DRV-BATCH-ONE", 0x0400, 1);
         world.put_tape_in_drive(0x0100, "CHK003L9", Some(0x0400), tape);
@@ -11001,7 +13973,8 @@ mod tests {
             selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.9,
             watermark_high: 0.95,
-            block_size_bytes: 4096,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
         let (changer_tx, _changer_rx) = mpsc::channel(1);
@@ -11016,7 +13989,7 @@ mod tests {
         state.drive_pool = Some(pool.clone());
 
         let mut previous_session_id = None;
-        for (session_ordinal, expected_tape_file_number) in [(1u8, 1u64), (2, 3)] {
+        for (session_ordinal, expected_tape_file_number) in [(1u8, 1u64), (2, 2)] {
             let session_id = open_actor_test_write_session(
                 &drive_tx,
                 &pool_cfg,
@@ -11303,7 +14276,7 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 0,
@@ -11779,9 +14752,6 @@ mod tests {
             sequence: 0,
             block_size_bytes: 4096,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
         let mut block = vec![0u8; 4096];
         write_bootstrap_block(&payload, &mut block).expect("write wrong-tape bootstrap");
@@ -12037,9 +15007,6 @@ mod tests {
             sequence: 0,
             block_size_bytes: 4096,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
         let mut bootstrap_block = vec![0u8; 4096];
         write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
@@ -12255,9 +15222,6 @@ mod tests {
             sequence: 0,
             block_size_bytes: 4096,
             drive_compression: false,
-            sidecar_epoch_directory: None,
-            parity_map_reference: None,
-            object_rows: Vec::new(),
         };
         let mut bootstrap_block = vec![0u8; 4096];
         write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
@@ -12343,6 +15307,7 @@ mod tests {
             selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.9,
             watermark_high: 0.95,
+            capacity_cap_bytes: None,
             block_size_bytes: 4096,
             min_object_size_bytes: 0,
         };
@@ -13201,5 +16166,64 @@ mod tests {
             file_range_read_request(&fixture.index, &RANGE_TAPE_UUID, RANGE_OBJECT_ID, "", 5, 4)
                 .expect_err("end before start must fail");
         assert_eq!(reversed.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn terminal_inventory_stream_proto_preserves_complete_book_rows() {
+        let structural = terminal_inventory_event_to_proto(
+            remanence_parity::TerminalInventoryStreamEvent::StructuralEntry {
+                attempt_id: 7,
+                replica_ordinal: 3,
+                entry: remanence_parity::TapeIndexReplicaMapEntry {
+                    tape_file_number: u64::MAX,
+                    kind: remanence_parity::TapeIndexReplicaFileKind::ParitySidecar,
+                    block_count: u64::MAX - 1,
+                    first_parity_data_ordinal: None,
+                    protected_ordinal_start: Some(u64::MAX - 3),
+                    protected_ordinal_end_exclusive: Some(u64::MAX - 2),
+                    epoch_id: Some(u64::MAX - 4),
+                },
+            },
+        );
+        let Some(pb::tape_inventory_stream_item::Item::StructuralEntry(structural)) =
+            structural.item
+        else {
+            panic!("structural event must remain structural")
+        };
+        assert_eq!(structural.attempt_id, 7);
+        assert_eq!(structural.replica_ordinal, 3);
+        assert_eq!(structural.tape_file_number, u64::MAX);
+        assert_eq!(structural.block_count, u64::MAX - 1);
+        assert_eq!(structural.protected_ordinal_start, Some(u64::MAX - 3));
+        assert_eq!(structural.epoch_id, Some(u64::MAX - 4));
+
+        let object = terminal_inventory_event_to_proto(
+            remanence_parity::TerminalInventoryStreamEvent::ObjectRow {
+                attempt_id: 7,
+                replica_ordinal: 3,
+                row: remanence_parity::TapeIndexReplicaObjectRow {
+                    tape_file_number: u64::MAX - 8,
+                    stored_block_count: u64::MAX - 9,
+                    object_id: b"complete-object-id".to_vec(),
+                    representation: remanence_parity::ObjectRecoveryRepresentation::Plaintext {
+                        manifest_first_chunk_lba: u64::MAX - 10,
+                        manifest_size_bytes: u64::MAX - 11,
+                        manifest_chunk_count: u64::MAX - 12,
+                        manifest_sha256: [0x5a; 32],
+                    },
+                },
+            },
+        );
+        let Some(pb::tape_inventory_stream_item::Item::ObjectRow(object)) = object.item else {
+            panic!("Object event must remain an Object row")
+        };
+        assert_eq!(object.object_id, b"complete-object-id");
+        let Some(pb::tape_inventory_object_row::Representation::Plaintext(plaintext)) =
+            object.representation
+        else {
+            panic!("plaintext recovery anchors must be present")
+        };
+        assert_eq!(plaintext.manifest_first_chunk_lba, u64::MAX - 10);
+        assert_eq!(plaintext.manifest_sha256, vec![0x5a; 32]);
     }
 }

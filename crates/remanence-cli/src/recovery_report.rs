@@ -1,9 +1,8 @@
-//! Catalog-less key-30 recovery reporting for `rem-debug tape`.
+//! Catalog-less terminal-index recovery reporting for `rem-debug tape`.
 //!
-//! This module composes the Layer 3c structural scan, authoritative-bootstrap
-//! selection, directory overlay, and digest-validation pipeline with bounded
-//! plaintext-manifest and keyless REM-ENCRYPT checks. It never consults the
-//! catalog, daemon, or host persistence.
+//! This module composes the sole-BOT structural scan with terminal-index
+//! selection and bounded plaintext-manifest/keyless REM-ENCRYPT checks. It
+//! never consults the catalog, daemon, or host persistence.
 
 use std::io::Write;
 use std::path::Path;
@@ -13,13 +12,14 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use remanence_aead::{KeyFrame, RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 use remanence_parity::{
-    discover_bootstrap_with_candidate_block_sizes, scan_reconstruct_filemark_map_with_report,
-    validate_scan_reconstruction_with_report, BootstrapObjectRepresentation, BootstrapObjectRow,
-    FilemarkMap, ImageDirectoryRawSource, RawReadOutcome, RawTapeSource, ScanDamageKind,
-    ScanDamagedRegion, ScanOverlaySource, ScanTailTruncation, ScanTailTruncationKind, TapeFileKind,
-    TapeFilePosition,
+    discover_bootstrap_with_candidate_block_sizes, read_terminal_index_inventory,
+    scan_reconstruct_filemark_map_with_report, FilemarkMap, ImageDirectoryRawSource,
+    ObjectRecoveryRepresentation, RawReadOutcome, RawTapeSource, ScanDamageKind, ScanDamagedRegion,
+    ScanTailTruncation, ScanTailTruncationKind, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
+    TerminalInventoryOutcome,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -42,18 +42,23 @@ impl CatalogLessRecoveryReport {
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryScanSummary {
-    bootstrap_generation_used: u32,
-    bootstrap_tape_file_number: Option<u32>,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    bootstrap_generation_used: u64,
+    #[serde(serialize_with = "serialize_optional_decimal_u64")]
+    bootstrap_tape_file_number: Option<u64>,
     overlay_source: &'static str,
-    recovered_scope_tape_file_count: u32,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    recovered_scope_tape_file_count: u64,
     damaged_regions: Vec<RecoveryDamageRegion>,
     truncation: Option<RecoveryTruncation>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryDamageRegion {
+    #[serde(serialize_with = "serialize_decimal_u64")]
     start_lba: u64,
     partition: u32,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     block_count: u64,
     kind: &'static str,
 }
@@ -67,6 +72,7 @@ impl From<ScanDamagedRegion> for RecoveryDamageRegion {
             kind: match value.kind {
                 ScanDamageKind::UnreadableTapeFileHead => "unreadable_tape_file_head",
                 ScanDamageKind::ClassificationCountMismatch => "classification_count_mismatch",
+                ScanDamageKind::InvalidTerminalControl => "invalid_terminal_control",
             },
         }
     }
@@ -74,7 +80,9 @@ impl From<ScanDamagedRegion> for RecoveryDamageRegion {
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryTruncation {
-    tape_file_number: u32,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    tape_file_number: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     start_lba: u64,
     partition: u32,
     kind: &'static str,
@@ -97,12 +105,14 @@ impl From<ScanTailTruncation> for RecoveryTruncation {
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryObjectReport {
-    tape_file_number: u32,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    tape_file_number: u64,
     representation: &'static str,
     object_id: Value,
     object_id_encoding: &'static str,
     #[serde(skip)]
     object_id_human: String,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     stored_block_count: u64,
     map_status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,18 +124,42 @@ struct RecoveryObjectReport {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 struct RecoveryTotals {
+    #[serde(serialize_with = "serialize_decimal_u64")]
     objects_seen: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     map_agreeing: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     verified: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     failed: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
     beyond_scope: u64,
+}
+
+fn serialize_decimal_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&value.to_string())
+}
+
+fn serialize_optional_decimal_u64<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_some(&value.to_string()),
+        None => serializer.serialize_none(),
+    }
 }
 
 struct RecoveredMap {
     map: FilemarkMap,
-    scope_tape_file_count: u32,
-    bootstrap_generation_used: u32,
+    object_rows: Vec<TapeIndexReplicaObjectRow>,
+    scope_tape_file_count: u64,
+    bootstrap_generation_used: u64,
     overlay_source: &'static str,
+    terminal_authority: bool,
     damaged_regions: Vec<ScanDamagedRegion>,
     truncation: Option<ScanTailTruncation>,
 }
@@ -199,51 +233,77 @@ fn build_recovery_report(
         first_bootstrap.block_size_bytes,
     )
     .map_err(|error| format!("scan filemark map: {error}"))?;
-    let winning_candidate = scan.authoritative_bootstrap().cloned();
-    let winning_bootstrap = winning_candidate.as_ref().map_or_else(
-        || first_bootstrap.clone(),
-        |candidate| candidate.payload.clone(),
-    );
-    let winning_tape_file_number = winning_candidate
-        .as_ref()
-        .map(|candidate| candidate.tape_file_number);
-
-    let recovered = if winning_bootstrap.filemark_map_digest.is_some() {
-        let validated = validate_scan_reconstruction_with_report(source, &winning_bootstrap, scan)
-            .map_err(|error| format!("validate recovered filemark map: {error}"))?;
-        RecoveredMap {
-            scope_tape_file_count: validated.attested_map.tape_file_count(),
-            map: validated.scoped_map.map,
-            bootstrap_generation_used: validated.authoritative_bootstrap_sequence,
-            overlay_source: overlay_source_name(validated.overlay_source),
-            damaged_regions: validated.damaged_regions,
-            truncation: validated.truncation,
+    let mut terminal_entries = Vec::new();
+    let mut terminal_rows = Vec::new();
+    let inventory = read_terminal_index_inventory(
+        source,
+        &first_bootstrap.tape_uuid,
+        first_bootstrap.block_size_bytes,
+        |entry| {
+            terminal_entries.push(entry.clone());
+            Ok(())
+        },
+        |row| {
+            terminal_rows.push(row.clone());
+            Ok(())
+        },
+    )
+    .map_err(|error| format!("read terminal tape index: {error}"))?;
+    let recovered = match inventory {
+        TerminalInventoryOutcome::Inventory(selection) => {
+            let map = FilemarkMap::new(
+                terminal_entries
+                    .into_iter()
+                    .map(terminal_entry_to_filemark_entry)
+                    .collect(),
+            )
+            .map_err(|error| format!("build terminal-index filemark map: {error}"))?;
+            RecoveredMap {
+                scope_tape_file_count: map.tape_file_count(),
+                map,
+                object_rows: terminal_rows,
+                bootstrap_generation_used: first_bootstrap.sequence,
+                overlay_source: selected_terminal_replica_name(selection.selected_replica_ordinal),
+                terminal_authority: true,
+                damaged_regions: scan.damaged_regions,
+                truncation: scan.truncation,
+            }
         }
-    } else if winning_bootstrap.no_parity_flag {
-        RecoveredMap {
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(_) => RecoveredMap {
             scope_tape_file_count: scan.map.tape_file_count(),
             map: scan.map,
-            bootstrap_generation_used: winning_bootstrap.sequence,
-            overlay_source: "structural_walk_no_digest",
+            object_rows: Vec::new(),
+            bootstrap_generation_used: first_bootstrap.sequence,
+            overlay_source: "structural_walk_no_terminal_authority",
+            terminal_authority: false,
             damaged_regions: scan.damaged_regions,
             truncation: scan.truncation,
-        }
-    } else {
-        return Err("parity bootstrap has no filemark-map digest".to_string());
+        },
     };
 
     let mut totals = RecoveryTotals {
-        objects_seen: u64::try_from(winning_bootstrap.object_rows.len())
-            .map_err(|_| "object-row count exceeds u64::MAX".to_string())?,
+        objects_seen: if recovered.terminal_authority {
+            u64::try_from(recovered.object_rows.len())
+                .map_err(|_| "terminal Object-row count exceeds u64::MAX".to_string())?
+        } else {
+            recovered
+                .map
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == TapeFileKind::Object)
+                .count()
+                .try_into()
+                .map_err(|_| "structural Object count exceeds u64::MAX".to_string())?
+        },
         ..RecoveryTotals::default()
     };
-    let mut objects = Vec::with_capacity(winning_bootstrap.object_rows.len());
-    for row in &winning_bootstrap.object_rows {
+    let mut objects = Vec::with_capacity(recovered.object_rows.len());
+    for row in &recovered.object_rows {
         let object = report_object_row(
             source,
             &recovered.map,
             recovered.scope_tape_file_count,
-            winning_bootstrap.block_size_bytes,
+            first_bootstrap.block_size_bytes,
             row,
         );
         match object.map_status {
@@ -263,14 +323,32 @@ fn build_recovery_report(
         }
         objects.push(object);
     }
+    if !recovered.terminal_authority {
+        for entry in recovered
+            .map
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == TapeFileKind::Object)
+        {
+            totals.map_agreeing = totals
+                .map_agreeing
+                .checked_add(1)
+                .ok_or_else(|| "recovery map-agreement count overflows u64".to_string())?;
+            totals.failed = totals
+                .failed
+                .checked_add(1)
+                .ok_or_else(|| "recovery failure count overflows u64".to_string())?;
+            objects.push(unknown_structural_object(entry));
+        }
+    }
 
     Ok(CatalogLessRecoveryReport {
         report_version: 1,
-        tape_uuid: hex(&winning_bootstrap.tape_uuid),
-        block_size_bytes: winning_bootstrap.block_size_bytes,
+        tape_uuid: hex(&first_bootstrap.tape_uuid),
+        block_size_bytes: first_bootstrap.block_size_bytes,
         scan: RecoveryScanSummary {
             bootstrap_generation_used: recovered.bootstrap_generation_used,
-            bootstrap_tape_file_number: winning_tape_file_number,
+            bootstrap_tape_file_number: Some(0),
             overlay_source: recovered.overlay_source,
             recovered_scope_tape_file_count: recovered.scope_tape_file_count,
             damaged_regions: recovered
@@ -286,17 +364,64 @@ fn build_recovery_report(
     })
 }
 
+fn terminal_entry_to_filemark_entry(entry: TapeIndexReplicaMapEntry) -> TapeFileMapEntry {
+    TapeFileMapEntry {
+        tape_file_number: entry.tape_file_number,
+        kind: match entry.kind {
+            TapeIndexReplicaFileKind::Object => TapeFileKind::Object,
+            TapeIndexReplicaFileKind::ParitySidecar => TapeFileKind::ParitySidecar,
+            TapeIndexReplicaFileKind::Bootstrap => TapeFileKind::Bootstrap,
+            TapeIndexReplicaFileKind::ParityMap => TapeFileKind::ParityMap,
+            TapeIndexReplicaFileKind::TapeIndexReplica => TapeFileKind::TapeIndexReplica,
+            TapeIndexReplicaFileKind::IndexSeparationExtent => TapeFileKind::IndexSeparationExtent,
+        },
+        block_count: entry.block_count,
+        first_parity_data_ordinal: entry.first_parity_data_ordinal,
+        protected_ordinal_start: entry.protected_ordinal_start,
+        protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive,
+        epoch_id: entry.epoch_id,
+    }
+}
+
+fn selected_terminal_replica_name(ordinal: u16) -> &'static str {
+    match ordinal {
+        1 => "terminal_index_replica_a",
+        2 => "terminal_index_replica_b",
+        3 => "terminal_index_replica_c",
+        _ => "terminal_index_replica_unknown",
+    }
+}
+
+fn unknown_structural_object(entry: &TapeFileMapEntry) -> RecoveryObjectReport {
+    RecoveryObjectReport {
+        tape_file_number: entry.tape_file_number,
+        representation: "unknown",
+        object_id: Value::Null,
+        object_id_encoding: "unavailable",
+        object_id_human: "<identity unavailable>".to_string(),
+        stored_block_count: entry.block_count,
+        map_status: "map_agrees",
+        map_detail: None,
+        verification_status: "terminal_authority_unavailable",
+        verification_detail: Some(
+            "no valid terminal tape-index replica survived; structural recovery cannot prove Object identity"
+                .to_string(),
+        ),
+    }
+}
+
 fn report_object_row(
     source: &mut dyn RawTapeSource,
     map: &FilemarkMap,
-    recovered_scope_tape_file_count: u32,
+    recovered_scope_tape_file_count: u64,
     block_size: u32,
-    row: &BootstrapObjectRow,
+    row: &TapeIndexReplicaObjectRow,
 ) -> RecoveryObjectReport {
-    let (object_id, object_id_encoding, object_id_human) = render_object_id(&row.object_id);
+    let (object_id, object_id_encoding, object_id_human) =
+        render_object_id(Some(row.object_id.as_slice()));
     let representation = match row.representation {
-        BootstrapObjectRepresentation::Plaintext { .. } => "plaintext",
-        BootstrapObjectRepresentation::Encrypted { .. } => "encrypted",
+        ObjectRecoveryRepresentation::Plaintext { .. } => "plaintext",
+        ObjectRecoveryRepresentation::Encrypted { .. } => "encrypted",
     };
     let mut report = RecoveryObjectReport {
         tape_file_number: row.tape_file_number,
@@ -321,10 +446,17 @@ fn report_object_row(
         return report;
     }
 
-    let Some(entry) = map
-        .entries()
-        .get(usize::try_from(row.tape_file_number).unwrap_or(usize::MAX))
-    else {
+    let map_index = match usize::try_from(row.tape_file_number) {
+        Ok(index) => index,
+        Err(_) => {
+            report.map_detail = Some(format!(
+                "tape file {} cannot be indexed in this reader's address space",
+                row.tape_file_number
+            ));
+            return report;
+        }
+    };
+    let Some(entry) = map.entries().get(map_index) else {
         report.map_detail = Some(format!(
             "tape file {} is absent from the recovered map",
             row.tape_file_number
@@ -348,7 +480,7 @@ fn report_object_row(
     report.map_status = "map_agrees";
 
     let verification = match &row.representation {
-        BootstrapObjectRepresentation::Plaintext {
+        ObjectRecoveryRepresentation::Plaintext {
             manifest_first_chunk_lba,
             manifest_size_bytes,
             manifest_chunk_count,
@@ -363,7 +495,7 @@ fn report_object_row(
             *manifest_chunk_count,
             manifest_sha256,
         ),
-        BootstrapObjectRepresentation::Encrypted {
+        ObjectRecoveryRepresentation::Encrypted {
             recipient_epoch_ids,
             metadata_frame_len,
             key_frame_len,
@@ -407,7 +539,7 @@ impl Verification {
 fn verify_plaintext_manifest(
     source: &mut dyn RawTapeSource,
     map: &FilemarkMap,
-    row: &BootstrapObjectRow,
+    row: &TapeIndexReplicaObjectRow,
     block_size: u32,
     manifest_first_chunk_lba: u64,
     manifest_size_bytes: u64,
@@ -495,7 +627,7 @@ fn verify_plaintext_manifest(
 fn verify_encrypted_envelope(
     source: &mut dyn RawTapeSource,
     map: &FilemarkMap,
-    row: &BootstrapObjectRow,
+    row: &TapeIndexReplicaObjectRow,
     block_size: u32,
     expected_recipient_epoch_ids: &[[u8; 16]],
     expected_metadata_frame_len: u64,
@@ -669,7 +801,7 @@ fn validate_envelope_geometry(header: &RemObjectHeader, stored_size: u64) -> Res
 fn verify_envelope_completion(
     source: &mut dyn RawTapeSource,
     map: &FilemarkMap,
-    tape_file_number: u32,
+    tape_file_number: u64,
     block_size: u32,
     footer_offset: u64,
     stored_size: u64,
@@ -771,7 +903,7 @@ fn round_up(value: u64, alignment: u64) -> Result<u64, String> {
 fn read_object_prefix(
     source: &mut dyn RawTapeSource,
     map: &FilemarkMap,
-    tape_file_number: u32,
+    tape_file_number: u64,
     stored_block_count: u64,
     block_size: u32,
     prefix_len: usize,
@@ -819,7 +951,7 @@ fn read_object_prefix(
 fn read_object_block(
     source: &mut dyn RawTapeSource,
     map: &FilemarkMap,
-    tape_file_number: u32,
+    tape_file_number: u64,
     block_within_file: u64,
     buf: &mut [u8],
 ) -> Result<(), String> {
@@ -848,7 +980,7 @@ fn read_object_block(
     }
 }
 
-fn render_object_id(object_id: &Option<Vec<u8>>) -> (Value, &'static str, String) {
+fn render_object_id(object_id: Option<&[u8]>) -> (Value, &'static str, String) {
     let Some(bytes) = object_id else {
         let absent = "absent(minor<=2)".to_string();
         return (Value::String(absent.clone()), "absent", absent);
@@ -861,17 +993,6 @@ fn render_object_id(object_id: &Option<Vec<u8>>) -> (Value, &'static str, String
             "base64",
             human,
         ),
-    }
-}
-
-fn overlay_source_name(source: ScanOverlaySource) -> &'static str {
-    match source {
-        ScanOverlaySource::StructuralWalk => "structural_walk",
-        ScanOverlaySource::Catalog => "catalog",
-        ScanOverlaySource::BootstrapInlineDirectory => "bootstrap_inline_directory",
-        ScanOverlaySource::ReferencedParityMap => "referenced_parity_map",
-        ScanOverlaySource::StructurallySelectedParityMap => "structurally_selected_parity_map",
-        ScanOverlaySource::ParityMapReferenceProjection => "parity_map_reference_projection",
     }
 }
 
@@ -965,26 +1086,29 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Command as ProcessCommand;
 
     use clap::Parser as _;
-    use remanence_parity::{BootstrapObjectRow, FilemarkMap, RawTapeSource, TapeFileMapEntry};
+    use remanence_aead::{
+        seal_deterministic_for_test_vectors, DataEncryptionKey, EnvelopeSealOptions,
+        RecipientPrivateKey, SealOptions, SealReport,
+    };
+    use remanence_parity::bootstrap::write_bootstrap_block;
+    use remanence_parity::{
+        checked_tape_index_replica_layout, default_scheme_for_block_size, plan_index_separation,
+        plan_tape_index_edition, plan_tape_index_replica, write_index_separation,
+        write_tape_index_replica, BootstrapPayload, IndexSeparationDescriptor,
+        IndexSeparationObservation, ParityError, ParitySchemeRecord, RawTapeSource,
+        TapeIndexEditionDescriptor, TapeIndexReplicaCounts, TapeIndexReplicaObservation,
+        TapeIndexReplicaRecordSource, TapeIndexReplicaScope, TerminalTailLayout,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
 
-    const OBJECT_ID_IMAGE: &str = "rem-parity-1/positive/object-id-36-bootstrap";
-    const MINIMAL_IMAGE: &str = "rem-parity-1/positive/minimal-image";
-    const KEY_30_PLAINTEXT_IMAGE: &str = "rem-parity-1/positive/key-30-plaintext-attested";
-    const KEY_30_ENCRYPTED_IMAGE: &str = "rem-parity-1/positive/key-30-encrypted-attested";
-    const ENCRYPTED_OBJECT: &str = "rem-object/objects/rem-object-tv-e2.rem-object";
-    const ENCRYPTED_MANIFEST: &str = "rem-object/manifests/rem-object-tv-e2.json";
-
-    fn archive_path() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../specs/publication/remanence-test-vectors.tar")
-    }
+    const BLOCK_SIZE: u32 = 262_144;
+    const TAPE_UUID: [u8; 16] = [0x42; 16];
+    const OBJECT_ID: &str = "00000000-0000-4000-8000-000000000001";
 
     #[test]
     fn debug_cli_parses_documented_recovery_report_syntax() {
@@ -1007,35 +1131,297 @@ mod tests {
         }
     }
 
-    fn extract_archive_entries(entries: &[&str]) -> TempDir {
-        let temp = tempfile::tempdir().expect("fixture extraction directory creates");
-        let mut command = ProcessCommand::new("tar");
-        command
-            .arg("-xf")
-            .arg(archive_path())
-            .arg("-C")
-            .arg(temp.path())
-            .args(entries);
-        let status = command
-            .status()
-            .expect("tar is required to extract the pinned publication archive");
-        assert!(
-            status.success(),
-            "tar must extract every requested pinned publication fixture"
-        );
+    fn parity_scheme_record() -> ParitySchemeRecord {
+        let scheme = default_scheme_for_block_size(BLOCK_SIZE);
+        ParitySchemeRecord {
+            id: scheme.id.as_str().to_string(),
+            data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+            parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+            stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            no_parity_flag: false,
+        }
+    }
+
+    fn bootstrap_block(parity_protected: bool) -> Vec<u8> {
+        let map =
+            FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("BOT map validates");
+        let payload = BootstrapPayload {
+            scheme: parity_protected.then(parity_scheme_record),
+            no_parity_flag: !parity_protected,
+            filemark_map_digest: Some(map.digest(false).expect("BOT map digest builds")),
+            tape_uuid: TAPE_UUID,
+            written_by_version: "recovery-report-hermetic-test".to_string(),
+            written_at: "2026-08-09T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: BLOCK_SIZE,
+            drive_compression: false,
+        };
+        let mut block = vec![0u8; BLOCK_SIZE as usize];
+        write_bootstrap_block(&payload, &mut block).expect("major-2 bootstrap block encodes");
+        block
+    }
+
+    #[derive(Clone)]
+    struct TerminalRows {
+        entries: Vec<TapeIndexReplicaMapEntry>,
+        rows: Vec<TapeIndexReplicaObjectRow>,
+    }
+
+    impl TapeIndexReplicaRecordSource for TerminalRows {
+        fn visit_structural_entries(
+            &mut self,
+            visitor: &mut dyn FnMut(&TapeIndexReplicaMapEntry) -> Result<(), ParityError>,
+        ) -> Result<(), ParityError> {
+            for entry in &self.entries {
+                visitor(entry)?;
+            }
+            Ok(())
+        }
+
+        fn visit_object_rows(
+            &mut self,
+            visitor: &mut dyn FnMut(&TapeIndexReplicaObjectRow) -> Result<(), ParityError>,
+        ) -> Result<(), ParityError> {
+            for row in &self.rows {
+                visitor(row)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn minimal_image() -> Vec<Vec<u8>> {
+        terminal_image(None, false)
+    }
+
+    fn plaintext_image(parity_protected: bool) -> Vec<Vec<u8>> {
+        let manifest = b"hermetic major-2 plaintext manifest";
+        let mut object = vec![0x31; BLOCK_SIZE as usize * 2];
+        object[BLOCK_SIZE as usize..BLOCK_SIZE as usize + manifest.len()].copy_from_slice(manifest);
+        let manifest_digest: [u8; 32] = Sha256::digest(manifest).into();
+        let row = TapeIndexReplicaObjectRow {
+            tape_file_number: 1,
+            stored_block_count: 2,
+            object_id: OBJECT_ID.as_bytes().to_vec(),
+            representation: ObjectRecoveryRepresentation::Plaintext {
+                manifest_first_chunk_lba: 1,
+                manifest_size_bytes: manifest.len() as u64,
+                manifest_chunk_count: 1,
+                manifest_sha256: manifest_digest,
+            },
+        };
+        image_with_object(object, row, parity_protected)
+    }
+
+    fn sealed_object() -> (Vec<u8>, SealReport, Vec<[u8; 16]>) {
+        let recipient_epoch_id = [0x71; 16];
+        let recipient = RecipientPrivateKey::new(recipient_epoch_id, "hermetic-recovery", [7; 32])
+            .expect("hermetic recipient key builds");
+        let plaintext = vec![0x5a; BLOCK_SIZE as usize];
+        let plaintext_digest: [u8; 32] = Sha256::digest(&plaintext).into();
+        let options = EnvelopeSealOptions {
+            common: SealOptions {
+                chunk_size: BLOCK_SIZE,
+                object_id: OBJECT_ID.to_string(),
+                plaintext_size: plaintext.len() as u64,
+                plaintext_digest,
+            },
+            allow_single_recipient: true,
+            recipients: vec![recipient
+                .public_key(0)
+                .expect("recipient public key derives")],
+        };
+        let mut object = Vec::new();
+        let report = seal_deterministic_for_test_vectors(
+            plaintext.as_slice(),
+            &mut object,
+            &options,
+            DataEncryptionKey::from_bytes([0x44; 32]),
+            [0x55; 32],
+        )
+        .expect("object seals deterministically");
+        (object, report, vec![recipient_epoch_id])
+    }
+
+    fn encrypted_image() -> Vec<Vec<u8>> {
+        let (object, seal, recipient_epoch_ids) = sealed_object();
+        let row = TapeIndexReplicaObjectRow {
+            tape_file_number: 1,
+            stored_block_count: seal.stored_size_blocks,
+            object_id: OBJECT_ID.as_bytes().to_vec(),
+            representation: ObjectRecoveryRepresentation::Encrypted {
+                recipient_epoch_ids,
+                metadata_frame_len: seal.metadata_frame_len,
+                key_frame_len: seal.header.key_frame_len,
+            },
+        };
+        image_with_object(object, row, true)
+    }
+
+    fn image_with_object(
+        object: Vec<u8>,
+        row: TapeIndexReplicaObjectRow,
+        parity_protected: bool,
+    ) -> Vec<Vec<u8>> {
+        terminal_image(Some((object, row)), parity_protected)
+    }
+
+    fn terminal_image(
+        object: Option<(Vec<u8>, TapeIndexReplicaObjectRow)>,
+        parity_protected: bool,
+    ) -> Vec<Vec<u8>> {
+        let mut entries = vec![TapeIndexReplicaMapEntry {
+            tape_file_number: 0,
+            kind: TapeIndexReplicaFileKind::Bootstrap,
+            block_count: 1,
+            first_parity_data_ordinal: None,
+            protected_ordinal_start: None,
+            protected_ordinal_end_exclusive: None,
+            epoch_id: None,
+        }];
+        let mut rows = Vec::new();
+        let mut files = vec![bootstrap_block(parity_protected)];
+        if let Some((object, row)) = object {
+            entries.push(TapeIndexReplicaMapEntry {
+                tape_file_number: 1,
+                kind: TapeIndexReplicaFileKind::Object,
+                block_count: row.stored_block_count,
+                first_parity_data_ordinal: Some(0),
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                epoch_id: None,
+            });
+            rows.push(row);
+            files.push(object);
+        }
+        let authority = TerminalRows { entries, rows };
+        let counts = TapeIndexReplicaCounts {
+            structural_entry_count: authority.entries.len() as u64,
+            object_row_count: authority.rows.len() as u64,
+        };
+        let replica_records = checked_tape_index_replica_layout(BLOCK_SIZE, counts)
+            .expect("terminal replica layout")
+            .replica_record_count;
+        let prefix_end_lba = authority
+            .entries
+            .iter()
+            .map(|entry| entry.block_count + 1)
+            .sum();
+        let layout = TerminalTailLayout::new(
+            0,
+            BLOCK_SIZE,
+            counts.structural_entry_count,
+            prefix_end_lba,
+            replica_records,
+            3,
+        )
+        .expect("terminal tail layout");
+        let mut planning = authority.clone();
+        let edition = plan_tape_index_edition(
+            TapeIndexEditionDescriptor {
+                tape_uuid: TAPE_UUID,
+                edition_id: [0x52; 16],
+                edition_sequence: 1,
+                scope: TapeIndexReplicaScope {
+                    covered_prefix_tape_file_count: counts.structural_entry_count,
+                    total_data_ordinals: authority
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.kind == TapeIndexReplicaFileKind::Object)
+                        .map(|entry| entry.block_count)
+                        .sum(),
+                    highest_protected_ordinal: 0,
+                },
+                counts,
+                block_size: BLOCK_SIZE,
+                compression_enabled: false,
+                writer_version: "recovery-report-hermetic-test".to_string(),
+                write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+                terminal_layout: layout,
+            },
+            &mut planning,
+        )
+        .expect("terminal edition plans");
+        for ordinal in 1..=3 {
+            let plan = plan_tape_index_replica(edition.clone(), ordinal).expect("replica plan");
+            let mut file = Vec::new();
+            let mut source = authority.clone();
+            write_tape_index_replica(
+                &plan,
+                TapeIndexReplicaObservation {
+                    tape_file_number: plan.component.planned_tape_file_number,
+                    start_lba: plan.component.planned_start_lba,
+                    record_count: plan.component.record_count,
+                },
+                &mut source,
+                |block| {
+                    file.extend_from_slice(block);
+                    Ok(())
+                },
+            )
+            .expect("terminal replica writes");
+            files.push(file);
+            if ordinal != 3 {
+                let separation = plan_index_separation(IndexSeparationDescriptor {
+                    tape_uuid: TAPE_UUID,
+                    edition_id: edition.descriptor.edition_id,
+                    gap_ordinal: ordinal,
+                    block_size: BLOCK_SIZE,
+                    nominal_extent_bytes: 3 * u64::from(BLOCK_SIZE),
+                    total_records: 3,
+                    compression_enabled: false,
+                    terminal_layout: layout,
+                })
+                .expect("separation plan");
+                let mut gap = Vec::new();
+                write_index_separation(
+                    &separation,
+                    IndexSeparationObservation {
+                        tape_file_number: separation.component.planned_tape_file_number,
+                        start_lba: separation.component.planned_start_lba,
+                        record_count: separation.component.record_count,
+                    },
+                    |block| {
+                        gap.extend_from_slice(block);
+                        Ok(())
+                    },
+                )
+                .expect("separation writes");
+                files.push(gap);
+            }
+        }
+        files
+    }
+
+    fn write_image_directory(tape_files: &[Vec<u8>]) -> TempDir {
+        let temp = tempfile::tempdir().expect("hermetic image directory creates");
+        for (index, bytes) in tape_files.iter().enumerate() {
+            let kind = if index == 0 {
+                "bootstrap"
+            } else if index == 1 && tape_files.len() == 7 {
+                "object"
+            } else {
+                "terminal"
+            };
+            fs::write(
+                temp.path().join(format!("tape-file-{index:03}-{kind}.bin")),
+                bytes,
+            )
+            .expect("hermetic tape file writes");
+        }
         temp
     }
 
     fn image_report(path: &Path) -> CatalogLessRecoveryReport {
-        let mut source = ImageDirectoryRawSource::open(path).expect("pinned image directory opens");
+        let mut source =
+            ImageDirectoryRawSource::open(path).expect("hermetic image directory opens");
         let candidates = source.candidate_block_sizes().to_vec();
-        build_recovery_report(&mut source, &candidates).expect("pinned image report builds")
+        build_recovery_report(&mut source, &candidates).expect("hermetic image report builds")
     }
 
     #[test]
     fn minimal_image_json_stable_fields_are_green() {
-        let temp = extract_archive_entries(&[MINIMAL_IMAGE]);
-        let report = image_report(&temp.path().join(MINIMAL_IMAGE));
+        let temp = write_image_directory(&minimal_image());
+        let report = image_report(temp.path());
         let actual = serde_json::to_value(report).expect("report serializes");
         assert_eq!(
             json!({
@@ -1054,19 +1440,19 @@ mod tests {
             json!({
                 "report_version": 1,
                 "tape_uuid": "42424242424242424242424242424242",
-                "block_size_bytes": 4096,
+                "block_size_bytes": 262144,
                 "scan": {
-                    "bootstrap_generation_used": 1,
-                    "overlay_source": "bootstrap_inline_directory",
-                    "recovered_scope_tape_file_count": 4,
+                    "bootstrap_generation_used": "0",
+                    "overlay_source": "terminal_index_replica_c",
+                    "recovered_scope_tape_file_count": "1",
                     "damaged_regions": [],
                 },
                 "totals": {
-                    "objects_seen": 0,
-                    "map_agreeing": 0,
-                    "verified": 0,
-                    "failed": 0,
-                    "beyond_scope": 0,
+                    "objects_seen": "0",
+                    "map_agreeing": "0",
+                    "verified": "0",
+                    "failed": "0",
+                    "beyond_scope": "0",
                 },
                 "success": true,
             })
@@ -1074,9 +1460,77 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_key_30_image_verifies_manifest_and_object_identity() {
-        let temp = extract_archive_entries(&[OBJECT_ID_IMAGE]);
-        let report = image_report(&temp.path().join(OBJECT_ID_IMAGE));
+    fn recovery_report_json_preserves_structural_u64_values_as_decimal_strings() {
+        let report = CatalogLessRecoveryReport {
+            report_version: 1,
+            tape_uuid: "42424242424242424242424242424242".to_string(),
+            block_size_bytes: BLOCK_SIZE,
+            scan: RecoveryScanSummary {
+                bootstrap_generation_used: u64::MAX,
+                bootstrap_tape_file_number: Some(u64::MAX),
+                overlay_source: "structural_walk",
+                recovered_scope_tape_file_count: u64::MAX,
+                damaged_regions: vec![RecoveryDamageRegion {
+                    start_lba: u64::MAX,
+                    partition: 0,
+                    block_count: u64::MAX,
+                    kind: "unreadable_tape_file_head",
+                }],
+                truncation: Some(RecoveryTruncation {
+                    tape_file_number: u64::MAX,
+                    start_lba: u64::MAX,
+                    partition: 0,
+                    kind: "missing_trailing_filemark",
+                }),
+            },
+            objects: vec![RecoveryObjectReport {
+                tape_file_number: u64::MAX,
+                representation: "plaintext",
+                object_id: Value::String(OBJECT_ID.to_string()),
+                object_id_encoding: "utf8",
+                object_id_human: OBJECT_ID.to_string(),
+                stored_block_count: u64::MAX,
+                map_status: "map_agrees",
+                map_detail: None,
+                verification_status: "manifest_verified",
+                verification_detail: None,
+            }],
+            totals: RecoveryTotals {
+                objects_seen: u64::MAX,
+                map_agreeing: u64::MAX,
+                verified: u64::MAX,
+                failed: u64::MAX,
+                beyond_scope: u64::MAX,
+            },
+            success: true,
+        };
+
+        let json = serde_json::to_value(report).expect("recovery report serializes");
+        let maximum = Value::String(u64::MAX.to_string());
+        for pointer in [
+            "/scan/bootstrap_generation_used",
+            "/scan/bootstrap_tape_file_number",
+            "/scan/recovered_scope_tape_file_count",
+            "/scan/damaged_regions/0/start_lba",
+            "/scan/damaged_regions/0/block_count",
+            "/scan/truncation/tape_file_number",
+            "/scan/truncation/start_lba",
+            "/objects/0/tape_file_number",
+            "/objects/0/stored_block_count",
+            "/totals/objects_seen",
+            "/totals/map_agreeing",
+            "/totals/verified",
+            "/totals/failed",
+            "/totals/beyond_scope",
+        ] {
+            assert_eq!(json.pointer(pointer), Some(&maximum), "{pointer}");
+        }
+    }
+
+    #[test]
+    fn plaintext_major_2_image_verifies_manifest_and_object_identity() {
+        let temp = write_image_directory(&plaintext_image(false));
+        let report = image_report(temp.path());
         assert!(report.success);
         assert_eq!(report.totals.objects_seen, 1);
         assert_eq!(report.totals.map_agreeing, 1);
@@ -1084,21 +1538,22 @@ mod tests {
         let object = &report.objects[0];
         assert_eq!(object.map_status, "map_agrees");
         assert_eq!(object.verification_status, "manifest_verified");
-        assert_eq!(
-            object.object_id,
-            Value::String("00000000-0000-4000-8000-000000000001".to_string())
-        );
+        assert_eq!(object.object_id, Value::String(OBJECT_ID.to_string()));
         assert_eq!(object.object_id_encoding, "utf8");
     }
 
-    fn assert_attested_key_30_image(image: &str, representation: &str, verification_status: &str) {
-        let temp = extract_archive_entries(&[image]);
-        let report = image_report(&temp.path().join(image));
+    fn assert_attested_major_2_image(
+        image: Vec<Vec<u8>>,
+        representation: &str,
+        verification_status: &str,
+    ) {
+        let temp = write_image_directory(&image);
+        let report = image_report(temp.path());
         assert!(report.success);
-        assert_eq!(report.scan.bootstrap_generation_used, 1);
-        assert_eq!(report.scan.bootstrap_tape_file_number, Some(3));
-        assert_eq!(report.scan.overlay_source, "bootstrap_inline_directory");
-        assert_eq!(report.scan.recovered_scope_tape_file_count, 4);
+        assert_eq!(report.scan.bootstrap_generation_used, 0);
+        assert_eq!(report.scan.bootstrap_tape_file_number, Some(0));
+        assert_eq!(report.scan.overlay_source, "terminal_index_replica_c");
+        assert_eq!(report.scan.recovered_scope_tape_file_count, 2);
         assert!(report.scan.damaged_regions.is_empty());
         assert_eq!(report.totals.objects_seen, 1);
         assert_eq!(report.totals.map_agreeing, 1);
@@ -1108,36 +1563,59 @@ mod tests {
         assert_eq!(object.representation, representation);
         assert_eq!(object.map_status, "map_agrees");
         assert_eq!(object.verification_status, verification_status);
-        assert_eq!(
-            object.object_id,
-            Value::String("00000000-0000-4000-8000-000000000001".to_string())
-        );
+        assert_eq!(object.object_id, Value::String(OBJECT_ID.to_string()));
     }
 
     #[test]
-    fn parity_protected_plaintext_key_30_image_is_attested_and_green() {
-        assert_attested_key_30_image(KEY_30_PLAINTEXT_IMAGE, "plaintext", "manifest_verified");
+    fn parity_protected_plaintext_major_2_image_is_attested_and_green() {
+        assert_attested_major_2_image(plaintext_image(true), "plaintext", "manifest_verified");
     }
 
     #[test]
-    fn encrypted_key_30_image_is_attested_and_green() {
-        assert_attested_key_30_image(KEY_30_ENCRYPTED_IMAGE, "encrypted", "envelope_consistent");
+    fn encrypted_major_2_image_is_attested_and_green() {
+        assert_attested_major_2_image(encrypted_image(), "encrypted", "envelope_consistent");
     }
 
     #[test]
     fn rows_outside_scope_are_not_failures_and_in_scope_map_mismatches_are() {
-        let row = BootstrapObjectRow::plaintext(1, 2, 0, 1, 1, [0u8; 32]);
-        let map = FilemarkMap::new(vec![TapeFileMapEntry::object(0, 1, 0)])
-            .expect("one-object map is valid");
-        let mut source = ImageDirectoryRawSource::from_tape_files(vec![vec![0u8; 4096]], 4096)
-            .expect("one-object image wraps");
+        let above_u32 = u64::from(u32::MAX) + 17;
+        let row = TapeIndexReplicaObjectRow {
+            tape_file_number: above_u32,
+            stored_block_count: 2,
+            object_id: b"outside-scope".to_vec(),
+            representation: ObjectRecoveryRepresentation::Plaintext {
+                manifest_first_chunk_lba: 0,
+                manifest_size_bytes: 1,
+                manifest_chunk_count: 1,
+                manifest_sha256: [0u8; 32],
+            },
+        };
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 1, 0),
+        ])
+        .expect("one-object map is valid");
+        let mut source =
+            ImageDirectoryRawSource::from_tape_files(vec![vec![0u8; 4096], vec![0u8; 4096]], 4096)
+                .expect("BOT-plus-object image wraps");
 
-        let beyond = report_object_row(&mut source, &map, 1, 4096, &row);
+        let beyond = report_object_row(&mut source, &map, 2, 4096, &row);
+        assert_eq!(beyond.tape_file_number, above_u32);
         assert_eq!(beyond.map_status, "beyond_recovered_scope");
         assert_eq!(beyond.verification_status, "not_checked_beyond_scope");
 
-        let mismatching_row = BootstrapObjectRow::plaintext(0, 2, 0, 1, 1, [0u8; 32]);
-        let mismatch = report_object_row(&mut source, &map, 1, 4096, &mismatching_row);
+        let mismatching_row = TapeIndexReplicaObjectRow {
+            tape_file_number: 1,
+            stored_block_count: 2,
+            object_id: b"mismatch".to_vec(),
+            representation: ObjectRecoveryRepresentation::Plaintext {
+                manifest_first_chunk_lba: 0,
+                manifest_size_bytes: 1,
+                manifest_chunk_count: 1,
+                manifest_sha256: [0u8; 32],
+            },
+        };
+        let mismatch = report_object_row(&mut source, &map, 2, 4096, &mismatching_row);
         assert_eq!(mismatch.map_status, "map_mismatch");
         assert!(mismatch
             .map_detail
@@ -1148,13 +1626,12 @@ mod tests {
 
     #[test]
     fn unreadable_manifest_block_is_a_precise_row_failure_and_exit_two() {
-        let temp = extract_archive_entries(&[OBJECT_ID_IMAGE]);
-        let image = temp.path().join(OBJECT_ID_IMAGE);
+        let temp = write_image_directory(&plaintext_image(false));
         let mut source =
-            ImageDirectoryRawSource::open(&image).expect("pinned plaintext image opens");
+            ImageDirectoryRawSource::open(temp.path()).expect("hermetic plaintext image opens");
         source
-            .mark_unreadable(1, 4)
-            .expect("pinned manifest block exists");
+            .mark_unreadable(1, 1)
+            .expect("hermetic manifest block exists");
         let candidates = source.candidate_block_sizes().to_vec();
         let report =
             build_recovery_report(&mut source, &candidates).expect("damage remains reportable");
@@ -1167,13 +1644,13 @@ mod tests {
         assert!(report.objects[0]
             .verification_detail
             .as_deref()
-            .is_some_and(|detail| detail.contains("block 4")));
+            .is_some_and(|detail| detail.contains("block 1")));
 
         let mut source =
-            ImageDirectoryRawSource::open(&image).expect("pinned plaintext image reopens");
+            ImageDirectoryRawSource::open(temp.path()).expect("hermetic plaintext image reopens");
         source
-            .mark_unreadable(1, 4)
-            .expect("pinned manifest block exists");
+            .mark_unreadable(1, 1)
+            .expect("hermetic manifest block exists");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let exit =
@@ -1184,17 +1661,16 @@ mod tests {
 
     #[test]
     fn manifest_byte_damage_is_digest_mismatch_and_exit_two() {
-        let temp = extract_archive_entries(&[OBJECT_ID_IMAGE]);
-        let image = temp.path().join(OBJECT_ID_IMAGE);
-        let object_path = image.join("tape-file-001-object.bin");
-        let mut object = fs::read(&object_path).expect("pinned image object reads");
-        object[4 * 4096] ^= 1;
+        let temp = write_image_directory(&plaintext_image(false));
+        let object_path = temp.path().join("tape-file-001-object.bin");
+        let mut object = fs::read(&object_path).expect("hermetic image object reads");
+        object[BLOCK_SIZE as usize] ^= 1;
         fs::write(&object_path, object)
-            .expect("fault injection rewrites only the extracted temporary image");
+            .expect("fault injection rewrites only the hermetic temporary image");
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit = run_image_recovery_report(&image, true, &mut stdout, &mut stderr);
+        let exit = run_image_recovery_report(temp.path(), true, &mut stdout, &mut stderr);
         assert_eq!(exit, ExitCode::from(2));
         assert!(stderr.is_empty());
         let report: Value = serde_json::from_slice(&stdout).expect("JSON failure report parses");
@@ -1202,74 +1678,43 @@ mod tests {
             report["objects"][0]["verification_status"],
             "manifest_digest_mismatch"
         );
-        assert_eq!(report["totals"]["failed"], 1);
+        assert_eq!(report["totals"]["failed"], "1");
     }
 
     #[test]
-    fn encrypted_publication_object_exercises_key_21_through_23_checks() {
-        let temp = extract_archive_entries(&[ENCRYPTED_OBJECT, ENCRYPTED_MANIFEST]);
-        let object =
-            fs::read(temp.path().join(ENCRYPTED_OBJECT)).expect("pinned encrypted object reads");
-        let manifest: Value = serde_json::from_slice(
-            &fs::read(temp.path().join(ENCRYPTED_MANIFEST))
-                .expect("pinned encrypted manifest reads"),
+    fn encrypted_hermetic_object_exercises_key_21_through_23_checks() {
+        let (object, seal, recipient_epoch_ids) = sealed_object();
+        let row = TapeIndexReplicaObjectRow {
+            tape_file_number: 1,
+            stored_block_count: seal.stored_size_blocks,
+            object_id: OBJECT_ID.as_bytes().to_vec(),
+            representation: ObjectRecoveryRepresentation::Encrypted {
+                recipient_epoch_ids: recipient_epoch_ids.clone(),
+                metadata_frame_len: seal.metadata_frame_len,
+                key_frame_len: seal.header.key_frame_len,
+            },
+        };
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, seal.stored_size_blocks, 0),
+        ])
+        .expect("one-object map is valid");
+        let mut source = ImageDirectoryRawSource::from_tape_files(
+            vec![vec![0u8; BLOCK_SIZE as usize], object.clone()],
+            BLOCK_SIZE,
         )
-        .expect("pinned encrypted manifest parses");
-        let block_size = manifest["inputs"]["chunk_size"]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .expect("pinned chunk size fits u32");
-        let stored_block_count = manifest["expected"]["stored_size_blocks"]
-            .as_u64()
-            .expect("pinned stored block count exists");
-        let metadata_frame_len = manifest["expected"]["metadata_frame_len"]
-            .as_u64()
-            .expect("pinned metadata frame length exists");
-        let key_frame_len = manifest["expected"]["key_frame_len"]
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .expect("pinned key frame length fits u32");
-        let recipient_epoch_ids = manifest["inputs"]["recipients"]
-            .as_array()
-            .expect("pinned recipients are an array")
-            .iter()
-            .map(|recipient| {
-                decode_hex_16(
-                    recipient["recipient_epoch_id"]
-                        .as_str()
-                        .expect("pinned recipient epoch id is text"),
-                )
-            })
-            .collect::<Vec<_>>();
-        let row = BootstrapObjectRow::encrypted(
-            0,
-            stored_block_count,
-            recipient_epoch_ids.clone(),
-            metadata_frame_len,
-            key_frame_len,
-        )
-        .with_object_id(
-            manifest["inputs"]["object_id"]
-                .as_str()
-                .expect("pinned object id exists")
-                .as_bytes()
-                .to_vec(),
-        );
-        let map = FilemarkMap::new(vec![TapeFileMapEntry::object(0, stored_block_count, 0)])
-            .expect("one-object map is valid");
-        let mut source = ImageDirectoryRawSource::from_tape_files(vec![object.clone()], block_size)
-            .expect("pinned encrypted object wraps as one tape file");
+        .expect("hermetic encrypted object wraps after BOT");
         source
-            .configure_fixed_block_size(block_size)
-            .expect("pinned encrypted image configures");
+            .configure_fixed_block_size(BLOCK_SIZE)
+            .expect("hermetic encrypted image configures");
         let verification = verify_encrypted_envelope(
             &mut source,
             &map,
             &row,
-            block_size,
+            BLOCK_SIZE,
             &recipient_epoch_ids,
-            metadata_frame_len,
-            key_frame_len,
+            seal.metadata_frame_len,
+            seal.header.key_frame_len,
         );
         assert_eq!(verification.status, "envelope_consistent");
         assert_eq!(verification.detail, None);
@@ -1277,23 +1722,25 @@ mod tests {
         let footer_offset = object
             .windows(REM_OBJECT_FOOTER.len())
             .rposition(|window| window == REM_OBJECT_FOOTER)
-            .expect("pinned encrypted object carries completion footer");
+            .expect("hermetic encrypted object carries completion footer");
         let mut damaged_object = object;
         damaged_object[footer_offset] ^= 1;
-        let mut damaged_source =
-            ImageDirectoryRawSource::from_tape_files(vec![damaged_object], block_size)
-                .expect("damaged encrypted object wraps as one tape file");
+        let mut damaged_source = ImageDirectoryRawSource::from_tape_files(
+            vec![vec![0u8; BLOCK_SIZE as usize], damaged_object],
+            BLOCK_SIZE,
+        )
+        .expect("damaged encrypted object wraps after BOT");
         damaged_source
-            .configure_fixed_block_size(block_size)
+            .configure_fixed_block_size(BLOCK_SIZE)
             .expect("damaged encrypted image configures");
         let damaged = verify_encrypted_envelope(
             &mut damaged_source,
             &map,
             &row,
-            block_size,
+            BLOCK_SIZE,
             &recipient_epoch_ids,
-            metadata_frame_len,
-            key_frame_len,
+            seal.metadata_frame_len,
+            seal.header.key_frame_len,
         );
         assert_eq!(damaged.status, "envelope_completion_invalid");
     }
@@ -1301,7 +1748,7 @@ mod tests {
     #[test]
     fn non_utf8_object_identity_is_base64_in_json_and_lossy_for_humans() {
         let bytes = vec![0xff, b'A'];
-        let (json_value, encoding, human) = render_object_id(&Some(bytes.clone()));
+        let (json_value, encoding, human) = render_object_id(Some(bytes.as_slice()));
         assert_eq!(json_value, Value::String(BASE64_STANDARD.encode(bytes)));
         assert_eq!(encoding, "base64");
         assert!(human.contains('\u{fffd}'));
@@ -1309,7 +1756,7 @@ mod tests {
 
     #[test]
     fn absent_legacy_object_identity_uses_the_required_marker() {
-        let (json_value, encoding, human) = render_object_id(&None);
+        let (json_value, encoding, human) = render_object_id(None);
         assert_eq!(json_value, Value::String("absent(minor<=2)".to_string()));
         assert_eq!(encoding, "absent");
         assert_eq!(human, "absent(minor<=2)");
@@ -1329,9 +1776,9 @@ mod tests {
             }
         }
 
-        let temp = extract_archive_entries(&[MINIMAL_IMAGE]);
-        let mut source = ImageDirectoryRawSource::open(temp.path().join(MINIMAL_IMAGE))
-            .expect("pinned minimal image opens");
+        let temp = write_image_directory(&minimal_image());
+        let mut source =
+            ImageDirectoryRawSource::open(temp.path()).expect("hermetic minimal image opens");
         let candidates = source.candidate_block_sizes().to_vec();
         let mut stdout = FailingWriter;
         let mut stderr = Vec::new();
@@ -1341,15 +1788,5 @@ mod tests {
         assert!(String::from_utf8(stderr)
             .expect("error is UTF-8")
             .contains("write human recovery report"));
-    }
-
-    fn decode_hex_16(value: &str) -> [u8; 16] {
-        assert_eq!(value.len(), 32, "pinned epoch id is 16 bytes");
-        let mut output = [0u8; 16];
-        for (index, byte) in output.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-                .expect("pinned epoch id is lowercase hex");
-        }
-        output
     }
 }

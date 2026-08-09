@@ -54,23 +54,29 @@ chunks (and their stored ciphertext byte offsets) that must be fetched
 and authenticated to serve it. What `rem archive covering-range` prints
 and `extract-stream`'s ranged mode consumes.
 
-**REM-PARITY** — the tape-layout-plus-parity format: bootstrap blocks,
-object tape files, Reed-Solomon parity sidecars, and parity maps.
+**REM-PARITY** — the tape-layout-plus-parity format: the BOT Bootstrap,
+Object tape files, Reed-Solomon parity sidecars, final parity map, and the
+A/gap/B/gap/C terminal inventory.
 Published as the REM-PARITY 1.0 specification.
 
-**bootstrap** — the self-description block a tape carries at LBA 0 (and
-at intervals down the tape): tape UUID, block size, parity scheme,
-filemark-map digest. What makes a tape readable without the catalog.
-Sequence 0 at BOT doubles as the volume label.
+**Bootstrap** — the Object-count-independent self-description block at LBA 0:
+tape UUID, block size, and parity scheme. It contains no Object recovery rows
+and is not repeated at checkpoints or finalization.
 
 **parity sidecar** — a tape file of Reed-Solomon parity shards covering
 the data blocks written since the previous sidecar.
 
-**parity map** — a tape file acting as a directory of sidecar epochs when
-that directory outgrows the bootstrap.
+**parity map** — the final pre-A sidecar-directory file emitted during parity
+closeout when sidecar metadata exists. It is indexed by the terminal replicas
+but is not itself terminal inventory authority.
+
+**terminal replica** — one of three complete streamed final inventories, A,
+B, and C. A reader prefers C, then B, then A, while requiring valid survivors
+to agree.
 
 **filemark map** — the structural catalog of a tape: which tape file at
-which position is an object, sidecar, bootstrap, or parity map.
+which position is an Object, sidecar, BOT Bootstrap, or final parity map. The terminal replica
+payload fixes the complete pre-tail map.
 
 **stripe / neighborhood** — parity geometry. A stripe is k data blocks
 plus m parity blocks; a neighborhood is S consecutive stripes whose

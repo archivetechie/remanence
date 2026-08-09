@@ -14,150 +14,57 @@ set_option maxRecDepth 2048
 
 namespace parity_capacity_verif
 
-/-- [parity_capacity_verif::CapacityReserveCause]
-    Source: 'src/lib.rs', lines 11:0-14:1
-    Visibility: public -/
-@[discriminant isize]
-inductive CapacityReserveCause where
-| TapeCapacity : CapacityReserveCause
-| ParitySpoolCapacity : CapacityReserveCause
-
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityReserveCause}::clone]:
-    Source: 'src/lib.rs', lines 10:9-10:14
-    Visibility: public -/
-def CapacityReserveCause.Insts.CoreCloneClone.clone
-  (self : CapacityReserveCause) : Result CapacityReserveCause := do
-  ok self
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityReserveCause}]
-    Source: 'src/lib.rs', lines 10:9-10:14 -/
-@[reducible]
-def CapacityReserveCause.Insts.CoreCloneClone : core.clone.Clone
-  CapacityReserveCause := {
-  clone := CapacityReserveCause.Insts.CoreCloneClone.clone
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::CapacityReserveCause}]
-    Source: 'src/lib.rs', lines 10:16-10:20 -/
-@[reducible]
-def CapacityReserveCause.Insts.CoreMarkerCopy : core.marker.Copy
-  CapacityReserveCause := {
-  cloneInst := CapacityReserveCause.Insts.CoreCloneClone
-}
-
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityReserveCause}::fmt]:
-    Source: 'src/lib.rs', lines 10:22-10:27
-    Visibility: public -/
-def CapacityReserveCause.Insts.CoreFmtDebug.fmt
-  (self : CapacityReserveCause) (f : core.fmt.Formatter) :
-  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
-  := do
-  match self with
-  | CapacityReserveCause.TapeCapacity =>
-    core.fmt.Formatter.write_str f (toStr "TapeCapacity")
-  | CapacityReserveCause.ParitySpoolCapacity =>
-    core.fmt.Formatter.write_str f (toStr "ParitySpoolCapacity")
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityReserveCause}]
-    Source: 'src/lib.rs', lines 10:22-10:27 -/
-@[reducible]
-def CapacityReserveCause.Insts.CoreFmtDebug : core.fmt.Debug
-  CapacityReserveCause := {
-  fmt := CapacityReserveCause.Insts.CoreFmtDebug.fmt
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::CapacityReserveCause}]
-    Source: 'src/lib.rs', lines 10:29-10:38 -/
-@[reducible]
-def CapacityReserveCause.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq CapacityReserveCause := {
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityReserveCause> for parity_capacity_verif::CapacityReserveCause}::eq]:
-    Source: 'src/lib.rs', lines 10:29-10:38
-    Visibility: public -/
-def CapacityReserveCause.Insts.CoreCmpPartialEqCapacityReserveCause.eq
-  (self : CapacityReserveCause) (other : CapacityReserveCause) :
-  Result Bool
-  := do
-  let self1 := read_discriminant self
-  let other1 := read_discriminant other
-  ok (self1 = other1)
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityReserveCause> for parity_capacity_verif::CapacityReserveCause}]
-    Source: 'src/lib.rs', lines 10:29-10:38 -/
-@[reducible]
-def CapacityReserveCause.Insts.CoreCmpPartialEqCapacityReserveCause :
-  core.cmp.PartialEq CapacityReserveCause CapacityReserveCause := {
-  eq := CapacityReserveCause.Insts.CoreCmpPartialEqCapacityReserveCause.eq
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityReserveCause}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 10:40-10:42
-    Visibility: public -/
-def CapacityReserveCause.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : CapacityReserveCause) : Result Unit := do
-  ok ()
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityReserveCause}]
-    Source: 'src/lib.rs', lines 10:40-10:42 -/
-@[reducible]
-def CapacityReserveCause.Insts.CoreCmpEq : core.cmp.Eq CapacityReserveCause
-  := {
-  partialEqInst :=
-    CapacityReserveCause.Insts.CoreCmpPartialEqCapacityReserveCause
-  assert_fields_are_eq :=
-    CapacityReserveCause.Insts.CoreCmpEq.assert_fields_are_eq
-}
-
 /-- [parity_capacity_verif::CapacityError]
-    Source: 'src/lib.rs', lines 17:0-37:1
+    Source: 'src/lib.rs', lines 11:0-34:1
     Visibility: public -/
 @[discriminant isize]
 inductive CapacityError where
 | BlockSizeZero : CapacityError
 | UnsupportedBlockSize : CapacityError
 | DataShardsPerEpochZero : CapacityError
-| ParityShardsPerEpochZero : CapacityError
+| ParityOffHasState : CapacityError
 | ProfileNeighborhoodTooLarge : CapacityError
 | CurrentEpochFillOutsideOpenEpoch : CapacityError
 | ObjectRowsExceedStructuralEntries : CapacityError
 | SidecarRowsExceedStructuralEntries : CapacityError
 | RecoveryRowsExceedStructuralEntries : CapacityError
 | StructuralEntriesExceedCapacity : CapacityError
+| MissingBotBootstrap : CapacityError
+| ProjectedObjectPresenceMismatch : CapacityError
+| GapExtentSizeMismatch : CapacityError
 | UnsafeCapacityProfile : CapacityError
 | CapacityProfileCloseExceedsCapacity : CapacityError
+| CapacityPolicyInvalid : CapacityError
 | SidecarDirectoryExceedsCapacity : CapacityError
 | SidecarEntryDoesNotFit : CapacityError
 | ReplicatedControlHeaderTooLarge : CapacityError
 | ArithmeticOverflow : CapacityError
-| ObjectTooLargeForEmptyTape : CapacityError
 | CapacityReserveExceededTape : CapacityError
 | CapacityReserveExceededSpool : CapacityError
 
 /-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityError}::clone]:
-    Source: 'src/lib.rs', lines 16:9-16:14
+    Source: 'src/lib.rs', lines 10:9-10:14
     Visibility: public -/
 def CapacityError.Insts.CoreCloneClone.clone
   (self : CapacityError) : Result CapacityError := do
   ok self
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityError}]
-    Source: 'src/lib.rs', lines 16:9-16:14 -/
+    Source: 'src/lib.rs', lines 10:9-10:14 -/
 @[reducible]
 def CapacityError.Insts.CoreCloneClone : core.clone.Clone CapacityError := {
   clone := CapacityError.Insts.CoreCloneClone.clone
 }
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::CapacityError}]
-    Source: 'src/lib.rs', lines 16:16-16:20 -/
+    Source: 'src/lib.rs', lines 10:16-10:20 -/
 @[reducible]
 def CapacityError.Insts.CoreMarkerCopy : core.marker.Copy CapacityError := {
   cloneInst := CapacityError.Insts.CoreCloneClone
 }
 
 /-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityError}::fmt]:
-    Source: 'src/lib.rs', lines 16:22-16:27
+    Source: 'src/lib.rs', lines 10:22-10:27
     Visibility: public -/
 def CapacityError.Insts.CoreFmtDebug.fmt
   (self : CapacityError) (f : core.fmt.Formatter) :
@@ -170,8 +77,8 @@ def CapacityError.Insts.CoreFmtDebug.fmt
     core.fmt.Formatter.write_str f (toStr "UnsupportedBlockSize")
   | CapacityError.DataShardsPerEpochZero =>
     core.fmt.Formatter.write_str f (toStr "DataShardsPerEpochZero")
-  | CapacityError.ParityShardsPerEpochZero =>
-    core.fmt.Formatter.write_str f (toStr "ParityShardsPerEpochZero")
+  | CapacityError.ParityOffHasState =>
+    core.fmt.Formatter.write_str f (toStr "ParityOffHasState")
   | CapacityError.ProfileNeighborhoodTooLarge =>
     core.fmt.Formatter.write_str f (toStr "ProfileNeighborhoodTooLarge")
   | CapacityError.CurrentEpochFillOutsideOpenEpoch =>
@@ -185,11 +92,19 @@ def CapacityError.Insts.CoreFmtDebug.fmt
       "RecoveryRowsExceedStructuralEntries")
   | CapacityError.StructuralEntriesExceedCapacity =>
     core.fmt.Formatter.write_str f (toStr "StructuralEntriesExceedCapacity")
+  | CapacityError.MissingBotBootstrap =>
+    core.fmt.Formatter.write_str f (toStr "MissingBotBootstrap")
+  | CapacityError.ProjectedObjectPresenceMismatch =>
+    core.fmt.Formatter.write_str f (toStr "ProjectedObjectPresenceMismatch")
+  | CapacityError.GapExtentSizeMismatch =>
+    core.fmt.Formatter.write_str f (toStr "GapExtentSizeMismatch")
   | CapacityError.UnsafeCapacityProfile =>
     core.fmt.Formatter.write_str f (toStr "UnsafeCapacityProfile")
   | CapacityError.CapacityProfileCloseExceedsCapacity =>
     core.fmt.Formatter.write_str f (toStr
       "CapacityProfileCloseExceedsCapacity")
+  | CapacityError.CapacityPolicyInvalid =>
+    core.fmt.Formatter.write_str f (toStr "CapacityPolicyInvalid")
   | CapacityError.SidecarDirectoryExceedsCapacity =>
     core.fmt.Formatter.write_str f (toStr "SidecarDirectoryExceedsCapacity")
   | CapacityError.SidecarEntryDoesNotFit =>
@@ -198,29 +113,27 @@ def CapacityError.Insts.CoreFmtDebug.fmt
     core.fmt.Formatter.write_str f (toStr "ReplicatedControlHeaderTooLarge")
   | CapacityError.ArithmeticOverflow =>
     core.fmt.Formatter.write_str f (toStr "ArithmeticOverflow")
-  | CapacityError.ObjectTooLargeForEmptyTape =>
-    core.fmt.Formatter.write_str f (toStr "ObjectTooLargeForEmptyTape")
   | CapacityError.CapacityReserveExceededTape =>
     core.fmt.Formatter.write_str f (toStr "CapacityReserveExceededTape")
   | CapacityError.CapacityReserveExceededSpool =>
     core.fmt.Formatter.write_str f (toStr "CapacityReserveExceededSpool")
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityError}]
-    Source: 'src/lib.rs', lines 16:22-16:27 -/
+    Source: 'src/lib.rs', lines 10:22-10:27 -/
 @[reducible]
 def CapacityError.Insts.CoreFmtDebug : core.fmt.Debug CapacityError := {
   fmt := CapacityError.Insts.CoreFmtDebug.fmt
 }
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::CapacityError}]
-    Source: 'src/lib.rs', lines 16:29-16:38 -/
+    Source: 'src/lib.rs', lines 10:29-10:38 -/
 @[reducible]
 def CapacityError.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq CapacityError := {
 }
 
 /-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityError> for parity_capacity_verif::CapacityError}::eq]:
-    Source: 'src/lib.rs', lines 16:29-16:38
+    Source: 'src/lib.rs', lines 10:29-10:38
     Visibility: public -/
 def CapacityError.Insts.CoreCmpPartialEqCapacityError.eq
   (self : CapacityError) (other : CapacityError) : Result Bool := do
@@ -229,7 +142,7 @@ def CapacityError.Insts.CoreCmpPartialEqCapacityError.eq
   ok (self1 = other1)
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityError> for parity_capacity_verif::CapacityError}]
-    Source: 'src/lib.rs', lines 16:29-16:38 -/
+    Source: 'src/lib.rs', lines 10:29-10:38 -/
 @[reducible]
 def CapacityError.Insts.CoreCmpPartialEqCapacityError : core.cmp.PartialEq
   CapacityError CapacityError := {
@@ -237,472 +150,25 @@ def CapacityError.Insts.CoreCmpPartialEqCapacityError : core.cmp.PartialEq
 }
 
 /-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityError}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 16:40-16:42
+    Source: 'src/lib.rs', lines 10:40-10:42
     Visibility: public -/
 def CapacityError.Insts.CoreCmpEq.assert_fields_are_eq
   (self : CapacityError) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityError}]
-    Source: 'src/lib.rs', lines 16:40-16:42 -/
+    Source: 'src/lib.rs', lines 10:40-10:42 -/
 @[reducible]
 def CapacityError.Insts.CoreCmpEq : core.cmp.Eq CapacityError := {
   partialEqInst := CapacityError.Insts.CoreCmpPartialEqCapacityError
   assert_fields_are_eq := CapacityError.Insts.CoreCmpEq.assert_fields_are_eq
 }
 
-/-- [parity_capacity_verif::CapacityReserveInput]
-    Source: 'src/lib.rs', lines 40:0-57:1
+/-- [parity_capacity_verif::TerminalTripleCloseInput]
+    Source: 'src/lib.rs', lines 38:0-62:1
     Visibility: public -/
-structure CapacityReserveInput where
-  projected_object_blocks : Std.U64
-  block_size_bytes : Std.U64
-  current_epoch_fill_blocks : Std.U64
-  data_shards_per_epoch : Std.U64
-  parity_shards_per_epoch : Std.U64
-  sidecar_index_block_count : Std.U64
-  object_filemark_blocks : Std.U64
-  sidecar_filemark_blocks : Std.U64
-  bootstrap_filemark_blocks : Std.U64
-  pending_completed_sidecars : Std.U64
-  remaining_bootstrap_count : Std.U64
-  safety_margin_blocks : Std.U64
-  remaining_tape_blocks : Std.U64
-  empty_tape_usable_blocks : Std.U64
-  pending_completed_epoch_parity_bytes : Std.U64
-  remaining_spool_bytes : Std.U64
-
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityReserveInput}::clone]:
-    Source: 'src/lib.rs', lines 39:9-39:14
-    Visibility: public -/
-def CapacityReserveInput.Insts.CoreCloneClone.clone
-  (self : CapacityReserveInput) : Result CapacityReserveInput := do
-  ok self
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityReserveInput}]
-    Source: 'src/lib.rs', lines 39:9-39:14 -/
-@[reducible]
-def CapacityReserveInput.Insts.CoreCloneClone : core.clone.Clone
-  CapacityReserveInput := {
-  clone := CapacityReserveInput.Insts.CoreCloneClone.clone
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::CapacityReserveInput}]
-    Source: 'src/lib.rs', lines 39:16-39:20 -/
-@[reducible]
-def CapacityReserveInput.Insts.CoreMarkerCopy : core.marker.Copy
-  CapacityReserveInput := {
-  cloneInst := CapacityReserveInput.Insts.CoreCloneClone
-}
-
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityReserveInput}::fmt]:
-    Source: 'src/lib.rs', lines 39:22-39:27
-    Visibility: public -/
-def CapacityReserveInput.Insts.CoreFmtDebug.fmt
-  (self : CapacityReserveInput) (f : core.fmt.Formatter) :
-  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
-  := do
-  let dyn := Dyn.mk _ core.fmt.DebugU64 self.projected_object_blocks
-  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.block_size_bytes
-  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.current_epoch_fill_blocks
-  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.data_shards_per_epoch
-  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.parity_shards_per_epoch
-  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_index_block_count
-  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.object_filemark_blocks
-  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_filemark_blocks
-  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.bootstrap_filemark_blocks
-  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.pending_completed_sidecars
-  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.remaining_bootstrap_count
-  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.safety_margin_blocks
-  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.remaining_tape_blocks
-  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.empty_tape_usable_blocks
-  let dyn14 :=
-    Dyn.mk _ core.fmt.DebugU64 self.pending_completed_epoch_parity_bytes
-  let dyn15 :=
-    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64)
-      self.remaining_spool_bytes
-  let values :=
-    Array.to_slice
-      (Array.make 16#usize [
-        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
-        dyn11, dyn12, dyn13, dyn14, dyn15
-        ])
-  let s ←
-    lift (Array.to_slice
-      (Array.make 16#usize [
-        toStr "projected_object_blocks", toStr "block_size_bytes", toStr
-        "current_epoch_fill_blocks", toStr "data_shards_per_epoch", toStr
-        "parity_shards_per_epoch", toStr "sidecar_index_block_count", toStr
-        "object_filemark_blocks", toStr "sidecar_filemark_blocks", toStr
-        "bootstrap_filemark_blocks", toStr "pending_completed_sidecars", toStr
-        "remaining_bootstrap_count", toStr "safety_margin_blocks", toStr
-        "remaining_tape_blocks", toStr "empty_tape_usable_blocks", toStr
-        "pending_completed_epoch_parity_bytes", toStr "remaining_spool_bytes"
-        ]))
-  core.fmt.Formatter.debug_struct_fields_finish f (toStr
-    "CapacityReserveInput") s values
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityReserveInput}]
-    Source: 'src/lib.rs', lines 39:22-39:27 -/
-@[reducible]
-def CapacityReserveInput.Insts.CoreFmtDebug : core.fmt.Debug
-  CapacityReserveInput := {
-  fmt := CapacityReserveInput.Insts.CoreFmtDebug.fmt
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::CapacityReserveInput}]
-    Source: 'src/lib.rs', lines 39:29-39:38 -/
-@[reducible]
-def CapacityReserveInput.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq CapacityReserveInput := {
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityReserveInput> for parity_capacity_verif::CapacityReserveInput}::eq]:
-    Source: 'src/lib.rs', lines 39:29-39:38
-    Visibility: public -/
-def CapacityReserveInput.Insts.CoreCmpPartialEqCapacityReserveInput.eq
-  (self : CapacityReserveInput) (other : CapacityReserveInput) :
-  Result Bool
-  := do
-  if self.projected_object_blocks = other.projected_object_blocks
-  then
-    if self.block_size_bytes = other.block_size_bytes
-    then
-      if self.current_epoch_fill_blocks = other.current_epoch_fill_blocks
-      then
-        if self.data_shards_per_epoch = other.data_shards_per_epoch
-        then
-          if self.parity_shards_per_epoch = other.parity_shards_per_epoch
-          then
-            if self.sidecar_index_block_count = other.sidecar_index_block_count
-            then
-              if self.object_filemark_blocks = other.object_filemark_blocks
-              then
-                if self.sidecar_filemark_blocks = other.sidecar_filemark_blocks
-                then
-                  if self.bootstrap_filemark_blocks =
-                    other.bootstrap_filemark_blocks
-                  then
-                    if self.pending_completed_sidecars =
-                      other.pending_completed_sidecars
-                    then
-                      if self.remaining_bootstrap_count =
-                        other.remaining_bootstrap_count
-                      then
-                        if self.safety_margin_blocks =
-                          other.safety_margin_blocks
-                        then
-                          if self.remaining_tape_blocks =
-                            other.remaining_tape_blocks
-                          then
-                            if self.empty_tape_usable_blocks =
-                              other.empty_tape_usable_blocks
-                            then
-                              if self.pending_completed_epoch_parity_bytes =
-                                other.pending_completed_epoch_parity_bytes
-                              then
-                                ok (self.remaining_spool_bytes =
-                                  other.remaining_spool_bytes)
-                              else ok false
-                            else ok false
-                          else ok false
-                        else ok false
-                      else ok false
-                    else ok false
-                  else ok false
-                else ok false
-              else ok false
-            else ok false
-          else ok false
-        else ok false
-      else ok false
-    else ok false
-  else ok false
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityReserveInput> for parity_capacity_verif::CapacityReserveInput}]
-    Source: 'src/lib.rs', lines 39:29-39:38 -/
-@[reducible]
-def CapacityReserveInput.Insts.CoreCmpPartialEqCapacityReserveInput :
-  core.cmp.PartialEq CapacityReserveInput CapacityReserveInput := {
-  eq := CapacityReserveInput.Insts.CoreCmpPartialEqCapacityReserveInput.eq
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityReserveInput}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 39:40-39:42
-    Visibility: public -/
-def CapacityReserveInput.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : CapacityReserveInput) : Result Unit := do
-  ok ()
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityReserveInput}]
-    Source: 'src/lib.rs', lines 39:40-39:42 -/
-@[reducible]
-def CapacityReserveInput.Insts.CoreCmpEq : core.cmp.Eq CapacityReserveInput
-  := {
-  partialEqInst :=
-    CapacityReserveInput.Insts.CoreCmpPartialEqCapacityReserveInput
-  assert_fields_are_eq :=
-    CapacityReserveInput.Insts.CoreCmpEq.assert_fields_are_eq
-}
-
-/-- [parity_capacity_verif::TapeReserveReport]
-    Source: 'src/lib.rs', lines 60:0-67:1
-    Visibility: public -/
-structure TapeReserveReport where
-  epochs_completed_by_object : Std.U64
-  final_partial_sidecar_needed : Bool
-  sidecar_tape_file_blocks : Std.U64
-  bootstrap_tape_file_blocks : Std.U64
-  reserve_after_object_blocks : Std.U64
-  required_tape_blocks : Std.U64
-
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TapeReserveReport}::clone]:
-    Source: 'src/lib.rs', lines 59:9-59:14
-    Visibility: public -/
-def TapeReserveReport.Insts.CoreCloneClone.clone
-  (self : TapeReserveReport) : Result TapeReserveReport := do
-  ok self
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TapeReserveReport}]
-    Source: 'src/lib.rs', lines 59:9-59:14 -/
-@[reducible]
-def TapeReserveReport.Insts.CoreCloneClone : core.clone.Clone TapeReserveReport
-  := {
-  clone := TapeReserveReport.Insts.CoreCloneClone.clone
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TapeReserveReport}]
-    Source: 'src/lib.rs', lines 59:16-59:20 -/
-@[reducible]
-def TapeReserveReport.Insts.CoreMarkerCopy : core.marker.Copy TapeReserveReport
-  := {
-  cloneInst := TapeReserveReport.Insts.CoreCloneClone
-}
-
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TapeReserveReport}::fmt]:
-    Source: 'src/lib.rs', lines 59:22-59:27
-    Visibility: public -/
-def TapeReserveReport.Insts.CoreFmtDebug.fmt
-  (self : TapeReserveReport) (f : core.fmt.Formatter) :
-  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
-  := do
-  let dyn := Dyn.mk _ core.fmt.DebugU64 self.epochs_completed_by_object
-  let dyn1 := Dyn.mk _ core.fmt.DebugBool self.final_partial_sidecar_needed
-  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_tape_file_blocks
-  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.bootstrap_tape_file_blocks
-  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.reserve_after_object_blocks
-  let dyn5 :=
-    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.required_tape_blocks
-  let values :=
-    Array.to_slice (Array.make 6#usize [ dyn, dyn1, dyn2, dyn3, dyn4, dyn5 ])
-  let s ←
-    lift (Array.to_slice
-      (Array.make 6#usize [
-        toStr "epochs_completed_by_object", toStr
-        "final_partial_sidecar_needed", toStr "sidecar_tape_file_blocks", toStr
-        "bootstrap_tape_file_blocks", toStr "reserve_after_object_blocks",
-        toStr "required_tape_blocks"
-        ]))
-  core.fmt.Formatter.debug_struct_fields_finish f (toStr "TapeReserveReport") s
-    values
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TapeReserveReport}]
-    Source: 'src/lib.rs', lines 59:22-59:27 -/
-@[reducible]
-def TapeReserveReport.Insts.CoreFmtDebug : core.fmt.Debug TapeReserveReport
-  := {
-  fmt := TapeReserveReport.Insts.CoreFmtDebug.fmt
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TapeReserveReport}]
-    Source: 'src/lib.rs', lines 59:29-59:38 -/
-@[reducible]
-def TapeReserveReport.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq TapeReserveReport := {
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TapeReserveReport> for parity_capacity_verif::TapeReserveReport}::eq]:
-    Source: 'src/lib.rs', lines 59:29-59:38
-    Visibility: public -/
-def TapeReserveReport.Insts.CoreCmpPartialEqTapeReserveReport.eq
-  (self : TapeReserveReport) (other : TapeReserveReport) : Result Bool := do
-  if self.epochs_completed_by_object = other.epochs_completed_by_object
-  then
-    if self.final_partial_sidecar_needed = other.final_partial_sidecar_needed
-    then
-      if self.sidecar_tape_file_blocks = other.sidecar_tape_file_blocks
-      then
-        if self.bootstrap_tape_file_blocks = other.bootstrap_tape_file_blocks
-        then
-          if self.reserve_after_object_blocks =
-            other.reserve_after_object_blocks
-          then ok (self.required_tape_blocks = other.required_tape_blocks)
-          else ok false
-        else ok false
-      else ok false
-    else ok false
-  else ok false
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TapeReserveReport> for parity_capacity_verif::TapeReserveReport}]
-    Source: 'src/lib.rs', lines 59:29-59:38 -/
-@[reducible]
-def TapeReserveReport.Insts.CoreCmpPartialEqTapeReserveReport :
-  core.cmp.PartialEq TapeReserveReport TapeReserveReport := {
-  eq := TapeReserveReport.Insts.CoreCmpPartialEqTapeReserveReport.eq
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TapeReserveReport}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 59:40-59:42
-    Visibility: public -/
-def TapeReserveReport.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : TapeReserveReport) : Result Unit := do
-  ok ()
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TapeReserveReport}]
-    Source: 'src/lib.rs', lines 59:40-59:42 -/
-@[reducible]
-def TapeReserveReport.Insts.CoreCmpEq : core.cmp.Eq TapeReserveReport := {
-  partialEqInst := TapeReserveReport.Insts.CoreCmpPartialEqTapeReserveReport
-  assert_fields_are_eq :=
-    TapeReserveReport.Insts.CoreCmpEq.assert_fields_are_eq
-}
-
-/-- [parity_capacity_verif::CapacityReserveReport]
-    Source: 'src/lib.rs', lines 70:0-78:1
-    Visibility: public -/
-structure CapacityReserveReport where
-  epochs_completed_by_object : Std.U64
-  final_partial_sidecar_needed : Bool
-  sidecar_tape_file_blocks : Std.U64
-  bootstrap_tape_file_blocks : Std.U64
-  reserve_after_object_blocks : Std.U64
-  required_tape_blocks : Std.U64
-  required_spool_bytes : Std.U64
-
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityReserveReport}::clone]:
-    Source: 'src/lib.rs', lines 69:9-69:14
-    Visibility: public -/
-def CapacityReserveReport.Insts.CoreCloneClone.clone
-  (self : CapacityReserveReport) : Result CapacityReserveReport := do
-  ok self
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::CapacityReserveReport}]
-    Source: 'src/lib.rs', lines 69:9-69:14 -/
-@[reducible]
-def CapacityReserveReport.Insts.CoreCloneClone : core.clone.Clone
-  CapacityReserveReport := {
-  clone := CapacityReserveReport.Insts.CoreCloneClone.clone
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::CapacityReserveReport}]
-    Source: 'src/lib.rs', lines 69:16-69:20 -/
-@[reducible]
-def CapacityReserveReport.Insts.CoreMarkerCopy : core.marker.Copy
-  CapacityReserveReport := {
-  cloneInst := CapacityReserveReport.Insts.CoreCloneClone
-}
-
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityReserveReport}::fmt]:
-    Source: 'src/lib.rs', lines 69:22-69:27
-    Visibility: public -/
-def CapacityReserveReport.Insts.CoreFmtDebug.fmt
-  (self : CapacityReserveReport) (f : core.fmt.Formatter) :
-  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
-  := do
-  let dyn := Dyn.mk _ core.fmt.DebugU64 self.epochs_completed_by_object
-  let dyn1 := Dyn.mk _ core.fmt.DebugBool self.final_partial_sidecar_needed
-  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_tape_file_blocks
-  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.bootstrap_tape_file_blocks
-  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.reserve_after_object_blocks
-  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.required_tape_blocks
-  let dyn6 :=
-    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.required_spool_bytes
-  let values :=
-    Array.to_slice
-      (Array.make 7#usize [ dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6 ])
-  let s ←
-    lift (Array.to_slice
-      (Array.make 7#usize [
-        toStr "epochs_completed_by_object", toStr
-        "final_partial_sidecar_needed", toStr "sidecar_tape_file_blocks", toStr
-        "bootstrap_tape_file_blocks", toStr "reserve_after_object_blocks",
-        toStr "required_tape_blocks", toStr "required_spool_bytes"
-        ]))
-  core.fmt.Formatter.debug_struct_fields_finish f (toStr
-    "CapacityReserveReport") s values
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::CapacityReserveReport}]
-    Source: 'src/lib.rs', lines 69:22-69:27 -/
-@[reducible]
-def CapacityReserveReport.Insts.CoreFmtDebug : core.fmt.Debug
-  CapacityReserveReport := {
-  fmt := CapacityReserveReport.Insts.CoreFmtDebug.fmt
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::CapacityReserveReport}]
-    Source: 'src/lib.rs', lines 69:29-69:38 -/
-@[reducible]
-def CapacityReserveReport.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq CapacityReserveReport := {
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityReserveReport> for parity_capacity_verif::CapacityReserveReport}::eq]:
-    Source: 'src/lib.rs', lines 69:29-69:38
-    Visibility: public -/
-def CapacityReserveReport.Insts.CoreCmpPartialEqCapacityReserveReport.eq
-  (self : CapacityReserveReport) (other : CapacityReserveReport) :
-  Result Bool
-  := do
-  if self.epochs_completed_by_object = other.epochs_completed_by_object
-  then
-    if self.final_partial_sidecar_needed = other.final_partial_sidecar_needed
-    then
-      if self.sidecar_tape_file_blocks = other.sidecar_tape_file_blocks
-      then
-        if self.bootstrap_tape_file_blocks = other.bootstrap_tape_file_blocks
-        then
-          if self.reserve_after_object_blocks =
-            other.reserve_after_object_blocks
-          then
-            if self.required_tape_blocks = other.required_tape_blocks
-            then ok (self.required_spool_bytes = other.required_spool_bytes)
-            else ok false
-          else ok false
-        else ok false
-      else ok false
-    else ok false
-  else ok false
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::CapacityReserveReport> for parity_capacity_verif::CapacityReserveReport}]
-    Source: 'src/lib.rs', lines 69:29-69:38 -/
-@[reducible]
-def CapacityReserveReport.Insts.CoreCmpPartialEqCapacityReserveReport :
-  core.cmp.PartialEq CapacityReserveReport CapacityReserveReport := {
-  eq := CapacityReserveReport.Insts.CoreCmpPartialEqCapacityReserveReport.eq
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityReserveReport}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 69:40-69:42
-    Visibility: public -/
-def CapacityReserveReport.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : CapacityReserveReport) : Result Unit := do
-  ok ()
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::CapacityReserveReport}]
-    Source: 'src/lib.rs', lines 69:40-69:42 -/
-@[reducible]
-def CapacityReserveReport.Insts.CoreCmpEq : core.cmp.Eq CapacityReserveReport
-  := {
-  partialEqInst :=
-    CapacityReserveReport.Insts.CoreCmpPartialEqCapacityReserveReport
-  assert_fields_are_eq :=
-    CapacityReserveReport.Insts.CoreCmpEq.assert_fields_are_eq
-}
-
-/-- [parity_capacity_verif::SnapshotCloseInput]
-    Source: 'src/lib.rs', lines 85:0-106:1
-    Visibility: public -/
-structure SnapshotCloseInput where
+structure TerminalTripleCloseInput where
+  projected_object_present : Bool
   projected_object_blocks : Std.U64
   block_size_bytes : Std.U64
   current_epoch_fill_blocks : Std.U64
@@ -715,453 +181,185 @@ structure SnapshotCloseInput where
   object_filemark_blocks : Std.U64
   sidecar_filemark_blocks : Std.U64
   parity_map_filemark_blocks : Std.U64
-  snapshot_filemark_blocks : Std.U64
-  bootstrap_filemark_blocks : Std.U64
+  replica_filemark_blocks : Std.U64
+  gap_filemark_blocks : Std.U64
+  gap_nominal_bytes : Std.U64
   safety_margin_blocks : Std.U64
   remaining_tape_blocks : Std.U64
-  empty_tape_usable_blocks : Std.U64
+  capacity_basis_blocks : Std.U64
+  low_watermark_blocks : Std.U64
   high_watermark_blocks : Std.U64
   pending_completed_epoch_parity_bytes : Std.U64
   remaining_spool_bytes : Std.U64
 
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotCloseInput}::clone]:
-    Source: 'src/lib.rs', lines 84:9-84:14
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalTripleCloseInput}::clone]:
+    Source: 'src/lib.rs', lines 37:9-37:14
     Visibility: public -/
-def SnapshotCloseInput.Insts.CoreCloneClone.clone
-  (self : SnapshotCloseInput) : Result SnapshotCloseInput := do
+def TerminalTripleCloseInput.Insts.CoreCloneClone.clone
+  (self : TerminalTripleCloseInput) : Result TerminalTripleCloseInput := do
   ok self
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotCloseInput}]
-    Source: 'src/lib.rs', lines 84:9-84:14 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalTripleCloseInput}]
+    Source: 'src/lib.rs', lines 37:9-37:14 -/
 @[reducible]
-def SnapshotCloseInput.Insts.CoreCloneClone : core.clone.Clone
-  SnapshotCloseInput := {
-  clone := SnapshotCloseInput.Insts.CoreCloneClone.clone
+def TerminalTripleCloseInput.Insts.CoreCloneClone : core.clone.Clone
+  TerminalTripleCloseInput := {
+  clone := TerminalTripleCloseInput.Insts.CoreCloneClone.clone
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::SnapshotCloseInput}]
-    Source: 'src/lib.rs', lines 84:16-84:20 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalTripleCloseInput}]
+    Source: 'src/lib.rs', lines 37:16-37:20 -/
 @[reducible]
-def SnapshotCloseInput.Insts.CoreMarkerCopy : core.marker.Copy
-  SnapshotCloseInput := {
-  cloneInst := SnapshotCloseInput.Insts.CoreCloneClone
+def TerminalTripleCloseInput.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalTripleCloseInput := {
+  cloneInst := TerminalTripleCloseInput.Insts.CoreCloneClone
 }
 
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotCloseInput}::fmt]:
-    Source: 'src/lib.rs', lines 84:22-84:27
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalTripleCloseInput}::fmt]:
+    Source: 'src/lib.rs', lines 37:22-37:27
     Visibility: public -/
-def SnapshotCloseInput.Insts.CoreFmtDebug.fmt
-  (self : SnapshotCloseInput) (f : core.fmt.Formatter) :
+def TerminalTripleCloseInput.Insts.CoreFmtDebug.fmt
+  (self : TerminalTripleCloseInput) (f : core.fmt.Formatter) :
   Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
   := do
-  let dyn := Dyn.mk _ core.fmt.DebugU64 self.projected_object_blocks
-  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.block_size_bytes
-  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.current_epoch_fill_blocks
-  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.data_shards_per_epoch
-  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.parity_shards_per_epoch
-  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.pending_completed_sidecars
-  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_entries_before_object
-  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.structural_entries_before_object
-  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.object_rows_before_object
-  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.object_filemark_blocks
-  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_filemark_blocks
-  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.parity_map_filemark_blocks
-  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_filemark_blocks
-  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.bootstrap_filemark_blocks
-  let dyn14 := Dyn.mk _ core.fmt.DebugU64 self.safety_margin_blocks
-  let dyn15 := Dyn.mk _ core.fmt.DebugU64 self.remaining_tape_blocks
-  let dyn16 := Dyn.mk _ core.fmt.DebugU64 self.empty_tape_usable_blocks
-  let dyn17 := Dyn.mk _ core.fmt.DebugU64 self.high_watermark_blocks
-  let dyn18 :=
+  let dyn := Dyn.mk _ core.fmt.DebugBool self.projected_object_present
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.projected_object_blocks
+  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.block_size_bytes
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.current_epoch_fill_blocks
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.data_shards_per_epoch
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.parity_shards_per_epoch
+  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.pending_completed_sidecars
+  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_entries_before_object
+  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.structural_entries_before_object
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.object_rows_before_object
+  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.object_filemark_blocks
+  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_filemark_blocks
+  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.parity_map_filemark_blocks
+  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.replica_filemark_blocks
+  let dyn14 := Dyn.mk _ core.fmt.DebugU64 self.gap_filemark_blocks
+  let dyn15 := Dyn.mk _ core.fmt.DebugU64 self.gap_nominal_bytes
+  let dyn16 := Dyn.mk _ core.fmt.DebugU64 self.safety_margin_blocks
+  let dyn17 := Dyn.mk _ core.fmt.DebugU64 self.remaining_tape_blocks
+  let dyn18 := Dyn.mk _ core.fmt.DebugU64 self.capacity_basis_blocks
+  let dyn19 := Dyn.mk _ core.fmt.DebugU64 self.low_watermark_blocks
+  let dyn20 := Dyn.mk _ core.fmt.DebugU64 self.high_watermark_blocks
+  let dyn21 :=
     Dyn.mk _ core.fmt.DebugU64 self.pending_completed_epoch_parity_bytes
-  let dyn19 :=
+  let dyn22 :=
     Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64)
       self.remaining_spool_bytes
   let values :=
     Array.to_slice
-      (Array.make 20#usize [
-        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
-        dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18, dyn19
-        ])
-  let s ←
-    lift (Array.to_slice
-      (Array.make 20#usize [
-        toStr "projected_object_blocks", toStr "block_size_bytes", toStr
-        "current_epoch_fill_blocks", toStr "data_shards_per_epoch", toStr
-        "parity_shards_per_epoch", toStr "pending_completed_sidecars", toStr
-        "sidecar_entries_before_object", toStr
-        "structural_entries_before_object", toStr "object_rows_before_object",
-        toStr "object_filemark_blocks", toStr "sidecar_filemark_blocks", toStr
-        "parity_map_filemark_blocks", toStr "snapshot_filemark_blocks", toStr
-        "bootstrap_filemark_blocks", toStr "safety_margin_blocks", toStr
-        "remaining_tape_blocks", toStr "empty_tape_usable_blocks", toStr
-        "high_watermark_blocks", toStr "pending_completed_epoch_parity_bytes",
-        toStr "remaining_spool_bytes"
-        ]))
-  core.fmt.Formatter.debug_struct_fields_finish f (toStr "SnapshotCloseInput")
-    s values
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotCloseInput}]
-    Source: 'src/lib.rs', lines 84:22-84:27 -/
-@[reducible]
-def SnapshotCloseInput.Insts.CoreFmtDebug : core.fmt.Debug SnapshotCloseInput
-  := {
-  fmt := SnapshotCloseInput.Insts.CoreFmtDebug.fmt
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::SnapshotCloseInput}]
-    Source: 'src/lib.rs', lines 84:29-84:38 -/
-@[reducible]
-def SnapshotCloseInput.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq SnapshotCloseInput := {
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotCloseInput> for parity_capacity_verif::SnapshotCloseInput}::eq]:
-    Source: 'src/lib.rs', lines 84:29-84:38
-    Visibility: public -/
-def SnapshotCloseInput.Insts.CoreCmpPartialEqSnapshotCloseInput.eq
-  (self : SnapshotCloseInput) (other : SnapshotCloseInput) : Result Bool := do
-  if self.projected_object_blocks = other.projected_object_blocks
-  then
-    if self.block_size_bytes = other.block_size_bytes
-    then
-      if self.current_epoch_fill_blocks = other.current_epoch_fill_blocks
-      then
-        if self.data_shards_per_epoch = other.data_shards_per_epoch
-        then
-          if self.parity_shards_per_epoch = other.parity_shards_per_epoch
-          then
-            if self.pending_completed_sidecars =
-              other.pending_completed_sidecars
-            then
-              if self.sidecar_entries_before_object =
-                other.sidecar_entries_before_object
-              then
-                if self.structural_entries_before_object =
-                  other.structural_entries_before_object
-                then
-                  if self.object_rows_before_object =
-                    other.object_rows_before_object
-                  then
-                    if self.object_filemark_blocks =
-                      other.object_filemark_blocks
-                    then
-                      if self.sidecar_filemark_blocks =
-                        other.sidecar_filemark_blocks
-                      then
-                        if self.parity_map_filemark_blocks =
-                          other.parity_map_filemark_blocks
-                        then
-                          if self.snapshot_filemark_blocks =
-                            other.snapshot_filemark_blocks
-                          then
-                            if self.bootstrap_filemark_blocks =
-                              other.bootstrap_filemark_blocks
-                            then
-                              if self.safety_margin_blocks =
-                                other.safety_margin_blocks
-                              then
-                                if self.remaining_tape_blocks =
-                                  other.remaining_tape_blocks
-                                then
-                                  if self.empty_tape_usable_blocks =
-                                    other.empty_tape_usable_blocks
-                                  then
-                                    if self.high_watermark_blocks =
-                                      other.high_watermark_blocks
-                                    then
-                                      if
-                                        self.pending_completed_epoch_parity_bytes
-                                        =
-                                        other.pending_completed_epoch_parity_bytes
-                                      then
-                                        ok (self.remaining_spool_bytes =
-                                          other.remaining_spool_bytes)
-                                      else ok false
-                                    else ok false
-                                  else ok false
-                                else ok false
-                              else ok false
-                            else ok false
-                          else ok false
-                        else ok false
-                      else ok false
-                    else ok false
-                  else ok false
-                else ok false
-              else ok false
-            else ok false
-          else ok false
-        else ok false
-      else ok false
-    else ok false
-  else ok false
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotCloseInput> for parity_capacity_verif::SnapshotCloseInput}]
-    Source: 'src/lib.rs', lines 84:29-84:38 -/
-@[reducible]
-def SnapshotCloseInput.Insts.CoreCmpPartialEqSnapshotCloseInput :
-  core.cmp.PartialEq SnapshotCloseInput SnapshotCloseInput := {
-  eq := SnapshotCloseInput.Insts.CoreCmpPartialEqSnapshotCloseInput.eq
-}
-
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotCloseInput}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 84:40-84:42
-    Visibility: public -/
-def SnapshotCloseInput.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : SnapshotCloseInput) : Result Unit := do
-  ok ()
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotCloseInput}]
-    Source: 'src/lib.rs', lines 84:40-84:42 -/
-@[reducible]
-def SnapshotCloseInput.Insts.CoreCmpEq : core.cmp.Eq SnapshotCloseInput := {
-  partialEqInst := SnapshotCloseInput.Insts.CoreCmpPartialEqSnapshotCloseInput
-  assert_fields_are_eq :=
-    SnapshotCloseInput.Insts.CoreCmpEq.assert_fields_are_eq
-}
-
-/-- [parity_capacity_verif::SnapshotCloseReport]
-    Source: 'src/lib.rs', lines 110:0-138:1
-    Visibility: public -/
-structure SnapshotCloseReport where
-  epochs_completed_by_object : Std.U64
-  final_partial_sidecar_needed : Bool
-  sidecar_index_block_count : Std.U64
-  sidecar_blocks_before_filemark : Std.U64
-  sidecar_tape_file_blocks : Std.U64
-  sidecars_emitted_by_commit : Std.U64
-  sidecar_blocks_emitted_by_commit : Std.U64
-  object_tape_file_blocks : Std.U64
-  object_commit_charge_blocks : Std.U64
-  object_rows_after : Std.U64
-  sidecar_entries_after_closeout : Std.U64
-  maximum_sidecar_entries_for_capacity : Std.U64
-  structural_entries_after_closeout : Std.U64
-  final_partial_sidecar_blocks : Std.U64
-  final_parity_map_needed : Bool
-  final_parity_map_directory_bound_bytes : Std.U64
-  final_parity_map_payload_bound_bytes : Std.U64
-  final_parity_map_blocks_before_filemark : Std.U64
-  final_parity_map_tape_file_blocks : Std.U64
-  snapshot_payload_bytes : Std.U64
-  snapshot_blocks_before_filemark : Std.U64
-  snapshot_tape_file_blocks : Std.U64
-  final_bootstrap_tape_file_blocks : Std.U64
-  safety_margin_blocks : Std.U64
-  close_bound_blocks : Std.U64
-  required_tape_blocks : Std.U64
-  required_spool_bytes : Std.U64
-
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotCloseReport}::clone]:
-    Source: 'src/lib.rs', lines 109:9-109:14
-    Visibility: public -/
-def SnapshotCloseReport.Insts.CoreCloneClone.clone
-  (self : SnapshotCloseReport) : Result SnapshotCloseReport := do
-  ok self
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotCloseReport}]
-    Source: 'src/lib.rs', lines 109:9-109:14 -/
-@[reducible]
-def SnapshotCloseReport.Insts.CoreCloneClone : core.clone.Clone
-  SnapshotCloseReport := {
-  clone := SnapshotCloseReport.Insts.CoreCloneClone.clone
-}
-
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::SnapshotCloseReport}]
-    Source: 'src/lib.rs', lines 109:16-109:20 -/
-@[reducible]
-def SnapshotCloseReport.Insts.CoreMarkerCopy : core.marker.Copy
-  SnapshotCloseReport := {
-  cloneInst := SnapshotCloseReport.Insts.CoreCloneClone
-}
-
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotCloseReport}::fmt]:
-    Source: 'src/lib.rs', lines 109:22-109:27
-    Visibility: public -/
-def SnapshotCloseReport.Insts.CoreFmtDebug.fmt
-  (self : SnapshotCloseReport) (f : core.fmt.Formatter) :
-  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
-  := do
-  let dyn := Dyn.mk _ core.fmt.DebugU64 self.epochs_completed_by_object
-  let dyn1 := Dyn.mk _ core.fmt.DebugBool self.final_partial_sidecar_needed
-  let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_index_block_count
-  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_blocks_before_filemark
-  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_tape_file_blocks
-  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.sidecars_emitted_by_commit
-  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_blocks_emitted_by_commit
-  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.object_tape_file_blocks
-  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.object_commit_charge_blocks
-  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.object_rows_after
-  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_entries_after_closeout
-  let dyn11 :=
-    Dyn.mk _ core.fmt.DebugU64 self.maximum_sidecar_entries_for_capacity
-  let dyn12 :=
-    Dyn.mk _ core.fmt.DebugU64 self.structural_entries_after_closeout
-  let dyn13 := Dyn.mk _ core.fmt.DebugU64 self.final_partial_sidecar_blocks
-  let dyn14 := Dyn.mk _ core.fmt.DebugBool self.final_parity_map_needed
-  let dyn15 :=
-    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_directory_bound_bytes
-  let dyn16 :=
-    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_payload_bound_bytes
-  let dyn17 :=
-    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_blocks_before_filemark
-  let dyn18 :=
-    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_tape_file_blocks
-  let dyn19 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_payload_bytes
-  let dyn20 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_blocks_before_filemark
-  let dyn21 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_tape_file_blocks
-  let dyn22 := Dyn.mk _ core.fmt.DebugU64 self.final_bootstrap_tape_file_blocks
-  let dyn23 := Dyn.mk _ core.fmt.DebugU64 self.safety_margin_blocks
-  let dyn24 := Dyn.mk _ core.fmt.DebugU64 self.close_bound_blocks
-  let dyn25 := Dyn.mk _ core.fmt.DebugU64 self.required_tape_blocks
-  let dyn26 :=
-    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.required_spool_bytes
-  let values :=
-    Array.to_slice
-      (Array.make 27#usize [
+      (Array.make 23#usize [
         dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
         dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18, dyn19, dyn20,
-        dyn21, dyn22, dyn23, dyn24, dyn25, dyn26
+        dyn21, dyn22
         ])
   let s ←
     lift (Array.to_slice
-      (Array.make 27#usize [
-        toStr "epochs_completed_by_object", toStr
-        "final_partial_sidecar_needed", toStr "sidecar_index_block_count",
-        toStr "sidecar_blocks_before_filemark", toStr
-        "sidecar_tape_file_blocks", toStr "sidecars_emitted_by_commit", toStr
-        "sidecar_blocks_emitted_by_commit", toStr "object_tape_file_blocks",
-        toStr "object_commit_charge_blocks", toStr "object_rows_after", toStr
-        "sidecar_entries_after_closeout", toStr
-        "maximum_sidecar_entries_for_capacity", toStr
-        "structural_entries_after_closeout", toStr
-        "final_partial_sidecar_blocks", toStr "final_parity_map_needed", toStr
-        "final_parity_map_directory_bound_bytes", toStr
-        "final_parity_map_payload_bound_bytes", toStr
-        "final_parity_map_blocks_before_filemark", toStr
-        "final_parity_map_tape_file_blocks", toStr "snapshot_payload_bytes",
-        toStr "snapshot_blocks_before_filemark", toStr
-        "snapshot_tape_file_blocks", toStr "final_bootstrap_tape_file_blocks",
-        toStr "safety_margin_blocks", toStr "close_bound_blocks", toStr
-        "required_tape_blocks", toStr "required_spool_bytes"
+      (Array.make 23#usize [
+        toStr "projected_object_present", toStr "projected_object_blocks",
+        toStr "block_size_bytes", toStr "current_epoch_fill_blocks", toStr
+        "data_shards_per_epoch", toStr "parity_shards_per_epoch", toStr
+        "pending_completed_sidecars", toStr "sidecar_entries_before_object",
+        toStr "structural_entries_before_object", toStr
+        "object_rows_before_object", toStr "object_filemark_blocks", toStr
+        "sidecar_filemark_blocks", toStr "parity_map_filemark_blocks", toStr
+        "replica_filemark_blocks", toStr "gap_filemark_blocks", toStr
+        "gap_nominal_bytes", toStr "safety_margin_blocks", toStr
+        "remaining_tape_blocks", toStr "capacity_basis_blocks", toStr
+        "low_watermark_blocks", toStr "high_watermark_blocks", toStr
+        "pending_completed_epoch_parity_bytes", toStr "remaining_spool_bytes"
         ]))
-  core.fmt.Formatter.debug_struct_fields_finish f (toStr "SnapshotCloseReport")
-    s values
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr
+    "TerminalTripleCloseInput") s values
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotCloseReport}]
-    Source: 'src/lib.rs', lines 109:22-109:27 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalTripleCloseInput}]
+    Source: 'src/lib.rs', lines 37:22-37:27 -/
 @[reducible]
-def SnapshotCloseReport.Insts.CoreFmtDebug : core.fmt.Debug SnapshotCloseReport
-  := {
-  fmt := SnapshotCloseReport.Insts.CoreFmtDebug.fmt
+def TerminalTripleCloseInput.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalTripleCloseInput := {
+  fmt := TerminalTripleCloseInput.Insts.CoreFmtDebug.fmt
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::SnapshotCloseReport}]
-    Source: 'src/lib.rs', lines 109:29-109:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TerminalTripleCloseInput}]
+    Source: 'src/lib.rs', lines 37:29-37:38 -/
 @[reducible]
-def SnapshotCloseReport.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq SnapshotCloseReport := {
+def TerminalTripleCloseInput.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq TerminalTripleCloseInput := {
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotCloseReport> for parity_capacity_verif::SnapshotCloseReport}::eq]:
-    Source: 'src/lib.rs', lines 109:29-109:38
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalTripleCloseInput> for parity_capacity_verif::TerminalTripleCloseInput}::eq]:
+    Source: 'src/lib.rs', lines 37:29-37:38
     Visibility: public -/
-def SnapshotCloseReport.Insts.CoreCmpPartialEqSnapshotCloseReport.eq
-  (self : SnapshotCloseReport) (other : SnapshotCloseReport) :
+def TerminalTripleCloseInput.Insts.CoreCmpPartialEqTerminalTripleCloseInput.eq
+  (self : TerminalTripleCloseInput) (other : TerminalTripleCloseInput) :
   Result Bool
   := do
-  if self.epochs_completed_by_object = other.epochs_completed_by_object
+  if self.projected_object_present = other.projected_object_present
   then
-    if self.final_partial_sidecar_needed = other.final_partial_sidecar_needed
+    if self.projected_object_blocks = other.projected_object_blocks
     then
-      if self.sidecar_index_block_count = other.sidecar_index_block_count
+      if self.block_size_bytes = other.block_size_bytes
       then
-        if self.sidecar_blocks_before_filemark =
-          other.sidecar_blocks_before_filemark
+        if self.current_epoch_fill_blocks = other.current_epoch_fill_blocks
         then
-          if self.sidecar_tape_file_blocks = other.sidecar_tape_file_blocks
+          if self.data_shards_per_epoch = other.data_shards_per_epoch
           then
-            if self.sidecars_emitted_by_commit =
-              other.sidecars_emitted_by_commit
+            if self.parity_shards_per_epoch = other.parity_shards_per_epoch
             then
-              if self.sidecar_blocks_emitted_by_commit =
-                other.sidecar_blocks_emitted_by_commit
+              if self.pending_completed_sidecars =
+                other.pending_completed_sidecars
               then
-                if self.object_tape_file_blocks = other.object_tape_file_blocks
+                if self.sidecar_entries_before_object =
+                  other.sidecar_entries_before_object
                 then
-                  if self.object_commit_charge_blocks =
-                    other.object_commit_charge_blocks
+                  if self.structural_entries_before_object =
+                    other.structural_entries_before_object
                   then
-                    if self.object_rows_after = other.object_rows_after
+                    if self.object_rows_before_object =
+                      other.object_rows_before_object
                     then
-                      if self.sidecar_entries_after_closeout =
-                        other.sidecar_entries_after_closeout
+                      if self.object_filemark_blocks =
+                        other.object_filemark_blocks
                       then
-                        if self.maximum_sidecar_entries_for_capacity =
-                          other.maximum_sidecar_entries_for_capacity
+                        if self.sidecar_filemark_blocks =
+                          other.sidecar_filemark_blocks
                         then
-                          if self.structural_entries_after_closeout =
-                            other.structural_entries_after_closeout
+                          if self.parity_map_filemark_blocks =
+                            other.parity_map_filemark_blocks
                           then
-                            if self.final_partial_sidecar_blocks =
-                              other.final_partial_sidecar_blocks
+                            if self.replica_filemark_blocks =
+                              other.replica_filemark_blocks
                             then
-                              if self.final_parity_map_needed =
-                                other.final_parity_map_needed
+                              if self.gap_filemark_blocks =
+                                other.gap_filemark_blocks
                               then
-                                if self.final_parity_map_directory_bound_bytes
-                                  =
-                                  other.final_parity_map_directory_bound_bytes
+                                if self.gap_nominal_bytes =
+                                  other.gap_nominal_bytes
                                 then
-                                  if self.final_parity_map_payload_bound_bytes
-                                    =
-                                    other.final_parity_map_payload_bound_bytes
+                                  if self.safety_margin_blocks =
+                                    other.safety_margin_blocks
                                   then
-                                    if
-                                      self.final_parity_map_blocks_before_filemark
-                                      =
-                                      other.final_parity_map_blocks_before_filemark
+                                    if self.remaining_tape_blocks =
+                                      other.remaining_tape_blocks
                                     then
-                                      if self.final_parity_map_tape_file_blocks
-                                        =
-                                        other.final_parity_map_tape_file_blocks
+                                      if self.capacity_basis_blocks =
+                                        other.capacity_basis_blocks
                                       then
-                                        if self.snapshot_payload_bytes =
-                                          other.snapshot_payload_bytes
+                                        if self.low_watermark_blocks =
+                                          other.low_watermark_blocks
                                         then
-                                          if
-                                            self.snapshot_blocks_before_filemark
-                                            =
-                                            other.snapshot_blocks_before_filemark
+                                          if self.high_watermark_blocks =
+                                            other.high_watermark_blocks
                                           then
-                                            if self.snapshot_tape_file_blocks =
-                                              other.snapshot_tape_file_blocks
+                                            if
+                                              self.pending_completed_epoch_parity_bytes
+                                              =
+                                              other.pending_completed_epoch_parity_bytes
                                             then
-                                              if
-                                                self.final_bootstrap_tape_file_blocks
-                                                =
-                                                other.final_bootstrap_tape_file_blocks
-                                              then
-                                                if self.safety_margin_blocks =
-                                                  other.safety_margin_blocks
-                                                then
-                                                  if self.close_bound_blocks =
-                                                    other.close_bound_blocks
-                                                  then
-                                                    if
-                                                      self.required_tape_blocks
-                                                      =
-                                                      other.required_tape_blocks
-                                                    then
-                                                      ok
-                                                        (self.required_spool_bytes
-                                                        =
-                                                        other.required_spool_bytes)
-                                                    else ok false
-                                                  else ok false
-                                                else ok false
-                                              else ok false
+                                              ok (self.remaining_spool_bytes =
+                                                other.remaining_spool_bytes)
                                             else ok false
                                           else ok false
                                         else ok false
@@ -1185,33 +383,192 @@ def SnapshotCloseReport.Insts.CoreCmpPartialEqSnapshotCloseReport.eq
     else ok false
   else ok false
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotCloseReport> for parity_capacity_verif::SnapshotCloseReport}]
-    Source: 'src/lib.rs', lines 109:29-109:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalTripleCloseInput> for parity_capacity_verif::TerminalTripleCloseInput}]
+    Source: 'src/lib.rs', lines 37:29-37:38 -/
 @[reducible]
-def SnapshotCloseReport.Insts.CoreCmpPartialEqSnapshotCloseReport :
-  core.cmp.PartialEq SnapshotCloseReport SnapshotCloseReport := {
-  eq := SnapshotCloseReport.Insts.CoreCmpPartialEqSnapshotCloseReport.eq
+def TerminalTripleCloseInput.Insts.CoreCmpPartialEqTerminalTripleCloseInput :
+  core.cmp.PartialEq TerminalTripleCloseInput TerminalTripleCloseInput := {
+  eq :=
+    TerminalTripleCloseInput.Insts.CoreCmpPartialEqTerminalTripleCloseInput.eq
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotCloseReport}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 109:40-109:42
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalTripleCloseInput}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 37:40-37:42
     Visibility: public -/
-def SnapshotCloseReport.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : SnapshotCloseReport) : Result Unit := do
+def TerminalTripleCloseInput.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : TerminalTripleCloseInput) : Result Unit := do
   ok ()
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotCloseReport}]
-    Source: 'src/lib.rs', lines 109:40-109:42 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalTripleCloseInput}]
+    Source: 'src/lib.rs', lines 37:40-37:42 -/
 @[reducible]
-def SnapshotCloseReport.Insts.CoreCmpEq : core.cmp.Eq SnapshotCloseReport := {
+def TerminalTripleCloseInput.Insts.CoreCmpEq : core.cmp.Eq
+  TerminalTripleCloseInput := {
   partialEqInst :=
-    SnapshotCloseReport.Insts.CoreCmpPartialEqSnapshotCloseReport
+    TerminalTripleCloseInput.Insts.CoreCmpPartialEqTerminalTripleCloseInput
   assert_fields_are_eq :=
-    SnapshotCloseReport.Insts.CoreCmpEq.assert_fields_are_eq
+    TerminalTripleCloseInput.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [parity_capacity_verif::TerminalTripleCloseReport]
+    Source: 'src/lib.rs', lines 66:0-102:1
+    Visibility: public -/
+structure TerminalTripleCloseReport where
+  projected_object_present : Bool
+  epochs_completed_by_object : Std.U64
+  final_partial_sidecar_needed : Bool
+  sidecar_index_block_count : Std.U64
+  sidecar_blocks_before_filemark : Std.U64
+  sidecar_tape_file_blocks : Std.U64
+  sidecars_emitted_by_commit : Std.U64
+  sidecar_blocks_emitted_by_commit : Std.U64
+  object_tape_file_blocks : Std.U64
+  prefix_commit_charge_blocks : Std.U64
+  object_rows_after : Std.U64
+  sidecar_entries_after_closeout : Std.U64
+  maximum_sidecar_entries_for_capacity : Std.U64
+  structural_entries_after_closeout : Std.U64
+  final_partial_sidecar_blocks : Std.U64
+  final_parity_map_needed : Bool
+  final_parity_map_directory_bound_bytes : Std.U64
+  final_parity_map_payload_bound_bytes : Std.U64
+  final_parity_map_blocks_before_filemark : Std.U64
+  final_parity_map_tape_file_blocks : Std.U64
+  replica_payload_bytes : Std.U64
+  replica_payload_record_count : Std.U64
+  replica_records_before_filemark : Std.U64
+  replica_tape_file_blocks : Std.U64
+  triple_replica_blocks : Std.U64
+  gap_nominal_bytes : Std.U64
+  gap_records_before_filemark : Std.U64
+  gap_tape_file_blocks : Std.U64
+  double_gap_blocks : Std.U64
+  parity_closeout_charge_blocks : Std.U64
+  terminal_tail_charge_blocks : Std.U64
+  safety_margin_blocks : Std.U64
+  close_bound_blocks : Std.U64
+  required_tape_blocks : Std.U64
+  required_spool_bytes : Std.U64
+
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalTripleCloseReport}::clone]:
+    Source: 'src/lib.rs', lines 65:9-65:14
+    Visibility: public -/
+def TerminalTripleCloseReport.Insts.CoreCloneClone.clone
+  (self : TerminalTripleCloseReport) : Result TerminalTripleCloseReport := do
+  ok self
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalTripleCloseReport}]
+    Source: 'src/lib.rs', lines 65:9-65:14 -/
+@[reducible]
+def TerminalTripleCloseReport.Insts.CoreCloneClone : core.clone.Clone
+  TerminalTripleCloseReport := {
+  clone := TerminalTripleCloseReport.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalTripleCloseReport}]
+    Source: 'src/lib.rs', lines 65:16-65:20 -/
+@[reducible]
+def TerminalTripleCloseReport.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalTripleCloseReport := {
+  cloneInst := TerminalTripleCloseReport.Insts.CoreCloneClone
+}
+
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalTripleCloseReport}::fmt]:
+    Source: 'src/lib.rs', lines 65:22-65:27
+    Visibility: public -/
+def TerminalTripleCloseReport.Insts.CoreFmtDebug.fmt
+  (self : TerminalTripleCloseReport) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugBool self.projected_object_present
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.epochs_completed_by_object
+  let dyn2 := Dyn.mk _ core.fmt.DebugBool self.final_partial_sidecar_needed
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_index_block_count
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_blocks_before_filemark
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_tape_file_blocks
+  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.sidecars_emitted_by_commit
+  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_blocks_emitted_by_commit
+  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.object_tape_file_blocks
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.prefix_commit_charge_blocks
+  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.object_rows_after
+  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_entries_after_closeout
+  let dyn12 :=
+    Dyn.mk _ core.fmt.DebugU64 self.maximum_sidecar_entries_for_capacity
+  let dyn13 :=
+    Dyn.mk _ core.fmt.DebugU64 self.structural_entries_after_closeout
+  let dyn14 := Dyn.mk _ core.fmt.DebugU64 self.final_partial_sidecar_blocks
+  let dyn15 := Dyn.mk _ core.fmt.DebugBool self.final_parity_map_needed
+  let dyn16 :=
+    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_directory_bound_bytes
+  let dyn17 :=
+    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_payload_bound_bytes
+  let dyn18 :=
+    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_blocks_before_filemark
+  let dyn19 :=
+    Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_tape_file_blocks
+  let dyn20 := Dyn.mk _ core.fmt.DebugU64 self.replica_payload_bytes
+  let dyn21 := Dyn.mk _ core.fmt.DebugU64 self.replica_payload_record_count
+  let dyn22 := Dyn.mk _ core.fmt.DebugU64 self.replica_records_before_filemark
+  let dyn23 := Dyn.mk _ core.fmt.DebugU64 self.replica_tape_file_blocks
+  let dyn24 := Dyn.mk _ core.fmt.DebugU64 self.triple_replica_blocks
+  let dyn25 := Dyn.mk _ core.fmt.DebugU64 self.gap_nominal_bytes
+  let dyn26 := Dyn.mk _ core.fmt.DebugU64 self.gap_records_before_filemark
+  let dyn27 := Dyn.mk _ core.fmt.DebugU64 self.gap_tape_file_blocks
+  let dyn28 := Dyn.mk _ core.fmt.DebugU64 self.double_gap_blocks
+  let dyn29 := Dyn.mk _ core.fmt.DebugU64 self.parity_closeout_charge_blocks
+  let dyn30 := Dyn.mk _ core.fmt.DebugU64 self.terminal_tail_charge_blocks
+  let dyn31 := Dyn.mk _ core.fmt.DebugU64 self.safety_margin_blocks
+  let dyn32 := Dyn.mk _ core.fmt.DebugU64 self.close_bound_blocks
+  let dyn33 := Dyn.mk _ core.fmt.DebugU64 self.required_tape_blocks
+  let dyn34 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.required_spool_bytes
+  let values :=
+    Array.to_slice
+      (Array.make 35#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
+        dyn11, dyn12, dyn13, dyn14, dyn15, dyn16, dyn17, dyn18, dyn19, dyn20,
+        dyn21, dyn22, dyn23, dyn24, dyn25, dyn26, dyn27, dyn28, dyn29, dyn30,
+        dyn31, dyn32, dyn33, dyn34
+        ])
+  let s ←
+    lift (Array.to_slice
+      (Array.make 35#usize [
+        toStr "projected_object_present", toStr "epochs_completed_by_object",
+        toStr "final_partial_sidecar_needed", toStr
+        "sidecar_index_block_count", toStr "sidecar_blocks_before_filemark",
+        toStr "sidecar_tape_file_blocks", toStr "sidecars_emitted_by_commit",
+        toStr "sidecar_blocks_emitted_by_commit", toStr
+        "object_tape_file_blocks", toStr "prefix_commit_charge_blocks", toStr
+        "object_rows_after", toStr "sidecar_entries_after_closeout", toStr
+        "maximum_sidecar_entries_for_capacity", toStr
+        "structural_entries_after_closeout", toStr
+        "final_partial_sidecar_blocks", toStr "final_parity_map_needed", toStr
+        "final_parity_map_directory_bound_bytes", toStr
+        "final_parity_map_payload_bound_bytes", toStr
+        "final_parity_map_blocks_before_filemark", toStr
+        "final_parity_map_tape_file_blocks", toStr "replica_payload_bytes",
+        toStr "replica_payload_record_count", toStr
+        "replica_records_before_filemark", toStr "replica_tape_file_blocks",
+        toStr "triple_replica_blocks", toStr "gap_nominal_bytes", toStr
+        "gap_records_before_filemark", toStr "gap_tape_file_blocks", toStr
+        "double_gap_blocks", toStr "parity_closeout_charge_blocks", toStr
+        "terminal_tail_charge_blocks", toStr "safety_margin_blocks", toStr
+        "close_bound_blocks", toStr "required_tape_blocks", toStr
+        "required_spool_bytes"
+        ]))
+  core.fmt.Formatter.debug_struct_fields_finish f (toStr
+    "TerminalTripleCloseReport") s values
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalTripleCloseReport}]
+    Source: 'src/lib.rs', lines 65:22-65:27 -/
+@[reducible]
+def TerminalTripleCloseReport.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalTripleCloseReport := {
+  fmt := TerminalTripleCloseReport.Insts.CoreFmtDebug.fmt
 }
 
 /-- [parity_capacity_verif::checked_add]:
-    Source: 'src/lib.rs', lines 140:0-145:1
+    Source: 'src/lib.rs', lines 104:0-109:1
     Visibility: public -/
 def checked_add
   (a : Std.U64) (b : Std.U64) :
@@ -1223,7 +580,7 @@ def checked_add
   | some sum => ok (core.result.Result.Ok sum)
 
 /-- [parity_capacity_verif::checked_mul]:
-    Source: 'src/lib.rs', lines 147:0-152:1
+    Source: 'src/lib.rs', lines 111:0-116:1
     Visibility: public -/
 def checked_mul
   (a : Std.U64) (b : Std.U64) :
@@ -1235,7 +592,7 @@ def checked_mul
   | some product => ok (core.result.Result.Ok product)
 
 /-- [parity_capacity_verif::checked_sub]:
-    Source: 'src/lib.rs', lines 154:0-159:1
+    Source: 'src/lib.rs', lines 118:0-123:1
     Visibility: public -/
 def checked_sub
   (a : Std.U64) (b : Std.U64) :
@@ -1246,80 +603,68 @@ def checked_sub
   | none => ok (core.result.Result.Err CapacityError.ArithmeticOverflow)
   | some difference => ok (core.result.Result.Ok difference)
 
-/-- [parity_capacity_verif::block_count_per_bootstrap]:
-    Source: 'src/lib.rs', lines 161:0-163:1
+/-- [parity_capacity_verif::terminal_structural_slot_bytes]:
+    Source: 'src/lib.rs', lines 125:0-127:1
     Visibility: public -/
-def block_count_per_bootstrap : Result Std.U64 := do
-  ok 1#u64
-
-/-- [parity_capacity_verif::snapshot_header_bytes]:
-    Source: 'src/lib.rs', lines 165:0-167:1
-    Visibility: public -/
-def snapshot_header_bytes : Result Std.U64 := do
-  ok 512#u64
-
-/-- [parity_capacity_verif::snapshot_structural_slot_bytes]:
-    Source: 'src/lib.rs', lines 169:0-171:1
-    Visibility: public -/
-def snapshot_structural_slot_bytes : Result Std.U64 := do
+def terminal_structural_slot_bytes : Result Std.U64 := do
   ok 64#u64
 
-/-- [parity_capacity_verif::snapshot_object_row_slot_bytes]:
-    Source: 'src/lib.rs', lines 173:0-175:1
+/-- [parity_capacity_verif::terminal_object_row_slot_bytes]:
+    Source: 'src/lib.rs', lines 129:0-131:1
     Visibility: public -/
-def snapshot_object_row_slot_bytes : Result Std.U64 := do
+def terminal_object_row_slot_bytes : Result Std.U64 := do
   ok 256#u64
 
 /-- [parity_capacity_verif::parity_map_header_bytes]:
-    Source: 'src/lib.rs', lines 177:0-179:1
+    Source: 'src/lib.rs', lines 133:0-135:1
     Visibility: public -/
 def parity_map_header_bytes : Result Std.U64 := do
-  ok 184#u64
+  ok 200#u64
 
 /-- [parity_capacity_verif::sidecar_header_bytes]:
-    Source: 'src/lib.rs', lines 181:0-183:1
+    Source: 'src/lib.rs', lines 137:0-139:1
     Visibility: public -/
 def sidecar_header_bytes : Result Std.U64 := do
-  ok 184#u64
+  ok 200#u64
 
 /-- [parity_capacity_verif::sidecar_trailing_crc_bytes]:
-    Source: 'src/lib.rs', lines 185:0-187:1
+    Source: 'src/lib.rs', lines 141:0-143:1
     Visibility: public -/
 def sidecar_trailing_crc_bytes : Result Std.U64 := do
   ok 8#u64
 
 /-- [parity_capacity_verif::parity_index_entry_bytes]:
-    Source: 'src/lib.rs', lines 189:0-191:1
+    Source: 'src/lib.rs', lines 145:0-147:1
     Visibility: public -/
 def parity_index_entry_bytes : Result Std.U64 := do
   ok 16#u64
 
 /-- [parity_capacity_verif::data_crc_entry_bytes]:
-    Source: 'src/lib.rs', lines 193:0-195:1
+    Source: 'src/lib.rs', lines 149:0-151:1
     Visibility: public -/
 def data_crc_entry_bytes : Result Std.U64 := do
   ok 8#u64
 
 /-- [parity_capacity_verif::parity_map_fixed_bound_bytes]:
-    Source: 'src/lib.rs', lines 197:0-199:1
+    Source: 'src/lib.rs', lines 153:0-155:1
     Visibility: public -/
 def parity_map_fixed_bound_bytes : Result Std.U64 := do
   ok 325#u64
 
 /-- [parity_capacity_verif::parity_map_directory_fixed_bound_bytes]:
-    Source: 'src/lib.rs', lines 201:0-203:1
+    Source: 'src/lib.rs', lines 157:0-159:1
     Visibility: public -/
 def parity_map_directory_fixed_bound_bytes : Result Std.U64 := do
   ok 43#u64
 
 /-- [parity_capacity_verif::parity_map_directory_entry_bound_bytes]:
-    Source: 'src/lib.rs', lines 205:0-207:1
+    Source: 'src/lib.rs', lines 161:0-163:1
     Visibility: public -/
 def parity_map_directory_entry_bound_bytes : Result Std.U64 := do
   ok 116#u64
 
 /-- [parity_capacity_verif::IndexPackingState]
-    Source: 'src/lib.rs', lines 210:0-215:1
+    Source: 'src/lib.rs', lines 166:0-171:1
     Visibility: public -/
 structure IndexPackingState where
   block_count : Std.U64
@@ -1328,14 +673,14 @@ structure IndexPackingState where
   current_block_is_empty : Bool
 
 /-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::IndexPackingState}::clone]:
-    Source: 'src/lib.rs', lines 209:9-209:14
+    Source: 'src/lib.rs', lines 165:9-165:14
     Visibility: public -/
 def IndexPackingState.Insts.CoreCloneClone.clone
   (self : IndexPackingState) : Result IndexPackingState := do
   ok self
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::IndexPackingState}]
-    Source: 'src/lib.rs', lines 209:9-209:14 -/
+    Source: 'src/lib.rs', lines 165:9-165:14 -/
 @[reducible]
 def IndexPackingState.Insts.CoreCloneClone : core.clone.Clone IndexPackingState
   := {
@@ -1343,7 +688,7 @@ def IndexPackingState.Insts.CoreCloneClone : core.clone.Clone IndexPackingState
 }
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::IndexPackingState}]
-    Source: 'src/lib.rs', lines 209:16-209:20 -/
+    Source: 'src/lib.rs', lines 165:16-165:20 -/
 @[reducible]
 def IndexPackingState.Insts.CoreMarkerCopy : core.marker.Copy IndexPackingState
   := {
@@ -1351,7 +696,7 @@ def IndexPackingState.Insts.CoreMarkerCopy : core.marker.Copy IndexPackingState
 }
 
 /-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::IndexPackingState}::fmt]:
-    Source: 'src/lib.rs', lines 209:22-209:27
+    Source: 'src/lib.rs', lines 165:22-165:27
     Visibility: public -/
 def IndexPackingState.Insts.CoreFmtDebug.fmt
   (self : IndexPackingState) (f : core.fmt.Formatter) :
@@ -1368,7 +713,7 @@ def IndexPackingState.Insts.CoreFmtDebug.fmt
     "inline_entry_bytes") dyn2 (toStr "current_block_is_empty") dyn3
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::IndexPackingState}]
-    Source: 'src/lib.rs', lines 209:22-209:27 -/
+    Source: 'src/lib.rs', lines 165:22-165:27 -/
 @[reducible]
 def IndexPackingState.Insts.CoreFmtDebug : core.fmt.Debug IndexPackingState
   := {
@@ -1376,14 +721,14 @@ def IndexPackingState.Insts.CoreFmtDebug : core.fmt.Debug IndexPackingState
 }
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::IndexPackingState}]
-    Source: 'src/lib.rs', lines 209:29-209:38 -/
+    Source: 'src/lib.rs', lines 165:29-165:38 -/
 @[reducible]
 def IndexPackingState.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq IndexPackingState := {
 }
 
 /-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::IndexPackingState> for parity_capacity_verif::IndexPackingState}::eq]:
-    Source: 'src/lib.rs', lines 209:29-209:38
+    Source: 'src/lib.rs', lines 165:29-165:38
     Visibility: public -/
 def IndexPackingState.Insts.CoreCmpPartialEqIndexPackingState.eq
   (self : IndexPackingState) (other : IndexPackingState) : Result Bool := do
@@ -1398,7 +743,7 @@ def IndexPackingState.Insts.CoreCmpPartialEqIndexPackingState.eq
   else ok false
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::IndexPackingState> for parity_capacity_verif::IndexPackingState}]
-    Source: 'src/lib.rs', lines 209:29-209:38 -/
+    Source: 'src/lib.rs', lines 165:29-165:38 -/
 @[reducible]
 def IndexPackingState.Insts.CoreCmpPartialEqIndexPackingState :
   core.cmp.PartialEq IndexPackingState IndexPackingState := {
@@ -1406,14 +751,14 @@ def IndexPackingState.Insts.CoreCmpPartialEqIndexPackingState :
 }
 
 /-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::IndexPackingState}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 209:40-209:42
+    Source: 'src/lib.rs', lines 165:40-165:42
     Visibility: public -/
 def IndexPackingState.Insts.CoreCmpEq.assert_fields_are_eq
   (self : IndexPackingState) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::IndexPackingState}]
-    Source: 'src/lib.rs', lines 209:40-209:42 -/
+    Source: 'src/lib.rs', lines 165:40-165:42 -/
 @[reducible]
 def IndexPackingState.Insts.CoreCmpEq : core.cmp.Eq IndexPackingState := {
   partialEqInst := IndexPackingState.Insts.CoreCmpPartialEqIndexPackingState
@@ -1422,21 +767,21 @@ def IndexPackingState.Insts.CoreCmpEq : core.cmp.Eq IndexPackingState := {
 }
 
 /-- [parity_capacity_verif::SidecarIndexCapacityLayout]
-    Source: 'src/lib.rs', lines 218:0-221:1
+    Source: 'src/lib.rs', lines 174:0-177:1
     Visibility: public -/
 structure SidecarIndexCapacityLayout where
   block_count : Std.U64
   inline_entry_bytes : Std.U64
 
 /-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SidecarIndexCapacityLayout}::clone]:
-    Source: 'src/lib.rs', lines 217:9-217:14
+    Source: 'src/lib.rs', lines 173:9-173:14
     Visibility: public -/
 def SidecarIndexCapacityLayout.Insts.CoreCloneClone.clone
   (self : SidecarIndexCapacityLayout) : Result SidecarIndexCapacityLayout := do
   ok self
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SidecarIndexCapacityLayout}]
-    Source: 'src/lib.rs', lines 217:9-217:14 -/
+    Source: 'src/lib.rs', lines 173:9-173:14 -/
 @[reducible]
 def SidecarIndexCapacityLayout.Insts.CoreCloneClone : core.clone.Clone
   SidecarIndexCapacityLayout := {
@@ -1444,7 +789,7 @@ def SidecarIndexCapacityLayout.Insts.CoreCloneClone : core.clone.Clone
 }
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::SidecarIndexCapacityLayout}]
-    Source: 'src/lib.rs', lines 217:16-217:20 -/
+    Source: 'src/lib.rs', lines 173:16-173:20 -/
 @[reducible]
 def SidecarIndexCapacityLayout.Insts.CoreMarkerCopy : core.marker.Copy
   SidecarIndexCapacityLayout := {
@@ -1452,7 +797,7 @@ def SidecarIndexCapacityLayout.Insts.CoreMarkerCopy : core.marker.Copy
 }
 
 /-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SidecarIndexCapacityLayout}::fmt]:
-    Source: 'src/lib.rs', lines 217:22-217:27
+    Source: 'src/lib.rs', lines 173:22-173:27
     Visibility: public -/
 def SidecarIndexCapacityLayout.Insts.CoreFmtDebug.fmt
   (self : SidecarIndexCapacityLayout) (f : core.fmt.Formatter) :
@@ -1466,7 +811,7 @@ def SidecarIndexCapacityLayout.Insts.CoreFmtDebug.fmt
     "inline_entry_bytes") dyn1
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SidecarIndexCapacityLayout}]
-    Source: 'src/lib.rs', lines 217:22-217:27 -/
+    Source: 'src/lib.rs', lines 173:22-173:27 -/
 @[reducible]
 def SidecarIndexCapacityLayout.Insts.CoreFmtDebug : core.fmt.Debug
   SidecarIndexCapacityLayout := {
@@ -1474,14 +819,14 @@ def SidecarIndexCapacityLayout.Insts.CoreFmtDebug : core.fmt.Debug
 }
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::SidecarIndexCapacityLayout}]
-    Source: 'src/lib.rs', lines 217:29-217:38 -/
+    Source: 'src/lib.rs', lines 173:29-173:38 -/
 @[reducible]
 def SidecarIndexCapacityLayout.Insts.CoreMarkerStructuralPartialEq :
   core.marker.StructuralPartialEq SidecarIndexCapacityLayout := {
 }
 
 /-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SidecarIndexCapacityLayout> for parity_capacity_verif::SidecarIndexCapacityLayout}::eq]:
-    Source: 'src/lib.rs', lines 217:29-217:38
+    Source: 'src/lib.rs', lines 173:29-173:38
     Visibility: public -/
 def
   SidecarIndexCapacityLayout.Insts.CoreCmpPartialEqSidecarIndexCapacityLayout.eq
@@ -1493,7 +838,7 @@ def
   else ok false
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SidecarIndexCapacityLayout> for parity_capacity_verif::SidecarIndexCapacityLayout}]
-    Source: 'src/lib.rs', lines 217:29-217:38 -/
+    Source: 'src/lib.rs', lines 173:29-173:38 -/
 @[reducible]
 def SidecarIndexCapacityLayout.Insts.CoreCmpPartialEqSidecarIndexCapacityLayout
   : core.cmp.PartialEq SidecarIndexCapacityLayout SidecarIndexCapacityLayout
@@ -1503,14 +848,14 @@ def SidecarIndexCapacityLayout.Insts.CoreCmpPartialEqSidecarIndexCapacityLayout
 }
 
 /-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SidecarIndexCapacityLayout}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 217:40-217:42
+    Source: 'src/lib.rs', lines 173:40-173:42
     Visibility: public -/
 def SidecarIndexCapacityLayout.Insts.CoreCmpEq.assert_fields_are_eq
   (self : SidecarIndexCapacityLayout) : Result Unit := do
   ok ()
 
 /-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SidecarIndexCapacityLayout}]
-    Source: 'src/lib.rs', lines 217:40-217:42 -/
+    Source: 'src/lib.rs', lines 173:40-173:42 -/
 @[reducible]
 def SidecarIndexCapacityLayout.Insts.CoreCmpEq : core.cmp.Eq
   SidecarIndexCapacityLayout := {
@@ -1521,7 +866,7 @@ def SidecarIndexCapacityLayout.Insts.CoreCmpEq : core.cmp.Eq
 }
 
 /-- [parity_capacity_verif::pack_index_segment]:
-    Source: 'src/lib.rs', lines 223:0-281:1
+    Source: 'src/lib.rs', lines 179:0-237:1
     Visibility: public -/
 def pack_index_segment
   (state : IndexPackingState) (spill_capacity : Std.U64)
@@ -1999,7 +1344,7 @@ def pack_index_segment
               IndexPackingState (core.convert.FromSame CapacityError) residual
 
 /-- [parity_capacity_verif::checked_sidecar_index_capacity_layout]:
-    Source: 'src/lib.rs', lines 283:0-316:1
+    Source: 'src/lib.rs', lines 239:0-272:1
     Visibility: public -/
 def checked_sidecar_index_capacity_layout
   (block_size_bytes : Std.U64) (parity_entry_count : Std.U64)
@@ -2066,7 +1411,7 @@ def checked_sidecar_index_capacity_layout
       SidecarIndexCapacityLayout (core.convert.FromSame CapacityError) residual
 
 /-- [parity_capacity_verif::parity_map_directory_len_upper_bound]:
-    Source: 'src/lib.rs', lines 318:0-326:1
+    Source: 'src/lib.rs', lines 274:0-282:1
     Visibility: public -/
 def parity_map_directory_len_upper_bound
   (directory_entry_count : Std.U64) :
@@ -2084,7 +1429,7 @@ def parity_map_directory_len_upper_bound
       Std.U64 (core.convert.FromSame CapacityError) residual
 
 /-- [parity_capacity_verif::parity_map_payload_len_upper_bound]:
-    Source: 'src/lib.rs', lines 328:0-336:1
+    Source: 'src/lib.rs', lines 284:0-292:1
     Visibility: public -/
 def parity_map_payload_len_upper_bound
   (directory_entry_count : Std.U64) :
@@ -2101,20 +1446,110 @@ def parity_map_payload_len_upper_bound
     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
       Std.U64 (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::supported_snapshot_block_size]:
-    Source: 'src/lib.rs', lines 338:0-340:1
+/-- [parity_capacity_verif::ParityMapCapacityLayout]
+    Source: 'src/lib.rs', lines 295:0-299:1
     Visibility: public -/
-def supported_snapshot_block_size
-  (block_size_bytes : Std.U64) : Result Bool := do
-  if block_size_bytes = 262144#u64
-  then ok true
-  else
-    if block_size_bytes = 524288#u64
-    then ok true
-    else ok (block_size_bytes = 1048576#u64)
+structure ParityMapCapacityLayout where
+  payload_bound_bytes : Std.U64
+  blocks_before_filemark : Std.U64
+  tape_file_blocks : Std.U64
+
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::ParityMapCapacityLayout}::clone]:
+    Source: 'src/lib.rs', lines 294:9-294:14
+    Visibility: public -/
+def ParityMapCapacityLayout.Insts.CoreCloneClone.clone
+  (self : ParityMapCapacityLayout) : Result ParityMapCapacityLayout := do
+  ok self
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::ParityMapCapacityLayout}]
+    Source: 'src/lib.rs', lines 294:9-294:14 -/
+@[reducible]
+def ParityMapCapacityLayout.Insts.CoreCloneClone : core.clone.Clone
+  ParityMapCapacityLayout := {
+  clone := ParityMapCapacityLayout.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::ParityMapCapacityLayout}]
+    Source: 'src/lib.rs', lines 294:16-294:20 -/
+@[reducible]
+def ParityMapCapacityLayout.Insts.CoreMarkerCopy : core.marker.Copy
+  ParityMapCapacityLayout := {
+  cloneInst := ParityMapCapacityLayout.Insts.CoreCloneClone
+}
+
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::ParityMapCapacityLayout}::fmt]:
+    Source: 'src/lib.rs', lines 294:22-294:27
+    Visibility: public -/
+def ParityMapCapacityLayout.Insts.CoreFmtDebug.fmt
+  (self : ParityMapCapacityLayout) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  let dyn := Dyn.mk _ core.fmt.DebugU64 self.payload_bound_bytes
+  let dyn1 := Dyn.mk _ core.fmt.DebugU64 self.blocks_before_filemark
+  let dyn2 :=
+    Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.tape_file_blocks
+  core.fmt.Formatter.debug_struct_field3_finish f (toStr
+    "ParityMapCapacityLayout") (toStr "payload_bound_bytes") dyn (toStr
+    "blocks_before_filemark") dyn1 (toStr "tape_file_blocks") dyn2
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::ParityMapCapacityLayout}]
+    Source: 'src/lib.rs', lines 294:22-294:27 -/
+@[reducible]
+def ParityMapCapacityLayout.Insts.CoreFmtDebug : core.fmt.Debug
+  ParityMapCapacityLayout := {
+  fmt := ParityMapCapacityLayout.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::ParityMapCapacityLayout}]
+    Source: 'src/lib.rs', lines 294:29-294:38 -/
+@[reducible]
+def ParityMapCapacityLayout.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq ParityMapCapacityLayout := {
+}
+
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::ParityMapCapacityLayout> for parity_capacity_verif::ParityMapCapacityLayout}::eq]:
+    Source: 'src/lib.rs', lines 294:29-294:38
+    Visibility: public -/
+def ParityMapCapacityLayout.Insts.CoreCmpPartialEqParityMapCapacityLayout.eq
+  (self : ParityMapCapacityLayout) (other : ParityMapCapacityLayout) :
+  Result Bool
+  := do
+  if self.payload_bound_bytes = other.payload_bound_bytes
+  then
+    if self.blocks_before_filemark = other.blocks_before_filemark
+    then ok (self.tape_file_blocks = other.tape_file_blocks)
+    else ok false
+  else ok false
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::ParityMapCapacityLayout> for parity_capacity_verif::ParityMapCapacityLayout}]
+    Source: 'src/lib.rs', lines 294:29-294:38 -/
+@[reducible]
+def ParityMapCapacityLayout.Insts.CoreCmpPartialEqParityMapCapacityLayout :
+  core.cmp.PartialEq ParityMapCapacityLayout ParityMapCapacityLayout := {
+  eq :=
+    ParityMapCapacityLayout.Insts.CoreCmpPartialEqParityMapCapacityLayout.eq
+}
+
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::ParityMapCapacityLayout}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 294:40-294:42
+    Visibility: public -/
+def ParityMapCapacityLayout.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : ParityMapCapacityLayout) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::ParityMapCapacityLayout}]
+    Source: 'src/lib.rs', lines 294:40-294:42 -/
+@[reducible]
+def ParityMapCapacityLayout.Insts.CoreCmpEq : core.cmp.Eq
+  ParityMapCapacityLayout := {
+  partialEqInst :=
+    ParityMapCapacityLayout.Insts.CoreCmpPartialEqParityMapCapacityLayout
+  assert_fields_are_eq :=
+    ParityMapCapacityLayout.Insts.CoreCmpEq.assert_fields_are_eq
+}
 
 /-- [parity_capacity_verif::replicated_control_total_blocks]:
-    Source: 'src/lib.rs', lines 344:0-360:1
+    Source: 'src/lib.rs', lines 325:0-341:1
     Visibility: public -/
 def replicated_control_total_blocks
   (block_size_bytes : Std.U64) (header_bytes : Std.U64)
@@ -2156,10 +1591,60 @@ def replicated_control_total_blocks
         core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
           Std.U64 (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::snapshot_payload_bytes]:
-    Source: 'src/lib.rs', lines 362:0-372:1
+/-- [parity_capacity_verif::checked_parity_map_capacity_layout]:
+    Source: 'src/lib.rs', lines 301:0-318:1
     Visibility: public -/
-def snapshot_payload_bytes
+def checked_parity_map_capacity_layout
+  (block_size_bytes : Std.U64) (sidecar_entry_count : Std.U64)
+  (filemark_blocks : Std.U64) :
+  Result (core.result.Result ParityMapCapacityLayout CapacityError)
+  := do
+  let r ← parity_map_payload_len_upper_bound sidecar_entry_count
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue val =>
+    let i ← parity_map_header_bytes
+    let r1 ← replicated_control_total_blocks block_size_bytes i val
+    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+    match cf1 with
+    | core.ops.control_flow.ControlFlow.Continue val1 =>
+      let r2 ← checked_add val1 filemark_blocks
+      let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+      match cf2 with
+      | core.ops.control_flow.ControlFlow.Continue val2 =>
+        ok (core.result.Result.Ok
+          {
+            payload_bound_bytes := val,
+            blocks_before_filemark := val1,
+            tape_file_blocks := val2
+          })
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          ParityMapCapacityLayout (core.convert.FromSame CapacityError)
+          residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        ParityMapCapacityLayout (core.convert.FromSame CapacityError) residual
+  | core.ops.control_flow.ControlFlow.Break residual =>
+    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+      ParityMapCapacityLayout (core.convert.FromSame CapacityError) residual
+
+/-- [parity_capacity_verif::supported_terminal_block_size]:
+    Source: 'src/lib.rs', lines 320:0-322:1
+    Visibility: public -/
+def supported_terminal_block_size
+  (block_size_bytes : Std.U64) : Result Bool := do
+  if block_size_bytes = 262144#u64
+  then ok true
+  else
+    if block_size_bytes = 524288#u64
+    then ok true
+    else ok (block_size_bytes = 1048576#u64)
+
+/-- [parity_capacity_verif::terminal_payload_bytes]:
+    Source: 'src/lib.rs', lines 343:0-353:1
+    Visibility: public -/
+def terminal_payload_bytes
   (structural_entry_count : Std.U64) (object_row_count : Std.U64) :
   Result (core.result.Result Std.U64 CapacityError)
   := do
@@ -2167,12 +1652,12 @@ def snapshot_payload_bytes
   then
     ok (core.result.Result.Err CapacityError.ObjectRowsExceedStructuralEntries)
   else
-    let i ← snapshot_structural_slot_bytes
+    let i ← terminal_structural_slot_bytes
     let r ← checked_mul structural_entry_count i
     let cf ← core.result.Result.Insts.CoreOpsTry.branch r
     match cf with
     | core.ops.control_flow.ControlFlow.Continue val =>
-      let i1 ← snapshot_object_row_slot_bytes
+      let i1 ← terminal_object_row_slot_bytes
       let r1 ← checked_mul object_row_count i1
       let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
       match cf1 with
@@ -2184,42 +1669,42 @@ def snapshot_payload_bytes
       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
         Std.U64 (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::SnapshotSidecarTerms]
-    Source: 'src/lib.rs', lines 375:0-379:1
+/-- [parity_capacity_verif::TerminalSidecarTerms]
+    Source: 'src/lib.rs', lines 356:0-360:1
     Visibility: public -/
-structure SnapshotSidecarTerms where
+structure TerminalSidecarTerms where
   index_block_count : Std.U64
   blocks_before_filemark : Std.U64
   tape_file_blocks : Std.U64
 
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotSidecarTerms}::clone]:
-    Source: 'src/lib.rs', lines 374:9-374:14
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalSidecarTerms}::clone]:
+    Source: 'src/lib.rs', lines 355:9-355:14
     Visibility: public -/
-def SnapshotSidecarTerms.Insts.CoreCloneClone.clone
-  (self : SnapshotSidecarTerms) : Result SnapshotSidecarTerms := do
+def TerminalSidecarTerms.Insts.CoreCloneClone.clone
+  (self : TerminalSidecarTerms) : Result TerminalSidecarTerms := do
   ok self
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotSidecarTerms}]
-    Source: 'src/lib.rs', lines 374:9-374:14 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalSidecarTerms}]
+    Source: 'src/lib.rs', lines 355:9-355:14 -/
 @[reducible]
-def SnapshotSidecarTerms.Insts.CoreCloneClone : core.clone.Clone
-  SnapshotSidecarTerms := {
-  clone := SnapshotSidecarTerms.Insts.CoreCloneClone.clone
+def TerminalSidecarTerms.Insts.CoreCloneClone : core.clone.Clone
+  TerminalSidecarTerms := {
+  clone := TerminalSidecarTerms.Insts.CoreCloneClone.clone
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::SnapshotSidecarTerms}]
-    Source: 'src/lib.rs', lines 374:16-374:20 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalSidecarTerms}]
+    Source: 'src/lib.rs', lines 355:16-355:20 -/
 @[reducible]
-def SnapshotSidecarTerms.Insts.CoreMarkerCopy : core.marker.Copy
-  SnapshotSidecarTerms := {
-  cloneInst := SnapshotSidecarTerms.Insts.CoreCloneClone
+def TerminalSidecarTerms.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalSidecarTerms := {
+  cloneInst := TerminalSidecarTerms.Insts.CoreCloneClone
 }
 
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotSidecarTerms}::fmt]:
-    Source: 'src/lib.rs', lines 374:22-374:27
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalSidecarTerms}::fmt]:
+    Source: 'src/lib.rs', lines 355:22-355:27
     Visibility: public -/
-def SnapshotSidecarTerms.Insts.CoreFmtDebug.fmt
-  (self : SnapshotSidecarTerms) (f : core.fmt.Formatter) :
+def TerminalSidecarTerms.Insts.CoreFmtDebug.fmt
+  (self : TerminalSidecarTerms) (f : core.fmt.Formatter) :
   Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
   := do
   let dyn := Dyn.mk _ core.fmt.DebugU64 self.index_block_count
@@ -2227,29 +1712,29 @@ def SnapshotSidecarTerms.Insts.CoreFmtDebug.fmt
   let dyn2 :=
     Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.tape_file_blocks
   core.fmt.Formatter.debug_struct_field3_finish f (toStr
-    "SnapshotSidecarTerms") (toStr "index_block_count") dyn (toStr
+    "TerminalSidecarTerms") (toStr "index_block_count") dyn (toStr
     "blocks_before_filemark") dyn1 (toStr "tape_file_blocks") dyn2
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotSidecarTerms}]
-    Source: 'src/lib.rs', lines 374:22-374:27 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalSidecarTerms}]
+    Source: 'src/lib.rs', lines 355:22-355:27 -/
 @[reducible]
-def SnapshotSidecarTerms.Insts.CoreFmtDebug : core.fmt.Debug
-  SnapshotSidecarTerms := {
-  fmt := SnapshotSidecarTerms.Insts.CoreFmtDebug.fmt
+def TerminalSidecarTerms.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalSidecarTerms := {
+  fmt := TerminalSidecarTerms.Insts.CoreFmtDebug.fmt
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::SnapshotSidecarTerms}]
-    Source: 'src/lib.rs', lines 374:29-374:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TerminalSidecarTerms}]
+    Source: 'src/lib.rs', lines 355:29-355:38 -/
 @[reducible]
-def SnapshotSidecarTerms.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq SnapshotSidecarTerms := {
+def TerminalSidecarTerms.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq TerminalSidecarTerms := {
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotSidecarTerms> for parity_capacity_verif::SnapshotSidecarTerms}::eq]:
-    Source: 'src/lib.rs', lines 374:29-374:38
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalSidecarTerms> for parity_capacity_verif::TerminalSidecarTerms}::eq]:
+    Source: 'src/lib.rs', lines 355:29-355:38
     Visibility: public -/
-def SnapshotSidecarTerms.Insts.CoreCmpPartialEqSnapshotSidecarTerms.eq
-  (self : SnapshotSidecarTerms) (other : SnapshotSidecarTerms) :
+def TerminalSidecarTerms.Insts.CoreCmpPartialEqTerminalSidecarTerms.eq
+  (self : TerminalSidecarTerms) (other : TerminalSidecarTerms) :
   Result Bool
   := do
   if self.index_block_count = other.index_block_count
@@ -2259,42 +1744,42 @@ def SnapshotSidecarTerms.Insts.CoreCmpPartialEqSnapshotSidecarTerms.eq
     else ok false
   else ok false
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotSidecarTerms> for parity_capacity_verif::SnapshotSidecarTerms}]
-    Source: 'src/lib.rs', lines 374:29-374:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalSidecarTerms> for parity_capacity_verif::TerminalSidecarTerms}]
+    Source: 'src/lib.rs', lines 355:29-355:38 -/
 @[reducible]
-def SnapshotSidecarTerms.Insts.CoreCmpPartialEqSnapshotSidecarTerms :
-  core.cmp.PartialEq SnapshotSidecarTerms SnapshotSidecarTerms := {
-  eq := SnapshotSidecarTerms.Insts.CoreCmpPartialEqSnapshotSidecarTerms.eq
+def TerminalSidecarTerms.Insts.CoreCmpPartialEqTerminalSidecarTerms :
+  core.cmp.PartialEq TerminalSidecarTerms TerminalSidecarTerms := {
+  eq := TerminalSidecarTerms.Insts.CoreCmpPartialEqTerminalSidecarTerms.eq
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotSidecarTerms}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 374:40-374:42
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalSidecarTerms}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 355:40-355:42
     Visibility: public -/
-def SnapshotSidecarTerms.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : SnapshotSidecarTerms) : Result Unit := do
+def TerminalSidecarTerms.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : TerminalSidecarTerms) : Result Unit := do
   ok ()
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotSidecarTerms}]
-    Source: 'src/lib.rs', lines 374:40-374:42 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalSidecarTerms}]
+    Source: 'src/lib.rs', lines 355:40-355:42 -/
 @[reducible]
-def SnapshotSidecarTerms.Insts.CoreCmpEq : core.cmp.Eq SnapshotSidecarTerms
+def TerminalSidecarTerms.Insts.CoreCmpEq : core.cmp.Eq TerminalSidecarTerms
   := {
   partialEqInst :=
-    SnapshotSidecarTerms.Insts.CoreCmpPartialEqSnapshotSidecarTerms
+    TerminalSidecarTerms.Insts.CoreCmpPartialEqTerminalSidecarTerms
   assert_fields_are_eq :=
-    SnapshotSidecarTerms.Insts.CoreCmpEq.assert_fields_are_eq
+    TerminalSidecarTerms.Insts.CoreCmpEq.assert_fields_are_eq
 }
 
-/-- [parity_capacity_verif::SnapshotProjectionTerms]
-    Source: 'src/lib.rs', lines 382:0-396:1
+/-- [parity_capacity_verif::TerminalProjectionTerms]
+    Source: 'src/lib.rs', lines 363:0-377:1
     Visibility: public -/
-structure SnapshotProjectionTerms where
+structure TerminalProjectionTerms where
   epochs_completed_by_object : Std.U64
   final_partial_sidecar_needed : Bool
   sidecars_emitted_by_commit : Std.U64
   sidecar_blocks_emitted_by_commit : Std.U64
   object_tape_file_blocks : Std.U64
-  object_commit_charge_blocks : Std.U64
+  prefix_commit_charge_blocks : Std.U64
   object_rows_after : Std.U64
   sidecar_entries_after_closeout : Std.U64
   maximum_sidecar_entries_for_capacity : Std.U64
@@ -2303,34 +1788,34 @@ structure SnapshotProjectionTerms where
   final_parity_map_directory_bound_bytes : Std.U64
   final_parity_map_payload_bound_bytes : Std.U64
 
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotProjectionTerms}::clone]:
-    Source: 'src/lib.rs', lines 381:9-381:14
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalProjectionTerms}::clone]:
+    Source: 'src/lib.rs', lines 362:9-362:14
     Visibility: public -/
-def SnapshotProjectionTerms.Insts.CoreCloneClone.clone
-  (self : SnapshotProjectionTerms) : Result SnapshotProjectionTerms := do
+def TerminalProjectionTerms.Insts.CoreCloneClone.clone
+  (self : TerminalProjectionTerms) : Result TerminalProjectionTerms := do
   ok self
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotProjectionTerms}]
-    Source: 'src/lib.rs', lines 381:9-381:14 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalProjectionTerms}]
+    Source: 'src/lib.rs', lines 362:9-362:14 -/
 @[reducible]
-def SnapshotProjectionTerms.Insts.CoreCloneClone : core.clone.Clone
-  SnapshotProjectionTerms := {
-  clone := SnapshotProjectionTerms.Insts.CoreCloneClone.clone
+def TerminalProjectionTerms.Insts.CoreCloneClone : core.clone.Clone
+  TerminalProjectionTerms := {
+  clone := TerminalProjectionTerms.Insts.CoreCloneClone.clone
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::SnapshotProjectionTerms}]
-    Source: 'src/lib.rs', lines 381:16-381:20 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalProjectionTerms}]
+    Source: 'src/lib.rs', lines 362:16-362:20 -/
 @[reducible]
-def SnapshotProjectionTerms.Insts.CoreMarkerCopy : core.marker.Copy
-  SnapshotProjectionTerms := {
-  cloneInst := SnapshotProjectionTerms.Insts.CoreCloneClone
+def TerminalProjectionTerms.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalProjectionTerms := {
+  cloneInst := TerminalProjectionTerms.Insts.CoreCloneClone
 }
 
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotProjectionTerms}::fmt]:
-    Source: 'src/lib.rs', lines 381:22-381:27
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalProjectionTerms}::fmt]:
+    Source: 'src/lib.rs', lines 362:22-362:27
     Visibility: public -/
-def SnapshotProjectionTerms.Insts.CoreFmtDebug.fmt
-  (self : SnapshotProjectionTerms) (f : core.fmt.Formatter) :
+def TerminalProjectionTerms.Insts.CoreFmtDebug.fmt
+  (self : TerminalProjectionTerms) (f : core.fmt.Formatter) :
   Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
   := do
   let dyn := Dyn.mk _ core.fmt.DebugU64 self.epochs_completed_by_object
@@ -2338,7 +1823,7 @@ def SnapshotProjectionTerms.Insts.CoreFmtDebug.fmt
   let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.sidecars_emitted_by_commit
   let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_blocks_emitted_by_commit
   let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.object_tape_file_blocks
-  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.object_commit_charge_blocks
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.prefix_commit_charge_blocks
   let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.object_rows_after
   let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.sidecar_entries_after_closeout
   let dyn8 :=
@@ -2362,7 +1847,7 @@ def SnapshotProjectionTerms.Insts.CoreFmtDebug.fmt
         toStr "epochs_completed_by_object", toStr
         "final_partial_sidecar_needed", toStr "sidecars_emitted_by_commit",
         toStr "sidecar_blocks_emitted_by_commit", toStr
-        "object_tape_file_blocks", toStr "object_commit_charge_blocks", toStr
+        "object_tape_file_blocks", toStr "prefix_commit_charge_blocks", toStr
         "object_rows_after", toStr "sidecar_entries_after_closeout", toStr
         "maximum_sidecar_entries_for_capacity", toStr
         "structural_entries_after_closeout", toStr "final_parity_map_needed",
@@ -2370,28 +1855,28 @@ def SnapshotProjectionTerms.Insts.CoreFmtDebug.fmt
         "final_parity_map_payload_bound_bytes"
         ]))
   core.fmt.Formatter.debug_struct_fields_finish f (toStr
-    "SnapshotProjectionTerms") s values
+    "TerminalProjectionTerms") s values
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotProjectionTerms}]
-    Source: 'src/lib.rs', lines 381:22-381:27 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalProjectionTerms}]
+    Source: 'src/lib.rs', lines 362:22-362:27 -/
 @[reducible]
-def SnapshotProjectionTerms.Insts.CoreFmtDebug : core.fmt.Debug
-  SnapshotProjectionTerms := {
-  fmt := SnapshotProjectionTerms.Insts.CoreFmtDebug.fmt
+def TerminalProjectionTerms.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalProjectionTerms := {
+  fmt := TerminalProjectionTerms.Insts.CoreFmtDebug.fmt
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::SnapshotProjectionTerms}]
-    Source: 'src/lib.rs', lines 381:29-381:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TerminalProjectionTerms}]
+    Source: 'src/lib.rs', lines 362:29-362:38 -/
 @[reducible]
-def SnapshotProjectionTerms.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq SnapshotProjectionTerms := {
+def TerminalProjectionTerms.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq TerminalProjectionTerms := {
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotProjectionTerms> for parity_capacity_verif::SnapshotProjectionTerms}::eq]:
-    Source: 'src/lib.rs', lines 381:29-381:38
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalProjectionTerms> for parity_capacity_verif::TerminalProjectionTerms}::eq]:
+    Source: 'src/lib.rs', lines 362:29-362:38
     Visibility: public -/
-def SnapshotProjectionTerms.Insts.CoreCmpPartialEqSnapshotProjectionTerms.eq
-  (self : SnapshotProjectionTerms) (other : SnapshotProjectionTerms) :
+def TerminalProjectionTerms.Insts.CoreCmpPartialEqTerminalProjectionTerms.eq
+  (self : TerminalProjectionTerms) (other : TerminalProjectionTerms) :
   Result Bool
   := do
   if self.epochs_completed_by_object = other.epochs_completed_by_object
@@ -2405,8 +1890,8 @@ def SnapshotProjectionTerms.Insts.CoreCmpPartialEqSnapshotProjectionTerms.eq
         then
           if self.object_tape_file_blocks = other.object_tape_file_blocks
           then
-            if self.object_commit_charge_blocks =
-              other.object_commit_charge_blocks
+            if self.prefix_commit_charge_blocks =
+              other.prefix_commit_charge_blocks
             then
               if self.object_rows_after = other.object_rows_after
               then
@@ -2440,122 +1925,140 @@ def SnapshotProjectionTerms.Insts.CoreCmpPartialEqSnapshotProjectionTerms.eq
     else ok false
   else ok false
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotProjectionTerms> for parity_capacity_verif::SnapshotProjectionTerms}]
-    Source: 'src/lib.rs', lines 381:29-381:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalProjectionTerms> for parity_capacity_verif::TerminalProjectionTerms}]
+    Source: 'src/lib.rs', lines 362:29-362:38 -/
 @[reducible]
-def SnapshotProjectionTerms.Insts.CoreCmpPartialEqSnapshotProjectionTerms :
-  core.cmp.PartialEq SnapshotProjectionTerms SnapshotProjectionTerms := {
+def TerminalProjectionTerms.Insts.CoreCmpPartialEqTerminalProjectionTerms :
+  core.cmp.PartialEq TerminalProjectionTerms TerminalProjectionTerms := {
   eq :=
-    SnapshotProjectionTerms.Insts.CoreCmpPartialEqSnapshotProjectionTerms.eq
+    TerminalProjectionTerms.Insts.CoreCmpPartialEqTerminalProjectionTerms.eq
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotProjectionTerms}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 381:40-381:42
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalProjectionTerms}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 362:40-362:42
     Visibility: public -/
-def SnapshotProjectionTerms.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : SnapshotProjectionTerms) : Result Unit := do
+def TerminalProjectionTerms.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : TerminalProjectionTerms) : Result Unit := do
   ok ()
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotProjectionTerms}]
-    Source: 'src/lib.rs', lines 381:40-381:42 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalProjectionTerms}]
+    Source: 'src/lib.rs', lines 362:40-362:42 -/
 @[reducible]
-def SnapshotProjectionTerms.Insts.CoreCmpEq : core.cmp.Eq
-  SnapshotProjectionTerms := {
+def TerminalProjectionTerms.Insts.CoreCmpEq : core.cmp.Eq
+  TerminalProjectionTerms := {
   partialEqInst :=
-    SnapshotProjectionTerms.Insts.CoreCmpPartialEqSnapshotProjectionTerms
+    TerminalProjectionTerms.Insts.CoreCmpPartialEqTerminalProjectionTerms
   assert_fields_are_eq :=
-    SnapshotProjectionTerms.Insts.CoreCmpEq.assert_fields_are_eq
+    TerminalProjectionTerms.Insts.CoreCmpEq.assert_fields_are_eq
 }
 
-/-- [parity_capacity_verif::SnapshotControlTerms]
-    Source: 'src/lib.rs', lines 399:0-408:1
+/-- [parity_capacity_verif::TerminalControlTerms]
+    Source: 'src/lib.rs', lines 380:0-395:1
     Visibility: public -/
-structure SnapshotControlTerms where
+structure TerminalControlTerms where
   final_partial_sidecar_blocks : Std.U64
   final_parity_map_blocks_before_filemark : Std.U64
   final_parity_map_tape_file_blocks : Std.U64
-  snapshot_payload_bytes : Std.U64
-  snapshot_blocks_before_filemark : Std.U64
-  snapshot_tape_file_blocks : Std.U64
-  final_bootstrap_tape_file_blocks : Std.U64
+  replica_payload_bytes : Std.U64
+  replica_payload_record_count : Std.U64
+  replica_records_before_filemark : Std.U64
+  replica_tape_file_blocks : Std.U64
+  triple_replica_blocks : Std.U64
+  gap_records_before_filemark : Std.U64
+  gap_tape_file_blocks : Std.U64
+  double_gap_blocks : Std.U64
+  parity_closeout_charge_blocks : Std.U64
+  terminal_tail_charge_blocks : Std.U64
   close_bound_blocks : Std.U64
 
-/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotControlTerms}::clone]:
-    Source: 'src/lib.rs', lines 398:9-398:14
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalControlTerms}::clone]:
+    Source: 'src/lib.rs', lines 379:9-379:14
     Visibility: public -/
-def SnapshotControlTerms.Insts.CoreCloneClone.clone
-  (self : SnapshotControlTerms) : Result SnapshotControlTerms := do
+def TerminalControlTerms.Insts.CoreCloneClone.clone
+  (self : TerminalControlTerms) : Result TerminalControlTerms := do
   ok self
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::SnapshotControlTerms}]
-    Source: 'src/lib.rs', lines 398:9-398:14 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalControlTerms}]
+    Source: 'src/lib.rs', lines 379:9-379:14 -/
 @[reducible]
-def SnapshotControlTerms.Insts.CoreCloneClone : core.clone.Clone
-  SnapshotControlTerms := {
-  clone := SnapshotControlTerms.Insts.CoreCloneClone.clone
+def TerminalControlTerms.Insts.CoreCloneClone : core.clone.Clone
+  TerminalControlTerms := {
+  clone := TerminalControlTerms.Insts.CoreCloneClone.clone
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::SnapshotControlTerms}]
-    Source: 'src/lib.rs', lines 398:16-398:20 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalControlTerms}]
+    Source: 'src/lib.rs', lines 379:16-379:20 -/
 @[reducible]
-def SnapshotControlTerms.Insts.CoreMarkerCopy : core.marker.Copy
-  SnapshotControlTerms := {
-  cloneInst := SnapshotControlTerms.Insts.CoreCloneClone
+def TerminalControlTerms.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalControlTerms := {
+  cloneInst := TerminalControlTerms.Insts.CoreCloneClone
 }
 
-/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotControlTerms}::fmt]:
-    Source: 'src/lib.rs', lines 398:22-398:27
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalControlTerms}::fmt]:
+    Source: 'src/lib.rs', lines 379:22-379:27
     Visibility: public -/
-def SnapshotControlTerms.Insts.CoreFmtDebug.fmt
-  (self : SnapshotControlTerms) (f : core.fmt.Formatter) :
+def TerminalControlTerms.Insts.CoreFmtDebug.fmt
+  (self : TerminalControlTerms) (f : core.fmt.Formatter) :
   Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
   := do
   let dyn := Dyn.mk _ core.fmt.DebugU64 self.final_partial_sidecar_blocks
   let dyn1 :=
     Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_blocks_before_filemark
   let dyn2 := Dyn.mk _ core.fmt.DebugU64 self.final_parity_map_tape_file_blocks
-  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_payload_bytes
-  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_blocks_before_filemark
-  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.snapshot_tape_file_blocks
-  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.final_bootstrap_tape_file_blocks
-  let dyn7 :=
+  let dyn3 := Dyn.mk _ core.fmt.DebugU64 self.replica_payload_bytes
+  let dyn4 := Dyn.mk _ core.fmt.DebugU64 self.replica_payload_record_count
+  let dyn5 := Dyn.mk _ core.fmt.DebugU64 self.replica_records_before_filemark
+  let dyn6 := Dyn.mk _ core.fmt.DebugU64 self.replica_tape_file_blocks
+  let dyn7 := Dyn.mk _ core.fmt.DebugU64 self.triple_replica_blocks
+  let dyn8 := Dyn.mk _ core.fmt.DebugU64 self.gap_records_before_filemark
+  let dyn9 := Dyn.mk _ core.fmt.DebugU64 self.gap_tape_file_blocks
+  let dyn10 := Dyn.mk _ core.fmt.DebugU64 self.double_gap_blocks
+  let dyn11 := Dyn.mk _ core.fmt.DebugU64 self.parity_closeout_charge_blocks
+  let dyn12 := Dyn.mk _ core.fmt.DebugU64 self.terminal_tail_charge_blocks
+  let dyn13 :=
     Dyn.mk _ (core.fmt.DebugShared core.fmt.DebugU64) self.close_bound_blocks
   let values :=
     Array.to_slice
-      (Array.make 8#usize [ dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7 ])
+      (Array.make 14#usize [
+        dyn, dyn1, dyn2, dyn3, dyn4, dyn5, dyn6, dyn7, dyn8, dyn9, dyn10,
+        dyn11, dyn12, dyn13
+        ])
   let s ←
     lift (Array.to_slice
-      (Array.make 8#usize [
+      (Array.make 14#usize [
         toStr "final_partial_sidecar_blocks", toStr
         "final_parity_map_blocks_before_filemark", toStr
-        "final_parity_map_tape_file_blocks", toStr "snapshot_payload_bytes",
-        toStr "snapshot_blocks_before_filemark", toStr
-        "snapshot_tape_file_blocks", toStr "final_bootstrap_tape_file_blocks",
+        "final_parity_map_tape_file_blocks", toStr "replica_payload_bytes",
+        toStr "replica_payload_record_count", toStr
+        "replica_records_before_filemark", toStr "replica_tape_file_blocks",
+        toStr "triple_replica_blocks", toStr "gap_records_before_filemark",
+        toStr "gap_tape_file_blocks", toStr "double_gap_blocks", toStr
+        "parity_closeout_charge_blocks", toStr "terminal_tail_charge_blocks",
         toStr "close_bound_blocks"
         ]))
   core.fmt.Formatter.debug_struct_fields_finish f (toStr
-    "SnapshotControlTerms") s values
+    "TerminalControlTerms") s values
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::SnapshotControlTerms}]
-    Source: 'src/lib.rs', lines 398:22-398:27 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalControlTerms}]
+    Source: 'src/lib.rs', lines 379:22-379:27 -/
 @[reducible]
-def SnapshotControlTerms.Insts.CoreFmtDebug : core.fmt.Debug
-  SnapshotControlTerms := {
-  fmt := SnapshotControlTerms.Insts.CoreFmtDebug.fmt
+def TerminalControlTerms.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalControlTerms := {
+  fmt := TerminalControlTerms.Insts.CoreFmtDebug.fmt
 }
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::SnapshotControlTerms}]
-    Source: 'src/lib.rs', lines 398:29-398:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TerminalControlTerms}]
+    Source: 'src/lib.rs', lines 379:29-379:38 -/
 @[reducible]
-def SnapshotControlTerms.Insts.CoreMarkerStructuralPartialEq :
-  core.marker.StructuralPartialEq SnapshotControlTerms := {
+def TerminalControlTerms.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq TerminalControlTerms := {
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotControlTerms> for parity_capacity_verif::SnapshotControlTerms}::eq]:
-    Source: 'src/lib.rs', lines 398:29-398:38
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalControlTerms> for parity_capacity_verif::TerminalControlTerms}::eq]:
+    Source: 'src/lib.rs', lines 379:29-379:38
     Visibility: public -/
-def SnapshotControlTerms.Insts.CoreCmpPartialEqSnapshotControlTerms.eq
-  (self : SnapshotControlTerms) (other : SnapshotControlTerms) :
+def TerminalControlTerms.Insts.CoreCmpPartialEqTerminalControlTerms.eq
+  (self : TerminalControlTerms) (other : TerminalControlTerms) :
   Result Bool
   := do
   if self.final_partial_sidecar_blocks = other.final_partial_sidecar_blocks
@@ -2566,16 +2069,39 @@ def SnapshotControlTerms.Insts.CoreCmpPartialEqSnapshotControlTerms.eq
       if self.final_parity_map_tape_file_blocks =
         other.final_parity_map_tape_file_blocks
       then
-        if self.snapshot_payload_bytes = other.snapshot_payload_bytes
+        if self.replica_payload_bytes = other.replica_payload_bytes
         then
-          if self.snapshot_blocks_before_filemark =
-            other.snapshot_blocks_before_filemark
+          if self.replica_payload_record_count =
+            other.replica_payload_record_count
           then
-            if self.snapshot_tape_file_blocks = other.snapshot_tape_file_blocks
+            if self.replica_records_before_filemark =
+              other.replica_records_before_filemark
             then
-              if self.final_bootstrap_tape_file_blocks =
-                other.final_bootstrap_tape_file_blocks
-              then ok (self.close_bound_blocks = other.close_bound_blocks)
+              if self.replica_tape_file_blocks = other.replica_tape_file_blocks
+              then
+                if self.triple_replica_blocks = other.triple_replica_blocks
+                then
+                  if self.gap_records_before_filemark =
+                    other.gap_records_before_filemark
+                  then
+                    if self.gap_tape_file_blocks = other.gap_tape_file_blocks
+                    then
+                      if self.double_gap_blocks = other.double_gap_blocks
+                      then
+                        if self.parity_closeout_charge_blocks =
+                          other.parity_closeout_charge_blocks
+                        then
+                          if self.terminal_tail_charge_blocks =
+                            other.terminal_tail_charge_blocks
+                          then
+                            ok (self.close_bound_blocks =
+                              other.close_bound_blocks)
+                          else ok false
+                        else ok false
+                      else ok false
+                    else ok false
+                  else ok false
+                else ok false
               else ok false
             else ok false
           else ok false
@@ -2584,361 +2110,553 @@ def SnapshotControlTerms.Insts.CoreCmpPartialEqSnapshotControlTerms.eq
     else ok false
   else ok false
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::SnapshotControlTerms> for parity_capacity_verif::SnapshotControlTerms}]
-    Source: 'src/lib.rs', lines 398:29-398:38 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalControlTerms> for parity_capacity_verif::TerminalControlTerms}]
+    Source: 'src/lib.rs', lines 379:29-379:38 -/
 @[reducible]
-def SnapshotControlTerms.Insts.CoreCmpPartialEqSnapshotControlTerms :
-  core.cmp.PartialEq SnapshotControlTerms SnapshotControlTerms := {
-  eq := SnapshotControlTerms.Insts.CoreCmpPartialEqSnapshotControlTerms.eq
+def TerminalControlTerms.Insts.CoreCmpPartialEqTerminalControlTerms :
+  core.cmp.PartialEq TerminalControlTerms TerminalControlTerms := {
+  eq := TerminalControlTerms.Insts.CoreCmpPartialEqTerminalControlTerms.eq
 }
 
-/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotControlTerms}::assert_fields_are_eq]:
-    Source: 'src/lib.rs', lines 398:40-398:42
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalControlTerms}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 379:40-379:42
     Visibility: public -/
-def SnapshotControlTerms.Insts.CoreCmpEq.assert_fields_are_eq
-  (self : SnapshotControlTerms) : Result Unit := do
+def TerminalControlTerms.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : TerminalControlTerms) : Result Unit := do
   ok ()
 
-/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::SnapshotControlTerms}]
-    Source: 'src/lib.rs', lines 398:40-398:42 -/
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalControlTerms}]
+    Source: 'src/lib.rs', lines 379:40-379:42 -/
 @[reducible]
-def SnapshotControlTerms.Insts.CoreCmpEq : core.cmp.Eq SnapshotControlTerms
+def TerminalControlTerms.Insts.CoreCmpEq : core.cmp.Eq TerminalControlTerms
   := {
   partialEqInst :=
-    SnapshotControlTerms.Insts.CoreCmpPartialEqSnapshotControlTerms
+    TerminalControlTerms.Insts.CoreCmpPartialEqTerminalControlTerms
   assert_fields_are_eq :=
-    SnapshotControlTerms.Insts.CoreCmpEq.assert_fields_are_eq
+    TerminalControlTerms.Insts.CoreCmpEq.assert_fields_are_eq
 }
 
-/-- [parity_capacity_verif::validate_snapshot_close_input]:
-    Source: 'src/lib.rs', lines 410:0-445:1
+/-- [parity_capacity_verif::terminal_replica_layout]:
+    Source: 'src/lib.rs', lines 397:0-410:1
     Visibility: public -/
-def validate_snapshot_close_input
-  (input : SnapshotCloseInput) :
-  Result (core.result.Result Unit CapacityError)
+def terminal_replica_layout
+  (block_size_bytes : Std.U64) (structural_entry_count : Std.U64)
+  (object_row_count : Std.U64) :
+  Result (core.result.Result (Std.U64 × Std.U64 × Std.U64) CapacityError)
   := do
-  let b ← supported_snapshot_block_size input.block_size_bytes
+  let b ← supported_terminal_block_size block_size_bytes
   if b
   then
-    if input.data_shards_per_epoch = 0#u64
-    then ok (core.result.Result.Err CapacityError.DataShardsPerEpochZero)
-    else
-      if input.parity_shards_per_epoch = 0#u64
-      then ok (core.result.Result.Err CapacityError.ParityShardsPerEpochZero)
-      else
-        let r ←
-          checked_add input.data_shards_per_epoch input.parity_shards_per_epoch
-        let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-        match cf with
-        | core.ops.control_flow.ControlFlow.Continue val =>
-          if val > 4294967295#u64
-          then
-            ok (core.result.Result.Err
-              CapacityError.ProfileNeighborhoodTooLarge)
-          else
-            if input.current_epoch_fill_blocks >= input.data_shards_per_epoch
-            then
-              ok (core.result.Result.Err
-                CapacityError.CurrentEpochFillOutsideOpenEpoch)
-            else
-              if input.object_rows_before_object >
-                input.structural_entries_before_object
-              then
-                ok (core.result.Result.Err
-                  CapacityError.ObjectRowsExceedStructuralEntries)
-              else
-                if input.sidecar_entries_before_object >
-                  input.structural_entries_before_object
-                then
-                  ok (core.result.Result.Err
-                    CapacityError.SidecarRowsExceedStructuralEntries)
-                else
-                  let r1 ←
-                    checked_add input.object_rows_before_object
-                      input.sidecar_entries_before_object
-                  let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
-                  match cf1 with
-                  | core.ops.control_flow.ControlFlow.Continue val1 =>
-                    if val1 > input.structural_entries_before_object
-                    then
-                      ok (core.result.Result.Err
-                        CapacityError.RecoveryRowsExceedStructuralEntries)
-                    else
-                      if input.structural_entries_before_object >
-                        input.empty_tape_usable_blocks
-                      then
-                        ok (core.result.Result.Err
-                          CapacityError.StructuralEntriesExceedCapacity)
-                      else ok (core.result.Result.Ok ())
-                  | core.ops.control_flow.ControlFlow.Break residual =>
-                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                      Unit (core.convert.FromSame CapacityError) residual
-        | core.ops.control_flow.ControlFlow.Break residual =>
-          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-            Unit (core.convert.FromSame CapacityError) residual
-  else ok (core.result.Result.Err CapacityError.UnsupportedBlockSize)
-
-/-- [parity_capacity_verif::compute_snapshot_sidecar_terms]:
-    Source: 'src/lib.rs', lines 447:0-466:1
-    Visibility: public -/
-def compute_snapshot_sidecar_terms
-  (input : SnapshotCloseInput) :
-  Result (core.result.Result SnapshotSidecarTerms CapacityError)
-  := do
-  let r ←
-    checked_sidecar_index_capacity_layout input.block_size_bytes
-      input.parity_shards_per_epoch input.data_shards_per_epoch
-  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-  match cf with
-  | core.ops.control_flow.ControlFlow.Continue val =>
-    let r1 ← checked_mul 2#u64 val.block_count
-    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
-    match cf1 with
-    | core.ops.control_flow.ControlFlow.Continue val1 =>
-      let r2 ← checked_add val1 input.parity_shards_per_epoch
-      let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
-      match cf2 with
-      | core.ops.control_flow.ControlFlow.Continue val2 =>
-        let r3 ← checked_add val2 1#u64
-        let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
-        match cf3 with
-        | core.ops.control_flow.ControlFlow.Continue val3 =>
-          let r4 ← checked_add val3 input.sidecar_filemark_blocks
-          let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
-          match cf4 with
-          | core.ops.control_flow.ControlFlow.Continue val4 =>
-            ok (core.result.Result.Ok
-              {
-                index_block_count := val.block_count,
-                blocks_before_filemark := val3,
-                tape_file_blocks := val4
-              })
-          | core.ops.control_flow.ControlFlow.Break residual =>
-            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-              SnapshotSidecarTerms (core.convert.FromSame CapacityError)
-              residual
-        | core.ops.control_flow.ControlFlow.Break residual =>
-          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-            SnapshotSidecarTerms (core.convert.FromSame CapacityError) residual
-      | core.ops.control_flow.ControlFlow.Break residual =>
-        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-          SnapshotSidecarTerms (core.convert.FromSame CapacityError) residual
-    | core.ops.control_flow.ControlFlow.Break residual =>
-      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-        SnapshotSidecarTerms (core.convert.FromSame CapacityError) residual
-  | core.ops.control_flow.ControlFlow.Break residual =>
-    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      SnapshotSidecarTerms (core.convert.FromSame CapacityError) residual
-
-/-- [parity_capacity_verif::validate_capacity_derived_profile_bounds]:
-    Source: 'src/lib.rs', lines 470:0-528:1
-    Visibility: public -/
-def validate_capacity_derived_profile_bounds
-  (input : SnapshotCloseInput)
-  (maximum_complete_sidecar_tape_file_blocks : Std.U64) :
-  Result (core.result.Result Std.U64 CapacityError)
-  := do
-  let r ←
-    checked_sub input.empty_tape_usable_blocks input.high_watermark_blocks
-  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-  match cf with
-  | core.ops.control_flow.ControlFlow.Continue val =>
-    if maximum_complete_sidecar_tape_file_blocks >
-      input.empty_tape_usable_blocks
-    then
-      ok (core.result.Result.Err
-        CapacityError.CapacityProfileCloseExceedsCapacity)
-    else
-      let r1 ← checked_add input.parity_shards_per_epoch 3#u64
+    let r ← terminal_payload_bytes structural_entry_count object_row_count
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let r1 ← checked_sub block_size_bytes 1#u64
       let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
       match cf1 with
       | core.ops.control_flow.ControlFlow.Continue val1 =>
-        let r2 ← checked_add val1 input.sidecar_filemark_blocks
+        let r2 ← checked_add val val1
         let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
         match cf2 with
         | core.ops.control_flow.ControlFlow.Continue val2 =>
-          let maximum_sidecar_entries_for_capacity ←
-            input.empty_tape_usable_blocks / val2
-          let r3 ←
-            parity_map_directory_len_upper_bound
-              maximum_sidecar_entries_for_capacity
+          let payload_record_count ← val2 / block_size_bytes
+          let r3 ← checked_add payload_record_count 2#u64
           let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
           match cf3 with
-          | core.ops.control_flow.ControlFlow.Continue _ =>
-            let r4 ←
-              parity_map_payload_len_upper_bound
-                maximum_sidecar_entries_for_capacity
-            let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
-            match cf4 with
-            | core.ops.control_flow.ControlFlow.Continue val3 =>
-              let i ← parity_map_header_bytes
-              let r5 ←
-                replicated_control_total_blocks input.block_size_bytes i val3
-              let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
-              match cf5 with
-              | core.ops.control_flow.ControlFlow.Continue val4 =>
-                if maximum_sidecar_entries_for_capacity = 0#u64
+          | core.ops.control_flow.ControlFlow.Continue val3 =>
+            ok (core.result.Result.Ok (val, payload_record_count, val3))
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              (Std.U64 × Std.U64 × Std.U64) (core.convert.FromSame
+              CapacityError) residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            (Std.U64 × Std.U64 × Std.U64) (core.convert.FromSame
+            CapacityError) residual
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          (Std.U64 × Std.U64 × Std.U64) (core.convert.FromSame CapacityError)
+          residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        (Std.U64 × Std.U64 × Std.U64) (core.convert.FromSame CapacityError)
+        residual
+  else ok (core.result.Result.Err CapacityError.UnsupportedBlockSize)
+
+/-- [parity_capacity_verif::index_separation_records]:
+    Source: 'src/lib.rs', lines 412:0-425:1
+    Visibility: public -/
+def index_separation_records
+  (block_size_bytes : Std.U64) (extent_bytes : Std.U64) :
+  Result (core.result.Result Std.U64 CapacityError)
+  := do
+  let b ← supported_terminal_block_size block_size_bytes
+  if b
+  then
+    let r ← checked_sub block_size_bytes 1#u64
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let r1 ← checked_add extent_bytes val
+      let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+      match cf1 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        let records ← val1 / block_size_bytes
+        if records < 2#u64
+        then ok (core.result.Result.Err CapacityError.UnsafeCapacityProfile)
+        else ok (core.result.Result.Ok records)
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          Std.U64 (core.convert.FromSame CapacityError) residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        Std.U64 (core.convert.FromSame CapacityError) residual
+  else ok (core.result.Result.Err CapacityError.UnsupportedBlockSize)
+
+/-- [parity_capacity_verif::validate_terminal_close_input]:
+    Source: 'src/lib.rs', lines 427:0-485:1
+    Visibility: public -/
+def validate_terminal_close_input
+  (input : TerminalTripleCloseInput) :
+  Result (core.result.Result Unit CapacityError)
+  := do
+  if input.remaining_tape_blocks > input.capacity_basis_blocks
+  then ok (core.result.Result.Err CapacityError.CapacityPolicyInvalid)
+  else
+    if input.low_watermark_blocks >= input.high_watermark_blocks
+    then ok (core.result.Result.Err CapacityError.CapacityPolicyInvalid)
+    else
+      if input.high_watermark_blocks > input.capacity_basis_blocks
+      then ok (core.result.Result.Err CapacityError.CapacityPolicyInvalid)
+      else
+        let b ← supported_terminal_block_size input.block_size_bytes
+        if b
+        then
+          if input.projected_object_present != (input.projected_object_blocks
+            != 0#u64)
+          then
+            ok (core.result.Result.Err
+              CapacityError.ProjectedObjectPresenceMismatch)
+          else
+            if input.gap_nominal_bytes != 1073741824#u64
+            then
+              ok (core.result.Result.Err CapacityError.GapExtentSizeMismatch)
+            else
+              if input.data_shards_per_epoch = 0#u64
+              then
+                ok (core.result.Result.Err
+                  CapacityError.DataShardsPerEpochZero)
+              else
+                if input.parity_shards_per_epoch != 0#u64
                 then
-                  let r6 ←
-                    snapshot_payload_bytes input.empty_tape_usable_blocks
-                      input.empty_tape_usable_blocks
-                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
-                  match cf6 with
-                  | core.ops.control_flow.ControlFlow.Continue val5 =>
-                    let i1 ← snapshot_header_bytes
-                    let r7 ←
-                      replicated_control_total_blocks input.block_size_bytes i1
-                        val5
-                    let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
-                    match cf7 with
-                    | core.ops.control_flow.ControlFlow.Continue val6 =>
-                      let r8 ←
-                        checked_add val6 input.snapshot_filemark_blocks
-                      let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
-                      match cf8 with
-                      | core.ops.control_flow.ControlFlow.Continue val7 =>
-                        let i2 ← block_count_per_bootstrap
-                        let r9 ←
-                          checked_add i2 input.bootstrap_filemark_blocks
-                        let cf9 ←
-                          core.result.Result.Insts.CoreOpsTry.branch r9
-                        match cf9 with
-                        | core.ops.control_flow.ControlFlow.Continue val8 =>
-                          let r10 ←
-                            checked_add
-                              maximum_complete_sidecar_tape_file_blocks 0#u64
-                          let cf10 ←
-                            core.result.Result.Insts.CoreOpsTry.branch r10
-                          match cf10 with
-                          | core.ops.control_flow.ControlFlow.Continue val9 =>
-                            let r11 ← checked_add val9 val7
-                            let cf11 ←
-                              core.result.Result.Insts.CoreOpsTry.branch r11
-                            match cf11 with
-                            | core.ops.control_flow.ControlFlow.Continue val10
+                  let r ←
+                    checked_add input.data_shards_per_epoch
+                      input.parity_shards_per_epoch
+                  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+                  match cf with
+                  | core.ops.control_flow.ControlFlow.Continue val =>
+                    if val > 4294967295#u64
+                    then
+                      ok (core.result.Result.Err
+                        CapacityError.ProfileNeighborhoodTooLarge)
+                    else
+                      if input.current_epoch_fill_blocks >=
+                        input.data_shards_per_epoch
+                      then
+                        ok (core.result.Result.Err
+                          CapacityError.CurrentEpochFillOutsideOpenEpoch)
+                      else
+                        if input.object_rows_before_object >
+                          input.structural_entries_before_object
+                        then
+                          ok (core.result.Result.Err
+                            CapacityError.ObjectRowsExceedStructuralEntries)
+                        else
+                          if input.sidecar_entries_before_object >
+                            input.structural_entries_before_object
+                          then
+                            ok (core.result.Result.Err
+                              CapacityError.SidecarRowsExceedStructuralEntries)
+                          else
+                            let r1 ←
+                              checked_add input.object_rows_before_object
+                                input.sidecar_entries_before_object
+                            let cf1 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r1
+                            match cf1 with
+                            | core.ops.control_flow.ControlFlow.Continue val1
                               =>
-                              let r12 ← checked_add val10 val8
-                              let cf12 ←
-                                core.result.Result.Insts.CoreOpsTry.branch r12
-                              match cf12 with
-                              | core.ops.control_flow.ControlFlow.Continue
-                                val11 =>
-                                let r13 ←
-                                  checked_add val11 input.safety_margin_blocks
-                                let cf13 ←
-                                  core.result.Result.Insts.CoreOpsTry.branch
-                                    r13
-                                match cf13 with
-                                | core.ops.control_flow.ControlFlow.Continue
-                                  val12 =>
-                                  if val12 > val
+                              if val1 > input.structural_entries_before_object
+                              then
+                                ok (core.result.Result.Err
+                                  CapacityError.RecoveryRowsExceedStructuralEntries)
+                              else
+                                if input.structural_entries_before_object >
+                                  input.capacity_basis_blocks
+                                then
+                                  ok (core.result.Result.Err
+                                    CapacityError.StructuralEntriesExceedCapacity)
+                                else
+                                  if input.structural_entries_before_object =
+                                    0#u64
                                   then
                                     ok (core.result.Result.Err
-                                      CapacityError.CapacityProfileCloseExceedsCapacity)
-                                  else
-                                    ok (core.result.Result.Ok
-                                      maximum_sidecar_entries_for_capacity)
-                                | core.ops.control_flow.ControlFlow.Break
-                                  residual =>
-                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                    Std.U64 (core.convert.FromSame
-                                    CapacityError) residual
-                              | core.ops.control_flow.ControlFlow.Break
-                                residual =>
-                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                  Std.U64 (core.convert.FromSame CapacityError)
-                                  residual
+                                      CapacityError.MissingBotBootstrap)
+                                  else ok (core.result.Result.Ok ())
                             | core.ops.control_flow.ControlFlow.Break residual
                               =>
                               core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                Std.U64 (core.convert.FromSame CapacityError)
+                                Unit (core.convert.FromSame CapacityError)
                                 residual
-                          | core.ops.control_flow.ControlFlow.Break residual =>
-                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                              Std.U64 (core.convert.FromSame CapacityError)
-                              residual
-                        | core.ops.control_flow.ControlFlow.Break residual =>
-                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                            Std.U64 (core.convert.FromSame CapacityError)
-                            residual
-                      | core.ops.control_flow.ControlFlow.Break residual =>
-                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                          Std.U64 (core.convert.FromSame CapacityError)
-                          residual
-                    | core.ops.control_flow.ControlFlow.Break residual =>
-                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                        Std.U64 (core.convert.FromSame CapacityError) residual
                   | core.ops.control_flow.ControlFlow.Break residual =>
                     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                      Std.U64 (core.convert.FromSame CapacityError) residual
+                      Unit (core.convert.FromSame CapacityError) residual
                 else
-                  let r6 ← checked_add val4 input.parity_map_filemark_blocks
-                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
-                  match cf6 with
-                  | core.ops.control_flow.ControlFlow.Continue val5 =>
-                    let r7 ←
-                      snapshot_payload_bytes input.empty_tape_usable_blocks
-                        input.empty_tape_usable_blocks
-                    let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
-                    match cf7 with
-                    | core.ops.control_flow.ControlFlow.Continue val6 =>
-                      let i1 ← snapshot_header_bytes
-                      let r8 ←
-                        replicated_control_total_blocks input.block_size_bytes
-                          i1 val6
-                      let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
-                      match cf8 with
-                      | core.ops.control_flow.ControlFlow.Continue val7 =>
-                        let r9 ←
-                          checked_add val7 input.snapshot_filemark_blocks
-                        let cf9 ←
-                          core.result.Result.Insts.CoreOpsTry.branch r9
-                        match cf9 with
-                        | core.ops.control_flow.ControlFlow.Continue val8 =>
-                          let i2 ← block_count_per_bootstrap
-                          let r10 ←
-                            checked_add i2 input.bootstrap_filemark_blocks
-                          let cf10 ←
-                            core.result.Result.Insts.CoreOpsTry.branch r10
-                          match cf10 with
-                          | core.ops.control_flow.ControlFlow.Continue val9 =>
-                            let r11 ←
-                              checked_add
-                                maximum_complete_sidecar_tape_file_blocks val5
-                            let cf11 ←
-                              core.result.Result.Insts.CoreOpsTry.branch r11
-                            match cf11 with
-                            | core.ops.control_flow.ControlFlow.Continue val10
+                  if input.current_epoch_fill_blocks != 0#u64
+                  then
+                    ok (core.result.Result.Err CapacityError.ParityOffHasState)
+                  else
+                    if input.pending_completed_sidecars != 0#u64
+                    then
+                      ok (core.result.Result.Err
+                        CapacityError.ParityOffHasState)
+                    else
+                      if input.sidecar_entries_before_object != 0#u64
+                      then
+                        ok (core.result.Result.Err
+                          CapacityError.ParityOffHasState)
+                      else
+                        if input.pending_completed_epoch_parity_bytes != 0#u64
+                        then
+                          ok (core.result.Result.Err
+                            CapacityError.ParityOffHasState)
+                        else
+                          let r ←
+                            checked_add input.data_shards_per_epoch
+                              input.parity_shards_per_epoch
+                          let cf ←
+                            core.result.Result.Insts.CoreOpsTry.branch r
+                          match cf with
+                          | core.ops.control_flow.ControlFlow.Continue val =>
+                            if val > 4294967295#u64
+                            then
+                              ok (core.result.Result.Err
+                                CapacityError.ProfileNeighborhoodTooLarge)
+                            else
+                              if input.current_epoch_fill_blocks >=
+                                input.data_shards_per_epoch
+                              then
+                                ok (core.result.Result.Err
+                                  CapacityError.CurrentEpochFillOutsideOpenEpoch)
+                              else
+                                if input.object_rows_before_object >
+                                  input.structural_entries_before_object
+                                then
+                                  ok (core.result.Result.Err
+                                    CapacityError.ObjectRowsExceedStructuralEntries)
+                                else
+                                  if input.sidecar_entries_before_object >
+                                    input.structural_entries_before_object
+                                  then
+                                    ok (core.result.Result.Err
+                                      CapacityError.SidecarRowsExceedStructuralEntries)
+                                  else
+                                    let r1 ←
+                                      checked_add
+                                        input.object_rows_before_object
+                                        input.sidecar_entries_before_object
+                                    let cf1 ←
+                                      core.result.Result.Insts.CoreOpsTry.branch
+                                        r1
+                                    match cf1 with
+                                    |
+                                      core.ops.control_flow.ControlFlow.Continue
+                                      val1 =>
+                                      if val1 >
+                                        input.structural_entries_before_object
+                                      then
+                                        ok (core.result.Result.Err
+                                          CapacityError.RecoveryRowsExceedStructuralEntries)
+                                      else
+                                        if
+                                          input.structural_entries_before_object
+                                          > input.capacity_basis_blocks
+                                        then
+                                          ok (core.result.Result.Err
+                                            CapacityError.StructuralEntriesExceedCapacity)
+                                        else
+                                          if
+                                            input.structural_entries_before_object
+                                            = 0#u64
+                                          then
+                                            ok (core.result.Result.Err
+                                              CapacityError.MissingBotBootstrap)
+                                          else ok (core.result.Result.Ok ())
+                                    | core.ops.control_flow.ControlFlow.Break
+                                      residual =>
+                                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                        Unit (core.convert.FromSame
+                                        CapacityError) residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              Unit (core.convert.FromSame CapacityError)
+                              residual
+        else ok (core.result.Result.Err CapacityError.UnsupportedBlockSize)
+
+/-- [parity_capacity_verif::compute_terminal_sidecar_terms]:
+    Source: 'src/lib.rs', lines 487:0-513:1
+    Visibility: public -/
+def compute_terminal_sidecar_terms
+  (input : TerminalTripleCloseInput) :
+  Result (core.result.Result TerminalSidecarTerms CapacityError)
+  := do
+  if input.parity_shards_per_epoch = 0#u64
+  then
+    ok (core.result.Result.Ok
+      {
+        index_block_count := 0#u64,
+        blocks_before_filemark := 0#u64,
+        tape_file_blocks := 0#u64
+      })
+  else
+    let r ←
+      checked_sidecar_index_capacity_layout input.block_size_bytes
+        input.parity_shards_per_epoch input.data_shards_per_epoch
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let r1 ← checked_mul 2#u64 val.block_count
+      let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+      match cf1 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        let r2 ← checked_add val1 input.parity_shards_per_epoch
+        let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+        match cf2 with
+        | core.ops.control_flow.ControlFlow.Continue val2 =>
+          let r3 ← checked_add val2 1#u64
+          let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+          match cf3 with
+          | core.ops.control_flow.ControlFlow.Continue val3 =>
+            let r4 ← checked_add val3 input.sidecar_filemark_blocks
+            let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+            match cf4 with
+            | core.ops.control_flow.ControlFlow.Continue val4 =>
+              ok (core.result.Result.Ok
+                {
+                  index_block_count := val.block_count,
+                  blocks_before_filemark := val3,
+                  tape_file_blocks := val4
+                })
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                TerminalSidecarTerms (core.convert.FromSame CapacityError)
+                residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              TerminalSidecarTerms (core.convert.FromSame CapacityError)
+              residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            TerminalSidecarTerms (core.convert.FromSame CapacityError) residual
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          TerminalSidecarTerms (core.convert.FromSame CapacityError) residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        TerminalSidecarTerms (core.convert.FromSame CapacityError) residual
+
+/-- [parity_capacity_verif::final_partial_sidecar_tape_file_blocks]:
+    Source: 'src/lib.rs', lines 518:0-540:1
+    Visibility: public -/
+def final_partial_sidecar_tape_file_blocks
+  (input : TerminalTripleCloseInput) :
+  Result (core.result.Result Std.U64 CapacityError)
+  := do
+  if input.data_shards_per_epoch = 0#u64
+  then ok (core.result.Result.Err CapacityError.DataShardsPerEpochZero)
+  else
+    let r ←
+      checked_add input.current_epoch_fill_blocks input.projected_object_blocks
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let data_crc_entry_count ← val % input.data_shards_per_epoch
+      let r1 ←
+        checked_sidecar_index_capacity_layout input.block_size_bytes
+          input.parity_shards_per_epoch data_crc_entry_count
+      let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+      match cf1 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        let r2 ← checked_mul 2#u64 val1.block_count
+        let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+        match cf2 with
+        | core.ops.control_flow.ControlFlow.Continue val2 =>
+          let r3 ← checked_add val2 input.parity_shards_per_epoch
+          let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+          match cf3 with
+          | core.ops.control_flow.ControlFlow.Continue val3 =>
+            let r4 ← checked_add val3 1#u64
+            let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+            match cf4 with
+            | core.ops.control_flow.ControlFlow.Continue val4 =>
+              checked_add val4 input.sidecar_filemark_blocks
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                Std.U64 (core.convert.FromSame CapacityError) residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              Std.U64 (core.convert.FromSame CapacityError) residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            Std.U64 (core.convert.FromSame CapacityError) residual
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          Std.U64 (core.convert.FromSame CapacityError) residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        Std.U64 (core.convert.FromSame CapacityError) residual
+
+/-- [parity_capacity_verif::validate_capacity_derived_profile_bounds]:
+    Source: 'src/lib.rs', lines 544:0-610:1
+    Visibility: public -/
+def validate_capacity_derived_profile_bounds
+  (input : TerminalTripleCloseInput) (parity_enabled : Bool)
+  (maximum_complete_sidecar_tape_file_blocks : Std.U64) :
+  Result (core.result.Result Std.U64 CapacityError)
+  := do
+  let r ← checked_sub input.capacity_basis_blocks input.high_watermark_blocks
+  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+  match cf with
+  | core.ops.control_flow.ControlFlow.Continue val =>
+    if parity_enabled
+    then
+      if maximum_complete_sidecar_tape_file_blocks >
+        input.capacity_basis_blocks
+      then
+        ok (core.result.Result.Err
+          CapacityError.CapacityProfileCloseExceedsCapacity)
+      else
+        let r1 ← checked_add input.parity_shards_per_epoch 3#u64
+        let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+        match cf1 with
+        | core.ops.control_flow.ControlFlow.Continue val1 =>
+          let r2 ← checked_add val1 input.sidecar_filemark_blocks
+          let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+          match cf2 with
+          | core.ops.control_flow.ControlFlow.Continue val2 =>
+            let maximum_sidecar_entries_for_capacity ←
+              input.capacity_basis_blocks / val2
+            let r3 ←
+              parity_map_directory_len_upper_bound
+                maximum_sidecar_entries_for_capacity
+            let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+            match cf3 with
+            | core.ops.control_flow.ControlFlow.Continue _ =>
+              let r4 ←
+                parity_map_payload_len_upper_bound
+                  maximum_sidecar_entries_for_capacity
+              let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+              match cf4 with
+              | core.ops.control_flow.ControlFlow.Continue val3 =>
+                let i ← parity_map_header_bytes
+                let r5 ←
+                  replicated_control_total_blocks input.block_size_bytes i val3
+                let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+                match cf5 with
+                | core.ops.control_flow.ControlFlow.Continue val4 =>
+                  if maximum_sidecar_entries_for_capacity = 0#u64
+                  then
+                    let r6 ←
+                      terminal_replica_layout input.block_size_bytes
+                        input.capacity_basis_blocks input.capacity_basis_blocks
+                    let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                    match cf6 with
+                    | core.ops.control_flow.ControlFlow.Continue val5 =>
+                      let (_, _, maximum_replica_records_before_filemark) :=
+                        val5
+                      let r7 ←
+                        checked_add maximum_replica_records_before_filemark
+                          input.replica_filemark_blocks
+                      let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                      match cf7 with
+                      | core.ops.control_flow.ControlFlow.Continue val6 =>
+                        let r8 ← checked_mul 3#u64 val6
+                        let cf8 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r8
+                        match cf8 with
+                        | core.ops.control_flow.ControlFlow.Continue val7 =>
+                          let r9 ←
+                            index_separation_records input.block_size_bytes
+                              input.gap_nominal_bytes
+                          let cf9 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r9
+                          match cf9 with
+                          | core.ops.control_flow.ControlFlow.Continue val8 =>
+                            let r10 ←
+                              checked_add val8 input.gap_filemark_blocks
+                            let cf10 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r10
+                            match cf10 with
+                            | core.ops.control_flow.ControlFlow.Continue val9
                               =>
-                              let r12 ← checked_add val10 val8
-                              let cf12 ←
-                                core.result.Result.Insts.CoreOpsTry.branch r12
-                              match cf12 with
+                              let r11 ← checked_mul 2#u64 val9
+                              let cf11 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r11
+                              match cf11 with
                               | core.ops.control_flow.ControlFlow.Continue
-                                val11 =>
-                                let r13 ← checked_add val11 val9
-                                let cf13 ←
+                                val10 =>
+                                let r12 ←
+                                  checked_add
+                                    maximum_complete_sidecar_tape_file_blocks
+                                    0#u64
+                                let cf12 ←
                                   core.result.Result.Insts.CoreOpsTry.branch
-                                    r13
-                                match cf13 with
+                                    r12
+                                match cf12 with
                                 | core.ops.control_flow.ControlFlow.Continue
-                                  val12 =>
-                                  let r14 ←
-                                    checked_add val12
-                                      input.safety_margin_blocks
-                                  let cf14 ←
+                                  val11 =>
+                                  let r13 ← checked_add val11 val7
+                                  let cf13 ←
                                     core.result.Result.Insts.CoreOpsTry.branch
-                                      r14
-                                  match cf14 with
+                                      r13
+                                  match cf13 with
                                   | core.ops.control_flow.ControlFlow.Continue
-                                    val13 =>
-                                    if val13 > val
-                                    then
-                                      ok (core.result.Result.Err
-                                        CapacityError.CapacityProfileCloseExceedsCapacity)
-                                    else
-                                      ok (core.result.Result.Ok
-                                        maximum_sidecar_entries_for_capacity)
+                                    val12 =>
+                                    let r14 ← checked_add val12 val10
+                                    let cf14 ←
+                                      core.result.Result.Insts.CoreOpsTry.branch
+                                        r14
+                                    match cf14 with
+                                    |
+                                      core.ops.control_flow.ControlFlow.Continue
+                                      val13 =>
+                                      let r15 ←
+                                        checked_add val13
+                                          input.safety_margin_blocks
+                                      let cf15 ←
+                                        core.result.Result.Insts.CoreOpsTry.branch
+                                          r15
+                                      match cf15 with
+                                      |
+                                        core.ops.control_flow.ControlFlow.Continue
+                                        val14 =>
+                                        if val14 > val
+                                        then
+                                          ok (core.result.Result.Err
+                                            CapacityError.CapacityProfileCloseExceedsCapacity)
+                                        else
+                                          ok (core.result.Result.Ok
+                                            maximum_sidecar_entries_for_capacity)
+                                      | core.ops.control_flow.ControlFlow.Break
+                                        residual =>
+                                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                          Std.U64 (core.convert.FromSame
+                                          CapacityError) residual
+                                    | core.ops.control_flow.ControlFlow.Break
+                                      residual =>
+                                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                        Std.U64 (core.convert.FromSame
+                                        CapacityError) residual
                                   | core.ops.control_flow.ControlFlow.Break
                                     residual =>
                                     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
@@ -2974,9 +2692,236 @@ def validate_capacity_derived_profile_bounds
                     | core.ops.control_flow.ControlFlow.Break residual =>
                       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
                         Std.U64 (core.convert.FromSame CapacityError) residual
+                  else
+                    let r6 ←
+                      checked_add val4 input.parity_map_filemark_blocks
+                    let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                    match cf6 with
+                    | core.ops.control_flow.ControlFlow.Continue val5 =>
+                      let r7 ←
+                        terminal_replica_layout input.block_size_bytes
+                          input.capacity_basis_blocks
+                          input.capacity_basis_blocks
+                      let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                      match cf7 with
+                      | core.ops.control_flow.ControlFlow.Continue val6 =>
+                        let (_, _, maximum_replica_records_before_filemark) :=
+                          val6
+                        let r8 ←
+                          checked_add maximum_replica_records_before_filemark
+                            input.replica_filemark_blocks
+                        let cf8 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r8
+                        match cf8 with
+                        | core.ops.control_flow.ControlFlow.Continue val7 =>
+                          let r9 ← checked_mul 3#u64 val7
+                          let cf9 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r9
+                          match cf9 with
+                          | core.ops.control_flow.ControlFlow.Continue val8 =>
+                            let r10 ←
+                              index_separation_records input.block_size_bytes
+                                input.gap_nominal_bytes
+                            let cf10 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r10
+                            match cf10 with
+                            | core.ops.control_flow.ControlFlow.Continue val9
+                              =>
+                              let r11 ←
+                                checked_add val9 input.gap_filemark_blocks
+                              let cf11 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r11
+                              match cf11 with
+                              | core.ops.control_flow.ControlFlow.Continue
+                                val10 =>
+                                let r12 ← checked_mul 2#u64 val10
+                                let cf12 ←
+                                  core.result.Result.Insts.CoreOpsTry.branch
+                                    r12
+                                match cf12 with
+                                | core.ops.control_flow.ControlFlow.Continue
+                                  val11 =>
+                                  let r13 ←
+                                    checked_add
+                                      maximum_complete_sidecar_tape_file_blocks
+                                      val5
+                                  let cf13 ←
+                                    core.result.Result.Insts.CoreOpsTry.branch
+                                      r13
+                                  match cf13 with
+                                  | core.ops.control_flow.ControlFlow.Continue
+                                    val12 =>
+                                    let r14 ← checked_add val12 val8
+                                    let cf14 ←
+                                      core.result.Result.Insts.CoreOpsTry.branch
+                                        r14
+                                    match cf14 with
+                                    |
+                                      core.ops.control_flow.ControlFlow.Continue
+                                      val13 =>
+                                      let r15 ← checked_add val13 val11
+                                      let cf15 ←
+                                        core.result.Result.Insts.CoreOpsTry.branch
+                                          r15
+                                      match cf15 with
+                                      |
+                                        core.ops.control_flow.ControlFlow.Continue
+                                        val14 =>
+                                        let r16 ←
+                                          checked_add val14
+                                            input.safety_margin_blocks
+                                        let cf16 ←
+                                          core.result.Result.Insts.CoreOpsTry.branch
+                                            r16
+                                        match cf16 with
+                                        |
+                                          core.ops.control_flow.ControlFlow.Continue
+                                          val15 =>
+                                          if val15 > val
+                                          then
+                                            ok (core.result.Result.Err
+                                              CapacityError.CapacityProfileCloseExceedsCapacity)
+                                          else
+                                            ok (core.result.Result.Ok
+                                              maximum_sidecar_entries_for_capacity)
+                                        |
+                                          core.ops.control_flow.ControlFlow.Break
+                                          residual =>
+                                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                            Std.U64 (core.convert.FromSame
+                                            CapacityError) residual
+                                      | core.ops.control_flow.ControlFlow.Break
+                                        residual =>
+                                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                          Std.U64 (core.convert.FromSame
+                                          CapacityError) residual
+                                    | core.ops.control_flow.ControlFlow.Break
+                                      residual =>
+                                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                        Std.U64 (core.convert.FromSame
+                                        CapacityError) residual
+                                  | core.ops.control_flow.ControlFlow.Break
+                                    residual =>
+                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                      Std.U64 (core.convert.FromSame
+                                      CapacityError) residual
+                                | core.ops.control_flow.ControlFlow.Break
+                                  residual =>
+                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                    Std.U64 (core.convert.FromSame
+                                    CapacityError) residual
+                              | core.ops.control_flow.ControlFlow.Break
+                                residual =>
+                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                  Std.U64 (core.convert.FromSame CapacityError)
+                                  residual
+                            | core.ops.control_flow.ControlFlow.Break residual
+                              =>
+                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                Std.U64 (core.convert.FromSame CapacityError)
+                                residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              Std.U64 (core.convert.FromSame CapacityError)
+                              residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            Std.U64 (core.convert.FromSame CapacityError)
+                            residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          Std.U64 (core.convert.FromSame CapacityError)
+                          residual
+                    | core.ops.control_flow.ControlFlow.Break residual =>
+                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                        Std.U64 (core.convert.FromSame CapacityError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    Std.U64 (core.convert.FromSame CapacityError) residual
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  Std.U64 (core.convert.FromSame CapacityError) residual
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                Std.U64 (core.convert.FromSame CapacityError) residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              Std.U64 (core.convert.FromSame CapacityError) residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            Std.U64 (core.convert.FromSame CapacityError) residual
+    else
+      let r1 ←
+        terminal_replica_layout input.block_size_bytes
+          input.capacity_basis_blocks input.capacity_basis_blocks
+      let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+      match cf1 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        let (_, _, maximum_replica_records_before_filemark) := val1
+        let r2 ←
+          checked_add maximum_replica_records_before_filemark
+            input.replica_filemark_blocks
+        let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+        match cf2 with
+        | core.ops.control_flow.ControlFlow.Continue val2 =>
+          let r3 ← checked_mul 3#u64 val2
+          let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+          match cf3 with
+          | core.ops.control_flow.ControlFlow.Continue val3 =>
+            let r4 ←
+              index_separation_records input.block_size_bytes
+                input.gap_nominal_bytes
+            let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+            match cf4 with
+            | core.ops.control_flow.ControlFlow.Continue val4 =>
+              let r5 ← checked_add val4 input.gap_filemark_blocks
+              let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+              match cf5 with
+              | core.ops.control_flow.ControlFlow.Continue val5 =>
+                let r6 ← checked_mul 2#u64 val5
+                let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                match cf6 with
+                | core.ops.control_flow.ControlFlow.Continue val6 =>
+                  let r7 ←
+                    checked_add maximum_complete_sidecar_tape_file_blocks 0#u64
+                  let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                  match cf7 with
+                  | core.ops.control_flow.ControlFlow.Continue val7 =>
+                    let r8 ← checked_add val7 val3
+                    let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
+                    match cf8 with
+                    | core.ops.control_flow.ControlFlow.Continue val8 =>
+                      let r9 ← checked_add val8 val6
+                      let cf9 ← core.result.Result.Insts.CoreOpsTry.branch r9
+                      match cf9 with
+                      | core.ops.control_flow.ControlFlow.Continue val9 =>
+                        let r10 ← checked_add val9 input.safety_margin_blocks
+                        let cf10 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r10
+                        match cf10 with
+                        | core.ops.control_flow.ControlFlow.Continue val10 =>
+                          if val10 > val
+                          then
+                            ok (core.result.Result.Err
+                              CapacityError.CapacityProfileCloseExceedsCapacity)
+                          else ok (core.result.Result.Ok 0#u64)
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            Std.U64 (core.convert.FromSame CapacityError)
+                            residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          Std.U64 (core.convert.FromSame CapacityError)
+                          residual
+                    | core.ops.control_flow.ControlFlow.Break residual =>
+                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                        Std.U64 (core.convert.FromSame CapacityError) residual
                   | core.ops.control_flow.ControlFlow.Break residual =>
                     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
                       Std.U64 (core.convert.FromSame CapacityError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    Std.U64 (core.convert.FromSame CapacityError) residual
               | core.ops.control_flow.ControlFlow.Break residual =>
                 core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
                   Std.U64 (core.convert.FromSame CapacityError) residual
@@ -2996,388 +2941,971 @@ def validate_capacity_derived_profile_bounds
     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
       Std.U64 (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::compute_snapshot_projection_terms]:
-    Source: 'src/lib.rs', lines 530:0-589:1
+/-- [parity_capacity_verif::compute_terminal_projection_terms]:
+    Source: 'src/lib.rs', lines 612:0-685:1
     Visibility: public -/
-def compute_snapshot_projection_terms
-  (input : SnapshotCloseInput) (sidecar : SnapshotSidecarTerms)
+def compute_terminal_projection_terms
+  (input : TerminalTripleCloseInput) (sidecar : TerminalSidecarTerms)
   (maximum_sidecar_entries_for_capacity : Std.U64) :
-  Result (core.result.Result SnapshotProjectionTerms CapacityError)
+  Result (core.result.Result TerminalProjectionTerms CapacityError)
   := do
-  let r ←
-    checked_add input.current_epoch_fill_blocks input.projected_object_blocks
-  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-  match cf with
-  | core.ops.control_flow.ControlFlow.Continue val =>
-    let epochs_completed_by_object ← val / input.data_shards_per_epoch
-    let i ← val % input.data_shards_per_epoch
-    let r1 ←
-      checked_add input.pending_completed_sidecars epochs_completed_by_object
-    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
-    match cf1 with
-    | core.ops.control_flow.ControlFlow.Continue val1 =>
-      let r2 ← checked_mul val1 sidecar.tape_file_blocks
-      let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
-      match cf2 with
-      | core.ops.control_flow.ControlFlow.Continue val2 =>
-        let r3 ←
-          checked_add input.projected_object_blocks
-            input.object_filemark_blocks
-        let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
-        match cf3 with
-        | core.ops.control_flow.ControlFlow.Continue val3 =>
-          let r4 ← checked_add val3 val2
-          let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
-          match cf4 with
-          | core.ops.control_flow.ControlFlow.Continue val4 =>
-            let r5 ← checked_add input.object_rows_before_object 1#u64
-            let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
-            match cf5 with
-            | core.ops.control_flow.ControlFlow.Continue val5 =>
-              let r6 ← checked_add input.sidecar_entries_before_object val1
-              let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
-              match cf6 with
-              | core.ops.control_flow.ControlFlow.Continue val6 =>
-                let (final_partial_sidecar_needed, final_partial_sidecar_count)
-                  ←
-                  if i != 0#u64
-                  then ok (true, 1#u64)
-                  else ok (false, 0#u64)
-                let r7 ← checked_add val6 final_partial_sidecar_count
-                let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
-                match cf7 with
-                | core.ops.control_flow.ControlFlow.Continue val7 =>
+  if input.parity_shards_per_epoch != 0#u64
+  then
+    let r ←
+      checked_add input.current_epoch_fill_blocks input.projected_object_blocks
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let epochs_completed_by_object ← val / input.data_shards_per_epoch
+      let i ← val % input.data_shards_per_epoch
+      let r1 ←
+        checked_add input.pending_completed_sidecars epochs_completed_by_object
+      let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+      match cf1 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        let r2 ← checked_mul val1 sidecar.tape_file_blocks
+        let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+        match cf2 with
+        | core.ops.control_flow.ControlFlow.Continue val2 =>
+          if input.projected_object_present
+          then
+            let r3 ←
+              checked_add input.projected_object_blocks
+                input.object_filemark_blocks
+            let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+            match cf3 with
+            | core.ops.control_flow.ControlFlow.Continue val3 =>
+              let r4 ← checked_add val3 val2
+              let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+              match cf4 with
+              | core.ops.control_flow.ControlFlow.Continue val4 =>
+                let r5 ← checked_add input.object_rows_before_object 1#u64
+                let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+                match cf5 with
+                | core.ops.control_flow.ControlFlow.Continue val5 =>
+                  let r6 ←
+                    checked_add input.sidecar_entries_before_object val1
+                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                  match cf6 with
+                  | core.ops.control_flow.ControlFlow.Continue val6 =>
+                    let (final_partial_sidecar_needed,
+                      final_partial_sidecar_count) ←
+                      if i != 0#u64
+                      then ok (true, 1#u64)
+                      else ok (false, 0#u64)
+                    let r7 ← checked_add val6 final_partial_sidecar_count
+                    let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                    match cf7 with
+                    | core.ops.control_flow.ControlFlow.Continue val7 =>
+                      if input.sidecar_entries_before_object >
+                        maximum_sidecar_entries_for_capacity
+                      then
+                        ok (core.result.Result.Err
+                          CapacityError.SidecarDirectoryExceedsCapacity)
+                      else
+                        let r8 ← parity_map_directory_len_upper_bound val7
+                        let cf8 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r8
+                        match cf8 with
+                        | core.ops.control_flow.ControlFlow.Continue val8 =>
+                          let r9 ← parity_map_payload_len_upper_bound val7
+                          let cf9 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r9
+                          match cf9 with
+                          | core.ops.control_flow.ControlFlow.Continue val9 =>
+                            let (final_parity_map_needed,
+                              final_parity_map_count) ←
+                              if val7 != 0#u64
+                              then ok (true, 1#u64)
+                              else ok (false, 0#u64)
+                            let r10 ←
+                              checked_add
+                                input.structural_entries_before_object 1#u64
+                            let cf10 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r10
+                            match cf10 with
+                            | core.ops.control_flow.ControlFlow.Continue val10
+                              =>
+                              let r11 ← checked_add val10 val1
+                              let cf11 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r11
+                              match cf11 with
+                              | core.ops.control_flow.ControlFlow.Continue
+                                val11 =>
+                                let r12 ←
+                                  checked_add val11 final_partial_sidecar_count
+                                let cf12 ←
+                                  core.result.Result.Insts.CoreOpsTry.branch
+                                    r12
+                                match cf12 with
+                                | core.ops.control_flow.ControlFlow.Continue
+                                  val12 =>
+                                  let r13 ←
+                                    checked_add val12 final_parity_map_count
+                                  let cf13 ←
+                                    core.result.Result.Insts.CoreOpsTry.branch
+                                      r13
+                                  match cf13 with
+                                  | core.ops.control_flow.ControlFlow.Continue
+                                    val13 =>
+                                    ok (core.result.Result.Ok
+                                      {
+                                        epochs_completed_by_object,
+                                        final_partial_sidecar_needed,
+                                        sidecars_emitted_by_commit := val1,
+                                        sidecar_blocks_emitted_by_commit :=
+                                          val2,
+                                        object_tape_file_blocks := val3,
+                                        prefix_commit_charge_blocks := val4,
+                                        object_rows_after := val5,
+                                        sidecar_entries_after_closeout := val7,
+                                        maximum_sidecar_entries_for_capacity,
+                                        structural_entries_after_closeout :=
+                                          val13,
+                                        final_parity_map_needed,
+                                        final_parity_map_directory_bound_bytes :=
+                                          val8,
+                                        final_parity_map_payload_bound_bytes :=
+                                          val9
+                                      })
+                                  | core.ops.control_flow.ControlFlow.Break
+                                    residual =>
+                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                      TerminalProjectionTerms
+                                      (core.convert.FromSame CapacityError)
+                                      residual
+                                | core.ops.control_flow.ControlFlow.Break
+                                  residual =>
+                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                    TerminalProjectionTerms
+                                    (core.convert.FromSame CapacityError)
+                                    residual
+                              | core.ops.control_flow.ControlFlow.Break
+                                residual =>
+                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                  TerminalProjectionTerms
+                                  (core.convert.FromSame CapacityError)
+                                  residual
+                            | core.ops.control_flow.ControlFlow.Break residual
+                              =>
+                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                TerminalProjectionTerms (core.convert.FromSame
+                                CapacityError) residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              TerminalProjectionTerms (core.convert.FromSame
+                              CapacityError) residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalProjectionTerms (core.convert.FromSame
+                            CapacityError) residual
+                    | core.ops.control_flow.ControlFlow.Break residual =>
+                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                        TerminalProjectionTerms (core.convert.FromSame
+                        CapacityError) residual
+                  | core.ops.control_flow.ControlFlow.Break residual =>
+                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                      TerminalProjectionTerms (core.convert.FromSame
+                      CapacityError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    TerminalProjectionTerms (core.convert.FromSame
+                    CapacityError) residual
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  TerminalProjectionTerms (core.convert.FromSame CapacityError)
+                  residual
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                TerminalProjectionTerms (core.convert.FromSame CapacityError)
+                residual
+          else
+            let r3 ← checked_add 0#u64 val2
+            let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+            match cf3 with
+            | core.ops.control_flow.ControlFlow.Continue val3 =>
+              let r4 ← checked_add input.object_rows_before_object 0#u64
+              let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+              match cf4 with
+              | core.ops.control_flow.ControlFlow.Continue val4 =>
+                let r5 ← checked_add input.sidecar_entries_before_object val1
+                let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+                match cf5 with
+                | core.ops.control_flow.ControlFlow.Continue val5 =>
+                  let (final_partial_sidecar_needed,
+                    final_partial_sidecar_count) ←
+                    if i != 0#u64
+                    then ok (true, 1#u64)
+                    else ok (false, 0#u64)
+                  let r6 ← checked_add val5 final_partial_sidecar_count
+                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                  match cf6 with
+                  | core.ops.control_flow.ControlFlow.Continue val6 =>
+                    if input.sidecar_entries_before_object >
+                      maximum_sidecar_entries_for_capacity
+                    then
+                      ok (core.result.Result.Err
+                        CapacityError.SidecarDirectoryExceedsCapacity)
+                    else
+                      let r7 ← parity_map_directory_len_upper_bound val6
+                      let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                      match cf7 with
+                      | core.ops.control_flow.ControlFlow.Continue val7 =>
+                        let r8 ← parity_map_payload_len_upper_bound val6
+                        let cf8 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r8
+                        match cf8 with
+                        | core.ops.control_flow.ControlFlow.Continue val8 =>
+                          let (final_parity_map_needed, final_parity_map_count)
+                            ←
+                            if val6 != 0#u64
+                            then ok (true, 1#u64)
+                            else ok (false, 0#u64)
+                          let r9 ←
+                            checked_add input.structural_entries_before_object
+                              0#u64
+                          let cf9 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r9
+                          match cf9 with
+                          | core.ops.control_flow.ControlFlow.Continue val9 =>
+                            let r10 ← checked_add val9 val1
+                            let cf10 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r10
+                            match cf10 with
+                            | core.ops.control_flow.ControlFlow.Continue val10
+                              =>
+                              let r11 ←
+                                checked_add val10 final_partial_sidecar_count
+                              let cf11 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r11
+                              match cf11 with
+                              | core.ops.control_flow.ControlFlow.Continue
+                                val11 =>
+                                let r12 ←
+                                  checked_add val11 final_parity_map_count
+                                let cf12 ←
+                                  core.result.Result.Insts.CoreOpsTry.branch
+                                    r12
+                                match cf12 with
+                                | core.ops.control_flow.ControlFlow.Continue
+                                  val12 =>
+                                  ok (core.result.Result.Ok
+                                    {
+                                      epochs_completed_by_object,
+                                      final_partial_sidecar_needed,
+                                      sidecars_emitted_by_commit := val1,
+                                      sidecar_blocks_emitted_by_commit := val2,
+                                      object_tape_file_blocks := 0#u64,
+                                      prefix_commit_charge_blocks := val3,
+                                      object_rows_after := val4,
+                                      sidecar_entries_after_closeout := val6,
+                                      maximum_sidecar_entries_for_capacity,
+                                      structural_entries_after_closeout :=
+                                        val12,
+                                      final_parity_map_needed,
+                                      final_parity_map_directory_bound_bytes :=
+                                        val7,
+                                      final_parity_map_payload_bound_bytes :=
+                                        val8
+                                    })
+                                | core.ops.control_flow.ControlFlow.Break
+                                  residual =>
+                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                    TerminalProjectionTerms
+                                    (core.convert.FromSame CapacityError)
+                                    residual
+                              | core.ops.control_flow.ControlFlow.Break
+                                residual =>
+                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                  TerminalProjectionTerms
+                                  (core.convert.FromSame CapacityError)
+                                  residual
+                            | core.ops.control_flow.ControlFlow.Break residual
+                              =>
+                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                TerminalProjectionTerms (core.convert.FromSame
+                                CapacityError) residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              TerminalProjectionTerms (core.convert.FromSame
+                              CapacityError) residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalProjectionTerms (core.convert.FromSame
+                            CapacityError) residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          TerminalProjectionTerms (core.convert.FromSame
+                          CapacityError) residual
+                  | core.ops.control_flow.ControlFlow.Break residual =>
+                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                      TerminalProjectionTerms (core.convert.FromSame
+                      CapacityError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    TerminalProjectionTerms (core.convert.FromSame
+                    CapacityError) residual
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  TerminalProjectionTerms (core.convert.FromSame CapacityError)
+                  residual
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                TerminalProjectionTerms (core.convert.FromSame CapacityError)
+                residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            TerminalProjectionTerms (core.convert.FromSame CapacityError)
+            residual
+      | core.ops.control_flow.ControlFlow.Break residual =>
+        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+          TerminalProjectionTerms (core.convert.FromSame CapacityError)
+          residual
+    | core.ops.control_flow.ControlFlow.Break residual =>
+      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+        TerminalProjectionTerms (core.convert.FromSame CapacityError) residual
+  else
+    let r ← checked_add input.pending_completed_sidecars 0#u64
+    let cf ← core.result.Result.Insts.CoreOpsTry.branch r
+    match cf with
+    | core.ops.control_flow.ControlFlow.Continue val =>
+      let r1 ← checked_mul val sidecar.tape_file_blocks
+      let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
+      match cf1 with
+      | core.ops.control_flow.ControlFlow.Continue val1 =>
+        if input.projected_object_present
+        then
+          let r2 ←
+            checked_add input.projected_object_blocks
+              input.object_filemark_blocks
+          let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+          match cf2 with
+          | core.ops.control_flow.ControlFlow.Continue val2 =>
+            let r3 ← checked_add val2 val1
+            let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+            match cf3 with
+            | core.ops.control_flow.ControlFlow.Continue val3 =>
+              let r4 ← checked_add input.object_rows_before_object 1#u64
+              let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+              match cf4 with
+              | core.ops.control_flow.ControlFlow.Continue val4 =>
+                let r5 ← checked_add input.sidecar_entries_before_object val
+                let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+                match cf5 with
+                | core.ops.control_flow.ControlFlow.Continue val5 =>
+                  let r6 ← checked_add val5 0#u64
+                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                  match cf6 with
+                  | core.ops.control_flow.ControlFlow.Continue val6 =>
+                    if input.sidecar_entries_before_object >
+                      maximum_sidecar_entries_for_capacity
+                    then
+                      ok (core.result.Result.Err
+                        CapacityError.SidecarDirectoryExceedsCapacity)
+                    else
+                      let r7 ← parity_map_directory_len_upper_bound val6
+                      let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                      match cf7 with
+                      | core.ops.control_flow.ControlFlow.Continue val7 =>
+                        let r8 ← parity_map_payload_len_upper_bound val6
+                        let cf8 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r8
+                        match cf8 with
+                        | core.ops.control_flow.ControlFlow.Continue val8 =>
+                          let (final_parity_map_needed, final_parity_map_count)
+                            ←
+                            if val6 != 0#u64
+                            then ok (true, 1#u64)
+                            else ok (false, 0#u64)
+                          let r9 ←
+                            checked_add input.structural_entries_before_object
+                              1#u64
+                          let cf9 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r9
+                          match cf9 with
+                          | core.ops.control_flow.ControlFlow.Continue val9 =>
+                            let r10 ← checked_add val9 val
+                            let cf10 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r10
+                            match cf10 with
+                            | core.ops.control_flow.ControlFlow.Continue val10
+                              =>
+                              let r11 ← checked_add val10 0#u64
+                              let cf11 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r11
+                              match cf11 with
+                              | core.ops.control_flow.ControlFlow.Continue
+                                val11 =>
+                                let r12 ←
+                                  checked_add val11 final_parity_map_count
+                                let cf12 ←
+                                  core.result.Result.Insts.CoreOpsTry.branch
+                                    r12
+                                match cf12 with
+                                | core.ops.control_flow.ControlFlow.Continue
+                                  val12 =>
+                                  ok (core.result.Result.Ok
+                                    {
+                                      epochs_completed_by_object := 0#u64,
+                                      final_partial_sidecar_needed := false,
+                                      sidecars_emitted_by_commit := val,
+                                      sidecar_blocks_emitted_by_commit := val1,
+                                      object_tape_file_blocks := val2,
+                                      prefix_commit_charge_blocks := val3,
+                                      object_rows_after := val4,
+                                      sidecar_entries_after_closeout := val6,
+                                      maximum_sidecar_entries_for_capacity,
+                                      structural_entries_after_closeout :=
+                                        val12,
+                                      final_parity_map_needed,
+                                      final_parity_map_directory_bound_bytes :=
+                                        val7,
+                                      final_parity_map_payload_bound_bytes :=
+                                        val8
+                                    })
+                                | core.ops.control_flow.ControlFlow.Break
+                                  residual =>
+                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                    TerminalProjectionTerms
+                                    (core.convert.FromSame CapacityError)
+                                    residual
+                              | core.ops.control_flow.ControlFlow.Break
+                                residual =>
+                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                  TerminalProjectionTerms
+                                  (core.convert.FromSame CapacityError)
+                                  residual
+                            | core.ops.control_flow.ControlFlow.Break residual
+                              =>
+                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                TerminalProjectionTerms (core.convert.FromSame
+                                CapacityError) residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              TerminalProjectionTerms (core.convert.FromSame
+                              CapacityError) residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalProjectionTerms (core.convert.FromSame
+                            CapacityError) residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          TerminalProjectionTerms (core.convert.FromSame
+                          CapacityError) residual
+                  | core.ops.control_flow.ControlFlow.Break residual =>
+                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                      TerminalProjectionTerms (core.convert.FromSame
+                      CapacityError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    TerminalProjectionTerms (core.convert.FromSame
+                    CapacityError) residual
+              | core.ops.control_flow.ControlFlow.Break residual =>
+                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                  TerminalProjectionTerms (core.convert.FromSame CapacityError)
+                  residual
+            | core.ops.control_flow.ControlFlow.Break residual =>
+              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                TerminalProjectionTerms (core.convert.FromSame CapacityError)
+                residual
+          | core.ops.control_flow.ControlFlow.Break residual =>
+            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+              TerminalProjectionTerms (core.convert.FromSame CapacityError)
+              residual
+        else
+          let r2 ← checked_add 0#u64 val1
+          let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
+          match cf2 with
+          | core.ops.control_flow.ControlFlow.Continue val2 =>
+            let r3 ← checked_add input.object_rows_before_object 0#u64
+            let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+            match cf3 with
+            | core.ops.control_flow.ControlFlow.Continue val3 =>
+              let r4 ← checked_add input.sidecar_entries_before_object val
+              let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+              match cf4 with
+              | core.ops.control_flow.ControlFlow.Continue val4 =>
+                let r5 ← checked_add val4 0#u64
+                let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+                match cf5 with
+                | core.ops.control_flow.ControlFlow.Continue val5 =>
                   if input.sidecar_entries_before_object >
                     maximum_sidecar_entries_for_capacity
                   then
                     ok (core.result.Result.Err
                       CapacityError.SidecarDirectoryExceedsCapacity)
                   else
-                    let r8 ← parity_map_directory_len_upper_bound val7
-                    let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
-                    match cf8 with
-                    | core.ops.control_flow.ControlFlow.Continue val8 =>
-                      let r9 ← parity_map_payload_len_upper_bound val7
-                      let cf9 ← core.result.Result.Insts.CoreOpsTry.branch r9
-                      match cf9 with
-                      | core.ops.control_flow.ControlFlow.Continue val9 =>
+                    let r6 ← parity_map_directory_len_upper_bound val5
+                    let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                    match cf6 with
+                    | core.ops.control_flow.ControlFlow.Continue val6 =>
+                      let r7 ← parity_map_payload_len_upper_bound val5
+                      let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                      match cf7 with
+                      | core.ops.control_flow.ControlFlow.Continue val7 =>
                         let (final_parity_map_needed, final_parity_map_count)
                           ←
-                          if val7 != 0#u64
+                          if val5 != 0#u64
                           then ok (true, 1#u64)
                           else ok (false, 0#u64)
-                        let r10 ←
+                        let r8 ←
                           checked_add input.structural_entries_before_object
-                            1#u64
-                        let cf10 ←
-                          core.result.Result.Insts.CoreOpsTry.branch r10
-                        match cf10 with
-                        | core.ops.control_flow.ControlFlow.Continue val10 =>
-                          let r11 ← checked_add val10 val1
-                          let cf11 ←
-                            core.result.Result.Insts.CoreOpsTry.branch r11
-                          match cf11 with
-                          | core.ops.control_flow.ControlFlow.Continue val11 =>
-                            let r12 ←
-                              checked_add val11 final_partial_sidecar_count
-                            let cf12 ←
-                              core.result.Result.Insts.CoreOpsTry.branch r12
-                            match cf12 with
-                            | core.ops.control_flow.ControlFlow.Continue val12
+                            0#u64
+                        let cf8 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r8
+                        match cf8 with
+                        | core.ops.control_flow.ControlFlow.Continue val8 =>
+                          let r9 ← checked_add val8 val
+                          let cf9 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r9
+                          match cf9 with
+                          | core.ops.control_flow.ControlFlow.Continue val9 =>
+                            let r10 ← checked_add val9 0#u64
+                            let cf10 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r10
+                            match cf10 with
+                            | core.ops.control_flow.ControlFlow.Continue val10
                               =>
-                              let r13 ←
-                                checked_add val12 final_parity_map_count
-                              let cf13 ←
-                                core.result.Result.Insts.CoreOpsTry.branch r13
-                              match cf13 with
+                              let r11 ←
+                                checked_add val10 final_parity_map_count
+                              let cf11 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r11
+                              match cf11 with
                               | core.ops.control_flow.ControlFlow.Continue
-                                val13 =>
+                                val11 =>
                                 ok (core.result.Result.Ok
                                   {
-                                    epochs_completed_by_object,
-                                    final_partial_sidecar_needed,
-                                    sidecars_emitted_by_commit := val1,
-                                    sidecar_blocks_emitted_by_commit := val2,
-                                    object_tape_file_blocks := val3,
-                                    object_commit_charge_blocks := val4,
-                                    object_rows_after := val5,
-                                    sidecar_entries_after_closeout := val7,
+                                    epochs_completed_by_object := 0#u64,
+                                    final_partial_sidecar_needed := false,
+                                    sidecars_emitted_by_commit := val,
+                                    sidecar_blocks_emitted_by_commit := val1,
+                                    object_tape_file_blocks := 0#u64,
+                                    prefix_commit_charge_blocks := val2,
+                                    object_rows_after := val3,
+                                    sidecar_entries_after_closeout := val5,
                                     maximum_sidecar_entries_for_capacity,
-                                    structural_entries_after_closeout := val13,
+                                    structural_entries_after_closeout := val11,
                                     final_parity_map_needed,
                                     final_parity_map_directory_bound_bytes :=
-                                      val8,
+                                      val6,
                                     final_parity_map_payload_bound_bytes :=
-                                      val9
+                                      val7
                                   })
                               | core.ops.control_flow.ControlFlow.Break
                                 residual =>
                                 core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                  SnapshotProjectionTerms
+                                  TerminalProjectionTerms
                                   (core.convert.FromSame CapacityError)
                                   residual
                             | core.ops.control_flow.ControlFlow.Break residual
                               =>
                               core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                SnapshotProjectionTerms (core.convert.FromSame
+                                TerminalProjectionTerms (core.convert.FromSame
                                 CapacityError) residual
                           | core.ops.control_flow.ControlFlow.Break residual =>
                             core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                              SnapshotProjectionTerms (core.convert.FromSame
+                              TerminalProjectionTerms (core.convert.FromSame
                               CapacityError) residual
                         | core.ops.control_flow.ControlFlow.Break residual =>
                           core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                            SnapshotProjectionTerms (core.convert.FromSame
+                            TerminalProjectionTerms (core.convert.FromSame
                             CapacityError) residual
                       | core.ops.control_flow.ControlFlow.Break residual =>
                         core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                          SnapshotProjectionTerms (core.convert.FromSame
+                          TerminalProjectionTerms (core.convert.FromSame
                           CapacityError) residual
                     | core.ops.control_flow.ControlFlow.Break residual =>
                       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                        SnapshotProjectionTerms (core.convert.FromSame
+                        TerminalProjectionTerms (core.convert.FromSame
                         CapacityError) residual
                 | core.ops.control_flow.ControlFlow.Break residual =>
                   core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                    SnapshotProjectionTerms (core.convert.FromSame
+                    TerminalProjectionTerms (core.convert.FromSame
                     CapacityError) residual
               | core.ops.control_flow.ControlFlow.Break residual =>
                 core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                  SnapshotProjectionTerms (core.convert.FromSame CapacityError)
+                  TerminalProjectionTerms (core.convert.FromSame CapacityError)
                   residual
             | core.ops.control_flow.ControlFlow.Break residual =>
               core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                SnapshotProjectionTerms (core.convert.FromSame CapacityError)
+                TerminalProjectionTerms (core.convert.FromSame CapacityError)
                 residual
           | core.ops.control_flow.ControlFlow.Break residual =>
             core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-              SnapshotProjectionTerms (core.convert.FromSame CapacityError)
+              TerminalProjectionTerms (core.convert.FromSame CapacityError)
               residual
-        | core.ops.control_flow.ControlFlow.Break residual =>
-          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-            SnapshotProjectionTerms (core.convert.FromSame CapacityError)
-            residual
       | core.ops.control_flow.ControlFlow.Break residual =>
         core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-          SnapshotProjectionTerms (core.convert.FromSame CapacityError)
+          TerminalProjectionTerms (core.convert.FromSame CapacityError)
           residual
     | core.ops.control_flow.ControlFlow.Break residual =>
       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-        SnapshotProjectionTerms (core.convert.FromSame CapacityError) residual
-  | core.ops.control_flow.ControlFlow.Break residual =>
-    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      SnapshotProjectionTerms (core.convert.FromSame CapacityError) residual
+        TerminalProjectionTerms (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::compute_snapshot_control_terms]:
-    Source: 'src/lib.rs', lines 591:0-650:1
+/-- [parity_capacity_verif::compute_terminal_control_terms]:
+    Source: 'src/lib.rs', lines 687:0-752:1
     Visibility: public -/
-def compute_snapshot_control_terms
-  (input : SnapshotCloseInput) (sidecar : SnapshotSidecarTerms)
-  (projection : SnapshotProjectionTerms) :
-  Result (core.result.Result SnapshotControlTerms CapacityError)
+def compute_terminal_control_terms
+  (input : TerminalTripleCloseInput) (_sidecar : TerminalSidecarTerms)
+  (projection : TerminalProjectionTerms) :
+  Result (core.result.Result TerminalControlTerms CapacityError)
   := do
   let r ←
-    snapshot_payload_bytes projection.structural_entries_after_closeout
-      projection.object_rows_after
+    terminal_replica_layout input.block_size_bytes
+      projection.structural_entries_after_closeout projection.object_rows_after
   let cf ← core.result.Result.Insts.CoreOpsTry.branch r
   match cf with
   | core.ops.control_flow.ControlFlow.Continue val =>
-    let i ← snapshot_header_bytes
-    let r1 ← replicated_control_total_blocks input.block_size_bytes i val
+    let (replica_payload_bytes, replica_payload_record_count,
+      replica_records_before_filemark) :=
+      val
+    let r1 ←
+      checked_add replica_records_before_filemark input.replica_filemark_blocks
     let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
     match cf1 with
     | core.ops.control_flow.ControlFlow.Continue val1 =>
-      let r2 ← checked_add val1 input.snapshot_filemark_blocks
+      let r2 ← checked_mul 3#u64 val1
       let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
       match cf2 with
       | core.ops.control_flow.ControlFlow.Continue val2 =>
-        if projection.final_parity_map_needed
-        then
-          let i1 ← parity_map_header_bytes
-          let r3 ←
-            replicated_control_total_blocks input.block_size_bytes i1
-              projection.final_parity_map_payload_bound_bytes
-          let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
-          match cf3 with
-          | core.ops.control_flow.ControlFlow.Continue val3 =>
-            let r4 ← checked_add val3 input.parity_map_filemark_blocks
-            let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
-            match cf4 with
-            | core.ops.control_flow.ControlFlow.Continue val4 =>
-              let final_partial_sidecar_blocks ←
-                if projection.final_partial_sidecar_needed
-                then ok sidecar.tape_file_blocks
-                else ok 0#u64
-              let i2 ← block_count_per_bootstrap
-              let r5 ← checked_add i2 input.bootstrap_filemark_blocks
-              let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
-              match cf5 with
-              | core.ops.control_flow.ControlFlow.Continue val5 =>
-                let r6 ← checked_add final_partial_sidecar_blocks val4
+        let r3 ←
+          index_separation_records input.block_size_bytes
+            input.gap_nominal_bytes
+        let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
+        match cf3 with
+        | core.ops.control_flow.ControlFlow.Continue val3 =>
+          let r4 ← checked_add val3 input.gap_filemark_blocks
+          let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
+          match cf4 with
+          | core.ops.control_flow.ControlFlow.Continue val4 =>
+            let r5 ← checked_mul 2#u64 val4
+            let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
+            match cf5 with
+            | core.ops.control_flow.ControlFlow.Continue val5 =>
+              if projection.final_parity_map_needed
+              then
+                let i ← parity_map_header_bytes
+                let r6 ←
+                  replicated_control_total_blocks input.block_size_bytes i
+                    projection.final_parity_map_payload_bound_bytes
                 let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
                 match cf6 with
                 | core.ops.control_flow.ControlFlow.Continue val6 =>
-                  let r7 ← checked_add val6 val2
+                  let r7 ← checked_add val6 input.parity_map_filemark_blocks
                   let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
                   match cf7 with
                   | core.ops.control_flow.ControlFlow.Continue val7 =>
-                    let r8 ← checked_add val7 val5
-                    let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
-                    match cf8 with
-                    | core.ops.control_flow.ControlFlow.Continue val8 =>
-                      let r9 ← checked_add val8 input.safety_margin_blocks
-                      let cf9 ← core.result.Result.Insts.CoreOpsTry.branch r9
-                      match cf9 with
-                      | core.ops.control_flow.ControlFlow.Continue val9 =>
-                        ok (core.result.Result.Ok
-                          {
-                            final_partial_sidecar_blocks,
-                            final_parity_map_blocks_before_filemark := val3,
-                            final_parity_map_tape_file_blocks := val4,
-                            snapshot_payload_bytes := val,
-                            snapshot_blocks_before_filemark := val1,
-                            snapshot_tape_file_blocks := val2,
-                            final_bootstrap_tape_file_blocks := val5,
-                            close_bound_blocks := val9
-                          })
+                    if projection.final_partial_sidecar_needed
+                    then
+                      let r8 ← final_partial_sidecar_tape_file_blocks input
+                      let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
+                      match cf8 with
+                      | core.ops.control_flow.ControlFlow.Continue val8 =>
+                        let r9 ← checked_add val8 val7
+                        let cf9 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r9
+                        match cf9 with
+                        | core.ops.control_flow.ControlFlow.Continue val9 =>
+                          let r10 ← checked_add val2 val5
+                          let cf10 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r10
+                          match cf10 with
+                          | core.ops.control_flow.ControlFlow.Continue val10 =>
+                            let r11 ← checked_add val9 val10
+                            let cf11 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r11
+                            match cf11 with
+                            | core.ops.control_flow.ControlFlow.Continue val11
+                              =>
+                              let r12 ←
+                                checked_add val11 input.safety_margin_blocks
+                              let cf12 ←
+                                core.result.Result.Insts.CoreOpsTry.branch r12
+                              match cf12 with
+                              | core.ops.control_flow.ControlFlow.Continue
+                                val12 =>
+                                ok (core.result.Result.Ok
+                                  {
+                                    final_partial_sidecar_blocks := val8,
+                                    final_parity_map_blocks_before_filemark :=
+                                      val6,
+                                    final_parity_map_tape_file_blocks := val7,
+                                    replica_payload_bytes,
+                                    replica_payload_record_count,
+                                    replica_records_before_filemark,
+                                    replica_tape_file_blocks := val1,
+                                    triple_replica_blocks := val2,
+                                    gap_records_before_filemark := val3,
+                                    gap_tape_file_blocks := val4,
+                                    double_gap_blocks := val5,
+                                    parity_closeout_charge_blocks := val9,
+                                    terminal_tail_charge_blocks := val10,
+                                    close_bound_blocks := val12
+                                  })
+                              | core.ops.control_flow.ControlFlow.Break
+                                residual =>
+                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                  TerminalControlTerms (core.convert.FromSame
+                                  CapacityError) residual
+                            | core.ops.control_flow.ControlFlow.Break residual
+                              =>
+                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                TerminalControlTerms (core.convert.FromSame
+                                CapacityError) residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              TerminalControlTerms (core.convert.FromSame
+                              CapacityError) residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalControlTerms (core.convert.FromSame
+                            CapacityError) residual
                       | core.ops.control_flow.ControlFlow.Break residual =>
                         core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                          SnapshotControlTerms (core.convert.FromSame
+                          TerminalControlTerms (core.convert.FromSame
+                          CapacityError) residual
+                    else
+                      let r8 ← checked_add 0#u64 val7
+                      let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
+                      match cf8 with
+                      | core.ops.control_flow.ControlFlow.Continue val8 =>
+                        let r9 ← checked_add val2 val5
+                        let cf9 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r9
+                        match cf9 with
+                        | core.ops.control_flow.ControlFlow.Continue val9 =>
+                          let r10 ← checked_add val8 val9
+                          let cf10 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r10
+                          match cf10 with
+                          | core.ops.control_flow.ControlFlow.Continue val10 =>
+                            let r11 ←
+                              checked_add val10 input.safety_margin_blocks
+                            let cf11 ←
+                              core.result.Result.Insts.CoreOpsTry.branch r11
+                            match cf11 with
+                            | core.ops.control_flow.ControlFlow.Continue val11
+                              =>
+                              ok (core.result.Result.Ok
+                                {
+                                  final_partial_sidecar_blocks := 0#u64,
+                                  final_parity_map_blocks_before_filemark :=
+                                    val6,
+                                  final_parity_map_tape_file_blocks := val7,
+                                  replica_payload_bytes,
+                                  replica_payload_record_count,
+                                  replica_records_before_filemark,
+                                  replica_tape_file_blocks := val1,
+                                  triple_replica_blocks := val2,
+                                  gap_records_before_filemark := val3,
+                                  gap_tape_file_blocks := val4,
+                                  double_gap_blocks := val5,
+                                  parity_closeout_charge_blocks := val8,
+                                  terminal_tail_charge_blocks := val9,
+                                  close_bound_blocks := val11
+                                })
+                            | core.ops.control_flow.ControlFlow.Break residual
+                              =>
+                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                                TerminalControlTerms (core.convert.FromSame
+                                CapacityError) residual
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              TerminalControlTerms (core.convert.FromSame
+                              CapacityError) residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalControlTerms (core.convert.FromSame
+                            CapacityError) residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          TerminalControlTerms (core.convert.FromSame
+                          CapacityError) residual
+                  | core.ops.control_flow.ControlFlow.Break residual =>
+                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                      TerminalControlTerms (core.convert.FromSame
+                      CapacityError) residual
+                | core.ops.control_flow.ControlFlow.Break residual =>
+                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                    TerminalControlTerms (core.convert.FromSame CapacityError)
+                    residual
+              else
+                if projection.final_partial_sidecar_needed
+                then
+                  let r6 ← final_partial_sidecar_tape_file_blocks input
+                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                  match cf6 with
+                  | core.ops.control_flow.ControlFlow.Continue val6 =>
+                    let r7 ← checked_add val6 0#u64
+                    let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                    match cf7 with
+                    | core.ops.control_flow.ControlFlow.Continue val7 =>
+                      let r8 ← checked_add val2 val5
+                      let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
+                      match cf8 with
+                      | core.ops.control_flow.ControlFlow.Continue val8 =>
+                        let r9 ← checked_add val7 val8
+                        let cf9 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r9
+                        match cf9 with
+                        | core.ops.control_flow.ControlFlow.Continue val9 =>
+                          let r10 ←
+                            checked_add val9 input.safety_margin_blocks
+                          let cf10 ←
+                            core.result.Result.Insts.CoreOpsTry.branch r10
+                          match cf10 with
+                          | core.ops.control_flow.ControlFlow.Continue val10 =>
+                            ok (core.result.Result.Ok
+                              {
+                                final_partial_sidecar_blocks := val6,
+                                final_parity_map_blocks_before_filemark :=
+                                  0#u64,
+                                final_parity_map_tape_file_blocks := 0#u64,
+                                replica_payload_bytes,
+                                replica_payload_record_count,
+                                replica_records_before_filemark,
+                                replica_tape_file_blocks := val1,
+                                triple_replica_blocks := val2,
+                                gap_records_before_filemark := val3,
+                                gap_tape_file_blocks := val4,
+                                double_gap_blocks := val5,
+                                parity_closeout_charge_blocks := val7,
+                                terminal_tail_charge_blocks := val8,
+                                close_bound_blocks := val10
+                              })
+                          | core.ops.control_flow.ControlFlow.Break residual =>
+                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                              TerminalControlTerms (core.convert.FromSame
+                              CapacityError) residual
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalControlTerms (core.convert.FromSame
+                            CapacityError) residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          TerminalControlTerms (core.convert.FromSame
                           CapacityError) residual
                     | core.ops.control_flow.ControlFlow.Break residual =>
                       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                        SnapshotControlTerms (core.convert.FromSame
+                        TerminalControlTerms (core.convert.FromSame
                         CapacityError) residual
                   | core.ops.control_flow.ControlFlow.Break residual =>
                     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                      SnapshotControlTerms (core.convert.FromSame
+                      TerminalControlTerms (core.convert.FromSame
                       CapacityError) residual
-                | core.ops.control_flow.ControlFlow.Break residual =>
-                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                    SnapshotControlTerms (core.convert.FromSame CapacityError)
-                    residual
-              | core.ops.control_flow.ControlFlow.Break residual =>
-                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                  SnapshotControlTerms (core.convert.FromSame CapacityError)
-                  residual
-            | core.ops.control_flow.ControlFlow.Break residual =>
-              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                SnapshotControlTerms (core.convert.FromSame CapacityError)
-                residual
-          | core.ops.control_flow.ControlFlow.Break residual =>
-            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-              SnapshotControlTerms (core.convert.FromSame CapacityError)
-              residual
-        else
-          let final_partial_sidecar_blocks ←
-            if projection.final_partial_sidecar_needed
-            then ok sidecar.tape_file_blocks
-            else ok 0#u64
-          let i1 ← block_count_per_bootstrap
-          let r3 ← checked_add i1 input.bootstrap_filemark_blocks
-          let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
-          match cf3 with
-          | core.ops.control_flow.ControlFlow.Continue val3 =>
-            let r4 ← checked_add final_partial_sidecar_blocks 0#u64
-            let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
-            match cf4 with
-            | core.ops.control_flow.ControlFlow.Continue val4 =>
-              let r5 ← checked_add val4 val2
-              let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
-              match cf5 with
-              | core.ops.control_flow.ControlFlow.Continue val5 =>
-                let r6 ← checked_add val5 val3
-                let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
-                match cf6 with
-                | core.ops.control_flow.ControlFlow.Continue val6 =>
-                  let r7 ← checked_add val6 input.safety_margin_blocks
-                  let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
-                  match cf7 with
-                  | core.ops.control_flow.ControlFlow.Continue val7 =>
-                    ok (core.result.Result.Ok
-                      {
-                        final_partial_sidecar_blocks,
-                        final_parity_map_blocks_before_filemark := 0#u64,
-                        final_parity_map_tape_file_blocks := 0#u64,
-                        snapshot_payload_bytes := val,
-                        snapshot_blocks_before_filemark := val1,
-                        snapshot_tape_file_blocks := val2,
-                        final_bootstrap_tape_file_blocks := val3,
-                        close_bound_blocks := val7
-                      })
+                else
+                  let r6 ← checked_add 0#u64 0#u64
+                  let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
+                  match cf6 with
+                  | core.ops.control_flow.ControlFlow.Continue val6 =>
+                    let r7 ← checked_add val2 val5
+                    let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
+                    match cf7 with
+                    | core.ops.control_flow.ControlFlow.Continue val7 =>
+                      let r8 ← checked_add val6 val7
+                      let cf8 ← core.result.Result.Insts.CoreOpsTry.branch r8
+                      match cf8 with
+                      | core.ops.control_flow.ControlFlow.Continue val8 =>
+                        let r9 ← checked_add val8 input.safety_margin_blocks
+                        let cf9 ←
+                          core.result.Result.Insts.CoreOpsTry.branch r9
+                        match cf9 with
+                        | core.ops.control_flow.ControlFlow.Continue val9 =>
+                          ok (core.result.Result.Ok
+                            {
+                              final_partial_sidecar_blocks := 0#u64,
+                              final_parity_map_blocks_before_filemark := 0#u64,
+                              final_parity_map_tape_file_blocks := 0#u64,
+                              replica_payload_bytes,
+                              replica_payload_record_count,
+                              replica_records_before_filemark,
+                              replica_tape_file_blocks := val1,
+                              triple_replica_blocks := val2,
+                              gap_records_before_filemark := val3,
+                              gap_tape_file_blocks := val4,
+                              double_gap_blocks := val5,
+                              parity_closeout_charge_blocks := val6,
+                              terminal_tail_charge_blocks := val7,
+                              close_bound_blocks := val9
+                            })
+                        | core.ops.control_flow.ControlFlow.Break residual =>
+                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                            TerminalControlTerms (core.convert.FromSame
+                            CapacityError) residual
+                      | core.ops.control_flow.ControlFlow.Break residual =>
+                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                          TerminalControlTerms (core.convert.FromSame
+                          CapacityError) residual
+                    | core.ops.control_flow.ControlFlow.Break residual =>
+                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+                        TerminalControlTerms (core.convert.FromSame
+                        CapacityError) residual
                   | core.ops.control_flow.ControlFlow.Break residual =>
                     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                      SnapshotControlTerms (core.convert.FromSame
+                      TerminalControlTerms (core.convert.FromSame
                       CapacityError) residual
-                | core.ops.control_flow.ControlFlow.Break residual =>
-                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                    SnapshotControlTerms (core.convert.FromSame CapacityError)
-                    residual
-              | core.ops.control_flow.ControlFlow.Break residual =>
-                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                  SnapshotControlTerms (core.convert.FromSame CapacityError)
-                  residual
             | core.ops.control_flow.ControlFlow.Break residual =>
               core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                SnapshotControlTerms (core.convert.FromSame CapacityError)
+                TerminalControlTerms (core.convert.FromSame CapacityError)
                 residual
           | core.ops.control_flow.ControlFlow.Break residual =>
             core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-              SnapshotControlTerms (core.convert.FromSame CapacityError)
+              TerminalControlTerms (core.convert.FromSame CapacityError)
               residual
+        | core.ops.control_flow.ControlFlow.Break residual =>
+          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
+            TerminalControlTerms (core.convert.FromSame CapacityError) residual
       | core.ops.control_flow.ControlFlow.Break residual =>
         core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-          SnapshotControlTerms (core.convert.FromSame CapacityError) residual
+          TerminalControlTerms (core.convert.FromSame CapacityError) residual
     | core.ops.control_flow.ControlFlow.Break residual =>
       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-        SnapshotControlTerms (core.convert.FromSame CapacityError) residual
+        TerminalControlTerms (core.convert.FromSame CapacityError) residual
   | core.ops.control_flow.ControlFlow.Break residual =>
     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      SnapshotControlTerms (core.convert.FromSame CapacityError) residual
+      TerminalControlTerms (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::evaluate_snapshot_close]:
-    Source: 'src/lib.rs', lines 654:0-719:1
+/-- [parity_capacity_verif::evaluate_terminal_close]:
+    Source: 'src/lib.rs', lines 755:0-833:1
     Visibility: public -/
-def evaluate_snapshot_close
-  (input : SnapshotCloseInput) :
-  Result (core.result.Result SnapshotCloseReport CapacityError)
+def evaluate_terminal_close
+  (input : TerminalTripleCloseInput) :
+  Result (core.result.Result TerminalTripleCloseReport CapacityError)
   := do
-  let r ← validate_snapshot_close_input input
+  let r ← validate_terminal_close_input input
   let cf ← core.result.Result.Insts.CoreOpsTry.branch r
   match cf with
   | core.ops.control_flow.ControlFlow.Continue _ =>
-    let r1 ← compute_snapshot_sidecar_terms input
+    let r1 ← compute_terminal_sidecar_terms input
     let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
     match cf1 with
     | core.ops.control_flow.ControlFlow.Continue val =>
       let r2 ←
-        validate_capacity_derived_profile_bounds input val.tape_file_blocks
+        validate_capacity_derived_profile_bounds input
+          (input.parity_shards_per_epoch != 0#u64) val.tape_file_blocks
       match r2 with
       | core.result.Result.Ok value =>
-        let r3 ← compute_snapshot_projection_terms input val value
+        let r3 ← compute_terminal_projection_terms input val value
         let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r3
         match cf2 with
         | core.ops.control_flow.ControlFlow.Continue val1 =>
-          let r4 ← compute_snapshot_control_terms input val val1
+          let r4 ← compute_terminal_control_terms input val val1
           let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r4
           match cf3 with
           | core.ops.control_flow.ControlFlow.Continue val2 =>
             let r5 ←
-              checked_add val1.object_commit_charge_blocks
+              checked_add val1.prefix_commit_charge_blocks
                 val2.close_bound_blocks
             let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r5
             match cf4 with
             | core.ops.control_flow.ControlFlow.Continue val3 =>
-              if input.empty_tape_usable_blocks < val3
+              if input.remaining_tape_blocks < val3
               then
                 ok (core.result.Result.Err
-                  CapacityError.ObjectTooLargeForEmptyTape)
+                  CapacityError.CapacityReserveExceededTape)
               else
-                if input.remaining_tape_blocks < val3
+                if input.parity_shards_per_epoch != 0#u64
                 then
-                  ok (core.result.Result.Err
-                    CapacityError.CapacityReserveExceededTape)
-                else
                   let r6 ←
                     checked_mul val.blocks_before_filemark
                       input.block_size_bytes
@@ -3401,6 +3929,8 @@ def evaluate_snapshot_close
                         else
                           ok (core.result.Result.Ok
                             {
+                              projected_object_present :=
+                                input.projected_object_present,
                               epochs_completed_by_object :=
                                 val1.epochs_completed_by_object,
                               final_partial_sidecar_needed :=
@@ -3416,8 +3946,8 @@ def evaluate_snapshot_close
                                 val1.sidecar_blocks_emitted_by_commit,
                               object_tape_file_blocks :=
                                 val1.object_tape_file_blocks,
-                              object_commit_charge_blocks :=
-                                val1.object_commit_charge_blocks,
+                              prefix_commit_charge_blocks :=
+                                val1.prefix_commit_charge_blocks,
                               object_rows_after := val1.object_rows_after,
                               sidecar_entries_after_closeout :=
                                 val1.sidecar_entries_after_closeout,
@@ -3437,14 +3967,25 @@ def evaluate_snapshot_close
                                 val2.final_parity_map_blocks_before_filemark,
                               final_parity_map_tape_file_blocks :=
                                 val2.final_parity_map_tape_file_blocks,
-                              snapshot_payload_bytes :=
-                                val2.snapshot_payload_bytes,
-                              snapshot_blocks_before_filemark :=
-                                val2.snapshot_blocks_before_filemark,
-                              snapshot_tape_file_blocks :=
-                                val2.snapshot_tape_file_blocks,
-                              final_bootstrap_tape_file_blocks :=
-                                val2.final_bootstrap_tape_file_blocks,
+                              replica_payload_bytes :=
+                                val2.replica_payload_bytes,
+                              replica_payload_record_count :=
+                                val2.replica_payload_record_count,
+                              replica_records_before_filemark :=
+                                val2.replica_records_before_filemark,
+                              replica_tape_file_blocks :=
+                                val2.replica_tape_file_blocks,
+                              triple_replica_blocks :=
+                                val2.triple_replica_blocks,
+                              gap_nominal_bytes := input.gap_nominal_bytes,
+                              gap_records_before_filemark :=
+                                val2.gap_records_before_filemark,
+                              gap_tape_file_blocks := val2.gap_tape_file_blocks,
+                              double_gap_blocks := val2.double_gap_blocks,
+                              parity_closeout_charge_blocks :=
+                                val2.parity_closeout_charge_blocks,
+                              terminal_tail_charge_blocks :=
+                                val2.terminal_tail_charge_blocks,
                               safety_margin_blocks :=
                                 input.safety_margin_blocks,
                               close_bound_blocks := val2.close_bound_blocks,
@@ -3453,293 +3994,409 @@ def evaluate_snapshot_close
                             })
                       | core.ops.control_flow.ControlFlow.Break residual =>
                         core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                          SnapshotCloseReport (core.convert.FromSame
+                          TerminalTripleCloseReport (core.convert.FromSame
                           CapacityError) residual
                     | core.ops.control_flow.ControlFlow.Break residual =>
                       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                        SnapshotCloseReport (core.convert.FromSame
+                        TerminalTripleCloseReport (core.convert.FromSame
                         CapacityError) residual
                   | core.ops.control_flow.ControlFlow.Break residual =>
                     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                      SnapshotCloseReport (core.convert.FromSame CapacityError)
-                      residual
+                      TerminalTripleCloseReport (core.convert.FromSame
+                      CapacityError) residual
+                else
+                  if input.remaining_spool_bytes < 0#u64
+                  then
+                    ok (core.result.Result.Err
+                      CapacityError.CapacityReserveExceededSpool)
+                  else
+                    ok (core.result.Result.Ok
+                      {
+                        projected_object_present :=
+                          input.projected_object_present,
+                        epochs_completed_by_object :=
+                          val1.epochs_completed_by_object,
+                        final_partial_sidecar_needed :=
+                          val1.final_partial_sidecar_needed,
+                        sidecar_index_block_count := val.index_block_count,
+                        sidecar_blocks_before_filemark :=
+                          val.blocks_before_filemark,
+                        sidecar_tape_file_blocks := val.tape_file_blocks,
+                        sidecars_emitted_by_commit :=
+                          val1.sidecars_emitted_by_commit,
+                        sidecar_blocks_emitted_by_commit :=
+                          val1.sidecar_blocks_emitted_by_commit,
+                        object_tape_file_blocks := val1.object_tape_file_blocks,
+                        prefix_commit_charge_blocks :=
+                          val1.prefix_commit_charge_blocks,
+                        object_rows_after := val1.object_rows_after,
+                        sidecar_entries_after_closeout :=
+                          val1.sidecar_entries_after_closeout,
+                        maximum_sidecar_entries_for_capacity :=
+                          val1.maximum_sidecar_entries_for_capacity,
+                        structural_entries_after_closeout :=
+                          val1.structural_entries_after_closeout,
+                        final_partial_sidecar_blocks :=
+                          val2.final_partial_sidecar_blocks,
+                        final_parity_map_needed := val1.final_parity_map_needed,
+                        final_parity_map_directory_bound_bytes :=
+                          val1.final_parity_map_directory_bound_bytes,
+                        final_parity_map_payload_bound_bytes :=
+                          val1.final_parity_map_payload_bound_bytes,
+                        final_parity_map_blocks_before_filemark :=
+                          val2.final_parity_map_blocks_before_filemark,
+                        final_parity_map_tape_file_blocks :=
+                          val2.final_parity_map_tape_file_blocks,
+                        replica_payload_bytes := val2.replica_payload_bytes,
+                        replica_payload_record_count :=
+                          val2.replica_payload_record_count,
+                        replica_records_before_filemark :=
+                          val2.replica_records_before_filemark,
+                        replica_tape_file_blocks :=
+                          val2.replica_tape_file_blocks,
+                        triple_replica_blocks := val2.triple_replica_blocks,
+                        gap_nominal_bytes := input.gap_nominal_bytes,
+                        gap_records_before_filemark :=
+                          val2.gap_records_before_filemark,
+                        gap_tape_file_blocks := val2.gap_tape_file_blocks,
+                        double_gap_blocks := val2.double_gap_blocks,
+                        parity_closeout_charge_blocks :=
+                          val2.parity_closeout_charge_blocks,
+                        terminal_tail_charge_blocks :=
+                          val2.terminal_tail_charge_blocks,
+                        safety_margin_blocks := input.safety_margin_blocks,
+                        close_bound_blocks := val2.close_bound_blocks,
+                        required_tape_blocks := val3,
+                        required_spool_bytes := 0#u64
+                      })
             | core.ops.control_flow.ControlFlow.Break residual =>
               core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                SnapshotCloseReport (core.convert.FromSame CapacityError)
+                TerminalTripleCloseReport (core.convert.FromSame CapacityError)
                 residual
           | core.ops.control_flow.ControlFlow.Break residual =>
             core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-              SnapshotCloseReport (core.convert.FromSame CapacityError)
+              TerminalTripleCloseReport (core.convert.FromSame CapacityError)
               residual
         | core.ops.control_flow.ControlFlow.Break residual =>
           core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-            SnapshotCloseReport (core.convert.FromSame CapacityError) residual
+            TerminalTripleCloseReport (core.convert.FromSame CapacityError)
+            residual
       | core.result.Result.Err _ =>
         ok (core.result.Result.Err CapacityError.UnsafeCapacityProfile)
     | core.ops.control_flow.ControlFlow.Break residual =>
       core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-        SnapshotCloseReport (core.convert.FromSame CapacityError) residual
+        TerminalTripleCloseReport (core.convert.FromSame CapacityError)
+        residual
   | core.ops.control_flow.ControlFlow.Break residual =>
     core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      SnapshotCloseReport (core.convert.FromSame CapacityError) residual
+      TerminalTripleCloseReport (core.convert.FromSame CapacityError) residual
 
-/-- [parity_capacity_verif::compute_tape_reserve]:
-    Source: 'src/lib.rs', lines 721:0-775:1
+/-- [parity_capacity_verif::TerminalTailProgress]
+    Source: 'src/lib.rs', lines 838:0-845:1
     Visibility: public -/
-def compute_tape_reserve
-  (input : CapacityReserveInput) :
-  Result (core.result.Result TapeReserveReport CapacityError)
+@[discriminant isize]
+inductive TerminalTailProgress where
+| BeforeReplicaA : TerminalTailProgress
+| AfterReplicaA : TerminalTailProgress
+| AfterSeparationAb : TerminalTailProgress
+| AfterReplicaB : TerminalTailProgress
+| AfterSeparationBc : TerminalTailProgress
+| AfterReplicaC : TerminalTailProgress
+
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalTailProgress}::clone]:
+    Source: 'src/lib.rs', lines 837:9-837:14
+    Visibility: public -/
+def TerminalTailProgress.Insts.CoreCloneClone.clone
+  (self : TerminalTailProgress) : Result TerminalTailProgress := do
+  ok self
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalTailProgress}]
+    Source: 'src/lib.rs', lines 837:9-837:14 -/
+@[reducible]
+def TerminalTailProgress.Insts.CoreCloneClone : core.clone.Clone
+  TerminalTailProgress := {
+  clone := TerminalTailProgress.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalTailProgress}]
+    Source: 'src/lib.rs', lines 837:16-837:20 -/
+@[reducible]
+def TerminalTailProgress.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalTailProgress := {
+  cloneInst := TerminalTailProgress.Insts.CoreCloneClone
+}
+
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalTailProgress}::fmt]:
+    Source: 'src/lib.rs', lines 837:22-837:27
+    Visibility: public -/
+def TerminalTailProgress.Insts.CoreFmtDebug.fmt
+  (self : TerminalTailProgress) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
   := do
-  if input.block_size_bytes = 0#u64
-  then ok (core.result.Result.Err CapacityError.BlockSizeZero)
+  match self with
+  | TerminalTailProgress.BeforeReplicaA =>
+    core.fmt.Formatter.write_str f (toStr "BeforeReplicaA")
+  | TerminalTailProgress.AfterReplicaA =>
+    core.fmt.Formatter.write_str f (toStr "AfterReplicaA")
+  | TerminalTailProgress.AfterSeparationAb =>
+    core.fmt.Formatter.write_str f (toStr "AfterSeparationAb")
+  | TerminalTailProgress.AfterReplicaB =>
+    core.fmt.Formatter.write_str f (toStr "AfterReplicaB")
+  | TerminalTailProgress.AfterSeparationBc =>
+    core.fmt.Formatter.write_str f (toStr "AfterSeparationBc")
+  | TerminalTailProgress.AfterReplicaC =>
+    core.fmt.Formatter.write_str f (toStr "AfterReplicaC")
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalTailProgress}]
+    Source: 'src/lib.rs', lines 837:22-837:27 -/
+@[reducible]
+def TerminalTailProgress.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalTailProgress := {
+  fmt := TerminalTailProgress.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TerminalTailProgress}]
+    Source: 'src/lib.rs', lines 837:29-837:38 -/
+@[reducible]
+def TerminalTailProgress.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq TerminalTailProgress := {
+}
+
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalTailProgress> for parity_capacity_verif::TerminalTailProgress}::eq]:
+    Source: 'src/lib.rs', lines 837:29-837:38
+    Visibility: public -/
+def TerminalTailProgress.Insts.CoreCmpPartialEqTerminalTailProgress.eq
+  (self : TerminalTailProgress) (other : TerminalTailProgress) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalTailProgress> for parity_capacity_verif::TerminalTailProgress}]
+    Source: 'src/lib.rs', lines 837:29-837:38 -/
+@[reducible]
+def TerminalTailProgress.Insts.CoreCmpPartialEqTerminalTailProgress :
+  core.cmp.PartialEq TerminalTailProgress TerminalTailProgress := {
+  eq := TerminalTailProgress.Insts.CoreCmpPartialEqTerminalTailProgress.eq
+}
+
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalTailProgress}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 837:40-837:42
+    Visibility: public -/
+def TerminalTailProgress.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : TerminalTailProgress) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalTailProgress}]
+    Source: 'src/lib.rs', lines 837:40-837:42 -/
+@[reducible]
+def TerminalTailProgress.Insts.CoreCmpEq : core.cmp.Eq TerminalTailProgress
+  := {
+  partialEqInst :=
+    TerminalTailProgress.Insts.CoreCmpPartialEqTerminalTailProgress
+  assert_fields_are_eq :=
+    TerminalTailProgress.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [parity_capacity_verif::completed_terminal_replicas]:
+    Source: 'src/lib.rs', lines 848:0-855:1
+    Visibility: public -/
+def completed_terminal_replicas
+  (progress : TerminalTailProgress) : Result Std.U64 := do
+  match progress with
+  | TerminalTailProgress.BeforeReplicaA => ok 0#u64
+  | TerminalTailProgress.AfterReplicaA => ok 1#u64
+  | TerminalTailProgress.AfterSeparationAb => ok 1#u64
+  | TerminalTailProgress.AfterReplicaB => ok 2#u64
+  | TerminalTailProgress.AfterSeparationBc => ok 2#u64
+  | TerminalTailProgress.AfterReplicaC => ok 3#u64
+
+/-- [parity_capacity_verif::advance_terminal_progress]:
+    Source: 'src/lib.rs', lines 858:0-873:1
+    Visibility: public -/
+def advance_terminal_progress
+  (progress : TerminalTailProgress) (barrier_succeeded : Bool) :
+  Result TerminalTailProgress
+  := do
+  if barrier_succeeded
+  then
+    match progress with
+    | TerminalTailProgress.BeforeReplicaA =>
+      ok TerminalTailProgress.AfterReplicaA
+    | TerminalTailProgress.AfterReplicaA =>
+      ok TerminalTailProgress.AfterSeparationAb
+    | TerminalTailProgress.AfterSeparationAb =>
+      ok TerminalTailProgress.AfterReplicaB
+    | TerminalTailProgress.AfterReplicaB =>
+      ok TerminalTailProgress.AfterSeparationBc
+    | TerminalTailProgress.AfterSeparationBc =>
+      ok TerminalTailProgress.AfterReplicaC
+    | TerminalTailProgress.AfterReplicaC =>
+      ok TerminalTailProgress.AfterReplicaC
+  else ok progress
+
+/-- [parity_capacity_verif::object_admission_allowed]:
+    Source: 'src/lib.rs', lines 876:0-878:1
+    Visibility: public -/
+def object_admission_allowed (finalizing : Bool) : Result Bool := do
+  ok (¬ finalizing)
+
+/-- [parity_capacity_verif::sealed_projection_allowed]:
+    Source: 'src/lib.rs', lines 881:0-890:1
+    Visibility: public -/
+def sealed_projection_allowed
+  (progress : TerminalTailProgress) : Result Bool := do
+  match progress with
+  | TerminalTailProgress.BeforeReplicaA => ok false
+  | TerminalTailProgress.AfterReplicaA => ok false
+  | TerminalTailProgress.AfterSeparationAb => ok false
+  | TerminalTailProgress.AfterReplicaB => ok false
+  | TerminalTailProgress.AfterSeparationBc => ok false
+  | TerminalTailProgress.AfterReplicaC => ok true
+
+/-- [parity_capacity_verif::TerminalReplicaSelection]
+    Source: 'src/lib.rs', lines 894:0-900:1
+    Visibility: public -/
+@[discriminant isize]
+inductive TerminalReplicaSelection where
+| ReplicaA : TerminalReplicaSelection
+| ReplicaB : TerminalReplicaSelection
+| ReplicaC : TerminalReplicaSelection
+| FullBotScan : TerminalReplicaSelection
+| Conflict : TerminalReplicaSelection
+
+/-- [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalReplicaSelection}::clone]:
+    Source: 'src/lib.rs', lines 893:9-893:14
+    Visibility: public -/
+def TerminalReplicaSelection.Insts.CoreCloneClone.clone
+  (self : TerminalReplicaSelection) : Result TerminalReplicaSelection := do
+  ok self
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::clone::Clone for parity_capacity_verif::TerminalReplicaSelection}]
+    Source: 'src/lib.rs', lines 893:9-893:14 -/
+@[reducible]
+def TerminalReplicaSelection.Insts.CoreCloneClone : core.clone.Clone
+  TerminalReplicaSelection := {
+  clone := TerminalReplicaSelection.Insts.CoreCloneClone.clone
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::Copy for parity_capacity_verif::TerminalReplicaSelection}]
+    Source: 'src/lib.rs', lines 893:16-893:20 -/
+@[reducible]
+def TerminalReplicaSelection.Insts.CoreMarkerCopy : core.marker.Copy
+  TerminalReplicaSelection := {
+  cloneInst := TerminalReplicaSelection.Insts.CoreCloneClone
+}
+
+/-- [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalReplicaSelection}::fmt]:
+    Source: 'src/lib.rs', lines 893:22-893:27
+    Visibility: public -/
+def TerminalReplicaSelection.Insts.CoreFmtDebug.fmt
+  (self : TerminalReplicaSelection) (f : core.fmt.Formatter) :
+  Result ((core.result.Result Unit core.fmt.Error) × core.fmt.Formatter)
+  := do
+  match self with
+  | TerminalReplicaSelection.ReplicaA =>
+    core.fmt.Formatter.write_str f (toStr "ReplicaA")
+  | TerminalReplicaSelection.ReplicaB =>
+    core.fmt.Formatter.write_str f (toStr "ReplicaB")
+  | TerminalReplicaSelection.ReplicaC =>
+    core.fmt.Formatter.write_str f (toStr "ReplicaC")
+  | TerminalReplicaSelection.FullBotScan =>
+    core.fmt.Formatter.write_str f (toStr "FullBotScan")
+  | TerminalReplicaSelection.Conflict =>
+    core.fmt.Formatter.write_str f (toStr "Conflict")
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::fmt::Debug for parity_capacity_verif::TerminalReplicaSelection}]
+    Source: 'src/lib.rs', lines 893:22-893:27 -/
+@[reducible]
+def TerminalReplicaSelection.Insts.CoreFmtDebug : core.fmt.Debug
+  TerminalReplicaSelection := {
+  fmt := TerminalReplicaSelection.Insts.CoreFmtDebug.fmt
+}
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::marker::StructuralPartialEq for parity_capacity_verif::TerminalReplicaSelection}]
+    Source: 'src/lib.rs', lines 893:29-893:38 -/
+@[reducible]
+def TerminalReplicaSelection.Insts.CoreMarkerStructuralPartialEq :
+  core.marker.StructuralPartialEq TerminalReplicaSelection := {
+}
+
+/-- [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalReplicaSelection> for parity_capacity_verif::TerminalReplicaSelection}::eq]:
+    Source: 'src/lib.rs', lines 893:29-893:38
+    Visibility: public -/
+def TerminalReplicaSelection.Insts.CoreCmpPartialEqTerminalReplicaSelection.eq
+  (self : TerminalReplicaSelection) (other : TerminalReplicaSelection) :
+  Result Bool
+  := do
+  let self1 := read_discriminant self
+  let other1 := read_discriminant other
+  ok (self1 = other1)
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::PartialEq<parity_capacity_verif::TerminalReplicaSelection> for parity_capacity_verif::TerminalReplicaSelection}]
+    Source: 'src/lib.rs', lines 893:29-893:38 -/
+@[reducible]
+def TerminalReplicaSelection.Insts.CoreCmpPartialEqTerminalReplicaSelection :
+  core.cmp.PartialEq TerminalReplicaSelection TerminalReplicaSelection := {
+  eq :=
+    TerminalReplicaSelection.Insts.CoreCmpPartialEqTerminalReplicaSelection.eq
+}
+
+/-- [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalReplicaSelection}::assert_fields_are_eq]:
+    Source: 'src/lib.rs', lines 893:40-893:42
+    Visibility: public -/
+def TerminalReplicaSelection.Insts.CoreCmpEq.assert_fields_are_eq
+  (self : TerminalReplicaSelection) : Result Unit := do
+  ok ()
+
+/-- Trait implementation: [parity_capacity_verif::{impl core::cmp::Eq for parity_capacity_verif::TerminalReplicaSelection}]
+    Source: 'src/lib.rs', lines 893:40-893:42 -/
+@[reducible]
+def TerminalReplicaSelection.Insts.CoreCmpEq : core.cmp.Eq
+  TerminalReplicaSelection := {
+  partialEqInst :=
+    TerminalReplicaSelection.Insts.CoreCmpPartialEqTerminalReplicaSelection
+  assert_fields_are_eq :=
+    TerminalReplicaSelection.Insts.CoreCmpEq.assert_fields_are_eq
+}
+
+/-- [parity_capacity_verif::select_terminal_replica]:
+    Source: 'src/lib.rs', lines 904:0-923:1
+    Visibility: public -/
+def select_terminal_replica
+  (replica_a_valid : Bool) (replica_b_valid : Bool) (replica_c_valid : Bool)
+  (surviving_replicas_agree : Bool) :
+  Result TerminalReplicaSelection
+  := do
+  let i ← lift (UScalar.cast_fromBool .U8 replica_a_valid)
+  let i1 ← lift (UScalar.cast_fromBool .U8 replica_b_valid)
+  let i2 ← i + i1
+  let i3 ← lift (UScalar.cast_fromBool .U8 replica_c_valid)
+  let survivor_count ← i2 + i3
+  if survivor_count > 1#u8
+  then
+    if surviving_replicas_agree
+    then
+      if replica_c_valid
+      then ok TerminalReplicaSelection.ReplicaC
+      else
+        if replica_b_valid
+        then ok TerminalReplicaSelection.ReplicaB
+        else
+          if replica_a_valid
+          then ok TerminalReplicaSelection.ReplicaA
+          else ok TerminalReplicaSelection.FullBotScan
+    else ok TerminalReplicaSelection.Conflict
   else
-    if input.data_shards_per_epoch = 0#u64
-    then ok (core.result.Result.Err CapacityError.DataShardsPerEpochZero)
+    if replica_c_valid
+    then ok TerminalReplicaSelection.ReplicaC
     else
-      if input.current_epoch_fill_blocks >= input.data_shards_per_epoch
-      then
-        ok (core.result.Result.Err
-          CapacityError.CurrentEpochFillOutsideOpenEpoch)
+      if replica_b_valid
+      then ok TerminalReplicaSelection.ReplicaB
       else
-        let r ← checked_mul 2#u64 input.sidecar_index_block_count
-        let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-        match cf with
-        | core.ops.control_flow.ControlFlow.Continue val =>
-          let r1 ← checked_add val 1#u64
-          let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
-          match cf1 with
-          | core.ops.control_flow.ControlFlow.Continue val1 =>
-            let r2 ← checked_add val1 input.parity_shards_per_epoch
-            let cf2 ← core.result.Result.Insts.CoreOpsTry.branch r2
-            match cf2 with
-            | core.ops.control_flow.ControlFlow.Continue val2 =>
-              let r3 ← checked_add val2 input.sidecar_filemark_blocks
-              let cf3 ← core.result.Result.Insts.CoreOpsTry.branch r3
-              match cf3 with
-              | core.ops.control_flow.ControlFlow.Continue val3 =>
-                let i ← block_count_per_bootstrap
-                let r4 ← checked_add i input.bootstrap_filemark_blocks
-                let cf4 ← core.result.Result.Insts.CoreOpsTry.branch r4
-                match cf4 with
-                | core.ops.control_flow.ControlFlow.Continue val4 =>
-                  let r5 ←
-                    checked_add input.current_epoch_fill_blocks
-                      input.projected_object_blocks
-                  let cf5 ← core.result.Result.Insts.CoreOpsTry.branch r5
-                  match cf5 with
-                  | core.ops.control_flow.ControlFlow.Continue val5 =>
-                    let epochs_completed_by_object ←
-                      val5 / input.data_shards_per_epoch
-                    let i1 ← val5 % input.data_shards_per_epoch
-                    let r6 ←
-                      checked_mul input.pending_completed_sidecars val3
-                    let cf6 ← core.result.Result.Insts.CoreOpsTry.branch r6
-                    match cf6 with
-                    | core.ops.control_flow.ControlFlow.Continue val6 =>
-                      let r7 ← checked_mul epochs_completed_by_object val3
-                      let cf7 ← core.result.Result.Insts.CoreOpsTry.branch r7
-                      match cf7 with
-                      | core.ops.control_flow.ControlFlow.Continue val7 =>
-                        let (final_partial_sidecar_needed,
-                          final_partial_sidecar_blocks) ←
-                          if i1 != 0#u64
-                          then ok (true, val3)
-                          else ok (false, 0#u64)
-                        let r8 ←
-                          checked_mul input.remaining_bootstrap_count val4
-                        let cf8 ←
-                          core.result.Result.Insts.CoreOpsTry.branch r8
-                        match cf8 with
-                        | core.ops.control_flow.ControlFlow.Continue val8 =>
-                          let r9 ←
-                            checked_add input.object_filemark_blocks val6
-                          let cf9 ←
-                            core.result.Result.Insts.CoreOpsTry.branch r9
-                          match cf9 with
-                          | core.ops.control_flow.ControlFlow.Continue val9 =>
-                            let r10 ← checked_add val9 val7
-                            let cf10 ←
-                              core.result.Result.Insts.CoreOpsTry.branch r10
-                            match cf10 with
-                            | core.ops.control_flow.ControlFlow.Continue val10
-                              =>
-                              let r11 ←
-                                checked_add val10 final_partial_sidecar_blocks
-                              let cf11 ←
-                                core.result.Result.Insts.CoreOpsTry.branch r11
-                              match cf11 with
-                              | core.ops.control_flow.ControlFlow.Continue
-                                val11 =>
-                                let r12 ← checked_add val11 val8
-                                let cf12 ←
-                                  core.result.Result.Insts.CoreOpsTry.branch
-                                    r12
-                                match cf12 with
-                                | core.ops.control_flow.ControlFlow.Continue
-                                  val12 =>
-                                  let r13 ←
-                                    checked_add val12
-                                      input.safety_margin_blocks
-                                  let cf13 ←
-                                    core.result.Result.Insts.CoreOpsTry.branch
-                                      r13
-                                  match cf13 with
-                                  | core.ops.control_flow.ControlFlow.Continue
-                                    val13 =>
-                                    let r14 ←
-                                      checked_add input.projected_object_blocks
-                                        val13
-                                    let cf14 ←
-                                      core.result.Result.Insts.CoreOpsTry.branch
-                                        r14
-                                    match cf14 with
-                                    |
-                                      core.ops.control_flow.ControlFlow.Continue
-                                      val14 =>
-                                      ok (core.result.Result.Ok
-                                        {
-                                          epochs_completed_by_object,
-                                          final_partial_sidecar_needed,
-                                          sidecar_tape_file_blocks := val3,
-                                          bootstrap_tape_file_blocks := val4,
-                                          reserve_after_object_blocks := val13,
-                                          required_tape_blocks := val14
-                                        })
-                                    | core.ops.control_flow.ControlFlow.Break
-                                      residual =>
-                                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                        TapeReserveReport
-                                        (core.convert.FromSame CapacityError)
-                                        residual
-                                  | core.ops.control_flow.ControlFlow.Break
-                                    residual =>
-                                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                      TapeReserveReport (core.convert.FromSame
-                                      CapacityError) residual
-                                | core.ops.control_flow.ControlFlow.Break
-                                  residual =>
-                                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                    TapeReserveReport (core.convert.FromSame
-                                    CapacityError) residual
-                              | core.ops.control_flow.ControlFlow.Break
-                                residual =>
-                                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                  TapeReserveReport (core.convert.FromSame
-                                  CapacityError) residual
-                            | core.ops.control_flow.ControlFlow.Break residual
-                              =>
-                              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                                TapeReserveReport (core.convert.FromSame
-                                CapacityError) residual
-                          | core.ops.control_flow.ControlFlow.Break residual =>
-                            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                              TapeReserveReport (core.convert.FromSame
-                              CapacityError) residual
-                        | core.ops.control_flow.ControlFlow.Break residual =>
-                          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                            TapeReserveReport (core.convert.FromSame
-                            CapacityError) residual
-                      | core.ops.control_flow.ControlFlow.Break residual =>
-                        core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                          TapeReserveReport (core.convert.FromSame
-                          CapacityError) residual
-                    | core.ops.control_flow.ControlFlow.Break residual =>
-                      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                        TapeReserveReport (core.convert.FromSame CapacityError)
-                        residual
-                  | core.ops.control_flow.ControlFlow.Break residual =>
-                    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                      TapeReserveReport (core.convert.FromSame CapacityError)
-                      residual
-                | core.ops.control_flow.ControlFlow.Break residual =>
-                  core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                    TapeReserveReport (core.convert.FromSame CapacityError)
-                    residual
-              | core.ops.control_flow.ControlFlow.Break residual =>
-                core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                  TapeReserveReport (core.convert.FromSame CapacityError)
-                  residual
-            | core.ops.control_flow.ControlFlow.Break residual =>
-              core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-                TapeReserveReport (core.convert.FromSame CapacityError)
-                residual
-          | core.ops.control_flow.ControlFlow.Break residual =>
-            core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-              TapeReserveReport (core.convert.FromSame CapacityError) residual
-        | core.ops.control_flow.ControlFlow.Break residual =>
-          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-            TapeReserveReport (core.convert.FromSame CapacityError) residual
-
-/-- [parity_capacity_verif::compute_spool_reserve]:
-    Source: 'src/lib.rs', lines 777:0-789:1
-    Visibility: public -/
-def compute_spool_reserve
-  (input : CapacityReserveInput) (epochs_completed_by_object : Std.U64)
-  (sidecar_tape_file_blocks : Std.U64) :
-  Result (core.result.Result Std.U64 CapacityError)
-  := do
-  let r ← checked_mul sidecar_tape_file_blocks input.block_size_bytes
-  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-  match cf with
-  | core.ops.control_flow.ControlFlow.Continue val =>
-    let r1 ← checked_mul epochs_completed_by_object val
-    let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
-    match cf1 with
-    | core.ops.control_flow.ControlFlow.Continue val1 =>
-      checked_add input.pending_completed_epoch_parity_bytes val1
-    | core.ops.control_flow.ControlFlow.Break residual =>
-      core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-        Std.U64 (core.convert.FromSame CapacityError) residual
-  | core.ops.control_flow.ControlFlow.Break residual =>
-    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      Std.U64 (core.convert.FromSame CapacityError) residual
-
-/-- [parity_capacity_verif::evaluate]:
-    Source: 'src/lib.rs', lines 791:0-821:1
-    Visibility: public -/
-def evaluate
-  (input : CapacityReserveInput) :
-  Result (core.result.Result CapacityReserveReport CapacityError)
-  := do
-  let r ← compute_tape_reserve input
-  let cf ← core.result.Result.Insts.CoreOpsTry.branch r
-  match cf with
-  | core.ops.control_flow.ControlFlow.Continue val =>
-    if input.empty_tape_usable_blocks < val.required_tape_blocks
-    then ok (core.result.Result.Err CapacityError.ObjectTooLargeForEmptyTape)
-    else
-      if input.remaining_tape_blocks < val.required_tape_blocks
-      then
-        ok (core.result.Result.Err CapacityError.CapacityReserveExceededTape)
-      else
-        let r1 ←
-          compute_spool_reserve input val.epochs_completed_by_object
-            val.sidecar_tape_file_blocks
-        let cf1 ← core.result.Result.Insts.CoreOpsTry.branch r1
-        match cf1 with
-        | core.ops.control_flow.ControlFlow.Continue val1 =>
-          if input.remaining_spool_bytes < val1
-          then
-            ok (core.result.Result.Err
-              CapacityError.CapacityReserveExceededSpool)
-          else
-            ok (core.result.Result.Ok
-              {
-                epochs_completed_by_object := val.epochs_completed_by_object,
-                final_partial_sidecar_needed :=
-                  val.final_partial_sidecar_needed,
-                sidecar_tape_file_blocks := val.sidecar_tape_file_blocks,
-                bootstrap_tape_file_blocks := val.bootstrap_tape_file_blocks,
-                reserve_after_object_blocks := val.reserve_after_object_blocks,
-                required_tape_blocks := val.required_tape_blocks,
-                required_spool_bytes := val1
-              })
-        | core.ops.control_flow.ControlFlow.Break residual =>
-          core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-            CapacityReserveReport (core.convert.FromSame CapacityError)
-            residual
-  | core.ops.control_flow.ControlFlow.Break residual =>
-    core.result.Result.Insts.CoreOpsTryTraitFromResidualResultInfallible.from_residual
-      CapacityReserveReport (core.convert.FromSame CapacityError) residual
+        if replica_a_valid
+        then ok TerminalReplicaSelection.ReplicaA
+        else ok TerminalReplicaSelection.FullBotScan
 
 end parity_capacity_verif

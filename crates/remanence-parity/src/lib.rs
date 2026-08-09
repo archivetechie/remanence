@@ -37,9 +37,11 @@ mod diagnostic_text;
 mod durable;
 pub mod error;
 pub mod filemark_map;
+pub mod index_separation;
 pub mod journal;
 pub mod mapping;
 pub mod model;
+pub mod object_recovery;
 pub mod parity_map;
 pub mod raw;
 pub mod recovery;
@@ -50,27 +52,41 @@ pub mod sidecar;
 pub mod sink;
 pub mod source;
 pub mod tape_index;
+pub mod tape_index_replica;
+pub mod terminal_inventory;
+pub mod terminal_tail;
+pub mod terminal_writer;
 
 pub use bootstrap::{
-    discover_authoritative_bootstrap, discover_authoritative_bootstrap_with_block_size,
     discover_bootstrap, discover_bootstrap_with_block_size,
-    discover_bootstrap_with_candidate_block_sizes, expected_bootstrap_positions,
-    BootstrapObjectRepresentation, BootstrapObjectRow, BootstrapPayload, ParitySchemeRecord,
-    BOOTSTRAP_HEADER_CRC_OFFSET, BOOTSTRAP_HEADER_LEN, DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
+    discover_bootstrap_with_candidate_block_sizes, expected_bootstrap_positions, BootstrapPayload,
+    ParitySchemeRecord, BOOTSTRAP_HEADER_CRC_OFFSET, BOOTSTRAP_HEADER_LEN,
+    DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
 };
 pub use capacity::{
-    CapacityReserveCause, CapacityReserveInput, CapacityReserveRemedy, CapacityReserveReport,
-    SnapshotCloseInput, SnapshotCloseReport,
+    CapacityReserveCause, CapacityReserveRemedy, TerminalTripleCloseInput,
+    TerminalTripleCloseReport, TerminalTripleObjectReservation,
 };
 pub use diagnostic_text::escape_member_name;
 pub use error::ParityError;
 pub use filemark_map::{
-    BootstrapMapCommit, FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, MapScope,
+    sole_bot_filemark_map_digest, FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, MapScope,
     ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
 };
+pub use index_separation::{
+    derive_index_separation_footer_magic, derive_index_separation_header_magic,
+    encode_index_separation_footer, encode_index_separation_header, index_separation_records,
+    parse_index_separation_footer, parse_index_separation_header, plan_index_separation,
+    validate_index_separation_full, validate_index_separation_pair, write_index_separation,
+    IndexSeparationDescriptor, IndexSeparationError, IndexSeparationFooter, IndexSeparationHeader,
+    IndexSeparationInteriorBlockSource, IndexSeparationObservation, IndexSeparationPlan,
+    DEFAULT_INDEX_SEPARATION_BYTES, INDEX_SEPARATION_CRC_OFFSET, INDEX_SEPARATION_FRAME_LEN,
+    INDEX_SEPARATION_SCHEMA_VERSION,
+};
 pub use journal::{
-    validate_committed_bundle_shape, validate_trusted_journal_volume, CommittedBundle,
-    CommittedBundleKind, CommittedBundleShapeError, CommittedState, FileTapeFileJournal,
+    validate_committed_bundle_shape, validate_trusted_journal_volume, BoundedJournalReplayMetrics,
+    CommittedBundle, CommittedBundleKind, CommittedBundleShapeError, CommittedState,
+    FileTapeFileJournal, FileTapeFileJournalCommittedReplay, FileTapeFileJournalCommittedSnapshot,
     FileTapeFileJournalReader, JournalError, TapeFileEntry, TapeFileJournal,
 };
 pub use mapping::data_shards_per_epoch;
@@ -79,6 +95,7 @@ pub use model::{
     RecoveryOutcome, SchemeId, SidecarMetadataHealth, SidecarMetadataHealthEvent, StripeAddress,
     StripePosition, TransportRetryEvent,
 };
+pub use object_recovery::{ObjectRecoveryRepresentation, ObjectRecoveryRow};
 pub use parity_map::{
     classify_parity_map_header_block, derive_parity_map_magic, encode_parity_map_tape_file,
     parity_map_directory_len_upper_bound, parity_map_payload_len_upper_bound,
@@ -102,10 +119,10 @@ pub use recovery::{
     recover_object_block_from_sidecar, recover_ordinal_from_sidecar, SidecarRecoveryResult,
 };
 pub use resume::{
-    committed_prefix_from_journal, emit_resume_rebuilt_sidecars_to_raw,
-    plan_resume_append_from_committed_prefix, plan_resume_append_from_journal,
-    rebuild_legacy_forensic_open_epoch_from_committed_prefix,
-    rebuild_open_epoch_from_committed_prefix, sidecar_directory_from_committed_state,
+    checked_bounded_resume_summary, checked_checkpointed_terminal_close_summary,
+    close_checkpointed_terminal_index_prefix, emit_resume_rebuilt_sidecars_to_raw,
+    plan_checkpointed_terminal_index_close, rebuild_open_epoch_from_bounded_summary,
+    BoundedResumeSummary, CheckpointedTerminalCloseSummary, CheckpointedTerminalPrefixCloseResult,
     ResumeAppendPlan, ResumeAppendResult, ResumeLiveEpochState, ResumeOpenEpochRebuild,
     ResumeRebuiltSidecar, ResumeSidecarPlan,
 };
@@ -130,29 +147,50 @@ pub use sidecar::{
     SIDECAR_HEADER_CRC_OFFSET, SIDECAR_HEADER_LEN, SIDECAR_SCHEMA_VERSION,
 };
 pub use sink::{
-    BootstrapObjectRowAdmission, BootstrapPlacementPolicy, CheckpointResult, CloseReason,
-    ObjectCloseResult, ObjectWriteSummary, ParitySink, ParitySinkSessionState, ResumeWriterSeed,
-    SidecarTapeFile, SidecarWriteSummary,
+    reconcile_terminal_prefix, BoundedResumeWriterSeed, CheckpointResult, CloseReason,
+    ObjectCloseResult, ObjectWriteSummary, ParitySink, ParitySinkSessionState, SidecarTapeFile,
+    SidecarWriteSummary, TerminalPrefixCloseResult, TerminalPrefixPlan,
+    TerminalPrefixReconcileEvidence, TerminalTripleCapacityRuntimeState,
 };
 pub use source::{
     BulkRecoveryPolicy, ObjectParitySource, OpenTrust, ParityAuditHook, RecoveredOrdinalBlock,
     RecoveredOrdinalRange, RecoveredRegion,
 };
-pub use tape_index::{
-    classify_tape_index_snapshot_header_block, derive_tape_index_snapshot_footer_magic,
-    derive_tape_index_snapshot_header_magic, encode_tape_index_snapshot_footer_block,
-    encode_tape_index_snapshot_header, parse_tape_index_snapshot_footer_block,
-    parse_tape_index_snapshot_header_block, plan_tape_index_snapshot, tape_index_snapshot_layout,
-    write_tape_index_snapshot, TapeIndexSnapshotCopyKind, TapeIndexSnapshotCounts,
-    TapeIndexSnapshotDescriptor, TapeIndexSnapshotFileKind, TapeIndexSnapshotFooter,
-    TapeIndexSnapshotHeader, TapeIndexSnapshotLayout, TapeIndexSnapshotMapEntry,
-    TapeIndexSnapshotObjectRow, TapeIndexSnapshotPlan, TapeIndexSnapshotRecordSource,
-    TapeIndexSnapshotReference, TapeIndexSnapshotScope, TAPE_INDEX_OBJECT_ROW_MAX_LEN,
-    TAPE_INDEX_OBJECT_ROW_SLOT_LEN, TAPE_INDEX_SLOT_PREFIX_LEN, TAPE_INDEX_SNAPSHOT_BLOCK_SIZES,
-    TAPE_INDEX_SNAPSHOT_FOOTER_CRC_OFFSET, TAPE_INDEX_SNAPSHOT_FOOTER_LEN,
-    TAPE_INDEX_SNAPSHOT_FOOTER_VERSION, TAPE_INDEX_SNAPSHOT_HEADER_CRC_OFFSET,
-    TAPE_INDEX_SNAPSHOT_HEADER_LEN, TAPE_INDEX_SNAPSHOT_SCHEMA_VERSION,
-    TAPE_INDEX_STRUCTURAL_ENTRY_MAX_LEN, TAPE_INDEX_STRUCTURAL_SLOT_LEN,
+pub use tape_index_replica::{
+    checked_tape_index_payload_len, checked_tape_index_replica_layout,
+    derive_tape_index_replica_footer_magic, derive_tape_index_replica_header_magic,
+    encode_tape_index_bootstrap_footer, encode_tape_index_replica_header,
+    parse_tape_index_bootstrap_footer, parse_tape_index_replica_header, plan_tape_index_edition,
+    plan_tape_index_replica, validate_tape_index_replica_pair, validate_tape_index_replica_payload,
+    write_tape_index_replica, TapeIndexBootstrapFooter, TapeIndexEditionDescriptor,
+    TapeIndexEditionPlan, TapeIndexReplicaCounts, TapeIndexReplicaError, TapeIndexReplicaFileKind,
+    TapeIndexReplicaHeader, TapeIndexReplicaLayout, TapeIndexReplicaMapEntry,
+    TapeIndexReplicaObjectRow, TapeIndexReplicaObservation, TapeIndexReplicaPayloadBlockSource,
+    TapeIndexReplicaPayloadSummary, TapeIndexReplicaPlan, TapeIndexReplicaRecordSource,
+    TapeIndexReplicaScope, TAPE_INDEX_REPLICA_CRC_OFFSET, TAPE_INDEX_REPLICA_FRAME_LEN,
+    TAPE_INDEX_REPLICA_SCHEMA_VERSION,
+};
+pub use terminal_inventory::{
+    read_terminal_index_inventory, read_terminal_index_inventory_streamed,
+    read_terminal_index_inventory_summary, recover_terminal_inventory_from_bot,
+    verify_terminal_index_full, BotRecoveredObject, BotRecoveredObjectState,
+    BotStructuralRecoveryError, BotStructuralRecoveryReason, BotStructuralRecoveryRequired,
+    BotStructuralRecoverySummary, TerminalIndexRecoveryRequired, TerminalIndexVerification,
+    TerminalIndexVerificationError, TerminalIndexVerificationOutcome, TerminalInventoryOutcome,
+    TerminalInventoryReadError, TerminalInventorySelection, TerminalInventoryStreamEvent,
+    TerminalReplicaEvidence, TerminalReplicaFailure, TerminalReplicaFailureKind,
+    TerminalSeparationEvidence,
+};
+pub use terminal_tail::{
+    validate_terminal_index_block_size, TerminalTailComponentKind, TerminalTailComponentPlan,
+    TerminalTailLayout, TerminalTailLayoutError, TerminalTailProgress, TERMINAL_INDEX_BLOCK_SIZES,
+    TERMINAL_INDEX_REPLICA_COUNT, TERMINAL_INDEX_SEPARATION_COUNT, TERMINAL_TAIL_COMPONENT_COUNT,
+};
+pub use terminal_writer::{
+    reconcile_terminal_tail_next, terminal_component_bundle, write_terminal_tail,
+    write_terminal_tail_step, TerminalComponentCommit, TerminalComponentReconcileEvidence,
+    TerminalTailAuthority, TerminalTailRunOutcome, TerminalTailStepOutcome, TerminalTailWriteError,
+    TerminalTripleWritePlan,
 };
 
 // ====================================================================

@@ -7,15 +7,15 @@
 //! Reed-Solomon recovery; those remain outside this proof target. The
 //! `drift_guard` test pins the production snippets this extraction mirrors.
 
-pub const SIDECAR_HEADER_LEN: u64 = 0xB8;
-pub const SIDECAR_HEADER_CRC_OFFSET: u64 = 0xB0;
-pub const SIDECAR_FOOTER_LEN: u64 = 0x80;
-pub const SIDECAR_FOOTER_CRC_OFFSET: u64 = 0x78;
+pub const SIDECAR_HEADER_LEN: u64 = 0xC8;
+pub const SIDECAR_HEADER_CRC_OFFSET: u64 = 0xC0;
+pub const SIDECAR_FOOTER_LEN: u64 = 0x88;
+pub const SIDECAR_FOOTER_CRC_OFFSET: u64 = 0x80;
 pub const PARITY_INDEX_ENTRY_LEN: u64 = 16;
 pub const DATA_CRC_ENTRY_LEN: u64 = 8;
 pub const TRAILING_CRC_LEN: u64 = 8;
 
-pub const MIN_HEADER_BLOCK_SIZE: u64 = 0xC0;
+pub const MIN_HEADER_BLOCK_SIZE: u64 = 0xD0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutError {
@@ -139,19 +139,19 @@ pub fn header_block_layout(block_size: u64) -> Result<HeaderBlockLayout, LayoutE
         protected_ordinal_end_exclusive: range(0x38, 0x40),
         logical_shard_count: range(0x40, 0x48),
         real_data_shard_count: range(0x48, 0x50),
-        parity_block_count: range(0x50, 0x54),
-        data_crc_count: range(0x54, 0x58),
-        shard_index_block_count: range(0x58, 0x5C),
-        inline_index_entry_bytes: range(0x5C, 0x60),
-        sidecar_total_block_count: range(0x60, 0x68),
-        primary_header_start_block: range(0x68, 0x70),
-        tail_header_start_block: range(0x70, 0x78),
-        footer_block_index: range(0x78, 0x80),
-        copy_kind: range(0x80, 0x82),
-        copy_kind_reserved: range(0x82, 0x84),
-        copy_generation: range(0x84, 0x88),
-        canonical_metadata_hash: range(0x88, 0xA8),
-        header_reserved: range(0xA8, SIDECAR_HEADER_CRC_OFFSET),
+        parity_block_count: range(0x50, 0x58),
+        data_crc_count: range(0x58, 0x60),
+        shard_index_block_count: range(0x60, 0x68),
+        inline_index_entry_bytes: range(0x68, 0x70),
+        sidecar_total_block_count: range(0x70, 0x78),
+        primary_header_start_block: range(0x78, 0x80),
+        tail_header_start_block: range(0x80, 0x88),
+        footer_block_index: range(0x88, 0x90),
+        copy_kind: range(0x90, 0x92),
+        copy_kind_reserved: range(0x92, 0x94),
+        copy_generation: range(0x94, 0x98),
+        canonical_metadata_hash: range(0x98, 0xB8),
+        header_reserved: range(0xB8, SIDECAR_HEADER_CRC_OFFSET),
         header_crc_field: range(SIDECAR_HEADER_CRC_OFFSET, SIDECAR_HEADER_LEN),
         inline_index_payload: range(SIDECAR_HEADER_LEN, block_crc_start),
         header_crc_input: range(0, SIDECAR_HEADER_CRC_OFFSET),
@@ -174,12 +174,12 @@ pub fn footer_block_layout(block_size: u64) -> Result<FooterBlockLayout, LayoutE
         epoch_id: range(0x20, 0x28),
         protected_ordinal_start: range(0x28, 0x30),
         protected_ordinal_end_exclusive: range(0x30, 0x38),
-        sidecar_header_block_count: range(0x38, 0x3C),
-        parity_shard_block_count: range(0x3C, 0x40),
-        sidecar_total_block_count: range(0x40, 0x48),
-        primary_header_start_block: range(0x48, 0x50),
-        tail_header_start_block: range(0x50, 0x58),
-        canonical_metadata_hash: range(0x58, SIDECAR_FOOTER_CRC_OFFSET),
+        sidecar_header_block_count: range(0x38, 0x40),
+        parity_shard_block_count: range(0x40, 0x48),
+        sidecar_total_block_count: range(0x48, 0x50),
+        primary_header_start_block: range(0x50, 0x58),
+        tail_header_start_block: range(0x58, 0x60),
+        canonical_metadata_hash: range(0x60, SIDECAR_FOOTER_CRC_OFFSET),
         footer_crc_field: range(SIDECAR_FOOTER_CRC_OFFSET, SIDECAR_FOOTER_LEN),
         footer_crc_input: range(0, SIDECAR_FOOTER_CRC_OFFSET),
         footer_padding: range(SIDECAR_FOOTER_LEN, block_size),
@@ -239,10 +239,10 @@ mod tests {
         .expect("original sidecar.rs must be readable from verif/parity-sidecar-layout");
 
         let snippets: &[&str] = &[
-            "pub const SIDECAR_HEADER_LEN: usize = 0xB8;",
-            "pub const SIDECAR_HEADER_CRC_OFFSET: usize = 0xB0;",
-            "pub const SIDECAR_FOOTER_LEN: usize = 0x80;",
-            "pub const SIDECAR_FOOTER_CRC_OFFSET: usize = 0x78;",
+            "pub const SIDECAR_HEADER_LEN: usize = 0xC8;",
+            "pub const SIDECAR_HEADER_CRC_OFFSET: usize = 0xC0;",
+            "pub const SIDECAR_FOOTER_LEN: usize = 0x88;",
+            "pub const SIDECAR_FOOTER_CRC_OFFSET: usize = 0x80;",
             "block0[0x00..0x08].copy_from_slice(&header.magic);",
             "block0[0x08..0x18].copy_from_slice(&header.tape_uuid);",
             "block0[0x18..0x20].copy_from_slice(&header.epoch_id.to_le_bytes());",
@@ -255,19 +255,19 @@ mod tests {
             "block0[0x38..0x40].copy_from_slice(&header.protected_ordinal_end_exclusive.to_le_bytes());",
             "block0[0x40..0x48].copy_from_slice(&header.logical_shard_count.to_le_bytes());",
             "block0[0x48..0x50].copy_from_slice(&header.real_data_shard_count.to_le_bytes());",
-            "block0[0x50..0x54].copy_from_slice(&header.parity_block_count.to_le_bytes());",
-            "block0[0x54..0x58].copy_from_slice(&header.data_crc_count.to_le_bytes());",
-            "block0[0x58..0x5C].copy_from_slice(&header.shard_index_block_count.to_le_bytes());",
-            "block0[0x5C..0x60].copy_from_slice(&header.inline_index_entry_bytes.to_le_bytes());",
-            "block0[0x60..0x68].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());",
-            "block0[0x68..0x70].copy_from_slice(&header.primary_header_start_block.to_le_bytes());",
-            "block0[0x70..0x78].copy_from_slice(&header.tail_header_start_block.to_le_bytes());",
-            "block0[0x78..0x80].copy_from_slice(&header.footer_block_index.to_le_bytes());",
-            "block0[0x80..0x82].copy_from_slice(&header.copy_kind.to_u16().to_le_bytes());",
-            "block0[0x82..0x84].copy_from_slice(&0u16.to_le_bytes());",
-            "block0[0x84..0x88].copy_from_slice(&header.copy_generation.to_le_bytes());",
-            "block0[0x88..0xA8].copy_from_slice(&header.canonical_metadata_hash);",
-            "block0[0xA8..0xB0].copy_from_slice(&0u64.to_le_bytes());",
+            "block0[0x50..0x58].copy_from_slice(&header.parity_block_count.to_le_bytes());",
+            "block0[0x58..0x60].copy_from_slice(&header.data_crc_count.to_le_bytes());",
+            "block0[0x60..0x68].copy_from_slice(&header.shard_index_block_count.to_le_bytes());",
+            "block0[0x68..0x70].copy_from_slice(&header.inline_index_entry_bytes.to_le_bytes());",
+            "block0[0x70..0x78].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());",
+            "block0[0x78..0x80].copy_from_slice(&header.primary_header_start_block.to_le_bytes());",
+            "block0[0x80..0x88].copy_from_slice(&header.tail_header_start_block.to_le_bytes());",
+            "block0[0x88..0x90].copy_from_slice(&header.footer_block_index.to_le_bytes());",
+            "block0[0x90..0x92].copy_from_slice(&header.copy_kind.to_u16().to_le_bytes());",
+            "block0[0x92..0x94].copy_from_slice(&0u16.to_le_bytes());",
+            "block0[0x94..0x98].copy_from_slice(&header.copy_generation.to_le_bytes());",
+            "block0[0x98..0xB8].copy_from_slice(&header.canonical_metadata_hash);",
+            "block0[0xB8..0xC0].copy_from_slice(&0u64.to_le_bytes());",
             "header.header_crc64 = crc64_xz(&block0[..SIDECAR_HEADER_CRC_OFFSET]);",
             "block0[SIDECAR_HEADER_CRC_OFFSET..SIDECAR_HEADER_CRC_OFFSET + 8]\n        .copy_from_slice(&header.header_crc64.to_le_bytes());",
             "let crc_offset = block0.len() - 8;\n    header.block0_crc64 = crc64_xz(&block0[..crc_offset]);",
@@ -285,19 +285,19 @@ mod tests {
             "let protected_ordinal_end_exclusive = read_u64_le(block0, 0x38);",
             "let logical_shard_count = read_u64_le(block0, 0x40);",
             "let real_data_shard_count = read_u64_le(block0, 0x48);",
-            "let parity_block_count = read_u32_le(block0, 0x50);",
-            "let data_crc_count = read_u32_le(block0, 0x54);",
-            "let shard_index_block_count = read_u32_le(block0, 0x58);",
-            "let inline_index_entry_bytes = read_u32_le(block0, 0x5C);",
-            "let sidecar_total_block_count = read_u64_le(block0, 0x60);",
-            "let primary_header_start_block = read_u64_le(block0, 0x68);",
-            "let tail_header_start_block = read_u64_le(block0, 0x70);",
-            "let footer_block_index = read_u64_le(block0, 0x78);",
-            "let copy_kind = SidecarCopyKind::from_u16(read_u16_le(block0, 0x80))?;",
-            "let copy_kind_reserved = read_u16_le(block0, 0x82);",
-            "let copy_generation = read_u32_le(block0, 0x84);",
-            "canonical_metadata_hash.copy_from_slice(&block0[0x88..0xA8]);",
-            "let header_reserved = read_u64_le(block0, 0xA8);",
+            "let parity_block_count = read_u64_le(block0, 0x50);",
+            "let data_crc_count = read_u64_le(block0, 0x58);",
+            "let shard_index_block_count = read_u64_le(block0, 0x60);",
+            "let inline_index_entry_bytes = read_u64_le(block0, 0x68);",
+            "let sidecar_total_block_count = read_u64_le(block0, 0x70);",
+            "let primary_header_start_block = read_u64_le(block0, 0x78);",
+            "let tail_header_start_block = read_u64_le(block0, 0x80);",
+            "let footer_block_index = read_u64_le(block0, 0x88);",
+            "let copy_kind = SidecarCopyKind::from_u16(read_u16_le(block0, 0x90))?;",
+            "let copy_kind_reserved = read_u16_le(block0, 0x92);",
+            "let copy_generation = read_u32_le(block0, 0x94);",
+            "canonical_metadata_hash.copy_from_slice(&block0[0x98..0xB8]);",
+            "let header_reserved = read_u64_le(block0, 0xB8);",
             "let header_crc64 = read_u64_le(block0, SIDECAR_HEADER_CRC_OFFSET);",
             "let block_size_usize = usize::try_from(block_size)\n        .map_err(|_| sidecar_parse(format!(\"sidecar block_size {block_size} overflows usize\")))?;",
             "if block_size_usize != block0.len() {",
@@ -306,7 +306,7 @@ mod tests {
             "let crc_offset = block_size_usize - 8;",
             "let block0_crc64 = read_u64_le(block0, crc_offset);",
             "let computed_block0_crc64 = crc64_xz(&block0[..crc_offset]);",
-            "let inline_end = SIDECAR_HEADER_LEN + inline_index_entry_bytes as usize;",
+            "let inline_index_entry_bytes_usize = usize::try_from(inline_index_entry_bytes)",
             "block[0x00..0x08].copy_from_slice(&derive_sidecar_footer_magic(&header.tape_uuid));",
             "block[0x08..0x0A].copy_from_slice(&SIDECAR_FOOTER_VERSION.to_le_bytes());",
             "block[0x0A..0x0C].copy_from_slice(&0u16.to_le_bytes());",
@@ -315,12 +315,12 @@ mod tests {
             "block[0x20..0x28].copy_from_slice(&header.epoch_id.to_le_bytes());",
             "block[0x28..0x30].copy_from_slice(&header.protected_ordinal_start.to_le_bytes());",
             "block[0x30..0x38].copy_from_slice(&header.protected_ordinal_end_exclusive.to_le_bytes());",
-            "block[0x38..0x3C].copy_from_slice(&header.shard_index_block_count.to_le_bytes());",
-            "block[0x3C..0x40].copy_from_slice(&header.parity_block_count.to_le_bytes());",
-            "block[0x40..0x48].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());",
-            "block[0x48..0x50].copy_from_slice(&header.primary_header_start_block.to_le_bytes());",
-            "block[0x50..0x58].copy_from_slice(&header.tail_header_start_block.to_le_bytes());",
-            "block[0x58..0x78].copy_from_slice(&header.canonical_metadata_hash);",
+            "block[0x38..0x40].copy_from_slice(&header.shard_index_block_count.to_le_bytes());",
+            "block[0x40..0x48].copy_from_slice(&header.parity_block_count.to_le_bytes());",
+            "block[0x48..0x50].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());",
+            "block[0x50..0x58].copy_from_slice(&header.primary_header_start_block.to_le_bytes());",
+            "block[0x58..0x60].copy_from_slice(&header.tail_header_start_block.to_le_bytes());",
+            "block[0x60..0x80].copy_from_slice(&header.canonical_metadata_hash);",
             "let crc = crc64_xz(&block[..SIDECAR_FOOTER_CRC_OFFSET]);",
             "block[SIDECAR_FOOTER_CRC_OFFSET..SIDECAR_FOOTER_CRC_OFFSET + 8]\n        .copy_from_slice(&crc.to_le_bytes());",
             "if footer_block.len() < SIDECAR_FOOTER_LEN {",
@@ -332,20 +332,20 @@ mod tests {
             "let epoch_id = read_u64_le(footer_block, 0x20);",
             "let protected_ordinal_start = read_u64_le(footer_block, 0x28);",
             "let protected_ordinal_end_exclusive = read_u64_le(footer_block, 0x30);",
-            "let sidecar_header_block_count = read_u32_le(footer_block, 0x38);",
-            "let parity_shard_block_count = read_u32_le(footer_block, 0x3C);",
-            "let sidecar_total_block_count = read_u64_le(footer_block, 0x40);",
-            "let primary_header_start_block = read_u64_le(footer_block, 0x48);",
-            "let tail_header_start_block = read_u64_le(footer_block, 0x50);",
-            "canonical_metadata_hash.copy_from_slice(&footer_block[0x58..0x78]);",
+            "let sidecar_header_block_count = read_u64_le(footer_block, 0x38);",
+            "let parity_shard_block_count = read_u64_le(footer_block, 0x40);",
+            "let sidecar_total_block_count = read_u64_le(footer_block, 0x48);",
+            "let primary_header_start_block = read_u64_le(footer_block, 0x50);",
+            "let tail_header_start_block = read_u64_le(footer_block, 0x58);",
+            "canonical_metadata_hash.copy_from_slice(&footer_block[0x60..0x80]);",
             "let footer_crc64 = read_u64_le(footer_block, SIDECAR_FOOTER_CRC_OFFSET);",
             "let computed = crc64_xz(&footer_block[..SIDECAR_FOOTER_CRC_OFFSET]);",
             "fn write_trailing_crc(block: &mut [u8]) {",
             "let crc_offset = block.len() - 8;\n    let crc = crc64_xz(&block[..crc_offset]);\n    block[crc_offset..].copy_from_slice(&crc.to_le_bytes());",
             "fn validate_spill_block_crc(block: &[u8], block_index: usize) -> Result<(), ParityError> {",
             "let crc_offset = block.len() - 8;\n    let stored = read_u64_le(block, crc_offset);\n    let computed = crc64_xz(&block[..crc_offset]);",
-            "let expected_tail = u64::from(shard_index_block_count)\n        .checked_add(u64::from(parity_block_count))",
-            "let expected_footer = expected_tail\n        .checked_add(u64::from(shard_index_block_count))",
+            "let expected_tail = shard_index_block_count\n        .checked_add(parity_block_count)",
+            "let expected_footer = expected_tail\n        .checked_add(shard_index_block_count)",
             "let expected_total = expected_footer\n        .checked_add(1)",
         ];
         for (i, snippet) in snippets.iter().enumerate() {
@@ -433,7 +433,7 @@ mod tests {
     fn header_layout_ranges_match_sidecar_constants() {
         let layout = header_block_layout(0x200).expect("valid header block size");
         assert_eq!(layout.magic, range(0x00, 0x08));
-        assert_eq!(layout.canonical_metadata_hash, range(0x88, 0xA8));
+        assert_eq!(layout.canonical_metadata_hash, range(0x98, 0xB8));
         assert_eq!(layout.header_crc_input, range(0, SIDECAR_HEADER_CRC_OFFSET));
         assert_eq!(
             layout.header_crc_field,
@@ -451,7 +451,7 @@ mod tests {
     fn footer_layout_ranges_match_sidecar_constants() {
         let layout = footer_block_layout(0x200).expect("valid footer block size");
         assert_eq!(layout.magic, range(0x00, 0x08));
-        assert_eq!(layout.canonical_metadata_hash, range(0x58, 0x78));
+        assert_eq!(layout.canonical_metadata_hash, range(0x60, 0x80));
         assert_eq!(layout.footer_crc_input, range(0, SIDECAR_FOOTER_CRC_OFFSET));
         assert_eq!(
             layout.footer_crc_field,

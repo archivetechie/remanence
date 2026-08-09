@@ -1184,7 +1184,7 @@ pub fn read_object_payload<S: RemTarEntrySink + Send + ?Sized>(
     source: &mut dyn BlockSource,
     block_size: usize,
     block_count: u64,
-    tape_file_number: u32,
+    tape_file_number: u64,
     manifest_sha256: Option<[u8; 32]>,
     sink: &mut S,
 ) -> Result<(), FormatError> {
@@ -1207,13 +1207,15 @@ pub(crate) fn read_object_payload_with_pipeline<S: RemTarEntrySink + Send + ?Siz
     source: &mut dyn BlockSource,
     block_size: usize,
     block_count: u64,
-    tape_file_number: u32,
+    tape_file_number: u64,
     manifest_sha256: Option<[u8; 32]>,
     sink: &mut S,
     config: ReadPipelineConfig,
     manager: Arc<IoMemoryReservation>,
 ) -> Result<(), FormatError> {
-    let positioned = source.space(i64::from(tape_file_number), SpaceKind::Filemarks)?;
+    let filemark_count = i64::try_from(tape_file_number)
+        .map_err(|_| FormatError::invalid("tape-file number exceeds SPACE range"))?;
+    let positioned = source.space(filemark_count, SpaceKind::Filemarks)?;
     run_read_pipeline(
         source,
         block_size,
@@ -1240,7 +1242,7 @@ pub struct PlaintextFileRangeReadRequest {
     /// Fixed tape block size in bytes.
     pub block_size: usize,
     /// Filemark-delimited tape-file number containing the object.
-    pub tape_file_number: u32,
+    pub tape_file_number: u64,
     /// Absolute physical LBA of the first block in the containing tape file,
     /// when the committed catalog prefix can derive it.
     pub physical_file_start_lba: Option<u64>,
@@ -1386,8 +1388,10 @@ fn position_plaintext_file_range(
     if current.partition != 0 || current.lba != 0 {
         source.rewind()?;
     }
+    let filemark_count = i64::try_from(request.tape_file_number)
+        .map_err(|_| FormatError::invalid("tape-file number exceeds SPACE range"))?;
     let mut positioned = source
-        .space(i64::from(request.tape_file_number), SpaceKind::Filemarks)?
+        .space(filemark_count, SpaceKind::Filemarks)?
         .position_after;
     let skip_blocks = i64::try_from(first_body_lba.0)
         .map_err(|_| FormatError::invalid("range first_body_lba exceeds SPACE range"))?;
@@ -2010,6 +2014,27 @@ mod tests {
         assert_eq!(payload, b"hello from tape");
         let expected: [u8; 32] = Sha256::digest(b"hello from tape").into();
         assert_eq!(digest, expected);
+    }
+
+    #[test]
+    fn read_object_payload_rejects_tape_file_beyond_scsi_space_range() {
+        let mut source = VecBlockSource::new(Vec::new());
+        let mut payload = Vec::new();
+        let mut sink = CapturePayloadSink::new(&mut payload);
+
+        let error = read_object_payload(
+            &mut source,
+            4096,
+            0,
+            u64::try_from(i64::MAX).unwrap() + 1,
+            None,
+            &mut sink,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("tape-file number exceeds SPACE range"));
     }
 
     #[test]

@@ -18,22 +18,22 @@ use crate::error::ParityError;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Sidecar schema version emitted and accepted by this codec.
-pub const SIDECAR_SCHEMA_VERSION: u32 = 1;
+pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
 
 /// Byte length of sidecar block 0's fixed header through the inline-index start.
-pub const SIDECAR_HEADER_LEN: usize = 0xB8;
+pub const SIDECAR_HEADER_LEN: usize = 0xC8;
 
 /// Byte offset of the `header_crc64` field in sidecar block 0.
-pub const SIDECAR_HEADER_CRC_OFFSET: usize = 0xB0;
+pub const SIDECAR_HEADER_CRC_OFFSET: usize = 0xC0;
 
 /// Sidecar footer schema version emitted and accepted by this codec.
-pub const SIDECAR_FOOTER_VERSION: u16 = 1;
+pub const SIDECAR_FOOTER_VERSION: u16 = 2;
 
 /// Byte length of the fixed footer fields including `footer_crc64`.
-pub const SIDECAR_FOOTER_LEN: usize = 0x80;
+pub const SIDECAR_FOOTER_LEN: usize = 0x88;
 
 /// Byte offset of the `footer_crc64` field in the footer block.
-pub const SIDECAR_FOOTER_CRC_OFFSET: usize = 0x78;
+pub const SIDECAR_FOOTER_CRC_OFFSET: usize = 0x80;
 
 /// Byte length of one packed parity-index entry.
 pub const PARITY_INDEX_ENTRY_LEN: usize = 16;
@@ -265,17 +265,17 @@ pub struct SidecarHeader {
     /// Real data-shard count, equal to `end_exclusive - start`.
     pub real_data_shard_count: u64,
     /// Number of raw parity shard blocks following the index, equal to `S * m`.
-    pub parity_block_count: u32,
+    pub parity_block_count: u64,
     /// Number of data-shard CRC entries, equal to `real_data_shard_count`.
-    pub data_crc_count: u32,
+    pub data_crc_count: u64,
     /// Number of header/index blocks, including block 0.
-    pub shard_index_block_count: u32,
+    pub shard_index_block_count: u64,
     /// Number of packed index-entry bytes stored after the header in block 0.
-    pub inline_index_entry_bytes: u32,
+    pub inline_index_entry_bytes: u64,
     /// Total fixed-block count for the whole sidecar tape file, excluding the
     /// trailing filemark.
     pub sidecar_total_block_count: u64,
-    /// Primary header/index copy start block; always 0 for v1.
+    /// Primary header/index copy start block; always 0 for schema v2.
     pub primary_header_start_block: u64,
     /// Tail header/index copy start block, equal to `H + P`.
     pub tail_header_start_block: u64,
@@ -310,12 +310,12 @@ pub struct SidecarFooter {
     /// Exclusive end of this sidecar's protected object-data ordinal range.
     pub protected_ordinal_end_exclusive: u64,
     /// Number of header/index blocks in one metadata copy.
-    pub sidecar_header_block_count: u32,
+    pub sidecar_header_block_count: u64,
     /// Number of raw parity shard blocks.
-    pub parity_shard_block_count: u32,
+    pub parity_shard_block_count: u64,
     /// Total fixed-block count for the sidecar tape file.
     pub sidecar_total_block_count: u64,
-    /// Primary header/index start block; always 0 for v1.
+    /// Primary header/index start block; always 0 for schema v2.
     pub primary_header_start_block: u64,
     /// Tail header/index start block.
     pub tail_header_start_block: u64,
@@ -412,9 +412,9 @@ struct HeaderCounts {
     protected_ordinal_end_exclusive: u64,
     logical_shard_count: u64,
     real_data_shard_count: u64,
-    parity_block_count: u32,
-    data_crc_count: u32,
-    shard_index_block_count: u32,
+    parity_block_count: u64,
+    data_crc_count: u64,
+    shard_index_block_count: u64,
     sidecar_total_block_count: u64,
     primary_header_start_block: u64,
     tail_header_start_block: u64,
@@ -465,7 +465,7 @@ pub fn parity_block_position(
     parity_index: u16,
     stripes_per_epoch: u32,
     parity_blocks_per_stripe: u16,
-    shard_index_block_count: u32,
+    shard_index_block_count: u64,
 ) -> u64 {
     assert!(
         stripe_index < stripes_per_epoch,
@@ -475,7 +475,7 @@ pub fn parity_block_position(
         parity_index < parity_blocks_per_stripe,
         "parity index must be below scheme m"
     );
-    u64::from(shard_index_block_count)
+    shard_index_block_count
         + u64::from(parity_index) * u64::from(stripes_per_epoch)
         + u64::from(stripe_index)
 }
@@ -528,11 +528,13 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
     data_shard_crc64s: Vec<u64>,
 ) -> Result<EncodedSidecarTapeFile, ParityError> {
     let block_size = validate_descriptor(descriptor)?;
-    let expected_parity_shards = descriptor
-        .stripes_per_epoch
-        .checked_mul(descriptor.m as u32)
-        .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?
-        as usize;
+    let expected_parity_shards = usize::try_from(
+        descriptor
+            .stripes_per_epoch
+            .checked_mul(u32::from(descriptor.m))
+            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+    )
+    .map_err(|_| sidecar_parse("sidecar parity block count overflows usize"))?;
     if parity_shards.len() != expected_parity_shards {
         return Err(sidecar_parse(format!(
             "sidecar has {} parity shards, expected {expected_parity_shards}",
@@ -559,7 +561,15 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
     let index = SidecarIndex::new(parity_entries, data_shard_crc64s);
     let encoded_index = encode_sidecar_index_blocks(descriptor, &index)?;
     let mut blocks = encoded_index.blocks;
-    blocks.reserve(parity_shards.len() + encoded_index.header.shard_index_block_count as usize + 1);
+    let tail_index_block_count = usize::try_from(encoded_index.header.shard_index_block_count)
+        .map_err(|_| sidecar_parse("sidecar index block count overflows usize"))?;
+    blocks.reserve(
+        parity_shards
+            .len()
+            .checked_add(tail_index_block_count)
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| sidecar_parse("sidecar output block capacity overflows usize"))?,
+    );
     for parity_index in 0..descriptor.m {
         for stripe_index in 0..descriptor.stripes_per_epoch {
             let entry_index = usize::try_from(
@@ -581,7 +591,8 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
             blocks.push(parity_shards[entry_index].as_ref().to_vec());
         }
     }
-    let block_size = descriptor.block_size as usize;
+    let block_size = usize::try_from(descriptor.block_size)
+        .map_err(|_| sidecar_parse("sidecar block size overflows usize"))?;
     let mut tail_blocks = pack_index_blocks(block_size, &index)?;
     let mut tail_header = build_header(
         descriptor,
@@ -641,25 +652,25 @@ pub fn parse_sidecar_header_block(
     let protected_ordinal_end_exclusive = read_u64_le(block0, 0x38);
     let logical_shard_count = read_u64_le(block0, 0x40);
     let real_data_shard_count = read_u64_le(block0, 0x48);
-    let parity_block_count = read_u32_le(block0, 0x50);
-    let data_crc_count = read_u32_le(block0, 0x54);
-    let shard_index_block_count = read_u32_le(block0, 0x58);
-    let inline_index_entry_bytes = read_u32_le(block0, 0x5C);
-    let sidecar_total_block_count = read_u64_le(block0, 0x60);
-    let primary_header_start_block = read_u64_le(block0, 0x68);
-    let tail_header_start_block = read_u64_le(block0, 0x70);
-    let footer_block_index = read_u64_le(block0, 0x78);
-    let copy_kind = SidecarCopyKind::from_u16(read_u16_le(block0, 0x80))?;
-    let copy_kind_reserved = read_u16_le(block0, 0x82);
+    let parity_block_count = read_u64_le(block0, 0x50);
+    let data_crc_count = read_u64_le(block0, 0x58);
+    let shard_index_block_count = read_u64_le(block0, 0x60);
+    let inline_index_entry_bytes = read_u64_le(block0, 0x68);
+    let sidecar_total_block_count = read_u64_le(block0, 0x70);
+    let primary_header_start_block = read_u64_le(block0, 0x78);
+    let tail_header_start_block = read_u64_le(block0, 0x80);
+    let footer_block_index = read_u64_le(block0, 0x88);
+    let copy_kind = SidecarCopyKind::from_u16(read_u16_le(block0, 0x90))?;
+    let copy_kind_reserved = read_u16_le(block0, 0x92);
     if copy_kind_reserved != 0 {
         return Err(sidecar_parse(format!(
             "sidecar copy-kind reserved field non-zero: 0x{copy_kind_reserved:04x}"
         )));
     }
-    let copy_generation = read_u32_le(block0, 0x84);
+    let copy_generation = read_u32_le(block0, 0x94);
     let mut canonical_metadata_hash = [0u8; 32];
-    canonical_metadata_hash.copy_from_slice(&block0[0x88..0xA8]);
-    let header_reserved = read_u64_le(block0, 0xA8);
+    canonical_metadata_hash.copy_from_slice(&block0[0x98..0xB8]);
+    let header_reserved = read_u64_le(block0, 0xB8);
     if header_reserved != 0 {
         return Err(sidecar_parse(format!(
             "sidecar header reserved field non-zero: 0x{header_reserved:016x}"
@@ -722,8 +733,10 @@ pub fn parse_sidecar_header_block(
 
     let (expected_h, expected_inline) = compute_index_layout(
         block_size_usize,
-        parity_block_count as usize,
-        data_crc_count as usize,
+        usize::try_from(parity_block_count)
+            .map_err(|_| sidecar_parse("sidecar parity block count overflows usize"))?,
+        usize::try_from(data_crc_count)
+            .map_err(|_| sidecar_parse("sidecar data CRC count overflows usize"))?,
     )?;
     if shard_index_block_count != expected_h {
         return Err(sidecar_parse(format!(
@@ -736,7 +749,11 @@ pub fn parse_sidecar_header_block(
         )));
     }
 
-    let inline_end = SIDECAR_HEADER_LEN + inline_index_entry_bytes as usize;
+    let inline_index_entry_bytes_usize = usize::try_from(inline_index_entry_bytes)
+        .map_err(|_| sidecar_parse("sidecar inline index byte count overflows usize"))?;
+    let inline_end = SIDECAR_HEADER_LEN
+        .checked_add(inline_index_entry_bytes_usize)
+        .ok_or_else(|| sidecar_parse("sidecar inline index end overflows usize"))?;
     if inline_end > crc_offset {
         return Err(sidecar_parse(
             "sidecar inline index exceeds block0 capacity",
@@ -839,13 +856,13 @@ pub fn parse_sidecar_footer_block(
     let epoch_id = read_u64_le(footer_block, 0x20);
     let protected_ordinal_start = read_u64_le(footer_block, 0x28);
     let protected_ordinal_end_exclusive = read_u64_le(footer_block, 0x30);
-    let sidecar_header_block_count = read_u32_le(footer_block, 0x38);
-    let parity_shard_block_count = read_u32_le(footer_block, 0x3C);
-    let sidecar_total_block_count = read_u64_le(footer_block, 0x40);
-    let primary_header_start_block = read_u64_le(footer_block, 0x48);
-    let tail_header_start_block = read_u64_le(footer_block, 0x50);
+    let sidecar_header_block_count = read_u64_le(footer_block, 0x38);
+    let parity_shard_block_count = read_u64_le(footer_block, 0x40);
+    let sidecar_total_block_count = read_u64_le(footer_block, 0x48);
+    let primary_header_start_block = read_u64_le(footer_block, 0x50);
+    let tail_header_start_block = read_u64_le(footer_block, 0x58);
     let mut canonical_metadata_hash = [0u8; 32];
-    canonical_metadata_hash.copy_from_slice(&footer_block[0x58..0x78]);
+    canonical_metadata_hash.copy_from_slice(&footer_block[0x60..0x80]);
     let footer_crc64 = read_u64_le(footer_block, SIDECAR_FOOTER_CRC_OFFSET);
     let computed = crc64_xz(&footer_block[..SIDECAR_FOOTER_CRC_OFFSET]);
     if footer_crc64 != computed {
@@ -900,8 +917,10 @@ pub fn parse_sidecar_index_blocks<B: AsRef<[u8]>>(
         .ok_or_else(|| sidecar_parse("sidecar has no header block"))?
         .as_ref();
     let header = parse_sidecar_header_block(block0, expected_tape_uuid)?;
-    let block_size = header.block_size as usize;
-    let h = header.shard_index_block_count as usize;
+    let block_size = usize::try_from(header.block_size)
+        .map_err(|_| sidecar_parse("sidecar block size overflows usize"))?;
+    let h = usize::try_from(header.shard_index_block_count)
+        .map_err(|_| sidecar_parse("sidecar index block count overflows usize"))?;
     if blocks.len() < h {
         return Err(sidecar_parse(format!(
             "sidecar has {} index blocks, header requires {h}",
@@ -1015,7 +1034,8 @@ pub fn parse_sidecar_tape_file<B: AsRef<[u8]>>(
         }
     };
 
-    let block_size = decoded.header.block_size as usize;
+    let block_size = usize::try_from(decoded.header.block_size)
+        .map_err(|_| sidecar_parse("sidecar block size overflows usize"))?;
     let mut parity_shards = Vec::with_capacity(p);
     for (i, entry) in decoded.index.parity_entries.iter().enumerate() {
         let block_index = usize::try_from(parity_block_position(
@@ -1073,15 +1093,16 @@ fn validate_descriptor(descriptor: &SidecarDescriptor) -> Result<usize, ParityEr
             .protected_ordinal_end_exclusive
             .checked_sub(descriptor.protected_ordinal_start)
             .ok_or_else(|| sidecar_parse("sidecar protected ordinal range is inverted"))?,
-        parity_block_count: descriptor
-            .stripes_per_epoch
-            .checked_mul(descriptor.m as u32)
-            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+        parity_block_count: u64::from(
+            descriptor
+                .stripes_per_epoch
+                .checked_mul(u32::from(descriptor.m))
+                .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+        ),
         data_crc_count: descriptor
             .protected_ordinal_end_exclusive
             .checked_sub(descriptor.protected_ordinal_start)
-            .and_then(|d| u32::try_from(d).ok())
-            .ok_or_else(|| sidecar_parse("sidecar data CRC count overflows u32"))?,
+            .ok_or_else(|| sidecar_parse("sidecar protected ordinal range is inverted"))?,
         shard_index_block_count: 1,
         sidecar_total_block_count: 0,
         primary_header_start_block: 0,
@@ -1135,17 +1156,17 @@ fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
             "sidecar real data count exceeds logical shard count",
         ));
     }
-    let expected_parity = stripes_per_epoch
-        .checked_mul(m as u32)
-        .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?;
+    let expected_parity = u64::from(
+        stripes_per_epoch
+            .checked_mul(m as u32)
+            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+    );
     if parity_block_count != expected_parity {
         return Err(sidecar_parse(format!(
             "sidecar parity_block_count {parity_block_count} != S*m {expected_parity}"
         )));
     }
-    let expected_data_crc_count: u32 = real_data_shard_count
-        .try_into()
-        .map_err(|_| sidecar_parse("sidecar real data count exceeds u32 data CRC count"))?;
+    let expected_data_crc_count = real_data_shard_count;
     if data_crc_count != expected_data_crc_count {
         return Err(sidecar_parse(format!(
             "sidecar data_crc_count {data_crc_count} != real data count {expected_data_crc_count}"
@@ -1170,8 +1191,8 @@ fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
 }
 
 fn validate_sidecar_layout(
-    shard_index_block_count: u32,
-    parity_block_count: u32,
+    shard_index_block_count: u64,
+    parity_block_count: u64,
     sidecar_total_block_count: u64,
     primary_header_start_block: u64,
     tail_header_start_block: u64,
@@ -1185,8 +1206,8 @@ fn validate_sidecar_layout(
             "sidecar primary_header_start_block {primary_header_start_block} != 0"
         )));
     }
-    let expected_tail = u64::from(shard_index_block_count)
-        .checked_add(u64::from(parity_block_count))
+    let expected_tail = shard_index_block_count
+        .checked_add(parity_block_count)
         .ok_or_else(|| sidecar_parse("sidecar tail header start overflows"))?;
     if tail_header_start_block != expected_tail {
         return Err(sidecar_parse(format!(
@@ -1194,7 +1215,7 @@ fn validate_sidecar_layout(
         )));
     }
     let expected_footer = expected_tail
-        .checked_add(u64::from(shard_index_block_count))
+        .checked_add(shard_index_block_count)
         .ok_or_else(|| sidecar_parse("sidecar footer block index overflows"))?;
     if footer_block_index != expected_footer {
         return Err(sidecar_parse(format!(
@@ -1216,11 +1237,13 @@ fn validate_index_shape(
     descriptor: &SidecarDescriptor,
     index: &SidecarIndex,
 ) -> Result<(), ParityError> {
-    let expected_parity = descriptor
-        .stripes_per_epoch
-        .checked_mul(descriptor.m as u32)
-        .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?
-        as usize;
+    let expected_parity = usize::try_from(
+        descriptor
+            .stripes_per_epoch
+            .checked_mul(descriptor.m as u32)
+            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+    )
+    .map_err(|_| sidecar_parse("sidecar parity block count overflows usize"))?;
     if index.parity_entries.len() != expected_parity {
         return Err(sidecar_parse(format!(
             "sidecar parity index has {} entries, expected {expected_parity}",
@@ -1228,11 +1251,13 @@ fn validate_index_shape(
         )));
     }
 
-    let expected_data = descriptor
-        .protected_ordinal_end_exclusive
-        .checked_sub(descriptor.protected_ordinal_start)
-        .ok_or_else(|| sidecar_parse("sidecar protected ordinal range is inverted"))?
-        as usize;
+    let expected_data = usize::try_from(
+        descriptor
+            .protected_ordinal_end_exclusive
+            .checked_sub(descriptor.protected_ordinal_start)
+            .ok_or_else(|| sidecar_parse("sidecar protected ordinal range is inverted"))?,
+    )
+    .map_err(|_| sidecar_parse("sidecar data CRC count overflows usize"))?;
     if index.data_shard_crc64s.len() != expected_data {
         return Err(sidecar_parse(format!(
             "sidecar data CRC index has {} entries, expected {expected_data}",
@@ -1270,23 +1295,25 @@ fn validate_index_order(header: &SidecarHeader, index: &SidecarIndex) -> Result<
 fn compute_canonical_metadata_hash(
     descriptor: &SidecarDescriptor,
     index: &SidecarIndex,
-    shard_index_block_count: u32,
-    inline_index_entry_bytes: u32,
+    shard_index_block_count: u64,
+    inline_index_entry_bytes: u64,
 ) -> Result<[u8; 32], ParityError> {
     let real_data_shard_count = descriptor
         .protected_ordinal_end_exclusive
         .checked_sub(descriptor.protected_ordinal_start)
         .ok_or_else(|| sidecar_parse("sidecar protected ordinal range is inverted"))?;
-    let parity_block_count = descriptor
-        .stripes_per_epoch
-        .checked_mul(descriptor.m as u32)
-        .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?;
+    let parity_block_count = u64::from(
+        descriptor
+            .stripes_per_epoch
+            .checked_mul(u32::from(descriptor.m))
+            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+    );
     let logical_shard_count = descriptor.stripes_per_epoch as u64 * descriptor.k as u64;
-    let tail_header_start_block = u64::from(shard_index_block_count)
-        .checked_add(u64::from(parity_block_count))
+    let tail_header_start_block = shard_index_block_count
+        .checked_add(parity_block_count)
         .ok_or_else(|| sidecar_parse("sidecar tail header start overflows"))?;
     let footer_block_index = tail_header_start_block
-        .checked_add(u64::from(shard_index_block_count))
+        .checked_add(shard_index_block_count)
         .ok_or_else(|| sidecar_parse("sidecar footer block index overflows"))?;
     let sidecar_total_block_count = footer_block_index
         .checked_add(1)
@@ -1307,9 +1334,7 @@ fn compute_canonical_metadata_hash(
     hash.update(logical_shard_count.to_le_bytes());
     hash.update(real_data_shard_count.to_le_bytes());
     hash.update(parity_block_count.to_le_bytes());
-    let data_crc_count: u32 = real_data_shard_count
-        .try_into()
-        .map_err(|_| sidecar_parse("sidecar data CRC count overflows u32"))?;
+    let data_crc_count = real_data_shard_count;
     hash.update(data_crc_count.to_le_bytes());
     hash.update(shard_index_block_count.to_le_bytes());
     hash.update(inline_index_entry_bytes.to_le_bytes());
@@ -1351,12 +1376,12 @@ fn encode_sidecar_footer_block(header: &SidecarHeader) -> Result<Vec<u8>, Parity
     block[0x20..0x28].copy_from_slice(&header.epoch_id.to_le_bytes());
     block[0x28..0x30].copy_from_slice(&header.protected_ordinal_start.to_le_bytes());
     block[0x30..0x38].copy_from_slice(&header.protected_ordinal_end_exclusive.to_le_bytes());
-    block[0x38..0x3C].copy_from_slice(&header.shard_index_block_count.to_le_bytes());
-    block[0x3C..0x40].copy_from_slice(&header.parity_block_count.to_le_bytes());
-    block[0x40..0x48].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());
-    block[0x48..0x50].copy_from_slice(&header.primary_header_start_block.to_le_bytes());
-    block[0x50..0x58].copy_from_slice(&header.tail_header_start_block.to_le_bytes());
-    block[0x58..0x78].copy_from_slice(&header.canonical_metadata_hash);
+    block[0x38..0x40].copy_from_slice(&header.shard_index_block_count.to_le_bytes());
+    block[0x40..0x48].copy_from_slice(&header.parity_block_count.to_le_bytes());
+    block[0x48..0x50].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());
+    block[0x50..0x58].copy_from_slice(&header.primary_header_start_block.to_le_bytes());
+    block[0x58..0x60].copy_from_slice(&header.tail_header_start_block.to_le_bytes());
+    block[0x60..0x80].copy_from_slice(&header.canonical_metadata_hash);
     let crc = crc64_xz(&block[..SIDECAR_FOOTER_CRC_OFFSET]);
     block[SIDECAR_FOOTER_CRC_OFFSET..SIDECAR_FOOTER_CRC_OFFSET + 8]
         .copy_from_slice(&crc.to_le_bytes());
@@ -1429,8 +1454,8 @@ fn sidecar_header_metadata_matches(left: &SidecarHeader, right: &SidecarHeader) 
 
 fn build_header(
     descriptor: &SidecarDescriptor,
-    shard_index_block_count: u32,
-    inline_index_entry_bytes: u32,
+    shard_index_block_count: u64,
+    inline_index_entry_bytes: u64,
     copy_kind: SidecarCopyKind,
     canonical_metadata_hash: [u8; 32],
 ) -> Result<SidecarHeader, ParityError> {
@@ -1438,18 +1463,18 @@ fn build_header(
         .protected_ordinal_end_exclusive
         .checked_sub(descriptor.protected_ordinal_start)
         .ok_or_else(|| sidecar_parse("sidecar protected ordinal range is inverted"))?;
-    let parity_block_count = descriptor
-        .stripes_per_epoch
-        .checked_mul(descriptor.m as u32)
-        .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?;
-    let data_crc_count: u32 = real_data_shard_count
-        .try_into()
-        .map_err(|_| sidecar_parse("sidecar data CRC count overflows u32"))?;
-    let tail_header_start_block = u64::from(shard_index_block_count)
-        .checked_add(u64::from(parity_block_count))
+    let parity_block_count = u64::from(
+        descriptor
+            .stripes_per_epoch
+            .checked_mul(u32::from(descriptor.m))
+            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+    );
+    let data_crc_count = real_data_shard_count;
+    let tail_header_start_block = shard_index_block_count
+        .checked_add(parity_block_count)
         .ok_or_else(|| sidecar_parse("sidecar tail header start overflows"))?;
     let footer_block_index = tail_header_start_block
-        .checked_add(u64::from(shard_index_block_count))
+        .checked_add(shard_index_block_count)
         .ok_or_else(|| sidecar_parse("sidecar footer block index overflows"))?;
     let sidecar_total_block_count = footer_block_index
         .checked_add(1)
@@ -1536,20 +1561,27 @@ fn parse_index_entries<B: AsRef<[u8]>>(
     header: &SidecarHeader,
     blocks: &[B],
 ) -> Result<SidecarIndex, ParityError> {
-    let block_size = header.block_size as usize;
+    let block_size = usize::try_from(header.block_size)
+        .map_err(|_| sidecar_parse("sidecar block size overflows usize"))?;
     let crc_offset = block_size - 8;
-    let h = header.shard_index_block_count as usize;
-    let inline_end = SIDECAR_HEADER_LEN + header.inline_index_entry_bytes as usize;
-    let entry_kinds = entry_kinds(
-        header.parity_block_count as usize,
-        header.data_crc_count as usize,
-    );
+    let h = usize::try_from(header.shard_index_block_count)
+        .map_err(|_| sidecar_parse("sidecar index block count overflows usize"))?;
+    let inline_entry_bytes = usize::try_from(header.inline_index_entry_bytes)
+        .map_err(|_| sidecar_parse("sidecar inline index byte count overflows usize"))?;
+    let inline_end = SIDECAR_HEADER_LEN
+        .checked_add(inline_entry_bytes)
+        .ok_or_else(|| sidecar_parse("sidecar inline index end overflows usize"))?;
+    let parity_count = usize::try_from(header.parity_block_count)
+        .map_err(|_| sidecar_parse("sidecar parity block count overflows usize"))?;
+    let data_count = usize::try_from(header.data_crc_count)
+        .map_err(|_| sidecar_parse("sidecar data CRC count overflows usize"))?;
+    let entry_kinds = entry_kinds(parity_count, data_count);
 
     let mut block_index = 0usize;
     let mut offset = SIDECAR_HEADER_LEN;
     let mut limit = inline_end;
-    let mut parity_entries = Vec::with_capacity(header.parity_block_count as usize);
-    let mut data_shard_crc64s = Vec::with_capacity(header.data_crc_count as usize);
+    let mut parity_entries = Vec::with_capacity(parity_count);
+    let mut data_shard_crc64s = Vec::with_capacity(data_count);
 
     for kind in entry_kinds {
         let len = entry_len(kind);
@@ -1611,7 +1643,7 @@ fn compute_index_layout(
     block_size: usize,
     parity_count: usize,
     data_count: usize,
-) -> Result<(u32, u32), ParityError> {
+) -> Result<(u64, u64), ParityError> {
     let layout = checked_sidecar_index_capacity_layout(
         u64::try_from(block_size).map_err(|_| sidecar_parse("sidecar block size overflows u64"))?,
         u64::try_from(parity_count)
@@ -1619,11 +1651,7 @@ fn compute_index_layout(
         u64::try_from(data_count)
             .map_err(|_| sidecar_parse("sidecar data CRC count overflows u64"))?,
     )?;
-    let h = u32::try_from(layout.block_count)
-        .map_err(|_| sidecar_parse("sidecar index block count overflows u32"))?;
-    let inline = u32::try_from(layout.inline_entry_bytes)
-        .map_err(|_| sidecar_parse("sidecar inline index byte count overflows u32"))?;
-    Ok((h, inline))
+    Ok((layout.block_count, layout.inline_entry_bytes))
 }
 
 fn entry_kinds(parity_count: usize, data_count: usize) -> impl Iterator<Item = EntryKind> {
@@ -1659,19 +1687,19 @@ fn write_header_without_crc(header: &SidecarHeader, block0: &mut [u8]) {
     block0[0x38..0x40].copy_from_slice(&header.protected_ordinal_end_exclusive.to_le_bytes());
     block0[0x40..0x48].copy_from_slice(&header.logical_shard_count.to_le_bytes());
     block0[0x48..0x50].copy_from_slice(&header.real_data_shard_count.to_le_bytes());
-    block0[0x50..0x54].copy_from_slice(&header.parity_block_count.to_le_bytes());
-    block0[0x54..0x58].copy_from_slice(&header.data_crc_count.to_le_bytes());
-    block0[0x58..0x5C].copy_from_slice(&header.shard_index_block_count.to_le_bytes());
-    block0[0x5C..0x60].copy_from_slice(&header.inline_index_entry_bytes.to_le_bytes());
-    block0[0x60..0x68].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());
-    block0[0x68..0x70].copy_from_slice(&header.primary_header_start_block.to_le_bytes());
-    block0[0x70..0x78].copy_from_slice(&header.tail_header_start_block.to_le_bytes());
-    block0[0x78..0x80].copy_from_slice(&header.footer_block_index.to_le_bytes());
-    block0[0x80..0x82].copy_from_slice(&header.copy_kind.to_u16().to_le_bytes());
-    block0[0x82..0x84].copy_from_slice(&0u16.to_le_bytes());
-    block0[0x84..0x88].copy_from_slice(&header.copy_generation.to_le_bytes());
-    block0[0x88..0xA8].copy_from_slice(&header.canonical_metadata_hash);
-    block0[0xA8..0xB0].copy_from_slice(&0u64.to_le_bytes());
+    block0[0x50..0x58].copy_from_slice(&header.parity_block_count.to_le_bytes());
+    block0[0x58..0x60].copy_from_slice(&header.data_crc_count.to_le_bytes());
+    block0[0x60..0x68].copy_from_slice(&header.shard_index_block_count.to_le_bytes());
+    block0[0x68..0x70].copy_from_slice(&header.inline_index_entry_bytes.to_le_bytes());
+    block0[0x70..0x78].copy_from_slice(&header.sidecar_total_block_count.to_le_bytes());
+    block0[0x78..0x80].copy_from_slice(&header.primary_header_start_block.to_le_bytes());
+    block0[0x80..0x88].copy_from_slice(&header.tail_header_start_block.to_le_bytes());
+    block0[0x88..0x90].copy_from_slice(&header.footer_block_index.to_le_bytes());
+    block0[0x90..0x92].copy_from_slice(&header.copy_kind.to_u16().to_le_bytes());
+    block0[0x92..0x94].copy_from_slice(&0u16.to_le_bytes());
+    block0[0x94..0x98].copy_from_slice(&header.copy_generation.to_le_bytes());
+    block0[0x98..0xB8].copy_from_slice(&header.canonical_metadata_hash);
+    block0[0xB8..0xC0].copy_from_slice(&0u64.to_le_bytes());
 }
 
 fn finalize_header_block(header: &mut SidecarHeader, block0: &mut [u8]) {
@@ -1744,7 +1772,7 @@ mod tests {
         block_size: usize,
         parity_count: usize,
         data_count: usize,
-    ) -> Result<(u32, u32), ParityError> {
+    ) -> Result<(u64, u64), ParityError> {
         if block_size < SIDECAR_HEADER_LEN + 8 {
             return Err(sidecar_parse(
                 "sidecar block_size smaller than header plus trailing CRC",
@@ -1774,7 +1802,12 @@ mod tests {
         if block_index == 0 {
             inline = offset - SIDECAR_HEADER_LEN;
         }
-        Ok(((block_index + 1) as u32, inline as u32))
+        Ok((
+            u64::try_from(block_index + 1)
+                .map_err(|_| sidecar_parse("reference index block count overflows u64"))?,
+            u64::try_from(inline)
+                .map_err(|_| sidecar_parse("reference inline byte count overflows u64"))?,
+        ))
     }
 
     #[test]
@@ -1788,12 +1821,7 @@ mod tests {
                         parity_count as u64,
                         data_count as u64,
                     )
-                    .map(|layout| {
-                        (
-                            u32::try_from(layout.block_count).unwrap(),
-                            u32::try_from(layout.inline_entry_bytes).unwrap(),
-                        )
-                    });
+                    .map(|layout| (layout.block_count, layout.inline_entry_bytes));
                     assert_eq!(
                         actual.is_ok(),
                         expected.is_ok(),
@@ -1978,7 +2006,7 @@ mod tests {
         assert_eq!(encoded.header.parity_block_count, 6);
         assert_eq!(encoded.header.data_crc_count, 12);
         assert_eq!(encoded.header.shard_index_block_count, 2);
-        assert_eq!(encoded.header.inline_index_entry_bytes, 64);
+        assert_eq!(encoded.header.inline_index_entry_bytes, 48);
         assert_eq!(encoded.header.sidecar_total_block_count, 11);
         assert_eq!(encoded.header.primary_header_start_block, 0);
         assert_eq!(encoded.header.tail_header_start_block, 8);
@@ -2081,6 +2109,80 @@ mod tests {
     }
 
     #[test]
+    fn fixed_sidecar_frames_preserve_structural_counts_above_u32() {
+        const TEST_BLOCK_SIZE: u32 = 256;
+        let stripes_per_epoch = u32::MAX;
+        let logical_shard_count = u64::from(stripes_per_epoch) * u64::from(u16::MAX);
+        let parity_block_count = u64::from(stripes_per_epoch);
+        let index_layout = checked_sidecar_index_capacity_layout(
+            u64::from(TEST_BLOCK_SIZE),
+            parity_block_count,
+            logical_shard_count,
+        )
+        .expect("large structural index layout remains finite");
+        assert!(index_layout.block_count > u64::from(u32::MAX));
+
+        let tail_header_start_block = index_layout
+            .block_count
+            .checked_add(parity_block_count)
+            .expect("tail locator remains finite");
+        let footer_block_index = tail_header_start_block
+            .checked_add(index_layout.block_count)
+            .expect("footer locator remains finite");
+        let sidecar_total_block_count = footer_block_index + 1;
+        let mut header = SidecarHeader {
+            magic: derive_sidecar_magic(&sample_uuid()),
+            tape_uuid: sample_uuid(),
+            epoch_id: u64::MAX,
+            k: u16::MAX,
+            m: 1,
+            stripes_per_epoch,
+            block_size: TEST_BLOCK_SIZE,
+            schema_version: SIDECAR_SCHEMA_VERSION,
+            protected_ordinal_start: 0,
+            protected_ordinal_end_exclusive: logical_shard_count,
+            logical_shard_count,
+            real_data_shard_count: logical_shard_count,
+            parity_block_count,
+            data_crc_count: logical_shard_count,
+            shard_index_block_count: index_layout.block_count,
+            inline_index_entry_bytes: index_layout.inline_entry_bytes,
+            sidecar_total_block_count,
+            primary_header_start_block: 0,
+            tail_header_start_block,
+            footer_block_index,
+            copy_kind: SidecarCopyKind::Primary,
+            copy_generation: 0,
+            canonical_metadata_hash: [0xA5; 32],
+            header_crc64: 0,
+            block0_crc64: 0,
+        };
+        let mut block0 = vec![0; TEST_BLOCK_SIZE as usize];
+        finalize_header_block(&mut header, &mut block0);
+
+        let decoded_header =
+            parse_sidecar_header_block(&block0, &sample_uuid()).expect("large header parses");
+        assert_eq!(decoded_header.data_crc_count, logical_shard_count);
+        assert_eq!(
+            decoded_header.shard_index_block_count,
+            index_layout.block_count
+        );
+
+        let footer_block = encode_sidecar_footer_block(&header).expect("large footer encodes");
+        let decoded_footer =
+            parse_sidecar_footer_block(&footer_block, &sample_uuid()).expect("large footer parses");
+        assert_eq!(
+            decoded_footer.sidecar_header_block_count,
+            index_layout.block_count
+        );
+        assert_eq!(decoded_footer.parity_shard_block_count, parity_block_count);
+        assert_eq!(
+            decoded_footer.sidecar_total_block_count,
+            sidecar_total_block_count
+        );
+    }
+
+    #[test]
     fn parser_uses_tail_copy_when_primary_header_is_damaged() {
         let desc = descriptor(256);
         let parity_shards = parity_shards_for(&desc);
@@ -2104,7 +2206,7 @@ mod tests {
         let mut encoded = encode_sidecar_tape_file(&desc, &parity_shards, data_crcs)
             .expect("encode full sidecar");
         let footer_index = encoded.header.footer_block_index as usize;
-        encoded.blocks[footer_index][0x58] ^= 0x01;
+        encoded.blocks[footer_index][0x60] ^= 0x01;
         let crc = crc64_xz(&encoded.blocks[footer_index][..SIDECAR_FOOTER_CRC_OFFSET]);
         encoded.blocks[footer_index][SIDECAR_FOOTER_CRC_OFFSET..SIDECAR_FOOTER_CRC_OFFSET + 8]
             .copy_from_slice(&crc.to_le_bytes());
@@ -2215,7 +2317,7 @@ mod tests {
         let mut block0 = vec![0u8; desc.block_size as usize];
         block0[0x00..0x08].copy_from_slice(&derive_sidecar_magic(&desc.tape_uuid));
         block0[0x08..0x18].copy_from_slice(&desc.tape_uuid);
-        block0[0x80..0x82].copy_from_slice(&SidecarCopyKind::Primary.to_u16().to_le_bytes());
+        block0[0x90..0x92].copy_from_slice(&SidecarCopyKind::Primary.to_u16().to_le_bytes());
 
         let err = classify_sidecar_header_block(&block0, &desc.tape_uuid)
             .expect_err("matching sidecar magic must force strict validation");
@@ -2296,7 +2398,7 @@ mod tests {
             block0_index_capacity
         );
         assert_eq!(
-            encoded.header.inline_index_entry_bytes % DATA_CRC_ENTRY_LEN as u32,
+            encoded.header.inline_index_entry_bytes % DATA_CRC_ENTRY_LEN as u64,
             0
         );
         assert_eq!(encoded.blocks.len(), 3);
@@ -2308,9 +2410,9 @@ mod tests {
         let first_spill_data_crc_count = (block_size as usize - 8) / DATA_CRC_ENTRY_LEN;
         let final_spill_data_crc_count =
             65_536 - inline_data_crc_count - first_spill_data_crc_count;
-        assert_eq!(inline_data_crc_count, 28_648);
+        assert_eq!(inline_data_crc_count, 28_646);
         assert_eq!(first_spill_data_crc_count, 32_767);
-        assert_eq!(final_spill_data_crc_count, 4_121);
+        assert_eq!(final_spill_data_crc_count, 4_123);
 
         let final_payload_bytes = final_spill_data_crc_count * DATA_CRC_ENTRY_LEN;
         assert!(
@@ -2404,17 +2506,19 @@ mod tests {
                 case.name
             );
             assert_eq!(
-                encoded.header.parity_block_count, case.expected_parity_entries,
+                encoded.header.parity_block_count,
+                u64::from(case.expected_parity_entries),
                 "{}",
                 case.name
             );
             assert_eq!(
-                encoded.header.data_crc_count, case.expected_data_crcs as u32,
+                encoded.header.data_crc_count, case.expected_data_crcs,
                 "{}",
                 case.name
             );
             assert_eq!(
-                encoded.header.shard_index_block_count, case.expected_index_blocks,
+                encoded.header.shard_index_block_count,
+                u64::from(case.expected_index_blocks),
                 "{}",
                 case.name
             );

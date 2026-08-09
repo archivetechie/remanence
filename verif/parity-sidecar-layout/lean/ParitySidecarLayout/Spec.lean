@@ -31,19 +31,19 @@ def headerLayoutSpec (blockSize crcStart : Std.U64) : HeaderBlockLayout := {
   protected_ordinal_end_exclusive := byteRangeSpec 56#u64 64#u64,
   logical_shard_count := byteRangeSpec 64#u64 72#u64,
   real_data_shard_count := byteRangeSpec 72#u64 80#u64,
-  parity_block_count := byteRangeSpec 80#u64 84#u64,
-  data_crc_count := byteRangeSpec 84#u64 88#u64,
-  shard_index_block_count := byteRangeSpec 88#u64 92#u64,
-  inline_index_entry_bytes := byteRangeSpec 92#u64 96#u64,
-  sidecar_total_block_count := byteRangeSpec 96#u64 104#u64,
-  primary_header_start_block := byteRangeSpec 104#u64 112#u64,
-  tail_header_start_block := byteRangeSpec 112#u64 120#u64,
-  footer_block_index := byteRangeSpec 120#u64 128#u64,
-  copy_kind := byteRangeSpec 128#u64 130#u64,
-  copy_kind_reserved := byteRangeSpec 130#u64 132#u64,
-  copy_generation := byteRangeSpec 132#u64 136#u64,
-  canonical_metadata_hash := byteRangeSpec 136#u64 168#u64,
-  header_reserved := byteRangeSpec 168#u64 SIDECAR_HEADER_CRC_OFFSET,
+  parity_block_count := byteRangeSpec 80#u64 88#u64,
+  data_crc_count := byteRangeSpec 88#u64 96#u64,
+  shard_index_block_count := byteRangeSpec 96#u64 104#u64,
+  inline_index_entry_bytes := byteRangeSpec 104#u64 112#u64,
+  sidecar_total_block_count := byteRangeSpec 112#u64 120#u64,
+  primary_header_start_block := byteRangeSpec 120#u64 128#u64,
+  tail_header_start_block := byteRangeSpec 128#u64 136#u64,
+  footer_block_index := byteRangeSpec 136#u64 144#u64,
+  copy_kind := byteRangeSpec 144#u64 146#u64,
+  copy_kind_reserved := byteRangeSpec 146#u64 148#u64,
+  copy_generation := byteRangeSpec 148#u64 152#u64,
+  canonical_metadata_hash := byteRangeSpec 152#u64 184#u64,
+  header_reserved := byteRangeSpec 184#u64 SIDECAR_HEADER_CRC_OFFSET,
   header_crc_field := byteRangeSpec SIDECAR_HEADER_CRC_OFFSET SIDECAR_HEADER_LEN,
   inline_index_payload := byteRangeSpec SIDECAR_HEADER_LEN crcStart,
   header_crc_input := byteRangeSpec 0#u64 SIDECAR_HEADER_CRC_OFFSET,
@@ -60,12 +60,12 @@ def footerLayoutSpec (blockSize : Std.U64) : FooterBlockLayout := {
   epoch_id := byteRangeSpec 32#u64 40#u64,
   protected_ordinal_start := byteRangeSpec 40#u64 48#u64,
   protected_ordinal_end_exclusive := byteRangeSpec 48#u64 56#u64,
-  sidecar_header_block_count := byteRangeSpec 56#u64 60#u64,
-  parity_shard_block_count := byteRangeSpec 60#u64 64#u64,
-  sidecar_total_block_count := byteRangeSpec 64#u64 72#u64,
-  primary_header_start_block := byteRangeSpec 72#u64 80#u64,
-  tail_header_start_block := byteRangeSpec 80#u64 88#u64,
-  canonical_metadata_hash := byteRangeSpec 88#u64 SIDECAR_FOOTER_CRC_OFFSET,
+  sidecar_header_block_count := byteRangeSpec 56#u64 64#u64,
+  parity_shard_block_count := byteRangeSpec 64#u64 72#u64,
+  sidecar_total_block_count := byteRangeSpec 72#u64 80#u64,
+  primary_header_start_block := byteRangeSpec 80#u64 88#u64,
+  tail_header_start_block := byteRangeSpec 88#u64 96#u64,
+  canonical_metadata_hash := byteRangeSpec 96#u64 SIDECAR_FOOTER_CRC_OFFSET,
   footer_crc_field := byteRangeSpec SIDECAR_FOOTER_CRC_OFFSET SIDECAR_FOOTER_LEN,
   footer_crc_input := byteRangeSpec 0#u64 SIDECAR_FOOTER_CRC_OFFSET,
   footer_padding := byteRangeSpec SIDECAR_FOOTER_LEN blockSize
@@ -154,7 +154,7 @@ def sidecarTapeLayoutWithin (layout : SidecarTapeFileLayout) (total : Std.U64) :
   layout.sidecar_total_block_count = total
 
 lemma headerLayoutSpec_within (blockSize crcStart : Std.U64)
-    (hBlock : 192 ≤ blockSize.val)
+    (hBlock : 208 ≤ blockSize.val)
     (hCrcStart : crcStart.val = blockSize.val - 8) :
     headerLayoutWithin (headerLayoutSpec blockSize crcStart) blockSize := by
   unfold headerLayoutWithin headerLayoutSpec rangeWithin byteRangeSpec
@@ -163,7 +163,7 @@ lemma headerLayoutSpec_within (blockSize crcStart : Std.U64)
   omega
 
 lemma footerLayoutSpec_within (blockSize : Std.U64)
-    (hBlock : 128 ≤ blockSize.val) :
+    (hBlock : 136 ≤ blockSize.val) :
     footerLayoutWithin (footerLayoutSpec blockSize) blockSize := by
   unfold footerLayoutWithin footerLayoutSpec rangeWithin byteRangeSpec
   unfold SIDECAR_FOOTER_CRC_OFFSET SIDECAR_FOOTER_LEN
@@ -219,7 +219,7 @@ lemma checked_sub_ok (a b : Std.U64) (h : b.val ≤ a.val) :
         exact hspec.2.1
 
 theorem header_block_layout_success (blockSize : Std.U64)
-    (hBlock : 192 ≤ blockSize.val) :
+    (hBlock : 208 ≤ blockSize.val) :
     ∃ crcStart layout,
       header_block_layout blockSize = ok (.Ok layout) ∧
       crcStart.val = blockSize.val - 8 ∧
@@ -237,7 +237,7 @@ theorem header_block_layout_success (blockSize : Std.U64)
     simpa using hCrcStart
 
 theorem header_block_layout_rejects_small (blockSize : Std.U64)
-    (hSmall : blockSize.val < 192) :
+    (hSmall : blockSize.val < 208) :
     header_block_layout blockSize = ok (.Err LayoutError.BlockTooSmall) := by
   have hLt : blockSize < MIN_HEADER_BLOCK_SIZE := by
     unfold MIN_HEADER_BLOCK_SIZE
@@ -246,7 +246,7 @@ theorem header_block_layout_rejects_small (blockSize : Std.U64)
   simp [hLt]
 
 theorem header_block_layout_ranges_within (blockSize : Std.U64)
-    (hBlock : 192 ≤ blockSize.val) :
+    (hBlock : 208 ≤ blockSize.val) :
     ∃ (crcStart : Std.U64) (layout : HeaderBlockLayout),
       header_block_layout blockSize = ok (.Ok layout) ∧
       headerLayoutWithin layout blockSize ∧
@@ -258,7 +258,7 @@ theorem header_block_layout_ranges_within (blockSize : Std.U64)
   exact headerLayoutSpec_within blockSize crcStart hBlock hCrcStart
 
 theorem footer_block_layout_success (blockSize : Std.U64)
-    (hBlock : 128 ≤ blockSize.val) :
+    (hBlock : 136 ≤ blockSize.val) :
     footer_block_layout blockSize = ok (.Ok (footerLayoutSpec blockSize)) := by
   have hNotLt : ¬ blockSize < SIDECAR_FOOTER_LEN := by
     unfold SIDECAR_FOOTER_LEN
@@ -267,7 +267,7 @@ theorem footer_block_layout_success (blockSize : Std.U64)
   simp [hNotLt]
 
 theorem footer_block_layout_rejects_small (blockSize : Std.U64)
-    (hSmall : blockSize.val < 128) :
+    (hSmall : blockSize.val < 136) :
     footer_block_layout blockSize = ok (.Err LayoutError.BlockTooSmall) := by
   have hLt : blockSize < SIDECAR_FOOTER_LEN := by
     unfold SIDECAR_FOOTER_LEN
@@ -276,7 +276,7 @@ theorem footer_block_layout_rejects_small (blockSize : Std.U64)
   simp [hLt]
 
 theorem footer_block_layout_ranges_within (blockSize : Std.U64)
-    (hBlock : 128 ≤ blockSize.val) :
+    (hBlock : 136 ≤ blockSize.val) :
     footer_block_layout blockSize = ok (.Ok (footerLayoutSpec blockSize)) ∧
       footerLayoutWithin (footerLayoutSpec blockSize) blockSize := by
   exact ⟨footer_block_layout_success blockSize hBlock,

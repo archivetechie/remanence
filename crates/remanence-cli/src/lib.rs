@@ -91,6 +91,9 @@ mod get;
 mod pool_ops;
 mod put;
 mod recovery_report;
+mod tape_finalize;
+mod tape_inventory;
+mod terminal_index_drill;
 #[cfg(feature = "tui")]
 mod top;
 
@@ -208,6 +211,9 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         Command::Tape {
             command: TapeCommand::FreezeDrill(_),
         } => Some("destructive direct tape freeze drill"),
+        Command::Tape {
+            command: TapeCommand::TerminalIndexDrill(_),
+        } => Some("direct terminal-index verification drill"),
         Command::Archive { command } if command.tape_target().is_some() => {
             Some("direct local tape archive access")
         }
@@ -227,6 +233,9 @@ fn rem_debug_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::TapeFinalizeClient(_)
+        | Command::TapeInventoryClient(_)
+        | Command::TapeVerifyIndexClient(_)
         | Command::ArchiveVerifyClient { .. }
         | Command::Tape { .. } => None,
     }
@@ -244,6 +253,9 @@ fn rem_only_reason(cmd: &Command) -> Option<&'static str> {
         | Command::GetClient(_)
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::TapeFinalizeClient(_)
+        | Command::TapeInventoryClient(_)
+        | Command::TapeVerifyIndexClient(_)
         | Command::ArchiveVerifyClient { .. } => Some("daemon client commands"),
         Command::Libraries { .. }
         | Command::Library { .. }
@@ -640,6 +652,9 @@ impl From<RemCommand> for Command {
                     json: args.json,
                     drive: args.drive,
                 },
+                RemTapeCommand::Finalize(args) => Self::TapeFinalizeClient(args),
+                RemTapeCommand::Inventory(args) => Self::TapeInventoryClient(args),
+                RemTapeCommand::VerifyIndex(args) => Self::TapeVerifyIndexClient(args),
                 other => Self::Tape {
                     command: other.into(),
                 },
@@ -691,6 +706,9 @@ fn state_changing_target(cmd: &Command) -> Option<&str> {
         | Command::AlarmsClient { .. }
         | Command::Top { .. }
         | Command::TapeAlertsAlias { .. }
+        | Command::TapeFinalizeClient(_)
+        | Command::TapeInventoryClient(_)
+        | Command::TapeVerifyIndexClient(_)
         | Command::ArchiveVerifyClient { .. }
         | Command::Tape { .. } => None,
     }
@@ -1130,6 +1148,18 @@ enum Command {
         command: TapeCommand,
     },
 
+    /// Finalize one exact tape through the daemon.
+    #[command(name = "tape-finalize-client", hide = true)]
+    TapeFinalizeClient(tape_finalize::TapeFinalizeArgs),
+
+    /// Read one exact tape's terminal-index inventory through the daemon.
+    #[command(name = "tape-inventory-client", hide = true)]
+    TapeInventoryClient(tape_inventory::TapeInventoryArgs),
+
+    /// Report the verification state for one exact tape's terminal index.
+    #[command(name = "tape-verify-index-client", hide = true)]
+    TapeVerifyIndexClient(tape_inventory::TapeInventoryArgs),
+
     /// Archive local files onto tape through the daemon write path.
     #[command(name = "put-client", hide = true)]
     PutClient(put::PutArgs),
@@ -1441,6 +1471,16 @@ enum RemTapeCommand {
 
     /// Permanently retire one tape identity in the local catalog.
     Retire(TapeRetireArgs),
+
+    /// Permanently finalize an exact reconciled tape through the daemon.
+    Finalize(tape_finalize::TapeFinalizeArgs),
+
+    /// Read the bounded terminal-index inventory for one exact tape.
+    Inventory(tape_inventory::TapeInventoryArgs),
+
+    /// Report whether one exact tape index has received full physical verification.
+    #[command(name = "verify-index")]
+    VerifyIndex(tape_inventory::TapeInventoryArgs),
 }
 
 impl From<RemTapeCommand> for TapeCommand {
@@ -1453,6 +1493,15 @@ impl From<RemTapeCommand> for TapeCommand {
             RemTapeCommand::WaitReady(args) => Self::WaitReady(args),
             RemTapeCommand::Quarantine { command } => Self::Quarantine { command },
             RemTapeCommand::Retire(args) => Self::Retire(args),
+            RemTapeCommand::Finalize(_) => {
+                unreachable!("rem tape finalize is dispatched as a daemon client")
+            }
+            RemTapeCommand::Inventory(_) => {
+                unreachable!("rem tape inventory is dispatched as a daemon client")
+            }
+            RemTapeCommand::VerifyIndex(_) => {
+                unreachable!("rem tape verify-index is dispatched as a daemon client")
+            }
         }
     }
 }
@@ -1464,6 +1513,10 @@ enum TapeCommand {
 
     /// Run one destructive §18.4 fault-injected scratch-tape round-trip.
     FreezeDrill(TapeFreezeDrillArgs),
+
+    /// Run one read-only terminal triple-index verification/fallback leg.
+    #[command(name = "terminal-index-drill")]
+    TerminalIndexDrill(terminal_index_drill::TerminalIndexDrillArgs),
 
     /// Read the loaded drive's TapeAlert LOG SENSE page.
     Alerts(TapeAlertsArgs),
@@ -1490,6 +1543,7 @@ impl TapeCommand {
         match self {
             Self::RecoveryReport(args) => args.validate_before_discovery(),
             Self::FreezeDrill(args) => args.validate_before_discovery(),
+            Self::TerminalIndexDrill(args) => args.validate_before_discovery(),
             Self::Alerts(args) => args.validate_before_discovery(),
             Self::Init(args) => args.validate_before_discovery(),
             Self::WaitReady(args) => args.validate_before_discovery(),
@@ -3642,6 +3696,11 @@ where
             };
             return run_drive_client_command(endpoint, *json, &command, out, err);
         }
+        Command::TapeFinalizeClient(args) => return tape_finalize::run(args, out, err),
+        Command::TapeInventoryClient(args) => return tape_inventory::run_inventory(args, out, err),
+        Command::TapeVerifyIndexClient(args) => {
+            return tape_inventory::run_verify_index(args, out, err)
+        }
         Command::ArchiveVerifyClient {
             endpoint,
             library,
@@ -3732,6 +3791,9 @@ where
                 out,
                 err,
             );
+        }
+        if let TapeCommand::TerminalIndexDrill(args) = command {
+            return terminal_index_drill::run_live(args, out, err);
         }
         // These tape subcommands are catalog + audit only — no SCSI, no
         // library allowlist — so they bypass discovery entirely (like the
@@ -3853,6 +3915,15 @@ where
             }
         },
         Command::TapeAlertsAlias { .. } => unreachable!("daemon alias dispatched pre-discovery"),
+        Command::TapeFinalizeClient(_) => {
+            unreachable!("daemon tape finalization dispatched pre-discovery")
+        }
+        Command::TapeInventoryClient(_) => {
+            unreachable!("daemon tape inventory dispatched pre-discovery")
+        }
+        Command::TapeVerifyIndexClient(_) => {
+            unreachable!("daemon tape index verification dispatched pre-discovery")
+        }
         Command::Move { serial, src, dst } => {
             return run_state_change(
                 &report,
@@ -6189,7 +6260,8 @@ fn tape_json(tape: &pb::Tape) -> Value {
         "data_blocks_per_stripe": tape.data_blocks_per_stripe,
         "parity_blocks_per_stripe": tape.parity_blocks_per_stripe,
         "stripes_per_neighborhood": tape.stripes_per_neighborhood,
-        "last_committed_tape_file": tape.last_committed_tape_file,
+        "last_committed_tape_file": tape.last_committed_tape_file.map(|value| value.to_string()),
+        "written_extent_lba": tape.written_extent_lba.map(|value| value.to_string()),
         "state": tape_state_name(tape.state),
         "updated_at": timestamp_value(tape.updated_at.as_ref()),
         "pool_id": tape.pool_id,
@@ -6430,9 +6502,9 @@ fn print_live_status_text(
 fn tape_file_json(file: &pb::TapeFile) -> Value {
     json!({
         "tape_uuid": bytes_to_uuid_text(&file.tape_uuid),
-        "tape_file_number": file.tape_file_number,
+        "tape_file_number": file.tape_file_number.to_string(),
         "kind": file.kind,
-        "block_count": file.block_count,
+        "block_count": file.block_count.to_string(),
         "object_id": if file.object_id.is_empty() {
             Value::Null
         } else {
@@ -6466,7 +6538,7 @@ fn catalog_entry_json(entry: &pb::CatalogEntry) -> Value {
         "entry_id": bytes_to_text_or_uuid(&entry.entry_id),
         "path": entry.path,
         "kind": catalog_entry_kind_name(entry.kind),
-        "size_bytes": entry.size_bytes,
+        "size_bytes": entry.size_bytes.map(|value| value.to_string()),
         "mtime": timestamp_value(entry.mtime.as_ref()),
         "state": catalog_entry_state_name(entry.state),
         "integrity_basis": integrity_basis_name(entry.integrity_basis),
@@ -7701,6 +7773,9 @@ fn run_tape_command(
         }
         TapeCommand::FreezeDrill(_) => {
             unreachable!("tape freeze-drill dispatched pre-discovery")
+        }
+        TapeCommand::TerminalIndexDrill(_) => {
+            unreachable!("tape terminal-index-drill dispatched pre-discovery")
         }
         TapeCommand::Alerts(args) => run_tape_alerts(report, args, out, err),
         TapeCommand::Init(args) => run_tape_init(report, args, out, err),
@@ -14907,6 +14982,7 @@ mod tests {
                 selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
                 watermark_low: 0.92,
                 watermark_high: 0.97,
+                capacity_cap_bytes: None,
                 block_size_bytes,
                 min_object_size_bytes: 0,
             }],
@@ -16391,6 +16467,117 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rem_tape_finalize_parses_required_daemon_client_surface() {
+        let tape_uuid = Uuid::from_u128(0x10).to_string();
+        let key = Uuid::from_u128(0x20).to_string();
+        let cli = Cli::parse_from([
+            "rem",
+            "tape",
+            "finalize",
+            "--tape-uuid",
+            &tape_uuid,
+            "--expected-pool",
+            "slow-offsite",
+            "--reason",
+            "  ship after audit  ",
+            "--idempotency-key",
+            &key,
+            "--wait",
+            "--json",
+            "--ack-tape-uuid",
+            &tape_uuid,
+            "--endpoint",
+            "http://127.0.0.1:50051",
+        ]);
+
+        match cli.command {
+            RemCommand::Tape {
+                command: RemTapeCommand::Finalize(args),
+            } => {
+                assert_eq!(args.tape_uuid, tape_uuid);
+                assert_eq!(args.expected_pool.as_deref(), Some("slow-offsite"));
+                assert_eq!(args.reason, "  ship after audit  ");
+                assert_eq!(args.idempotency_key, key);
+                assert!(args.wait);
+                assert!(args.json);
+                assert_eq!(args.ack_tape_uuid, tape_uuid);
+                assert_eq!(args.endpoint, "http://127.0.0.1:50051");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rem_tape_finalize_requires_idempotency_and_acknowledgement() {
+        let tape_uuid = Uuid::from_u128(0x10).to_string();
+        let missing_key = Cli::try_parse_from([
+            "rem",
+            "tape",
+            "finalize",
+            "--tape-uuid",
+            &tape_uuid,
+            "--reason",
+            "ship",
+            "--ack-tape-uuid",
+            &tape_uuid,
+        ])
+        .unwrap_err();
+        assert!(missing_key.to_string().contains("--idempotency-key"));
+
+        let missing_ack = Cli::try_parse_from([
+            "rem",
+            "tape",
+            "finalize",
+            "--tape-uuid",
+            &tape_uuid,
+            "--reason",
+            "ship",
+            "--idempotency-key",
+            &Uuid::from_u128(0x20).to_string(),
+        ])
+        .unwrap_err();
+        assert!(missing_ack.to_string().contains("--ack-tape-uuid"));
+    }
+
+    #[test]
+    fn rem_tape_finalize_bypasses_allowlist_and_local_discovery() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-cli-finalize-no-discovery")
+            .tempdir()
+            .unwrap();
+        let tape_uuid = Uuid::from_u128(0x10).to_string();
+        let endpoint = format!("unix:{}", dir.path().join("missing.sock").display());
+        let cli = Cli::parse_from([
+            "rem",
+            "tape",
+            "finalize",
+            "--tape-uuid",
+            &tape_uuid,
+            "--reason",
+            "ship",
+            "--idempotency-key",
+            &Uuid::from_u128(0x20).to_string(),
+            "--ack-tape-uuid",
+            &tape_uuid,
+            "--endpoint",
+            &endpoint,
+        ]);
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run(
+            cli,
+            || panic!("daemon finalization must not invoke local SCSI discovery"),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::from(1));
+        assert!(out.is_empty());
+        assert!(String::from_utf8(err)
+            .unwrap()
+            .contains("connect daemon at unix:"));
     }
 
     #[test]

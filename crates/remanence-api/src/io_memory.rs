@@ -31,17 +31,33 @@ impl IoMemoryReservation {
     }
 
     pub(crate) fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<IoMemoryPermit> {
+        self.try_reserve_with_available(bytes).ok()
+    }
+
+    /// Atomically reserve `bytes`, or return the available byte count observed
+    /// at the failed admission decision.
+    ///
+    /// The returned shortfall value is diagnostic evidence from the same
+    /// atomic loop that denied the request. Callers must not use a separate
+    /// "free bytes" read as an admission grant because another session could
+    /// consume that capacity before its reservation.
+    pub(crate) fn try_reserve_with_available(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<IoMemoryPermit, u64> {
         if bytes == 0 {
-            return Some(IoMemoryPermit {
+            return Ok(IoMemoryPermit {
                 manager: Arc::clone(self),
                 bytes: 0,
             });
         }
         let mut current = self.granted.load(Ordering::Acquire);
         loop {
-            let next = current.checked_add(bytes)?;
+            let Some(next) = current.checked_add(bytes) else {
+                return Err(self.ceiling.saturating_sub(current));
+            };
             if next > self.ceiling {
-                return None;
+                return Err(self.ceiling.saturating_sub(current));
             }
             match self.granted.compare_exchange_weak(
                 current,
@@ -51,7 +67,7 @@ impl IoMemoryReservation {
             ) {
                 Ok(_) => {
                     debug_assert!(next <= self.ceiling);
-                    return Some(IoMemoryPermit {
+                    return Ok(IoMemoryPermit {
                         manager: Arc::clone(self),
                         bytes,
                     });
@@ -121,5 +137,17 @@ mod tests {
         drop(permit);
         assert_eq!(manager.granted(), 0);
         assert!(manager.try_reserve(8).is_some());
+    }
+
+    #[test]
+    fn denied_reservation_reports_available_bytes_from_atomic_decision() {
+        let manager = IoMemoryReservation::new(10).expect("manager");
+        let held = manager.try_reserve(7).expect("initial reservation");
+
+        assert_eq!(manager.try_reserve_with_available(4).unwrap_err(), 3);
+        assert_eq!(manager.granted(), 7);
+
+        drop(held);
+        assert!(manager.try_reserve_with_available(10).is_ok());
     }
 }

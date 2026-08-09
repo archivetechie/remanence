@@ -1,188 +1,149 @@
 # parity-capacity formal specification
 
-Target: `verif/parity-capacity/src/lib.rs`, a dependency-free extraction of the
-pure arithmetic in `crates/remanence-parity/src/capacity.rs`.
+Target: the terminal-close and compact decision kernels in
+`verif/parity-capacity/src/lib.rs`, extracted from the scalar arithmetic in
+`crates/remanence-parity/src/capacity.rs`.
 
-Notation:
+The extraction contains only the current terminal-triple capacity model.
+ParityMap arithmetic is used only for the single final pre-A parity-closeout
+file, never as terminal inventory authority.
 
-- `S` = one sidecar tape file's tape-block cost
-- `B` = one bootstrap tape file's tape-block cost
-- `F = current_epoch_fill_blocks + projected_object_blocks`
-- `E = data_shards_per_epoch`
-- `Q = F / E` = full epochs completed by the projected object
-- `R = F % E`
-- `P = S` when `R != 0`, otherwise `0`
+## C1 — exact replica and separation geometry
 
-## C1 -- sidecar and bootstrap file sizes
+For structural count `S:u64`, Object-row count `R:u64`, and supported block
+size `B`, require `R <= S` and a nonzero structural prefix containing the
+BOT Bootstrap.
 
-When arithmetic does not overflow:
+```text
+payload_bytes          = 64*S + 256*R
+payload_records        = ceil(payload_bytes/B)
+replica_records        = payload_records + 2
+replica_charge         = replica_records + replica_filemark_charge
+triple_replica_charge  = 3*replica_charge
+```
 
-- `S = (2 * sidecar_index_block_count + 1) + parity_shards_per_epoch + sidecar_filemark_blocks`
-- `B = 1 + bootstrap_filemark_blocks`
+The added two records are exactly one header and one replica-local footer. The
+replica payload is streamed fixed-slot data; no one-block row ceiling is part of
+this model.
 
-## C2 -- epoch completion and final partial sidecar
+For nominal separation bytes `G = 1 GiB`:
 
-For `E > 0` and `current_epoch_fill_blocks < E`:
+```text
+gap_records       = ceil(G/B)
+gap_charge        = gap_records + gap_filemark_charge
+double_gap_charge = 2*gap_charge
+```
 
-- `epochs_completed_by_object = Q`
-- `final_partial_sidecar_needed` is true exactly when `R != 0`
+The supported 256 KiB, 512 KiB, and 1 MiB record sizes yield respectively
+4096, 2048, and 1024 records per gap. Header and footer are included in that
+count. A different nominal extent, an unsupported block size, `R > S`, or
+checked overflow fails closed.
 
-## C3 -- tape reserve
+## C2 — exact close reserve
 
-When arithmetic does not overflow:
+Object admission and manual finalization use the same close kernel:
 
-`reserve_after_object_blocks =
-object_filemark_blocks
-+ pending_completed_sidecars * S
-+ Q * S
-+ P
-+ remaining_bootstrap_count * B
-+ safety_margin_blocks`
+```text
+parity_closeout = final_partial_sidecar_charge + final_parity_map_charge
+terminal_tail   = triple_replica_charge + double_gap_charge
+close_bound     = parity_closeout + terminal_tail + safety_allowance
+required_tape   = prefix_commit_charge + close_bound
+```
 
-and
+The input carries the selected cartridge/profile capacity basis `C`, pool
+watermarks `L/H`, and barrier-proved physical remainder. It rejects
+`remaining > C` and any policy other than `L < H <= C`. The worst legal close
+must fit `C-H` before the first Object can use the profile.
 
-`required_tape_blocks = projected_object_blocks + reserve_after_object_blocks`.
+Each term is disjoint. No record, footer, or filemark appears twice. Spool
+reserve includes only encoded pending sidecar records and therefore excludes
+tape-only filemarks, final ParityMap, gaps, replicas, and safety.
 
-## C4 -- spool reserve
+The final partial-sidecar charge uses the actual projected epoch remainder for
+its data-CRC index rows. Its parity shard count remains the scheme-fixed
+`stripes_per_neighborhood * parity_blocks_per_stripe`; it is not charged as a
+full data-index layout.
 
-When arithmetic does not overflow:
+Projection distinguishes automatic Object admission from manual close:
 
-`required_spool_bytes =
-pending_completed_epoch_parity_bytes + Q * (S * block_size_bytes)`.
+- automatic admission adds the Object file/row and sidecars completed by it;
+- manual close adds no Object file, Object row, or Object filemark charge;
+- the no-parity profile requires zero epoch/sidecar/spool state and sets every
+  sidecar, parity-closeout, and spool term to zero while preserving A/B/C and
+  both gaps;
+- both close a nonempty partial epoch when present, fix exact post-closeout
+  structural/Object counts, and preserve the complete terminal tail;
+- both validate the worst-close profile and current tape/spool availability;
+- equality at a tape or spool bound succeeds;
+- both report the same current-tape shortage before spool shortage; pool
+  orchestration classifies fresh-media impossibility from that same exact
+  result instead of invoking a second capacity model.
 
-## C5 -- gate ordering
+Every nonempty sidecar directory emits exactly one external final ParityMap.
+It belongs to pre-A parity closeout and consumes one structural slot in all
+three replicas; it is not one of the five terminal-tail components. The
+no-parity branch is currently tied to production by the compiled Rust
+behavior check; it is extracted into Lean but does not yet carry a dedicated
+success theorem. The Lean theorems prove the checked scalar formulas, exact multiplicities
+`3` and `2`, fail-closed arithmetic, profile guards, projection identities,
+and branch ordering over the extracted functions.
 
-After invariant and arithmetic checks:
+## C3 — irreversible five-component progress
 
-- if `empty_tape_usable_blocks < required_tape_blocks`, the result is
-  `ObjectTooLargeForEmptyTape`
-- else if `remaining_tape_blocks < required_tape_blocks`, the result is
-  `TapeCapacity`
-- else if `remaining_spool_bytes < required_spool_bytes`, the result is
-  `ParitySpoolCapacity`
-- otherwise `evaluate` returns a report with the C1-C4 fields.
+The proof-facing progress type has exactly six states:
 
-The C1-C5 surface remains the compatibility proof for the current live reserve
-helper. The following clauses specify the proof-first snapshot-aware helper;
-it is intentionally unused by the writer until this proof gate is complete.
+```text
+BeforeReplicaA
+AfterReplicaA
+AfterSeparationAb
+AfterReplicaB
+AfterSeparationBc
+AfterReplicaC
+```
 
-## C6 -- shared sidecar index bound
+- successful advancement moves exactly one component and never skips;
+- a failed or completion-unknown barrier leaves progress unchanged;
+- completed replica projection is `0,1,1,2,2,3` and never decreases;
+- Object admission is false throughout Finalizing;
+- ordinary sealed/finalized projection is allowed only at `AfterReplicaC`.
 
-For block size `b`, the sidecar index starts after a 184-byte fixed header and
-ends eight bytes before each block boundary. The extracted scalar packer places
-all 16-byte parity rows followed by all 8-byte data-CRC rows without allowing a
-row to cross a block. The production encoder calls this same scalar helper, so
-there is no second layout formula to reconcile. Rust boundary tests compare it
-with the retired entry-by-entry reference and pin the shipped 256 KiB profile;
-Lean checks the extracted scalar result and composes it into the tape bound.
-The maximum complete sidecar uses
-`parity_shards_per_epoch` parity rows and `data_shards_per_epoch` data rows.
+These theorems establish the scalar progress and admission predicates used by
+the lifecycle. They do not prove persistence of the caller's
+`Open -> Finalizing -> Finalized/RecoveryRequired` state or independently prove
+that orchestration never clears the finalizing flag; that durable transition is
+outside this proof boundary.
 
-The sidecar's pre-filemark tape cost is:
+## C4 — terminal replica selection
 
-`SidecarBody = 2 * index_blocks + parity_shards_per_epoch + 1`
+The compact selection kernel has five outcomes:
 
-where the final block is the footer locator. Its physical tape-file charge is
-`SidecarBody + sidecar_filemark_blocks`.
+```text
+ReplicaC | ReplicaB | ReplicaA | FullBotScan | Conflict
+```
 
-## C7 -- bounded ParityMap term
+With agreeing common edition facts, selection prefers C, then B, then A. Any
+two or more valid survivors whose common facts disagree yield `Conflict`.
+No valid survivor yields `FullBotScan`, never an empty-success inventory.
 
-For post-closeout sidecar row count `N`, checked allocation-free CBOR bounds are:
+## Boundaries
 
-- directory bytes `<= 43 + 116 * N`
-- complete ParityMap payload bytes `<= 325 + 116 * N`
+The proofs do not cover:
 
-The constants charge u64-width structural integers, maximum legal diagnostic
-strings, maximum CBOR container heads, and every fixed field. The current
-encoder must remain below this future-width-safe bound. The allocation-free
-constants are a reviewed CBOR derivation guarded by maximum-width encoder
-tests. Lean proves the checked `43+116*N` and `325+116*N` arithmetic; it does
-not verify the `ciborium` implementation. An external ParityMap uses C8's
-control geometry with a 184-byte header, plus its separate filemark.
+- deterministic CBOR encoding/decoding or fixed-slot bytes;
+- HMAC-SHA-256, SHA-256, or CRC-64/XZ algebra;
+- replica/separation header and footer buffer construction;
+- device positioning, filemarks, EOD, persistence barriers, or media damage;
+- journal fsync/SQLite ordering or restart orchestration;
+- byte-level survivor-agreement fields or the physical BOT recovery walk;
+- the standard library internals used by production collections and IO.
 
-The capacity profile also derives a physical directory-count ceiling:
-
-`Nmax = empty_tape_usable_blocks /
-        (parity_shards_per_epoch + 3 + sidecar_filemark_blocks)`.
-
-A pre-existing committed directory above that ceiling is inconsistent and
-rejected. A proposed Object that would cross it proceeds to the ordinary
-empty/current-tape capacity gates, so a naturally oversized Object receives
-the correct terminal-versus-retry classification instead of `Invariant`.
-Before per-Object projection, the kernel evaluates the ParityMap bounds at
-`Nmax` and the snapshot fixed-slot/control geometry at conservative counts
-`T=C, O=C`. It also requires the maximum complete sidecar and the conservative
-sum of that sidecar, the maximum ParityMap, the maximum snapshot, the terminal
-bootstrap, their filemarks, and safety allowance to fit the checked closeout
-band `C-H`. `H > C`, any arithmetic failure, or a physically impossible close
-is a typed unsafe-profile refusal. This is an allocation-free representability
-and physical-feasibility check, not a claim that those hypothetical rows are
-materialized.
-
-## C8 -- snapshot geometry
-
-For `structural_entry_count = T` and `object_row_count = O`, require `O <= T`.
-The exact payload is `64*T + 256*O`. For block size `b`, header size `h`, and
-payload size `p`, one replicated control file occupies:
-
-`2 * ceil((h + p) / b) + 1` blocks.
-
-All arithmetic is checked. The final one is the footer locator. The snapshot
-uses `h=512`; its trailing filemark is charged separately.
-
-## C9 -- post-Object and post-closeout counts
-
-Before projection, Object rows and sidecar-directory rows are disjoint map
-entries, so checked `object_rows_before + sidecar_rows_before <=
-structural_entries_before` is required in addition to each individual bound.
-Every mapped structural file, including a bootstrap prefix, consumes at least
-one physical block, so `structural_entries_before <= C` is also required. There
-is no uncounted bootstrap-prefix allowance outside that ceiling.
-
-Let `D = pending_completed_sidecars + Q` and `J = 1` when `R != 0`, else `0`.
-Then:
-
-- `object_commit_charge = projected_object_blocks + object_filemark_blocks + D*S`
-- `object_rows_after = object_rows_before_object + 1`
-- `sidecar_entries_after_closeout = sidecar_entries_before_object + D + J`
-- `structural_entries_after_closeout =
-  structural_entries_before_object + 1 + D + J + [N != 0]`
-
-The new snapshot and following terminal bootstrap are deliberately excluded
-from the embedded map's prefix count. Until the replacement bootstrap byte
-contract supplies a codec-derived inline-fit decision, this proof-first kernel
-conservatively reserves one external ParityMap for every non-empty directory;
-it accepts no caller-supplied inline byte budget.
-
-## C10 -- conservative checked close bound and gates
-
-`CloseBound` is the checked safe upper bound formed from:
-
-- a maximum-layout terminal partial sidecar and filemark, when `J=1`
-- the external replicated ParityMap and filemark, when required
-- the replicated snapshot and filemark
-- one bootstrap block and its filemark
-- the safety allowance
-
-`required_tape_blocks = object_commit_charge + CloseBound`.
-
-The empty-tape-impossible gate precedes current-tape retry, which precedes the
-separate spool gate. Snapshot-aware spool bytes charge encoded sidecar blocks
-before the tape-only filemark. Equality with tape or spool availability
-succeeds; every checked overflow fails closed.
-
-This Stage 0 base kernel covers an ordinary Object for which no checkpoint or
-geometric policy control is due. Its Object charge is the Object file plus
-completed sidecars. The Stage 4 scheduler must add every forced checkpoint or
-policy ParityMap/snapshot/bootstrap bundle to `U'` and re-establish the
-post-policy close bound before this result is wired into admission; the pure
-pool kernel already accepts that complete caller-projected charge.
+Drift guards and compiled-production behavior matrices connect selected scalar
+inputs/results to production. They are change detectors, not semantic
+equivalence proofs.
 
 ## Trust anchor
 
-The Lean type checker (`lake build` with zero local placeholders) is the proof
-anchor for the extracted arithmetic and branch order. Rust drift tests compare
-the proof-facing kernel with production behavior and pin encoder-only facts
-outside Lean's scope. The proof inventory also regenerates the checked-in
-Aeneas output and requires a byte-for-byte match. If either guard fires, the
-extraction and proofs must be re-established.
+`lake build` type-checks the local Lean theorems. The proof inventory also
+regenerates Aeneas output and compares it byte-for-byte with the checked-in
+definitions. External Aeneas library warnings are outside the local proof
+files; local maintained proof files must contain no placeholders.

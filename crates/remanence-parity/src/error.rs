@@ -107,9 +107,9 @@ pub enum ParityError {
         message: String,
     },
 
-    /// Tape-index snapshot framing, source, or integrity validation failed.
-    #[error("tape-index snapshot error: {0}")]
-    TapeIndexSnapshot(String),
+    /// Terminal tape-index payload framing, source, or integrity validation failed.
+    #[error("terminal tape-index replica error: {0}")]
+    TapeIndexReplica(String),
 
     /// A sidecar epoch directory violates a required structural invariant.
     #[error("DirectoryInvalid: {0}")]
@@ -142,8 +142,7 @@ pub enum ParityError {
     #[error("filemark map could not be reconstructed: {0}")]
     FilemarkMapReconstruct(String),
 
-    /// A recovery request is outside the tape-file prefix that an
-    /// intermediate bootstrap authenticated.
+    /// A recovery request is outside the digest-validated tape-file prefix.
     #[error("ordinal {ordinal} is outside validated map prefix ending at {prefix_ordinals}")]
     OutsideValidatedMapPrefix {
         /// Requested parity data ordinal.

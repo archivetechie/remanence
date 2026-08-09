@@ -6,7 +6,8 @@ use remanence_library::{
 use remanence_state::{CatalogIndex, StateError};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use uuid::Uuid;
 
@@ -349,6 +350,536 @@ pub(crate) enum ReadSessionTarget {
         library_serial: String,
         bay: u16,
     },
+}
+
+/// Authenticated manual close-out request before catalog assignment is reread
+/// under the shared per-tape owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ManualFinalizeTapeAdmission {
+    pub(crate) candidate_operation_id: Uuid,
+    pub(crate) actor: remanence_state::AuditActor,
+    pub(crate) actor_fingerprint: String,
+    pub(crate) idempotency_key: Uuid,
+    pub(crate) request_fingerprint: [u8; 32],
+    pub(crate) tape_uuid: TapeUuid,
+    pub(crate) expected_pool_id: Option<String>,
+    pub(crate) reason: String,
+}
+
+/// Read the terminal index of one exact tape under the same tape/drive owner
+/// used by ordinary read sessions. The actor performs only readiness, identity,
+/// fixed-read configuration, and read/position commands.
+pub(crate) async fn tape_inventory(
+    state: &ApiState,
+    tape_uuid: TapeUuid,
+) -> Result<ReceiverStream<Result<pb::TapeInventoryStreamItem, Status>>, Status> {
+    state.drive_pool()?;
+    let (stream_tx, stream_rx) = mpsc::channel(16);
+    let state = state.clone();
+    tokio::spawn(async move {
+        let error_tx = stream_tx.clone();
+        if let Err(error) = tape_inventory_critical(state, tape_uuid, stream_tx).await {
+            let _ = error_tx.send(Err(error)).await;
+        }
+    });
+    Ok(ReceiverStream::new(stream_rx))
+}
+
+async fn tape_inventory_critical(
+    state: ApiState,
+    tape_uuid: TapeUuid,
+    stream_tx: mpsc::Sender<Result<pb::TapeInventoryStreamItem, Status>>,
+) -> Result<(), Status> {
+    let pool = state.drive_pool()?.clone();
+    let _tape_reservation = pool.reserve_tape(tape_uuid)?;
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let tape = index
+        .get_tape(&tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    if tape.kind != "data" {
+        return Err(Status::failed_precondition(format!(
+            "tape is a {} cartridge, not a data tape",
+            tape.kind
+        )));
+    }
+    let library_serial = state
+        .default_library_serial
+        .as_deref()
+        .map(|serial| serial.as_str().to_string())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "tape inventory requires exactly one configured library in this slice",
+            )
+        })?;
+    let (mount, drive_reservation) =
+        resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+    let drive = pool.drive_tx(mount.bay)?;
+    if let Some(slot) = mount.source_slot {
+        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+            drop(drive_reservation);
+            return Err(error);
+        }
+    }
+    let (reply, response) = oneshot::channel();
+    if drive
+        .send(crate::write_owner::DriveCommand::TapeInventory {
+            tape_uuid,
+            needs_drive_load: mount.needs_drive_load,
+            library_serial: mount.library_serial.clone(),
+            barcode: mount.barcode.clone(),
+            source_slot: mount.source_slot,
+            drive_serial: mount.drive_serial.clone(),
+            stream_tx,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        compensate_open_mount(&pool, &mount).await;
+        drop(drive_reservation);
+        return Err(Status::unavailable("drive actor is unavailable"));
+    }
+    let result = response
+        .await
+        .map_err(|_| Status::unavailable("drive actor stopped during tape inventory"))?;
+    if let Some(home_slot) = mount.home_slot {
+        let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+            bay: mount.bay,
+            library_serial: mount.library_serial,
+            barcode: mount.barcode,
+            home_slot,
+            tape_uuid: Some(tape_uuid),
+            prior_session_id: None,
+        });
+        schedule_idle_dismount(state, parked);
+    }
+    drop(drive_reservation);
+    result
+}
+
+/// Run the slow measured-prefix/full-terminal verification under the exact
+/// tape owner. Unlike [`tape_inventory`], this walks from BOT and reads every
+/// record in all three replicas and both separation extents.
+pub(crate) async fn verify_tape_index(
+    state: &ApiState,
+    tape_uuid: TapeUuid,
+) -> Result<pb::TapeIndexVerification, Status> {
+    let state = state.clone();
+    await_critical_task(
+        "verify_tape_index",
+        tokio::spawn(async move { verify_tape_index_critical(state, tape_uuid).await }),
+    )
+    .await
+}
+
+async fn verify_tape_index_critical(
+    state: ApiState,
+    tape_uuid: TapeUuid,
+) -> Result<pb::TapeIndexVerification, Status> {
+    let pool = state.drive_pool()?.clone();
+    let _tape_reservation = pool.reserve_tape(tape_uuid)?;
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let tape = index
+        .get_tape(&tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    if tape.kind != "data" {
+        return Err(Status::failed_precondition(format!(
+            "tape is a {} cartridge, not a data tape",
+            tape.kind
+        )));
+    }
+    let library_serial = state
+        .default_library_serial
+        .as_deref()
+        .map(|serial| serial.as_str().to_string())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "tape index verification requires exactly one configured library in this slice",
+            )
+        })?;
+    let (mount, drive_reservation) =
+        resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
+    let drive = pool.drive_tx(mount.bay)?;
+    if let Some(slot) = mount.source_slot {
+        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+            drop(drive_reservation);
+            return Err(error);
+        }
+    }
+    let (reply, response) = oneshot::channel();
+    if drive
+        .send(crate::write_owner::DriveCommand::VerifyTapeIndex {
+            tape_uuid,
+            needs_drive_load: mount.needs_drive_load,
+            library_serial: mount.library_serial.clone(),
+            barcode: mount.barcode.clone(),
+            source_slot: mount.source_slot,
+            drive_serial: mount.drive_serial.clone(),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        compensate_open_mount(&pool, &mount).await;
+        drop(drive_reservation);
+        return Err(Status::unavailable("drive actor is unavailable"));
+    }
+    let result = response
+        .await
+        .map_err(|_| Status::unavailable("drive actor stopped during tape index verification"))?;
+    if let Some(home_slot) = mount.home_slot {
+        let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+            bay: mount.bay,
+            library_serial: mount.library_serial,
+            barcode: mount.barcode,
+            home_slot,
+            tape_uuid: Some(tape_uuid),
+            prior_session_id: None,
+        });
+        schedule_idle_dismount(state, parked);
+    }
+    drop(drive_reservation);
+    result
+}
+
+/// Acquire the same exact-tape owner used by append and dispatch terminal
+/// close-out only after the pool assignment and generation have been captured.
+/// A conflicting Object/read session therefore returns busy before audit,
+/// intent publication, changer motion, or tape motion.
+pub(crate) async fn manual_finalize_tape(
+    state: &ApiState,
+    mut admission: ManualFinalizeTapeAdmission,
+) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
+    let pool = state.drive_pool()?.clone();
+    let _tape_reservation = match pool.reserve_tape(admission.tape_uuid) {
+        Ok(reservation) => reservation,
+        Err(error)
+            if error.code() == tonic::Code::FailedPrecondition
+                && error.message() == "tape is already mounted" =>
+        {
+            return Ok(crate::write_owner::ManualFinalizeTapeResult::Busy);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut index = CatalogIndex::open(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let tape = index
+        .get_tape(&admission.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    if tape.kind != "data" {
+        return Err(Status::failed_precondition(format!(
+            "tape is a {} cartridge, not a data tape",
+            tape.kind
+        )));
+    }
+    let assignment = index
+        .get_tape_assignment_snapshot(&admission.tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape assignment vanished"))?;
+    match (&assignment.pool_id, &admission.expected_pool_id) {
+        (Some(actual), Some(expected)) if actual == expected => {}
+        (None, None) => {}
+        (Some(actual), None) => {
+            return Err(Status::invalid_argument(format!(
+                "expected_pool_id is required for pooled tape assigned to {actual:?}"
+            )));
+        }
+        (actual, expected) => {
+            return Err(Status::failed_precondition(format!(
+                "expected_pool_id {expected:?} does not match current assignment {actual:?}"
+            )));
+        }
+    }
+    if let Some(scope) = index
+        .idempotency_scope_record(
+            admission.actor_fingerprint.as_str(),
+            "finalize_tape",
+            admission.idempotency_key,
+        )
+        .map_err(crate::status_from_state_error)?
+    {
+        if scope.request_fingerprint.as_slice() != admission.request_fingerprint {
+            return Err(Status::already_exists(
+                "FinalizeTape idempotency key is already bound to a different request",
+            ));
+        }
+        admission.candidate_operation_id = scope.operation_id;
+    }
+    if !matches!(
+        tape.state.as_str(),
+        "ready"
+            | "ingested"
+            | "finalizing"
+            | "finalized"
+            | "sealed"
+            | "finalized_degraded"
+            | "recovery_required"
+    ) {
+        return Err(Status::failed_precondition(format!(
+            "tape state {:?} cannot be terminally finalized",
+            tape.state
+        )));
+    }
+    let geometry_label = assignment.pool_id.as_deref().unwrap_or("(unpooled)");
+    let (block_size, parity_config) =
+        crate::pool_write::selected_tape_geometry(&tape, geometry_label)
+            .map_err(crate::write_owner::status_from_select_tape_error)?;
+    let pool_config = match assignment.pool_id.as_deref() {
+        Some(pool_id) => Some(state.pool_config(pool_id)?),
+        None => None,
+    };
+    let mut actor_request = crate::write_owner::ManualFinalizeTapeActorRequest {
+        candidate_operation_id: admission.candidate_operation_id,
+        actor: admission.actor,
+        actor_fingerprint: admission.actor_fingerprint,
+        idempotency_key: admission.idempotency_key,
+        request_fingerprint: admission.request_fingerprint,
+        tape_uuid: admission.tape_uuid,
+        expected_pool_id: admission.expected_pool_id,
+        assignment_generation: assignment.assignment_generation,
+        reason: admission.reason,
+        block_size,
+        parity_config,
+        pool_config,
+    };
+    if let Some(reply) = crate::write_owner::preflight_manual_finalize_tape(
+        &mut index,
+        crate::write_owner::ManualFinalizePreflightConfig {
+            checkpoint_journal_dir: state.checkpoint_journal_dir.as_path(),
+            audit_dir: state.audit_dir.as_path(),
+            audit_fsync: state.audit_fsync,
+            audit_append_lock: &state.audit_append_lock,
+        },
+        tape.voltag.as_deref(),
+        &mut actor_request,
+    )? {
+        return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
+            reply,
+        ));
+    }
+    drop(index);
+    let library_serial = state
+        .default_library_serial
+        .as_deref()
+        .map(|serial| serial.as_str().to_string())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "manual tape finalization requires exactly one configured library in this slice",
+            )
+        })?;
+    let (mount, drive_reservation) = resolve_and_reserve_actor_mount(
+        state,
+        &pool,
+        library_serial.as_str(),
+        &admission.tape_uuid,
+    )
+    .await?;
+    let drive = pool.drive_tx(mount.bay)?;
+    if let Some(slot) = mount.source_slot {
+        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+            drop(drive_reservation);
+            return Err(error);
+        }
+    }
+    let (reply, response) = oneshot::channel();
+    let command = crate::write_owner::DriveCommand::FinalizeTape {
+        request: actor_request,
+        needs_drive_load: mount.needs_drive_load,
+        library_serial: mount.library_serial.clone(),
+        barcode: mount.barcode.clone(),
+        source_slot: mount.source_slot,
+        drive_uuid: mount.drive_uuid.clone(),
+        drive_serial: mount.drive_serial.clone(),
+        reply,
+    };
+    if drive.send(command).await.is_err() {
+        compensate_open_mount(&pool, &mount).await;
+        drop(drive_reservation);
+        return Err(Status::unavailable("drive actor is unavailable"));
+    }
+    let result = response
+        .await
+        .map_err(|_| Status::unavailable("drive actor stopped during tape finalization"))?;
+    if let Some(home_slot) = mount.home_slot {
+        let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+            bay: mount.bay,
+            library_serial: mount.library_serial,
+            barcode: mount.barcode,
+            home_slot,
+            tape_uuid: Some(admission.tape_uuid),
+            prior_session_id: None,
+        });
+        schedule_idle_dismount(state.clone(), parked);
+    }
+    drop(drive_reservation);
+    result.map(crate::write_owner::ManualFinalizeTapeResult::Accepted)
+}
+
+/// Resume every daemon-owned terminal finalization that was durable when the
+/// process stopped. Operator-owned finalizations remain attached to their
+/// original idempotent API operation and are resumed only by that caller.
+pub(crate) fn spawn_startup_automatic_terminal_recoveries(state: ApiState) {
+    tokio::spawn(async move {
+        let paths =
+            match remanence_state::list_checkpoint_journals(state.checkpoint_journal_dir.as_path())
+            {
+                Ok(paths) => paths,
+                Err(error) => {
+                    tracing::error!(%error, "cannot enumerate startup terminal recoveries");
+                    return;
+                }
+            };
+        for path in paths {
+            let tape_uuid = match remanence_state::tape_uuid_from_checkpoint_path(&path) {
+                Ok(tape_uuid) => tape_uuid,
+                Err(error) => {
+                    tracing::error!(path = %path.display(), %error, "invalid checkpoint journal path during startup recovery");
+                    continue;
+                }
+            };
+            let journal = match remanence_state::FileCheckpointJournal::open(
+                state.checkpoint_journal_dir.as_path(),
+                tape_uuid,
+            ) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot open checkpoint journal during startup recovery");
+                    continue;
+                }
+            };
+            let intent = match journal.terminal_finalization_intent() {
+                Ok(intent) => intent,
+                Err(error) => {
+                    tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot inspect terminal intent during startup recovery");
+                    continue;
+                }
+            };
+            let Some(intent) = intent else {
+                continue;
+            };
+            if intent.manual.is_some() {
+                tracing::info!(
+                    tape_uuid = %Uuid::from_bytes(tape_uuid),
+                    progress = ?intent.progress,
+                    "operator terminal finalization awaits idempotent FinalizeTape retry"
+                );
+                continue;
+            }
+            if let Err(error) = recover_automatic_terminal_tape(&state, tape_uuid).await {
+                tracing::error!(
+                    tape_uuid = %Uuid::from_bytes(tape_uuid),
+                    progress = ?intent.progress,
+                    %error,
+                    "automatic terminal finalization did not complete during startup recovery"
+                );
+            }
+        }
+    });
+}
+
+async fn recover_automatic_terminal_tape(
+    state: &ApiState,
+    tape_uuid: TapeUuid,
+) -> Result<(), Status> {
+    let pool = state.drive_pool()?.clone();
+    let _tape_reservation = pool.reserve_tape(tape_uuid)?;
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let tape = index
+        .get_tape(&tape_uuid)
+        .map_err(crate::status_from_state_error)?
+        .ok_or_else(|| Status::not_found("terminal-recovery tape not found"))?;
+    let pool_id = tape.pool_id.as_deref().ok_or_else(|| {
+        Status::failed_precondition(
+            "automatic terminal recovery requires the original pool assignment",
+        )
+    })?;
+    let pool_cfg = state.pool_config(pool_id)?;
+    let (block_size, parity_config) = crate::pool_write::selected_tape_geometry(&tape, pool_id)
+        .map_err(crate::write_owner::status_from_select_tape_error)?;
+    let selected = crate::SelectedTape {
+        pool_id: pool_id.to_string(),
+        tape_uuid,
+        block_size,
+        parity_config,
+    };
+    let library_serial = state
+        .default_library_serial
+        .as_deref()
+        .map(|serial| serial.as_str().to_string())
+        .ok_or_else(|| {
+            Status::invalid_argument(
+                "automatic terminal recovery requires exactly one configured library",
+            )
+        })?;
+    let (mount, drive_reservation) =
+        resolve_and_reserve_actor_mount(state, &pool, &library_serial, &tape_uuid).await?;
+    let drive = pool.drive_tx(mount.bay)?;
+    if let Some(slot) = mount.source_slot {
+        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+            drop(drive_reservation);
+            return Err(error);
+        }
+    }
+    let (reply, response) = oneshot::channel();
+    if drive
+        .send(crate::write_owner::DriveCommand::OpenWrite {
+            pool_cfg,
+            selected,
+            target_kind: pb::write_session::TargetKind::WriteSessionTargetKindPinnedTape,
+            needs_drive_load: mount.needs_drive_load,
+            library_serial: mount.library_serial.clone(),
+            barcode: mount.barcode.clone(),
+            source_slot: mount.source_slot,
+            drive_uuid: mount.drive_uuid.clone(),
+            drive_serial: mount.drive_serial.clone(),
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        compensate_open_mount(&pool, &mount).await;
+        drop(drive_reservation);
+        return Err(Status::unavailable(
+            "drive actor is unavailable for automatic terminal recovery",
+        ));
+    }
+    let actor_result = response.await.map_err(|_| {
+        Status::unavailable("drive actor stopped during automatic terminal recovery")
+    })?;
+    if let Some(home_slot) = mount.home_slot {
+        let parked = pool.park_cartridge(crate::write_owner::SeatedCartridge {
+            bay: mount.bay,
+            library_serial: mount.library_serial,
+            barcode: mount.barcode,
+            home_slot,
+            tape_uuid: Some(tape_uuid),
+            prior_session_id: None,
+        });
+        schedule_idle_dismount(state.clone(), parked);
+    }
+    drop(drive_reservation);
+
+    let projection = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?
+        .terminal_finalization(&tape_uuid)
+        .map_err(crate::status_from_state_error)?;
+    if projection.is_some_and(|projection| {
+        projection.outcome == remanence_state::TerminalFinalizationOutcome::Finalized
+    }) {
+        return Ok(());
+    }
+    match actor_result {
+        Ok(_) => Err(Status::internal(
+            "automatic terminal recovery unexpectedly opened an Object session",
+        )),
+        Err(error) => Err(error),
+    }
 }
 
 impl ReadSessionTarget {
@@ -1815,7 +2346,7 @@ mod tests {
                         protected_ordinal_start: None,
                         protected_ordinal_end_exclusive: None,
                         canonical_metadata_hash: None,
-                        bootstrap_object_row: None,
+                        object_recovery_row: None,
                     }],
                     highest_protected_ordinal: 0,
                     total_committed_ordinals: 3,
@@ -1830,6 +2361,7 @@ mod tests {
             selection_policy: PoolSelectionPolicyName::CompleteOrFill,
             watermark_low: 0.92,
             watermark_high: 0.97,
+            capacity_cap_bytes: None,
             block_size_bytes: u64::from(BLOCK_SIZE),
             min_object_size_bytes: 0,
         };
@@ -2042,6 +2574,64 @@ mod tests {
         let parked = pool.parked_at(0x0101).expect("managed cartridge parked");
         assert_eq!(parked.seated.library_serial, "LIB001");
         assert_eq!(parked.seated.barcode.as_deref(), Some("MAIN01L9"));
+    }
+
+    #[tokio::test]
+    async fn manual_finalize_returns_typed_busy_before_state_or_motion() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-manual-finalize-busy")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("state.sqlite");
+        let index = CatalogIndex::open(&index_path).expect("open catalog");
+        let mut state = ApiState::new(index);
+        let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
+        let (changer_tx, mut changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let tape_uuid = [0xB5; 16];
+        let _active_object_owner = pool.reserve_tape(tape_uuid).expect("reserve exact tape");
+
+        let result = manual_finalize_tape(
+            &state,
+            ManualFinalizeTapeAdmission {
+                candidate_operation_id: Uuid::from_u128(0xB501),
+                actor: remanence_state::AuditActor::User("busy@example.invalid".to_string()),
+                actor_fingerprint: "sha256:busy".to_string(),
+                idempotency_key: Uuid::from_u128(0xB502),
+                request_fingerprint: [0xB5; 32],
+                tape_uuid,
+                expected_pool_id: Some("busy.pool".to_string()),
+                reason: "operator close-out while Object is active".to_string(),
+            },
+        )
+        .await
+        .expect("busy is a typed result");
+
+        assert_eq!(result, crate::write_owner::ManualFinalizeTapeResult::Busy);
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "busy must issue no drive command"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "busy must issue no changer command"
+        );
+        let reopened = CatalogIndex::open_read_only(&index_path).expect("reopen catalog");
+        assert!(reopened
+            .idempotency_scope_record("sha256:busy", "finalize_tape", Uuid::from_u128(0xB502))
+            .expect("query idempotency")
+            .is_none());
     }
 
     struct DismountHarness {

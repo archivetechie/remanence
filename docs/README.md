@@ -19,9 +19,8 @@ format specifications — and their plain-language companion — live in
   file, defaults, environment variables, on-disk state.
 - [reference-tape-layout.md](reference-tape-layout.md) — what a written
   cartridge contains.
-- [guide-object-sizing.md](guide-object-sizing.md) — the bootstrap row
-  budget per block size, and how large objects and bundles must be for
-  each LTO generation to use tapes efficiently.
+- [guide-object-sizing.md](guide-object-sizing.md) — terminal-index capacity
+  terms and the operational tradeoffs for Object and bundle size.
 - [guide-troubleshooting.md](guide-troubleshooting.md) — failure modes
   and their remedies.
 - [reference-glossary.md](reference-glossary.md) — project and tape

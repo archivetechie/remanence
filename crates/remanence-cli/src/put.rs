@@ -979,12 +979,12 @@ fn print_receipt(
                             // above always identifies the tape. Deliberate:
                             // an unknown label is not a UUID-shaped string.
                             "voltag": voltags.get(&copy.tape_uuid),
-                            "tape_file_number": copy.tape_file_number,
+                            "tape_file_number": copy.tape_file_number.to_string(),
                             // Together with tape_uuid/tape_file_number and the
                             // object identity above, this makes each copy a
                             // complete canonical locator: the same fields the
                             // catalog and the daemon read path key on.
-                            "first_body_lba": copy.first_body_lba,
+                            "first_body_lba": copy.first_body_lba.to_string(),
                             "pool_id": copy.pool_id,
                         })
                     }).collect::<Vec<_>>(),
@@ -1422,9 +1422,9 @@ mod tests {
             assert_eq!(object["body_format"], "rem-object-v1");
             let copy = &object["copies"][0];
             assert_eq!(copy["pool_id"], "solo");
-            assert_eq!(copy["tape_file_number"], 100 + index as u64);
+            assert_eq!(copy["tape_file_number"], (100 + index as u64).to_string());
             // The receipt copy must be a complete canonical locator.
-            assert_eq!(copy["first_body_lba"], 7 * index as u64);
+            assert_eq!(copy["first_body_lba"], (7 * index as u64).to_string());
         }
         // The fake hashed what it received and asserted it matched the
         // client's declared digest, so a passing run proves byte fidelity.

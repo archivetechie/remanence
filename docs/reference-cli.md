@@ -43,6 +43,10 @@ Conventions shared across both CLIs:
   `/etc/rem/config.toml`.
 - `--json` switches to stable, machine-readable JSON output intended for
   orchestrators and scripts.
+- Tape-structural unsigned 64-bit values (file numbers, LBAs, block/row counts,
+  scopes, and edition sequences) are canonical decimal JSON strings. This is a
+  lossless contract through `u64::MAX`; consumers must not coerce them through
+  an IEEE-754 number. Human output remains ordinary decimal text.
 - Durations accept `ms`/`s`/`m`/`h` suffixes; sizes accept byte counts or
   `KiB`/`MiB`/`GiB`-style suffixes (powers of 1024).
 
@@ -128,10 +132,13 @@ or UUID.
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
 ## Tape lifecycle
 
-These run against the local config/state (not the daemon) and drive real
-hardware; they are gated by what the code calls the destructive-safety
-gauntlet — a chain of identity, ownership, and data-presence checks that
-each initialization must pass.
+Initialization, readiness, quarantine, and retirement run against local
+config/state and real hardware; they are gated by what the code calls the
+destructive-safety gauntlet — a chain of identity, ownership, and
+data-presence checks that each initialization must pass. Finalization is the
+exception: it is daemon-backed so it shares the daemon's tape ownership,
+capacity, fencing, and durable idempotency authority, and it never performs
+local SCSI discovery.
 
 | Command | What it does |
 |---|---|
@@ -141,6 +148,9 @@ each initialization must pass.
 | `rem tape quarantine show <ID>` | One fence, by quarantine id or operation UUID. |
 | `rem tape quarantine release <ID> --ack <TEXT> [--after-settled-inventory]` | Release a fence after operator root-cause acknowledgement. |
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
+| `rem tape finalize --tape-uuid <UUID> [--expected-pool <ID>] --reason <EXACT> --idempotency-key <UUID> --ack-tape-uuid <UUID> [--wait] [--json] [--endpoint <URI>]` | Irreversibly finalize one exact reconciled tape, including below the automatic low watermark. Voltags are not accepted, the acknowledgement must name the same UUID, and a pooled tape requires its canonical current pool id. The reason is sent exactly as supplied. Without `--wait`, the command submits once and prints the current status; with it, the command polls the read-only status RPC across daemon reconnects until a terminal outcome and never resubmits finalization. JSON uses schema `rem.tape.finalization.v1`. |
+| `rem tape inventory --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Stream the complete bounded terminal inventory by locating EOD and selecting C, then B, then A. Human output labels every pre-summary row `provisional`; the final summary names the authoritative `attempt_id`. `--json` emits NDJSON events under `rem.tape.inventory.stream.v1` and ends with exactly one `summary` event. Consumers must commit only that summary's selected attempt. Rejected attempts make fallback evidence explicit; no surviving replica triggers streamed BOT recovery rather than empty success. |
+| `rem tape verify-index --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Perform the distinct full physical verification: measure EOD, walk the prefix, compare the canonical map, and validate all three replicas and both separation extents. |
 
 <!-- code-anchor: crates/remanence-cli/src/put.rs @ 836da0af -->
 ## Writing to tape
@@ -300,6 +310,7 @@ journals):
 | `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. |
 | `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
+| `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --damage-plan <PLAN> [--full-verify] --report <PATH>` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. |
 
 Destructive maintenance:
 

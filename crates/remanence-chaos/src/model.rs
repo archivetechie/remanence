@@ -29,6 +29,12 @@ pub type SharedVirtualWorld = Arc<Mutex<VirtualWorld>>;
 pub enum Record {
     /// One data block written by a single WRITE(6) command.
     Block(Vec<u8>),
+    /// An all-zero data block stored sparsely by the virtual transport.
+    ///
+    /// This preserves the exact record length and readback bytes without
+    /// allocating gigabytes for terminal-index separation extents in
+    /// hermetic tape-model tests.
+    ZeroBlock(u32),
     /// One tape filemark.
     Filemark,
 }
@@ -84,6 +90,7 @@ fn record_data_bytes(records: &[Record]) -> u64 {
         .iter()
         .map(|record| match record {
             Record::Block(block) => block.len() as u64,
+            Record::ZeroBlock(len) => u64::from(*len),
             Record::Filemark => 0,
         })
         .sum()
@@ -752,6 +759,16 @@ impl ModelTransport {
                             buf[bytes_read..end].copy_from_slice(&block);
                             bytes_read = end;
                         }
+                        Record::ZeroBlock(len) => {
+                            if usize::try_from(len).ok() != Some(block_size) {
+                                return Err(ScsiError::InvalidInput(
+                                    "fixed READ encountered non-fixed-size sparse zero block",
+                                ));
+                            }
+                            let end = bytes_read + block_size;
+                            buf[bytes_read..end].fill(0);
+                            bytes_read = end;
+                        }
                         Record::Filemark => {
                             let residual = records_requested - record_index;
                             error_advance = record_index as u64 + 1;
@@ -772,6 +789,16 @@ impl ModelTransport {
                     Record::Block(block) => {
                         let n = block.len().min(buf.len());
                         buf[..n].copy_from_slice(&block[..n]);
+                        success_advance = 1;
+                        Ok(TransferOutcome::clean(n as u32))
+                    }
+                    Record::ZeroBlock(len) => {
+                        let n = usize::try_from(len)
+                            .map_err(|_| {
+                                ScsiError::InvalidInput("sparse zero block exceeds usize")
+                            })?
+                            .min(buf.len());
+                        buf[..n].fill(0);
                         success_advance = 1;
                         Ok(TransferOutcome::clean(n as u32))
                     }
@@ -825,7 +852,14 @@ impl ModelTransport {
                     ));
                 }
                 for block in buf.chunks_exact(block_size) {
-                    tape.records.push(Record::Block(block.to_vec()));
+                    if block.iter().all(|byte| *byte == 0) {
+                        let len = u32::try_from(block.len()).map_err(|_| {
+                            ScsiError::InvalidInput("sparse zero block length exceeds u32")
+                        })?;
+                        tape.records.push(Record::ZeroBlock(len));
+                    } else {
+                        tape.records.push(Record::Block(block.to_vec()));
+                    }
                 }
                 records_written = records as u64;
             } else {
@@ -834,7 +868,14 @@ impl ModelTransport {
                         "variable WRITE buffer length does not match transfer length",
                     ));
                 }
-                tape.records.push(Record::Block(buf.to_vec()));
+                if buf.iter().all(|byte| *byte == 0) {
+                    let len = u32::try_from(buf.len()).map_err(|_| {
+                        ScsiError::InvalidInput("sparse zero block length exceeds u32")
+                    })?;
+                    tape.records.push(Record::ZeroBlock(len));
+                } else {
+                    tape.records.push(Record::Block(buf.to_vec()));
+                }
                 records_written = 1;
             }
             tape.written_bytes = tape.written_bytes.saturating_add(buf.len() as u64);
@@ -1973,10 +2014,11 @@ mod l1b_tests {
         StaticAllowlist, TapeIoError,
     };
     use remanence_parity::{
-        scan_reconstruct_filemark_map, CapacityReserveInput, CommittedBundle, CommittedBundleKind,
-        CommittedState, DriveHandleRawSink, DriveHandleRawSource, JournalError, ObjectParitySource,
-        OpenTrust, ParityAuditHook, ParityError, ParityScheme, ParitySink, RecoveryEvent,
-        RecoveryOutcome, SchemeId, ScopedFilemarkMap, TapeFileJournal, TapeFilePosition,
+        scan_reconstruct_filemark_map, CommittedBundle, CommittedBundleKind, CommittedState,
+        DriveHandleRawSink, DriveHandleRawSource, JournalError, ObjectParitySource, OpenTrust,
+        ParityAuditHook, ParityError, ParityScheme, ParitySink, RecoveryEvent, RecoveryOutcome,
+        SchemeId, ScopedFilemarkMap, TapeFileJournal, TapeFilePosition, TerminalTripleCloseInput,
+        TerminalTripleObjectReservation, DEFAULT_INDEX_SEPARATION_BYTES,
     };
     use rusqlite::{params, Connection};
     use serde_json::{json, Value};
@@ -1990,12 +2032,12 @@ mod l1b_tests {
     const BAY: u16 = 0x0100;
     const SLOT: u16 = 0x0400;
     const BARCODE: &str = "TAPE001";
-    const BLOCK_SIZE: u32 = 4096;
+    const BLOCK_SIZE: u32 = 256 * 1024;
     const TAPE_UUID: [u8; 16] = [0xc7; 16];
 
     #[derive(Clone)]
     struct WrittenObject {
-        tape_file_number: u32,
+        tape_file_number: u64,
         block_count: u64,
         manifest_sha256: [u8; 32],
         payload_first_body_lba: u64,
@@ -2152,28 +2194,37 @@ mod l1b_tests {
         (0..37_000).map(|i| ((i * 31 + 17) % 251) as u8).collect()
     }
 
-    fn capacity_input(projected_object_blocks: u64) -> CapacityReserveInput {
+    fn capacity_input(projected_object_blocks: u64) -> TerminalTripleObjectReservation {
         let scheme = scheme();
-        CapacityReserveInput {
+        TerminalTripleCloseInput {
+            projected_object_present: true,
             projected_object_blocks,
-            block_size_bytes: u64::from(BLOCK_SIZE),
+            block_size_bytes: BLOCK_SIZE,
             current_epoch_fill_blocks: 0,
             data_shards_per_epoch: u64::from(scheme.data_blocks_per_stripe)
                 * u64::from(scheme.stripes_per_neighborhood),
             parity_shards_per_epoch: u64::from(scheme.parity_blocks_per_stripe)
                 * u64::from(scheme.stripes_per_neighborhood),
-            sidecar_index_block_count: 2,
+            pending_completed_sidecars: 0,
+            sidecar_entries_before_object: 0,
+            structural_entries_before_object: 1,
+            object_rows_before_object: 0,
             object_filemark_blocks: 1,
             sidecar_filemark_blocks: 1,
-            bootstrap_filemark_blocks: 1,
-            pending_completed_sidecars: 0,
-            remaining_bootstrap_count: 1,
+            parity_map_filemark_blocks: 1,
+            replica_filemark_blocks: 1,
+            gap_filemark_blocks: 1,
+            gap_nominal_bytes: DEFAULT_INDEX_SEPARATION_BYTES,
             safety_margin_blocks: 3,
             remaining_tape_blocks: 100_000,
-            empty_tape_usable_blocks: 100_000,
+            capacity_basis_blocks: 100_002,
+            low_watermark_blocks: 0,
+            high_watermark_blocks: 1,
             pending_completed_epoch_parity_bytes: 0,
-            remaining_spool_bytes: 16 * 1024 * 1024,
+            remaining_spool_bytes: u64::MAX,
         }
+        .reserve_object()
+        .expect("chaos exact terminal reservation")
     }
 
     fn write_object(world: SharedVirtualWorld) -> WrittenObject {
@@ -2195,7 +2246,7 @@ mod l1b_tests {
             .expect("open parity sink");
             sink.write_bootstrap().expect("write bootstrap");
             let (tape_file_number, _) = sink
-                .begin_object_with_capacity_reserve(capacity_input(128))
+                .begin_object_with_terminal_triple_reservation(capacity_input(128))
                 .expect("begin object");
 
             let mut options = RemTarObjectOptions::new(

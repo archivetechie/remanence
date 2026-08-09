@@ -70,6 +70,17 @@ compare_generated_file \
     "$parity_dir/lean/ParityCapacity/Funs.lean" \
     "$parity_out/ParityCapacityVerif.lean"
 
+sidecar_dir="$ROOT_DIR/verif/parity-sidecar-layout"
+sidecar_llbc="$TEMP_ROOT/parity_sidecar_layout_verif.llbc"
+sidecar_out="$TEMP_ROOT/parity-sidecar-layout"
+generate_llbc "$sidecar_dir" "$sidecar_llbc"
+mkdir -p "$sidecar_out"
+"$AENEAS_BIN" -backend lean -no-progress-bar -dest "$sidecar_out" "$sidecar_llbc"
+compare_generated_file \
+    "ParitySidecarLayout/Funs.lean" \
+    "$sidecar_dir/lean/ParitySidecarLayout/Funs.lean" \
+    "$sidecar_out/ParitySidecarLayoutVerif.lean"
+
 pool_dir="$ROOT_DIR/verif/pool-selection"
 pool_llbc="$TEMP_ROOT/pool_selection_verif.llbc"
 pool_out="$TEMP_ROOT/pool-selection"

@@ -181,7 +181,7 @@ FileIndexEntry {
   file_offset:    u64,       // byte offset within the object
   file_size:      u64,
   first_chunk:    u32,       // index into the per-chunk table below
-  chunk_count:    u32,
+  chunk_count:    u64,
 }
 ```
 
