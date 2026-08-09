@@ -1031,15 +1031,22 @@ impl DrivePool {
     }
 
     pub(crate) fn reserve_tape(&self, tape_uuid: TapeUuid) -> Result<TapeReservation, Status> {
-        if self
-            .sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
+        self.reserve_tape_with_after_session_check(tape_uuid, || {})
+    }
+
+    fn reserve_tape_with_after_session_check(
+        &self,
+        tape_uuid: TapeUuid,
+        after_session_check: impl FnOnce(),
+    ) -> Result<TapeReservation, Status> {
+        let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
+        if sessions
             .values()
             .any(|mounted| mounted.tape_uuid == tape_uuid)
         {
             return Err(Status::failed_precondition("tape is already mounted"));
         }
+        after_session_check();
         let mut reservations = self
             .tape_reservations
             .lock()
@@ -1047,6 +1054,10 @@ impl DrivePool {
         if !reservations.insert(tape_uuid) {
             return Err(Status::failed_precondition("tape is already mounted"));
         }
+        // Keep the sessions guard through reservation insertion. Otherwise a
+        // concurrent opener can publish a mounted session after our check but
+        // before this exact-tape owner becomes visible.
+        drop(sessions);
         Ok(TapeReservation {
             tape_uuid,
             reservations: self.tape_reservations.clone(),
@@ -6249,13 +6260,16 @@ pub(crate) fn preflight_manual_finalize_tape(
         })?;
     if previous.sealed_after_write {
         if had_existing_intent {
-            checkpoint
-                .replay_for_terminal_recovery()
+            project_sealed_checkpoint_then_retire_terminal_intent(
+                index,
+                &mut checkpoint,
+                &previous,
+            )?;
+        } else {
+            index
+                .project_checkpoint_record(&previous)
                 .map_err(crate::status_from_state_error)?;
         }
-        index
-            .project_checkpoint_record(&previous)
-            .map_err(crate::status_from_state_error)?;
         let projection = index
             .terminal_finalization(&request.tape_uuid)
             .map_err(crate::status_from_state_error)?
@@ -6537,15 +6551,7 @@ pub(crate) fn preflight_automatic_terminal_completion(
             )
         })?;
     if previous.sealed_after_write {
-        // A crash after sealed-checkpoint fsync may leave the exact companion
-        // behind. Project first so a catalog failure retains retry routing;
-        // exact recovery replay then retires only the matching companion.
-        index
-            .project_checkpoint_record(&previous)
-            .map_err(crate::status_from_state_error)?;
-        checkpoint
-            .replay_for_terminal_recovery()
-            .map_err(crate::status_from_state_error)?;
+        project_sealed_checkpoint_then_retire_terminal_intent(index, &mut checkpoint, &previous)?;
         return Ok(true);
     }
     let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, pool_cfg);
@@ -6666,6 +6672,26 @@ pub(crate) fn preflight_automatic_terminal_completion(
         tix_fault.as_ref(),
     )?;
     Ok(true)
+}
+
+/// Project sealed authority before retiring its matching recovery companion.
+///
+/// The recovery lease acquisition has already proved that the sealed
+/// completion exactly matches the normalized companion. Keeping the companion
+/// through projection preserves host-only retry routing if SQLite rejects the
+/// update; replay removes it only after projection succeeds.
+fn project_sealed_checkpoint_then_retire_terminal_intent(
+    index: &mut CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    previous: &remanence_state::CheckpointJournalRecord,
+) -> Result<(), Status> {
+    index
+        .project_checkpoint_record(previous)
+        .map_err(crate::status_from_state_error)?;
+    checkpoint
+        .replay_for_terminal_recovery()
+        .map_err(crate::status_from_state_error)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11287,6 +11313,82 @@ mod tests {
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    #[test]
+    fn tape_reservation_holds_session_guard_through_handoff() {
+        const TAPE_UUID: TapeUuid = [0xD4; 16];
+        let (changer_tx, _changer_rx) = mpsc::channel(1);
+        let pool = DrivePool::new(changer_tx, HashMap::new(), Arc::new(HashMap::new()));
+        let existing_owner = pool
+            .reserve_tape(TAPE_UUID)
+            .expect("reserve exact tape for opener");
+
+        let (checked_tx, checked_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let candidate_pool = pool.clone();
+        let candidate = std::thread::spawn(move || {
+            candidate_pool.reserve_tape_with_after_session_check(TAPE_UUID, || {
+                checked_tx.send(()).expect("signal completed session check");
+                release_rx.recv().expect("release reservation candidate");
+            })
+        });
+        checked_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("candidate reached guarded handoff");
+
+        let session_id = Uuid::from_u128(0xd4);
+        let record_pool = pool.clone();
+        let (record_started_tx, record_started_rx) = std_mpsc::channel();
+        let (record_done_tx, record_done_rx) = std_mpsc::channel();
+        let record = std::thread::spawn(move || {
+            record_started_tx
+                .send(())
+                .expect("signal session publication attempt");
+            record_pool.record_session(
+                session_id,
+                MountedSession {
+                    bay: 0x0100,
+                    library_serial: "LIB-HANDOFF".to_string(),
+                    barcode: Some("HND001L9".to_string()),
+                    home_slot: Some(0x0400),
+                    tape_uuid: TAPE_UUID,
+                    drive_uuid: Some(vec![0xD4; 16]),
+                },
+            );
+            record_done_tx.send(()).expect("signal session publication");
+        });
+        record_started_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("session publisher started");
+        assert!(
+            record_done_rx
+                .recv_timeout(StdDuration::from_millis(100))
+                .is_err(),
+            "session publication must wait until exact-tape reservation insertion finishes"
+        );
+
+        release_tx
+            .send(())
+            .expect("release guarded reservation candidate");
+        let candidate_error = candidate
+            .join()
+            .expect("join reservation candidate")
+            .expect_err("existing exact-tape owner must win the handoff");
+        assert_eq!(candidate_error.code(), tonic::Code::FailedPrecondition);
+        record_done_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .expect("session publication resumes after handoff");
+        record.join().expect("join session publisher");
+        assert_eq!(
+            pool.session(session_id)
+                .expect("published session")
+                .tape_uuid,
+            TAPE_UUID
+        );
+
+        pool.forget_session(session_id);
+        drop(existing_owner);
+    }
 
     #[test]
     fn parity_and_checkpoint_terminal_progress_are_exhaustive_bijections() {

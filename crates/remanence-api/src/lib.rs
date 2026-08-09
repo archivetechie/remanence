@@ -2259,22 +2259,29 @@ fn replay_checkpoint_journal_projections(
         let pending_intent = journal
             .terminal_finalization_intent()
             .map_err(status_from_state_error)?;
-        let (records, pending_intent) = if pending_intent.is_some() {
+        let pending_intent = if pending_intent.is_some() {
             let mut lease = journal
                 .acquire_exclusive_for_terminal_recovery()
+                .map_err(status_from_state_error)?;
+            // Project every validated record while the exact companion is
+            // still retained. A catalog failure therefore leaves startup
+            // routing authority intact; exact replay retires a stale sealed
+            // companion only after all projections succeed.
+            lease
+                .for_each_record_bounded(|record| index.project_checkpoint_record(record))
                 .map_err(status_from_state_error)?;
             let authority = lease
                 .replay_for_terminal_recovery()
                 .map_err(status_from_state_error)?;
-            (authority.records, authority.finalization_intent)
+            authority.finalization_intent
         } else {
-            (journal.replay().map_err(status_from_state_error)?, None)
+            for record in journal.replay().map_err(status_from_state_error)? {
+                index
+                    .project_checkpoint_record(&record)
+                    .map_err(status_from_state_error)?;
+            }
+            None
         };
-        for record in records {
-            index
-                .project_checkpoint_record(&record)
-                .map_err(status_from_state_error)?;
-        }
         if let Some(intent) = pending_intent {
             let operation_id = intent
                 .manual
@@ -8185,6 +8192,19 @@ BCw3Wyv2UWY=
         assert!(interrupted.to_string().contains("cleanup interruption"));
         drop(lease);
         drop(index);
+
+        let failed_index_path = temp.path().join("terminal-projection-failure.sqlite");
+        let mut failed_index =
+            CatalogIndex::open(&failed_index_path).expect("open empty projection-failure catalog");
+        replay_checkpoint_journal_projections(&mut failed_index, &checkpoint_dir)
+            .expect_err("startup projection failure retains terminal retry authority");
+        assert!(
+            journal
+                .terminal_finalization_intent()
+                .expect("read companion after startup projection failure")
+                .is_some(),
+            "startup must not retire the companion before every checkpoint projection succeeds"
+        );
 
         let mut index = CatalogIndex::open(&index_path).expect("restart after sealed checkpoint");
         replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
