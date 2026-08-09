@@ -16,13 +16,17 @@ use std::process::ExitCode;
 use clap::{Args, ValueEnum};
 use remanence_library::{DriveHandle, LinuxSgTransport, TapeIoError};
 use remanence_parity::{
-    encode_tape_index_bootstrap_footer, encode_tape_index_replica_header, plan_tape_index_edition,
-    plan_tape_index_replica, read_terminal_index_inventory, recover_terminal_inventory_from_bot,
-    verify_terminal_index_full, BotStructuralRecoveryReason, DriveHandleRawSource, ParityError,
-    PhysicalPositionHint, RawReadOutcome, RawTapeSource, SpaceFilemarksOutcome,
-    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaObservation,
-    TapeIndexReplicaRecordSource, TerminalInventoryOutcome, TerminalInventoryReadError,
-    TerminalReplicaEvidence, TerminalSeparationEvidence,
+    encode_tape_index_bootstrap_footer, encode_tape_index_replica_header, plan_index_separation,
+    plan_tape_index_edition, plan_tape_index_replica, read_terminal_index_inventory,
+    reconcile_terminal_tail_next, recover_terminal_inventory_from_bot, verify_terminal_index_full,
+    write_terminal_tail_step, BotStructuralRecoveryReason, DriveHandleRawSource,
+    IndexSeparationDescriptor, ParityError, PhysicalPositionHint, RawReadOutcome, RawTapeSink,
+    RawTapeSource, RawWriteOutcome, SpaceFilemarksOutcome, TapeIndexReplicaMapEntry,
+    TapeIndexReplicaObjectRow, TapeIndexReplicaObservation, TapeIndexReplicaRecordSource,
+    TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalInventoryOutcome,
+    TerminalInventoryReadError, TerminalReplicaEvidence, TerminalSeparationEvidence,
+    TerminalTailAuthority, TerminalTailComponentPlan, TerminalTailProgress,
+    TerminalTailStepOutcome, TerminalTripleWritePlan,
 };
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -78,6 +82,39 @@ pub(crate) enum TerminalIndexDamagePlan {
     GapBcHeader,
     /// Make the BC separation footer unreadable during full verification.
     GapBcFooter,
+}
+
+/// Read-only reconciliation outcomes that the TIX drill may force above the
+/// transport before invoking the production terminal-tail decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum TerminalReconcileDrill {
+    /// Make the next component readable at its proved start only as a torn WORM tail.
+    TornWorm,
+    /// Make the next component's immutable start unprovable.
+    UnprovedStart,
+}
+
+impl TerminalReconcileDrill {
+    const fn requested_evidence(self) -> &'static str {
+        match self {
+            Self::TornWorm => "torn_worm",
+            Self::UnprovedStart => "unproved",
+        }
+    }
+
+    const fn expected_evidence(self) -> TerminalComponentReconcileEvidence {
+        match self {
+            Self::TornWorm => TerminalComponentReconcileEvidence::TornWorm,
+            Self::UnprovedStart => TerminalComponentReconcileEvidence::Unproved,
+        }
+    }
+
+    const fn injection_kind(self) -> &'static str {
+        match self {
+            Self::TornWorm => "read_side_transport_error",
+            Self::UnprovedStart => "read_side_unproved_start",
+        }
+    }
 }
 
 impl TerminalIndexDamagePlan {
@@ -163,6 +200,10 @@ pub(crate) struct TerminalIndexDrillArgs {
     #[arg(long, value_enum, default_value_t = TerminalIndexDamagePlan::None)]
     damage_plan: TerminalIndexDamagePlan,
 
+    /// Force one no-write production reconciliation refusal for system TIX.
+    #[arg(long, value_enum)]
+    reconcile_outcome: Option<TerminalReconcileDrill>,
+
     /// Also walk the measured physical prefix and all five terminal files.
     #[arg(long)]
     full_verify: bool,
@@ -182,6 +223,11 @@ impl TerminalIndexDrillArgs {
         }
         if self.damage_plan.separation_damage().is_some() && !self.full_verify {
             return Err("terminal-index gap-damage plans require --full-verify".to_string());
+        }
+        if self.reconcile_outcome.is_some() && self.damage_plan != TerminalIndexDamagePlan::None {
+            return Err(
+                "terminal-index reconciliation injection requires --damage-plan none".to_string(),
+            );
         }
         fs::metadata(&self.device).map_err(|error| {
             format!(
@@ -317,6 +363,20 @@ struct BotRecoveryReport {
     visited_object_count: u64,
 }
 
+/// Stable proof that the production terminal-tail decision refused motion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct TerminalReconciliationReport {
+    requested_evidence: &'static str,
+    component: &'static str,
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    component_start_lba: u64,
+    injection_kind: &'static str,
+    outcome: &'static str,
+    component_motion_attempted: bool,
+    terminal_component_admission: &'static str,
+    progress_advanced: bool,
+}
+
 /// Stable machine-readable result for one read-only live drill leg.
 #[derive(Clone, Debug, Serialize)]
 struct TerminalIndexDrillReport {
@@ -335,6 +395,7 @@ struct TerminalIndexDrillReport {
     fast_inventory: FastInventoryReport,
     bot_recovery: BotRecoveryReport,
     full_verify: FullVerifyReport,
+    terminal_reconciliation: Option<TerminalReconciliationReport>,
     capabilities_exercised: Vec<&'static str>,
     expectations_met: bool,
     expectation_failures: Vec<String>,
@@ -345,6 +406,7 @@ struct InstrumentedSource<S> {
     inner: S,
     unreadable_lbas: BTreeSet<u64>,
     replacement_records: BTreeMap<u64, Vec<u8>>,
+    unproved_lbas: BTreeSet<u64>,
     read_lbas: Vec<u64>,
     eod_calls: u64,
     backward_filemark_calls: u64,
@@ -356,6 +418,7 @@ impl<S> InstrumentedSource<S> {
             inner,
             unreadable_lbas: BTreeSet::new(),
             replacement_records: BTreeMap::new(),
+            unproved_lbas: BTreeSet::new(),
             read_lbas: Vec::new(),
             eod_calls: 0,
             backward_filemark_calls: 0,
@@ -381,6 +444,12 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
         &mut self,
         hint: PhysicalPositionHint,
     ) -> Result<(), remanence_parity::ParityError> {
+        if self.unproved_lbas.contains(&hint.lba) {
+            return Err(ParityError::SessionOpen(format!(
+                "terminal-index drill injected unproved LBA {}",
+                hint.lba
+            )));
+        }
         self.inner.locate_physical(hint)
     }
 
@@ -466,6 +535,208 @@ impl TapeIndexReplicaRecordSource for CapturedRecords {
     }
 }
 
+#[derive(Default)]
+struct MotionRefusingSink {
+    motion_attempts: u64,
+}
+
+impl MotionRefusingSink {
+    fn reject_motion(&mut self) -> Result<RawWriteOutcome, ParityError> {
+        self.motion_attempts =
+            self.motion_attempts
+                .checked_add(1)
+                .ok_or(ParityError::Invariant(
+                    "reconciliation drill motion counter overflow",
+                ))?;
+        Err(ParityError::Invariant(
+            "reconciliation drill forbids terminal media motion",
+        ))
+    }
+}
+
+impl RawTapeSink for MotionRefusingSink {
+    fn locate_for_overwrite(&mut self, _hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        self.reject_motion().map(|_| ())
+    }
+
+    fn write_fixed_block(&mut self, _buf: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+        self.reject_motion()
+    }
+
+    fn write_filemarks(
+        &mut self,
+        _count: u32,
+        _immediate: bool,
+    ) -> Result<RawWriteOutcome, ParityError> {
+        self.reject_motion()
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.motion_attempts =
+            self.motion_attempts
+                .checked_add(1)
+                .ok_or(ParityError::Invariant(
+                    "reconciliation drill motion counter overflow",
+                ))?;
+        Err(ParityError::Invariant(
+            "reconciliation drill forbids terminal position commands",
+        ))
+    }
+}
+
+struct ReconcileDrillAuthority<'a, S> {
+    source: &'a mut InstrumentedSource<S>,
+    plan: &'a TerminalTripleWritePlan,
+    evidence: Option<TerminalComponentReconcileEvidence>,
+    commit_attempted: bool,
+}
+
+impl<S: RawTapeSource> TerminalTailAuthority for ReconcileDrillAuthority<'_, S> {
+    fn load_progress(&mut self) -> Result<TerminalTailProgress, String> {
+        Ok(TerminalTailProgress::BeforeReplicaA)
+    }
+
+    fn reconcile_next(
+        &mut self,
+        progress: TerminalTailProgress,
+        component: TerminalTailComponentPlan,
+    ) -> Result<TerminalComponentReconcileEvidence, String> {
+        if progress != TerminalTailProgress::BeforeReplicaA
+            || component != self.plan.edition.descriptor.terminal_layout.components[0]
+        {
+            return Err("reconciliation drill reached an unexpected component".to_string());
+        }
+        let evidence = reconcile_terminal_tail_next(self.source, self.plan, progress, false);
+        self.evidence = Some(evidence);
+        Ok(evidence)
+    }
+
+    fn commit_after_barrier(&mut self, _commit: &TerminalComponentCommit) -> Result<(), String> {
+        self.commit_attempted = true;
+        Err("reconciliation drill must not commit terminal progress".to_string())
+    }
+}
+
+fn run_terminal_reconciliation_drill<S: RawTapeSource>(
+    source: &mut InstrumentedSource<S>,
+    records: &mut CapturedRecords,
+    edition: remanence_parity::TapeIndexEditionPlan,
+    requested: TerminalReconcileDrill,
+) -> Result<(TerminalReconciliationReport, Vec<String>), String> {
+    let replicas = [
+        plan_tape_index_replica(edition.clone(), 1)
+            .map_err(|error| format!("plan reconciliation replica A: {error}"))?,
+        plan_tape_index_replica(edition.clone(), 2)
+            .map_err(|error| format!("plan reconciliation replica B: {error}"))?,
+        plan_tape_index_replica(edition.clone(), 3)
+            .map_err(|error| format!("plan reconciliation replica C: {error}"))?,
+    ];
+    let separation = |ordinal| {
+        let component = edition
+            .descriptor
+            .terminal_layout
+            .separation(ordinal)
+            .map_err(|error| format!("resolve reconciliation gap {ordinal}: {error}"))?;
+        let nominal_extent_bytes = component
+            .record_count
+            .checked_mul(u64::from(edition.descriptor.block_size))
+            .ok_or_else(|| "reconciliation drill separation extent overflows".to_string())?;
+        plan_index_separation(IndexSeparationDescriptor {
+            tape_uuid: edition.descriptor.tape_uuid,
+            edition_id: edition.descriptor.edition_id,
+            gap_ordinal: ordinal,
+            block_size: edition.descriptor.block_size,
+            nominal_extent_bytes,
+            total_records: component.record_count,
+            compression_enabled: edition.descriptor.compression_enabled,
+            terminal_layout: edition.descriptor.terminal_layout,
+        })
+        .map_err(|error| format!("plan reconciliation gap {ordinal}: {error}"))
+    };
+    let separations = [separation(1)?, separation(2)?];
+    let plan = TerminalTripleWritePlan::from_parts(edition, replicas, separations)
+        .map_err(|error| format!("plan terminal reconciliation drill: {error}"))?;
+    let component = plan.edition.descriptor.terminal_layout.components[0];
+    source.unreadable_lbas.clear();
+    source.replacement_records.clear();
+    source.unproved_lbas.clear();
+    match requested {
+        TerminalReconcileDrill::TornWorm => {
+            source.unreadable_lbas.insert(component.planned_start_lba);
+        }
+        TerminalReconcileDrill::UnprovedStart => {
+            source.unproved_lbas.insert(component.planned_start_lba);
+        }
+    }
+
+    let mut sink = MotionRefusingSink::default();
+    let mut authority = ReconcileDrillAuthority {
+        source,
+        plan: &plan,
+        evidence: None,
+        commit_attempted: false,
+    };
+    let outcome = write_terminal_tail_step(&mut sink, records, &mut authority, &plan)
+        .map_err(|error| format!("production terminal reconciliation decision: {error}"))?;
+    let observed_evidence = authority.evidence;
+    let commit_attempted = authority.commit_attempted;
+    let mut failures = Vec::new();
+    let recovery_required = matches!(
+        outcome,
+        TerminalTailStepOutcome::RecoveryRequired {
+            progress: TerminalTailProgress::BeforeReplicaA,
+            component: observed_component,
+            evidence,
+        } if observed_component == component && evidence == requested.expected_evidence()
+    );
+    if !recovery_required {
+        failures.push(format!(
+            "production decision returned {outcome:?}, expected RecoveryRequired({:?})",
+            requested.expected_evidence()
+        ));
+    }
+    if observed_evidence != Some(requested.expected_evidence()) {
+        failures.push(format!(
+            "production reconciler returned {observed_evidence:?}, expected {:?}",
+            requested.expected_evidence()
+        ));
+    }
+    if sink.motion_attempts != 0 {
+        failures.push(format!(
+            "production decision attempted {} terminal media command(s)",
+            sink.motion_attempts
+        ));
+    }
+    if commit_attempted {
+        failures.push("production decision attempted to advance durable progress".to_string());
+    }
+    let refused_without_motion =
+        recovery_required && sink.motion_attempts == 0 && !commit_attempted;
+    Ok((
+        TerminalReconciliationReport {
+            requested_evidence: requested.requested_evidence(),
+            component: "replica_a",
+            component_start_lba: component.planned_start_lba,
+            injection_kind: requested.injection_kind(),
+            outcome: if recovery_required {
+                "recovery_required"
+            } else {
+                "unexpected"
+            },
+            component_motion_attempted: sink.motion_attempts != 0,
+            terminal_component_admission: if refused_without_motion {
+                "refused"
+            } else {
+                "unexpected"
+            },
+            // The drill authority never mutates progress. A callback attempt
+            // is separately a failed expectation above.
+            progress_advanced: false,
+        },
+        failures,
+    ))
+}
+
 fn parse_block_size(value: &str) -> Result<u32, String> {
     let parsed = value
         .parse::<u32>()
@@ -533,6 +804,7 @@ fn inspect_source<S: RawTapeSource>(
     tape_uuid: [u8; 16],
     block_size: u32,
     damage_plan: TerminalIndexDamagePlan,
+    reconcile_outcome: Option<TerminalReconcileDrill>,
     full_verify_requested: bool,
     execution: &'static str,
 ) -> Result<TerminalIndexDrillReport, String> {
@@ -584,7 +856,7 @@ fn inspect_source<S: RawTapeSource>(
             .collect(),
     };
     let first_terminal_lba = layout.components[0].planned_start_lba;
-    let injected_unreadable_lbas = damage_plan
+    let damage_unreadable_lbas = damage_plan
         .ordinals()
         .iter()
         .map(|ordinal| {
@@ -594,6 +866,10 @@ fn inspect_source<S: RawTapeSource>(
                 .map_err(|error| format!("resolve replica {ordinal} start: {error}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut injected_unreadable_lbas = damage_unreadable_lbas.clone();
+    if reconcile_outcome == Some(TerminalReconcileDrill::TornWorm) {
+        injected_unreadable_lbas.push(layout.components[0].planned_start_lba);
+    }
     let mut injected_replacement_lbas = Vec::new();
     if let Some((ordinal, footer)) = damage_plan.separation_damage() {
         let component = layout
@@ -612,7 +888,7 @@ fn inspect_source<S: RawTapeSource>(
             .insert(lba, vec![0xd7; block_size as usize]);
         injected_replacement_lbas.push(lba);
     }
-    source.unreadable_lbas = injected_unreadable_lbas.iter().copied().collect();
+    source.unreadable_lbas = damage_unreadable_lbas.iter().copied().collect();
     if damage_plan == TerminalIndexDamagePlan::Disagreement {
         let component = layout
             .replica(1)
@@ -913,6 +1189,19 @@ fn inspect_source<S: RawTapeSource>(
         full_verify.complete = complete;
     }
 
+    let terminal_reconciliation = if let Some(requested) = reconcile_outcome {
+        let (report, failures) = run_terminal_reconciliation_drill(
+            &mut source,
+            &mut captured,
+            healthy.edition.clone(),
+            requested,
+        )?;
+        expectation_failures.extend(failures);
+        Some(report)
+    } else {
+        None
+    };
+
     let mut capabilities_exercised = vec![
         "rem.tape.index.terminal_triple",
         "rem.tape.index.replica_set_integrity",
@@ -931,6 +1220,9 @@ fn inspect_source<S: RawTapeSource>(
             "rem.tape.index.full_physical_verify",
         ]);
     }
+    if terminal_reconciliation.is_some() {
+        capabilities_exercised.push("rem.tape.index.resume_authority");
+    }
     let expectations_met = expectation_failures.is_empty();
     Ok(TerminalIndexDrillReport {
         schema: REPORT_SCHEMA,
@@ -939,13 +1231,18 @@ fn inspect_source<S: RawTapeSource>(
         tape_uuid: Uuid::from_bytes(tape_uuid).to_string(),
         block_size_bytes: block_size,
         damage_plan,
-        injection_mechanism: damage_plan.injection_mechanism(),
+        injection_mechanism: if reconcile_outcome.is_some() {
+            "read_side_production_terminal_reconciler"
+        } else {
+            damage_plan.injection_mechanism()
+        },
         injected_unreadable_lbas,
         injected_replacement_lbas,
         terminal_layout,
         fast_inventory,
         bot_recovery,
         full_verify,
+        terminal_reconciliation,
         capabilities_exercised,
         expectations_met,
         expectation_failures,
@@ -989,6 +1286,7 @@ pub(crate) fn run_live(
             *args.tape_uuid.as_bytes(),
             args.block_size,
             args.damage_plan,
+            args.reconcile_outcome,
             args.full_verify,
             "live_sg_read_only",
         )
@@ -1228,6 +1526,7 @@ mod tests {
                 TAPE_UUID,
                 BLOCK_SIZE,
                 plan,
+                None,
                 full_verify,
                 "hermetic_image",
             )
@@ -1272,6 +1571,56 @@ mod tests {
     }
 
     #[test]
+    fn hermetic_reconciliation_drill_exercises_production_no_motion_decision() {
+        for requested in [
+            TerminalReconcileDrill::TornWorm,
+            TerminalReconcileDrill::UnprovedStart,
+        ] {
+            let report = inspect_source(
+                fixture(),
+                TAPE_UUID,
+                BLOCK_SIZE,
+                TerminalIndexDamagePlan::None,
+                Some(requested),
+                false,
+                "hermetic_image",
+            )
+            .unwrap_or_else(|error| panic!("{requested:?}: {error}"));
+            assert!(report.success, "{:?}", report.expectation_failures);
+            assert_eq!(
+                report.injection_mechanism,
+                "read_side_production_terminal_reconciler"
+            );
+            let evidence = report
+                .terminal_reconciliation
+                .expect("requested reconciliation report");
+            assert_eq!(
+                serde_json::to_value(evidence).expect("serialize reconciliation evidence"),
+                serde_json::json!({
+                    "requested_evidence": requested.requested_evidence(),
+                    "component": "replica_a",
+                    "component_start_lba": report.terminal_layout.components[0].start_lba.to_string(),
+                    "injection_kind": requested.injection_kind(),
+                    "outcome": "recovery_required",
+                    "component_motion_attempted": false,
+                    "terminal_component_admission": "refused",
+                    "progress_advanced": false,
+                })
+            );
+            assert_eq!(
+                report.injected_unreadable_lbas,
+                if requested == TerminalReconcileDrill::TornWorm {
+                    vec![report.terminal_layout.components[0].start_lba]
+                } else {
+                    Vec::new()
+                }
+            );
+            assert!(report.expectations_met);
+            assert!(report.expectation_failures.is_empty());
+        }
+    }
+
+    #[test]
     fn documented_cli_parses() {
         let cli = <crate::DebugCli as clap::Parser>::try_parse_from([
             "rem-debug",
@@ -1285,6 +1634,8 @@ mod tests {
             "262144",
             "--damage-plan",
             "none",
+            "--reconcile-outcome",
+            "torn-worm",
             "--full-verify",
             "--report",
             "/tmp/tix.json",
@@ -1299,6 +1650,10 @@ mod tests {
         assert_eq!(args.device, Path::new("/dev/sg7"));
         assert_eq!(args.block_size, BLOCK_SIZE);
         assert_eq!(args.damage_plan, TerminalIndexDamagePlan::None);
+        assert_eq!(
+            args.reconcile_outcome,
+            Some(TerminalReconcileDrill::TornWorm)
+        );
         assert!(args.full_verify);
     }
 
@@ -1317,6 +1672,7 @@ mod tests {
             tape_uuid: Uuid::from_bytes(TAPE_UUID).to_string(),
             block_size_bytes: BLOCK_SIZE,
             damage_plan: TerminalIndexDamagePlan::None,
+            terminal_reconciliation: None,
             injection_mechanism: "none",
             injected_unreadable_lbas: vec![0, max],
             injected_replacement_lbas: vec![max],

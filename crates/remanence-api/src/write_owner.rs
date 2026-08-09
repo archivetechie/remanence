@@ -6513,16 +6513,6 @@ fn finalize_terminal_with_parity(
         record_manual_finalize_request(index, cfg, request)?;
     }
 
-    let prefix_evidence = {
-        let mut raw = DriveHandleRawSource::new(drive);
-        reconcile_terminal_prefix(
-            &mut raw,
-            &prefix,
-            &spec.tape_uuid,
-            spec.block_size,
-            rewritable,
-        )
-    };
     let prefix_checkpoint = remanence_parity::CommittedBundle {
         kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
         entries: Vec::new(),
@@ -6536,6 +6526,42 @@ fn finalize_terminal_with_parity(
                 "inspect terminal-prefix journal transition: {error}"
             ))
         })?;
+
+    // The immutable intent is already fsynced at BeforeReplicaA here. The
+    // daemon's partial sidecar, when any exists, belongs to the preceding
+    // ordinary checkpoint; only the final ParityMap can still require prefix
+    // media motion on this path. A restart with a durable prefix skips this
+    // motion boundary instead of manufacturing a second cut.
+    if let Some(fault) = tix_fault.as_ref().filter(|_| !prefix_already_journaled) {
+        let position = drive.position().map_err(|error| {
+            Status::unavailable(format!(
+                "read position before terminal-prefix fault boundary: {error}"
+            ))
+        })?;
+        fault
+            .abort_prefix_if_matches(
+                crate::terminal_fault::TerminalFaultCut::BeforeTerminalPrefix,
+                Some(PhysicalPositionHint {
+                    partition: position.partition,
+                    lba: position.lba,
+                }),
+                &prefix,
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+            })?;
+    }
+
+    let prefix_evidence = {
+        let mut raw = DriveHandleRawSource::new(drive);
+        reconcile_terminal_prefix(
+            &mut raw,
+            &prefix,
+            &spec.tape_uuid,
+            spec.block_size,
+            rewritable,
+        )
+    };
     if prefix_already_journaled {
         if prefix_evidence != TerminalPrefixReconcileEvidence::Complete {
             return Err(Status::failed_precondition(format!(
@@ -6547,8 +6573,13 @@ fn finalize_terminal_with_parity(
             Status::internal("bounded parity prefix authority snapshot is missing")
         })?;
         let mut raw = DriveHandleRawSink::new(drive);
-        let prefix_result = remanence_parity::close_checkpointed_terminal_index_prefix(
+        let mut faulting = crate::terminal_fault::TerminalPrefixFaultSink::new(
             &mut raw,
+            tix_fault.as_ref(),
+            &prefix,
+        );
+        let prefix_result = remanence_parity::close_checkpointed_terminal_index_prefix(
+            &mut faulting,
             &mut journal,
             snapshot,
             &prefix,
@@ -6557,11 +6588,10 @@ fn finalize_terminal_with_parity(
         .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
         if let Some(fault) = tix_fault.as_ref() {
             fault
-                .abort_if_matches(
-                    "parity_closeout",
+                .abort_prefix_if_matches(
                     crate::terminal_fault::TerminalFaultCut::AfterTerminalPrefix,
                     Some(PhysicalPositionHint::new(prefix_result.used_tape_blocks)),
-                    None,
+                    &prefix,
                 )
                 .map_err(|error| {
                     Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
