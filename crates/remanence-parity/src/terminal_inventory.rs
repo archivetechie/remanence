@@ -2920,7 +2920,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_inventory_accepts_4096_byte_hints_for_legacy_media() {
+    fn fast_inventory_rejects_4096_before_media_motion() {
         struct EmptyLegacySource {
             configured: Option<u32>,
         }
@@ -2962,14 +2962,17 @@ mod tests {
         }
 
         let mut source = EmptyLegacySource { configured: None };
-        let outcome = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, 4096)
-            .expect("4096-byte legacy hint must reach media discovery");
-        assert_eq!(source.configured, Some(4096));
+        let error = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, 4096)
+            .expect_err("4096-byte geometry is not a terminal-tail profile");
         assert!(matches!(
-            outcome,
-            TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery)
-                if recovery.reason == BotStructuralRecoveryReason::NoUsableTerminalLayout
+            error,
+            TerminalInventoryReadError::BlockSize(
+                crate::terminal_tail::TerminalTailLayoutError::UnsupportedBlockSize {
+                    block_size: 4096
+                }
+            )
         ));
+        assert_eq!(source.configured, None);
     }
 
     #[test]

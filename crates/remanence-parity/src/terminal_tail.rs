@@ -385,19 +385,16 @@ pub fn validate_terminal_index_block_size(
         .map_err(|_| TerminalTailLayoutError::UnsupportedBlockSize { block_size })
 }
 
-/// Validate a physically hinted terminal record size for generic decoding.
+/// Validate an operator-supplied terminal record-size hint.
 ///
-/// Readers accept any checked fixed record large enough for the framing table;
-/// production writers and capacity planning remain restricted to
-/// [`TERMINAL_INDEX_BLOCK_SIZES`] through [`validate_terminal_index_block_size`].
+/// A hint selects one of the same three record sizes that a conformant terminal
+/// writer may emit. It does not extend the terminal grammar. Arbitrary sizes
+/// remain usable by the separate BOT structural-recovery walk, which does not
+/// claim that it decoded a terminal tail.
 pub(crate) fn validate_terminal_index_block_size_hint(
     block_size: u32,
 ) -> Result<usize, TerminalTailLayoutError> {
-    if block_size < 0x400 {
-        return Err(TerminalTailLayoutError::UnsupportedBlockSize { block_size });
-    }
-    usize::try_from(block_size)
-        .map_err(|_| TerminalTailLayoutError::UnsupportedBlockSize { block_size })
+    validate_terminal_index_block_size(block_size)
 }
 
 /// Checked terminal-tail planning failure.

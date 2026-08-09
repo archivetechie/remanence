@@ -37,12 +37,13 @@ headers and footers differ because their ordinal and location differ.
 Unless a field is explicitly inside deterministic CBOR, every fixed-width
 integer below is unsigned little-endian; the two-byte slot-length prefix is
 also little-endian. Deterministic CBOR uses its own canonical big-endian
-argument encoding. All arithmetic is checked in `u64`. Production writers and
-capacity profiles support fixed record sizes of 256 KiB, 512 KiB, and 1 MiB.
-Explicitly labelled test/vector media MAY use a 4096-byte record size through
-the Section 8.4 out-of-band block-size hint path; 4096 is not a production
-writer or capacity profile. The draft profile uses partition zero and requires
-hardware compression disabled.
+argument encoding. All arithmetic is checked in `u64`. Terminal writers,
+readers, capacity profiles, and replacement-draft vectors support fixed record
+sizes of 256 KiB, 512 KiB, and 1 MiB. An out-of-band read hint chooses one of
+those sizes; it does not extend the terminal-tail grammar. The separate BOT
+structural walk may still measure a nonconformant or historical tape at another
+hinted size without claiming that it decoded a terminal tail. The draft profile
+uses partition zero and requires hardware compression disabled.
 
 ## 2. Planned terminal layout
 

@@ -780,7 +780,7 @@ impl ApiState {
         state.reconcile_drive_catalog_from_report(config, &report)?;
         state.reconcile_clean_runs_from_report(&report)?;
         crate::mount::register_startup_seated_cartridges(&state, &report);
-        crate::mount::spawn_startup_automatic_terminal_recoveries(state.clone());
+        crate::mount::spawn_startup_terminal_recoveries(state.clone());
         spawn_drive_collection_workers(
             index_path,
             report,

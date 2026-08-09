@@ -6239,11 +6239,12 @@ pub(crate) fn preflight_manual_finalize_tape(
         cfg.audit_append_lock,
         request,
     )?;
-    if index
+    let projection = index
         .terminal_finalization(&request.tape_uuid)
-        .map_err(crate::status_from_state_error)?
-        .is_none()
-    {
+        .map_err(crate::status_from_state_error)?;
+    if projection.is_none_or(|projection| {
+        projection.outcome == TerminalFinalizationOutcome::RecoveryRequired
+    }) {
         index
             .project_terminal_finalization(TerminalFinalizationProjectionInput {
                 tape_uuid: request.tape_uuid,
