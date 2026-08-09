@@ -5902,6 +5902,13 @@ fn authorize_terminal_intent_capacity(
     intent: &remanence_state::TerminalFinalizationIntent,
     counts: remanence_parity::TapeIndexReplicaCounts,
 ) -> Result<(), Status> {
+    if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
+        // Capacity admission governs future tape motion. Once replica C is
+        // durably proved, the reserved tail is already on media; reapplying a
+        // changed cap or watermark here could only obstruct host metadata
+        // completion and cannot protect tape capacity.
+        return Ok(());
+    }
     crate::pool_write::authorize_terminal_close_only_plan(
         index,
         spec.pool_config.as_ref(),
@@ -7049,7 +7056,7 @@ fn complete_terminal_finalization_host_only(
     previous: &remanence_state::CheckpointJournalRecord,
     spec: &TerminalFinalizeSpec,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
-    mut intent: remanence_state::TerminalFinalizationIntent,
+    intent: remanence_state::TerminalFinalizationIntent,
     plan: &TerminalTripleWritePlan,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
@@ -7058,11 +7065,11 @@ fn complete_terminal_finalization_host_only(
             "host-only terminal completion requires durable replica C progress",
         ));
     }
-    if intent.recovery_required {
-        intent = checkpoint
-            .clear_terminal_recovery_required_after_replica_c()
-            .map_err(crate::status_from_state_error)?;
-    }
+    // Keep a recovery-required companion fail-closed until the sealed
+    // checkpoint itself is fsynced. The checkpoint transition validates a
+    // normalized completion copy and retires the companion only afterwards.
+    let mut completed_intent = intent.clone();
+    completed_intent.recovery_required = false;
     let replica_c = plan.edition.descriptor.terminal_layout.components[4];
     let final_bundle = remanence_parity::terminal_component_bundle(plan, replica_c)
         .map_err(|error| Status::internal(format!("build final C authority: {error}")))?;
@@ -7085,7 +7092,7 @@ fn complete_terminal_finalization_host_only(
         scheme: previous.scheme.clone(),
         object_tape_file_bundles: Vec::new(),
         barrier_bundle: Some(final_bundle),
-        terminal_finalization: Some(intent),
+        terminal_finalization: Some(completed_intent),
         sealed_after_write: true,
     };
     if let Some(fault) = tix_fault {
