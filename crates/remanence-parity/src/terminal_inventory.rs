@@ -25,6 +25,7 @@ use crate::terminal_tail::{
     validate_terminal_index_block_size_hint, TerminalTailLayout, TERMINAL_INDEX_REPLICA_COUNT,
     TERMINAL_TAIL_COMPONENT_COUNT,
 };
+use remanence_library::{scsi::decode_sense, TapeIoError};
 use std::cell::RefCell;
 
 /// Typed stage at which one terminal member failed validation.
@@ -483,6 +484,11 @@ struct LayoutInspection {
     envelopes: [Option<ValidatedReplicaEnvelope>; 3],
 }
 
+enum TerminalMemberReadError {
+    Invalid(TerminalReplicaFailure),
+    Source(TerminalInventoryReadError),
+}
+
 #[derive(Clone)]
 struct ValidatedReplicaEnvelope {
     header: TapeIndexReplicaHeader,
@@ -547,7 +553,7 @@ where
 
     let mut inspections = Vec::with_capacity(layouts.len());
     for layout in layouts {
-        let inspection = inspect_layout(source, tape_uuid, block_size, layout);
+        let inspection = inspect_layout(source, tape_uuid, block_size, layout)?;
         inspections.push((layout, inspection));
     }
     resolve_conflicting_survivor_envelopes(source, block_size, &mut inspections)?;
@@ -612,7 +618,7 @@ where
             }
             let summary = match payload {
                 Ok(summary) => summary,
-                Err(failure) => {
+                Err(TerminalMemberReadError::Invalid(failure)) => {
                     inspection.replicas[selected_index] =
                         TerminalReplicaEvidence::Invalid(failure.clone());
                     emit_inventory_event(
@@ -625,6 +631,7 @@ where
                     )?;
                     continue;
                 }
+                Err(TerminalMemberReadError::Source(error)) => return Err(error),
             };
             inspection.replicas[selected_index] = TerminalReplicaEvidence::Valid { summary };
             for index in 0..usize::from(TERMINAL_INDEX_REPLICA_COUNT) {
@@ -712,10 +719,11 @@ fn resolve_conflicting_survivor_envelopes(
                         surviving_editions.push(envelope.header.plan.edition.clone());
                     }
                 }
-                Err(failure) => {
+                Err(TerminalMemberReadError::Invalid(failure)) => {
                     inspection.replicas[index] = TerminalReplicaEvidence::Invalid(failure);
                     inspection.envelopes[index] = None;
                 }
+                Err(TerminalMemberReadError::Source(error)) => return Err(error),
             }
         }
     }
@@ -788,12 +796,7 @@ where
         selection.edition.descriptor.terminal_layout,
         selected_ordinal,
     )
-    .map_err(|failure| TerminalInventoryReadError::SelectedReplica {
-        ordinal: selected_ordinal,
-        source: TapeIndexReplicaError::Payload {
-            message: failure.detail,
-        },
-    })?;
+    .map_err(|error| selected_member_error(selected_ordinal, error))?;
     let replayed_summary = validate_member_payload(
         source,
         block_size,
@@ -801,12 +804,7 @@ where
         &mut visit_entry,
         &mut visit_row,
     )
-    .map_err(|failure| TerminalInventoryReadError::SelectedReplica {
-        ordinal: selected_ordinal,
-        source: TapeIndexReplicaError::Payload {
-            message: failure.detail,
-        },
-    })?;
+    .map_err(|error| selected_member_error(selected_ordinal, error))?;
     if replayed_summary != selection.payload {
         return Err(TerminalInventoryReadError::SelectedReplica {
             ordinal: selected_ordinal,
@@ -1113,9 +1111,12 @@ fn verify_terminal_index_after_damage(
         let envelope =
             match validate_member_envelope(source, tape_uuid, block_size, layout, ordinal) {
                 Ok(envelope) => envelope,
-                Err(failure) => {
+                Err(TerminalMemberReadError::Invalid(failure)) => {
                     replicas[index] = TerminalReplicaEvidence::Invalid(failure);
                     continue;
+                }
+                Err(TerminalMemberReadError::Source(error)) => {
+                    return Err(inventory_error_to_verification(error));
                 }
             };
         let mut entry_index = 0usize;
@@ -1157,7 +1158,12 @@ fn verify_terminal_index_after_damage(
                     physical_prefix.len()
                 ),
             }),
-            Err(failure) => TerminalReplicaEvidence::Invalid(failure),
+            Err(TerminalMemberReadError::Invalid(failure)) => {
+                TerminalReplicaEvidence::Invalid(failure)
+            }
+            Err(TerminalMemberReadError::Source(error)) => {
+                return Err(inventory_error_to_verification(error));
+            }
         };
     }
     let selected_index = replicas
@@ -1387,11 +1393,7 @@ fn verify_terminal_index_strict(
     let mut edition: Option<TapeIndexEditionPlan> = None;
     for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
         let envelope = validate_member_envelope(source, tape_uuid, block_size, layout, ordinal)
-            .map_err(|failure| TerminalIndexVerificationError::Replica {
-                ordinal,
-                failure: failure.kind,
-                detail: failure.detail,
-            })?;
+            .map_err(|error| member_error_to_verification(ordinal, error))?;
         let mut entry_index = 0usize;
         let mut canonical_mismatch = None;
         let summary = validate_member_payload(
@@ -1423,18 +1425,21 @@ fn verify_terminal_index_strict(
             },
             &mut |_| Ok(()),
         )
-        .map_err(|failure| {
-            if let Some(detail) = canonical_mismatch {
-                TerminalIndexVerificationError::CanonicalMapMismatch {
-                    ordinal,
-                    tape_file_number: u64::try_from(entry_index).unwrap_or(u64::MAX),
-                    detail,
-                }
-            } else {
-                TerminalIndexVerificationError::Replica {
-                    ordinal,
-                    failure: failure.kind,
-                    detail: failure.detail,
+        .map_err(|error| match error {
+            TerminalMemberReadError::Source(error) => inventory_error_to_verification(error),
+            TerminalMemberReadError::Invalid(failure) => {
+                if let Some(detail) = canonical_mismatch {
+                    TerminalIndexVerificationError::CanonicalMapMismatch {
+                        ordinal,
+                        tape_file_number: u64::try_from(entry_index).unwrap_or(u64::MAX),
+                        detail,
+                    }
+                } else {
+                    TerminalIndexVerificationError::Replica {
+                        ordinal,
+                        failure: failure.kind,
+                        detail: failure.detail,
+                    }
                 }
             }
         })?;
@@ -1595,10 +1600,7 @@ fn verify_separation_full(
         },
         block_size,
     )
-    .map_err(|error| TerminalIndexVerificationError::Separation {
-        ordinal,
-        source: IndexSeparationError::PhysicalSource(error.to_string()),
-    })?;
+    .map_err(|error| separation_read_error(ordinal, "read terminal separation header", error))?;
     let header = parse_index_separation_header(&header_block, tape_uuid)
         .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
     if header.plan.descriptor.edition_id != expected_edition_id {
@@ -1637,10 +1639,7 @@ fn verify_separation_full(
         },
         block_size,
     )
-    .map_err(|error| TerminalIndexVerificationError::Separation {
-        ordinal,
-        source: IndexSeparationError::PhysicalSource(error.to_string()),
-    })?;
+    .map_err(|error| separation_read_error(ordinal, "read terminal separation footer", error))?;
     let footer = parse_index_separation_footer(&footer_block, tape_uuid)
         .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
     validate_index_separation_pair(&header, &footer)
@@ -1662,8 +1661,16 @@ fn verify_separation_full(
                 context: "separation interior record count",
             },
         )?,
+        fatal_error: None,
     };
-    let verified = validate_index_separation_full(&header, &footer, &mut interior)
+    let validation = validate_index_separation_full(&header, &footer, &mut interior);
+    if let Some(error) = interior.fatal_error.take() {
+        return Err(verification_source_error(
+            "read terminal separation interior",
+            error,
+        ));
+    }
+    let verified = validation
         .map_err(|source| TerminalIndexVerificationError::Separation { ordinal, source })?;
     let filemark_lba = component
         .planned_start_lba
@@ -1679,10 +1686,7 @@ fn verify_separation_full(
         },
         block_size,
     )
-    .map_err(|failure| TerminalIndexVerificationError::Separation {
-        ordinal,
-        source: IndexSeparationError::PhysicalSource(failure.detail),
-    })?;
+    .map_err(|error| member_error_to_separation(ordinal, error))?;
     Ok(verified)
 }
 
@@ -1691,6 +1695,7 @@ struct RawSeparationInteriorSource<'a> {
     start: PhysicalPositionHint,
     block_size: u32,
     record_count: u64,
+    fatal_error: Option<ParityError>,
 }
 
 impl IndexSeparationInteriorBlockSource for RawSeparationInteriorSource<'_> {
@@ -1704,15 +1709,24 @@ impl IndexSeparationInteriorBlockSource for RawSeparationInteriorSource<'_> {
                     context: "full verification separation interior LBA",
                 },
             )?;
-            let block = read_fixed_block(
+            let block = match read_fixed_block(
                 self.source,
                 PhysicalPositionHint {
                     lba,
                     partition: self.start.partition,
                 },
                 self.block_size,
-            )
-            .map_err(|error| IndexSeparationError::PhysicalSource(error.to_string()))?;
+            ) {
+                Ok(block) => block,
+                Err(error) if terminal_candidate_error_is_damage(&error) => {
+                    return Err(IndexSeparationError::PhysicalSource(error.to_string()));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.fatal_error = Some(error);
+                    return Err(IndexSeparationError::PhysicalSource(message));
+                }
+            };
             visitor(&block)?;
         }
         Ok(())
@@ -1743,15 +1757,19 @@ fn discover_terminal_layouts(
             lba: footer_lba,
             partition: eod.partition,
         };
-        if let Ok(block) = read_fixed_block(source, footer_position, block_size) {
-            if let Ok(footer) = parse_tape_index_bootstrap_footer(&block, tape_uuid) {
-                if footer.observed_footer_lba == footer_lba {
-                    let layout = footer.plan.edition.descriptor.terminal_layout;
-                    if layout.expected_eod_lba >= eod.lba && !layouts.contains(&layout) {
-                        layouts.push(layout);
+        match read_fixed_block(source, footer_position, block_size) {
+            Ok(block) => {
+                if let Ok(footer) = parse_tape_index_bootstrap_footer(&block, tape_uuid) {
+                    if footer.observed_footer_lba == footer_lba {
+                        let layout = footer.plan.edition.descriptor.terminal_layout;
+                        if layout.expected_eod_lba >= eod.lba && !layouts.contains(&layout) {
+                            layouts.push(layout);
+                        }
                     }
                 }
             }
+            Err(error) if terminal_candidate_error_is_damage(&error) => {}
+            Err(error) => return Err(source_error("read terminal footer candidate", error)),
         }
         source
             .locate_physical(spaced.position_after)
@@ -1765,7 +1783,7 @@ fn inspect_layout(
     tape_uuid: &[u8; 16],
     block_size: u32,
     layout: TerminalTailLayout,
-) -> LayoutInspection {
+) -> Result<LayoutInspection, TerminalInventoryReadError> {
     let mut replicas = missing_evidence("member was not inspected");
     let mut envelopes: [Option<ValidatedReplicaEnvelope>; 3] = [None, None, None];
     for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
@@ -1775,14 +1793,17 @@ fn inspect_layout(
                 replicas[index] = TerminalReplicaEvidence::ConsistentEnvelope;
                 envelopes[index] = Some(envelope);
             }
-            Err(failure) => replicas[index] = TerminalReplicaEvidence::Invalid(failure),
+            Err(TerminalMemberReadError::Invalid(failure)) => {
+                replicas[index] = TerminalReplicaEvidence::Invalid(failure);
+            }
+            Err(TerminalMemberReadError::Source(error)) => return Err(error),
         }
     }
 
-    LayoutInspection {
+    Ok(LayoutInspection {
         replicas,
         envelopes,
-    }
+    })
 }
 
 fn validate_member_envelope(
@@ -1791,23 +1812,28 @@ fn validate_member_envelope(
     block_size: u32,
     layout: TerminalTailLayout,
     ordinal: u16,
-) -> Result<ValidatedReplicaEnvelope, TerminalReplicaFailure> {
+) -> Result<ValidatedReplicaEnvelope, TerminalMemberReadError> {
     let component = layout
         .replica(ordinal)
-        .map_err(|error| failure(TerminalReplicaFailureKind::Missing, error))?;
+        .map_err(|error| invalid_member(TerminalReplicaFailureKind::Missing, error))?;
     let header_position = PhysicalPositionHint {
         lba: component.planned_start_lba,
         partition: layout.partition,
     };
-    let header_block = read_fixed_block(source, header_position, block_size)
-        .map_err(|error| failure(TerminalReplicaFailureKind::HeaderRead, error))?;
+    let header_block = read_fixed_block(source, header_position, block_size).map_err(|error| {
+        member_read_error(
+            "read terminal replica header",
+            TerminalReplicaFailureKind::HeaderRead,
+            error,
+        )
+    })?;
     let header = parse_tape_index_replica_header(&header_block, tape_uuid)
-        .map_err(|error| failure(TerminalReplicaFailureKind::HeaderInvalid, error))?;
+        .map_err(|error| invalid_member(TerminalReplicaFailureKind::HeaderInvalid, error))?;
     if header.plan.replica_ordinal != ordinal
         || header.plan.component != component
         || header.plan.edition.descriptor.terminal_layout != layout
     {
-        return Err(failure(
+        return Err(invalid_member(
             TerminalReplicaFailureKind::HeaderInvalid,
             format!("header does not describe the discovered layout for replica {ordinal}"),
         ));
@@ -1816,13 +1842,13 @@ fn validate_member_envelope(
     let footer_lba = component
         .planned_start_lba
         .checked_add(component.record_count.checked_sub(1).ok_or_else(|| {
-            failure(
+            invalid_member(
                 TerminalReplicaFailureKind::FooterRead,
                 "replica record count has no footer",
             )
         })?)
         .ok_or_else(|| {
-            failure(
+            invalid_member(
                 TerminalReplicaFailureKind::FooterRead,
                 "replica footer LBA overflows u64",
             )
@@ -1835,23 +1861,29 @@ fn validate_member_envelope(
         },
         block_size,
     )
-    .map_err(|error| failure(TerminalReplicaFailureKind::FooterRead, error))?;
+    .map_err(|error| {
+        member_read_error(
+            "read terminal replica footer",
+            TerminalReplicaFailureKind::FooterRead,
+            error,
+        )
+    })?;
     let footer = parse_tape_index_bootstrap_footer(&footer_block, tape_uuid)
-        .map_err(|error| failure(TerminalReplicaFailureKind::FooterInvalid, error))?;
+        .map_err(|error| invalid_member(TerminalReplicaFailureKind::FooterInvalid, error))?;
     if footer.observed_footer_lba != footer_lba || footer.plan.replica_ordinal != ordinal {
-        return Err(failure(
+        return Err(invalid_member(
             TerminalReplicaFailureKind::FooterInvalid,
             format!("footer does not bind measured replica {ordinal} position"),
         ));
     }
     validate_tape_index_replica_pair(&header, &footer)
-        .map_err(|error| failure(TerminalReplicaFailureKind::LocalBinding, error))?;
+        .map_err(|error| invalid_member(TerminalReplicaFailureKind::LocalBinding, error))?;
 
     let filemark_lba = component
         .planned_start_lba
         .checked_add(component.record_count)
         .ok_or_else(|| {
-            failure(
+            invalid_member(
                 TerminalReplicaFailureKind::TrailingFilemark,
                 "replica trailing-filemark LBA overflows u64",
             )
@@ -1874,7 +1906,7 @@ fn validate_member_payload<FE, FR>(
     envelope: &ValidatedReplicaEnvelope,
     visit_entry: &mut FE,
     visit_row: &mut FR,
-) -> Result<TapeIndexReplicaPayloadSummary, TerminalReplicaFailure>
+) -> Result<TapeIndexReplicaPayloadSummary, TerminalMemberReadError>
 where
     FE: FnMut(&TapeIndexReplicaMapEntry) -> Result<(), TapeIndexReplicaError>,
     FR: FnMut(&TapeIndexReplicaObjectRow) -> Result<(), TapeIndexReplicaError>,
@@ -1886,7 +1918,7 @@ where
         .planned_start_lba
         .checked_add(1)
         .ok_or_else(|| {
-            failure(
+            invalid_member(
                 TerminalReplicaFailureKind::PayloadInvalid,
                 "replica payload start overflows u64",
             )
@@ -1910,16 +1942,22 @@ where
             .edition
             .replica_layout
             .payload_record_count,
+        fatal_error: None,
     };
-    let summary = validate_tape_index_replica_payload(
+    let result = validate_tape_index_replica_payload(
         &envelope.header,
         &envelope.footer,
         &mut payload_source,
         visit_entry,
         visit_row,
-    )
-    .map_err(|error| failure(TerminalReplicaFailureKind::PayloadInvalid, error))?;
-    Ok(summary)
+    );
+    if let Some(error) = payload_source.fatal_error.take() {
+        return Err(TerminalMemberReadError::Source(source_error(
+            "read terminal replica payload",
+            error,
+        )));
+    }
+    result.map_err(|error| invalid_member(TerminalReplicaFailureKind::PayloadInvalid, error))
 }
 
 struct RawReplicaPayloadSource<'a> {
@@ -1927,6 +1965,7 @@ struct RawReplicaPayloadSource<'a> {
     start: PhysicalPositionHint,
     block_size: u32,
     record_count: u64,
+    fatal_error: Option<ParityError>,
 }
 
 impl TapeIndexReplicaPayloadBlockSource for RawReplicaPayloadSource<'_> {
@@ -1940,17 +1979,26 @@ impl TapeIndexReplicaPayloadBlockSource for RawReplicaPayloadSource<'_> {
                     context: "terminal inventory payload LBA",
                 },
             )?;
-            let block = read_fixed_block(
+            let block = match read_fixed_block(
                 self.source,
                 PhysicalPositionHint {
                     lba,
                     partition: self.start.partition,
                 },
                 self.block_size,
-            )
-            .map_err(|error| TapeIndexReplicaError::Payload {
-                message: error.to_string(),
-            })?;
+            ) {
+                Ok(block) => block,
+                Err(error) if terminal_candidate_error_is_damage(&error) => {
+                    return Err(TapeIndexReplicaError::Payload {
+                        message: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.fatal_error = Some(error);
+                    return Err(TapeIndexReplicaError::Payload { message });
+                }
+            };
             visitor(&block)?;
         }
         Ok(())
@@ -1961,14 +2009,18 @@ fn expect_filemark(
     source: &mut dyn RawTapeSource,
     position: PhysicalPositionHint,
     block_size: u32,
-) -> Result<(), TerminalReplicaFailure> {
-    source
-        .locate_physical(position)
-        .map_err(|error| failure(TerminalReplicaFailureKind::TrailingFilemark, error))?;
+) -> Result<(), TerminalMemberReadError> {
+    source.locate_physical(position).map_err(|error| {
+        member_read_error(
+            "locate terminal replica trailing filemark",
+            TerminalReplicaFailureKind::TrailingFilemark,
+            error,
+        )
+    })?;
     let mut buffer = vec![
         0;
         usize::try_from(block_size).map_err(|_| {
-            failure(
+            invalid_member(
                 TerminalReplicaFailureKind::TrailingFilemark,
                 "block size does not fit usize",
             )
@@ -1979,7 +2031,7 @@ fn expect_filemark(
             if position_after.partition == position.partition
                 && position_after.lba
                     == position.lba.checked_add(1).ok_or_else(|| {
-                        failure(
+                        invalid_member(
                             TerminalReplicaFailureKind::TrailingFilemark,
                             "position after filemark overflows u64",
                         )
@@ -1987,14 +2039,18 @@ fn expect_filemark(
         {
             Ok(())
         }
-        Ok(outcome) => Err(failure(
+        Ok(outcome) => Err(invalid_member(
             TerminalReplicaFailureKind::TrailingFilemark,
             format!(
                 "expected filemark at LBA {}, observed {outcome:?}",
                 position.lba
             ),
         )),
-        Err(error) => Err(failure(TerminalReplicaFailureKind::TrailingFilemark, error)),
+        Err(error) => Err(member_read_error(
+            "read terminal replica trailing filemark",
+            TerminalReplicaFailureKind::TrailingFilemark,
+            error,
+        )),
     }
 }
 
@@ -2043,6 +2099,92 @@ fn failure(
     TerminalReplicaFailure {
         kind,
         detail: detail.to_string(),
+    }
+}
+
+fn invalid_member(
+    kind: TerminalReplicaFailureKind,
+    detail: impl std::fmt::Display,
+) -> TerminalMemberReadError {
+    TerminalMemberReadError::Invalid(failure(kind, detail))
+}
+
+fn member_read_error(
+    operation: &'static str,
+    kind: TerminalReplicaFailureKind,
+    error: ParityError,
+) -> TerminalMemberReadError {
+    if terminal_candidate_error_is_damage(&error) {
+        invalid_member(kind, error)
+    } else {
+        TerminalMemberReadError::Source(source_error(operation, error))
+    }
+}
+
+fn terminal_candidate_error_is_damage(error: &ParityError) -> bool {
+    match error {
+        ParityError::TapeIo(TapeIoError::CheckCondition(
+            remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
+        )) => decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03),
+        ParityError::TapeIndexReplica(_) => true,
+        _ => false,
+    }
+}
+
+fn selected_member_error(
+    ordinal: u16,
+    error: TerminalMemberReadError,
+) -> TerminalInventoryReadError {
+    match error {
+        TerminalMemberReadError::Invalid(failure) => TerminalInventoryReadError::SelectedReplica {
+            ordinal,
+            source: TapeIndexReplicaError::Payload {
+                message: failure.detail,
+            },
+        },
+        TerminalMemberReadError::Source(error) => error,
+    }
+}
+
+fn member_error_to_verification(
+    ordinal: u16,
+    error: TerminalMemberReadError,
+) -> TerminalIndexVerificationError {
+    match error {
+        TerminalMemberReadError::Invalid(failure) => TerminalIndexVerificationError::Replica {
+            ordinal,
+            failure: failure.kind,
+            detail: failure.detail,
+        },
+        TerminalMemberReadError::Source(error) => inventory_error_to_verification(error),
+    }
+}
+
+fn separation_read_error(
+    ordinal: u16,
+    operation: &'static str,
+    error: ParityError,
+) -> TerminalIndexVerificationError {
+    if terminal_candidate_error_is_damage(&error) {
+        TerminalIndexVerificationError::Separation {
+            ordinal,
+            source: IndexSeparationError::PhysicalSource(error.to_string()),
+        }
+    } else {
+        verification_source_error(operation, error)
+    }
+}
+
+fn member_error_to_separation(
+    ordinal: u16,
+    error: TerminalMemberReadError,
+) -> TerminalIndexVerificationError {
+    match error {
+        TerminalMemberReadError::Invalid(failure) => TerminalIndexVerificationError::Separation {
+            ordinal,
+            source: IndexSeparationError::PhysicalSource(failure.detail),
+        },
+        TerminalMemberReadError::Source(error) => inventory_error_to_verification(error),
     }
 }
 
@@ -2145,6 +2287,14 @@ mod tests {
         cursor: usize,
         read_lbas: Vec<u64>,
         eod_calls: u64,
+        read_fault: Option<(u64, TestReadFault)>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestReadFault {
+        Medium,
+        Hardware,
+        Transport,
     }
 
     impl RecordingSource {
@@ -2154,7 +2304,13 @@ mod tests {
                 cursor: 0,
                 read_lbas: Vec::new(),
                 eod_calls: 0,
+                read_fault: None,
             }
+        }
+
+        fn with_read_fault(mut self, lba: u64, fault: TestReadFault) -> Self {
+            self.read_fault = Some((lba, fault));
+            self
         }
     }
 
@@ -2222,6 +2378,33 @@ mod tests {
             let lba = u64::try_from(self.cursor)
                 .map_err(|_| ParityError::Invariant("test cursor does not fit u64"))?;
             self.read_lbas.push(lba);
+            if let Some((fault_lba, fault)) = self.read_fault {
+                if fault_lba == lba {
+                    return Err(ParityError::TapeIo(match fault {
+                        TestReadFault::Medium => TapeIoError::CheckCondition(
+                            remanence_library::scsi::ScsiError::CheckCondition {
+                                sense: vec![0x72, 0x03, 0x11, 0x00],
+                                bytes_transferred: 0,
+                            },
+                        ),
+                        TestReadFault::Hardware => TapeIoError::CheckCondition(
+                            remanence_library::scsi::ScsiError::CheckCondition {
+                                sense: vec![0x72, 0x04, 0x44, 0x00],
+                                bytes_transferred: 0,
+                            },
+                        ),
+                        TestReadFault::Transport => TapeIoError::Transport(
+                            remanence_library::scsi::ScsiError::TransportError {
+                                status: 0,
+                                host_status: 0,
+                                driver_status: 0x06,
+                                info: 1,
+                                sense: Vec::new(),
+                            },
+                        ),
+                    }));
+                }
+            }
             let Some(record) = self.records.get(self.cursor) else {
                 return Ok(RawReadOutcome::EndOfData {
                     position_after: PhysicalPositionHint::new(lba),
@@ -2796,6 +2979,114 @@ mod tests {
                 "fallback must try C then B exactly once and never stream A"
             );
         }
+    }
+
+    #[test]
+    fn medium_error_in_c_payload_falls_back_to_b() {
+        let fixture = triple_fixture();
+        let c_payload_lba = fixture
+            .layout
+            .replica(3)
+            .expect("replica C")
+            .planned_start_lba
+            .checked_add(1)
+            .expect("replica C payload LBA");
+        let mut source = RecordingSource::new(fixture.records)
+            .with_read_fault(c_payload_lba, TestReadFault::Medium);
+
+        let outcome = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("a medium error invalidates only the affected candidate");
+        let TerminalInventoryOutcome::Inventory(selection) = outcome else {
+            panic!("replica B must survive a medium error in replica C")
+        };
+        assert_eq!(selection.selected_replica_ordinal, 2);
+        assert!(matches!(
+            &selection.replicas[2],
+            TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::PayloadInvalid,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn non_medium_payload_errors_abort_without_fallback() {
+        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+            let fixture = triple_fixture();
+            let c_payload_lba = fixture
+                .layout
+                .replica(3)
+                .expect("replica C")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("replica C payload LBA");
+            let b_payload_lba = fixture
+                .layout
+                .replica(2)
+                .expect("replica B")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("replica B payload LBA");
+            let mut source =
+                RecordingSource::new(fixture.records).with_read_fault(c_payload_lba, fault);
+
+            let error = read_terminal_index_inventory_summary(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                .expect_err("a non-medium source error must abort discovery");
+            assert!(matches!(
+                error,
+                TerminalInventoryReadError::Source {
+                    operation: "read terminal replica payload",
+                    ..
+                }
+            ));
+            assert!(
+                !source.read_lbas.contains(&b_payload_lba),
+                "fallback must not continue after a non-medium source error"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_footer_probe_distinguishes_medium_and_transport_errors() {
+        let fixture = triple_fixture();
+        let c_footer_lba = fixture
+            .layout
+            .replica(3)
+            .expect("replica C")
+            .planned_start_lba
+            .checked_add(
+                fixture
+                    .layout
+                    .replica(3)
+                    .expect("replica C")
+                    .record_count
+                    .checked_sub(1)
+                    .expect("replica C footer offset"),
+            )
+            .expect("replica C footer LBA");
+
+        let mut medium_source = RecordingSource::new(fixture.records.clone())
+            .with_read_fault(c_footer_lba, TestReadFault::Medium);
+        let medium_outcome =
+            read_terminal_index_inventory_summary(&mut medium_source, &TAPE_UUID, BLOCK_SIZE)
+                .expect("a medium error during footer probing remains candidate damage");
+        assert!(matches!(
+            medium_outcome,
+            TerminalInventoryOutcome::Inventory(_)
+        ));
+
+        let mut transport_source = RecordingSource::new(fixture.records)
+            .with_read_fault(c_footer_lba, TestReadFault::Transport);
+        let error =
+            read_terminal_index_inventory_summary(&mut transport_source, &TAPE_UUID, BLOCK_SIZE)
+                .expect_err("transport failure during footer probing must abort");
+        assert!(matches!(
+            error,
+            TerminalInventoryReadError::Source {
+                operation: "read terminal footer candidate",
+                ..
+            }
+        ));
     }
 
     #[test]
