@@ -48,6 +48,35 @@ const TAPE_INDEX_REPLICA_HEADER_ROLE: u16 = 1;
 const TAPE_INDEX_REPLICA_FOOTER_ROLE: u16 = 2;
 const TAPE_INDEX_REPLICA_FLAG_FINAL: u32 = 1;
 
+const MAGIC_OFFSET: usize = 0x000;
+const SCHEMA_VERSION_OFFSET: usize = 0x008;
+const ROLE_OFFSET: usize = 0x00A;
+const FINALITY_FLAGS_OFFSET: usize = 0x00C;
+const TAPE_UUID_OFFSET: usize = 0x010;
+const EDITION_ID_OFFSET: usize = 0x020;
+const EDITION_SEQUENCE_OFFSET: usize = 0x030;
+const REPLICA_ORDINAL_OFFSET: usize = 0x038;
+const REPLICA_COUNT_OFFSET: usize = 0x03A;
+const PARTITION_OFFSET: usize = 0x03C;
+const BLOCK_SIZE_OFFSET: usize = 0x040;
+const COMPRESSION_OFFSET: usize = 0x044;
+const COVERED_PREFIX_FILE_COUNT_OFFSET: usize = 0x048;
+const TOTAL_DATA_ORDINALS_OFFSET: usize = 0x050;
+const HIGHEST_PROTECTED_ORDINAL_OFFSET: usize = 0x058;
+const STRUCTURAL_ENTRY_COUNT_OFFSET: usize = 0x060;
+const OBJECT_ROW_COUNT_OFFSET: usize = 0x068;
+const PAYLOAD_LEN_OFFSET: usize = 0x070;
+const PAYLOAD_RECORD_COUNT_OFFSET: usize = 0x078;
+const REPLICA_RECORD_COUNT_OFFSET: usize = 0x080;
+const PLANNED_TAPE_FILE_OFFSET: usize = 0x088;
+const PLANNED_START_LBA_OFFSET: usize = 0x090;
+const FOOTER_BLOCK_OFFSET: usize = 0x098;
+const EXPECTED_EOD_LBA_OFFSET: usize = 0x0A0;
+const PAYLOAD_SHA256_OFFSET: usize = 0x0A8;
+const CANONICAL_MAP_SHA256_OFFSET: usize = 0x0C8;
+const EDITION_DIGEST_OFFSET: usize = 0x0E8;
+const LAYOUT_DIGEST_OFFSET: usize = 0x108;
+const DESCRIPTOR_DIGEST_OFFSET: usize = 0x128;
 const TAIL_COMPONENTS_OFFSET: usize = 0x148;
 const TAIL_COMPONENT_LEN: usize = 32;
 const DIAGNOSTIC_LENGTHS_OFFSET: usize = 0x1F0;
@@ -69,7 +98,36 @@ const OBSERVED_FOOTER_LBA_OFFSET: usize = 0x2F0;
 const BACKWARD_START_DELTA_OFFSET: usize = 0x2F8;
 const FIXED_RESERVED_OFFSET: usize = 0x300;
 const _: () = assert!(
-    0x128 + 32 == TAIL_COMPONENTS_OFFSET
+    MAGIC_OFFSET == 0
+        && MAGIC_OFFSET + 8 == SCHEMA_VERSION_OFFSET
+        && SCHEMA_VERSION_OFFSET + size_of::<u16>() == ROLE_OFFSET
+        && ROLE_OFFSET + size_of::<u16>() == FINALITY_FLAGS_OFFSET
+        && FINALITY_FLAGS_OFFSET + size_of::<u32>() == TAPE_UUID_OFFSET
+        && TAPE_UUID_OFFSET + 16 == EDITION_ID_OFFSET
+        && EDITION_ID_OFFSET + 16 == EDITION_SEQUENCE_OFFSET
+        && EDITION_SEQUENCE_OFFSET + size_of::<u64>() == REPLICA_ORDINAL_OFFSET
+        && REPLICA_ORDINAL_OFFSET + size_of::<u16>() == REPLICA_COUNT_OFFSET
+        && REPLICA_COUNT_OFFSET + size_of::<u16>() == PARTITION_OFFSET
+        && PARTITION_OFFSET + size_of::<u32>() == BLOCK_SIZE_OFFSET
+        && BLOCK_SIZE_OFFSET + size_of::<u32>() == COMPRESSION_OFFSET
+        && COMPRESSION_OFFSET + size_of::<u32>() == COVERED_PREFIX_FILE_COUNT_OFFSET
+        && COVERED_PREFIX_FILE_COUNT_OFFSET + size_of::<u64>() == TOTAL_DATA_ORDINALS_OFFSET
+        && TOTAL_DATA_ORDINALS_OFFSET + size_of::<u64>() == HIGHEST_PROTECTED_ORDINAL_OFFSET
+        && HIGHEST_PROTECTED_ORDINAL_OFFSET + size_of::<u64>() == STRUCTURAL_ENTRY_COUNT_OFFSET
+        && STRUCTURAL_ENTRY_COUNT_OFFSET + size_of::<u64>() == OBJECT_ROW_COUNT_OFFSET
+        && OBJECT_ROW_COUNT_OFFSET + size_of::<u64>() == PAYLOAD_LEN_OFFSET
+        && PAYLOAD_LEN_OFFSET + size_of::<u64>() == PAYLOAD_RECORD_COUNT_OFFSET
+        && PAYLOAD_RECORD_COUNT_OFFSET + size_of::<u64>() == REPLICA_RECORD_COUNT_OFFSET
+        && REPLICA_RECORD_COUNT_OFFSET + size_of::<u64>() == PLANNED_TAPE_FILE_OFFSET
+        && PLANNED_TAPE_FILE_OFFSET + size_of::<u64>() == PLANNED_START_LBA_OFFSET
+        && PLANNED_START_LBA_OFFSET + size_of::<u64>() == FOOTER_BLOCK_OFFSET
+        && FOOTER_BLOCK_OFFSET + size_of::<u64>() == EXPECTED_EOD_LBA_OFFSET
+        && EXPECTED_EOD_LBA_OFFSET + size_of::<u64>() == PAYLOAD_SHA256_OFFSET
+        && PAYLOAD_SHA256_OFFSET + 32 == CANONICAL_MAP_SHA256_OFFSET
+        && CANONICAL_MAP_SHA256_OFFSET + 32 == EDITION_DIGEST_OFFSET
+        && EDITION_DIGEST_OFFSET + 32 == LAYOUT_DIGEST_OFFSET
+        && LAYOUT_DIGEST_OFFSET + 32 == DESCRIPTOR_DIGEST_OFFSET
+        && DESCRIPTOR_DIGEST_OFFSET + 32 == TAIL_COMPONENTS_OFFSET
         && TAIL_COMPONENTS_OFFSET + TERMINAL_TAIL_COMPONENT_COUNT * TAIL_COMPONENT_LEN
             <= DIAGNOSTIC_LENGTHS_OFFSET
         && DIAGNOSTIC_LENGTHS_OFFSET + 4 <= WRITER_VERSION_OFFSET
@@ -703,7 +761,9 @@ pub fn parse_tape_index_replica_header(
     expected_tape_uuid: &[u8; 16],
 ) -> Result<TapeIndexReplicaHeader, TapeIndexReplicaError> {
     let expected_magic = derive_tape_index_replica_header_magic(expected_tape_uuid);
-    if block.len() < 8 || block[..8] != expected_magic {
+    if block.len() < SCHEMA_VERSION_OFFSET
+        || block[MAGIC_OFFSET..SCHEMA_VERSION_OFFSET] != expected_magic
+    {
         return Err(TapeIndexReplicaError::MagicMismatch { frame: "header" });
     }
     let plan = parse_replica_frame(
@@ -724,7 +784,9 @@ pub fn parse_tape_index_bootstrap_footer(
     expected_tape_uuid: &[u8; 16],
 ) -> Result<TapeIndexBootstrapFooter, TapeIndexReplicaError> {
     let expected_magic = derive_tape_index_replica_footer_magic(expected_tape_uuid);
-    if block.len() < 8 || block[..8] != expected_magic {
+    if block.len() < SCHEMA_VERSION_OFFSET
+        || block[MAGIC_OFFSET..SCHEMA_VERSION_OFFSET] != expected_magic
+    {
         return Err(TapeIndexReplicaError::MagicMismatch { frame: "footer" });
     }
     let plan = parse_replica_frame(
@@ -1483,42 +1545,93 @@ fn write_replica_frame(
             actual: block.len(),
         });
     }
-    block[..8].copy_from_slice(&magic);
-    block[0x08..0x0A].copy_from_slice(&TAPE_INDEX_REPLICA_SCHEMA_VERSION.to_le_bytes());
-    block[0x0A..0x0C].copy_from_slice(&role.to_le_bytes());
-    block[0x0C..0x10].copy_from_slice(&TAPE_INDEX_REPLICA_FLAG_FINAL.to_le_bytes());
-    block[0x10..0x20].copy_from_slice(&descriptor.tape_uuid);
-    block[0x20..0x30].copy_from_slice(&descriptor.edition_id);
-    write_u64(block, 0x30, descriptor.edition_sequence);
-    block[0x38..0x3A].copy_from_slice(&plan.replica_ordinal.to_le_bytes());
-    block[0x3A..0x3C].copy_from_slice(&TERMINAL_INDEX_REPLICA_COUNT.to_le_bytes());
-    block[0x3C..0x40].copy_from_slice(&descriptor.terminal_layout.partition.to_le_bytes());
-    block[0x40..0x44].copy_from_slice(&descriptor.block_size.to_le_bytes());
-    write_u64(block, 0x48, descriptor.scope.covered_prefix_tape_file_count);
-    write_u64(block, 0x50, descriptor.scope.total_data_ordinals);
-    write_u64(block, 0x58, descriptor.scope.highest_protected_ordinal);
-    write_u64(block, 0x60, descriptor.counts.structural_entry_count);
-    write_u64(block, 0x68, descriptor.counts.object_row_count);
-    write_u64(block, 0x70, plan.edition.replica_layout.payload_len);
+    block[MAGIC_OFFSET..MAGIC_OFFSET + 8].copy_from_slice(&magic);
+    block[SCHEMA_VERSION_OFFSET..SCHEMA_VERSION_OFFSET + size_of::<u16>()]
+        .copy_from_slice(&TAPE_INDEX_REPLICA_SCHEMA_VERSION.to_le_bytes());
+    block[ROLE_OFFSET..ROLE_OFFSET + size_of::<u16>()].copy_from_slice(&role.to_le_bytes());
+    block[FINALITY_FLAGS_OFFSET..FINALITY_FLAGS_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&TAPE_INDEX_REPLICA_FLAG_FINAL.to_le_bytes());
+    block[TAPE_UUID_OFFSET..TAPE_UUID_OFFSET + 16].copy_from_slice(&descriptor.tape_uuid);
+    block[EDITION_ID_OFFSET..EDITION_ID_OFFSET + 16].copy_from_slice(&descriptor.edition_id);
+    write_u64(block, EDITION_SEQUENCE_OFFSET, descriptor.edition_sequence);
+    block[REPLICA_ORDINAL_OFFSET..REPLICA_ORDINAL_OFFSET + size_of::<u16>()]
+        .copy_from_slice(&plan.replica_ordinal.to_le_bytes());
+    block[REPLICA_COUNT_OFFSET..REPLICA_COUNT_OFFSET + size_of::<u16>()]
+        .copy_from_slice(&TERMINAL_INDEX_REPLICA_COUNT.to_le_bytes());
+    block[PARTITION_OFFSET..PARTITION_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&descriptor.terminal_layout.partition.to_le_bytes());
+    block[BLOCK_SIZE_OFFSET..BLOCK_SIZE_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&descriptor.block_size.to_le_bytes());
     write_u64(
         block,
-        0x78,
+        COVERED_PREFIX_FILE_COUNT_OFFSET,
+        descriptor.scope.covered_prefix_tape_file_count,
+    );
+    write_u64(
+        block,
+        TOTAL_DATA_ORDINALS_OFFSET,
+        descriptor.scope.total_data_ordinals,
+    );
+    write_u64(
+        block,
+        HIGHEST_PROTECTED_ORDINAL_OFFSET,
+        descriptor.scope.highest_protected_ordinal,
+    );
+    write_u64(
+        block,
+        STRUCTURAL_ENTRY_COUNT_OFFSET,
+        descriptor.counts.structural_entry_count,
+    );
+    write_u64(
+        block,
+        OBJECT_ROW_COUNT_OFFSET,
+        descriptor.counts.object_row_count,
+    );
+    write_u64(
+        block,
+        PAYLOAD_LEN_OFFSET,
+        plan.edition.replica_layout.payload_len,
+    );
+    write_u64(
+        block,
+        PAYLOAD_RECORD_COUNT_OFFSET,
         plan.edition.replica_layout.payload_record_count,
     );
     write_u64(
         block,
-        0x80,
+        REPLICA_RECORD_COUNT_OFFSET,
         plan.edition.replica_layout.replica_record_count,
     );
-    write_u64(block, 0x88, plan.component.planned_tape_file_number);
-    write_u64(block, 0x90, plan.component.planned_start_lba);
-    write_u64(block, 0x98, plan.edition.replica_layout.footer_block_offset);
-    write_u64(block, 0xA0, descriptor.terminal_layout.expected_eod_lba);
-    block[0xA8..0xC8].copy_from_slice(&plan.edition.payload_sha256);
-    block[0xC8..0xE8].copy_from_slice(&plan.edition.canonical_map_sha256);
-    block[0xE8..0x108].copy_from_slice(&plan.edition.edition_digest);
-    block[0x108..0x128].copy_from_slice(&plan.edition.layout_digest);
-    block[0x128..0x148].copy_from_slice(&plan.descriptor_digest);
+    write_u64(
+        block,
+        PLANNED_TAPE_FILE_OFFSET,
+        plan.component.planned_tape_file_number,
+    );
+    write_u64(
+        block,
+        PLANNED_START_LBA_OFFSET,
+        plan.component.planned_start_lba,
+    );
+    write_u64(
+        block,
+        FOOTER_BLOCK_OFFSET,
+        plan.edition.replica_layout.footer_block_offset,
+    );
+    write_u64(
+        block,
+        EXPECTED_EOD_LBA_OFFSET,
+        descriptor.terminal_layout.expected_eod_lba,
+    );
+    block[PAYLOAD_SHA256_OFFSET..PAYLOAD_SHA256_OFFSET + 32]
+        .copy_from_slice(&plan.edition.payload_sha256);
+    block[CANONICAL_MAP_SHA256_OFFSET..CANONICAL_MAP_SHA256_OFFSET + 32]
+        .copy_from_slice(&plan.edition.canonical_map_sha256);
+    block[EDITION_DIGEST_OFFSET..EDITION_DIGEST_OFFSET + 32]
+        .copy_from_slice(&plan.edition.edition_digest);
+    block[LAYOUT_DIGEST_OFFSET..LAYOUT_DIGEST_OFFSET + 32]
+        .copy_from_slice(&plan.edition.layout_digest);
+    block[DESCRIPTOR_DIGEST_OFFSET..DESCRIPTOR_DIGEST_OFFSET + 32]
+        .copy_from_slice(&plan.descriptor_digest);
     for (index, component) in descriptor
         .terminal_layout
         .components
@@ -1577,47 +1690,47 @@ fn parse_replica_frame(
     {
         return Err(TapeIndexReplicaError::CrcMismatch { frame });
     }
-    let version = read_u16(block, 0x08);
+    let version = read_u16(block, SCHEMA_VERSION_OFFSET);
     if version != TAPE_INDEX_REPLICA_SCHEMA_VERSION {
         return Err(TapeIndexReplicaError::UnsupportedVersion { version });
     }
-    if read_u16(block, 0x0A) != expected_role
-        || read_u32(block, 0x0C) != TAPE_INDEX_REPLICA_FLAG_FINAL
+    if read_u16(block, ROLE_OFFSET) != expected_role
+        || read_u32(block, FINALITY_FLAGS_OFFSET) != TAPE_INDEX_REPLICA_FLAG_FINAL
     {
         return Err(TapeIndexReplicaError::DigestMismatch {
             field: "role/finality flags",
         });
     }
     let mut tape_uuid = [0u8; 16];
-    tape_uuid.copy_from_slice(&block[0x10..0x20]);
+    tape_uuid.copy_from_slice(&block[TAPE_UUID_OFFSET..TAPE_UUID_OFFSET + 16]);
     if &tape_uuid != expected_tape_uuid {
         return Err(TapeIndexReplicaError::WrongTape);
     }
     let mut edition_id = [0u8; 16];
-    edition_id.copy_from_slice(&block[0x20..0x30]);
+    edition_id.copy_from_slice(&block[EDITION_ID_OFFSET..EDITION_ID_OFFSET + 16]);
     if edition_id == [0; 16] {
         return Err(TapeIndexReplicaError::ZeroEditionId);
     }
-    let edition_sequence = read_u64(block, 0x30);
+    let edition_sequence = read_u64(block, EDITION_SEQUENCE_OFFSET);
     if edition_sequence == 0 {
         return Err(TapeIndexReplicaError::ZeroEditionSequence);
     }
-    let replica_ordinal = read_u16(block, 0x38);
+    let replica_ordinal = read_u16(block, REPLICA_ORDINAL_OFFSET);
     if !(1..=TERMINAL_INDEX_REPLICA_COUNT).contains(&replica_ordinal) {
         return Err(TapeIndexReplicaError::InvalidReplicaOrdinal {
             ordinal: replica_ordinal,
         });
     }
-    if read_u16(block, 0x3A) != TERMINAL_INDEX_REPLICA_COUNT {
+    if read_u16(block, REPLICA_COUNT_OFFSET) != TERMINAL_INDEX_REPLICA_COUNT {
         return Err(TapeIndexReplicaError::DigestMismatch {
             field: "replica count",
         });
     }
-    let partition = read_u32(block, 0x3C);
+    let partition = read_u32(block, PARTITION_OFFSET);
     if partition != 0 {
         return Err(TerminalTailLayoutError::UnsupportedPartition { partition }.into());
     }
-    let block_size = read_u32(block, 0x40);
+    let block_size = read_u32(block, BLOCK_SIZE_OFFSET);
     if block_size != physical_block_size as u32 {
         return Err(TapeIndexReplicaError::WrongLength {
             frame,
@@ -1625,17 +1738,17 @@ fn parse_replica_frame(
             actual: block.len(),
         });
     }
-    if read_u32(block, 0x44) != 0 {
+    if read_u32(block, COMPRESSION_OFFSET) != 0 {
         return Err(TapeIndexReplicaError::CompressionEnabled);
     }
     let scope = TapeIndexReplicaScope {
-        covered_prefix_tape_file_count: read_u64(block, 0x48),
-        total_data_ordinals: read_u64(block, 0x50),
-        highest_protected_ordinal: read_u64(block, 0x58),
+        covered_prefix_tape_file_count: read_u64(block, COVERED_PREFIX_FILE_COUNT_OFFSET),
+        total_data_ordinals: read_u64(block, TOTAL_DATA_ORDINALS_OFFSET),
+        highest_protected_ordinal: read_u64(block, HIGHEST_PROTECTED_ORDINAL_OFFSET),
     };
     let counts = TapeIndexReplicaCounts {
-        structural_entry_count: read_u64(block, 0x60),
-        object_row_count: read_u64(block, 0x68),
+        structural_entry_count: read_u64(block, STRUCTURAL_ENTRY_COUNT_OFFSET),
+        object_row_count: read_u64(block, OBJECT_ROW_COUNT_OFFSET),
     };
     validate_replica_scope_counts(scope, counts)?;
     let writer_len = usize::from(read_u16(block, DIAGNOSTIC_LENGTHS_OFFSET));
@@ -1684,15 +1797,18 @@ fn parse_replica_frame(
         "write_timestamp padding",
     )?;
     let mut payload_sha256 = [0u8; 32];
-    payload_sha256.copy_from_slice(&block[0xA8..0xC8]);
+    payload_sha256.copy_from_slice(&block[PAYLOAD_SHA256_OFFSET..PAYLOAD_SHA256_OFFSET + 32]);
     let mut canonical_map_sha256 = [0u8; 32];
-    canonical_map_sha256.copy_from_slice(&block[0xC8..0xE8]);
+    canonical_map_sha256
+        .copy_from_slice(&block[CANONICAL_MAP_SHA256_OFFSET..CANONICAL_MAP_SHA256_OFFSET + 32]);
     let mut stored_edition_digest = [0u8; 32];
-    stored_edition_digest.copy_from_slice(&block[0xE8..0x108]);
+    stored_edition_digest
+        .copy_from_slice(&block[EDITION_DIGEST_OFFSET..EDITION_DIGEST_OFFSET + 32]);
     let mut stored_layout_digest = [0u8; 32];
-    stored_layout_digest.copy_from_slice(&block[0x108..0x128]);
+    stored_layout_digest.copy_from_slice(&block[LAYOUT_DIGEST_OFFSET..LAYOUT_DIGEST_OFFSET + 32]);
     let mut stored_descriptor_digest = [0u8; 32];
-    stored_descriptor_digest.copy_from_slice(&block[0x128..0x148]);
+    stored_descriptor_digest
+        .copy_from_slice(&block[DESCRIPTOR_DIGEST_OFFSET..DESCRIPTOR_DIGEST_OFFSET + 32]);
     let mut components = [TerminalTailComponentPlan {
         kind: TerminalTailComponentKind::TapeIndexReplica,
         ordinal: 1,
@@ -1717,7 +1833,7 @@ fn parse_replica_frame(
         partition,
         block_size,
         components,
-        expected_eod_lba: read_u64(block, 0xA0),
+        expected_eod_lba: read_u64(block, EXPECTED_EOD_LBA_OFFSET),
     };
     let descriptor = TapeIndexEditionDescriptor {
         tape_uuid,
@@ -1732,10 +1848,10 @@ fn parse_replica_frame(
         terminal_layout,
     };
     let replica_layout = checked_tape_index_replica_layout_hinted(block_size, counts)?;
-    if replica_layout.payload_len != read_u64(block, 0x70)
-        || replica_layout.payload_record_count != read_u64(block, 0x78)
-        || replica_layout.replica_record_count != read_u64(block, 0x80)
-        || replica_layout.footer_block_offset != read_u64(block, 0x98)
+    if replica_layout.payload_len != read_u64(block, PAYLOAD_LEN_OFFSET)
+        || replica_layout.payload_record_count != read_u64(block, PAYLOAD_RECORD_COUNT_OFFSET)
+        || replica_layout.replica_record_count != read_u64(block, REPLICA_RECORD_COUNT_OFFSET)
+        || replica_layout.footer_block_offset != read_u64(block, FOOTER_BLOCK_OFFSET)
     {
         return Err(TapeIndexReplicaError::DigestMismatch {
             field: "replica geometry",
@@ -1762,8 +1878,8 @@ fn parse_replica_frame(
         layout_digest,
     };
     let plan = plan_tape_index_replica_hinted(edition, replica_ordinal)?;
-    if plan.component.planned_tape_file_number != read_u64(block, 0x88)
-        || plan.component.planned_start_lba != read_u64(block, 0x90)
+    if plan.component.planned_tape_file_number != read_u64(block, PLANNED_TAPE_FILE_OFFSET)
+        || plan.component.planned_start_lba != read_u64(block, PLANNED_START_LBA_OFFSET)
         || plan.descriptor_digest != stored_descriptor_digest
     {
         return Err(TapeIndexReplicaError::DigestMismatch {

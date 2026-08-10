@@ -4022,6 +4022,11 @@ fn close_write_actor(input: CloseWriteActorInput<'_>) -> Result<CloseWriteActorR
 /// Mutable authority owned by one drive actor for the lifetime of an open
 /// write session. Command handlers borrow this state so each transition's
 /// inputs and mutations remain local and visible to the borrow checker.
+type DeferredWriteCloseReply = (
+    oneshot::Sender<Result<CloseWriteActorReply, Status>>,
+    CloseWriteActorReply,
+);
+
 struct WriteSessionState<'a> {
     bay: u16,
     index: &'a mut CatalogIndex,
@@ -4052,11 +4057,16 @@ struct WriteSessionState<'a> {
     timer_checkpoint_waiting: Option<Uuid>,
     append_gate: SessionAppendGate,
     append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics,
+    deferred_close_reply: Option<DeferredWriteCloseReply>,
 }
 
 impl WriteSessionState<'_> {
     /// Dispatch commands until a close transition releases the drive actor.
-    fn run(&mut self, rx: &mut mpsc::Receiver<DriveCommand>) {
+    ///
+    /// A successful close reply is returned to the caller so the outer owner
+    /// can drop this state, including its checkpoint lease, before
+    /// acknowledging the transition.
+    fn run(&mut self, rx: &mut mpsc::Receiver<DriveCommand>) -> Option<DeferredWriteCloseReply> {
         while let Some(command) = rx.blocking_recv() {
             match command {
                 command @ DriveCommand::AppendFinish { .. } => {
@@ -4140,6 +4150,7 @@ impl WriteSessionState<'_> {
                 }
             }
         }
+        self.deferred_close_reply.take()
     }
 
     /// Complete one accepted append and advance provisional checkpoint state.
@@ -5006,7 +5017,7 @@ impl WriteSessionState<'_> {
         });
         match result {
             Ok(result) => {
-                let _ = reply.send(Ok(result));
+                self.deferred_close_reply = Some((reply, result));
                 true
             }
             Err(err) => {
@@ -5062,7 +5073,7 @@ impl WriteSessionState<'_> {
         });
         match result {
             Ok(result) => {
-                let _ = reply.send(Ok(result));
+                self.deferred_close_reply = Some((reply, result));
                 true
             }
             Err(err) => {
@@ -5474,7 +5485,7 @@ fn handle_drive_open_write(
         return;
     }
 
-    WriteSessionState {
+    let mut session_state = WriteSessionState {
         bay,
         index,
         cfg,
@@ -5504,8 +5515,13 @@ fn handle_drive_open_write(
         timer_checkpoint_waiting,
         append_gate: SessionAppendGate::default(),
         append_commit_diagnostics: crate::pool_write::AppendCommitDiagnostics::default(),
+        deferred_close_reply: None,
+    };
+    let deferred_close_reply = session_state.run(rx);
+    drop(session_state);
+    if let Some((reply, result)) = deferred_close_reply {
+        let _ = reply.send(Ok(result));
     }
-    .run(rx);
 }
 
 fn append_latest_tape_io_fence_evidence(
