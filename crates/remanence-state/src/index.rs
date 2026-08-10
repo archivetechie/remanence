@@ -10,7 +10,7 @@ use remanence_parity::{
     ParityConfig, ParityScheme, TapeFileEntry, TapeFileKind,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -251,6 +251,34 @@ pub struct TerminalFinalizationProjectionInput {
     pub outcome: TerminalFinalizationOutcome,
     /// Projection timestamp; current UTC when omitted.
     pub updated_at_utc: Option<String>,
+}
+
+/// All catalog facts that make an operator close-out irrevocably accepted.
+///
+/// The caller publishes the matching checkpoint companion while the catalog's
+/// immediate transaction is held. That transaction prevents an assignment
+/// mutation from crossing the companion publication boundary, and commits the
+/// scoped idempotency binding and `BeforeReplicaA` projection together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManualTerminalFinalizationAcceptanceInput {
+    /// Physical tape identity.
+    pub tape_uuid: [u8; 16],
+    /// Pool observed by the authenticated request, including explicit absence.
+    pub expected_pool_id: Option<String>,
+    /// Assignment generation observed by the authenticated request.
+    pub expected_assignment_generation: u64,
+    /// Stable authenticated actor scope.
+    pub actor_fingerprint: String,
+    /// Stable operation kind used by the idempotency namespace.
+    pub operation_kind: String,
+    /// Caller-provided idempotency key.
+    pub idempotency_key: Uuid,
+    /// Fingerprint of every immutable request field.
+    pub request_fingerprint: [u8; 32],
+    /// Durable operation identity.
+    pub operation_id: Uuid,
+    /// Exact `BeforeReplicaA` catalog projection committed by acceptance.
+    pub projection: TerminalFinalizationProjectionInput,
 }
 
 /// Durable catalog view of terminal finalization for one tape.
@@ -4548,6 +4576,95 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("commit terminal finalization projection", err))?;
         self.get_tape(&input.tape_uuid)?
             .ok_or_else(|| StateError::IndexCorrupt("finalizing tape vanished".to_string()))
+    }
+
+    /// Atomically accept one guarded operator close-out.
+    ///
+    /// The immediate transaction is intentionally held while `publish_intent`
+    /// fsyncs the exact checkpoint companion. Assignment writers therefore
+    /// either commit before the guarded reread in this transaction or observe
+    /// the committed `Finalizing` fence afterwards. The idempotency scope and
+    /// `BeforeReplicaA` projection commit in that same transaction.
+    pub fn accept_manual_terminal_finalization_with(
+        &mut self,
+        input: ManualTerminalFinalizationAcceptanceInput,
+        publish_intent: impl FnOnce() -> Result<(), StateError>,
+    ) -> Result<TapeRecord, StateError> {
+        validate_terminal_finalization_input(&input.projection)?;
+        if input.projection.tape_uuid != input.tape_uuid
+            || input.projection.trigger != TerminalFinalizationTrigger::OperatorCloseOut
+            || input.projection.operation_id != Some(input.operation_id)
+            || input.projection.progress != TerminalFinalizationProgress::BeforeReplicaA
+        {
+            return Err(StateError::ConfigInvalid(
+                "manual terminal acceptance requires its exact operator BeforeReplicaA projection"
+                    .to_string(),
+            ));
+        }
+        let actor_fingerprint = input.actor_fingerprint.trim();
+        let operation_kind = input.operation_kind.trim();
+        if actor_fingerprint.is_empty() || operation_kind.is_empty() {
+            return Err(StateError::ConfigInvalid(
+                "manual terminal acceptance idempotency scope must be non-empty".to_string(),
+            ));
+        }
+        let expected_pool_id = input
+            .expected_pool_id
+            .as_deref()
+            .map(normalize_pool_id)
+            .transpose()?;
+        let updated_at_utc = input
+            .projection
+            .updated_at_utc
+            .clone()
+            .unwrap_or(now_utc()?);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|err| sqlite_error("begin guarded manual terminal acceptance", err))?;
+        let assignment =
+            query_tape_assignment_snapshot_tx(&tx, input.tape_uuid)?.ok_or_else(|| {
+                StateError::TapePoolAssignmentConflict(format!(
+                    "tape {} disappeared before terminal finalization",
+                    hex_uuid(input.tape_uuid)
+                ))
+            })?;
+        if assignment.assignment_generation != input.expected_assignment_generation
+            || assignment.pool_id != expected_pool_id
+        {
+            return Err(StateError::TapePoolAssignmentConflict(format!(
+                "tape assignment changed before terminal finalization: expected generation {} pool {:?}, found generation {} pool {:?}",
+                input.expected_assignment_generation,
+                expected_pool_id,
+                assignment.assignment_generation,
+                assignment.pool_id
+            )));
+        }
+        let registration = upsert_idempotency_request(
+            &tx,
+            IdempotencyRequestProjection {
+                actor_fingerprint,
+                operation_kind,
+                idempotency_key: input.idempotency_key,
+                request_fingerprint: input.request_fingerprint.to_vec(),
+                operation_id: input.operation_id,
+                updated_at_utc: updated_at_utc.as_str(),
+            },
+            IdempotencyProjectionMode::Live,
+        )?;
+        if registration.operation_id != input.operation_id {
+            return Err(StateError::IdempotencyConflict(format!(
+                "manual terminal idempotency scope is already bound to operation {}",
+                registration.operation_id
+            )));
+        }
+        project_terminal_finalization_tx(&tx, &input.projection, updated_at_utc.as_str())?;
+        publish_intent()?;
+        tx.commit()
+            .map_err(|err| sqlite_error("commit guarded manual terminal acceptance", err))?;
+        self.get_tape(&input.tape_uuid)?.ok_or_else(|| {
+            StateError::IndexCorrupt("accepted manual-finalization tape vanished".to_string())
+        })
     }
 
     /// Return a tape's durable terminal-finalization projection.
@@ -20900,6 +21017,126 @@ mod tests {
         assert!(
             matches!(fenced, StateError::TapePoolAssignmentConflict(_)),
             "{fenced}"
+        );
+    }
+
+    #[test]
+    fn guarded_manual_acceptance_is_all_or_none_and_rechecks_assignment() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-index-manual-acceptance")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0xA6; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMNA06L9".to_string(),
+                block_size: 262_144,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .upsert_tape_pool_projection(pool_projection("pool-a"))
+            .expect("project pool");
+        let assigned = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, 0, Some("pool-a"))
+            .expect("assign pool");
+        let operation_id = Uuid::from_u128(0xFA11);
+        let key = Uuid::from_u128(0xFA12);
+        let request_fingerprint = [0xFA; 32];
+        let input = ManualTerminalFinalizationAcceptanceInput {
+            tape_uuid,
+            expected_pool_id: Some("pool-a".to_string()),
+            expected_assignment_generation: assigned.assignment_generation,
+            actor_fingerprint: "user:operator".to_string(),
+            operation_kind: "finalize_tape".to_string(),
+            idempotency_key: key,
+            request_fingerprint,
+            operation_id,
+            projection: terminal_projection(
+                tape_uuid,
+                TerminalFinalizationProgress::BeforeReplicaA,
+                TerminalFinalizationOutcome::InProgress,
+            ),
+        };
+
+        let publication_error = index
+            .accept_manual_terminal_finalization_with(input.clone(), || {
+                Err(StateError::JournalReplayFailed(
+                    "simulated companion publication failure".to_string(),
+                ))
+            })
+            .expect_err("failed companion publication rolls back acceptance");
+        assert!(
+            matches!(publication_error, StateError::JournalReplayFailed(_)),
+            "{publication_error}"
+        );
+        assert!(index
+            .idempotency_scope_record("user:operator", "finalize_tape", key)
+            .expect("read rolled-back scope")
+            .is_none());
+        assert!(index
+            .terminal_finalization(&tape_uuid)
+            .expect("read rolled-back projection")
+            .is_none());
+
+        let changed = index
+            .compare_and_set_tape_pool_assignment(tape_uuid, assigned.assignment_generation, None)
+            .expect("race changes assignment after caller snapshot");
+        let published = std::cell::Cell::new(false);
+        let race = index
+            .accept_manual_terminal_finalization_with(input.clone(), || {
+                published.set(true);
+                Ok(())
+            })
+            .expect_err("transactional reread rejects changed assignment");
+        assert!(
+            matches!(race, StateError::TapePoolAssignmentConflict(_)),
+            "{race}"
+        );
+        assert!(!published.get(), "rejected race must not publish companion");
+        assert!(index
+            .idempotency_scope_record("user:operator", "finalize_tape", key)
+            .expect("read race scope")
+            .is_none());
+        assert!(index
+            .terminal_finalization(&tape_uuid)
+            .expect("read race projection")
+            .is_none());
+
+        let reassigned = index
+            .compare_and_set_tape_pool_assignment(
+                tape_uuid,
+                changed.assignment_generation,
+                Some("pool-a"),
+            )
+            .expect("restore assignment");
+        let accepted = ManualTerminalFinalizationAcceptanceInput {
+            expected_assignment_generation: reassigned.assignment_generation,
+            ..input
+        };
+        index
+            .accept_manual_terminal_finalization_with(accepted, || {
+                published.set(true);
+                Ok(())
+            })
+            .expect("commit guarded acceptance");
+        assert!(published.get());
+        let scope = index
+            .idempotency_scope_record("user:operator", "finalize_tape", key)
+            .expect("read accepted scope")
+            .expect("accepted scope");
+        assert_eq!(scope.operation_id, operation_id);
+        assert_eq!(scope.request_fingerprint, request_fingerprint);
+        assert_eq!(
+            index
+                .terminal_finalization(&tape_uuid)
+                .expect("read accepted projection")
+                .expect("accepted projection")
+                .progress,
+            TerminalFinalizationProgress::BeforeReplicaA
         );
     }
 

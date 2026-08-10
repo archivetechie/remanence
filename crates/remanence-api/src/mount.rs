@@ -932,6 +932,26 @@ pub(crate) fn spawn_startup_terminal_recoveries(state: ApiState) {
             let Some(intent) = intent else {
                 continue;
             };
+            if intent.manual.is_some() {
+                let reconciled = (|| {
+                    let mut lease = journal.acquire_exclusive_for_terminal_recovery()?;
+                    let index = CatalogIndex::open(state.index_path.as_ref())?;
+                    crate::write_owner::reconcile_manual_terminal_acceptance(
+                        &index, &mut lease, &intent,
+                    )
+                    .map_err(|status| {
+                        remanence_state::StateError::JournalReplayFailed(status.to_string())
+                    })
+                })();
+                match reconciled {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        tracing::error!(tape_uuid = %Uuid::from_bytes(tape_uuid), %error, "cannot reconcile startup manual acceptance");
+                        continue;
+                    }
+                }
+            }
             let recovery = if intent.manual.is_some() {
                 recover_manual_terminal_tape(&state, &intent).await
             } else {

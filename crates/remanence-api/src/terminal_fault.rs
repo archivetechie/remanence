@@ -47,6 +47,7 @@ pub(crate) enum TerminalFaultCut {
     BeforeFinalSqliteProjection,
     AfterFinalSqliteProjection,
     BeforeAssignmentReread,
+    AfterAssignmentRereadBeforeAcceptance,
 }
 
 impl TerminalFaultCut {
@@ -73,6 +74,9 @@ impl TerminalFaultCut {
             Self::BeforeFinalSqliteProjection => "before_final_sqlite_projection",
             Self::AfterFinalSqliteProjection => "after_final_sqlite_projection",
             Self::BeforeAssignmentReread => "before_assignment_reread",
+            Self::AfterAssignmentRereadBeforeAcceptance => {
+                "after_assignment_reread_before_acceptance"
+            }
         }
     }
 
@@ -99,6 +103,9 @@ impl TerminalFaultCut {
             "before_final_sqlite_projection" => Self::BeforeFinalSqliteProjection,
             "after_final_sqlite_projection" => Self::AfterFinalSqliteProjection,
             "before_assignment_reread" => Self::BeforeAssignmentReread,
+            "after_assignment_reread_before_acceptance" => {
+                Self::AfterAssignmentRereadBeforeAcceptance
+            }
             _ => return None,
         })
     }
@@ -266,9 +273,42 @@ impl TerminalFaultPlan {
         expected_generation: u64,
         expected_pool_id: Option<&str>,
     ) -> Result<(), String> {
-        if self.component != "assignment_race"
-            || self.cut != TerminalFaultCut::BeforeAssignmentReread
-        {
+        self.clear_assignment_at_cut(
+            TerminalFaultCut::BeforeAssignmentReread,
+            index,
+            tape_uuid,
+            expected_generation,
+            expected_pool_id,
+        )
+    }
+
+    /// Mutate the assignment after the ordinary reread but before the atomic
+    /// acceptance transaction repeats its guarded comparison.
+    pub(crate) fn clear_assignment_after_reread_before_acceptance(
+        &self,
+        index: &mut remanence_state::CatalogIndex,
+        tape_uuid: [u8; 16],
+        expected_generation: u64,
+        expected_pool_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.clear_assignment_at_cut(
+            TerminalFaultCut::AfterAssignmentRereadBeforeAcceptance,
+            index,
+            tape_uuid,
+            expected_generation,
+            expected_pool_id,
+        )
+    }
+
+    fn clear_assignment_at_cut(
+        &self,
+        expected_cut: TerminalFaultCut,
+        index: &mut remanence_state::CatalogIndex,
+        tape_uuid: [u8; 16],
+        expected_generation: u64,
+        expected_pool_id: Option<&str>,
+    ) -> Result<(), String> {
+        if self.component != "assignment_race" || self.cut != expected_cut {
             return Ok(());
         }
         if self.evidence_path.exists() {
@@ -464,7 +504,11 @@ fn validate_component_cut(component: &str, cut: TerminalFaultCut) -> Result<(), 
                 | TerminalFaultCut::BeforeFinalSqliteProjection
                 | TerminalFaultCut::AfterFinalSqliteProjection
         ),
-        "assignment_race" => cut == TerminalFaultCut::BeforeAssignmentReread,
+        "assignment_race" => matches!(
+            cut,
+            TerminalFaultCut::BeforeAssignmentReread
+                | TerminalFaultCut::AfterAssignmentRereadBeforeAcceptance
+        ),
         _ => !matches!(
             cut,
             TerminalFaultCut::BeforeTerminalPrefix
@@ -476,6 +520,7 @@ fn validate_component_cut(component: &str, cut: TerminalFaultCut) -> Result<(), 
                 | TerminalFaultCut::BeforeFinalSqliteProjection
                 | TerminalFaultCut::AfterFinalSqliteProjection
                 | TerminalFaultCut::BeforeAssignmentReread
+                | TerminalFaultCut::AfterAssignmentRereadBeforeAcceptance
         ),
     };
     if valid {
@@ -902,6 +947,8 @@ mod tests {
         assignment["component"] = Value::String("assignment_race".to_string());
         assignment["cut"] = Value::String("before_assignment_reread".to_string());
         TerminalFaultPlan::parse(&assignment).expect("assignment reread race cut");
+        assignment["cut"] = Value::String("after_assignment_reread_before_acceptance".to_string());
+        TerminalFaultPlan::parse(&assignment).expect("assignment acceptance race cut");
         assignment["cut"] = Value::String("after_barrier".to_string());
         assert!(TerminalFaultPlan::parse(&assignment).is_err());
     }

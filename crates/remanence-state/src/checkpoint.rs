@@ -2444,6 +2444,48 @@ impl FileCheckpointJournalLease {
         Ok(intent.clone())
     }
 
+    /// Retire a companion that never crossed the catalog acceptance commit.
+    ///
+    /// This is deliberately narrower than terminal recovery cleanup. Only an
+    /// untouched manual `BeforeReplicaA` companion can be provisional, and the
+    /// caller must have proved that neither the finalization projection nor the
+    /// scoped idempotency binding exists. Any database half makes deletion a
+    /// corruption-hiding operation and is rejected.
+    pub fn retire_provisional_manual_finalization(
+        &mut self,
+        expected: &TerminalFinalizationIntent,
+        catalog_projection_present: bool,
+        idempotency_binding_present: bool,
+    ) -> Result<(), StateError> {
+        if catalog_projection_present || idempotency_binding_present {
+            return Err(StateError::JournalReplayFailed(
+                "cannot retire provisional manual finalization while catalog acceptance authority exists"
+                    .to_string(),
+            ));
+        }
+        if expected.manual.is_none()
+            || expected.trigger != TerminalFinalizationTrigger::OperatorCloseOut
+            || expected.progress != TerminalFinalizationProgress::BeforeReplicaA
+            || expected.recovery_required
+        {
+            return Err(StateError::JournalReplayFailed(
+                "only an untouched manual BeforeReplicaA companion can be provisional".to_string(),
+            ));
+        }
+        let current =
+            read_terminal_finalization_intent(&self.path, self.tape_uuid)?.ok_or_else(|| {
+                StateError::JournalReplayFailed(
+                    "provisional manual finalization companion disappeared".to_string(),
+                )
+            })?;
+        if current != *expected {
+            return Err(StateError::JournalReplayFailed(
+                "provisional manual finalization companion changed before retirement".to_string(),
+            ));
+        }
+        clear_terminal_finalization_intent(&self.path)
+    }
+
     /// Read the current structured intent while retaining exclusive ownership.
     pub fn terminal_finalization_intent(
         &self,
@@ -5315,6 +5357,40 @@ mod tests {
             TerminalFinalizationProgress::AfterReplicaC
         );
         assert!(classified.recovery_required);
+    }
+
+    #[test]
+    fn provisional_manual_intent_retires_only_with_both_database_halves_absent() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x73; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        journal
+            .append(&record(tape_uuid))
+            .expect("append ordinary checkpoint");
+        let intent = finalization_intent(tape_uuid);
+        let mut lease = journal.acquire_exclusive().expect("acquire lease");
+        lease
+            .begin_terminal_finalization(&intent)
+            .expect("publish provisional intent");
+        for (projection, binding) in [(true, false), (false, true), (true, true)] {
+            let error = lease
+                .retire_provisional_manual_finalization(&intent, projection, binding)
+                .expect_err("any database acceptance half forbids retirement");
+            assert!(error.to_string().contains("catalog acceptance authority"));
+            assert_eq!(
+                lease
+                    .terminal_finalization_intent()
+                    .expect("read retained intent"),
+                Some(intent.clone())
+            );
+        }
+        lease
+            .retire_provisional_manual_finalization(&intent, false, false)
+            .expect("both absent proves provisional intent");
+        assert!(lease
+            .terminal_finalization_intent()
+            .expect("read retired provisional intent")
+            .is_none());
     }
 
     #[test]
