@@ -4307,11 +4307,11 @@ impl CatalogIndex {
             .map(|(tape_uuid, pool_id)| (tape_uuid.to_vec(), pool_id.clone()))
             .collect::<HashSet<_>>();
 
-        // Retired identities retain their last pool as immutable provenance.
-        // Their barcode is detached, so they are intentionally absent from
-        // `configured_memberships`; do not interpret that absence as a request
-        // to erase the historical assignment.
-        let existing_memberships = query_active_memberships_tx(&tx)?;
+        // Final/terminal identities retain their last pool as immutable
+        // provenance. They may be absent from `configured_memberships` after
+        // barcode detachment or a later config change; do not interpret that
+        // absence as a request to erase historical assignment authority.
+        let existing_memberships = query_mutable_memberships_tx(&tx)?;
         for (tape_uuid, pool_id) in existing_memberships {
             if !configured_memberships.contains(&(tape_uuid.clone(), pool_id)) {
                 let tape_uuid: [u8; 16] = tape_uuid.try_into().map_err(|tape_uuid: Vec<u8>| {
@@ -9231,7 +9231,11 @@ fn project_catalog_evidence_record(
                      when tapes.state = 'retired' then tapes.state
                      else excluded.state
                    end,
-                   updated_at_utc = excluded.updated_at_utc",
+                   updated_at_utc = case
+                     when tapes.state = 'retired' and excluded.state = 'sealed'
+                       then tapes.updated_at_utc
+                     else excluded.updated_at_utc
+                   end",
                 params![tape_uuid, state, record.timestamp_utc.as_str()],
             )
             .map_err(|err| sqlite_error("project tape lifecycle audit record", err))?;
@@ -10550,7 +10554,12 @@ fn set_tape_pool_membership_tx(
     if finalization_progress.is_some()
         || matches!(
             state.as_str(),
-            "finalizing" | "finalized" | "sealed" | "finalized_degraded" | "recovery_required"
+            "finalizing"
+                | "finalized"
+                | "sealed"
+                | "retired"
+                | "finalized_degraded"
+                | "recovery_required"
         )
     {
         return Err(StateError::TapePoolAssignmentConflict(format!(
@@ -10596,7 +10605,7 @@ fn set_tape_pool_membership_tx(
                and assignment_generation = ?5
                and finalization_progress is null
                and state not in (
-                 'finalizing', 'finalized', 'sealed',
+                 'finalizing', 'finalized', 'sealed', 'retired',
                  'finalized_degraded', 'recovery_required'
                )",
             params![
@@ -10845,13 +10854,18 @@ fn terminal_progress_reaches(
     false
 }
 
-fn query_active_memberships_tx(
+fn query_mutable_memberships_tx(
     tx: &rusqlite::Transaction<'_>,
 ) -> Result<Vec<(Vec<u8>, String)>, StateError> {
     let mut stmt = tx
         .prepare(
             "select tape_uuid, pool_id from tapes
-             where pool_id is not null and state != 'retired'",
+             where pool_id is not null
+               and finalization_progress is null
+               and state not in (
+                 'finalizing', 'finalized', 'sealed', 'retired',
+                 'finalized_degraded', 'recovery_required'
+               )",
         )
         .map_err(|err| sqlite_error("prepare tape pool membership reconciliation query", err))?;
     let mut rows = stmt
@@ -14098,6 +14112,58 @@ mod tests {
         assert_eq!(replacement.state, "ready");
         assert_eq!(replacement.voltag.as_deref(), Some(voltag));
         assert_eq!(replacement.pool_id.as_deref(), Some("terminal-index"));
+
+        let error = index
+            .project_tape_pool_membership(retired_uuid, "other-pool")
+            .expect_err("retired assignment is immutable history");
+        assert!(matches!(error, StateError::TapePoolAssignmentConflict(_)));
+    }
+
+    #[test]
+    fn rules_reconcile_preserves_sealed_pool_history_after_rule_removal() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-sealed-pool-history")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let tape_uuid = [0x74; 16];
+        let pools = [TapePoolProjectionInput {
+            pool_id: "terminal-index".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        }];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMN009L9".to_string(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .reconcile_tape_pool_projection_from_rules(
+                &pools,
+                &[TapePoolRuleConfig {
+                    prefix: "RMN".to_string(),
+                    pool_id: "terminal-index".to_string(),
+                }],
+            )
+            .expect("assign pool");
+        index.seal_tape(tape_uuid).expect("seal tape");
+
+        index
+            .reconcile_tape_pool_projection_from_rules(&pools, &[])
+            .expect("removed rule must not rewrite sealed history");
+
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("read tape")
+            .expect("tape exists");
+        assert_eq!(tape.state, "sealed");
+        assert_eq!(tape.pool_id.as_deref(), Some("terminal-index"));
     }
 
     #[test]
@@ -17482,6 +17548,11 @@ mod tests {
                 reason: "scratch-media recycle".to_string(),
             })
             .expect("retire tape");
+        let retired_at = index
+            .get_tape(&tape_uuid)
+            .expect("read retired tape")
+            .expect("retired tape exists")
+            .updated_at_utc;
 
         let sealed = catalog_evidence_record(
             1,
@@ -17500,6 +17571,7 @@ mod tests {
             .expect("tape exists");
         assert_eq!(tape.state, "retired");
         assert_eq!(tape.voltag, None);
+        assert_eq!(tape.updated_at_utc, retired_at);
     }
 
     #[test]
