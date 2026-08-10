@@ -124,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     emit_matrix_manifests(&output)?;
     fs::write(
         output.join("README.md"),
-        "# REM-PARITY terminal-index candidate vectors\n\nReview-only draft.4 artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
+        "# REM-PARITY terminal-index candidate vectors\n\nReview-only draft.4 artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins the positive unknown-key and fail-closed assigned/noncanonical extension seam. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
     )?;
     println!(
         "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, and executable hostile matrices in {}",
@@ -484,6 +484,16 @@ fn emit_high_count_evidence(root: &Path) -> Result<(), Box<dyn std::error::Error
 }
 
 fn emit_matrix_manifests(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(
+        root.join("OBJECT_ROW_EXTENSIONS.tsv"),
+        "case_id\tbase_profile\trow_index\tmutation\texpected\n\
+unknown-positive-key\tmulti-256k\t0\tunknown-positive-key\tvalid\n\
+unknown-negative-key\tmulti-256k\t0\tunknown-negative-key\tvalid\n\
+plaintext-with-encrypted-field\tmulti-256k\t0\tencrypted-field-on-plaintext\tcross-representation\n\
+encrypted-with-plaintext-field\tmulti-256k\t1\tplaintext-field-on-encrypted\tcross-representation\n\
+unknown-noncanonical-value\tmulti-256k\t0\tunknown-noncanonical-value\tcbor\n\
+unknown-nested-map-order\tmulti-256k\t0\tunknown-nested-map-order\tcbor\n",
+    )?;
     fs::write(
         root.join("MUTATIONS.tsv"),
         "case_id\tkind\tbase_profile\ttarget\tmutation\tother_profile\texpected\n\

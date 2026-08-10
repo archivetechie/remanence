@@ -3,8 +3,8 @@
 
 This implementation intentionally does not import or execute the Rust codec. It
 re-derives the fixed frames, digest domains, deterministic CBOR rows, streamed
-large-count payload, local footer bindings, survivor selection, and compact
-mutations directly from the draft byte tables.
+large-count payload, local footer bindings, survivor selection, future Object-row
+extension behavior, and compact mutations directly from the draft byte tables.
 """
 
 from __future__ import annotations
@@ -256,7 +256,7 @@ def cbor_encode(value: Any) -> bytes:
     if value is None:
         return b"\xf6"
     if isinstance(value, int):
-        return cbor_head(0, value)
+        return cbor_head(0, value) if value >= 0 else cbor_head(1, -1 - value)
     if isinstance(value, bytes):
         return cbor_head(2, len(value)) + value
     if isinstance(value, str):
@@ -292,8 +292,8 @@ def cbor_decode(data: bytes, cursor: int = 0) -> tuple[Any, int]:
     if major == 7 and additional == 22:
         return None, cursor
     argument, cursor = decode_argument(data, cursor, additional)
-    if major == 0:
-        return argument, cursor
+    if major in (0, 1):
+        return (argument if major == 0 else -1 - argument), cursor
     if major in (2, 3):
         require(cursor + argument <= len(data), "slot-length", "truncated CBOR string")
         value = data[cursor : cursor + argument]
@@ -312,12 +312,18 @@ def cbor_decode(data: bytes, cursor: int = 0) -> tuple[Any, int]:
         return tuple(values), cursor
     if major == 5:
         pairs = []
-        prior_key = -1
+        prior_key_encoding: tuple[int, bytes] | None = None
         for _ in range(argument):
             key, cursor = cbor_decode(data, cursor)
-            require(isinstance(key, int), "cbor", "Object-row key is not an unsigned integer")
-            require(key > prior_key, "cbor", "Object-row keys are duplicate or noncanonical")
-            prior_key = key
+            require(isinstance(key, int), "cbor", "Object-row key is not an integer")
+            encoded_key = cbor_encode(key)
+            key_order = (len(encoded_key), encoded_key)
+            require(
+                prior_key_encoding is None or key_order > prior_key_encoding,
+                "cbor",
+                "Object-row keys are duplicate or noncanonical",
+            )
+            prior_key_encoding = key_order
             value, cursor = cbor_decode(data, cursor)
             pairs.append((key, value))
         return CborMap(tuple(pairs)), cursor
@@ -340,14 +346,21 @@ def object_fields(value: Any, block_size: int) -> tuple[int, int]:
     require(isinstance(value, CborMap), "map-row-bijection", "Object row is not a map")
     fields = dict(value.pairs)
     representation = fields.get(2)
-    expected = (
+    required = (
         {1, 2, 3, 4, 10, 11, 12, 13}
         if representation == "plaintext"
         else {1, 2, 3, 4, 21, 22, 23}
         if representation == "encrypted"
         else set()
     )
-    require(set(fields) == expected, "map-row-bijection", "Object row schema")
+    require(required, "map-row-bijection", "Object row representation")
+    require(required <= set(fields), "map-row-bijection", "Object row required schema")
+    forbidden = {21, 22, 23} if representation == "plaintext" else {10, 11, 12, 13}
+    require(
+        not forbidden.intersection(fields),
+        "cross-representation",
+        "Object row carries fields assigned to the other representation",
+    )
     tape_file, stored = fields[1], fields[3]
     require(isinstance(tape_file, int) and isinstance(stored, int) and stored > 0, "map-row-bijection", "Object locator")
     object_id = fields[4]
@@ -920,6 +933,94 @@ def verify_mutations(root: Path, contexts: dict[str, ProfileContext]) -> int:
     return len(rows)
 
 
+def canonical_map(pairs: tuple[tuple[int, Any], ...]) -> CborMap:
+    """Order integer-keyed pairs by their deterministic encoded key bytes."""
+    return CborMap(
+        tuple(
+            sorted(
+                pairs,
+                key=lambda pair: (len(cbor_encode(pair[0])), cbor_encode(pair[0])),
+            )
+        )
+    )
+
+
+def encoded_slot(value: Any, size: int, label: str) -> bytes:
+    """Frame one independently encoded CBOR value in a fixed-size slot."""
+    encoded = cbor_encode(value)
+    require(len(encoded) <= size - 2, "slot-length", f"{label}: extension exceeds slot")
+    return struct.pack("<H", len(encoded)) + encoded + bytes(size - 2 - len(encoded))
+
+
+def verify_object_row_extensions(root: Path, contexts: dict[str, ProfileContext]) -> int:
+    """Exercise the frozen accept/reject seam for future Object-row fields."""
+    rows = read_tsv(root / "OBJECT_ROW_EXTENSIONS.tsv")
+    required_cases = {
+        "unknown-positive-key",
+        "unknown-negative-key",
+        "plaintext-with-encrypted-field",
+        "encrypted-with-plaintext-field",
+        "unknown-noncanonical-value",
+        "unknown-nested-map-order",
+    }
+    require(
+        {row["case_id"] for row in rows} == required_cases,
+        "manifest",
+        "Object-row extension coverage set",
+    )
+    for row in rows:
+        context = contexts[row["base_profile"]]
+        replica = (context.directory / "replica-a.bin").read_bytes()
+        row_index = int(row["row_index"])
+        require(0 <= row_index < context.object_rows, "manifest", row["case_id"])
+        start = context.block_size + context.structural_rows * 64 + row_index * 256
+        value, _ = decode_slot(replica[start : start + 256], 256, row["case_id"])
+        require(isinstance(value, CborMap), "manifest", f"{row['case_id']}: base row")
+
+        pairs = value.pairs
+        mutation = row["mutation"]
+        if mutation == "unknown-positive-key":
+            mutated = canonical_map(pairs + ((24, b"future"),))
+            slot = encoded_slot(mutated, 256, row["case_id"])
+        elif mutation == "unknown-negative-key":
+            extension = canonical_map(((1, 7), (2, None)))
+            mutated = canonical_map(pairs + ((-1, extension),))
+            slot = encoded_slot(mutated, 256, row["case_id"])
+        elif mutation == "encrypted-field-on-plaintext":
+            mutated = canonical_map(pairs + ((21, None),))
+            slot = encoded_slot(mutated, 256, row["case_id"])
+        elif mutation == "plaintext-field-on-encrypted":
+            mutated = canonical_map(pairs + ((10, None),))
+            slot = encoded_slot(mutated, 256, row["case_id"])
+        elif mutation == "unknown-noncanonical-value":
+            mutated = canonical_map(pairs + ((24, 0),))
+            encoded = cbor_encode(mutated)
+            require(encoded.endswith(b"\x00"), "manifest", row["case_id"])
+            encoded = encoded[:-1] + b"\x18\x00"
+            require(len(encoded) <= 254, "slot-length", row["case_id"])
+            slot = struct.pack("<H", len(encoded)) + encoded + bytes(254 - len(encoded))
+        elif mutation == "unknown-nested-map-order":
+            extension = CborMap(((2, None), (1, None)))
+            mutated = canonical_map(pairs + ((24, extension),))
+            slot = encoded_slot(mutated, 256, row["case_id"])
+        else:
+            fail("manifest", f"{row['case_id']}: unknown extension mutation {mutation}")
+
+        expected = row["expected"]
+        try:
+            decoded, _ = decode_slot(slot, 256, row["case_id"])
+            object_fields(decoded, context.block_size)
+        except VectorError as error:
+            require(
+                expected != "valid" and error.code == expected,
+                "matrix",
+                f"{row['case_id']}: got {error.code}, expected {expected}",
+            )
+        else:
+            require(expected == "valid", "matrix", f"{row['case_id']}: mutation was accepted")
+    return len(rows)
+
+
 def verify_selection(root: Path, contexts: dict[str, ProfileContext]) -> int:
     rows = read_tsv(root / "SELECTION.tsv")
     expected_cases = {
@@ -1312,13 +1413,15 @@ def main() -> None:
         verify_profile(contexts[name], grouped[name])
     maximums = verify_maximums(root)
     streaming = verify_streaming(root)
+    extensions = verify_object_row_extensions(root, contexts)
     mutations = verify_mutations(root, contexts)
     selections = verify_selection(root, contexts)
     interruptions = verify_interruptions(root)
     print(
         f"verified {len(grouped)} healthy profiles ({len(manifest_rows)} components), "
         f"{maximums} maximum artifacts, {streaming} million-Object stream, "
-        f"{mutations} hostile mutations, {selections} survivor selections, and "
+        f"{extensions} Object-row extension cases, {mutations} hostile mutations, "
+        f"{selections} survivor selections, and "
         f"{interruptions} interruption cuts"
     )
 
