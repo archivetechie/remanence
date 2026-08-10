@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, ValueEnum};
-use remanence_library::{DriveHandle, LinuxSgTransport, TapeIoError};
+use remanence_library::{scsi::ScsiError, DriveHandle, LinuxSgTransport, TapeIoError};
 use remanence_parity::{
     encode_tape_index_bootstrap_footer, encode_tape_index_replica_header, plan_index_separation,
     plan_tape_index_edition, plan_tape_index_replica, read_terminal_index_inventory,
@@ -484,10 +484,13 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
         let position = self.inner.position()?;
         self.read_lbas.push(position.lba);
         if self.unreadable_lbas.contains(&position.lba) {
-            return Err(TapeIoError::OperationFailed(format!(
-                "terminal-index drill injected unreadable LBA {}",
-                position.lba
-            ))
+            return Err(TapeIoError::CheckCondition(ScsiError::CheckCondition {
+                // Descriptor-format MEDIUM ERROR / UNRECOVERED READ ERROR.
+                // The production terminal reader may fall back only for this
+                // typed damage class; generic/transport failures must abort.
+                sense: vec![0x72, 0x03, 0x11, 0x00],
+                bytes_transferred: 0,
+            })
             .into());
         }
         let outcome = self.inner.read_record(buf)?;
