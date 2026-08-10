@@ -2379,6 +2379,13 @@ ordinary append owner MUST NOT acquire the checkpoint journal or retire the
 companion implicitly; only the explicit terminal-recovery owner may complete
 the project-then-retire sequence.
 
+After the sealed projection, the host MUST ensure that the append-only audit
+contains exactly one `TapeSealed` fact. For an operator close-out it MUST also
+contain exactly one `OperationFinished` fact bound to the manual identity in
+the sealed checkpoint. Recovery performs a read-before-append check under the
+audit append lock, so an interruption before either fact is repaired and an
+interruption after its durable append does not duplicate it.
+
 The companion intent format is versioned independently from the tape format.
 A companion that carries the durable `RecoveryRequired` classification MUST
 use a format revision that older readers cannot silently treat as an ordinary
