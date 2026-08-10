@@ -318,7 +318,8 @@ Destructive maintenance:
 
 | Command | What it does |
 |---|---|
-| `rem-debug catalog reset --i-understand-this-erases-the-catalog` | Destructively reset local catalog state from the configured paths. |
+| `rem-debug catalog reset-preflight [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape, rejects any bound label outside the two exact selector sets, and returns a source-bound token plus `source_schema_version`. Schema 16/17 clean-break predecessors are inspectable only when preservation is empty and every bound tape is explicitly allowed to be erased; they are never migrated or accepted for preservation. |
+| `rem-debug catalog reset --i-understand-this-erases-the-catalog [--expected-preflight-token <SHA256>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Destructively reset local catalog state from the configured paths. Any scoped reset requires the exact current preflight token and repeats selector and source-schema admission under the exclusive state lock before mutation. |
 | `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape` | Overwrite the loaded scratch tape with raw dump bytes (test fixture setup). |
 
 The `--allow-derived <SERIAL>` flag additionally permits operating drive

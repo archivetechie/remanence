@@ -164,6 +164,8 @@ pub enum CatalogResetTapeState {
 /// Read-only, all-kinds catalog admission report for a proposed scoped reset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogResetPreflightReport {
+    /// SQLite schema version from which reset admission evidence was read.
+    pub source_schema_version: u32,
     /// Stable admission token over config, selectors, and source evidence.
     pub preflight_token: String,
     /// Digest that binds the exact admitted request, config bytes, and paths.
@@ -354,9 +356,7 @@ impl StateHandle {
         let _lock = StateLockGuard::acquire(&paths.state_dir)?;
         let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(config_path)?;
         ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
-        let index = CatalogIndex::open_read_only(&paths.sqlite_path)?;
-        let (mut report, _, output_is_clean) = preflight_catalog_reset_index(
-            &index,
+        let (mut report, _, output_is_clean) = preflight_catalog_reset_source(
             &paths,
             &locked_config,
             &config_bytes,
@@ -442,7 +442,17 @@ impl StateHandle {
         let token = "0".repeat(64);
         let request_digest =
             catalog_reset_request_digest(&paths, &config_bytes, &[], &[], true, &token)?;
-        reset_catalog_locked(&paths, &locked_config, &[], &request_digest, &token, &token)
+        reset_catalog_locked(
+            &paths,
+            &locked_config,
+            &[],
+            CatalogResetAdmission {
+                request_digest: &request_digest,
+                preflight_token: &token,
+                output_token: &token,
+                source_schema_version: None,
+            },
+        )
     }
 
     /// Scoped counterpart of [`Self::reset_catalog_with_config`] for callers
@@ -491,17 +501,13 @@ impl StateHandle {
         let _lock = StateLockGuard::acquire(&paths.state_dir)?;
         let (locked_config, config_bytes) = load_catalog_reset_config_snapshot(&paths.config_path)?;
         ensure_catalog_reset_config_unchanged(&paths, &config, &locked_config)?;
-        let (preflight, preserved_tapes, output_is_clean) = {
-            let index = CatalogIndex::open_read_only(&paths.sqlite_path)?;
-            preflight_catalog_reset_index(
-                &index,
-                &paths,
-                &locked_config,
-                &config_bytes,
-                &preserve,
-                &allow_erase,
-            )?
-        };
+        let (preflight, preserved_tapes, output_is_clean) = preflight_catalog_reset_source(
+            &paths,
+            &locked_config,
+            &config_bytes,
+            &preserve,
+            &allow_erase,
+        )?;
         let mut already_swapped = false;
         let (token, output_token) = if let Some((stored_request, stored_token, stored_output)) =
             catalog_reset_fence_evidence(&paths)?
@@ -590,9 +596,12 @@ impl StateHandle {
             &paths,
             &locked_config,
             &preserved_tapes,
-            &request_digest,
-            &token,
-            &output_token,
+            CatalogResetAdmission {
+                request_digest: &request_digest,
+                preflight_token: &token,
+                output_token: &output_token,
+                source_schema_version: Some(preflight.source_schema_version),
+            },
         )?;
         Ok(CatalogResetReport {
             preserved_tapes: preserved_tapes
@@ -1406,12 +1415,89 @@ fn preflight_catalog_reset_index(
     StateError,
 > {
     let preserved_tapes = index.capture_catalog_reset_tapes(preserve, &config.tape_pool_rules)?;
+    let source_schema_version = index.schema_version()?;
+    let source_tapes = index.list_tapes(None, TapeKindFilter::All)?;
+    let output_is_clean = index.catalog_reset_output_is_clean()?
+        && catalog_reset_output_pools_match(index, config)?
+        && catalog_reset_output_directories_clean(paths)?;
+    preflight_catalog_reset_rows(
+        paths,
+        config_bytes,
+        preserve,
+        allow_erase,
+        source_schema_version,
+        source_tapes,
+        preserved_tapes,
+        output_is_clean,
+    )
+}
+
+fn preflight_catalog_reset_source(
+    paths: &StatePaths,
+    config: &RemConfig,
+    config_bytes: &[u8],
+    preserve: &[String],
+    allow_erase: &[String],
+) -> Result<
+    (
+        CatalogResetPreflightReport,
+        Vec<CatalogResetPreservedTape>,
+        bool,
+    ),
+    StateError,
+> {
+    match CatalogIndex::open_read_only(&paths.sqlite_path) {
+        Ok(index) => preflight_catalog_reset_index(
+            &index,
+            paths,
+            config,
+            config_bytes,
+            preserve,
+            allow_erase,
+        ),
+        Err(current_schema_error) => {
+            if !preserve.is_empty() || allow_erase.is_empty() {
+                return Err(current_schema_error);
+            }
+            let (source_schema_version, source_tapes) =
+                CatalogIndex::read_legacy_catalog_reset_erase_source(&paths.sqlite_path)?;
+            preflight_catalog_reset_rows(
+                paths,
+                config_bytes,
+                preserve,
+                allow_erase,
+                source_schema_version,
+                source_tapes,
+                Vec::new(),
+                false,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_catalog_reset_rows(
+    paths: &StatePaths,
+    config_bytes: &[u8],
+    preserve: &[String],
+    allow_erase: &[String],
+    source_schema_version: u32,
+    source_tapes: Vec<TapeRecord>,
+    preserved_tapes: Vec<CatalogResetPreservedTape>,
+    output_is_clean: bool,
+) -> Result<
+    (
+        CatalogResetPreflightReport,
+        Vec<CatalogResetPreservedTape>,
+        bool,
+    ),
+    StateError,
+> {
     let preserve_set = preserve.iter().map(String::as_str).collect::<HashSet<_>>();
     let erase_set = allow_erase
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let source_tapes = index.list_tapes(None, TapeKindFilter::All)?;
     let mut seen_uuids = HashSet::with_capacity(source_tapes.len());
     let mut seen_voltags = HashSet::with_capacity(source_tapes.len());
     let mut tapes = Vec::with_capacity(source_tapes.len());
@@ -1452,14 +1538,13 @@ fn preflight_catalog_reset_index(
         config_bytes,
         preserve,
         allow_erase,
+        source_schema_version,
         &tapes,
         &preserved_tapes,
     )?;
-    let output_is_clean = index.catalog_reset_output_is_clean()?
-        && catalog_reset_output_pools_match(index, config)?
-        && catalog_reset_output_directories_clean(paths)?;
     Ok((
         CatalogResetPreflightReport {
+            source_schema_version,
             preflight_token,
             request_digest: String::new(),
             resume_exact: false,
@@ -1754,12 +1839,14 @@ fn catalog_reset_preflight_token(
     config_bytes: &[u8],
     preserve: &[String],
     allow_erase: &[String],
+    source_schema_version: u32,
     tapes: &[CatalogResetPreflightTape],
     preserved: &[CatalogResetPreservedTape],
 ) -> Result<String, StateError> {
     let path_evidence = catalog_reset_preflight_paths(paths)?;
     let mut hasher = Sha256::new();
     hash_catalog_reset_field(&mut hasher, b"REM-CATALOG-PREFLIGHT-V1");
+    hash_catalog_reset_field(&mut hasher, &source_schema_version.to_be_bytes());
     hash_catalog_reset_field(&mut hasher, config_bytes);
     for path in [
         &path_evidence.config,
@@ -2092,38 +2179,39 @@ enum CatalogResetPhase {
     AfterAtomicSwap,
 }
 
+#[derive(Clone, Copy)]
+struct CatalogResetAdmission<'a> {
+    request_digest: &'a str,
+    preflight_token: &'a str,
+    output_token: &'a str,
+    source_schema_version: Option<u32>,
+}
+
 fn reset_catalog_locked(
     paths: &StatePaths,
     config: &RemConfig,
     preserved_tapes: &[CatalogResetPreservedTape],
-    request_digest: &str,
-    preflight_token: &str,
-    output_token: &str,
+    admission: CatalogResetAdmission<'_>,
 ) -> Result<(), StateError> {
-    reset_catalog_locked_with_hook(
-        paths,
-        config,
-        preserved_tapes,
-        request_digest,
-        preflight_token,
-        output_token,
-        |_| Ok(()),
-    )
+    reset_catalog_locked_with_hook(paths, config, preserved_tapes, admission, |_| Ok(()))
 }
 
 fn reset_catalog_locked_with_hook<F>(
     paths: &StatePaths,
     config: &RemConfig,
     preserved_tapes: &[CatalogResetPreservedTape],
-    request_digest: &str,
-    preflight_token: &str,
-    output_token: &str,
+    admission: CatalogResetAdmission<'_>,
     mut phase_hook: F,
 ) -> Result<(), StateError>
 where
     F: FnMut(CatalogResetPhase) -> Result<(), StateError>,
 {
-    begin_or_resume_catalog_reset_fence(paths, request_digest, preflight_token, output_token)?;
+    begin_or_resume_catalog_reset_fence(
+        paths,
+        admission.request_digest,
+        admission.preflight_token,
+        admission.output_token,
+    )?;
     archive_reset_authoritative_inputs(paths)?;
     phase_hook(CatalogResetPhase::AuthoritativeInputsArchived)?;
     ensure_state_directories(paths)?;
@@ -2131,8 +2219,15 @@ where
     // The source remains a complete, reusable catalog until the final atomic
     // rename. Checkpointing first makes removal of its stale sidecars safe.
     if paths.sqlite_path.exists() {
-        let source = CatalogIndex::open(&paths.sqlite_path)?;
-        source.prepare_catalog_reset_atomic_swap()?;
+        if let Some(expected_schema_version) = admission.source_schema_version {
+            CatalogIndex::prepare_admitted_catalog_reset_source_atomic_swap(
+                &paths.sqlite_path,
+                expected_schema_version,
+            )?;
+        } else {
+            let source = CatalogIndex::open(&paths.sqlite_path)?;
+            source.prepare_catalog_reset_atomic_swap()?;
+        }
     }
     phase_hook(CatalogResetPhase::SourceCheckpointed)?;
 
@@ -2495,6 +2590,57 @@ pool_id = "camera.copy-a"
 
     fn config_with_pool_b(root: &Path) -> String {
         config_text(root).replace("camera.copy-a", "camera.copy-b")
+    }
+
+    fn seed_clean_break_reset_catalog(
+        root: &Path,
+        schema_version: u32,
+        tapes: &[([u8; 16], &str)],
+    ) {
+        for path in [
+            root.join("index"),
+            root.join("audit"),
+            root.join("journals"),
+            root.join("cache/tapes"),
+        ] {
+            fs::create_dir_all(path).expect("create legacy reset path");
+        }
+        let conn = rusqlite::Connection::open(root.join("index/rem-state.sqlite"))
+            .expect("open legacy reset catalog");
+        conn.execute_batch(
+            "create table tapes(
+               tape_uuid blob primary key,
+               voltag text,
+               pool_id text,
+               kind text not null default 'data',
+               cleaning_uses integer,
+               cleaning_state text,
+               block_size integer,
+               scheme_id text,
+               data_blocks_per_stripe integer,
+               parity_blocks_per_stripe integer,
+               stripes_per_neighborhood integer,
+               highest_protected_ordinal integer not null default 0,
+               total_committed_ordinals integer not null default 0,
+               last_committed_tape_file integer,
+               written_extent_lba integer,
+               state text not null,
+               updated_at_utc text not null
+             );",
+        )
+        .expect("create schema-16 tapes table");
+        for (tape_uuid, voltag) in tapes {
+            conn.execute(
+                "insert into tapes(
+                   tape_uuid, voltag, pool_id, kind, block_size, state, updated_at_utc
+                 ) values(?1, ?2, 'camera.copy-a', 'data', 1048576, 'ready',
+                          '2026-08-09T00:00:00Z')",
+                rusqlite::params![tape_uuid.as_slice(), voltag],
+            )
+            .expect("insert schema-16 tape");
+        }
+        conn.pragma_update(None, "user_version", schema_version)
+            .expect("mark clean-break catalog version");
     }
 
     fn adoption_input(operation_id: Uuid) -> AdoptBootstrapIdentityInput {
@@ -3712,9 +3858,12 @@ pool_id = "camera.copy-a"
                 &paths,
                 &config,
                 &preserved,
-                &request_digest,
-                &admitted.preflight_token,
-                &output_token,
+                CatalogResetAdmission {
+                    request_digest: &request_digest,
+                    preflight_token: &admitted.preflight_token,
+                    output_token: &output_token,
+                    source_schema_version: Some(admitted.source_schema_version),
+                },
                 |phase| {
                     if phase == cut {
                         Err(StateError::ConfigInvalid(format!(
@@ -4000,6 +4149,123 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
+    fn exact_full_erase_admits_schema_v16_but_preserve_and_drift_fail_closed() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-reset-v16-full-erase")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        seed_clean_break_reset_catalog(
+            temp.path(),
+            16,
+            &[([0xC0; 16], "ACM020L9"), ([0xC1; 16], "ACM021L9")],
+        );
+        fs::write(temp.path().join("audit/sentinel"), b"unchanged").expect("write audit sentinel");
+
+        let erase = vec![
+            "ACM020L9".to_string(),
+            "ACM021L9".to_string(),
+            "ACM022L9".to_string(),
+        ];
+        let admitted =
+            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
+                .expect("schema-16 full erase preflight");
+        assert_eq!(admitted.source_schema_version, 16);
+        assert_eq!(admitted.tapes.len(), 2);
+        assert!(admitted.preserve_tape_voltags.is_empty());
+
+        let preserve_error = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &["ACM020L9".to_string()],
+            &["ACM021L9".to_string()],
+        )
+        .expect_err("legacy preservation must remain closed");
+        assert!(
+            preserve_error.to_string().contains("empty preserve list"),
+            "{preserve_error}"
+        );
+        let incomplete_error = StateHandle::preflight_catalog_reset_from_config_file(
+            &config_path,
+            &[],
+            &["ACM020L9".to_string()],
+        )
+        .expect_err("legacy erase must enumerate every bound tape");
+        assert!(
+            incomplete_error
+                .to_string()
+                .contains("outside the exact preserve and allow-erase"),
+            "{incomplete_error}"
+        );
+
+        let conn = rusqlite::Connection::open(temp.path().join("index/rem-state.sqlite"))
+            .expect("open legacy catalog for drift");
+        conn.execute(
+            "insert into tapes(
+               tape_uuid, voltag, pool_id, kind, block_size, state, updated_at_utc
+             ) values(?1, 'ACM022L9', 'camera.copy-a', 'data', 1048576, 'ready',
+                      '2026-08-09T00:00:00Z')",
+            rusqlite::params![[0xC2_u8; 16].as_slice()],
+        )
+        .expect("insert admitted-selector source drift");
+        drop(conn);
+        let stale = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+            &config_path,
+            &[],
+            &erase,
+            &admitted.preflight_token,
+        )
+        .expect_err("legacy source drift must invalidate preflight token");
+        assert!(stale.to_string().contains("source changed after preflight"));
+        assert_eq!(
+            fs::read(temp.path().join("audit/sentinel")).expect("sentinel survives refusal"),
+            b"unchanged"
+        );
+
+        let current =
+            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
+                .expect("refresh legacy full erase evidence");
+        let reset = StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+            &config_path,
+            &[],
+            &erase,
+            &current.preflight_token,
+        )
+        .expect("reset exact schema-16 source");
+        assert!(reset.preserved_tapes.is_empty());
+
+        let empty =
+            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
+                .expect("preflight current empty replacement");
+        assert_eq!(empty.source_schema_version, crate::index::SCHEMA_VERSION);
+        assert!(empty.tapes.is_empty());
+        assert!(!empty.resume_exact);
+    }
+
+    #[test]
+    fn exact_full_erase_admits_schema_v17() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-state-reset-v17-full-erase")
+            .tempdir()
+            .expect("temp dir");
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).expect("write config");
+        seed_clean_break_reset_catalog(temp.path(), 17, &[([0xD0; 16], "ACM030L9")]);
+        let erase = ["ACM030L9".to_string()];
+        let admitted =
+            StateHandle::preflight_catalog_reset_from_config_file(&config_path, &[], &erase)
+                .expect("schema-17 full erase preflight");
+        assert_eq!(admitted.source_schema_version, 17);
+        StateHandle::reset_catalog_preserving_with_preflight_token_from_config_file(
+            &config_path,
+            &[],
+            &erase,
+            &admitted.preflight_token,
+        )
+        .expect("reset exact schema-17 source");
+    }
+
+    #[test]
     fn reset_fence_binds_config_contents_and_rejects_changed_resume() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-reset-fence-config")
@@ -4050,9 +4316,12 @@ pool_id = "camera.copy-a"
             &paths,
             &config,
             &preserved,
-            &digest,
-            &admitted.preflight_token,
-            &output_token,
+            CatalogResetAdmission {
+                request_digest: &digest,
+                preflight_token: &admitted.preflight_token,
+                output_token: &output_token,
+                source_schema_version: Some(admitted.source_schema_version),
+            },
             |phase| {
                 if phase == CatalogResetPhase::SourceCheckpointed {
                     Err(StateError::ConfigInvalid("injected config cut".to_string()))
