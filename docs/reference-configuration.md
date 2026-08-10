@@ -65,7 +65,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `checkpoint_max_bytes` | byte size > 0 | `"32GiB"` | Request the single checkpoint barrier when pending logical bytes reach this limit. |
 | `checkpoint_max_objects` | integer > 0 | `200` | Request the single checkpoint barrier when the pending object count reaches this limit. |
 | `checkpoint_max_age_seconds` | integer > 0 | `300` | Server-owned age deadline for an open batch. The timer queues its barrier through the drive actor, so an in-flight object finishes first. |
-| `read_only` | bool | `false` | Reject state-changing operations; skips library discovery and the drive pool at startup. |
+| `read_only` | bool | `false` | Reject state-changing API operations; skips library discovery and the drive pool at startup. Read-only and writable daemons both hold exclusive ownership of `state_dir` while running. |
 | `socket_path` | absolute path | `<state_dir>/rem.sock` | Unix-domain gRPC socket. Parent directory created `0700`; socket chmod `0660`; connecting peers must be root or the daemon's own user. |
 | `listen` | `host:port` string | unset | TCP listen address for mTLS gRPC. Requires `[daemon.tls]`. |
 

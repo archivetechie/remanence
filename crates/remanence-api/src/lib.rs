@@ -515,7 +515,6 @@ impl ApiState {
             &mut index,
             config.journal.dir.join("checkpoints").as_path(),
             config.audit.dir.as_path(),
-            config.audit.fsync,
             &audit_append_lock,
         )?;
         let index_path = index.path().to_path_buf();
@@ -699,7 +698,6 @@ impl ApiState {
             &mut index,
             config.journal.dir.join("checkpoints").as_path(),
             config.audit.dir.as_path(),
-            config.audit.fsync,
             &audit_append_lock,
         )?;
         reject_active_tape_io_fences_on_startup(&index)?;
@@ -2108,13 +2106,14 @@ fn append_and_project_audit_locked(
 ///
 /// The sealed checkpoint carries the original operation identity, so both
 /// startup replay and an explicit retry can repair a crash after final SQLite
-/// projection without a drive or changer. The process-local append lock spans
-/// the read-before-append decision; an already durable record is reprojected
-/// instead of duplicated.
+/// projection without a drive or changer. The daemon's process-lifetime state
+/// lock excludes other state owners, while this append lock spans the
+/// in-process read-before-append decision. An already durable record is
+/// reprojected instead of duplicated, and a new completion record always
+/// forces fsync.
 pub(crate) fn ensure_manual_finalize_finished_audit(
     index: &mut CatalogIndex,
     audit_dir: &Path,
-    audit_fsync: bool,
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
     tape_uuid: [u8; 16],
     finalization: &remanence_state::TerminalFinalizationIntent,
@@ -2167,21 +2166,54 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
     let mut durable = None;
     let mut durable_count = 0usize;
     let mut conflict = None;
+    let mut incompatible_terminal = None;
+    let mut latest_completion_unknown_sequence = None;
     FileAuditLog::replay_incremental(audit_dir, |record| {
-        if record.event != AuditEvent::OperationFinished
-            || record.operation_id != Some(operation_id)
-        {
+        if record.operation_id != Some(operation_id) {
             return ControlFlow::Continue(());
         }
-        if manual_finalize_finished_audit_matches(&record, tape_uuid, idempotency_key, manual) {
-            durable_count += 1;
-            durable.get_or_insert(record);
-        } else {
-            conflict.get_or_insert(record);
+        match &record.event {
+            AuditEvent::OperationFinished => {
+                if manual_finalize_finished_audit_matches(
+                    &record,
+                    tape_uuid,
+                    idempotency_key,
+                    manual,
+                ) {
+                    durable_count += 1;
+                    durable.get_or_insert(record);
+                } else {
+                    conflict.get_or_insert(record);
+                }
+            }
+            AuditEvent::CompletionUnknown => {
+                if manual_finalize_completion_unknown_audit_matches(
+                    &record,
+                    tape_uuid,
+                    idempotency_key,
+                    manual,
+                ) {
+                    latest_completion_unknown_sequence = Some(record.sequence);
+                } else {
+                    incompatible_terminal.get_or_insert(record);
+                }
+            }
+            AuditEvent::OperationFailed
+            | AuditEvent::CancelledBeforeDispatch
+            | AuditEvent::CompletedAfterCancel => {
+                incompatible_terminal.get_or_insert(record);
+            }
+            _ => {}
         }
         ControlFlow::Continue(())
     })
     .map_err(status_from_state_error)?;
+    if let Some(record) = incompatible_terminal {
+        return Err(Status::failed_precondition(format!(
+            "operation {operation_id} has incompatible durable terminal audit record {} ({:?})",
+            record.record_uuid, record.event
+        )));
+    }
     if let Some(record) = conflict {
         return Err(Status::failed_precondition(format!(
             "operation {} has conflicting durable OperationFinished audit record {}",
@@ -2194,22 +2226,35 @@ pub(crate) fn ensure_manual_finalize_finished_audit(
         )));
     }
     if let Some(record) = durable {
+        if latest_completion_unknown_sequence.is_some_and(|sequence| sequence > record.sequence) {
+            return Err(Status::failed_precondition(format!(
+                "operation {operation_id} has CompletionUnknown authority after its durable OperationFinished record"
+            )));
+        }
         index
             .project_audit_record(&record)
             .map_err(status_from_state_error)?;
         return Ok(());
     }
 
-    if scope.terminal_state.as_deref() == Some("finished") {
-        return Err(Status::failed_precondition(
-            "manual finalization is projected finished without its durable completion audit",
-        ));
+    match scope.terminal_state.as_deref() {
+        None | Some("completion_unknown") => {}
+        Some("finished") => {
+            return Err(Status::failed_precondition(
+                "manual finalization is projected finished without its durable completion audit",
+            ));
+        }
+        Some(state) => {
+            return Err(Status::failed_precondition(format!(
+                "manual finalization has incompatible projected terminal state {state:?}"
+            )));
+        }
     }
 
     append_and_project_audit_locked(
         index,
         audit_dir,
-        audit_fsync,
+        true,
         ProjectedAuditInput {
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer5,
@@ -2248,11 +2293,51 @@ fn manual_finalize_finished_audit_matches(
     idempotency_key: Uuid,
     manual: &remanence_state::ManualTerminalFinalizationIdentity,
 ) -> bool {
+    manual_finalize_audit_identity_matches(record, tape_uuid, idempotency_key, manual)
+        && record.detail.len() == 4
+        && matches!(
+            record.detail.get("finalization_progress"),
+            Some(CborValue::Text(value)) if value == "after_replica_c"
+        )
+}
+
+fn manual_finalize_completion_unknown_audit_matches(
+    record: &AuditRecord,
+    tape_uuid: [u8; 16],
+    idempotency_key: Uuid,
+    manual: &remanence_state::ManualTerminalFinalizationIdentity,
+) -> bool {
+    manual_finalize_audit_identity_matches(record, tape_uuid, idempotency_key, manual)
+        && record.detail.len() == 5
+        && matches!(
+            record.detail.get("finalization_progress"),
+            Some(CborValue::Text(value))
+                if matches!(
+                    value.as_str(),
+                    "before_replica_a"
+                        | "after_replica_a"
+                        | "after_separation_ab"
+                        | "after_replica_b"
+                        | "after_separation_bc"
+                        | "after_replica_c"
+                )
+        )
+        && matches!(
+            record.detail.get("recovery_detail"),
+            Some(CborValue::Text(value)) if !value.is_empty()
+        )
+}
+
+fn manual_finalize_audit_identity_matches(
+    record: &AuditRecord,
+    tape_uuid: [u8; 16],
+    idempotency_key: Uuid,
+    manual: &remanence_state::ManualTerminalFinalizationIdentity,
+) -> bool {
     record.actor == AuditActor::System
         && record.source_layer == SourceLayer::Layer5
         && record.session_id.is_none()
         && record.idempotency_key == Some(idempotency_key)
-        && record.detail.len() == 4
         && audit_subject_matches_tape(record, tape_uuid)
         && matches!(
             record.detail.get("operation_kind"),
@@ -2263,20 +2348,15 @@ fn manual_finalize_finished_audit_matches(
             Some(CborValue::Text(value)) if value == &manual.actor_fingerprint
         )
         && matches!(
-            record.detail.get("finalization_progress"),
-            Some(CborValue::Text(value)) if value == "after_replica_c"
-        )
-        && matches!(
             record.detail.get("tape_uuid"),
             Some(CborValue::Bytes(value)) if value.as_slice() == tape_uuid
         )
 }
 
-/// Ensure the catalog-evidence audit contains one durable tape-sealed fact.
+/// Ensure the catalog-evidence audit contains one fsynced tape-sealed fact.
 pub(crate) fn ensure_tape_sealed_audit(
     index: &mut CatalogIndex,
     audit_dir: &Path,
-    audit_fsync: bool,
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
     tape_uuid: [u8; 16],
 ) -> Result<(), Status> {
@@ -2328,7 +2408,7 @@ pub(crate) fn ensure_tape_sealed_audit(
     append_and_project_audit_locked(
         index,
         audit_dir,
-        audit_fsync,
+        true,
         ProjectedAuditInput {
             actor: AuditActor::System,
             source_layer: SourceLayer::Layer4,
@@ -2530,7 +2610,6 @@ fn replay_checkpoint_journal_projections(
         index,
         checkpoint_dir,
         audit_dir.as_path(),
-        false,
         &audit_append_lock,
     )
 }
@@ -2539,7 +2618,6 @@ fn replay_checkpoint_journal_projections_with_audit(
     index: &mut CatalogIndex,
     checkpoint_dir: &Path,
     audit_dir: &Path,
-    audit_fsync: bool,
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
 ) -> Result<(), Status> {
     for path in remanence_state::list_checkpoint_journals(checkpoint_dir)
@@ -2610,11 +2688,10 @@ fn replay_checkpoint_journal_projections_with_audit(
                 .map_err(status_from_state_error)?;
         }
         if let Some(completion) = sealed_completion.as_ref() {
-            ensure_tape_sealed_audit(index, audit_dir, audit_fsync, audit_append_lock, tape_uuid)?;
+            ensure_tape_sealed_audit(index, audit_dir, audit_append_lock, tape_uuid)?;
             ensure_manual_finalize_finished_audit(
                 index,
                 audit_dir,
-                audit_fsync,
                 audit_append_lock,
                 tape_uuid,
                 completion,
@@ -4017,8 +4094,12 @@ impl TryFrom<pb::QueryAuditRequest> for AuditQuery {
                         })?
                         .to_string();
                 }
-                "event_kind" | "event" | "kind" | "actor" | "source_layer" | "subject_kind"
-                | "subject_id" => {}
+                "subject_id" => {
+                    if let Ok(subject_uuid) = Uuid::parse_str(value.as_str()) {
+                        value = subject_uuid.to_string();
+                    }
+                }
+                "event_kind" | "event" | "kind" | "actor" | "source_layer" | "subject_kind" => {}
                 _ => {
                     return Err(Status::invalid_argument(format!(
                         "unsupported audit filter {raw_key:?}"
@@ -4101,7 +4182,7 @@ fn audit_record_matches(record: &AuditRecord, query: &AuditQuery) -> Result<bool
             "actor" => audit_actor_name(&record.actor) == *expected,
             "source_layer" => audit_source_layer_name(&record.source_layer) == expected,
             "subject_kind" => record.subject.kind == *expected,
-            "subject_id" => record.subject.id.as_deref() == Some(expected.as_str()),
+            "subject_id" => audit_subject_id_matches(record.subject.id.as_deref(), expected),
             _ => unreachable!("audit filter keys are validated before streaming"),
         };
         if !matched {
@@ -4109,6 +4190,15 @@ fn audit_record_matches(record: &AuditRecord, query: &AuditQuery) -> Result<bool
         }
     }
     Ok(true)
+}
+
+fn audit_subject_id_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual.is_some_and(|actual| {
+        actual == expected
+            || Uuid::parse_str(actual).is_ok_and(|actual_uuid| {
+                Uuid::parse_str(expected).is_ok_and(|expected_uuid| actual_uuid == expected_uuid)
+            })
+    })
 }
 
 fn audit_record_to_proto(record: AuditRecord) -> Result<pb::AuditEntry, Status> {
@@ -8166,12 +8256,11 @@ BCw3Wyv2UWY=
         let lock = Arc::new(std::sync::Mutex::new(()));
 
         for _ in 0..2 {
-            ensure_tape_sealed_audit(&mut index, &audit_dir, false, &lock, tape_uuid)
+            ensure_tape_sealed_audit(&mut index, &audit_dir, &lock, tape_uuid)
                 .expect("ensure exact tape-sealed evidence");
             ensure_manual_finalize_finished_audit(
                 &mut index,
                 &audit_dir,
-                false,
                 &lock,
                 tape_uuid,
                 &completion,
@@ -8232,9 +8321,8 @@ BCw3Wyv2UWY=
             },
         )
         .expect("append hostile duplicate tape-sealed evidence");
-        let duplicate_seal =
-            ensure_tape_sealed_audit(&mut index, &audit_dir, false, &lock, tape_uuid)
-                .expect_err("duplicate tape-sealed evidence must fail closed");
+        let duplicate_seal = ensure_tape_sealed_audit(&mut index, &audit_dir, &lock, tape_uuid)
+            .expect_err("duplicate tape-sealed evidence must fail closed");
         assert_eq!(duplicate_seal.code(), tonic::Code::FailedPrecondition);
         assert!(duplicate_seal.message().contains("2 durable TapeSealed"));
 
@@ -8276,7 +8364,6 @@ BCw3Wyv2UWY=
         let duplicate_finish = ensure_manual_finalize_finished_audit(
             &mut index,
             &audit_dir,
-            false,
             &lock,
             tape_uuid,
             &completion,
@@ -8286,6 +8373,49 @@ BCw3Wyv2UWY=
         assert!(duplicate_finish
             .message()
             .contains("2 durable OperationFinished"));
+
+        append_and_project_audit(
+            &mut index,
+            &audit_dir,
+            false,
+            &lock,
+            ProjectedAuditInput {
+                actor: AuditActor::System,
+                source_layer: SourceLayer::Layer5,
+                operation_id: Some(operation_id),
+                session_id: None,
+                idempotency_key: Some(idempotency_key),
+                event: AuditEvent::OperationFailed,
+                subject_kind: "tape",
+                subject_id: Some(Uuid::from_bytes(tape_uuid).to_string()),
+                detail: BTreeMap::from([
+                    (
+                        "actor_fingerprint".to_string(),
+                        CborValue::Text(actor_fingerprint.to_string()),
+                    ),
+                    (
+                        "operation_kind".to_string(),
+                        CborValue::Text(FINALIZE_TAPE_OPERATION_KIND.to_string()),
+                    ),
+                ]),
+            },
+        )
+        .expect("append hostile incompatible terminal evidence");
+        let incompatible_terminal = ensure_manual_finalize_finished_audit(
+            &mut index,
+            &audit_dir,
+            &lock,
+            tape_uuid,
+            &completion,
+        )
+        .expect_err("incompatible terminal evidence must fail closed");
+        assert_eq!(
+            incompatible_terminal.code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(incompatible_terminal
+            .message()
+            .contains("incompatible durable terminal audit"));
     }
 
     fn project_no_parity_tape(index: &mut CatalogIndex, pool_id: &str, tape_uuid: [u8; 16]) {
@@ -12580,6 +12710,10 @@ BCw3Wyv2UWY=
                 (
                     "operation_id".to_string(),
                     operation_id.simple().to_string(),
+                ),
+                (
+                    "subject_id".to_string(),
+                    session_id.simple().to_string().to_ascii_uppercase(),
                 ),
             ]),
         })
