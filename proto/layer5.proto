@@ -751,6 +751,7 @@ message Tape {
     TAPE_STATE_FINALIZED_DEGRADED = 7;
     TAPE_STATE_COMPLETION_UNKNOWN = 8;
     TAPE_STATE_RECOVERY_REQUIRED = 9;
+    TAPE_STATE_RETIRED = 10;
   }
   State state                  = 9;  // NOT NULL; UNSPECIFIED already says "unknown"
   google.protobuf.Timestamp updated_at = 10;

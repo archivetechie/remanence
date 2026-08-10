@@ -5912,8 +5912,7 @@ fn tape_state(value: &str) -> pb::tape::State {
         "ingestion_pending" => pb::tape::State::TapeStateInventoried,
         "degraded" => pb::tape::State::TapeStateDegraded,
         "failed" => pb::tape::State::TapeStateFailed,
-        // `retired` intentionally maps to UNSPECIFIED until the proto enum
-        // gains an explicit value; adoption does not change retire semantics.
+        "retired" => pb::tape::State::TapeStateRetired,
         _ => pb::tape::State::TapeStateUnspecified,
     }
 }
@@ -8976,11 +8975,16 @@ BCw3Wyv2UWY=
         let mut record = writable_tape_record();
         record.assignment_generation = 7;
         record.state = "recovery_required".to_string();
-        let projected = tape_to_proto(record);
+        let projected = tape_to_proto(record.clone());
         assert_eq!(projected.assignment_generation, 7);
         assert_eq!(
             projected.state,
             pb::tape::State::TapeStateRecoveryRequired as i32
+        );
+        record.state = "retired".to_string();
+        assert_eq!(
+            tape_to_proto(record).state,
+            pb::tape::State::TapeStateRetired as i32
         );
     }
 
