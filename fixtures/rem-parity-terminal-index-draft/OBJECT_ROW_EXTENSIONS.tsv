@@ -1,7 +1,8 @@
-case_id	base_profile	row_index	mutation	expected
-unknown-positive-key	multi-256k	0	unknown-positive-key	valid
-unknown-negative-key	multi-256k	0	unknown-negative-key	valid
-plaintext-with-encrypted-field	multi-256k	0	encrypted-field-on-plaintext	cross-representation
-encrypted-with-plaintext-field	multi-256k	1	plaintext-field-on-encrypted	cross-representation
-unknown-noncanonical-value	multi-256k	0	unknown-noncanonical-value	cbor
-unknown-nested-map-order	multi-256k	0	unknown-nested-map-order	cbor
+case_id	base_profile	row_index	artifact	encoded_len	bytes	sha256	expected
+unknown-positive-key	multi-256k	0	object-row-extensions/unknown-positive-key.slot	94	256	c5592c86801adcb347da0ec26eea1b165ca890392ee77e3e06857c0bfe89868a	valid
+unknown-negative-key	multi-256k	0	object-row-extensions/unknown-negative-key.slot	91	256	81bc74e00d095daa798cd60fb97d35cae54f2e73b802ab4046799101ec3e0d15	valid
+unknown-nested-boolean	multi-256k	0	object-row-extensions/unknown-nested-boolean.slot	94	256	5c0d1886e7b2dca3ae7f44a0a3b9d94b9a0c5775a8474613776df2b0e70e5981	valid
+plaintext-with-encrypted-field	multi-256k	0	object-row-extensions/plaintext-with-encrypted-field.slot	87	256	f17ed0ddbe8c2de2373efab1d6e80179de14e37c7f6612800416735766a195ab	cross-representation
+encrypted-with-plaintext-field	multi-256k	1	object-row-extensions/encrypted-with-plaintext-field.slot	89	256	e43114842e442b47d388169fc18848f844d8c08e7a1423f18893c2e7c2482a34	cross-representation
+unknown-noncanonical-value	multi-256k	0	object-row-extensions/unknown-noncanonical-value.slot	89	256	5e7d60dab4a6c50ea21e48fe664749a0579b0363b0d33c1aad29ba0dd79ffec2	cbor
+unknown-nested-map-order	multi-256k	0	object-row-extensions/unknown-nested-map-order.slot	92	256	74803a131b97cf425e226ac2d39eafdeea653bab98002911d19d6d17a5b1130b	cbor
