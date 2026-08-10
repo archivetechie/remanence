@@ -376,7 +376,10 @@ the exact companion beside sealed authority, recovery validates their exact
 match under its retained lease, publishes the final SQLite outcome while the
 companion still provides retry routing, and retires it only after that
 projection succeeds. Both the sealed-fsync-to-cleanup window and a final
-projection failure are therefore separately restartable and tested.
+projection failure are therefore separately restartable and tested. An
+ordinary append owner cannot consume or clean a surviving companion; the
+explicit terminal-recovery owner alone performs the project-then-retire
+sequence.
 
 The run-to-completion writer performs one final, read-only position assertion
 against planned terminal EOD after the fifth barrier. Terminal component

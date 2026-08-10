@@ -2374,7 +2374,10 @@ companion, a recovery lease first verifies exact equality between the sealed
 completion and normalized companion. Recovery then projects the sealed
 checkpoint while retaining the companion, and retires it only after projection
 succeeds. A projection failure therefore preserves host-only retry routing; no
-path regresses to in-progress authority.
+path regresses to in-progress authority. While that companion exists, an
+ordinary append owner MUST NOT acquire the checkpoint journal or retire the
+companion implicitly; only the explicit terminal-recovery owner may complete
+the project-then-retire sequence.
 
 The companion intent format is versioned independently from the tape format.
 A companion that carries the durable `RecoveryRequired` classification MUST
