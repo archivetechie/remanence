@@ -6698,22 +6698,34 @@ pub(crate) fn preflight_automatic_terminal_completion(
         selected.tape_uuid,
     )
     .map_err(crate::status_from_state_error)?;
-    let Some(pending) = checkpoint_journal
+    let pending = checkpoint_journal
         .terminal_finalization_intent()
-        .map_err(crate::status_from_state_error)?
-    else {
-        return Ok(false);
-    };
-    if pending.manual.is_some() {
+        .map_err(crate::status_from_state_error)?;
+    if pending
+        .as_ref()
+        .is_some_and(|intent| intent.manual.is_some())
+    {
         return Ok(false);
     }
-    let mut checkpoint = checkpoint_journal
-        .acquire_exclusive_for_terminal_recovery()
-        .map_err(crate::status_from_state_error)?;
-    let intent = checkpoint
-        .terminal_finalization_intent()
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| Status::internal("automatic terminal intent disappeared in preflight"))?;
+    let (mut checkpoint, intent) = if pending.is_some() {
+        let checkpoint = checkpoint_journal
+            .acquire_exclusive_for_terminal_recovery()
+            .map_err(crate::status_from_state_error)?;
+        let intent = checkpoint
+            .terminal_finalization_intent()
+            .map_err(crate::status_from_state_error)?
+            .ok_or_else(|| {
+                Status::internal("automatic terminal intent disappeared in preflight")
+            })?;
+        (checkpoint, Some(intent))
+    } else {
+        (
+            checkpoint_journal
+                .acquire_exclusive()
+                .map_err(crate::status_from_state_error)?,
+            None,
+        )
+    };
     let previous = checkpoint
         .last_record_bounded()
         .map_err(crate::status_from_state_error)?
@@ -6723,12 +6735,30 @@ pub(crate) fn preflight_automatic_terminal_completion(
             )
         })?;
     if previous.sealed_after_write {
-        project_sealed_checkpoint_then_retire_terminal_intent(index, &mut checkpoint, &previous)?;
         let completion = previous.terminal_finalization.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "sealed checkpoint authority has no terminal-finalization completion",
             )
         })?;
+        if completion.manual.is_some() {
+            return Ok(false);
+        }
+        if intent.is_some() {
+            project_sealed_checkpoint_then_retire_terminal_intent(
+                index,
+                &mut checkpoint,
+                &previous,
+            )?;
+        } else {
+            // An uninterrupted owner may retire the companion immediately
+            // after the sealed checkpoint fsync, then fail before SQLite or
+            // audit repair. The sealed record remains sufficient host-only
+            // authority; ordinary journal ownership excludes a concurrent
+            // writer while it is projected.
+            index
+                .project_checkpoint_record(&previous)
+                .map_err(crate::status_from_state_error)?;
+        }
         crate::ensure_tape_sealed_audit(
             index,
             cfg.audit_dir,
@@ -6744,6 +6774,9 @@ pub(crate) fn preflight_automatic_terminal_completion(
         )?;
         return Ok(true);
     }
+    let Some(intent) = intent else {
+        return Ok(false);
+    };
     let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, pool_cfg);
     let (intent, plan) = match &selected.parity_config {
         remanence_parity::ParityConfig::None => {
