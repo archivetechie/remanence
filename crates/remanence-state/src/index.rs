@@ -4307,7 +4307,11 @@ impl CatalogIndex {
             .map(|(tape_uuid, pool_id)| (tape_uuid.to_vec(), pool_id.clone()))
             .collect::<HashSet<_>>();
 
-        let existing_memberships = query_memberships_tx(&tx)?;
+        // Retired identities retain their last pool as immutable provenance.
+        // Their barcode is detached, so they are intentionally absent from
+        // `configured_memberships`; do not interpret that absence as a request
+        // to erase the historical assignment.
+        let existing_memberships = query_active_memberships_tx(&tx)?;
         for (tape_uuid, pool_id) in existing_memberships {
             if !configured_memberships.contains(&(tape_uuid.clone(), pool_id)) {
                 let tape_uuid: [u8; 16] = tape_uuid.try_into().map_err(|tape_uuid: Vec<u8>| {
@@ -9223,7 +9227,10 @@ fn project_catalog_evidence_record(
                  values(?1, null, ?2, ?3)
                  on conflict(tape_uuid) do update set
                    voltag = case when excluded.state = 'retired' then null else tapes.voltag end,
-                   state = excluded.state,
+                   state = case
+                     when tapes.state = 'retired' then tapes.state
+                     else excluded.state
+                   end,
                    updated_at_utc = excluded.updated_at_utc",
                 params![tape_uuid, state, record.timestamp_utc.as_str()],
             )
@@ -10838,11 +10845,14 @@ fn terminal_progress_reaches(
     false
 }
 
-fn query_memberships_tx(
+fn query_active_memberships_tx(
     tx: &rusqlite::Transaction<'_>,
 ) -> Result<Vec<(Vec<u8>, String)>, StateError> {
     let mut stmt = tx
-        .prepare("select tape_uuid, pool_id from tapes where pool_id is not null")
+        .prepare(
+            "select tape_uuid, pool_id from tapes
+             where pool_id is not null and state != 'retired'",
+        )
         .map_err(|err| sqlite_error("prepare tape pool membership reconciliation query", err))?;
     let mut rows = stmt
         .query([])
@@ -14018,6 +14028,76 @@ mod tests {
             .reconcile_tape_pool_projection_from_rules(&pools, &[])
             .expect("reconcile no rules");
         assert_eq!(index.get_tape_pool_membership(&uuid).expect("lookup"), None);
+    }
+
+    #[test]
+    fn rules_reconcile_preserves_retired_pool_history_while_rebinding_barcode() {
+        let dir = tempfile::Builder::new()
+            .prefix("rem-retired-pool-rebind")
+            .tempdir()
+            .expect("tempdir");
+        let mut index = CatalogIndex::open(dir.path().join("s.sqlite")).expect("open");
+        let retired_uuid = [0x71; 16];
+        let replacement_uuid = [0x72; 16];
+        let voltag = "RMN009L9";
+        let pools = [TapePoolProjectionInput {
+            pool_id: "terminal-index".to_string(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            created_at_utc: None,
+        }];
+        let rules = [TapePoolRuleConfig {
+            prefix: "RMN".to_string(),
+            pool_id: "terminal-index".to_string(),
+        }];
+
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: retired_uuid,
+                voltag: voltag.to_string(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision first identity");
+        index
+            .reconcile_tape_pool_projection_from_rules(&pools, &rules)
+            .expect("assign first identity");
+        index
+            .retire_tape(RetireTapeInput {
+                tape_uuid: retired_uuid,
+                reason: "scratch-media recycle".to_string(),
+            })
+            .expect("retire first identity");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: replacement_uuid,
+                voltag: voltag.to_string(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision replacement identity");
+
+        index
+            .reconcile_tape_pool_projection_from_rules(&pools, &rules)
+            .expect("assign replacement without mutating retired history");
+
+        let retired = index
+            .get_tape(&retired_uuid)
+            .expect("read retired identity")
+            .expect("retired identity exists");
+        assert_eq!(retired.state, "retired");
+        assert_eq!(retired.voltag, None);
+        assert_eq!(retired.pool_id.as_deref(), Some("terminal-index"));
+        let replacement = index
+            .get_tape(&replacement_uuid)
+            .expect("read replacement identity")
+            .expect("replacement identity exists");
+        assert_eq!(replacement.state, "ready");
+        assert_eq!(replacement.voltag.as_deref(), Some(voltag));
+        assert_eq!(replacement.pool_id.as_deref(), Some("terminal-index"));
     }
 
     #[test]
@@ -17377,6 +17457,49 @@ mod tests {
         let (state, voltag) = tape_state_and_voltag(&index, input.tape_uuid);
         assert_eq!(state, "retired");
         assert_eq!(voltag, None);
+    }
+
+    #[test]
+    fn tape_sealed_audit_cannot_resurrect_a_retired_identity() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-retired-seal-audit")
+            .tempdir()
+            .expect("temp dir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open");
+        let tape_uuid = [0x73; 16];
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RMN009L9".to_string(),
+                block_size: 1024 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        index
+            .retire_tape(RetireTapeInput {
+                tape_uuid,
+                reason: "scratch-media recycle".to_string(),
+            })
+            .expect("retire tape");
+
+        let sealed = catalog_evidence_record(
+            1,
+            AuditEvent::TapeSealed,
+            "tape",
+            hex_uuid_from_slice(&tape_uuid).as_str(),
+            BTreeMap::new(),
+        );
+        index
+            .project_audit_record(&sealed)
+            .expect("replay older durable seal fact");
+
+        let tape = index
+            .get_tape(&tape_uuid)
+            .expect("read tape")
+            .expect("tape exists");
+        assert_eq!(tape.state, "retired");
+        assert_eq!(tape.voltag, None);
     }
 
     #[test]
