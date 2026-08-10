@@ -2200,7 +2200,7 @@ struct PendingCheckpointBatch {
 struct ParityActorSession {
     scheme: remanence_parity::ParityScheme,
     sink_state: Option<ParitySinkSessionState>,
-    journal: FileTapeFileJournal,
+    journal: Option<FileTapeFileJournal>,
 }
 
 struct ParityActorAuthority {
@@ -2445,7 +2445,7 @@ fn open_parity_actor_session(
     Ok(ParityActorSession {
         scheme,
         sink_state: Some(sink_state),
-        journal,
+        journal: Some(journal),
     })
 }
 
@@ -2604,7 +2604,7 @@ fn perform_checkpoint_barrier(
     checkpoint_ordinal: &mut u64,
     tape_committed_object_count: &mut u64,
     batch: &PendingCheckpointBatch,
-    parity_session: Option<&mut ParityActorSession>,
+    mut parity_session: Option<&mut ParityActorSession>,
     selected: &SelectedTape,
     pool_cfg: &TapePoolConfig,
     cfg: &WriteOwnerConfig,
@@ -2663,10 +2663,15 @@ fn perform_checkpoint_barrier(
         barrier_bundle,
         scheme,
         parity_early_warning,
-    ) = if let Some(parity_session) = parity_session {
+    ) = if let Some(parity_session) = parity_session.as_deref_mut() {
         let state = parity_session.sink_state.take().ok_or_else(|| {
             CheckpointBarrierFailure::before_journal(Status::internal(
                 "parity sink session state is unavailable",
+            ))
+        })?;
+        let parity_journal = parity_session.journal.as_mut().ok_or_else(|| {
+            CheckpointBarrierFailure::before_journal(Status::internal(
+                "active parity session has no append journal",
             ))
         })?;
         let mut raw_write_attempted = false;
@@ -2674,11 +2679,7 @@ fn perform_checkpoint_barrier(
             let mut raw = DriveHandleRawSink::new(drive);
             let mut tracked = ActivityTrackingRawTapeSink::new(&mut raw, &mut raw_write_attempted);
             (|| -> Result<_, ParityError> {
-                let mut sink = ParitySink::from_session_state(
-                    &mut tracked,
-                    &mut parity_session.journal,
-                    state,
-                )?;
+                let mut sink = ParitySink::from_session_state(&mut tracked, parity_journal, state)?;
                 let closed = sink.close_open_epoch(CloseReason::Barrier)?;
                 let sink_state = sink.into_session_state()?;
                 Ok((closed, sink_state))
@@ -2863,9 +2864,28 @@ fn perform_checkpoint_barrier(
             remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
                 index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
             ),
-            remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
-                index, cfg, drive, journal, &record, None, &spec, selected, None, rewritable,
-            ),
+            remanence_parity::ParityConfig::Scheme(_) => {
+                let parity_journal = parity_session
+                    .and_then(|session| session.journal.take())
+                    .ok_or_else(|| {
+                        CheckpointBarrierFailure::after_journal(Status::internal(
+                            "automatic parity finalization has no session-owned append journal",
+                        ))
+                    })?;
+                finalize_terminal_with_parity_journal(
+                    index,
+                    cfg,
+                    drive,
+                    journal,
+                    &record,
+                    None,
+                    &spec,
+                    selected,
+                    None,
+                    parity_journal,
+                    rewritable,
+                )
+            }
         }
         .map_err(CheckpointBarrierFailure::after_journal)?;
         let final_record = result.final_record.ok_or_else(|| {
@@ -4238,45 +4258,53 @@ impl WriteSessionState<'_> {
         };
         let append_started = Instant::now();
         let mut parity_raw_write_attempted = false;
-        let result =
-            match crate::pool_write::maybe_replay_pool_write(self.index, &pool_cfg, &request) {
-                Ok(Some(result)) => Ok(result),
-                Ok(None) => {
-                    if let Some(parity_session) = self.parity_session.as_mut() {
-                        let mut raw = DriveHandleRawSink::new(self.drive);
-                        crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
+        let result = match crate::pool_write::maybe_replay_pool_write(
+            self.index, &pool_cfg, &request,
+        ) {
+            Ok(Some(result)) => Ok(result),
+            Ok(None) => {
+                if let Some(parity_session) = self.parity_session.as_mut() {
+                    let mut raw = DriveHandleRawSink::new(self.drive);
+                    match parity_session.journal.as_mut() {
+                            Some(parity_journal) => {
+                                crate::pool_write::write_batched_parity_to_selected_tape_after_replay_check(
+                                    self.index,
+                                    &mut raw,
+                                    parity_journal,
+                                    &mut parity_session.sink_state,
+                                    &pool_cfg,
+                                    request,
+                                    selected.clone(),
+                                    &cfg.io_memory,
+                                    &mut parity_raw_write_attempted,
+                                )
+                            }
+                            None => Err(PoolWriteError::InvalidInput(
+                                "active parity session has no append journal".to_string(),
+                            )),
+                        }
+                } else {
+                    let mut sink = DriveHandleSink(self.drive);
+                    if let Some(append) = self.next_batched_append.clone() {
+                        self.next_batched_append = Some(append.clone());
+                        crate::pool_write::write_batched_to_selected_tape_after_replay_check(
                             self.index,
-                            &mut raw,
-                            &mut parity_session.journal,
-                            &mut parity_session.sink_state,
+                            &mut sink,
                             &pool_cfg,
                             request,
                             selected.clone(),
-                            &cfg.io_memory,
-                            &mut parity_raw_write_attempted,
+                            live_write_counter,
+                            append,
                         )
                     } else {
-                        let mut sink = DriveHandleSink(self.drive);
-                        if let Some(append) = self.next_batched_append.clone() {
-                            self.next_batched_append = Some(append.clone());
-                            crate::pool_write::write_batched_to_selected_tape_after_replay_check(
-                                self.index,
-                                &mut sink,
-                                &pool_cfg,
-                                request,
-                                selected.clone(),
-                                live_write_counter,
-                                append,
-                            )
-                        } else {
-                            Err(PoolWriteError::InvalidInput(
-                                "checkpoint append context is unavailable".to_string(),
-                            ))
-                        }
+                        Err(PoolWriteError::InvalidInput(
+                            "checkpoint append context is unavailable".to_string(),
+                        ))
                     }
                 }
-                Err(err) => Err(err),
-            };
+            }
+            Err(err) => Err(err),
+        };
         let append_elapsed = append_started.elapsed();
         if let Some(path) = cleanup_path {
             let _ = std::fs::remove_file(path);
@@ -4517,20 +4545,32 @@ impl WriteSessionState<'_> {
                             None,
                             rewritable,
                         ),
-                        remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
-                            self.index,
-                            cfg,
-                            self.drive,
-                            &mut self.checkpoint_lease,
-                            self.durable_checkpoint_records
-                                .last()
-                                .expect("automatic finalization requires checkpoint authority"),
-                            None,
-                            &spec,
-                            &selected,
-                            None,
-                            rewritable,
-                        ),
+                        remanence_parity::ParityConfig::Scheme(_) => {
+                            match self
+                                .parity_session
+                                .as_mut()
+                                .and_then(|session| session.journal.take())
+                            {
+                                Some(parity_journal) => finalize_terminal_with_parity_journal(
+                                    self.index,
+                                    cfg,
+                                    self.drive,
+                                    &mut self.checkpoint_lease,
+                                    self.durable_checkpoint_records.last().expect(
+                                        "automatic finalization requires checkpoint authority",
+                                    ),
+                                    None,
+                                    &spec,
+                                    &selected,
+                                    None,
+                                    parity_journal,
+                                    rewritable,
+                                ),
+                                None => Err(Status::internal(
+                                    "automatic parity rollover has no session-owned append journal",
+                                )),
+                            }
+                        }
                     };
                     match terminal_result {
                         Ok(result) => {
@@ -6864,10 +6904,6 @@ fn finalize_terminal_with_parity(
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
     rewritable: bool,
 ) -> Result<TerminalFinalizeResult, Status> {
-    let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
-        .map_err(|error| {
-            Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
-        })?;
     let scheme = match &selected.parity_config {
         remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
         remanence_parity::ParityConfig::None => {
@@ -6884,6 +6920,44 @@ fn finalize_terminal_with_parity(
         scheme.clone(),
     )
     .map_err(|error| Status::failed_precondition(format!("open parity journal: {error}")))?;
+    finalize_terminal_with_parity_journal(
+        index,
+        cfg,
+        drive,
+        checkpoint,
+        previous,
+        existing_intent,
+        spec,
+        selected,
+        manual_request,
+        journal,
+        rewritable,
+    )
+}
+
+/// Finalize with the caller's already-exclusive parity journal.
+///
+/// An open write session owns this handle for its whole append lifetime. Its
+/// automatic terminal transition must transfer that handle here instead of
+/// opening the same journal a second time and contending with itself.
+#[allow(clippy::too_many_arguments)]
+fn finalize_terminal_with_parity_journal(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    previous: &remanence_state::CheckpointJournalRecord,
+    existing_intent: Option<remanence_state::TerminalFinalizationIntent>,
+    spec: &TerminalFinalizeSpec,
+    selected: &SelectedTape,
+    manual_request: Option<&ManualFinalizeTapeActorRequest>,
+    journal: FileTapeFileJournal,
+    rewritable: bool,
+) -> Result<TerminalFinalizeResult, Status> {
+    let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
+        .map_err(|error| {
+            Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
+        })?;
     let resuming_existing_intent = existing_intent.is_some();
     let (prefix, intent, plan, source, prefix_snapshot, mut journal) = match existing_intent {
         Some(intent) => {
@@ -13197,6 +13271,37 @@ mod tests {
             record.event == AuditEvent::TapeIoFenceRaised
                 && record.subject.id.as_deref() == Some(active[0].quarantine_id.as_str())
         }));
+    }
+
+    #[test]
+    fn automatic_terminal_transition_transfers_the_session_parity_journal_lock() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-terminal-journal-transfer-")
+            .tempdir()
+            .expect("tempdir");
+        let tape_uuid = [0x48; 16];
+        let scheme = remanence_parity::default_scheme_for_block_size(256 * 1024);
+        let path = temp.path().join("terminal.remjournal");
+        let journal = FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme.clone())
+            .expect("open session journal");
+        let mut session = ParityActorSession {
+            scheme: scheme.clone(),
+            sink_state: None,
+            journal: Some(journal),
+        };
+
+        let contended = FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme.clone())
+            .expect_err("a second open must contend with the session-owned journal");
+        assert!(contended.is_lock_contended(), "{contended}");
+
+        let terminal_journal = session
+            .journal
+            .take()
+            .expect("transfer the session journal to terminal finalization");
+        assert!(session.journal.is_none());
+        drop(terminal_journal);
+        FileTapeFileJournal::open(&path, tape_uuid, 256 * 1024, scheme)
+            .expect("the journal lock is released after terminal ownership ends");
     }
 
     #[tokio::test]
