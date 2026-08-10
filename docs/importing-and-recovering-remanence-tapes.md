@@ -205,6 +205,12 @@ that repair succeeds. Changes to a pool's capacity cap or watermarks do not
 block this final host-only bookkeeping, because the complete reserved tail is
 already barrier-proved on tape.
 
+An ordinary write session cannot take ownership while that recovery companion
+exists, even when the sealed checkpoint already matches it. The explicit
+terminal-recovery path must project the durable completion first and remove the
+companion second. This prevents a normal append opener from accidentally
+discarding the information that tells a later restart how to finish recovery.
+
 Before that boundary, a failed or uncertain component is recorded durably as
 `recovery_required`. Restart does not quietly turn that state back into ordinary
 `finalizing`; it must reconcile the next physical component first. This
