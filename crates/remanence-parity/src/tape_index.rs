@@ -525,6 +525,9 @@ pub(crate) fn decode_tape_index_payload_object_row_slot(
         TAPE_INDEX_PAYLOAD_OBJECT_ROW_SLOT_LEN,
         "Object recovery row",
     )?;
+    validate_canonical_cbor_shape(&value, "Object recovery row")?;
+    let canonical = encode_cbor_value(&value, "Object recovery row")?;
+    validate_slot_reencoding(slot, &canonical, "Object recovery row")?;
     let CborValue::Map(entries) = value else {
         return Err(payload_error("Object recovery row CBOR is not a map"));
     };
@@ -534,8 +537,6 @@ pub(crate) fn decode_tape_index_payload_object_row_slot(
         let key = key_order
             .next(key, "tape-index Object recovery row")
             .map_err(payload_error)?;
-        let key = u64::try_from(key)
-            .map_err(|_| payload_error("Object recovery row has a negative map key"))?;
         if fields.insert(key, value).is_some() {
             return Err(payload_error(format!(
                 "Object recovery row contains duplicate key {key}"
@@ -551,19 +552,19 @@ pub(crate) fn decode_tape_index_payload_object_row_slot(
             ))
         }
     };
-    let expected_keys: &[u64] = match representation.as_str() {
-        "plaintext" => &[1, 3, 4, 10, 11, 12, 13],
-        "encrypted" => &[1, 3, 4, 21, 22, 23],
+    let (forbidden_keys, forbidden_representation): (&[i128], &str) = match representation.as_str()
+    {
+        "plaintext" => (&[21, 22, 23], "encrypted"),
+        "encrypted" => (&[10, 11, 12, 13], "plaintext"),
         other => {
             return Err(payload_error(format!(
                 "unsupported Object recovery row representation {other:?}"
             )))
         }
     };
-    let actual_keys = fields.keys().copied().collect::<Vec<_>>();
-    if actual_keys != expected_keys {
+    if let Some(key) = forbidden_keys.iter().find(|key| fields.contains_key(key)) {
         return Err(payload_error(format!(
-            "Object recovery row fields {actual_keys:?} do not match {representation} schema {expected_keys:?}"
+            "{representation} Object recovery row carries {forbidden_representation} field key {key}"
         )));
     }
 
@@ -638,7 +639,6 @@ pub(crate) fn decode_tape_index_payload_object_row_slot(
                 .map_err(|_| payload_error("key_frame_len exceeds u32"))?,
         }
     };
-    debug_assert!(fields.is_empty());
     let row = TapeIndexPayloadObjectRow {
         tape_file_number,
         stored_block_count,
@@ -652,8 +652,6 @@ pub(crate) fn decode_tape_index_payload_object_row_slot(
         Some(block_size),
     )
     .map_err(|error| payload_error(error.to_string()))?;
-    let encoded = encode_payload_object_row(&row)?;
-    validate_slot_reencoding(slot, &encoded, "Object recovery row")?;
     Ok(row)
 }
 
@@ -721,6 +719,39 @@ fn validate_slot_reencoding(slot: &[u8], canonical: &[u8], label: &str) -> Resul
     Ok(())
 }
 
+fn validate_canonical_cbor_shape(value: &CborValue, label: &str) -> Result<(), ParityError> {
+    match value {
+        CborValue::Integer(_)
+        | CborValue::Bytes(_)
+        | CborValue::Text(_)
+        | CborValue::Bool(_)
+        | CborValue::Null => Ok(()),
+        CborValue::Array(values) => {
+            for value in values {
+                validate_canonical_cbor_shape(value, label)?;
+            }
+            Ok(())
+        }
+        CborValue::Map(entries) => {
+            let mut key_order = IntegerMapKeyTracker::default();
+            for (key, value) in entries {
+                key_order.next(key.clone(), label).map_err(payload_error)?;
+                validate_canonical_cbor_shape(value, label)?;
+            }
+            Ok(())
+        }
+        CborValue::Float(_) => Err(payload_error(format!(
+            "{label} contains a forbidden CBOR float"
+        ))),
+        CborValue::Tag(_, _) => Err(payload_error(format!(
+            "{label} contains a forbidden CBOR tag"
+        ))),
+        _ => Err(payload_error(format!(
+            "{label} contains an unsupported CBOR value"
+        ))),
+    }
+}
+
 fn cbor_u64(value: CborValue, field: &str) -> Result<u64, ParityError> {
     let CborValue::Integer(value) = value else {
         return Err(payload_error(format!("{field} is not a CBOR integer")));
@@ -736,8 +767,8 @@ fn cbor_optional_u64(value: CborValue, field: &str) -> Result<Option<u64>, Parit
 }
 
 fn required_field(
-    fields: &mut BTreeMap<u64, CborValue>,
-    key: u64,
+    fields: &mut BTreeMap<i128, CborValue>,
+    key: i128,
     field: &str,
 ) -> Result<CborValue, ParityError> {
     fields
@@ -989,6 +1020,64 @@ mod tests {
         }
     }
 
+    fn plaintext_object_row() -> TapeIndexPayloadObjectRow {
+        TapeIndexPayloadObjectRow {
+            tape_file_number: 1,
+            stored_block_count: 8,
+            object_id: b"object-1".to_vec(),
+            representation: ObjectRecoveryRepresentation::Plaintext {
+                manifest_first_chunk_lba: 1,
+                manifest_size_bytes: 100,
+                manifest_chunk_count: 1,
+                manifest_sha256: [0x5a; 32],
+            },
+        }
+    }
+
+    fn encrypted_object_row() -> TapeIndexPayloadObjectRow {
+        TapeIndexPayloadObjectRow {
+            tape_file_number: 1,
+            stored_block_count: 8,
+            object_id: b"object-1".to_vec(),
+            representation: ObjectRecoveryRepresentation::Encrypted {
+                recipient_epoch_ids: vec![[0x6b; 16]],
+                metadata_frame_len: 4_096,
+                key_frame_len: 1_191,
+            },
+        }
+    }
+
+    fn with_object_row_field(value: CborValue, key: i128, field: CborValue) -> CborValue {
+        let CborValue::Map(mut entries) = value else {
+            panic!("encoded Object row must be a map");
+        };
+        entries.push((
+            CborValue::Integer(key.try_into().expect("test key fits CBOR integer")),
+            field,
+        ));
+        entries.sort_by(|(left, _), (right, _)| {
+            let left = encode_cbor_value(left, "test map key").expect("left key encodes");
+            let right = encode_cbor_value(right, "test map key").expect("right key encodes");
+            left.len().cmp(&right.len()).then_with(|| left.cmp(&right))
+        });
+        CborValue::Map(entries)
+    }
+
+    fn encoded_object_row_value(row: &TapeIndexPayloadObjectRow) -> CborValue {
+        let encoded = encode_payload_object_row(row).expect("Object row encodes");
+        ciborium::from_reader(encoded.as_slice()).expect("Object row value decodes")
+    }
+
+    fn object_row_slot(value: &CborValue) -> Vec<u8> {
+        let encoded = encode_cbor_value(value, "test Object row").expect("Object row encodes");
+        encode_slot(
+            &encoded,
+            TAPE_INDEX_PAYLOAD_OBJECT_ROW_SLOT_LEN,
+            "Object recovery row",
+        )
+        .expect("Object row fits its slot")
+    }
+
     #[test]
     fn payload_length_is_checked_without_outer_replica_geometry() {
         assert_eq!(
@@ -1032,6 +1121,94 @@ mod tests {
         assert_eq!(
             decode_tape_index_payload_map_entry_slot(&slot).unwrap(),
             entry
+        );
+    }
+
+    #[test]
+    fn object_row_ignores_canonical_unknown_integer_keys() {
+        let row = plaintext_object_row();
+        let extended = with_object_row_field(
+            encoded_object_row_value(&row),
+            -1,
+            CborValue::Map(vec![
+                (CborValue::Integer(1.into()), CborValue::Integer(7.into())),
+                (CborValue::Integer(2.into()), CborValue::Bool(true)),
+            ]),
+        );
+        let extended = with_object_row_field(extended, 24, CborValue::Bytes(vec![0xaa, 0xbb]));
+
+        assert_eq!(
+            decode_tape_index_payload_object_row_slot(&object_row_slot(&extended), 256 * 1024)
+                .expect("canonical unknown integer fields are ignored"),
+            row
+        );
+    }
+
+    #[test]
+    fn object_row_rejects_fields_assigned_to_the_other_representation() {
+        let cases = [
+            (plaintext_object_row(), 21, "encrypted field key 21"),
+            (encrypted_object_row(), 10, "plaintext field key 10"),
+        ];
+        for (row, key, expected) in cases {
+            let extended =
+                with_object_row_field(encoded_object_row_value(&row), key, CborValue::Null);
+            let error =
+                decode_tape_index_payload_object_row_slot(&object_row_slot(&extended), 256 * 1024)
+                    .expect_err(
+                        "assigned cross-representation field must reject regardless of type",
+                    );
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn object_row_checks_canonical_encoding_of_unknown_fields() {
+        let row = plaintext_object_row();
+        let extended = with_object_row_field(
+            encoded_object_row_value(&row),
+            24,
+            CborValue::Integer(0.into()),
+        );
+        let mut encoded = encode_cbor_value(&extended, "test Object row").unwrap();
+        assert_eq!(encoded.last(), Some(&0), "unknown value is the final byte");
+        encoded.pop();
+        encoded.extend_from_slice(&[0x18, 0x00]);
+        let slot = encode_slot(
+            &encoded,
+            TAPE_INDEX_PAYLOAD_OBJECT_ROW_SLOT_LEN,
+            "Object recovery row",
+        )
+        .unwrap();
+
+        let error = decode_tape_index_payload_object_row_slot(&slot, 256 * 1024)
+            .expect_err("non-shortest unknown value must reject");
+        assert!(
+            error
+                .to_string()
+                .contains("not the deterministic canonical encoding"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn object_row_checks_deterministic_order_inside_unknown_maps() {
+        let row = plaintext_object_row();
+        let extended = with_object_row_field(
+            encoded_object_row_value(&row),
+            24,
+            CborValue::Map(vec![
+                (CborValue::Integer(2.into()), CborValue::Bool(true)),
+                (CborValue::Integer(1.into()), CborValue::Bool(false)),
+            ]),
+        );
+
+        let error =
+            decode_tape_index_payload_object_row_slot(&object_row_slot(&extended), 256 * 1024)
+                .expect_err("noncanonical nested extension map must reject");
+        assert!(
+            error.to_string().contains("not in deterministic order"),
+            "{error}"
         );
     }
 
