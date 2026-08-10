@@ -251,8 +251,8 @@ For an exact Bootstrap-only tape reported `ready`, the catalog has enough
 identity to treat it as an empty native cartridge, but still has no invented
 Object history.
 
-For `recovery_required`, keep the tape out of write service. With the daemon
-running under controlled ownership, inspect its terminal indexes:
+For `recovery_required`, keep the tape out of write service. Start the daemon
+under controlled ownership and inspect the terminal indexes through its API:
 
 ```text
 rem tape inventory --tape-uuid TAPE_UUID --json
@@ -261,9 +261,10 @@ rem tape verify-index --tape-uuid TAPE_UUID --json
 
 Inventory attempts terminal replicas in the defined fallback order and reports
 BOT recovery explicitly if none survives. Full verification separately measures
-and validates the physical prefix and terminal structures. Restore any surviving
-per-tape journals and audit material to their configured locations, then rebuild
-the SQLite projection when appropriate:
+and validates the physical prefix and terminal structures. Stop the daemon again
+before changing host state. Restore any surviving per-tape journals and audit
+material to their configured locations, then rebuild the SQLite projection
+offline when appropriate:
 
 ```text
 rem rebuild-catalog-from-journals --config /path/to/config.toml
@@ -300,9 +301,12 @@ and exact parking failures also prevent catalog mutation.
 6. Run `adopt-bootstrap` with that UUID, the same exact library and home slot,
    and review the internally generated operation UUID in the JSON result.
 7. Confirm the cartridge was parked and inspect the returned catalog state.
-8. If `recovery_required`, keep it read-only and run terminal inventory and
-   verification before restoring transferred journals or rebuilding the
-   catalog. If no host journals survived, keep the tape read-only: tape-only
-   inventory-to-catalog import is not implemented yet.
-9. Resume daemon or site operations only after ownership and recovered catalog
-   authority are reconciled.
+8. If `recovery_required`, start the daemon under exclusive controlled
+   ownership, keep the tape out of write service, and run terminal inventory
+   and verification.
+9. Stop the daemon again before restoring transferred journals or running the
+   offline catalog rebuild. If no host journals survived, do not rebuild from
+   the inventory: keep the tape read-only because tape-only inventory-to-catalog
+   import is not implemented yet.
+10. Resume the daemon or normal site operations only after ownership and
+   recovered catalog authority are reconciled.

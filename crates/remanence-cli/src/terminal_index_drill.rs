@@ -111,7 +111,7 @@ impl TerminalReconcileDrill {
 
     const fn injection_kind(self) -> &'static str {
         match self {
-            Self::TornWorm => "read_side_transport_error",
+            Self::TornWorm => "read_side_scsi_medium_error",
             Self::UnprovedStart => "read_side_unproved_start",
         }
     }
@@ -176,7 +176,7 @@ impl TerminalIndexDamagePlan {
         } else if self.separation_damage().is_some() {
             "read_side_fixed_block_replacement_0xd7"
         } else {
-            "read_side_transport_error"
+            "read_side_scsi_medium_error"
         }
     }
 }
