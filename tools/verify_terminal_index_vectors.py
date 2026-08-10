@@ -239,7 +239,11 @@ def validate_layout(
 
 
 def cbor_head(major: int, argument: int) -> bytes:
-    require(0 <= argument <= MASK64, "cbor", "CBOR argument outside u64")
+    require(
+        is_unsigned_integer(argument) and argument <= MASK64,
+        "cbor",
+        "CBOR argument outside u64",
+    )
     initial = major << 5
     if argument < 24:
         return bytes([initial | argument])
@@ -255,6 +259,8 @@ def cbor_head(major: int, argument: int) -> bytes:
 def cbor_encode(value: Any) -> bytes:
     if value is None:
         return b"\xf6"
+    if isinstance(value, bool):
+        return b"\xf5" if value else b"\xf4"
     if isinstance(value, int):
         return cbor_head(0, value) if value >= 0 else cbor_head(1, -1 - value)
     if isinstance(value, bytes):
@@ -289,8 +295,14 @@ def cbor_decode(data: bytes, cursor: int = 0) -> tuple[Any, int]:
     initial = data[cursor]
     cursor += 1
     major, additional = initial >> 5, initial & 0x1F
-    if major == 7 and additional == 22:
-        return None, cursor
+    if major == 7:
+        if additional == 20:
+            return False, cursor
+        if additional == 21:
+            return True, cursor
+        if additional == 22:
+            return None, cursor
+        fail("cbor", f"unsupported CBOR major-type-7 value {additional}")
     argument, cursor = decode_argument(data, cursor, additional)
     if major in (0, 1):
         return (argument if major == 0 else -1 - argument), cursor
@@ -315,7 +327,11 @@ def cbor_decode(data: bytes, cursor: int = 0) -> tuple[Any, int]:
         prior_key_encoding: tuple[int, bytes] | None = None
         for _ in range(argument):
             key, cursor = cbor_decode(data, cursor)
-            require(isinstance(key, int), "cbor", "Object-row key is not an integer")
+            require(
+                is_integer(key),
+                "cbor",
+                "Object-row key is not an integer",
+            )
             encoded_key = cbor_encode(key)
             key_order = (len(encoded_key), encoded_key)
             require(
@@ -328,6 +344,16 @@ def cbor_decode(data: bytes, cursor: int = 0) -> tuple[Any, int]:
             pairs.append((key, value))
         return CborMap(tuple(pairs)), cursor
     fail("cbor", f"unsupported CBOR major type {major}")
+
+
+def is_integer(value: Any) -> bool:
+    """Return whether a decoded value is an integer rather than Python bool."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def is_unsigned_integer(value: Any) -> bool:
+    """Return whether a decoded value is an unsigned integer rather than bool."""
+    return is_integer(value) and value >= 0
 
 
 def decode_slot(slot: bytes, expected_size: int, label: str) -> tuple[Any, bytes]:
@@ -362,7 +388,13 @@ def object_fields(value: Any, block_size: int) -> tuple[int, int]:
         "Object row carries fields assigned to the other representation",
     )
     tape_file, stored = fields[1], fields[3]
-    require(isinstance(tape_file, int) and isinstance(stored, int) and stored > 0, "map-row-bijection", "Object locator")
+    require(
+        is_unsigned_integer(tape_file)
+        and is_unsigned_integer(stored)
+        and stored > 0,
+        "map-row-bijection",
+        "Object locator",
+    )
     object_id = fields[4]
     require(
         isinstance(object_id, bytes) and 1 <= len(object_id) <= 64 and b"\0" not in object_id,
@@ -371,14 +403,22 @@ def object_fields(value: Any, block_size: int) -> tuple[int, int]:
     )
     if representation == "plaintext":
         first, size, count, digest = fields[10], fields[11], fields[12], fields[13]
-        require(all(isinstance(item, int) for item in (first, size, count)), "map-row-bijection", "manifest integer")
+        require(
+            all(is_unsigned_integer(item) for item in (first, size, count)),
+            "map-row-bijection",
+            "manifest integer",
+        )
         require(size > 0 and count > 0, "map-row-bijection", "manifest size/count")
         require(checked_add(first, count, "manifest range") <= stored, "map-row-bijection", "manifest range")
         require(size <= checked_mul(count, block_size, "manifest capacity"), "map-row-bijection", "manifest capacity")
         require(isinstance(digest, bytes) and len(digest) == 32, "map-row-bijection", "manifest digest")
     else:
         metadata, recipients, key_len = fields[21], fields[22], fields[23]
-        require(isinstance(metadata, int) and 17 <= metadata <= 16 * 1024 * 1024, "map-row-bijection", "metadata length")
+        require(
+            is_unsigned_integer(metadata) and 17 <= metadata <= 16 * 1024 * 1024,
+            "map-row-bijection",
+            "metadata length",
+        )
         require(isinstance(recipients, tuple) and 1 <= len(recipients) <= 8, "map-row-bijection", "recipient count")
         require(
             all(isinstance(item, bytes) and len(item) == 16 and item != bytes(16) for item in recipients)
@@ -386,7 +426,11 @@ def object_fields(value: Any, block_size: int) -> tuple[int, int]:
             "map-row-bijection",
             "recipient IDs",
         )
-        require(isinstance(key_len, int) and 1191 <= key_len <= 16_384, "map-row-bijection", "key-frame length")
+        require(
+            is_unsigned_integer(key_len) and 1191 <= key_len <= 16_384,
+            "map-row-bijection",
+            "key-frame length",
+        )
     return tape_file, stored
 
 
@@ -422,16 +466,38 @@ def validate_payload(data: bytes, header: bytes, block_size: int) -> tuple[bytes
         value, encoded = decode_slot(slot, 64, "structural row")
         require(isinstance(value, tuple) and len(value) == 7, "map-row-bijection", "structural row shape")
         tape_file, kind, blocks, first, start, end, epoch = value
-        require(all(isinstance(item, int) for item in (tape_file, kind, blocks)), "map-row-bijection", "structural integer")
+        require(
+            all(is_unsigned_integer(item) for item in (tape_file, kind, blocks)),
+            "map-row-bijection",
+            "structural integer",
+        )
         require(tape_file == expected_file and blocks > 0, "map-row-bijection", "dense structural map")
         require(kind in (0, 1, 2, 3), "map-row-bijection", "terminal kind in pre-tail map")
         require(index != 0 or (kind == 2 and blocks == 1), "map-row-bijection", "row zero is not BOT Bootstrap")
         if kind == 0:
-            require(first == expected_data and start is None and end is None and epoch is None, "map-row-bijection", "Object kind fields")
+            require(
+                is_unsigned_integer(first)
+                and first == expected_data
+                and start is None
+                and end is None
+                and epoch is None,
+                "map-row-bijection",
+                "Object kind fields",
+            )
             object_locators.append((tape_file, blocks))
             expected_data = checked_add(expected_data, blocks, "data ordinal range")
         elif kind == 1:
-            require(first is None and start == expected_protected and isinstance(end, int) and end > start and epoch == expected_epoch, "map-row-bijection", "sidecar range")
+            require(
+                first is None
+                and is_unsigned_integer(start)
+                and start == expected_protected
+                and is_unsigned_integer(end)
+                and end > start
+                and is_unsigned_integer(epoch)
+                and epoch == expected_epoch,
+                "map-row-bijection",
+                "sidecar range",
+            )
             expected_protected = end
             expected_epoch += 1
         else:
@@ -933,31 +999,83 @@ def verify_mutations(root: Path, contexts: dict[str, ProfileContext]) -> int:
     return len(rows)
 
 
-def canonical_map(pairs: tuple[tuple[int, Any], ...]) -> CborMap:
-    """Order integer-keyed pairs by their deterministic encoded key bytes."""
-    return CborMap(
-        tuple(
-            sorted(
-                pairs,
-                key=lambda pair: (len(cbor_encode(pair[0])), cbor_encode(pair[0])),
-            )
+def verify_cbor_simple_values() -> tuple[int, int, int]:
+    """Pin supported major-type-7 values and reject every unsupported family."""
+    supported = ((b"\xf4", False), (b"\xf5", True), (b"\xf6", None))
+    for encoded, expected in supported:
+        value, cursor = cbor_decode(encoded)
+        require(cursor == len(encoded), "cbor", "simple value was not fully consumed")
+        require(
+            value is expected,
+            "cbor",
+            f"simple value {encoded.hex()} decoded with the wrong Python type",
         )
+        require(cbor_encode(value) == encoded, "cbor", "simple value did not round-trip")
+
+    unsupported = (
+        b"\xe0",  # unsupported simple value 0
+        b"\xf7",  # undefined
+        b"\xf8\x14",  # non-preferred false simple value
+        b"\xf8\x20",  # unsupported one-byte simple value
+        b"\xf9\x00\x00",  # half-precision float
+        b"\xfa\x00\x00\x00\x00",  # single-precision float
+        b"\xfb" + bytes(8),  # double-precision float
+        b"\xfc",  # reserved additional information
+        b"\xff",  # break outside an indefinite item
+    )
+    for encoded in unsupported:
+        try:
+            cbor_decode(encoded)
+        except VectorError as error:
+            require(error.code == "cbor", "cbor", f"{encoded.hex()}: wrong rejection")
+        else:
+            fail("cbor", f"unsupported major-type-7 value {encoded.hex()} was accepted")
+
+    boolean_key = cbor_encode(CborMap(((False, None),)))
+    try:
+        cbor_decode(boolean_key)
+    except VectorError as error:
+        require(error.code == "cbor", "cbor", "boolean map key rejection")
+    else:
+        fail("cbor", "boolean map key was accepted as an integer key")
+    return len(supported), len(unsupported), 1
+
+
+def require_base_row_and_extension(
+    value: Any,
+    base: CborMap,
+    extension_key: int,
+    expected_extension: Any,
+    case_id: str,
+) -> None:
+    """Prove a Rust-emitted vector changes only its declared extension field."""
+    require(isinstance(value, CborMap), "manifest", f"{case_id}: Object row is not a map")
+    actual = dict(value.pairs)
+    expected = dict(base.pairs)
+    require(
+        set(actual) == set(expected) | {extension_key},
+        "manifest",
+        f"{case_id}: extension key set",
+    )
+    require(
+        all(cbor_encode(actual[key]) == cbor_encode(field) for key, field in expected.items()),
+        "manifest",
+        f"{case_id}: base row changed",
+    )
+    require(
+        cbor_encode(actual[extension_key]) == cbor_encode(expected_extension),
+        "manifest",
+        f"{case_id}: extension value",
     )
 
 
-def encoded_slot(value: Any, size: int, label: str) -> bytes:
-    """Frame one independently encoded CBOR value in a fixed-size slot."""
-    encoded = cbor_encode(value)
-    require(len(encoded) <= size - 2, "slot-length", f"{label}: extension exceeds slot")
-    return struct.pack("<H", len(encoded)) + encoded + bytes(size - 2 - len(encoded))
-
-
 def verify_object_row_extensions(root: Path, contexts: dict[str, ProfileContext]) -> int:
-    """Exercise the frozen accept/reject seam for future Object-row fields."""
+    """Consume Rust-emitted fixed slots for the future-field accept/reject seam."""
     rows = read_tsv(root / "OBJECT_ROW_EXTENSIONS.tsv")
     required_cases = {
         "unknown-positive-key",
         "unknown-negative-key",
+        "unknown-nested-boolean",
         "plaintext-with-encrypted-field",
         "encrypted-with-plaintext-field",
         "unknown-noncanonical-value",
@@ -968,47 +1086,61 @@ def verify_object_row_extensions(root: Path, contexts: dict[str, ProfileContext]
         "manifest",
         "Object-row extension coverage set",
     )
+    require(
+        len({row["artifact"] for row in rows}) == len(rows),
+        "manifest",
+        "Object-row extension artifacts are not unique",
+    )
     for row in rows:
         context = contexts[row["base_profile"]]
         replica = (context.directory / "replica-a.bin").read_bytes()
         row_index = int(row["row_index"])
         require(0 <= row_index < context.object_rows, "manifest", row["case_id"])
         start = context.block_size + context.structural_rows * 64 + row_index * 256
-        value, _ = decode_slot(replica[start : start + 256], 256, row["case_id"])
-        require(isinstance(value, CborMap), "manifest", f"{row['case_id']}: base row")
+        base, _ = decode_slot(replica[start : start + 256], 256, row["case_id"])
+        require(isinstance(base, CborMap), "manifest", f"{row['case_id']}: base row")
 
-        pairs = value.pairs
-        mutation = row["mutation"]
-        if mutation == "unknown-positive-key":
-            mutated = canonical_map(pairs + ((24, b"future"),))
-            slot = encoded_slot(mutated, 256, row["case_id"])
-        elif mutation == "unknown-negative-key":
-            extension = canonical_map(((1, 7), (2, None)))
-            mutated = canonical_map(pairs + ((-1, extension),))
-            slot = encoded_slot(mutated, 256, row["case_id"])
-        elif mutation == "encrypted-field-on-plaintext":
-            mutated = canonical_map(pairs + ((21, None),))
-            slot = encoded_slot(mutated, 256, row["case_id"])
-        elif mutation == "plaintext-field-on-encrypted":
-            mutated = canonical_map(pairs + ((10, None),))
-            slot = encoded_slot(mutated, 256, row["case_id"])
-        elif mutation == "unknown-noncanonical-value":
-            mutated = canonical_map(pairs + ((24, 0),))
-            encoded = cbor_encode(mutated)
-            require(encoded.endswith(b"\x00"), "manifest", row["case_id"])
-            encoded = encoded[:-1] + b"\x18\x00"
-            require(len(encoded) <= 254, "slot-length", row["case_id"])
-            slot = struct.pack("<H", len(encoded)) + encoded + bytes(254 - len(encoded))
-        elif mutation == "unknown-nested-map-order":
-            extension = CborMap(((2, None), (1, None)))
-            mutated = canonical_map(pairs + ((24, extension),))
-            slot = encoded_slot(mutated, 256, row["case_id"])
-        else:
-            fail("manifest", f"{row['case_id']}: unknown extension mutation {mutation}")
+        slot = (root / row["artifact"]).read_bytes()
+        require(len(slot) == int(row["bytes"]), "manifest", f"{row['case_id']}: byte count")
+        require(len(slot) == 256, "slot-length", f"{row['case_id']}: fixed slot size")
+        require(
+            hashlib.sha256(slot).hexdigest() == row["sha256"],
+            "manifest",
+            f"{row['case_id']}: artifact digest",
+        )
+        require(
+            u16(slot, 0) == int(row["encoded_len"]),
+            "manifest",
+            f"{row['case_id']}: encoded length",
+        )
 
         expected = row["expected"]
         try:
             decoded, _ = decode_slot(slot, 256, row["case_id"])
+            case_id = row["case_id"]
+            if case_id == "unknown-positive-key":
+                require_base_row_and_extension(decoded, base, 24, b"future", case_id)
+            elif case_id == "unknown-negative-key":
+                extension = CborMap(((1, 7), (2, None)))
+                require_base_row_and_extension(decoded, base, -1, extension, case_id)
+            elif case_id == "unknown-nested-boolean":
+                extension = CborMap(((1, False), (2, (True, None))))
+                require_base_row_and_extension(decoded, base, 25, extension, case_id)
+                nested = dict(dict(decoded.pairs)[25].pairs)
+                require(
+                    nested[1] is False
+                    and isinstance(nested[2], tuple)
+                    and nested[2][0] is True
+                    and nested[2][1] is None,
+                    "manifest",
+                    f"{case_id}: nested simple-value types",
+                )
+            elif case_id == "plaintext-with-encrypted-field":
+                require_base_row_and_extension(decoded, base, 21, None, case_id)
+            elif case_id == "encrypted-with-plaintext-field":
+                require_base_row_and_extension(decoded, base, 10, None, case_id)
+            else:
+                fail("manifest", f"{case_id}: noncanonical vector was decoded")
             object_fields(decoded, context.block_size)
         except VectorError as error:
             require(
@@ -1413,6 +1545,7 @@ def main() -> None:
         verify_profile(contexts[name], grouped[name])
     maximums = verify_maximums(root)
     streaming = verify_streaming(root)
+    simple_values = verify_cbor_simple_values()
     extensions = verify_object_row_extensions(root, contexts)
     mutations = verify_mutations(root, contexts)
     selections = verify_selection(root, contexts)
@@ -1420,6 +1553,9 @@ def main() -> None:
     print(
         f"verified {len(grouped)} healthy profiles ({len(manifest_rows)} components), "
         f"{maximums} maximum artifacts, {streaming} million-Object stream, "
+        f"{simple_values[0]} supported simple values, "
+        f"{simple_values[1]} rejected major-type-7 encodings, "
+        f"{simple_values[2]} rejected boolean map key, "
         f"{extensions} Object-row extension cases, {mutations} hostile mutations, "
         f"{selections} survivor selections, and "
         f"{interruptions} interruption cuts"

@@ -8,6 +8,7 @@
 
 use std::env;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
@@ -121,13 +122,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(output.join("MANIFEST.tsv"), manifest)?;
     emit_maximum_vectors(&output)?;
     emit_high_count_evidence(&output)?;
+    emit_object_row_extension_vectors(&output)?;
     emit_matrix_manifests(&output)?;
     fs::write(
         output.join("README.md"),
-        "# REM-PARITY terminal-index candidate vectors\n\nReview-only draft.4 artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins the positive unknown-key and fail-closed assigned/noncanonical extension seam. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
+        "# REM-PARITY terminal-index candidate vectors\n\nReview-only draft.4 artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
     )?;
     println!(
-        "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, and executable hostile matrices in {}",
+        "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, 7 Object-row extension slots, and executable hostile matrices in {}",
         output.display()
     );
     Ok(())
@@ -483,17 +485,203 @@ fn emit_high_count_evidence(root: &Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+fn emit_object_row_extension_vectors(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let plaintext = generated_object_row(root, 0)?;
+    let encrypted = generated_object_row(root, 1)?;
+
+    let unknown_positive = fixed_slot(with_integer_field(
+        plaintext.clone(),
+        24,
+        CborValue::Bytes(b"future".to_vec()),
+    )?)?;
+    let unknown_negative_value = canonical_map(vec![
+        (cbor_integer(1)?, CborValue::Integer(7.into())),
+        (cbor_integer(2)?, CborValue::Null),
+    ])?;
+    let unknown_negative = fixed_slot(with_integer_field(
+        plaintext.clone(),
+        -1,
+        unknown_negative_value,
+    )?)?;
+    let nested_boolean_value = canonical_map(vec![
+        (cbor_integer(1)?, CborValue::Bool(false)),
+        (
+            cbor_integer(2)?,
+            CborValue::Array(vec![CborValue::Bool(true), CborValue::Null]),
+        ),
+    ])?;
+    let unknown_nested_boolean = fixed_slot(with_integer_field(
+        plaintext.clone(),
+        25,
+        nested_boolean_value,
+    )?)?;
+    let plaintext_with_encrypted =
+        fixed_slot(with_integer_field(plaintext.clone(), 21, CborValue::Null)?)?;
+    let encrypted_with_plaintext = fixed_slot(with_integer_field(encrypted, 10, CborValue::Null)?)?;
+
+    let mut unknown_noncanonical_value = fixed_slot(with_integer_field(
+        plaintext.clone(),
+        24,
+        CborValue::Integer(0.into()),
+    )?)?;
+    let canonical_len = usize::from(u16::from_le_bytes(
+        unknown_noncanonical_value[..2].try_into()?,
+    ));
+    if canonical_len == 0 || canonical_len >= unknown_noncanonical_value.len() - 2 {
+        return Err("canonical unknown extension has no room for a widened value".into());
+    }
+    let last_value = 2 + canonical_len - 1;
+    if unknown_noncanonical_value[last_value] != 0 {
+        return Err("unknown extension value is not the expected final zero".into());
+    }
+    unknown_noncanonical_value[last_value] = 0x18;
+    unknown_noncanonical_value[last_value + 1] = 0;
+    unknown_noncanonical_value[..2]
+        .copy_from_slice(&u16::try_from(canonical_len + 1)?.to_le_bytes());
+
+    let noncanonical_nested_map = CborValue::Map(vec![
+        (cbor_integer(2)?, CborValue::Bool(true)),
+        (cbor_integer(1)?, CborValue::Bool(false)),
+    ]);
+    let unknown_nested_map_order =
+        fixed_slot(with_integer_field(plaintext, 24, noncanonical_nested_map)?)?;
+
+    let vectors = [
+        ("unknown-positive-key", 0, unknown_positive, "valid"),
+        ("unknown-negative-key", 0, unknown_negative, "valid"),
+        ("unknown-nested-boolean", 0, unknown_nested_boolean, "valid"),
+        (
+            "plaintext-with-encrypted-field",
+            0,
+            plaintext_with_encrypted,
+            "cross-representation",
+        ),
+        (
+            "encrypted-with-plaintext-field",
+            1,
+            encrypted_with_plaintext,
+            "cross-representation",
+        ),
+        (
+            "unknown-noncanonical-value",
+            0,
+            unknown_noncanonical_value,
+            "cbor",
+        ),
+        (
+            "unknown-nested-map-order",
+            0,
+            unknown_nested_map_order,
+            "cbor",
+        ),
+    ];
+    let directory = root.join("object-row-extensions");
+    fs::create_dir_all(&directory)?;
+    let mut manifest = String::from(
+        "case_id\tbase_profile\trow_index\tartifact\tencoded_len\tbytes\tsha256\texpected\n",
+    );
+    for (case_id, row_index, slot, expected) in vectors {
+        let artifact = format!("object-row-extensions/{case_id}.slot");
+        fs::write(root.join(&artifact), &slot)?;
+        manifest.push_str(&format!(
+            "{case_id}\tmulti-256k\t{row_index}\t{artifact}\t{}\t{}\t{}\t{expected}\n",
+            u16::from_le_bytes(slot[..2].try_into()?),
+            slot.len(),
+            hex(&Sha256::digest(&slot)),
+        ));
+    }
+    fs::write(root.join("OBJECT_ROW_EXTENSIONS.tsv"), manifest)?;
+    Ok(())
+}
+
+fn generated_object_row(
+    root: &Path,
+    row_index: usize,
+) -> Result<CborValue, Box<dyn std::error::Error>> {
+    const BLOCK_SIZE: usize = 256 * 1024;
+    const STRUCTURAL_SLOT_LEN: usize = 64;
+    const OBJECT_SLOT_LEN: usize = 256;
+
+    let replica = fs::read(root.join("multi-256k/replica-a.bin"))?;
+    let structural_bytes = multi_records()
+        .entries
+        .len()
+        .checked_mul(STRUCTURAL_SLOT_LEN)
+        .ok_or("generated structural-slot span overflow")?;
+    let object_offset = row_index
+        .checked_mul(OBJECT_SLOT_LEN)
+        .ok_or("generated Object-row relative offset overflow")?;
+    let start = BLOCK_SIZE
+        .checked_add(structural_bytes)
+        .and_then(|offset| offset.checked_add(object_offset))
+        .ok_or("generated Object-row offset overflow")?;
+    let end = start
+        .checked_add(OBJECT_SLOT_LEN)
+        .ok_or("generated Object-row end overflow")?;
+    let slot = replica
+        .get(start..end)
+        .ok_or("generated Object row is outside replica A")?;
+    let encoded_len = usize::from(u16::from_le_bytes(slot[..2].try_into()?));
+    if encoded_len == 0 || encoded_len > OBJECT_SLOT_LEN - 2 {
+        return Err("generated Object row has an invalid encoded length".into());
+    }
+    let encoded_end = 2 + encoded_len;
+    if slot[encoded_end..].iter().any(|byte| *byte != 0) {
+        return Err("generated Object row has nonzero slot padding".into());
+    }
+    let encoded = &slot[2..encoded_end];
+    let mut reader = Cursor::new(encoded);
+    let value: CborValue = ciborium::from_reader(&mut reader)?;
+    if reader.position() != encoded_len as u64 {
+        return Err("generated Object row has trailing CBOR bytes".into());
+    }
+    let mut reencoded = Vec::new();
+    ciborium::into_writer(&value, &mut reencoded)?;
+    if reencoded != encoded {
+        return Err("generated Object row is not canonical CBOR".into());
+    }
+    Ok(value)
+}
+
+fn cbor_integer(value: i128) -> Result<CborValue, Box<dyn std::error::Error>> {
+    Ok(CborValue::Integer(value.try_into().map_err(|_| {
+        format!("extension key {value} is outside the CBOR integer range")
+    })?))
+}
+
+fn canonical_map(
+    entries: Vec<(CborValue, CborValue)>,
+) -> Result<CborValue, Box<dyn std::error::Error>> {
+    let mut encoded_entries = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let mut encoded_key = Vec::new();
+        ciborium::into_writer(&key, &mut encoded_key)?;
+        encoded_entries.push((encoded_key, key, value));
+    }
+    encoded_entries.sort_by(|(left, _, _), (right, _, _)| {
+        left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+    });
+    Ok(CborValue::Map(
+        encoded_entries
+            .into_iter()
+            .map(|(_, key, value)| (key, value))
+            .collect(),
+    ))
+}
+
+fn with_integer_field(
+    value: CborValue,
+    key: i128,
+    field: CborValue,
+) -> Result<CborValue, Box<dyn std::error::Error>> {
+    let CborValue::Map(mut entries) = value else {
+        return Err("generated Object row is not a CBOR map".into());
+    };
+    entries.push((cbor_integer(key)?, field));
+    canonical_map(entries)
+}
+
 fn emit_matrix_manifests(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    fs::write(
-        root.join("OBJECT_ROW_EXTENSIONS.tsv"),
-        "case_id\tbase_profile\trow_index\tmutation\texpected\n\
-unknown-positive-key\tmulti-256k\t0\tunknown-positive-key\tvalid\n\
-unknown-negative-key\tmulti-256k\t0\tunknown-negative-key\tvalid\n\
-plaintext-with-encrypted-field\tmulti-256k\t0\tencrypted-field-on-plaintext\tcross-representation\n\
-encrypted-with-plaintext-field\tmulti-256k\t1\tplaintext-field-on-encrypted\tcross-representation\n\
-unknown-noncanonical-value\tmulti-256k\t0\tunknown-noncanonical-value\tcbor\n\
-unknown-nested-map-order\tmulti-256k\t0\tunknown-nested-map-order\tcbor\n",
-    )?;
     fs::write(
         root.join("MUTATIONS.tsv"),
         "case_id\tkind\tbase_profile\ttarget\tmutation\tother_profile\texpected\n\
