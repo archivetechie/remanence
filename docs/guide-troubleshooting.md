@@ -129,6 +129,7 @@ layers — seeing one does not imply the others tripped too.
 | `TLS private key ... has insecure permissions` | The key file is group- or world-accessible. `chmod 600` it. |
 | `startup blocked by active tape-I/O fence <id> ...` | A write was interrupted in a completion-unknown state before shutdown. `rem tape quarantine release <id>` after verifying the tape, as the message says. |
 | `error: discover libraries: ...` | Same permission gates as the CLI (tape group + `CAP_SYS_RAWIO`, via systemd `AmbientCapabilities` for a service). |
+| `error: acquire daemon state ownership ...` | Another daemon or offline state-mutating command holds `<state_dir>/state.lock`. Stop the other owner; do not delete the lock file or point a second daemon at the same state directory. The kernel releases the lock when its owner exits. |
 
 Two non-fatal, stderr-only warnings worth recognizing (they don't stop
 startup): `daemon.io_memory_ceiling=... exceeds startup MemAvailable=...;
@@ -138,14 +139,11 @@ they cannot be locked` — both are sanity checks against the host's actual
 memory/mlock limits, checked once at startup; the ceiling itself is what
 the daemon actually enforces at runtime.
 
-**There is no "another daemon already owns this state dir" startup
-check.** `rem-daemon` never takes the `state.lock` file at all (only
-`rem-debug`'s offline state-mutating subcommands do — see the
-[configuration reference](reference-configuration.md#what-ends-up-on-disk));
-its only concurrent-instance guard is a liveness probe on its own Unix
-socket path (`AddrInUse` if something is already listening there). Two
-daemons pointed at the same `state_dir` with *different* `socket_path`s
-will both start — this is a known gap, not a safety net you can rely on.
+`rem-daemon` acquires `<state_dir>/state.lock` before opening API state and
+holds that kernel `flock` for its lifetime. Offline state-mutating commands use
+the same lock, so another daemon or maintenance command receives the ownership
+error above even if it uses a different socket path. The Unix-socket liveness
+probe remains a separate check for a stale or already-listening socket.
 
 <!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs @ f643f8c2 -->
 ## Writes are refused
@@ -220,12 +218,8 @@ Strings worth grepping for, mapped to the sections above:
 | `sealed at the checkpoint boundary` | tape sealed at a checkpoint barrier; open a new session against the pool |
 | `has insecure permissions` | TLS key mode |
 | `read-only mode` | daemon started with `read_only = true` |
+| `acquire daemon state ownership` | another daemon or offline state owner holds `state.lock`; stop that owner |
 | `remanence_read_diag` (as `target`) | read-pipeline reservoir/backpressure diagnostics, see above |
-
-Note there is deliberately no `state lock is already held` row here —
-`rem-daemon` itself never takes that lock (see [The daemon refuses to
-start](#the-daemon-refuses-to-start)); you would only see that message
-from a `rem-debug` state-mutating subcommand racing another one.
 
 <!-- code-anchor: none -->
 ## Known open issue
