@@ -338,7 +338,7 @@ impl ImageDirectoryRawSource {
 
     /// Mark one image block as unreadable for deterministic fault injection.
     ///
-    /// This is used by immutable-vector tests to model transport medium errors
+    /// This is used by immutable-vector tests to model SCSI medium errors
     /// without rewriting or regenerating the pinned artifact bytes.
     pub fn mark_unreadable(
         &mut self,
@@ -477,9 +477,12 @@ impl RawTapeSource for ImageDirectoryRawSource {
                     .unreadable_blocks
                     .contains(&(tape_file_index, block_within_file))
                 {
-                    return Err(TapeIoError::OperationFailed(format!(
-                        "simulated unreadable image tape file {tape_file_index} block {block_within_file}"
-                    ))
+                    return Err(TapeIoError::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x72, 0x03, 0x11, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    )
                     .into());
                 }
                 if buf.len() < block_size {
@@ -1084,6 +1087,34 @@ mod compat_tests {
             .mark_unreadable(number, 0)
             .expect_err("out-of-image u64 tape-file number must fail");
         assert!(error.to_string().contains(&number.to_string()), "{error}");
+    }
+
+    #[test]
+    fn image_fault_injection_emits_descriptor_medium_error() {
+        let mut source = ImageDirectoryRawSource::from_tape_files(vec![vec![0; 8]], 4)
+            .expect("construct image source");
+        source
+            .mark_unreadable(0, 1)
+            .expect("second image block exists");
+        source
+            .configure_fixed_block_size(4)
+            .expect("configure image source");
+        source
+            .locate_physical(PhysicalPositionHint::new(1))
+            .expect("locate unreadable block");
+
+        let error = source
+            .read_record(&mut [0; 4])
+            .expect_err("marked block returns a medium error");
+        assert!(matches!(
+            error,
+            ParityError::TapeIo(TapeIoError::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                }
+            )) if sense == [0x72, 0x03, 0x11, 0x00]
+        ));
     }
 
     #[test]
