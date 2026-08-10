@@ -8194,10 +8194,47 @@ BCw3Wyv2UWY=
         drop(index);
 
         let failed_index_path = temp.path().join("terminal-projection-failure.sqlite");
-        let mut failed_index =
-            CatalogIndex::open(&failed_index_path).expect("open empty projection-failure catalog");
-        replay_checkpoint_journal_projections(&mut failed_index, &checkpoint_dir)
-            .expect_err("startup projection failure retains terminal retry authority");
+        let mut failed_index = CatalogIndex::open(&failed_index_path)
+            .expect("open terminal projection-failure catalog");
+        failed_index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RST902L9".to_string(),
+                block_size: TERMINAL_BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision projection-failure tape");
+        failed_index
+            .project_checkpoint_record(&checkpoint)
+            .expect("project every ordinary record before terminal failure");
+        let completed = terminal
+            .terminal_finalization
+            .as_ref()
+            .expect("terminal completion authority");
+        let mut conflicting_edition_digest = completed.edition_digest;
+        conflicting_edition_digest[0] ^= 0xff;
+        failed_index
+            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
+                tape_uuid,
+                trigger: completed.trigger,
+                operation_id: None,
+                progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+                edition_digest: conflicting_edition_digest,
+                layout_digest: completed.layout.layout_digest,
+                outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+                updated_at_utc: None,
+            })
+            .expect("seed a contradiction reached only by the sealed projection");
+        let projection_error =
+            replay_checkpoint_journal_projections(&mut failed_index, &checkpoint_dir)
+                .expect_err("terminal projection failure retains terminal retry authority");
+        assert!(
+            projection_error
+                .message()
+                .contains("terminal finalization identity changed"),
+            "{projection_error}"
+        );
         assert!(
             journal
                 .terminal_finalization_intent()

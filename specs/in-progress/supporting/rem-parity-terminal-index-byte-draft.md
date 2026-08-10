@@ -370,9 +370,13 @@ checkpoint journal and rebuilds SQLite. Equality is idempotent. Every other
 skip, regression, or byte disagreement fails before media motion.
 
 After replica C follows that same SQLite progress projection, the writer
-fsyncs the sealed checkpoint, retires the matching companion intent, and only
-then publishes the final SQLite outcome. The sealed-fsync-to-intent-cleanup
-window is therefore separately restartable and tested.
+fsyncs the sealed checkpoint. An uninterrupted owner retires the matching
+companion intent and then publishes the final SQLite outcome. If a crash leaves
+the exact companion beside sealed authority, recovery validates their exact
+match under its retained lease, publishes the final SQLite outcome while the
+companion still provides retry routing, and retires it only after that
+projection succeeds. Both the sealed-fsync-to-cleanup window and a final
+projection failure are therefore separately restartable and tested.
 
 The run-to-completion writer performs one final, read-only position assertion
 against planned terminal EOD after the fifth barrier. Terminal component

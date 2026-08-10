@@ -2366,11 +2366,15 @@ rebuilds SQLite, all before media motion. A skip, regression, non-next record,
 or conflicting digest fails closed. This exception promotes barrier-proved
 terminal progress; it never promotes an ordinary Object or parity bundle.
 `AfterReplicaC` remains `Finalizing` until its SQLite progress projection, a
-sealed checkpoint containing the exact completed intent, retirement of the
-matching companion intent, and the final SQLite projection complete in that
-order. If interruption leaves the sealed checkpoint with its exact companion
-intent, replay clears the stale companion and projects the sealed checkpoint;
-it does not regress to in-progress authority.
+sealed checkpoint containing the exact completed intent, and the final SQLite
+projection are durable. On the uninterrupted owner path, sealed-checkpoint
+fsync permits retirement of the matching companion before that final SQLite
+projection. If interruption instead leaves the sealed checkpoint with its
+companion, a recovery lease first verifies exact equality between the sealed
+completion and normalized companion. Recovery then projects the sealed
+checkpoint while retaining the companion, and retires it only after projection
+succeeds. A projection failure therefore preserves host-only retry routing; no
+path regresses to in-progress authority.
 
 The companion intent format is versioned independently from the tape format.
 A companion that carries the durable `RecoveryRequired` classification MUST

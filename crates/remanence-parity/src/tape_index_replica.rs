@@ -69,10 +69,21 @@ const OBSERVED_FOOTER_LBA_OFFSET: usize = 0x2F0;
 const BACKWARD_START_DELTA_OFFSET: usize = 0x2F8;
 const FIXED_RESERVED_OFFSET: usize = 0x300;
 const _: () = assert!(
-    BACKWARD_START_DELTA_OFFSET + size_of::<u64>() == FIXED_RESERVED_OFFSET
+    0x128 + 32 == TAIL_COMPONENTS_OFFSET
+        && TAIL_COMPONENTS_OFFSET + TERMINAL_TAIL_COMPONENT_COUNT * TAIL_COMPONENT_LEN
+            <= DIAGNOSTIC_LENGTHS_OFFSET
+        && DIAGNOSTIC_LENGTHS_OFFSET + 4 <= WRITER_VERSION_OFFSET
+        && WRITER_VERSION_OFFSET + WRITER_VERSION_MAX_BYTES == WRITE_TIMESTAMP_OFFSET
+        && WRITE_TIMESTAMP_OFFSET + WRITE_TIMESTAMP_MAX_BYTES == HEADER_SHA256_OFFSET
+        && HEADER_SHA256_OFFSET + 32 == OBSERVED_TAPE_FILE_OFFSET
+        && OBSERVED_TAPE_FILE_OFFSET + size_of::<u64>() == OBSERVED_START_LBA_OFFSET
+        && OBSERVED_START_LBA_OFFSET + size_of::<u64>() == OBSERVED_RECORD_COUNT_OFFSET
+        && OBSERVED_RECORD_COUNT_OFFSET + size_of::<u64>() == OBSERVED_FOOTER_LBA_OFFSET
+        && OBSERVED_FOOTER_LBA_OFFSET + size_of::<u64>() == BACKWARD_START_DELTA_OFFSET
+        && BACKWARD_START_DELTA_OFFSET + size_of::<u64>() == FIXED_RESERVED_OFFSET
         && FIXED_RESERVED_OFFSET <= TAPE_INDEX_REPLICA_CRC_OFFSET
         && TAPE_INDEX_REPLICA_CRC_OFFSET + size_of::<u64>() == TAPE_INDEX_REPLICA_FRAME_LEN,
-    "fixed fields, reserved bytes, and CRC must remain inside the replica frame"
+    "every fixed field, reserved region, and CRC must remain ordered inside the replica frame"
 );
 
 /// Exact counts that determine the streamed payload size.
