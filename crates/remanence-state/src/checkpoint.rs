@@ -2124,7 +2124,7 @@ impl FileCheckpointJournal {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let records = Vec::new();
-                enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, false)?;
+                enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, true)?;
                 return Ok(records);
             }
             Err(err) => {
@@ -2136,7 +2136,7 @@ impl FileCheckpointJournal {
             }
         };
         let records = replay_checkpoint_records(&mut file, self.tape_uuid, &self.path)?;
-        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, false)?;
+        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, true)?;
         Ok(records)
     }
 
@@ -2150,7 +2150,7 @@ impl FileCheckpointJournal {
         let mut file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &[], false)?;
+                enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &[], true)?;
                 return Ok(None);
             }
             Err(error) => {
@@ -2169,7 +2169,7 @@ impl FileCheckpointJournal {
             tail.push(record.clone());
             Ok(())
         })?;
-        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &tail, false)?;
+        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &tail, true)?;
         Ok(tail.pop())
     }
 
@@ -2280,7 +2280,7 @@ impl FileCheckpointJournalLease {
     ) -> Result<(), StateError> {
         let tail = self.bounded_tail_records()?;
         if !allow_pending_terminal_intent {
-            return enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &tail, true);
+            return enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &tail, false);
         }
         let finalization_intent = read_terminal_finalization_intent(&self.path, self.tape_uuid)?;
         if finalization_intent.is_none() {
@@ -2353,7 +2353,7 @@ impl FileCheckpointJournalLease {
     /// Replay the authority while retaining the exclusive lease.
     pub fn replay(&mut self) -> Result<Vec<CheckpointJournalRecord>, StateError> {
         let records = replay_checkpoint_records(&mut self.file, self.tape_uuid, &self.path)?;
-        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, true)?;
+        enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &records, false)?;
         Ok(records)
     }
 
@@ -2364,7 +2364,9 @@ impl FileCheckpointJournalLease {
     /// validates the intent against the ordinary checkpoint prefix but does
     /// not treat the expected pending/unsealed state as an append error. If a
     /// matching sealed completion is already durable, it wins and the stale
-    /// companion intent is cleared before returning.
+    /// companion intent is cleared before returning. Callers must project the
+    /// sealed checkpoint while this lease still retains the companion, then
+    /// invoke this method to retire that retry-routing authority.
     pub fn replay_for_terminal_recovery(
         &mut self,
     ) -> Result<CheckpointTerminalRecoveryAuthority, StateError> {
@@ -2591,7 +2593,7 @@ impl FileCheckpointJournalLease {
         }
         let prior = self.bounded_tail_records()?;
         if !terminal_transition {
-            enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &prior, true)?;
+            enforce_terminal_intent_for_replay(&self.path, self.tape_uuid, &prior, false)?;
         }
         let mut previous = prior.last();
         for record in records {
@@ -2892,7 +2894,7 @@ fn enforce_terminal_intent_for_replay(
     path: &Path,
     tape_uuid: [u8; 16],
     records: &[CheckpointJournalRecord],
-    clear_completed: bool,
+    allow_matching_sealed_companion: bool,
 ) -> Result<(), StateError> {
     let structured_pending = read_terminal_finalization_intent(path, tape_uuid)?;
     if let Some(intent) = &structured_pending {
@@ -2923,8 +2925,11 @@ fn enforce_terminal_intent_for_replay(
                 )));
             }
         }
-        if clear_completed {
-            clear_terminal_finalization_intent(path)?;
+        if !allow_matching_sealed_companion {
+            return Err(StateError::JournalReplayFailed(format!(
+                "checkpoint journal {} has sealed authority with a pending terminal finalization intent; an explicit terminal recovery lease must project the completion before companion cleanup",
+                path.display()
+            )));
         }
         return Ok(());
     }
@@ -5424,6 +5429,19 @@ mod tests {
         drop(lease);
 
         assert!(terminal_finalization_intent_path(journal.path()).exists());
+        let ordinary_error = journal
+            .acquire_exclusive()
+            .expect_err("ordinary ownership must not consume sealed retry authority");
+        assert!(
+            ordinary_error
+                .to_string()
+                .contains("explicit terminal recovery lease"),
+            "{ordinary_error}"
+        );
+        assert!(
+            terminal_finalization_intent_path(journal.path()).exists(),
+            "ordinary acquisition must retain the matching companion"
+        );
         let mut recovery = journal
             .acquire_exclusive_for_terminal_recovery()
             .expect("acquire terminal recovery owner");
