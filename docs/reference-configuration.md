@@ -52,7 +52,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `state_dir` | absolute path | required | Root directory for mutable daemon state (default socket, default spool, and — only for `rem-debug` state-mutating subcommands, not `rem-daemon` itself — `state.lock`; see [What ends up on disk](#what-ends-up-on-disk)). |
+| `state_dir` | absolute path | required | Root directory for mutable daemon state, including the default socket, default spool, and `state.lock`. Every daemon holds that lock for its lifetime; offline state-mutating commands acquire the same lock (see [What ends up on disk](#what-ends-up-on-disk)). |
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `drive_idle_unload_seconds` | integer ≥ 0 | `300` | Rewind, unload, and return a seated cartridge to its home slot after this many idle seconds. `0` keeps it seated until eviction or daemon shutdown. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
@@ -311,7 +311,7 @@ For the minimal config above, a running daemon owns:
 
 ```text
 /var/lib/rem/                     state_dir
-/var/lib/rem/state.lock           only written by rem-debug state-mutating commands (see below)
+/var/lib/rem/state.lock           daemon/offline-state kernel ownership lock (see below)
 /var/lib/rem/rem.sock             gRPC Unix socket (mode 0660)
 /var/lib/rem/spool/               pre-commit append spool (mode 0700, spool-<uuid>.bin files)
 /var/lib/rem/journal/*.remjournal per-tape Layer 3c tape-file journals
@@ -333,18 +333,16 @@ Object admission is permanently disabled. A failure enters
 their proved positions, never a new Object or a second terminal triple. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
-`state.lock` is a kernel `flock`, and **`rem-daemon` never takes it** —
-it opens the SQLite catalog and drive pool directly. Only `rem-debug`'s
-offline state-mutating subcommands (tape init, pool ops, catalog reset,
-and similar) acquire it, to serialize themselves against each other; the
-lock is released automatically if the holding process dies, regardless
-of what the file's `pid=`/`host_id=` diagnostics still say. This means
-`rem-daemon`'s only defense against a second instance starting is a
-liveness probe against its own Unix socket path at bind time — nothing
-stops two daemons with *different* `socket_path`s from both starting
-against the same `state_dir`. On startup, a non-read-only `rem-daemon`
-also deletes any of its own leftover `spool-<uuid>.bin` files from a
-prior unclean exit before resolving the spool budget.
+`state.lock` is a kernel `flock`. Every `rem-daemon`, including a read-only
+one, acquires it before opening the API state and holds it for the process
+lifetime. `rem-debug`'s offline state-mutating subcommands (tape init, pool
+ops, catalog reset, and similar) acquire the same lock. A second daemon cannot
+evade this ownership boundary by choosing another socket path, and an offline
+mutation cannot run beside the daemon. The lock is released automatically if
+the holding process dies, regardless of what the file's `pid=`/`host_id=`
+diagnostics still say. On startup, a non-read-only daemon also deletes any of
+its own leftover `spool-<uuid>.bin` files from a prior unclean exit before
+resolving the spool budget.
 
 The audit log and per-tape journals are append-only records; the SQLite
 file is a projection that `rem rebuild-catalog-from-journals` can
