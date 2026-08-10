@@ -6558,37 +6558,34 @@ pub(crate) fn preflight_manual_finalize_tape(
                 }
             }
         }
-        None => {
-            let planned = match request.parity_config {
-                remanence_parity::ParityConfig::None => {
-                    let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
+        None => match request.parity_config {
+            remanence_parity::ParityConfig::None => {
+                let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
                         .map_err(crate::status_from_state_error)?;
-                    let first_file = source.summary().scope.covered_prefix_tape_file_count;
-                    build_new_terminal_plan(
-                        index,
-                        &selected,
-                        &spec,
-                        &previous,
-                        &mut source,
-                        TerminalPlanPosition {
-                            first_tape_file_number: first_file,
-                            first_start_lba: previous.eod_lba,
-                            terminal_prefix: None,
-                        },
-                    )?
-                }
-                remanence_parity::ParityConfig::Scheme(_) => plan_terminal_prefix_without_motion(
+                let first_file = source.summary().scope.covered_prefix_tape_file_count;
+                build_new_terminal_plan(
                     index,
                     &selected,
-                    &checkpoint,
-                    cfg.checkpoint_journal_dir,
-                    &previous,
-                    request,
                     &spec,
-                )?,
-            };
-            planned
-        }
+                    &previous,
+                    &mut source,
+                    TerminalPlanPosition {
+                        first_tape_file_number: first_file,
+                        first_start_lba: previous.eod_lba,
+                        terminal_prefix: None,
+                    },
+                )?
+            }
+            remanence_parity::ParityConfig::Scheme(_) => plan_terminal_prefix_without_motion(
+                index,
+                &selected,
+                &checkpoint,
+                cfg.checkpoint_journal_dir,
+                &previous,
+                request,
+                &spec,
+            )?,
+        },
     };
 
     // Planning may stream a large authority. Re-read at the acceptance edge,
