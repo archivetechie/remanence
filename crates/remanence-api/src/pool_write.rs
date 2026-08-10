@@ -645,8 +645,9 @@ pub struct SelectedTape {
 /// Result of pinned-tape admission before a write session resolves media actors.
 ///
 /// The recovery-only variant deliberately remains distinct from an ordinarily
-/// writable selection so an `AfterReplicaC` companion can reach host preflight
-/// without ever becoming authority to mount or write the tape.
+/// writable selection so an `AfterReplicaC` companion, or a sealed checkpoint
+/// whose companion was already retired, can reach host preflight without ever
+/// becoming authority to mount or write the tape.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PinnedWriteDisposition {
     /// The tape passed ordinary Object-write admission.
@@ -1303,12 +1304,22 @@ pub fn admit_pinned_tape_for_write_session(
     }
     let checkpoint_journal_tapes = checkpoint_journal_tape_uuids(checkpoint_journal_dir)?;
     let host_only_after_replica_c = if checkpoint_journal_tapes.contains(&tape_uuid) {
-        remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, tape_uuid)?
-            .terminal_finalization_intent()?
-            .is_some_and(|intent| {
-                intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC
-                    && intent.manual.is_none()
+        let journal =
+            remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, tape_uuid)?;
+        if let Some(intent) = journal.terminal_finalization_intent()? {
+            intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC
+                && intent.manual.is_none()
+        } else {
+            let checkpoint = journal.acquire_exclusive()?;
+            checkpoint.last_record_bounded()?.is_some_and(|record| {
+                record.sealed_after_write
+                    && record.terminal_finalization.is_some_and(|completion| {
+                        completion.progress
+                            == remanence_state::TerminalFinalizationProgress::AfterReplicaC
+                            && completion.manual.is_none()
+                    })
             })
+        }
     } else {
         false
     };

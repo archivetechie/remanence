@@ -3142,6 +3142,7 @@ mod tests {
         const STARTUP_TAPE: TapeUuid = [0xB2; 16];
         const STALE_COMPANION_TAPE: TapeUuid = [0xB3; 16];
         const OWNED_TAPE: TapeUuid = [0xB4; 16];
+        const SEALED_NO_COMPANION_TAPE: TapeUuid = [0xB5; 16];
         let temp = tempfile::Builder::new()
             .prefix("remanence-after-c-entry-routes")
             .tempdir()
@@ -3159,6 +3160,13 @@ mod tests {
             BLOCK_SIZE,
         );
         seed_automatic_after_replica_c(&index_path, OWNED_TAPE, "HST004L9", pool_id, BLOCK_SIZE);
+        seed_automatic_after_replica_c(
+            &index_path,
+            SEALED_NO_COMPANION_TAPE,
+            "HST005L9",
+            pool_id,
+            BLOCK_SIZE,
+        );
         let index = CatalogIndex::open(&index_path).expect("reopen host-only route catalog");
         let mut state = ApiState::new_with_pool_configs(index, [pool_config.clone()]);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
@@ -3361,6 +3369,68 @@ mod tests {
             "stale-companion route reached changer actor"
         );
 
+        // Recreate the permitted uninterrupted-owner window: the sealed
+        // checkpoint is durable and its companion is gone, but SQLite/audit
+        // bookkeeping has not completed. A same-process pinned retry must
+        // route that sealed record through host-only preflight without media.
+        recover_automatic_terminal_tape(&state, SEALED_NO_COMPANION_TAPE)
+            .await
+            .expect("seed sealed automatic authority without a companion");
+        let sealed_no_companion_journal = remanence_state::FileCheckpointJournal::open(
+            state.checkpoint_journal_dir.as_path(),
+            SEALED_NO_COMPANION_TAPE,
+        )
+        .expect("open sealed no-companion checkpoint");
+        assert!(
+            sealed_no_companion_journal
+                .terminal_finalization_intent()
+                .expect("read retired no-companion intent")
+                .is_none(),
+            "sealed completion must have retired its companion"
+        );
+        rusqlite::Connection::open(&index_path)
+            .expect("open no-companion projection fixture")
+            .execute(
+                "update tapes set state = 'finalizing', finalization_outcome = 'in_progress' where tape_uuid = ?1",
+                rusqlite::params![SEALED_NO_COMPANION_TAPE.to_vec()],
+            )
+            .expect("downgrade only the no-companion SQLite projection");
+        let no_companion_error = open_write_session_reserved(
+            &state,
+            &pool,
+            WriteSessionTarget::PinnedTape {
+                tape_uuid: SEALED_NO_COMPANION_TAPE,
+                required_pool_id: pool_id.to_string(),
+            },
+            "unused-library".to_string(),
+        )
+        .await
+        .expect_err("sealed no-companion retry must repair host-only and refuse Objects");
+        assert_eq!(no_companion_error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            no_companion_error
+                .message()
+                .contains("host-only open recovery"),
+            "{no_companion_error}"
+        );
+        assert_eq!(
+            CatalogIndex::open(&index_path)
+                .expect("reopen no-companion catalog")
+                .terminal_finalization(&SEALED_NO_COMPANION_TAPE)
+                .expect("read no-companion terminal result")
+                .expect("no-companion terminal result")
+                .outcome,
+            remanence_state::TerminalFinalizationOutcome::Finalized
+        );
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "sealed no-companion route reached drive actor"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "sealed no-companion route reached changer actor"
+        );
+
         let mut lowered = pool_config;
         lowered.capacity_cap_bytes = Some(u64::from(BLOCK_SIZE));
         let lowered_index = CatalogIndex::open(&index_path).expect("open lowered-cap catalog");
@@ -3378,7 +3448,12 @@ mod tests {
             "automatic route reached changer actor"
         );
         let final_index = CatalogIndex::open(&index_path).expect("read host-only route results");
-        for tape_uuid in [OPEN_TAPE, STARTUP_TAPE, STALE_COMPANION_TAPE] {
+        for tape_uuid in [
+            OPEN_TAPE,
+            STARTUP_TAPE,
+            STALE_COMPANION_TAPE,
+            SEALED_NO_COMPANION_TAPE,
+        ] {
             assert_eq!(
                 final_index
                     .terminal_finalization(&tape_uuid)
