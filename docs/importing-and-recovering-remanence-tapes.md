@@ -124,10 +124,12 @@ default-parity Bootstrap geometry with compression disabled. The expected UUID
 argument is compared with the UUID from this authoritative fresh BOT read, not
 with discovery or catalog data.
 
-`StateHandle` is a local advisory lock. These commands do not acquire a SCSI
-persistent reservation and the daemon does not participate in the state lock.
-Before importing, stop or quiesce the daemon and any other robotics or tape
-software that could move or use the same cartridge or drive.
+`StateHandle` and the daemon use the same local advisory state lock; the daemon
+holds it for its full lifetime. This excludes another cooperating Remanence
+daemon or offline state command, but it is not a SCSI persistent reservation
+and cannot exclude unrelated robotics or tape software. Stop the daemon before
+importing, and quiesce every other system that could move or use the same
+cartridge or drive.
 
 ## Commands
 
