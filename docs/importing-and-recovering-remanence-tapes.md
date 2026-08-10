@@ -194,22 +194,32 @@ remaining sealed-checkpoint, SQLite projection, intent cleanup, and audit work
 without loading, locating, reading, or writing the cartridge. This applies to
 automatic finalization and to an operator-requested close-out.
 
-If the operation was already classified `recovery_required`, that conservative
-flag remains durable until the sealed checkpoint itself is safely on disk. A
+During finalization, Remanence keeps a small durable recovery record on the
+host. The code calls this record the *companion intent*. It records what the
+writer was doing and where a restart must resume. It is not another index or
+checkpoint on the tape.
+
+If the operation was already classified `recovery_required`, the companion
+keeps that conservative flag until the sealed checkpoint is safely on disk. A
 failure before that point cannot silently downgrade the tape to ordinary
-`finalizing`; a failure after it replays the sealed checkpoint and removes the
-now-stale companion. When a sealed checkpoint and companion coexist after a
-crash, recovery first proves they describe the same completion, then repairs
-SQLite while retaining the companion, and removes the companion only after
-that repair succeeds. Changes to a pool's capacity cap or watermarks do not
-block this final host-only bookkeeping, because the complete reserved tail is
-already barrier-proved on tape.
+`finalizing`. After the sealed checkpoint is durable, recovery can replay it
+and remove the now-stale companion. When a sealed checkpoint and companion
+coexist after a crash, recovery first proves they describe the same completion,
+then repairs SQLite while retaining the companion. It removes the companion
+only after that repair succeeds. Changes to a pool's capacity cap or
+watermarks do not block this final host-only bookkeeping, because the complete
+reserved tail is already barrier-proved on tape.
 
 An ordinary write session cannot take ownership while that recovery companion
 exists, even when the sealed checkpoint already matches it. The explicit
 terminal-recovery path must project the durable completion first and remove the
 companion second. This prevents a normal append opener from accidentally
 discarding the information that tells a later restart how to finish recovery.
+
+The same restart also repairs missing completion records in the append-only
+audit log. It records one tape-sealed event and, for a manual close-out, one
+operation-finished event. If either event was already written before the
+crash, recovery reuses it instead of adding a duplicate.
 
 Before that boundary, a failed or uncertain component is recorded durably as
 `recovery_required`. Restart does not quietly turn that state back into ordinary

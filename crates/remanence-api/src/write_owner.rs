@@ -50,11 +50,10 @@ use uuid::Uuid;
 use crate::pool_write::{SelectedTape, WriteObjectToPoolRequest};
 use crate::{
     load_tape_by_uuid, pb, status_from_state_error, timestamp_from_rfc3339, verify_tape_identity,
-    PoolWriteError, SelectTapeError, TapeUuid,
+    PoolWriteError, SelectTapeError, TapeUuid, FINALIZE_TAPE_OPERATION_KIND,
 };
 
 pub(crate) const SPOOL_MAX_BYTES: u64 = crate::APPEND_SPOOL_MAX_BYTES;
-const FINALIZE_TAPE_OPERATION_KIND: &str = "finalize_tape";
 const LOAD_READY_TIMEOUT: StdDuration = StdDuration::from_secs(9_000);
 const LOAD_READY_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 
@@ -5545,24 +5544,13 @@ fn append_tape_sealed_evidence(
     cfg: &WriteOwnerConfig,
     tape_uuid: [u8; 16],
 ) -> Result<(), Status> {
-    crate::append_and_project_audit(
+    crate::ensure_tape_sealed_audit(
         index,
         cfg.audit_dir.as_path(),
         cfg.audit_fsync,
         &cfg.audit_append_lock,
-        crate::ProjectedAuditInput {
-            actor: AuditActor::System,
-            source_layer: SourceLayer::Layer4,
-            operation_id: None,
-            session_id: None,
-            idempotency_key: None,
-            event: AuditEvent::TapeSealed,
-            subject_kind: "tape",
-            subject_id: Some(crate::bytes_to_hex(tape_uuid.as_slice())),
-            detail: BTreeMap::new(),
-        },
-    )?;
-    Ok(())
+        tape_uuid,
+    )
 }
 
 fn append_tape_io_fence_evidence(
@@ -5797,6 +5785,29 @@ fn handle_drive_finalize_tape(
         .last()
         .is_some_and(|record| record.sealed_after_write)
     {
+        let sealed = records
+            .last()
+            .expect("sealed checkpoint predicate requires a final record");
+        let completion = sealed.terminal_finalization.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "sealed checkpoint authority has no terminal-finalization completion",
+            )
+        })?;
+        crate::ensure_tape_sealed_audit(
+            index,
+            cfg.audit_dir.as_path(),
+            cfg.audit_fsync,
+            &cfg.audit_append_lock,
+            request.tape_uuid,
+        )?;
+        crate::ensure_manual_finalize_finished_audit(
+            index,
+            cfg.audit_dir.as_path(),
+            cfg.audit_fsync,
+            &cfg.audit_append_lock,
+            request.tape_uuid,
+            completion,
+        )?;
         let projection = index
             .terminal_finalization(&request.tape_uuid)
             .map_err(crate::status_from_state_error)?
@@ -6286,6 +6297,26 @@ pub(crate) fn preflight_manual_finalize_tape(
                 .project_checkpoint_record(&previous)
                 .map_err(crate::status_from_state_error)?;
         }
+        let completion = previous.terminal_finalization.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "sealed checkpoint authority has no terminal-finalization completion",
+            )
+        })?;
+        crate::ensure_tape_sealed_audit(
+            index,
+            cfg.audit_dir,
+            cfg.audit_fsync,
+            cfg.audit_append_lock,
+            request.tape_uuid,
+        )?;
+        crate::ensure_manual_finalize_finished_audit(
+            index,
+            cfg.audit_dir,
+            cfg.audit_fsync,
+            cfg.audit_append_lock,
+            request.tape_uuid,
+            completion,
+        )?;
         let projection = index
             .terminal_finalization(&request.tape_uuid)
             .map_err(crate::status_from_state_error)?
@@ -6515,7 +6546,6 @@ pub(crate) fn preflight_manual_finalize_tape(
             &mut checkpoint,
             &previous,
             &spec,
-            Some(request),
             intent,
             &plan,
             tix_fault.as_ref(),
@@ -6568,6 +6598,26 @@ pub(crate) fn preflight_automatic_terminal_completion(
         })?;
     if previous.sealed_after_write {
         project_sealed_checkpoint_then_retire_terminal_intent(index, &mut checkpoint, &previous)?;
+        let completion = previous.terminal_finalization.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "sealed checkpoint authority has no terminal-finalization completion",
+            )
+        })?;
+        crate::ensure_tape_sealed_audit(
+            index,
+            cfg.audit_dir,
+            cfg.audit_fsync,
+            cfg.audit_append_lock,
+            selected.tape_uuid,
+        )?;
+        crate::ensure_manual_finalize_finished_audit(
+            index,
+            cfg.audit_dir,
+            cfg.audit_fsync,
+            cfg.audit_append_lock,
+            selected.tape_uuid,
+            completion,
+        )?;
         return Ok(true);
     }
     let spec = TerminalFinalizeSpec::resume(&intent, selected.block_size, pool_cfg);
@@ -6682,7 +6732,6 @@ pub(crate) fn preflight_automatic_terminal_completion(
         &mut checkpoint,
         &previous,
         &spec,
-        None,
         intent,
         &plan,
         tix_fault.as_ref(),
@@ -6783,7 +6832,6 @@ fn finalize_terminal_no_parity(
             checkpoint,
             previous,
             spec,
-            manual_request,
             intent,
             &plan,
             tix_fault.as_ref(),
@@ -7001,7 +7049,6 @@ fn finalize_terminal_with_parity(
             checkpoint,
             previous,
             spec,
-            manual_request,
             intent,
             &plan,
             tix_fault.as_ref(),
@@ -7125,7 +7172,6 @@ fn complete_terminal_finalization_host_only(
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
     previous: &remanence_state::CheckpointJournalRecord,
     spec: &TerminalFinalizeSpec,
-    manual_request: Option<&ManualFinalizeTapeActorRequest>,
     intent: remanence_state::TerminalFinalizationIntent,
     plan: &TerminalTripleWritePlan,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
@@ -7231,13 +7277,23 @@ fn complete_terminal_finalization_host_only(
                 Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
             })?;
     }
-    record_terminal_finalize_event_with(
+    crate::ensure_tape_sealed_audit(
         index,
-        audit,
-        manual_request,
-        AuditEvent::OperationFinished,
-        remanence_state::TerminalFinalizationProgress::AfterReplicaC,
-        None,
+        audit.audit_dir,
+        audit.audit_fsync,
+        audit.audit_append_lock,
+        spec.tape_uuid,
+    )?;
+    let completion = final_record.terminal_finalization.as_ref().ok_or_else(|| {
+        Status::internal("sealed terminal checkpoint omitted its completion authority")
+    })?;
+    crate::ensure_manual_finalize_finished_audit(
+        index,
+        audit.audit_dir,
+        audit.audit_fsync,
+        audit.audit_append_lock,
+        spec.tape_uuid,
+        completion,
     )?;
     let projection = index
         .terminal_finalization(&spec.tape_uuid)
@@ -7407,7 +7463,6 @@ fn finish_terminal_tail(
         checkpoint,
         previous,
         spec,
-        manual_request,
         completed_intent,
         &plan,
         tix_fault,
@@ -15304,6 +15359,31 @@ mod tests {
             world.lock().expect("world lock").command_log.len(),
             commands_before_host_repair,
             "sealed host repair must issue zero drive commands"
+        );
+        let audit = FileAuditLog::replay(&audit_dir).expect("replay manual finalization audit");
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|record| {
+                    record.event == AuditEvent::OperationFinished
+                        && record.operation_id == Some(operation_id)
+                })
+                .count(),
+            1,
+            "manual finalization and every sealed retry share one completion event"
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|record| {
+                    record.event == AuditEvent::TapeSealed
+                        && record.subject.kind == "tape"
+                        && record.subject.id.as_deref()
+                            == Some(crate::bytes_to_hex(tape_uuid.as_slice()).as_str())
+                })
+                .count(),
+            1,
+            "manual finalization and every sealed retry share one TapeSealed event"
         );
     }
 
