@@ -152,19 +152,14 @@ sessions, operations, idempotency keys, media-readiness records,
 tape-I/O fences, and the drive-stewardship set (drives, events, health
 snapshots, clean runs, alarms).
 
-The state lock is **not** taken by `rem-daemon` itself — only
-`StateHandle`-based `rem-debug` state-mutating subcommands (tape init,
-existing-Bootstrap identity adoption,
-pool ops, catalog reset, and similar offline operations) acquire the
-kernel `flock` on `<state_dir>/state.lock`, which serializes those
-commands against each other and is released automatically if the
-holding process dies. `rem-daemon` opens the SQLite catalog directly and
-never takes this lock; its only guard against a second instance is a
-liveness probe on the Unix socket path at bind time (a live listener at
-that exact path is a hard error, a stale socket file is unlinked and
-reused). Two daemons configured with different socket paths but the same
-`state_dir` are not stopped from both starting — this is a known gap,
-not a documented safety property.
+`rem-daemon` holds the kernel `flock` on `<state_dir>/state.lock` for its
+complete process lifetime. `StateHandle`-based `rem-debug` mutations (tape
+init, existing-Bootstrap identity adoption, pool operations, catalog reset,
+and similar offline work) acquire the same lock. A second daemon cannot evade
+this ownership boundary by choosing another socket, and an offline mutator
+cannot race SQLite, checkpoint recovery, or the hash-chained audit log while
+the daemon is running. The lock is released automatically when its process
+dies; maintenance runbooks stop the daemon before acquiring it.
 
 The recovery/import boundary and its deliberately identity-only authority are
 described in [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).

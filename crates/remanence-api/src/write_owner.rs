@@ -5547,7 +5547,6 @@ fn append_tape_sealed_evidence(
     crate::ensure_tape_sealed_audit(
         index,
         cfg.audit_dir.as_path(),
-        cfg.audit_fsync,
         &cfg.audit_append_lock,
         tape_uuid,
     )
@@ -5796,14 +5795,12 @@ fn handle_drive_finalize_tape(
         crate::ensure_tape_sealed_audit(
             index,
             cfg.audit_dir.as_path(),
-            cfg.audit_fsync,
             &cfg.audit_append_lock,
             request.tape_uuid,
         )?;
         crate::ensure_manual_finalize_finished_audit(
             index,
             cfg.audit_dir.as_path(),
-            cfg.audit_fsync,
             &cfg.audit_append_lock,
             request.tape_uuid,
             completion,
@@ -6305,14 +6302,12 @@ pub(crate) fn preflight_manual_finalize_tape(
         crate::ensure_tape_sealed_audit(
             index,
             cfg.audit_dir,
-            cfg.audit_fsync,
             cfg.audit_append_lock,
             request.tape_uuid,
         )?;
         crate::ensure_manual_finalize_finished_audit(
             index,
             cfg.audit_dir,
-            cfg.audit_fsync,
             cfg.audit_append_lock,
             request.tape_uuid,
             completion,
@@ -6606,14 +6601,12 @@ pub(crate) fn preflight_automatic_terminal_completion(
         crate::ensure_tape_sealed_audit(
             index,
             cfg.audit_dir,
-            cfg.audit_fsync,
             cfg.audit_append_lock,
             selected.tape_uuid,
         )?;
         crate::ensure_manual_finalize_finished_audit(
             index,
             cfg.audit_dir,
-            cfg.audit_fsync,
             cfg.audit_append_lock,
             selected.tape_uuid,
             completion,
@@ -7280,7 +7273,6 @@ fn complete_terminal_finalization_host_only(
     crate::ensure_tape_sealed_audit(
         index,
         audit.audit_dir,
-        audit.audit_fsync,
         audit.audit_append_lock,
         spec.tape_uuid,
     )?;
@@ -7290,7 +7282,6 @@ fn complete_terminal_finalization_host_only(
     crate::ensure_manual_finalize_finished_audit(
         index,
         audit.audit_dir,
-        audit.audit_fsync,
         audit.audit_append_lock,
         spec.tape_uuid,
         completion,

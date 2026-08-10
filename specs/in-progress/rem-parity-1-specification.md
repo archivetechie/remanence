@@ -2384,7 +2384,10 @@ contains exactly one `TapeSealed` fact. For an operator close-out it MUST also
 contain exactly one `OperationFinished` fact bound to the manual identity in
 the sealed checkpoint. Recovery performs a read-before-append check under the
 audit append lock, so an interruption before either fact is repaired and an
-interruption after its durable append does not duplicate it.
+interruption after its durable append does not duplicate it. The daemon MUST
+hold exclusive process-lifetime ownership of the state directory, and these
+two completion appends MUST be fsynced even when optional audit appends are
+configured without per-record fsync.
 
 The companion intent format is versioned independently from the tape format.
 A companion that carries the durable `RecoveryRequired` classification MUST

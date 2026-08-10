@@ -219,7 +219,10 @@ discarding the information that tells a later restart how to finish recovery.
 The same restart also repairs missing completion records in the append-only
 audit log. It records one tape-sealed event and, for a manual close-out, one
 operation-finished event. If either event was already written before the
-crash, recovery reuses it instead of adding a duplicate.
+crash, recovery reuses it instead of adding a duplicate. These two records are
+always flushed to stable storage. Remanence also permits only one daemon or
+offline state owner to use a state directory at a time, so another process
+cannot race that decision.
 
 Before that boundary, a failed or uncertain component is recorded durably as
 `recovery_required`. Restart does not quietly turn that state back into ordinary

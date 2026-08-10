@@ -385,7 +385,9 @@ Sealed-checkpoint replay also repairs the host audit suffix without media
 access. It ensures one `TapeSealed` fact and, when the sealed intent carries a
 manual identity, one matching `OperationFinished` fact. Both use a locked
 read-before-append decision and are safe to repeat after either audit append or
-catalog projection is interrupted.
+catalog projection is interrupted. The daemon holds exclusive state-directory
+ownership for the full process lifetime, and terminal completion facts force
+an audit fsync independently of the optional audit-append setting.
 
 The run-to-completion writer performs one final, read-only position assertion
 against planned terminal EOD after the fifth barrier. Terminal component

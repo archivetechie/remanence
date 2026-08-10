@@ -45,6 +45,21 @@ pub async fn main_entry_with_registry(
     };
     warn_io_memory_sanity(config.daemon.io_memory_ceiling);
 
+    // The state lock is a process-lifetime ownership boundary, not merely an
+    // offline-maintenance mutex. It prevents a second daemon on another socket
+    // (or a direct state mutator) from racing SQLite, checkpoint recovery, or
+    // the hash-chained audit append sequence.
+    let _state_lock = match remanence_state::StateLockGuard::acquire(&config.daemon.state_dir) {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!(
+                "error: acquire daemon state ownership {}: {error}",
+                config.daemon.state_dir.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+
     let socket_path = args
         .socket
         .unwrap_or_else(|| config.daemon.socket_path_or_default());
