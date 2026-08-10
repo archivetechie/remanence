@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write as _;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex, RwLock};
@@ -36,8 +37,8 @@ use remanence_parity::{
 use remanence_state::{
     AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
     CleaningConfig, DriveHealthSnapshotInput, DriveHealthSnapshotRecord, FileAuditLog,
-    NativeObjectFileRecord, SourceLayer, TapeIoConfig, TapeIoFenceRecord, TapePoolConfig,
-    TerminalFinalizationOutcome, TerminalFinalizationProjection,
+    ManualTerminalFinalizationAcceptanceInput, NativeObjectFileRecord, SourceLayer, TapeIoConfig,
+    TapeIoFenceRecord, TapePoolConfig, TerminalFinalizationOutcome, TerminalFinalizationProjection,
     TerminalFinalizationProjectionInput,
 };
 use remanence_stream::StreamingError;
@@ -6232,6 +6233,66 @@ fn publish_terminal_intent(
     Ok(())
 }
 
+/// Distinguish an accepted manual intent from the provisional companion left
+/// if the process dies before the guarded SQLite transaction commits.
+///
+/// Both database halves are committed by one transaction. Seeing neither is
+/// therefore the sole removable provisional state; seeing exactly one is
+/// corruption, while seeing both requires exact equality before recovery.
+pub(crate) fn reconcile_manual_terminal_acceptance(
+    index: &CatalogIndex,
+    checkpoint: &mut remanence_state::FileCheckpointJournalLease,
+    intent: &remanence_state::TerminalFinalizationIntent,
+) -> Result<bool, Status> {
+    let manual = intent.manual.as_ref().ok_or_else(|| {
+        Status::failed_precondition("manual acceptance reconciliation has no manual identity")
+    })?;
+    if intent.trigger != remanence_state::TerminalFinalizationTrigger::OperatorCloseOut
+        || manual.operation_kind != FINALIZE_TAPE_OPERATION_KIND
+    {
+        return Err(Status::failed_precondition(
+            "manual acceptance reconciliation has invalid operation authority",
+        ));
+    }
+    let operation_id = Uuid::from_bytes(manual.operation_id);
+    let idempotency_key = Uuid::from_bytes(manual.idempotency_key);
+    let projection = index
+        .terminal_finalization(&intent.tape_uuid)
+        .map_err(crate::status_from_state_error)?;
+    let scope = index
+        .idempotency_scope_record(
+            manual.actor_fingerprint.as_str(),
+            FINALIZE_TAPE_OPERATION_KIND,
+            idempotency_key,
+        )
+        .map_err(crate::status_from_state_error)?;
+    match (projection, scope) {
+        (None, None) => {
+            checkpoint
+                .retire_provisional_manual_finalization(intent, false, false)
+                .map_err(crate::status_from_state_error)?;
+            Ok(false)
+        }
+        (Some(_), None) | (None, Some(_)) => Err(Status::failed_precondition(
+            "manual terminal acceptance is corrupt: finalization projection and idempotency binding are not both present",
+        )),
+        (Some(projection), Some(scope)) => {
+            if projection.trigger != intent.trigger
+                || projection.operation_id != Some(operation_id)
+                || projection.edition_digest != intent.edition_digest
+                || projection.layout_digest != intent.layout.layout_digest
+                || scope.operation_id != operation_id
+                || scope.request_fingerprint.as_slice() != manual.request_fingerprint
+            {
+                return Err(Status::failed_precondition(
+                    "manual terminal acceptance database authority differs from its checkpoint companion",
+                ));
+            }
+            Ok(true)
+        }
+    }
+}
+
 /// Complete manual close-out admission without possessing any changer or drive
 /// capability. Every request-dependent rejection therefore precedes robotics,
 /// LOAD, rewind, locate, mode-page configuration, and tape writes.
@@ -6247,7 +6308,7 @@ pub(crate) fn preflight_manual_finalize_tape(
     let pending_intent = checkpoint_journal
         .terminal_finalization_intent()
         .map_err(crate::status_from_state_error)?;
-    let (mut checkpoint, existing_intent) = if pending_intent.is_some() {
+    let (mut checkpoint, mut existing_intent) = if pending_intent.is_some() {
         let lease = checkpoint_journal
             .acquire_exclusive_for_terminal_recovery()
             .map_err(crate::status_from_state_error)?;
@@ -6261,6 +6322,15 @@ pub(crate) fn preflight_manual_finalize_tape(
             .map_err(crate::status_from_state_error)?;
         (lease, None)
     };
+
+    if let Some(intent) = existing_intent
+        .as_ref()
+        .filter(|intent| intent.manual.is_some())
+    {
+        if !reconcile_manual_terminal_acceptance(index, &mut checkpoint, intent)? {
+            existing_intent = None;
+        }
+    }
 
     // The checkpoint intent is the crash-recovery authority. If the process
     // stopped after that fsync but before the audit projection, recover the
@@ -6517,36 +6587,26 @@ pub(crate) fn preflight_manual_finalize_tape(
                     &spec,
                 )?,
             };
-            // Planning may stream a large authority. Re-read the conditional
-            // pool generation at the acceptance edge while the exact-tape
-            // owner is still held.
-            validate_manual_finalize_owned_request(index, request)?;
-            // Establish the global actor/kind/key binding before publishing a
-            // tape-local intent. A crash here is recoverable by idempotency
-            // replay, and a cross-tape same-key race cannot orphan a second
-            // tape's terminal intent.
-            record_manual_finalize_request_with(
-                index,
-                cfg.audit_dir,
-                cfg.audit_fsync,
-                cfg.audit_append_lock,
-                request,
-            )?;
-            publish_terminal_intent(index, &mut checkpoint, &spec, &planned.0)?;
             planned
         }
     };
 
-    // Existing checkpoint intents from a crash or upgrade may predate their
-    // audit projection. Repair that projection before physical dispatch.
+    // Planning may stream a large authority. Re-read at the acceptance edge,
+    // then let the immediate catalog transaction repeat the same guard while
+    // holding assignment writers out through companion publication.
     validate_manual_finalize_owned_request(index, request)?;
-    record_manual_finalize_request_with(
-        index,
-        cfg.audit_dir,
-        cfg.audit_fsync,
-        cfg.audit_append_lock,
-        request,
-    )?;
+    if let Some(fault) = tix_fault.as_ref() {
+        fault
+            .clear_assignment_after_reread_before_acceptance(
+                index,
+                request.tape_uuid,
+                request.assignment_generation,
+                request.expected_pool_id.as_deref(),
+            )
+            .map_err(|error| {
+                Status::failed_precondition(format!("TIX assignment-race hook: {error}"))
+            })?;
+    }
     let projected_recovery_required = index
         .terminal_finalization(&request.tape_uuid)
         .map_err(crate::status_from_state_error)?
@@ -6554,22 +6614,56 @@ pub(crate) fn preflight_manual_finalize_tape(
             projection.progress == intent.progress
                 && projection.outcome == TerminalFinalizationOutcome::RecoveryRequired
         });
-    index
-        .project_terminal_finalization(TerminalFinalizationProjectionInput {
-            tape_uuid: request.tape_uuid,
-            trigger: intent.trigger,
-            operation_id: Some(request.candidate_operation_id),
-            progress: intent.progress,
-            edition_digest: intent.edition_digest,
-            layout_digest: intent.layout.layout_digest,
-            outcome: if intent.recovery_required || projected_recovery_required {
-                TerminalFinalizationOutcome::RecoveryRequired
-            } else {
-                TerminalFinalizationOutcome::InProgress
-            },
-            updated_at_utc: None,
-        })
-        .map_err(crate::status_from_state_error)?;
+    let projection = TerminalFinalizationProjectionInput {
+        tape_uuid: request.tape_uuid,
+        trigger: intent.trigger,
+        operation_id: Some(request.candidate_operation_id),
+        progress: intent.progress,
+        edition_digest: intent.edition_digest,
+        layout_digest: intent.layout.layout_digest,
+        outcome: if intent.recovery_required || projected_recovery_required {
+            TerminalFinalizationOutcome::RecoveryRequired
+        } else {
+            TerminalFinalizationOutcome::InProgress
+        },
+        updated_at_utc: None,
+    };
+    if intent.progress == remanence_state::TerminalFinalizationProgress::BeforeReplicaA {
+        index
+            .accept_manual_terminal_finalization_with(
+                ManualTerminalFinalizationAcceptanceInput {
+                    tape_uuid: request.tape_uuid,
+                    expected_pool_id: request.expected_pool_id.clone(),
+                    expected_assignment_generation: request.assignment_generation,
+                    actor_fingerprint: request.actor_fingerprint.clone(),
+                    operation_kind: FINALIZE_TAPE_OPERATION_KIND.to_string(),
+                    idempotency_key: request.idempotency_key,
+                    request_fingerprint: request.request_fingerprint,
+                    operation_id: request.candidate_operation_id,
+                    projection,
+                },
+                || checkpoint.begin_terminal_finalization(&intent).map(|_| ()),
+            )
+            .map_err(|error| match error {
+                remanence_state::StateError::TapePoolAssignmentConflict(detail) => {
+                    Status::failed_precondition(detail)
+                }
+                other => crate::status_from_state_error(other),
+            })?;
+    } else {
+        index
+            .project_terminal_finalization(projection)
+            .map_err(crate::status_from_state_error)?;
+    }
+    // A crash after acceptance but before this append is repaired from the
+    // accepted companion before any physical dispatch.
+    record_manual_finalize_request_with(
+        index,
+        cfg.audit_dir,
+        cfg.audit_fsync,
+        cfg.audit_append_lock,
+        request,
+    )?;
     if intent.progress == remanence_state::TerminalFinalizationProgress::AfterReplicaC {
         let result = complete_terminal_finalization_host_only(
             index,
@@ -7644,21 +7738,10 @@ fn record_manual_finalize_request(
 fn record_manual_finalize_request_with(
     index: &mut CatalogIndex,
     audit_dir: &Path,
-    audit_fsync: bool,
+    _audit_fsync: bool,
     audit_append_lock: &Arc<std::sync::Mutex<()>>,
     request: &ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
-    if index
-        .idempotency_scope_record(
-            request.actor_fingerprint.as_str(),
-            FINALIZE_TAPE_OPERATION_KIND,
-            request.idempotency_key,
-        )
-        .map_err(crate::status_from_state_error)?
-        .is_some()
-    {
-        return Ok(());
-    }
     let mut detail = BTreeMap::from([
         (
             "tape_uuid".to_string(),
@@ -7687,22 +7770,78 @@ fn record_manual_finalize_request_with(
             CborValue::Text(pool_id.clone()),
         );
     }
-    crate::append_operation_audit(
-        index,
-        audit_dir,
-        audit_fsync,
-        audit_append_lock,
-        crate::OperationAuditInput {
-            actor: request.actor.clone(),
-            operation_id: request.candidate_operation_id,
-            operation_kind: FINALIZE_TAPE_OPERATION_KIND,
-            event: AuditEvent::RequestReceived,
-            subject_kind: "tape",
-            subject_id: Some(Uuid::from_bytes(request.tape_uuid).to_string()),
-            idempotency_key: Some(request.idempotency_key),
-            detail,
-        },
-    )
+    detail.insert(
+        "operation_kind".to_string(),
+        CborValue::Text(FINALIZE_TAPE_OPERATION_KIND.to_string()),
+    );
+    let subject = AuditSubject {
+        kind: "tape".to_string(),
+        id: Some(Uuid::from_bytes(request.tape_uuid).to_string()),
+    };
+    let _guard = audit_append_lock
+        .lock()
+        .map_err(|_| Status::internal("audit append lock poisoned"))?;
+    std::fs::create_dir_all(audit_dir).map_err(|error| {
+        Status::internal(format!(
+            "create audit directory {}: {error}",
+            audit_dir.display()
+        ))
+    })?;
+    let mut exact = None;
+    let mut exact_count = 0usize;
+    let mut conflict = None;
+    FileAuditLog::replay_incremental(audit_dir, |record| {
+        if record.operation_id != Some(request.candidate_operation_id)
+            || record.event != AuditEvent::RequestReceived
+        {
+            return ControlFlow::Continue(());
+        }
+        if record.source_layer == SourceLayer::Layer5
+            && record.session_id.is_none()
+            && record.idempotency_key == Some(request.idempotency_key)
+            && record.subject == subject
+            && record.detail == detail
+        {
+            exact_count += 1;
+            exact.get_or_insert(record);
+        } else {
+            conflict.get_or_insert(record);
+        }
+        ControlFlow::Continue(())
+    })
+    .map_err(crate::status_from_state_error)?;
+    if conflict.is_some() {
+        return Err(Status::already_exists(
+            "FinalizeTape operation has a conflicting durable RequestReceived audit record",
+        ));
+    }
+    if exact_count > 1 {
+        return Err(Status::failed_precondition(format!(
+            "FinalizeTape operation has {exact_count} duplicate durable RequestReceived audit records"
+        )));
+    }
+    let record = if let Some(record) = exact {
+        record
+    } else {
+        let mut audit =
+            FileAuditLog::open(audit_dir, true).map_err(crate::status_from_state_error)?;
+        audit
+            .append_and_return_record(AuditEventRecord {
+                actor: request.actor.clone(),
+                source_layer: SourceLayer::Layer5,
+                operation_id: Some(request.candidate_operation_id),
+                session_id: None,
+                idempotency_key: Some(request.idempotency_key),
+                event: AuditEvent::RequestReceived,
+                subject,
+                detail,
+            })
+            .map_err(crate::status_from_state_error)?
+            .1
+    };
+    index
+        .project_audit_record(&record)
+        .map_err(crate::status_from_state_error)
 }
 
 fn record_terminal_finalize_event(
@@ -15221,11 +15360,9 @@ mod tests {
             .expect("query rejected terminal intent")
             .is_none());
 
-        // Crash cut: the globally scoped audit/idempotency binding commits,
-        // then checkpoint-intent publication fails. No drive command is
-        // possible because preflight owns neither a drive nor a changer. The
-        // retry must recover the original operation id from the binding and
-        // publish the exact BeforeReplicaA plan.
+        // Failed companion publication must roll back both halves of manual
+        // acceptance. No drive command is possible because preflight owns
+        // neither a drive nor a changer, and the scoped key remains reusable.
         let mut blocked_intent_path = checkpoint.path().as_os_str().to_os_string();
         blocked_intent_path.push(".finalizing.new");
         let blocked_intent_path = std::path::PathBuf::from(blocked_intent_path);
@@ -15243,7 +15380,7 @@ mod tests {
             Some(barcode),
             &mut request.clone(),
         )
-        .expect_err("intent cut fails after durable idempotency binding");
+        .expect_err("intent publication failure rolls back acceptance");
         assert_eq!(crash_error.code(), tonic::Code::Internal);
         assert_eq!(
             world.lock().expect("world lock").command_log.len(),
@@ -15254,19 +15391,23 @@ mod tests {
             .terminal_finalization_intent()
             .expect("read crash-cut intent")
             .is_none());
-        let crash_scope = crash_index
+        assert!(crash_index
             .idempotency_scope_record(
                 request.actor_fingerprint.as_str(),
                 FINALIZE_TAPE_OPERATION_KIND,
                 request.idempotency_key,
             )
             .expect("read crash-cut idempotency binding")
-            .expect("idempotency binding survives intent failure");
-        assert_eq!(crash_scope.operation_id, operation_id);
+            .is_none());
+        assert!(crash_index
+            .terminal_finalization(&request.tape_uuid)
+            .expect("read crash-cut finalization projection")
+            .is_none());
         std::fs::remove_dir(&blocked_intent_path).expect("unblock intent publication");
 
         let mut recovered_request = request.clone();
-        recovered_request.candidate_operation_id = Uuid::from_u128(0x7d05);
+        let recovered_operation_id = Uuid::from_u128(0x7d05);
+        recovered_request.candidate_operation_id = recovered_operation_id;
         let mut retry_index = CatalogIndex::open(&index_path).expect("open retry catalog");
         assert!(preflight_manual_finalize_tape(
             &mut retry_index,
@@ -15281,7 +15422,10 @@ mod tests {
         )
         .expect("identical crash retry rejoins")
         .is_none());
-        assert_eq!(recovered_request.candidate_operation_id, operation_id);
+        assert_eq!(
+            recovered_request.candidate_operation_id,
+            recovered_operation_id
+        );
         let durable = checkpoint
             .terminal_finalization_intent()
             .expect("read retry intent")
@@ -15296,7 +15440,7 @@ mod tests {
                 .as_ref()
                 .expect("manual identity")
                 .operation_id,
-            *operation_id.as_bytes()
+            *recovered_operation_id.as_bytes()
         );
         assert_eq!(
             durable
@@ -15306,6 +15450,86 @@ mod tests {
                 .operation_kind,
             FINALIZE_TAPE_OPERATION_KIND
         );
+
+        // Model process death after companion fsync but before the guarded
+        // SQLite commit by rolling back both database halves while retaining
+        // the exact BeforeReplicaA companion. Retry must retire only that
+        // provisional companion, rebuild acceptance atomically, and move no
+        // media.
+        let raw =
+            rusqlite::Connection::open(&index_path).expect("open acceptance rollback fixture");
+        let rollback = raw
+            .unchecked_transaction()
+            .expect("begin acceptance rollback fixture");
+        rollback
+            .execute(
+                "update tapes
+                 set finalization_progress = null,
+                     finalization_trigger = null,
+                     finalization_operation_id = null,
+                     finalization_edition_digest = null,
+                     finalization_layout_digest = null,
+                     completed_replicas = null,
+                     finalization_outcome = null,
+                     state = 'ready'
+                 where tape_uuid = ?1",
+                rusqlite::params![tape_uuid.to_vec()],
+            )
+            .expect("roll back finalization projection fixture");
+        rollback
+            .execute(
+                "delete from idempotency_keys
+                 where actor_fingerprint = ?1
+                   and operation_kind = ?2
+                   and idempotency_key = ?3",
+                rusqlite::params![
+                    recovered_request.actor_fingerprint.as_str(),
+                    FINALIZE_TAPE_OPERATION_KIND,
+                    recovered_request.idempotency_key.to_string()
+                ],
+            )
+            .expect("roll back idempotency projection fixture");
+        rollback
+            .commit()
+            .expect("commit acceptance rollback fixture");
+        drop(raw);
+        assert!(checkpoint
+            .terminal_finalization_intent()
+            .expect("read provisional companion")
+            .is_some());
+        let commands_before_provisional_retry = world.lock().expect("world lock").command_log.len();
+        let mut provisional_retry = recovered_request.clone();
+        assert!(preflight_manual_finalize_tape(
+            &mut retry_index,
+            ManualFinalizePreflightConfig {
+                checkpoint_journal_dir: &checkpoint_dir,
+                audit_dir: &audit_dir,
+                audit_fsync: false,
+                audit_append_lock: &audit_append_lock,
+            },
+            Some(barcode),
+            &mut provisional_retry,
+        )
+        .expect("retry repairs provisional companion")
+        .is_none());
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            commands_before_provisional_retry,
+            "provisional acceptance retry must issue zero drive commands"
+        );
+        assert!(retry_index
+            .idempotency_scope_record(
+                recovered_request.actor_fingerprint.as_str(),
+                FINALIZE_TAPE_OPERATION_KIND,
+                recovered_request.idempotency_key,
+            )
+            .expect("read repaired idempotency binding")
+            .is_some());
+        assert!(retry_index
+            .terminal_finalization(&tape_uuid)
+            .expect("read repaired finalization projection")
+            .is_some());
+
         let mut changed_request = recovered_request.clone();
         changed_request.reason = "different exact reason bytes".to_string();
         changed_request.request_fingerprint = [0x7F; 32];
@@ -15346,7 +15570,7 @@ mod tests {
             .await
             .expect("manual finalize reply")
             .expect("manual finalization below low succeeds");
-        assert_eq!(first.operation_id, operation_id);
+        assert_eq!(first.operation_id, recovered_operation_id);
         assert_eq!(
             first.projection.outcome,
             TerminalFinalizationOutcome::Finalized
@@ -15462,7 +15686,7 @@ mod tests {
                 .iter()
                 .filter(|record| {
                     record.event == AuditEvent::OperationFinished
-                        && record.operation_id == Some(operation_id)
+                        && record.operation_id == Some(recovered_operation_id)
                 })
                 .count(),
             1,

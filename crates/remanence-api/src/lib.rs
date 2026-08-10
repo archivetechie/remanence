@@ -2635,6 +2635,17 @@ fn replay_checkpoint_journal_projections_with_audit(
             let mut lease = journal
                 .acquire_exclusive_for_terminal_recovery()
                 .map_err(status_from_state_error)?;
+            let retained_intent = if let Some(intent) = lease
+                .terminal_finalization_intent()
+                .map_err(status_from_state_error)?
+                .filter(|intent| intent.manual.is_some())
+            {
+                crate::write_owner::reconcile_manual_terminal_acceptance(
+                    index, &mut lease, &intent,
+                )?
+            } else {
+                true
+            };
             // Project every validated record while the exact companion is
             // still retained. A catalog failure therefore leaves startup
             // routing authority intact; exact replay retires a stale sealed
@@ -2648,10 +2659,14 @@ fn replay_checkpoint_journal_projections_with_audit(
                     Ok(())
                 })
                 .map_err(status_from_state_error)?;
-            let authority = lease
-                .replay_for_terminal_recovery()
-                .map_err(status_from_state_error)?;
-            authority.finalization_intent
+            if retained_intent {
+                let authority = lease
+                    .replay_for_terminal_recovery()
+                    .map_err(status_from_state_error)?;
+                authority.finalization_intent
+            } else {
+                None
+            }
         } else {
             for record in journal.replay().map_err(status_from_state_error)? {
                 index
@@ -8652,6 +8667,187 @@ BCw3Wyv2UWY=
         assert!(message.contains(second_object_id), "{message}");
         assert!(message.contains("journal="), "{message}");
         assert!(message.contains("sqlite="), "{message}");
+    }
+
+    #[test]
+    fn startup_replay_retires_only_companion_only_manual_acceptance() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-manual-acceptance-restart")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let tape_uuid = [0x93; 16];
+        let operation_id = Uuid::from_u128(0x9301);
+        let idempotency_key = Uuid::from_u128(0x9302);
+        let request_fingerprint = [0x93; 32];
+        let mut index = CatalogIndex::open(&index_path).expect("open index");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "RST003L9".to_string(),
+                block_size: BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision restart-cycle tape");
+        let journal = remanence_state::FileCheckpointJournal::open(&checkpoint_dir, tape_uuid)
+            .expect("open checkpoint journal");
+        let mut checkpoint = restart_cycle_checkpoint_record(tape_uuid, 1, 0x74, 1, 3, 3);
+        checkpoint.block_size = BLOCK_SIZE;
+        checkpoint.objects[0].block_size = BLOCK_SIZE;
+        checkpoint.objects[0].object.logical_size_bytes = Some(3 * u64::from(BLOCK_SIZE));
+        journal.append(&checkpoint).expect("fsync checkpoint");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("project ordinary checkpoint");
+        let layout = remanence_parity::TerminalTailLayout::new(
+            0,
+            BLOCK_SIZE,
+            checkpoint.next_tape_file_number,
+            checkpoint.eod_lba,
+            3,
+            remanence_parity::index_separation_records(
+                BLOCK_SIZE,
+                remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+            )
+            .expect("gap records"),
+        )
+        .expect("terminal layout");
+        let intent = remanence_state::TerminalFinalizationIntent {
+            tape_uuid,
+            trigger: remanence_state::TerminalFinalizationTrigger::OperatorCloseOut,
+            manual: Some(remanence_state::ManualTerminalFinalizationIdentity {
+                operation_id: *operation_id.as_bytes(),
+                operation_kind: FINALIZE_TAPE_OPERATION_KIND.to_string(),
+                actor_fingerprint: "user:restart-operator".to_string(),
+                idempotency_key: *idempotency_key.as_bytes(),
+                request_fingerprint,
+                assigned_pool_id: None,
+                expected_pool_id: None,
+                assignment_generation: 0,
+                reason: "restart provisional acceptance".to_string(),
+            }),
+            progress: remanence_state::TerminalFinalizationProgress::BeforeReplicaA,
+            recovery_required: false,
+            edition_id: [0x94; 16],
+            edition_sequence: 2,
+            edition_digest: [0x95; 32],
+            writer_version: "restart-manual-test".to_string(),
+            write_timestamp: "2026-08-10T00:00:00Z".to_string(),
+            terminal_prefix: None,
+            layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
+                .expect("persist layout"),
+        };
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("acquire checkpoint owner");
+        lease
+            .begin_terminal_finalization(&intent)
+            .expect("publish provisional companion");
+        drop(lease);
+
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("startup retires companion-only acceptance");
+        assert!(journal
+            .terminal_finalization_intent()
+            .expect("read retired provisional companion")
+            .is_none());
+        assert!(index
+            .terminal_finalization(&tape_uuid)
+            .expect("read absent finalization projection")
+            .is_none());
+        assert!(index
+            .idempotency_scope_record(
+                "user:restart-operator",
+                FINALIZE_TAPE_OPERATION_KIND,
+                idempotency_key,
+            )
+            .expect("read absent idempotency binding")
+            .is_none());
+
+        let mut lease = journal
+            .acquire_exclusive()
+            .expect("reacquire checkpoint owner");
+        lease
+            .begin_terminal_finalization(&intent)
+            .expect("republish provisional companion");
+        drop(lease);
+        index
+            .register_idempotency_request(
+                "user:restart-operator",
+                FINALIZE_TAPE_OPERATION_KIND,
+                idempotency_key,
+                request_fingerprint,
+                operation_id,
+                None,
+            )
+            .expect("seed one database half");
+        let half_error = replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect_err("startup refuses one-half acceptance");
+        assert!(
+            half_error.message().contains("not both present"),
+            "{half_error}"
+        );
+        assert!(journal
+            .terminal_finalization_intent()
+            .expect("read retained one-half companion")
+            .is_some());
+
+        index
+            .project_terminal_finalization(remanence_state::TerminalFinalizationProjectionInput {
+                tape_uuid,
+                trigger: intent.trigger,
+                operation_id: Some(operation_id),
+                progress: intent.progress,
+                edition_digest: intent.edition_digest,
+                layout_digest: intent.layout.layout_digest,
+                outcome: remanence_state::TerminalFinalizationOutcome::InProgress,
+                updated_at_utc: None,
+            })
+            .expect("seed finalization projection");
+        rusqlite::Connection::open(&index_path)
+            .expect("open raw index connection")
+            .execute(
+                "delete from idempotency_keys
+                 where actor_fingerprint = ?1
+                   and operation_kind = ?2
+                   and idempotency_key = ?3",
+                rusqlite::params![
+                    "user:restart-operator",
+                    FINALIZE_TAPE_OPERATION_KIND,
+                    idempotency_key.to_string()
+                ],
+            )
+            .expect("remove idempotency half");
+        let projection_half_error =
+            replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+                .expect_err("startup refuses projection-only acceptance");
+        assert!(
+            projection_half_error.message().contains("not both present"),
+            "{projection_half_error}"
+        );
+        assert!(journal
+            .terminal_finalization_intent()
+            .expect("read retained projection-only companion")
+            .is_some());
+
+        index
+            .register_idempotency_request(
+                "user:restart-operator",
+                FINALIZE_TAPE_OPERATION_KIND,
+                idempotency_key,
+                request_fingerprint,
+                operation_id,
+                None,
+            )
+            .expect("restore exact second database half");
+        replay_checkpoint_journal_projections(&mut index, &checkpoint_dir)
+            .expect("startup resumes exact two-half acceptance");
+        assert!(journal
+            .terminal_finalization_intent()
+            .expect("read resumable accepted companion")
+            .is_some());
     }
 
     #[test]
