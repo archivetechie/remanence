@@ -789,7 +789,9 @@ fn rejoin_accepted_manual_finalization(
         return Ok(None);
     };
     if scope.request_fingerprint.as_slice() != admission.request_fingerprint {
-        return Ok(None);
+        return Err(Status::already_exists(
+            "FinalizeTape idempotency key is already bound to a different request",
+        ));
     }
     let Some(projection) = index
         .terminal_finalization(&admission.tape_uuid)
@@ -3518,6 +3520,29 @@ mod tests {
         assert!(
             changer_rx.try_recv().is_err(),
             "loaded-tape tail moved media"
+        );
+
+        // The same durable key cannot be hidden behind BUSY while its worker
+        // owns the tape. A changed request fingerprint remains a typed
+        // idempotency conflict and cannot dispatch another tail or motion.
+        let mut conflict = admission.clone();
+        conflict.request_fingerprint = [0xA6; 32];
+        conflict.reason = "changed request".to_string();
+        let conflict = manual_finalize_tape(&state, conflict)
+            .await
+            .expect_err("same-key changed request must conflict while worker owns tape");
+        assert_eq!(conflict.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            conflict.message(),
+            "FinalizeTape idempotency key is already bound to a different request"
+        );
+        assert!(
+            drive_rx.try_recv().is_err(),
+            "idempotency conflict duplicated tail dispatch"
+        );
+        assert!(
+            changer_rx.try_recv().is_err(),
+            "idempotency conflict moved media"
         );
 
         // Dropping the actor reply simulates a worker dispatch failure after
