@@ -190,7 +190,7 @@ content that must be inventoried before normal use.
 Terminal finalization has a useful no-media recovery boundary. Once the
 checkpoint and parity journal prove that replica C completed its synchronizing
 barrier, all three full indexes are already on tape. A restart completes the
-remaining sealed-checkpoint, intent cleanup, SQLite projection, and audit work
+remaining sealed-checkpoint, SQLite projection, intent cleanup, and audit work
 without loading, locating, reading, or writing the cartridge. This applies to
 automatic finalization and to an operator-requested close-out.
 
@@ -198,9 +198,12 @@ If the operation was already classified `recovery_required`, that conservative
 flag remains durable until the sealed checkpoint itself is safely on disk. A
 failure before that point cannot silently downgrade the tape to ordinary
 `finalizing`; a failure after it replays the sealed checkpoint and removes the
-now-stale companion. Changes to a pool's capacity cap or watermarks do not block
-this final host-only bookkeeping, because the complete reserved tail is already
-barrier-proved on tape.
+now-stale companion. When a sealed checkpoint and companion coexist after a
+crash, recovery first proves they describe the same completion, then repairs
+SQLite while retaining the companion, and removes the companion only after
+that repair succeeds. Changes to a pool's capacity cap or watermarks do not
+block this final host-only bookkeeping, because the complete reserved tail is
+already barrier-proved on tape.
 
 Before that boundary, a failed or uncertain component is recorded durably as
 `recovery_required`. Restart does not quietly turn that state back into ordinary

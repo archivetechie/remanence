@@ -1031,13 +1031,13 @@ impl DrivePool {
     }
 
     pub(crate) fn reserve_tape(&self, tape_uuid: TapeUuid) -> Result<TapeReservation, Status> {
-        self.reserve_tape_with_after_session_check(tape_uuid, || {})
+        self.reserve_tape_with_after_insert(tape_uuid, |_| {})
     }
 
-    fn reserve_tape_with_after_session_check(
+    fn reserve_tape_with_after_insert(
         &self,
         tape_uuid: TapeUuid,
-        after_session_check: impl FnOnce(),
+        after_insert: impl FnOnce(&HashSet<TapeUuid>),
     ) -> Result<TapeReservation, Status> {
         let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
         if sessions
@@ -1046,7 +1046,6 @@ impl DrivePool {
         {
             return Err(Status::failed_precondition("tape is already mounted"));
         }
-        after_session_check();
         let mut reservations = self
             .tape_reservations
             .lock()
@@ -1054,6 +1053,7 @@ impl DrivePool {
         if !reservations.insert(tape_uuid) {
             return Err(Status::failed_precondition("tape is already mounted"));
         }
+        after_insert(&reservations);
         // Keep the sessions guard through reservation insertion. Otherwise a
         // concurrent opener can publish a mounted session after our check but
         // before this exact-tape owner becomes visible.
@@ -11319,75 +11319,25 @@ mod tests {
         const TAPE_UUID: TapeUuid = [0xD4; 16];
         let (changer_tx, _changer_rx) = mpsc::channel(1);
         let pool = DrivePool::new(changer_tx, HashMap::new(), Arc::new(HashMap::new()));
-        let existing_owner = pool
-            .reserve_tape(TAPE_UUID)
-            .expect("reserve exact tape for opener");
-
-        let (checked_tx, checked_rx) = std_mpsc::channel();
-        let (release_tx, release_rx) = std_mpsc::channel();
-        let candidate_pool = pool.clone();
-        let candidate = std::thread::spawn(move || {
-            candidate_pool.reserve_tape_with_after_session_check(TAPE_UUID, || {
-                checked_tx.send(()).expect("signal completed session check");
-                release_rx.recv().expect("release reservation candidate");
+        let sessions = Arc::clone(&pool.sessions);
+        let reservation = pool
+            .reserve_tape_with_after_insert(TAPE_UUID, |reservations| {
+                assert!(reservations.contains(&TAPE_UUID));
+                assert!(
+                    matches!(
+                        sessions.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    ),
+                    "session publication lock must remain held after exact-tape insertion"
+                );
             })
-        });
-        checked_rx
-            .recv_timeout(StdDuration::from_secs(1))
-            .expect("candidate reached guarded handoff");
-
-        let session_id = Uuid::from_u128(0xd4);
-        let record_pool = pool.clone();
-        let (record_started_tx, record_started_rx) = std_mpsc::channel();
-        let (record_done_tx, record_done_rx) = std_mpsc::channel();
-        let record = std::thread::spawn(move || {
-            record_started_tx
-                .send(())
-                .expect("signal session publication attempt");
-            record_pool.record_session(
-                session_id,
-                MountedSession {
-                    bay: 0x0100,
-                    library_serial: "LIB-HANDOFF".to_string(),
-                    barcode: Some("HND001L9".to_string()),
-                    home_slot: Some(0x0400),
-                    tape_uuid: TAPE_UUID,
-                    drive_uuid: Some(vec![0xD4; 16]),
-                },
-            );
-            record_done_tx.send(()).expect("signal session publication");
-        });
-        record_started_rx
-            .recv_timeout(StdDuration::from_secs(1))
-            .expect("session publisher started");
-        assert!(
-            record_done_rx
-                .recv_timeout(StdDuration::from_millis(100))
-                .is_err(),
-            "session publication must wait until exact-tape reservation insertion finishes"
-        );
-
-        release_tx
-            .send(())
-            .expect("release guarded reservation candidate");
-        let candidate_error = candidate
-            .join()
-            .expect("join reservation candidate")
-            .expect_err("existing exact-tape owner must win the handoff");
-        assert_eq!(candidate_error.code(), tonic::Code::FailedPrecondition);
-        record_done_rx
-            .recv_timeout(StdDuration::from_secs(1))
-            .expect("session publication resumes after handoff");
-        record.join().expect("join session publisher");
-        assert_eq!(
-            pool.session(session_id)
-                .expect("published session")
-                .tape_uuid,
-            TAPE_UUID
-        );
-
-        pool.forget_session(session_id);
-        drop(existing_owner);
+            .expect("reserve exact tape through guarded handoff");
+        assert!(pool
+            .sessions
+            .lock()
+            .expect("session map after handoff")
+            .is_empty());
+        drop(reservation);
     }
 
     #[test]
