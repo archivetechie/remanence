@@ -1,0 +1,7 @@
+case_id	base_profile	row_index	mutation	expected
+unknown-positive-key	multi-256k	0	unknown-positive-key	valid
+unknown-negative-key	multi-256k	0	unknown-negative-key	valid
+plaintext-with-encrypted-field	multi-256k	0	encrypted-field-on-plaintext	cross-representation
+encrypted-with-plaintext-field	multi-256k	1	plaintext-field-on-encrypted	cross-representation
+unknown-noncanonical-value	multi-256k	0	unknown-noncanonical-value	cbor
+unknown-nested-map-order	multi-256k	0	unknown-nested-map-order	cbor
