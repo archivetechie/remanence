@@ -25,6 +25,11 @@ use crate::error::StateError;
 /// Current Layer 4 SQLite schema version.
 pub const SCHEMA_VERSION: u32 = 18;
 
+/// Oldest clean-break catalog whose tape table can be inspected safely by the
+/// exact full-catalog erase admission path. Ordinary opens still reject every
+/// pre-current schema.
+const MIN_EXACT_ERASE_SCHEMA_VERSION: u32 = 16;
+
 const STRUCTURAL_U64_COLUMNS: &[(&str, &str)] = &[
     ("tapes", "highest_protected_ordinal"),
     ("tapes", "total_committed_ordinals"),
@@ -1247,6 +1252,86 @@ impl CatalogIndex {
         Ok(Self { conn, path })
     }
 
+    /// Read only the tape identities needed to admit an exact full-catalog
+    /// erase from a known clean-break predecessor schema.
+    ///
+    /// This is intentionally not a general legacy-catalog reader. It is used
+    /// only when the preserve set is empty, and it requires the complete
+    /// identity/geometry column set needed to enumerate every bound tape.
+    pub(crate) fn read_legacy_catalog_reset_erase_source(
+        path: impl AsRef<Path>,
+    ) -> Result<(u32, Vec<TapeRecord>), StateError> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|err| sqlite_open_error(path, err))?;
+        configure_read_only_sqlite(&conn)?;
+        let schema_version = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .map_err(|err| sqlite_error("read legacy reset sqlite user_version", err))?;
+        if !(MIN_EXACT_ERASE_SCHEMA_VERSION..SCHEMA_VERSION).contains(&schema_version) {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "sqlite user_version {schema_version} is not a supported clean-break predecessor for exact full-catalog erase (supported: {MIN_EXACT_ERASE_SCHEMA_VERSION}..{}); restore a schema-{SCHEMA_VERSION} catalog backup or use matching older Remanence tooling to reset it",
+                SCHEMA_VERSION - 1
+            )));
+        }
+
+        let mut column_stmt = conn
+            .prepare("PRAGMA table_info(tapes)")
+            .map_err(|err| sqlite_error("inspect legacy reset tapes table", err))?;
+        let columns = column_stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|err| sqlite_error("query legacy reset tapes columns", err))?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|err| sqlite_error("read legacy reset tapes columns", err))?;
+        let required = [
+            "tape_uuid",
+            "voltag",
+            "kind",
+            "pool_id",
+            "state",
+            "block_size",
+            "scheme_id",
+            "data_blocks_per_stripe",
+            "parity_blocks_per_stripe",
+            "stripes_per_neighborhood",
+        ];
+        let missing = required
+            .into_iter()
+            .filter(|column| !columns.contains(*column))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "sqlite user_version {schema_version} cannot prove exact full-catalog erase because tapes is missing columns {}; restore a schema-{SCHEMA_VERSION} catalog backup or use matching older Remanence tooling to reset it",
+                missing.join(", ")
+            )));
+        }
+        let assignment_generation = if columns.contains("assignment_generation") {
+            "assignment_generation"
+        } else {
+            "0"
+        };
+        let sql = format!(
+            "select tape_uuid, voltag, kind, pool_id, state, block_size, scheme_id,
+                    data_blocks_per_stripe, parity_blocks_per_stripe,
+                    stripes_per_neighborhood, {assignment_generation}
+             from tapes order by hex(tape_uuid)"
+        );
+        let mut tape_stmt = conn
+            .prepare(&sql)
+            .map_err(|err| sqlite_error("prepare legacy reset tape enumeration", err))?;
+        let mut rows = tape_stmt
+            .query([])
+            .map_err(|err| sqlite_error("query legacy reset tape enumeration", err))?;
+        let mut tapes = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|err| sqlite_error("iterate legacy reset tape enumeration", err))?
+        {
+            tapes.push(legacy_catalog_reset_tape_from_row(row)?);
+        }
+        Ok((schema_version, tapes))
+    }
+
     /// Path backing this projection.
     pub fn path(&self) -> &Path {
         &self.path
@@ -1737,16 +1822,29 @@ impl CatalogIndex {
     /// Checkpoint every WAL frame into the main database and switch to a
     /// single-file journal mode before an atomic catalog-reset swap.
     pub(crate) fn prepare_catalog_reset_atomic_swap(&self) -> Result<(), StateError> {
-        let (_busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = self
-            .conn
-            .query_row("pragma wal_checkpoint(truncate)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(|err| sqlite_error("checkpoint catalog reset sqlite WAL", err))?;
-        self.conn
-            .pragma_update(None, "journal_mode", "DELETE")
-            .map_err(|err| sqlite_error("set catalog reset sqlite journal mode", err))?;
-        Ok(())
+        prepare_catalog_reset_atomic_swap_conn(&self.conn)
+    }
+
+    /// Checkpoint a preflight-admitted source without asking ordinary catalog
+    /// open to migrate or validate its intentionally stale schema.
+    pub(crate) fn prepare_admitted_catalog_reset_source_atomic_swap(
+        path: impl AsRef<Path>,
+        expected_schema_version: u32,
+    ) -> Result<(), StateError> {
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|err| sqlite_open_error(path, err))?;
+        conn.pragma_update(None, "busy_timeout", 5000)
+            .map_err(|err| sqlite_error("set reset-source sqlite busy_timeout", err))?;
+        let actual_schema_version = conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .map_err(|err| sqlite_error("recheck reset-source sqlite user_version", err))?;
+        if actual_schema_version != expected_schema_version {
+            return Err(StateError::ConfigInvalid(format!(
+                "catalog reset source schema changed after admission from {expected_schema_version} to {actual_schema_version}; run preflight again"
+            )));
+        }
+        prepare_catalog_reset_atomic_swap_conn(&conn)
     }
 
     /// Index one fully replayed 3c committed state.
@@ -12331,6 +12429,68 @@ fn configure_read_only_sqlite(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+fn prepare_catalog_reset_atomic_swap_conn(conn: &Connection) -> Result<(), StateError> {
+    let (_busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = conn
+        .query_row("pragma wal_checkpoint(truncate)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|err| sqlite_error("checkpoint catalog reset sqlite WAL", err))?;
+    conn.pragma_update(None, "journal_mode", "DELETE")
+        .map_err(|err| sqlite_error("set catalog reset sqlite journal mode", err))?;
+    Ok(())
+}
+
+fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
+    let optional_u64 = |index, field| -> Result<Option<u64>, StateError> {
+        let value: Option<i64> = row_get(row, index, field)?;
+        value
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    StateError::IndexCorrupt(format!(
+                        "legacy catalog reset field {field} is negative"
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let optional_u32 = |index, field| -> Result<Option<u32>, StateError> {
+        optional_u64(index, field)?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    StateError::IndexCorrupt(format!(
+                        "legacy catalog reset field {field} exceeds u32"
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let assignment_generation =
+        optional_u64(10, "tapes.assignment_generation")?.ok_or_else(|| {
+            StateError::IndexCorrupt(
+                "legacy catalog reset assignment_generation is null".to_string(),
+            )
+        })?;
+    Ok(TapeRecord {
+        tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
+        voltag: row_get(row, 1, "tapes.voltag")?,
+        kind: row_get(row, 2, "tapes.kind")?,
+        pool_id: row_get(row, 3, "tapes.pool_id")?,
+        assignment_generation,
+        body_format: None,
+        block_size: optional_u64(5, "tapes.block_size")?,
+        scheme_id: row_get(row, 6, "tapes.scheme_id")?,
+        data_blocks_per_stripe: optional_u32(7, "tapes.data_blocks_per_stripe")?,
+        parity_blocks_per_stripe: optional_u32(8, "tapes.parity_blocks_per_stripe")?,
+        stripes_per_neighborhood: optional_u32(9, "tapes.stripes_per_neighborhood")?,
+        last_committed_tape_file: None,
+        total_committed_ordinals: 0,
+        written_extent_lba: None,
+        terminal_finalization: None,
+        state: row_get(row, 4, "tapes.state")?,
+        updated_at_utc: String::new(),
+    })
+}
+
 fn validate_schema(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
@@ -12344,7 +12504,7 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
         )));
     }
     Err(StateError::IndexMigrationFailed(format!(
-        "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; rebuild the catalog from its authoritative journals and audit log"
+        "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; ordinary startup will not rewrite it in place. To retain the catalog, restore or rebuild it with schema-{SCHEMA_VERSION}-compatible tooling; to intentionally discard a schema-16/17 catalog, use the catalog reset-preflight/reset funnel with an empty preserve list and an exact complete erase allowlist; older shapes require matching older tooling"
     )))
 }
 
@@ -12362,7 +12522,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
     }
     if current != 0 || database_has_user_tables(conn)? {
         return Err(StateError::IndexMigrationFailed(format!(
-            "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; rebuild the catalog from its authoritative journals and audit log"
+            "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; ordinary startup will not rewrite it in place. To retain the catalog, restore or rebuild it with schema-{SCHEMA_VERSION}-compatible tooling; to intentionally discard a schema-16/17 catalog, use the catalog reset-preflight/reset funnel with an empty preserve list and an exact complete erase allowlist; older shapes require matching older tooling"
         )));
     }
 
@@ -15349,7 +15509,7 @@ mod tests {
         let error = CatalogIndex::open(&path).expect_err("v12 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
-                if message.contains("rebuild the catalog")
+                if message.contains("restore or rebuild")
                     && message.contains(&SCHEMA_VERSION.to_string())),
             "{error}"
         );
@@ -15490,7 +15650,8 @@ mod tests {
         let error = CatalogIndex::open(&path).expect_err("v16 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
-                if message.contains("rebuild the catalog")
+                if message.contains("restore or rebuild")
+                    && message.contains("empty preserve list")
                     && message.contains(&SCHEMA_VERSION.to_string())),
             "{error}"
         );
@@ -15513,7 +15674,7 @@ mod tests {
         let error = CatalogIndex::open(&path).expect_err("v8 catalog must require rebuild");
         assert!(
             matches!(error, StateError::IndexMigrationFailed(ref message)
-                if message.contains("rebuild the catalog")
+                if message.contains("restore or rebuild")
                     && message.contains(&SCHEMA_VERSION.to_string())),
             "{error}"
         );
@@ -16729,10 +16890,9 @@ mod tests {
         let StateError::IndexMigrationFailed(message) = error else {
             panic!("expected migration failure, got {error}");
         };
-        assert_eq!(
-            message,
-            "sqlite user_version 17 predates the unsigned structural-index schema 18; rebuild the catalog from its authoritative journals and audit log"
-        );
+        assert!(message.contains("ordinary startup will not rewrite it in place"));
+        assert!(message.contains("empty preserve list"));
+        assert!(message.contains("exact complete erase allowlist"));
         let conn = Connection::open(&path).expect("reopen raw sqlite");
         let preserved: i64 = conn
             .query_row("select highest_protected_ordinal from tapes", [], |row| {

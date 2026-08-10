@@ -142,11 +142,11 @@ the daemon, catalog, or config.
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
-operator config, an advisory state lock, the append-only audit log, and
+operator config, an exclusive state lock, the append-only audit log, and
 the SQLite catalog. The catalog is explicitly a projection —
 `rebuild_index_from_journals` replays the audit log and per-tape
 journals to regenerate it, and opening it read-only refuses to migrate.
-Schema version 14 today, tracked in SQLite's `user_version`, with tables
+Schema version 18 today, tracked in SQLite's `user_version`, with tables
 for tapes, pools, tape files, objects/copies/files, catalog units,
 sessions, operations, idempotency keys, media-readiness records,
 tape-I/O fences, and the drive-stewardship set (drives, events, health
@@ -160,6 +160,15 @@ this ownership boundary by choosing another socket, and an offline mutator
 cannot race SQLite, checkpoint recovery, or the hash-chained audit log while
 the daemon is running. The lock is released automatically when its process
 dies; maintenance runbooks stop the daemon before acquiring it.
+
+Catalog reset has one typed admission funnel. A current catalog is inspected
+normally. A schema-16 or schema-17 clean-break predecessor may be inspected
+only for an empty-preserve, exact full-catalog erase: the reader enumerates
+every bound tape and refuses any label outside the erase allowlist. It cannot
+preserve legacy rows, does not migrate them, and binds the observed source
+schema and tape identities into the token that mutation rechecks under the
+same lock. This provides a safe path to a clean slate without weakening the
+ordinary clean-break refusal.
 
 The recovery/import boundary and its deliberately identity-only authority are
 described in [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).

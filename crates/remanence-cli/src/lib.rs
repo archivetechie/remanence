@@ -7309,6 +7309,7 @@ fn run_catalog_reset_preflight(
             let document = serde_json::json!({
                 "schema": "rem.catalog.reset-preflight.v1",
                 "ok": true,
+                "source_schema_version": report.source_schema_version,
                 "preflight_token": report.preflight_token,
                 "request_digest": report.request_digest,
                 "resume_exact": report.resume_exact,
@@ -19688,6 +19689,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             serde_json::from_slice(&out).expect("preflight JSON document");
         assert_eq!(document["schema"], "rem.catalog.reset-preflight.v1");
         assert_eq!(document["ok"], true);
+        assert_eq!(document["source_schema_version"], 18);
         assert_eq!(document["resume_exact"], false);
         assert_eq!(
             document["preflight_token"]
