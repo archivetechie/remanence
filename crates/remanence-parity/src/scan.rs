@@ -31,6 +31,7 @@ use crate::tape_index_replica::{
     derive_tape_index_replica_footer_magic, derive_tape_index_replica_header_magic,
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
 };
+use remanence_library::{scsi::decode_sense, TapeIoError};
 
 /// Catalog-supplied filemark map and protection watermark for a loaded tape.
 ///
@@ -521,7 +522,7 @@ fn scan_reconstruct_filemark_map_with_provenance(
                 source.locate_physical(measured.position_after)?;
                 saw_file = true;
             }
-            Err(_err) => {
+            Err(error) if scan_read_error_is_medium_damage(&error) => {
                 damaged_regions.push(ScanDamagedRegion {
                     start: file_start,
                     block_count: 1,
@@ -555,6 +556,7 @@ fn scan_reconstruct_filemark_map_with_provenance(
                 source.locate_physical(measured.position_after)?;
                 saw_file = true;
             }
+            Err(error) => return Err(error),
         }
     }
 
@@ -1015,8 +1017,18 @@ fn read_optional_fixed_block_at(
         Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block_size_usize => Ok(Some(buf)),
         Ok(RawReadOutcome::Block { .. })
         | Ok(RawReadOutcome::Filemark { .. })
-        | Ok(RawReadOutcome::EndOfData { .. })
-        | Err(_) => Ok(None),
+        | Ok(RawReadOutcome::EndOfData { .. }) => Ok(None),
+        Err(error) if scan_read_error_is_medium_damage(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn scan_read_error_is_medium_damage(error: &ParityError) -> bool {
+    match error {
+        ParityError::TapeIo(TapeIoError::CheckCondition(
+            remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
+        )) => decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03),
+        _ => false,
     }
 }
 
@@ -1526,7 +1538,42 @@ mod tests {
     enum Record {
         Block(Vec<u8>),
         Filemark,
-        Unreadable,
+        ReadFault(TestReadFault),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum TestReadFault {
+        Medium,
+        Hardware,
+        Transport,
+    }
+
+    impl TestReadFault {
+        fn error(self) -> ParityError {
+            ParityError::TapeIo(match self {
+                Self::Medium => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x03, 0x11, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::Hardware => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x04, 0x44, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::Transport => {
+                    TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
+                        status: 0,
+                        host_status: 0,
+                        driver_status: 0x06,
+                        info: 1,
+                        sense: Vec::new(),
+                    })
+                }
+            })
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1636,11 +1683,7 @@ mod tests {
                         position_after: PhysicalPositionHint::new(self.cursor as u64),
                     })
                 }
-                Record::Unreadable => Err(remanence_library::TapeIoError::ReadBufferTooSmall {
-                    actual: BLOCK_SIZE,
-                    provided: BLOCK_SIZE / 2,
-                }
-                .into()),
+                Record::ReadFault(fault) => Err(fault.error()),
             }
         }
 
@@ -1749,6 +1792,93 @@ mod tests {
             measured,
             MeasureCurrentFileOutcome::Truncated(ScanTailTruncationKind::ZeroBlockFile)
         );
+    }
+
+    #[test]
+    fn scanner_degrades_only_medium_errors_at_tape_file_heads() {
+        let bot_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .expect("BOT-only map validates");
+        let bot = bootstrap_block(bot_map.digest(false).expect("BOT digest"), 0);
+        let mut medium_source = RecordingRawSource::new(vec![
+            Record::Block(bot.clone()),
+            Record::Filemark,
+            Record::ReadFault(TestReadFault::Medium),
+            Record::Filemark,
+        ]);
+
+        let walked =
+            scan_reconstruct_filemark_map_with_report(&mut medium_source, &TAPE_UUID, BLOCK_SIZE)
+                .expect("a SCSI medium error is retained as physical damage");
+        assert_eq!(walked.map.entries()[1].kind, TapeFileKind::Object);
+        assert!(walked.damaged_regions.iter().any(|region| {
+            region.start.lba == 2 && region.kind == ScanDamageKind::UnreadableTapeFileHead
+        }));
+
+        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+            let mut source = RecordingRawSource::new(vec![
+                Record::Block(bot.clone()),
+                Record::Filemark,
+                Record::ReadFault(fault),
+                Record::Filemark,
+            ]);
+            let error =
+                scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                    .expect_err("non-medium head failures must abort the structural walk");
+            match fault {
+                TestReadFault::Hardware => assert!(matches!(
+                    error,
+                    ParityError::TapeIo(TapeIoError::CheckCondition(_))
+                )),
+                TestReadFault::Transport => assert!(matches!(
+                    error,
+                    ParityError::TapeIo(TapeIoError::Transport(_))
+                )),
+                TestReadFault::Medium => unreachable!("medium case was tested separately"),
+            }
+        }
+    }
+
+    #[test]
+    fn scanner_degrades_only_medium_errors_during_optional_tail_probes() {
+        let bot_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .expect("BOT-only map validates");
+        let bot = bootstrap_block(bot_map.digest(false).expect("BOT digest"), 0);
+        let records_for = |fault| {
+            vec![
+                Record::Block(bot.clone()),
+                Record::Filemark,
+                Record::Block(block(0xA5)),
+                Record::ReadFault(fault),
+                Record::Filemark,
+            ]
+        };
+        let mut medium_source = RecordingRawSource::new(records_for(TestReadFault::Medium));
+
+        let walked =
+            scan_reconstruct_filemark_map_with_report(&mut medium_source, &TAPE_UUID, BLOCK_SIZE)
+                .expect("a medium-damaged optional footer remains unclassified Object evidence");
+        assert_eq!(walked.map.entries()[1].kind, TapeFileKind::Object);
+        assert_eq!(walked.map.entries()[1].block_count, 2);
+
+        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+            let mut source = RecordingRawSource::new(records_for(fault));
+            let error =
+                scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                    .expect_err(
+                        "non-medium optional-probe failures must abort the structural walk",
+                    );
+            match fault {
+                TestReadFault::Hardware => assert!(matches!(
+                    error,
+                    ParityError::TapeIo(TapeIoError::CheckCondition(_))
+                )),
+                TestReadFault::Transport => assert!(matches!(
+                    error,
+                    ParityError::TapeIo(TapeIoError::Transport(_))
+                )),
+                TestReadFault::Medium => unreachable!("medium case was tested separately"),
+            }
+        }
     }
 
     fn encode_test_parity_map(
@@ -1866,7 +1996,11 @@ mod tests {
             Record::Filemark,
         ]);
         records.extend(second_parity_map.blocks.into_iter().map(Record::Block));
-        records.extend([Record::Filemark, Record::Unreadable, Record::Filemark]);
+        records.extend([
+            Record::Filemark,
+            Record::ReadFault(TestReadFault::Medium),
+            Record::Filemark,
+        ]);
         (records, first_map, second_map, authoritative_bootstrap)
     }
 

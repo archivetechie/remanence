@@ -902,19 +902,23 @@ fn reject_readable_foreign_bot_bootstrap(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<(), BotStructuralRecoveryError> {
-    if source.configure_fixed_block_size(block_size).is_err()
-        || source
-            .locate_physical(PhysicalPositionHint::new(0))
-            .is_err()
-    {
-        return Ok(());
-    }
-    let Ok(block_size) = usize::try_from(block_size) else {
-        return Ok(());
-    };
+    source
+        .configure_fixed_block_size(block_size)
+        .map_err(|error| bot_bootstrap_source_error("configure fixed block size", error))?;
+    source
+        .locate_physical(PhysicalPositionHint::new(0))
+        .map_err(|error| bot_bootstrap_source_error("locate BOT Bootstrap", error))?;
+    let block_size = usize::try_from(block_size).map_err(|_| {
+        BotStructuralRecoveryError::ArithmeticOverflow {
+            context: "BOT Bootstrap probe block size",
+        }
+    })?;
     let mut block = vec![0; block_size];
-    let Ok(RawReadOutcome::Block { bytes, .. }) = source.read_record(&mut block) else {
-        return Ok(());
+    let bytes = match source.read_record(&mut block) {
+        Ok(RawReadOutcome::Block { bytes, .. }) => bytes,
+        Ok(RawReadOutcome::Filemark { .. } | RawReadOutcome::EndOfData { .. }) => return Ok(()),
+        Err(error) if terminal_source_error_is_medium_damage(&error) => return Ok(()),
+        Err(error) => return Err(bot_bootstrap_source_error("read BOT Bootstrap", error)),
     };
     if bytes != block_size {
         return Ok(());
@@ -925,6 +929,15 @@ fn reject_readable_foreign_bot_bootstrap(
         }
     }
     Ok(())
+}
+
+fn bot_bootstrap_source_error(
+    operation: &'static str,
+    error: ParityError,
+) -> BotStructuralRecoveryError {
+    BotStructuralRecoveryError::Scan {
+        message: format!("{operation}: {error}"),
+    }
 }
 
 fn checked_recovery_increment(
@@ -1210,8 +1223,11 @@ fn verify_terminal_index_after_damage(
         }
     }
 
-    let separations = std::array::from_fn(|index| {
-        let ordinal = u16::try_from(index + 1).expect("two separation ordinals fit u16");
+    let mut separations = std::array::from_fn(|_| TerminalSeparationEvidence::Invalid {
+        detail: "separation verification was not attempted".to_string(),
+    });
+    for ordinal in 1..=crate::terminal_tail::TERMINAL_INDEX_SEPARATION_COUNT {
+        let index = usize::from(ordinal - 1);
         match verify_separation_full(
             source,
             tape_uuid,
@@ -1220,14 +1236,19 @@ fn verify_terminal_index_after_damage(
             ordinal,
             edition.descriptor.edition_id,
         ) {
-            Ok(interior_record_count) => TerminalSeparationEvidence::Valid {
-                interior_record_count,
-            },
-            Err(error) => TerminalSeparationEvidence::Invalid {
-                detail: error.to_string(),
-            },
+            Ok(interior_record_count) => {
+                separations[index] = TerminalSeparationEvidence::Valid {
+                    interior_record_count,
+                };
+            }
+            Err(error @ TerminalIndexVerificationError::Separation { .. }) => {
+                separations[index] = TerminalSeparationEvidence::Invalid {
+                    detail: error.to_string(),
+                };
+            }
+            Err(error) => return Err(error),
         }
-    });
+    }
     let all_replicas_valid = replicas
         .iter()
         .all(|evidence| matches!(evidence, TerminalReplicaEvidence::Valid { .. }));
@@ -2122,13 +2143,17 @@ fn member_read_error(
 }
 
 fn terminal_candidate_error_is_damage(error: &ParityError) -> bool {
-    match error {
+    terminal_source_error_is_medium_damage(error)
+        || matches!(error, ParityError::TapeIndexReplica(_))
+}
+
+fn terminal_source_error_is_medium_damage(error: &ParityError) -> bool {
+    matches!(
+        error,
         ParityError::TapeIo(TapeIoError::CheckCondition(
             remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-        )) => decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03),
-        ParityError::TapeIndexReplica(_) => true,
-        _ => false,
-    }
+        )) if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03)
+    )
 }
 
 fn selected_member_error(
@@ -2288,6 +2313,8 @@ mod tests {
         read_lbas: Vec<u64>,
         eod_calls: u64,
         read_fault: Option<(u64, TestReadFault)>,
+        configure_fault: Option<TestReadFault>,
+        locate_fault: Option<(u64, TestReadFault)>,
     }
 
     #[derive(Clone, Copy)]
@@ -2295,6 +2322,34 @@ mod tests {
         Medium,
         Hardware,
         Transport,
+    }
+
+    impl TestReadFault {
+        fn error(self) -> ParityError {
+            ParityError::TapeIo(match self {
+                Self::Medium => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x03, 0x11, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::Hardware => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x04, 0x44, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::Transport => {
+                    TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
+                        status: 0,
+                        host_status: 0,
+                        driver_status: 0x06,
+                        info: 1,
+                        sense: Vec::new(),
+                    })
+                }
+            })
+        }
     }
 
     impl RecordingSource {
@@ -2305,6 +2360,8 @@ mod tests {
                 read_lbas: Vec::new(),
                 eod_calls: 0,
                 read_fault: None,
+                configure_fault: None,
+                locate_fault: None,
             }
         }
 
@@ -2312,10 +2369,23 @@ mod tests {
             self.read_fault = Some((lba, fault));
             self
         }
+
+        fn with_configure_fault(mut self, fault: TestReadFault) -> Self {
+            self.configure_fault = Some(fault);
+            self
+        }
+
+        fn with_locate_fault(mut self, lba: u64, fault: TestReadFault) -> Self {
+            self.locate_fault = Some((lba, fault));
+            self
+        }
     }
 
     impl RawTapeSource for RecordingSource {
         fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+            if let Some(fault) = self.configure_fault {
+                return Err(fault.error());
+            }
             if block_size != BLOCK_SIZE {
                 return Err(ParityError::Invariant("unexpected test block size"));
             }
@@ -2323,6 +2393,11 @@ mod tests {
         }
 
         fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            if let Some((fault_lba, fault)) = self.locate_fault {
+                if fault_lba == hint.lba {
+                    return Err(fault.error());
+                }
+            }
             if hint.partition != 0 {
                 return Err(ParityError::Invariant("unexpected test partition"));
             }
@@ -2380,29 +2455,7 @@ mod tests {
             self.read_lbas.push(lba);
             if let Some((fault_lba, fault)) = self.read_fault {
                 if fault_lba == lba {
-                    return Err(ParityError::TapeIo(match fault {
-                        TestReadFault::Medium => TapeIoError::CheckCondition(
-                            remanence_library::scsi::ScsiError::CheckCondition {
-                                sense: vec![0x72, 0x03, 0x11, 0x00],
-                                bytes_transferred: 0,
-                            },
-                        ),
-                        TestReadFault::Hardware => TapeIoError::CheckCondition(
-                            remanence_library::scsi::ScsiError::CheckCondition {
-                                sense: vec![0x72, 0x04, 0x44, 0x00],
-                                bytes_transferred: 0,
-                            },
-                        ),
-                        TestReadFault::Transport => TapeIoError::Transport(
-                            remanence_library::scsi::ScsiError::TransportError {
-                                status: 0,
-                                host_status: 0,
-                                driver_status: 0x06,
-                                info: 1,
-                                sense: Vec::new(),
-                            },
-                        ),
-                    }));
+                    return Err(fault.error());
                 }
             }
             let Some(record) = self.records.get(self.cursor) else {
@@ -2792,6 +2845,59 @@ mod tests {
     }
 
     #[test]
+    fn full_verify_after_replica_damage_keeps_medium_separation_damage_typed() {
+        let mut fixture = triple_fixture();
+        corrupt_replica_payload(&mut fixture, 1);
+        let separation_lba = fixture
+            .layout
+            .separation(1)
+            .expect("AB separation")
+            .planned_start_lba
+            .checked_add(1)
+            .expect("AB separation interior LBA");
+        let mut source = RecordingSource::new(fixture.records)
+            .with_read_fault(separation_lba, TestReadFault::Medium);
+
+        let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("medium damage remains typed degraded evidence");
+        assert!(matches!(
+            outcome,
+            TerminalIndexVerificationOutcome::VerifiedDegraded(verification)
+                if matches!(
+                    verification.separations[0],
+                    TerminalSeparationEvidence::Invalid { .. }
+                )
+        ));
+    }
+
+    #[test]
+    fn full_verify_after_replica_damage_propagates_non_medium_separation_failures() {
+        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+            let mut fixture = triple_fixture();
+            corrupt_replica_payload(&mut fixture, 1);
+            let separation_lba = fixture
+                .layout
+                .separation(1)
+                .expect("AB separation")
+                .planned_start_lba
+                .checked_add(1)
+                .expect("AB separation interior LBA");
+            let mut source =
+                RecordingSource::new(fixture.records).with_read_fault(separation_lba, fault);
+
+            let error = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                .expect_err("non-medium separation failure must abort degraded verification");
+            assert!(matches!(
+                error,
+                TerminalIndexVerificationError::Source {
+                    operation: "read terminal separation interior",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
     fn full_verify_reports_nonzero_separation_interior_as_degraded() {
         let mut fixture = triple_fixture();
         corrupt_separation_interior(&mut fixture, 2);
@@ -2940,6 +3046,92 @@ mod tests {
             error,
             BotStructuralRecoveryError::TapeIdentityMismatch
         ));
+    }
+
+    #[test]
+    fn bot_bootstrap_probe_preserves_absence_and_medium_damage() {
+        let records = vec![Record::Block(bot_bootstrap()), Record::Filemark];
+        let mut sources = [
+            RecordingSource::new(records).with_read_fault(0, TestReadFault::Medium),
+            RecordingSource::new(Vec::new()),
+        ];
+
+        for source in &mut sources {
+            reject_readable_foreign_bot_bootstrap(source, &TAPE_UUID, BLOCK_SIZE)
+                .expect("absence or medium damage does not prove a foreign Bootstrap");
+        }
+    }
+
+    #[test]
+    fn bot_bootstrap_probe_propagates_positioning_and_non_medium_read_failures() {
+        for fault in [
+            TestReadFault::Medium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
+            let records = vec![Record::Block(bot_bootstrap()), Record::Filemark];
+            let mut configure_source =
+                RecordingSource::new(records.clone()).with_configure_fault(fault);
+            let error = reject_readable_foreign_bot_bootstrap(
+                &mut configure_source,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect_err("non-medium configure failure must abort BOT recovery");
+            assert!(matches!(
+                error,
+                BotStructuralRecoveryError::Scan { message }
+                    if message.contains("configure fixed block size")
+            ));
+
+            let mut locate_source =
+                RecordingSource::new(records.clone()).with_locate_fault(0, fault);
+            let error =
+                reject_readable_foreign_bot_bootstrap(&mut locate_source, &TAPE_UUID, BLOCK_SIZE)
+                    .expect_err("non-medium locate failure must abort BOT recovery");
+            assert!(matches!(
+                error,
+                BotStructuralRecoveryError::Scan { message }
+                    if message.contains("locate BOT Bootstrap")
+            ));
+        }
+
+        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+            let records = vec![Record::Block(bot_bootstrap()), Record::Filemark];
+            let mut read_source = RecordingSource::new(records).with_read_fault(0, fault);
+            let error =
+                reject_readable_foreign_bot_bootstrap(&mut read_source, &TAPE_UUID, BLOCK_SIZE)
+                    .expect_err("non-medium read failure must abort BOT recovery");
+            assert!(matches!(
+                error,
+                BotStructuralRecoveryError::Scan { message }
+                    if message.contains("read BOT Bootstrap")
+            ));
+        }
+    }
+
+    #[test]
+    fn full_verify_bot_head_faults_only_degrade_medium_errors() {
+        let fixture = triple_fixture();
+        let mut medium_source =
+            RecordingSource::new(fixture.records.clone()).with_read_fault(0, TestReadFault::Medium);
+        let medium_outcome = verify_terminal_index_full(&mut medium_source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("BOT medium damage remains a typed recovery outcome");
+        assert!(matches!(
+            medium_outcome,
+            TerminalIndexVerificationOutcome::RecoveryRequired(_)
+        ));
+
+        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+            let mut source =
+                RecordingSource::new(fixture.records.clone()).with_read_fault(0, fault);
+            let error = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                .expect_err("non-medium BOT source failure must abort full verification");
+            assert!(matches!(
+                error,
+                TerminalIndexVerificationError::PrefixWalk { .. }
+            ));
+        }
     }
 
     #[test]
