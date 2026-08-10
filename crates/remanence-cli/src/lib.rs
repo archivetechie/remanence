@@ -16976,7 +16976,7 @@ mod tests {
 
     #[test]
     fn tape_json_preserves_assignment_generation_and_new_lifecycle_states() {
-        let tape = pb::Tape {
+        let mut tape = pb::Tape {
             assignment_generation: 11,
             state: pb::tape::State::TapeStateRecoveryRequired as i32,
             ..pb::Tape::default()
@@ -16984,6 +16984,8 @@ mod tests {
         let rendered = tape_json(&tape);
         assert_eq!(rendered["assignment_generation"], 11);
         assert_eq!(rendered["state"], "recovery_required");
+        tape.state = pb::tape::State::TapeStateRetired as i32;
+        assert_eq!(tape_json(&tape)["state"], "retired");
     }
 
     #[derive(Default)]
