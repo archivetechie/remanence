@@ -190,6 +190,16 @@ media motion. A matching cut durably fsyncs one evidence record before abort;
 the assignment-race variant uses the catalog's conditional generation update
 and then lets the normal FinalizeTape reread reject before Finalizing.
 
+The system WOR acceptance scenario has a separate private cut at a completed
+Object-body write-command boundary. It is inert unless
+`REM_WOR_OBJECT_FAULT_ENABLE=whole-object-recovery-v1-abort` and
+`REM_WOR_OBJECT_FAULT_PLAN` are both present. The exact-tape, exact-caller plan
+and its durable one-shot evidence must be confined beneath
+`/tmp/system-harness/scenario-wor/object-faults`. Malformed, unconfined, stale,
+or cross-object plans fail closed. This is a scenario seam, not an operator
+recovery control; ordinary production recovery uses checkpoint EOD and a
+whole-Object source replay.
+
 `[[tape_pool_rules]]` maps barcodes to pools by prefix. Prefixes are ASCII
 alphanumeric, matched case-insensitively, longest match wins, and each
 `pool_id` must reference a defined pool:

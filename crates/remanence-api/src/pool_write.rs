@@ -20,12 +20,14 @@ use std::time::{Duration, Instant};
 
 use remanence_aead::{RecipientPublicKey, SealReport};
 use remanence_format::{
-    write_encrypted_rem_object_from_readers, write_rem_tar_object_from_readers, RemTarFileLayout,
-    RemTarFileSpec, RemTarFileStream, RemTarObjectOptions, FORMAT_ID,
+    stream_rem_tar_object, write_encrypted_rem_object_from_readers,
+    write_rem_tar_object_from_readers, FormatError, MetadataPreservation, RemTarEntrySink,
+    RemTarEntryType, RemTarFileLayout, RemTarFileSpec, RemTarFileStream, RemTarObjectOptions,
+    RemTarStreamEntry, FORMAT_ID, MANIFEST_PATH,
 };
 use remanence_library::{
-    BlockSink, BlockSource, PipelinedWriteDiagnostics, TapeIoError, TapePosition, VecBlockSink,
-    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    BlockSink, BlockSource, FileBlockSource, PipelinedWriteDiagnostics, TapeIoError, TapePosition,
+    VecBlockSink, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
 use remanence_parity::{
     bootstrap::{parse_bootstrap_block, write_bootstrap_block},
@@ -307,6 +309,16 @@ pub enum PoolWriteRepresentation {
     },
 }
 
+/// Interpretation of the bytes supplied for one pool write.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum WriteObjectInputKind {
+    /// One logical regular file which the daemon wraps as a REM object.
+    #[default]
+    LogicalFile,
+    /// An already-built canonical plaintext REM object written byte-for-byte.
+    CanonicalPlaintextRemObject,
+}
+
 /// Live plaintext source metadata and reader supplied by the append RPC.
 pub struct StreamedWriteSource {
     reader: Arc<Mutex<Box<dyn Read + Send>>>,
@@ -403,8 +415,12 @@ pub struct WriteObjectToPoolRequest {
     pub caller_object_id: String,
     /// Optional caller-supplied payload SHA-256 that must match before tape I/O.
     pub expected_content_sha256: Option<[u8; 32]>,
+    /// Optional embedded object UUID guard for canonical-object ingestion.
+    pub expected_object_id: Option<[u8; 16]>,
     /// Stored representation to write to tape.
     pub representation: PoolWriteRepresentation,
+    /// Whether `source` is a logical file or a complete canonical object.
+    pub input_kind: WriteObjectInputKind,
 }
 
 /// One object record returned by the reusable pool-targeted write core.
@@ -2568,7 +2584,9 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
     let stored = prepare_stored_object(&prepared, &request.representation)?;
     let capacity_blocks = parity_capacity_basis_blocks(state, pool_cfg, &selected)?;
     let projected_object_blocks = match &stored {
-        PreparedStoredObject::Plaintext => prepared.plan.layout.projected_size_blocks,
+        PreparedStoredObject::Plaintext | PreparedStoredObject::CanonicalPlaintext => {
+            prepared.plan.layout.projected_size_blocks
+        }
         PreparedStoredObject::Encrypted(encrypted) => encrypted.envelope.stored_size_blocks,
     };
     let mut plaintext_readers = if matches!(&stored, PreparedStoredObject::Plaintext) {
@@ -2629,6 +2647,12 @@ pub(crate) fn write_batched_parity_to_selected_tape_after_replay_check(
             )
             .map_err(PoolWriteError::from)
         }
+        PreparedStoredObject::CanonicalPlaintext => write_canonical_plaintext_object_to_parity(
+            &mut parity,
+            selected.tape_uuid,
+            &prepared,
+            capacity,
+        ),
         PreparedStoredObject::Encrypted(encrypted) => write_encrypted_object_to_parity(
             &mut parity,
             selected.tape_uuid,
@@ -3859,6 +3883,7 @@ where
     .result
 }
 
+#[cfg(test)]
 fn run_counted_fenced_staged_transfer<S, R>(
     state: &mut CatalogIndex,
     selected: &SelectedTape,
@@ -3888,6 +3913,48 @@ where
                 &error,
             )
         })?;
+    inner.stats.record_staging(&outcome.staging_diagnostics);
+    outcome.result
+}
+
+fn run_faulted_counted_fenced_staged_transfer<S, R>(
+    state: &mut CatalogIndex,
+    selected: &SelectedTape,
+    inner: &mut CountingBlockSink<'_, S>,
+    block_size: usize,
+    overlap_control: Option<Arc<crate::append_ring::AppendRingControl>>,
+    fault: Option<&crate::object_fault::ObjectFaultPlan>,
+    producer: impl FnOnce(&mut dyn BlockSink) -> Result<R, PoolWriteError> + Send,
+) -> Result<R, PoolWriteError>
+where
+    S: BlockSink + ?Sized,
+    R: Send,
+{
+    let tape_write_control = overlap_control.as_ref().map(Arc::clone);
+    let outcome = {
+        let mut faulting = crate::object_fault::ObjectFaultSink::new(inner, fault);
+        run_ring_staged_transfer(
+            &mut faulting,
+            block_size,
+            producer,
+            tape_write_control,
+            |error| {
+                if overlap_control
+                    .as_ref()
+                    .is_some_and(|control| !control.tape_started())
+                {
+                    return Ok(());
+                }
+                let error = error.to_string();
+                record_tape_io_fence_for_transfer_error(
+                    state,
+                    selected,
+                    tape_io_fence_reason_for_transfer_error(&error),
+                    &error,
+                )
+            },
+        )?
+    };
     inner.stats.record_staging(&outcome.staging_diagnostics);
     outcome.result
 }
@@ -5096,6 +5163,24 @@ fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                                 capacity,
                             )?)
                         }
+                        PreparedStoredObject::CanonicalPlaintext => {
+                            let capacity = reserve_parity_object_capacity(
+                                parity.terminal_triple_capacity_runtime_state()?,
+                                parity.scheme(),
+                                &selected,
+                                (pool_cfg, 1, 0),
+                                capacity_blocks,
+                                prepared.plan.layout.projected_size_blocks,
+                                &io_memory,
+                            )?;
+                            let (capacity, _spool_permit) = capacity.into_parts();
+                            write_canonical_plaintext_object_to_parity(
+                                &mut parity,
+                                tape_uuid,
+                                &prepared,
+                                capacity,
+                            )
+                        }
                         PreparedStoredObject::Encrypted(encrypted) => {
                             let capacity = reserve_parity_object_capacity(
                                 parity.terminal_triple_capacity_runtime_state()?,
@@ -5226,14 +5311,26 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
     };
     let expected_initial_lba = append.expected_append_lba()?;
     let overlap_control = prepared.overlap_control();
+    let object_fault = crate::object_fault::ObjectFaultPlan::from_env_for_object(
+        selected.tape_uuid,
+        &request.caller_object_id,
+    )
+    .map_err(PoolWriteError::InvalidInput)?;
+    if object_fault.is_some() && append.fresh_tape {
+        return Err(PoolWriteError::InvalidInput(
+            "WOR object fault requires a prior committed checkpoint so its record count is object-relative"
+                .to_string(),
+        ));
+    }
     let transfer_started = Instant::now();
     let write_report: Result<StreamingObjectWriteReport, PoolWriteError> =
-        run_counted_fenced_staged_transfer(
+        run_faulted_counted_fenced_staged_transfer(
             state,
             &selected,
             sink,
             selected.block_size as usize,
             overlap_control.as_ref().map(Arc::clone),
+            object_fault.as_ref(),
             |staged| {
                 with_overlap_sink(staged, overlap_control, expected_initial_lba, |gated| {
                     match &durability {
@@ -5296,6 +5393,23 @@ fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                                 tape_uuid,
                                 &prepared,
                                 layout,
+                                object_digest,
+                                filemark_outcome,
+                                append,
+                            )
+                        }
+                        PreparedStoredObject::CanonicalPlaintext => {
+                            let object_digest = write_canonical_plaintext_blocks(gated, &prepared)?;
+                            let filemark_outcome = write_object_delimiter(
+                                gated,
+                                &durability,
+                                append,
+                                prepared.plan.layout.projected_size_blocks,
+                            )?;
+                            no_parity_write_report(
+                                tape_uuid,
+                                &prepared,
+                                prepared.plan.layout.clone(),
                                 object_digest,
                                 filemark_outcome,
                                 append,
@@ -5777,6 +5891,7 @@ pub(crate) fn maybe_replay_pool_write(
     pool_cfg: &TapePoolConfig,
     request: &WriteObjectToPoolRequest,
 ) -> Result<Option<PoolWriteResult>, PoolWriteError> {
+    validate_input_kind_guards(request)?;
     if request.caller_object_id.trim().is_empty() {
         return Ok(None);
     }
@@ -5787,6 +5902,21 @@ pub(crate) fn maybe_replay_pool_write(
     else {
         return Ok(None);
     };
+    if let Some(expected_object_id) = request.expected_object_id {
+        let existing_object_id = Uuid::parse_str(&existing.object_id).map_err(|error| {
+            replay_object_invalid(
+                &existing.object_id,
+                format!("object_id is not a UUID: {error}"),
+            )
+        })?;
+        if existing_object_id.as_bytes() != &expected_object_id {
+            return Err(PoolWriteError::InvalidInput(format!(
+                "canonical plaintext REM object replay identity mismatch: committed={}, expected={}",
+                existing_object_id,
+                Uuid::from_bytes(expected_object_id)
+            )));
+        }
+    }
     let _ = request.source.size_bytes()?;
     let requested_hash = request.source.content_sha256()?;
     if let Some(expected) = request.expected_content_sha256 {
@@ -5926,7 +6056,7 @@ struct PreparedPoolObject {
 impl PreparedPoolObject {
     fn overlap_control(&self) -> Option<Arc<crate::append_ring::AppendRingControl>> {
         match &self.source {
-            PreparedPoolSource::Paths => None,
+            PreparedPoolSource::Paths | PreparedPoolSource::CanonicalPath(_) => None,
             PreparedPoolSource::Streamed { control, .. } => Some(Arc::clone(control)),
         }
     }
@@ -5934,6 +6064,7 @@ impl PreparedPoolObject {
 
 enum PreparedPoolSource {
     Paths,
+    CanonicalPath(PathBuf),
     Streamed {
         reader: Arc<Mutex<Box<dyn Read + Send>>>,
         control: Arc<crate::append_ring::AppendRingControl>,
@@ -5953,6 +6084,7 @@ struct PreparedEncryptedPoolObject {
 
 enum PreparedStoredObject {
     Plaintext,
+    CanonicalPlaintext,
     Encrypted(Box<PreparedEncryptedPoolObject>),
 }
 
@@ -5960,20 +6092,21 @@ impl PreparedStoredObject {
     fn projected_size_blocks(&self, prepared: &PreparedPoolObject) -> u64 {
         match self {
             Self::Plaintext => prepared.plan.layout.projected_size_blocks,
+            Self::CanonicalPlaintext => prepared.plan.layout.projected_size_blocks,
             Self::Encrypted(encrypted) => encrypted.envelope.stored_size_blocks,
         }
     }
 
     fn representation_label(&self) -> &'static str {
         match self {
-            Self::Plaintext => OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+            Self::Plaintext | Self::CanonicalPlaintext => OBJECT_COPY_REPRESENTATION_PLAINTEXT,
             Self::Encrypted(_) => OBJECT_COPY_REPRESENTATION_ENCRYPTED,
         }
     }
 
     fn copy_representation(&self) -> CopyRepresentation {
         match self {
-            Self::Plaintext => CopyRepresentation::plaintext(),
+            Self::Plaintext | Self::CanonicalPlaintext => CopyRepresentation::plaintext(),
             Self::Encrypted(encrypted) => CopyRepresentation::encrypted(&encrypted.envelope),
         }
     }
@@ -6166,6 +6299,10 @@ fn prepare_pool_object(
     request: &WriteObjectToPoolRequest,
     block_size: u32,
 ) -> Result<PreparedPoolObject, PoolWriteError> {
+    validate_input_kind_guards(request)?;
+    if request.input_kind == WriteObjectInputKind::CanonicalPlaintextRemObject {
+        return prepare_canonical_plaintext_pool_object(request, block_size);
+    }
     let content_sha256 = request.source.content_sha256()?;
     let object_uuid = Uuid::new_v4();
     let object_id = object_uuid.to_string();
@@ -6227,12 +6364,275 @@ fn prepare_pool_object(
     })
 }
 
+fn validate_input_kind_guards(request: &WriteObjectToPoolRequest) -> Result<(), PoolWriteError> {
+    match (request.input_kind, request.expected_object_id) {
+        (WriteObjectInputKind::LogicalFile, Some(_)) => Err(PoolWriteError::InvalidInput(
+            "expected_object_id is valid only for canonical plaintext REM object ingestion"
+                .to_string(),
+        )),
+        (WriteObjectInputKind::CanonicalPlaintextRemObject, None) => {
+            Err(PoolWriteError::InvalidInput(
+                "canonical plaintext REM object ingestion requires expected_object_id".to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Default)]
+struct ValidateCanonicalEntrySink;
+
+impl RemTarEntrySink for ValidateCanonicalEntrySink {
+    fn begin_file(&mut self, _entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn write_file_data(&mut self, _bytes: &[u8]) -> Result<(), FormatError> {
+        Ok(())
+    }
+
+    fn end_file(&mut self, _entry: &RemTarStreamEntry) -> Result<(), FormatError> {
+        Ok(())
+    }
+}
+
+fn prepare_canonical_plaintext_pool_object(
+    request: &WriteObjectToPoolRequest,
+    block_size: u32,
+) -> Result<PreparedPoolObject, PoolWriteError> {
+    if !matches!(request.representation, PoolWriteRepresentation::Plaintext) {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM objects cannot request envelope encryption".to_string(),
+        ));
+    }
+    let source_path = match &request.source {
+        WriteObjectSource::Path(path) => path,
+        WriteObjectSource::Streamed(_) => {
+            return Err(PoolWriteError::InvalidInput(
+                "canonical plaintext REM objects require a completed spool".to_string(),
+            ));
+        }
+    };
+    let source_size = source_file_size(source_path)?;
+    if source_size == 0 || source_size % u64::from(block_size) != 0 {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "canonical plaintext REM object size {source_size} is not a nonzero multiple of selected block size {block_size}"
+        )));
+    }
+    let block_count = source_size / u64::from(block_size);
+    let mut source = FileBlockSource::open(source_path, block_size as usize)?;
+    let mut entry_sink = ValidateCanonicalEntrySink;
+    let report = stream_rem_tar_object(
+        &mut source,
+        block_size as usize,
+        block_count,
+        &mut entry_sink,
+    )
+    .map_err(StreamingError::from)?;
+    if !report.warnings.is_empty()
+        || !report.digest_mismatches.is_empty()
+        || report.manifest_cbor.is_none()
+    {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM object requires a valid final manifest and no integrity warnings"
+                .to_string(),
+        ));
+    }
+
+    let required_global = |key: &str| {
+        report
+            .global_pax
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                PoolWriteError::InvalidInput(format!(
+                    "canonical plaintext REM object is missing {key}"
+                ))
+            })
+    };
+    let object_id = required_global("REMANENCE.object_id")?;
+    let object_uuid = Uuid::parse_str(&object_id).map_err(|error| {
+        PoolWriteError::InvalidInput(format!(
+            "canonical plaintext REM object_id must be a UUID: {error}"
+        ))
+    })?;
+    if object_uuid.to_string() != object_id {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM object_id must be canonical lowercase UUID text".to_string(),
+        ));
+    }
+    if let Some(expected_object_id) = request.expected_object_id {
+        if object_uuid.as_bytes() != &expected_object_id {
+            return Err(PoolWriteError::InvalidInput(format!(
+                "canonical plaintext REM object_id mismatch: embedded={}, expected={}",
+                object_uuid,
+                Uuid::from_bytes(expected_object_id)
+            )));
+        }
+    }
+    let embedded_caller_object_id = required_global("REMANENCE.caller_object_id")?;
+    if embedded_caller_object_id != request.caller_object_id {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "canonical plaintext REM caller_object_id mismatch: embedded={embedded_caller_object_id:?}, requested={:?}",
+            request.caller_object_id
+        )));
+    }
+    let write_timestamp = required_global("REMANENCE.write_timestamp")?;
+    OffsetDateTime::parse(&write_timestamp, &Rfc3339).map_err(|error| {
+        PoolWriteError::InvalidInput(format!(
+            "canonical plaintext REM write_timestamp is invalid: {error}"
+        ))
+    })?;
+    let metadata_preservation = match required_global("REMANENCE.metadata_preservation")?.as_str() {
+        "minimal" => MetadataPreservation::Minimal,
+        "archival" => MetadataPreservation::Archival,
+        "full" => MetadataPreservation::Full,
+        other => {
+            return Err(PoolWriteError::InvalidInput(format!(
+                "unsupported canonical plaintext REM metadata_preservation {other:?}"
+            )));
+        }
+    };
+
+    let manifest_entry = report
+        .entries
+        .iter()
+        .find(|entry| entry.path == MANIFEST_PATH)
+        .ok_or_else(|| {
+            PoolWriteError::InvalidInput(
+                "canonical plaintext REM object has no manifest entry".to_string(),
+            )
+        })?;
+    let manifest_file_id = required_entry_text(manifest_entry, "REMANENCE.file_id")?;
+    let mut options = RemTarObjectOptions::new(
+        object_id,
+        embedded_caller_object_id,
+        write_timestamp.clone(),
+        manifest_file_id,
+    );
+    options.chunk_size = block_size as usize;
+    options.metadata_preservation = metadata_preservation;
+    options.extensions = report.object_extensions.clone();
+
+    let mut files = Vec::with_capacity(report.entries.len().saturating_sub(1));
+    for entry in report
+        .entries
+        .iter()
+        .filter(|entry| entry.path != MANIFEST_PATH)
+    {
+        if entry.entry_type != RemTarEntryType::Regular {
+            return Err(PoolWriteError::InvalidInput(format!(
+                "canonical daemon ingest currently requires regular payload members; {:?} is {:?}",
+                entry.path, entry.entry_type
+            )));
+        }
+        let file_id = required_entry_text(entry, "REMANENCE.file_id")?;
+        let file_sha256 =
+            parse_canonical_sha256(required_entry_text(entry, "REMANENCE.file_sha256")?)?;
+        let executable = entry
+            .pax_records
+            .get("REMANENCE.executable")
+            .map(|value| {
+                value.parse::<bool>().map_err(|_| {
+                    PoolWriteError::InvalidInput(format!(
+                        "canonical plaintext REM executable flag for {:?} is invalid",
+                        entry.path
+                    ))
+                })
+            })
+            .transpose()?;
+        files.push(PreparedFile {
+            source_path: PathBuf::new(),
+            spec: RemTarFileSpec {
+                entry_type: entry.entry_type,
+                path: entry.path.clone(),
+                file_id,
+                size_bytes: entry.size_bytes,
+                file_sha256: Some(file_sha256),
+                link_target: entry.link_target.clone(),
+                xattrs: entry.xattrs.clone(),
+                extensions: entry.extensions.clone(),
+                mtime: entry.pax_records.get("mtime").cloned(),
+                executable,
+            },
+        });
+    }
+    if files.is_empty() {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM object has no payload members".to_string(),
+        ));
+    }
+    let plan = plan_prepared_object(&options, &files)?;
+    let manifest_cbor = report
+        .manifest_cbor
+        .as_ref()
+        .expect("manifest presence checked above");
+    if plan.layout.projected_size_blocks != block_count
+        || plan.layout.total_size_bytes != source_size
+        || plan.layout.manifest_cbor != *manifest_cbor
+    {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM bytes do not match the deterministic layout plan".to_string(),
+        ));
+    }
+    let content_sha256 = sha256_file(source_path)?;
+    Ok(PreparedPoolObject {
+        content_sha256,
+        object_uuid,
+        write_timestamp,
+        options,
+        files,
+        plan,
+        source: PreparedPoolSource::CanonicalPath(source_path.clone()),
+    })
+}
+
+fn required_entry_text(entry: &RemTarStreamEntry, key: &str) -> Result<String, PoolWriteError> {
+    entry
+        .pax_records
+        .get(key)
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .ok_or_else(|| {
+            PoolWriteError::InvalidInput(format!(
+                "canonical plaintext REM entry {:?} is missing {key}",
+                entry.path
+            ))
+        })
+}
+
+fn parse_canonical_sha256(value: String) -> Result<[u8; 32], PoolWriteError> {
+    if value.len() != 64
+        || value
+            .bytes()
+            .any(|byte| !byte.is_ascii_digit() && !(b'a'..=b'f').contains(&byte))
+    {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM file digest must be 64 lowercase hex digits".to_string(),
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let text = std::str::from_utf8(pair).expect("validated digest bytes are ASCII");
+        digest[index] = u8::from_str_radix(text, 16).map_err(|_| {
+            PoolWriteError::InvalidInput(
+                "canonical plaintext REM file digest is invalid".to_string(),
+            )
+        })?;
+    }
+    Ok(digest)
+}
+
 fn prepare_stored_object(
     prepared: &PreparedPoolObject,
     representation: &PoolWriteRepresentation,
 ) -> Result<PreparedStoredObject, PoolWriteError> {
     match representation {
-        PoolWriteRepresentation::Plaintext => Ok(PreparedStoredObject::Plaintext),
+        PoolWriteRepresentation::Plaintext => match &prepared.source {
+            PreparedPoolSource::CanonicalPath(_) => Ok(PreparedStoredObject::CanonicalPlaintext),
+            _ => Ok(PreparedStoredObject::Plaintext),
+        },
         PoolWriteRepresentation::Encrypted { recipients } => Ok(PreparedStoredObject::Encrypted(
             Box::new(seal_prepared_object(prepared, recipients)?),
         )),
@@ -6460,10 +6860,73 @@ fn open_prepared_readers(
                     })
             })
             .collect(),
+        PreparedPoolSource::CanonicalPath(_) => Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM object must use verbatim block streaming".to_string(),
+        )),
         PreparedPoolSource::Streamed { reader, .. } => {
             Ok(vec![Box::new(SharedStreamReader(Arc::clone(reader)))])
         }
     }
+}
+
+fn write_canonical_plaintext_blocks(
+    sink: &mut dyn BlockSink,
+    prepared: &PreparedPoolObject,
+) -> Result<[u8; 32], PoolWriteError> {
+    let path = match &prepared.source {
+        PreparedPoolSource::CanonicalPath(path) => path,
+        _ => {
+            return Err(PoolWriteError::InvalidInput(
+                "verbatim REM object write is missing its canonical source".to_string(),
+            ));
+        }
+    };
+    let mut reader = BufReader::new(File::open(path).map_err(|source| PoolWriteError::Io {
+        context: "reopen canonical plaintext REM object for tape write",
+        path: path.clone(),
+        source,
+    })?);
+    let mut hashing = ObjectDigestBlockSink::new(sink);
+    let mut block = vec![0u8; prepared.options.chunk_size];
+    for _ in 0..prepared.plan.layout.projected_size_blocks {
+        reader
+            .read_exact(&mut block)
+            .map_err(|source| PoolWriteError::Io {
+                context: "read canonical plaintext REM object block",
+                path: path.clone(),
+                source,
+            })?;
+        let outcome = hashing.write_block(&block)?;
+        if usize::try_from(outcome.bytes_written).ok() != Some(block.len()) || outcome.end_of_medium
+        {
+            return Err(PoolWriteError::InvalidInput(
+                "canonical plaintext REM object suffered an incomplete tape block write"
+                    .to_string(),
+            ));
+        }
+    }
+    let mut extra = [0u8; 1];
+    if reader
+        .read(&mut extra)
+        .map_err(|source| PoolWriteError::Io {
+            context: "verify canonical plaintext REM object EOF",
+            path: path.clone(),
+            source,
+        })?
+        != 0
+    {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM object grew after admission".to_string(),
+        ));
+    }
+    let digest = hashing.finish_digest();
+    if digest != prepared.content_sha256 {
+        return Err(PoolWriteError::ContentHashMismatch {
+            expected: bytes_to_hex(&prepared.content_sha256),
+            actual: bytes_to_hex(&digest),
+        });
+    }
+    Ok(digest)
 }
 
 fn no_parity_write_report(
@@ -6573,6 +7036,105 @@ fn no_parity_write_report(
         object_id: prepared.options.object_id.clone(),
         summary: format!(
             "committed no-parity object {} to tape file {} ({} payload files, {} object blocks)",
+            prepared.options.object_id,
+            object_close.tape_file_number,
+            prepared.files.len(),
+            object_close.data_block_count
+        ),
+    }];
+    Ok(StreamingObjectWriteReport {
+        layout,
+        object_close,
+        catalog,
+        audit_events,
+    })
+}
+
+fn write_canonical_plaintext_object_to_parity(
+    parity: &mut ParitySink<'_>,
+    tape_uuid: TapeUuid,
+    prepared: &PreparedPoolObject,
+    capacity: TerminalTripleObjectReservation,
+) -> Result<StreamingObjectWriteReport, PoolWriteError> {
+    let opened = parity.begin_object_with_terminal_triple_reservation(capacity)?;
+    let object_digest = write_canonical_plaintext_blocks(parity, prepared)?;
+    let object_close = parity.finish_object()?;
+    if opened.0 != object_close.tape_file_number
+        || object_close.data_block_count != prepared.plan.layout.projected_size_blocks
+    {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM parity close does not match admitted geometry".to_string(),
+        ));
+    }
+    parity_plaintext_write_report(tape_uuid, prepared, object_digest, object_close)
+}
+
+fn parity_plaintext_write_report(
+    tape_uuid: TapeUuid,
+    prepared: &PreparedPoolObject,
+    object_digest: [u8; 32],
+    object_close: ObjectWriteSummary,
+) -> Result<StreamingObjectWriteReport, PoolWriteError> {
+    let layout = prepared.plan.layout.clone();
+    if prepared.files.len() != layout.files.len() {
+        return Err(PoolWriteError::InvalidInput(
+            "prepared file count does not match canonical plaintext REM layout".to_string(),
+        ));
+    }
+    let logical_size_bytes = layout.files.iter().try_fold(0u64, |acc, file| {
+        acc.checked_add(file.size_bytes)
+            .ok_or_else(|| PoolWriteError::InvalidInput("logical size overflow".to_string()))
+    })?;
+    let files = layout
+        .files
+        .iter()
+        .zip(prepared.files.iter())
+        .map(|(file, prepared_file)| {
+            no_parity_file_catalog_projection(&prepared.options.object_id, file, prepared_file)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let object = ObjectCatalogProjection {
+        object_id: prepared.options.object_id.clone(),
+        caller_object_id: prepared.options.caller_object_id.clone(),
+        body_format: FORMAT_ID.to_string(),
+        logical_size_bytes,
+        manifest_sha256: layout.manifest_sha256,
+    };
+    let parity_state = remanence_parity::ObjectParityState::from_ordinals(
+        object_close.first_parity_data_ordinal,
+        object_close.data_block_count,
+        object_close.highest_protected_ordinal,
+    )?;
+    let object_copy = ObjectCopyProjection {
+        object_id: prepared.options.object_id.clone(),
+        tape_uuid,
+        tape_file_number: object_close.tape_file_number,
+        first_parity_data_ordinal: Some(object_close.first_parity_data_ordinal),
+        data_block_count: object_close.data_block_count,
+        protected_until_ordinal: Some(object_close.highest_protected_ordinal),
+        parity_state: Some(parity_state),
+        plaintext_digest: object_digest,
+        stored_digest: object_digest,
+    };
+    let mut tape_file_bundle = object_close.committed_bundle()?;
+    for entry in &mut tape_file_bundle.entries {
+        if entry.kind == TapeFileKind::Object
+            && entry.tape_file_number == object_close.tape_file_number
+        {
+            entry.object_id = Some(prepared.options.object_id.clone());
+        }
+    }
+    let catalog = StreamingCatalogProjection {
+        object,
+        files,
+        object_copy,
+        tape_file_bundle,
+    };
+    let audit_events = vec![StreamingAuditEvent {
+        kind: "canonical_plaintext_object_committed",
+        object_id: prepared.options.object_id.clone(),
+        summary: format!(
+            "committed canonical plaintext REM object {} to tape file {} ({} payload files, {} object blocks)",
             prepared.options.object_id,
             object_close.tape_file_number,
             prepared.files.len(),
@@ -7850,6 +8412,91 @@ mod tests {
     }
 
     #[test]
+    fn canonical_plaintext_object_is_validated_and_written_verbatim() {
+        const BLOCK_SIZE: usize = 4096;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("multi.rem-object");
+        let object_uuid = Uuid::from_bytes([0x41; 16]);
+        let caller_object_id = "canonical-caller-41";
+        let mut options = RemTarObjectOptions::new(
+            object_uuid.to_string(),
+            caller_object_id,
+            "2026-08-11T09:30:00Z",
+            Uuid::from_bytes([0x42; 16]).to_string(),
+        );
+        options.chunk_size = BLOCK_SIZE;
+        let first = b"first canonical member\n".repeat(300);
+        let second = b"second canonical member\n".repeat(500);
+        let files = [
+            remanence_format::RemTarFile {
+                path: "tree/first.txt",
+                file_id: "41414141-4141-4141-4141-414141414142",
+                data: &first,
+                mtime: None,
+                executable: Some(false),
+            },
+            remanence_format::RemTarFile {
+                path: "tree/second.txt",
+                file_id: "41414141-4141-4141-4141-414141414143",
+                data: &second,
+                mtime: None,
+                executable: Some(false),
+            },
+        ];
+        let mut file_sink = remanence_library::FileBlockSink::create(&path, BLOCK_SIZE)
+            .expect("create canonical object");
+        let layout = remanence_format::write_rem_tar_object(&mut file_sink, &options, &files)
+            .expect("build canonical object");
+        file_sink.sync_all().expect("sync canonical object");
+        drop(file_sink);
+        let digest = sha256_file(&path).expect("hash canonical object");
+        let request = WriteObjectToPoolRequest {
+            pool_id: "canonical-pool".to_string(),
+            source: WriteObjectSource::Path(path.clone()),
+            archive_path: PathBuf::new(),
+            caller_object_id: caller_object_id.to_string(),
+            expected_content_sha256: Some(digest),
+            expected_object_id: Some(*object_uuid.as_bytes()),
+            input_kind: WriteObjectInputKind::CanonicalPlaintextRemObject,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+
+        let prepared = prepare_pool_object(&request, BLOCK_SIZE as u32)
+            .expect("validate canonical object before tape motion");
+        assert_eq!(prepared.object_uuid, object_uuid);
+        assert_eq!(prepared.options.caller_object_id, caller_object_id);
+        assert_eq!(prepared.files.len(), 2);
+        assert_eq!(
+            prepared.plan.layout.projected_size_blocks,
+            layout.projected_size_blocks
+        );
+
+        let mut written = VecBlockSink::new();
+        assert_eq!(
+            write_canonical_plaintext_blocks(&mut written, &prepared)
+                .expect("write canonical blocks"),
+            digest
+        );
+        assert_eq!(written.blocks.concat(), std::fs::read(&path).unwrap());
+
+        let missing_identity_guard = WriteObjectToPoolRequest {
+            pool_id: "canonical-pool".to_string(),
+            source: WriteObjectSource::Path(path),
+            archive_path: PathBuf::new(),
+            caller_object_id: caller_object_id.to_string(),
+            expected_content_sha256: Some(digest),
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::CanonicalPlaintextRemObject,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let error = match prepare_pool_object(&missing_identity_guard, BLOCK_SIZE as u32) {
+            Ok(_) => panic!("canonical object identity guard is mandatory"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("requires expected_object_id"));
+    }
+
+    #[test]
     fn cloned_pool_write_resources_share_one_atomic_budget() {
         let resources = PoolWriteResources::new(10).expect("shared resources");
         let clone = resources.clone();
@@ -8839,6 +9486,8 @@ mod tests {
             archive_path: "large.bin".into(),
             caller_object_id: "overlap-larger-than-spool-cap".into(),
             expected_content_sha256: Some(digest),
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
 
@@ -9561,6 +10210,8 @@ mod tests {
                 archive_path: PathBuf::from("payload.bin"),
                 caller_object_id: "direct-encrypted-capacity-caller".into(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Encrypted {
                     recipients: vec![test_recipient(0x71, 0), test_recipient(0x72, 1)],
                 },
@@ -9673,6 +10324,8 @@ mod tests {
                 archive_path: PathBuf::from("payload.bin"),
                 caller_object_id: "direct-parity-fence-caller".into(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected.clone(),
@@ -9889,6 +10542,8 @@ mod tests {
             archive_path: PathBuf::from("payload.bin"),
             caller_object_id: "capacity-session-caller".into(),
             expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
 
@@ -10363,6 +11018,8 @@ mod tests {
                 archive_path: "retry.bin".into(),
                 caller_object_id: format!("retry-after-{cut}"),
                 expected_content_sha256: Some(retry_digest),
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             };
             let mut retry_sink = VecBlockSink::new();
@@ -10916,6 +11573,8 @@ mod tests {
             archive_path: PathBuf::from("payload.bin"),
             caller_object_id: "caller-object".to_string(),
             expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
         let counter = Arc::new(crate::DriveByteCounters::new(0));
@@ -10994,6 +11653,8 @@ mod tests {
             archive_path: PathBuf::from("payload.bin"),
             caller_object_id: "batch-one-caller".to_string(),
             expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
         let checkpoint_dir = temp.path().join("checkpoints");
@@ -11114,6 +11775,8 @@ mod tests {
                 archive_path: PathBuf::from("payload.bin"),
                 caller_object_id: "terminal-success-caller".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -11231,6 +11894,8 @@ mod tests {
                 archive_path: PathBuf::from("payload.bin"),
                 caller_object_id: "parity-terminal-success-caller".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -11343,6 +12008,8 @@ mod tests {
                 archive_path: PathBuf::from("payload.bin"),
                 caller_object_id: "terminal-authority-caller".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -11473,6 +12140,8 @@ mod tests {
                 archive_path: PathBuf::from("payload.bin"),
                 caller_object_id: "parity-bot-proof-caller".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -11627,6 +12296,8 @@ mod tests {
             archive_path: PathBuf::from("payload.bin"),
             caller_object_id: "parity-resume-caller".to_string(),
             expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
         let mut sink = LocateCountingSink::default();
@@ -11721,6 +12392,8 @@ mod tests {
             archive_path: PathBuf::from("payload.bin"),
             caller_object_id: "parity-resume-caller".to_string(),
             expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
         let mut sink = LocateCountingSink::default();
@@ -11811,6 +12484,8 @@ mod tests {
             archive_path: PathBuf::from("second-payload.bin"),
             caller_object_id: "parity-resume-second-caller".to_string(),
             expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
         let mut mismatch_sink = LocateCountingSink::default();
@@ -11848,6 +12523,8 @@ mod tests {
                 archive_path: PathBuf::from("missing-journal-payload.bin"),
                 caller_object_id: "parity-resume-missing-journal".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             pinned,

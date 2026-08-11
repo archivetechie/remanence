@@ -189,6 +189,47 @@ content that must be inventoried before normal use.
 
 ## Crash recovery and natural idempotency
 
+### Interrupted Object writes are retried whole
+
+An Object is one complete REM-OBJECT tar stream, possibly containing many
+separately named and checksummed files. Remanence writes the filemark only after
+all of that Object's blocks have been written. It never turns a power cut into
+“part one, filemark, part two.” Members inside a bundle do not have tape
+filemarks between them.
+
+If the host stops while writing the body, the tail may contain some physical
+blocks but it has no committed Object delimiter or catalog projection. On an
+open no-parity tape, the last durable checkpoint journal records the EOD after
+the previous complete Object. After restart, a new write session positions at
+that checkpoint EOD and the caller sends the interrupted Object again from byte
+zero. The rewrite replaces the uncommitted tail; only the completed retry gets
+one filemark and enters the catalog. This preserves the useful fallback: a
+stock tar implementation sees one complete tar stream for the Object, not two
+pieces that require Remanence-specific joining.
+
+The caller must retain the source until `CheckpointSession` reports it
+committed. Session resumption is not the recovery contract: an interrupted
+session is abandoned and every uncheckpointed Object is replayed in full under
+the same caller id and content digest. If the catalog already contains that
+exact pair, the retry is an idempotent read of committed state; different bytes
+under the same caller id are refused.
+
+This mechanism depends on the host checkpoint journal for an open tape. A
+Remanence cartridge arriving from another installation does not acquire safe
+append authority merely because its Bootstrap can be adopted. Transfer the
+matching host journals when they are available; otherwise keep the cartridge
+out of ordinary write service and use terminal inventory or bounded BOT
+recovery to establish what is present. Identity adoption alone never guesses a
+last committed append position.
+
+An actual drive or transport failure can make the last command's completion
+uncertain. Remanence fences that tape instead of assuming how much landed. The
+whole-Object rule remains the same, but an operator must first reconcile or
+release the fence using the recorded evidence. The VTL end-to-end recovery
+drill exercises an abrupt daemon loss after a completed write-command boundary;
+it does not claim to emulate a particular physical drive's volatile-cache
+behavior.
+
 Terminal finalization has a useful no-media recovery boundary. Once the
 checkpoint and parity journal prove that replica C completed its synchronizing
 barrier, all three full indexes are already on tape. A restart completes the

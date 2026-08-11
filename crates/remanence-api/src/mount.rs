@@ -1271,13 +1271,19 @@ async fn open_read_session_on_mount(
     Ok(session)
 }
 
+pub(crate) struct AppendFinishRequest {
+    pub(crate) spool_path: std::path::PathBuf,
+    pub(crate) archive_path: std::path::PathBuf,
+    pub(crate) caller_object_id: String,
+    pub(crate) expected_content_sha256: Option<[u8; 32]>,
+    pub(crate) expected_object_id: Option<[u8; 16]>,
+    pub(crate) input_kind: crate::WriteObjectInputKind,
+}
+
 pub(crate) async fn append_finish(
     state: &ApiState,
     session_id: Uuid,
-    spool_path: std::path::PathBuf,
-    archive_path: std::path::PathBuf,
-    caller_object_id: String,
-    expected_content_sha256: Option<[u8; 32]>,
+    request: AppendFinishRequest,
 ) -> Result<pb::ObjectRecord, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
@@ -1290,10 +1296,12 @@ pub(crate) async fn append_finish(
     drive
         .send(crate::write_owner::DriveCommand::AppendFinish {
             session_id,
-            source: crate::WriteObjectSource::Path(spool_path),
-            archive_path,
-            caller_object_id,
-            expected_content_sha256,
+            source: crate::WriteObjectSource::Path(request.spool_path),
+            archive_path: request.archive_path,
+            caller_object_id: request.caller_object_id,
+            expected_content_sha256: request.expected_content_sha256,
+            expected_object_id: request.expected_object_id,
+            input_kind: request.input_kind,
             live_write_counter,
             reply: reply_tx,
         })
@@ -1328,6 +1336,8 @@ pub(crate) async fn append_streamed(
             archive_path,
             caller_object_id,
             expected_content_sha256: Some(expected_content_sha256),
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             live_write_counter,
             reply: reply_tx,
         })

@@ -478,6 +478,7 @@ where
             if !second.iter().all(|&byte| byte == 0) {
                 return Err(FormatError::parse("single zero tar EOF record"));
             }
+            reader.require_zero_fill_after_tar_eof()?;
             break;
         }
         verify_checksum(&header)?;
@@ -646,6 +647,14 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
             let second = read_record(bytes, next)?;
             if !second.iter().all(|&byte| byte == 0) {
                 return Err(FormatError::parse("single zero tar EOF record"));
+            }
+            let fill_start = next
+                .checked_add(TAR_RECORD_SIZE)
+                .ok_or_else(|| FormatError::parse("archive offset overflow"))?;
+            if bytes[fill_start..].iter().any(|byte| *byte != 0) {
+                return Err(FormatError::parse(
+                    "nonzero bytes after the canonical tar EOF records",
+                ));
             }
             break;
         }
@@ -933,6 +942,24 @@ impl<'a, S: BlockRead + ?Sized> BlockByteReader<'a, S> {
         buffered
             .checked_add(unread)
             .ok_or_else(|| FormatError::parse("stream remaining byte count overflow"))
+    }
+
+    fn require_zero_fill_after_tar_eof(&mut self) -> Result<(), FormatError> {
+        while self.bytes_remaining()? > 0 {
+            self.ensure_available()?;
+            let remaining = &self.block[self.position..];
+            if remaining.iter().any(|byte| *byte != 0) {
+                return Err(FormatError::parse(
+                    "nonzero bytes after the canonical tar EOF records",
+                ));
+            }
+            self.offset = self
+                .offset
+                .checked_add(remaining.len() as u64)
+                .ok_or_else(|| FormatError::parse("stream offset overflow"))?;
+            self.position = self.block.len();
+        }
+        Ok(())
     }
 }
 
@@ -2300,6 +2327,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("single zero"));
+    }
+
+    #[test]
+    fn readers_reject_nonzero_fixed_block_fill_after_tar_eof() {
+        let opts = options(4096);
+        let files = [RemTarFile {
+            path: "a.txt",
+            file_id: "file-a",
+            data: b"hello",
+            mtime: None,
+            executable: Some(false),
+        }];
+        let mut sink = VecBlockSink::new();
+        let layout = write_rem_tar_object(&mut sink, &opts, &files).unwrap();
+        *sink
+            .blocks
+            .last_mut()
+            .expect("object has a final block")
+            .last_mut()
+            .expect("block is nonempty") = 1;
+
+        let mut materialized = VecBlockSource::new(sink.blocks.clone());
+        let err = read_rem_tar_object(
+            &mut materialized,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+        )
+        .expect_err("materialized reader must reject nonzero post-EOF fill");
+        assert!(err.to_string().contains("nonzero bytes after"), "{err}");
+
+        let mut streamed = VecBlockSource::new(sink.blocks);
+        let mut entries = CollectingEntrySink::default();
+        let err = stream_rem_tar_object(
+            &mut streamed,
+            opts.chunk_size,
+            layout.projected_size_blocks,
+            &mut entries,
+        )
+        .expect_err("streaming reader must reject nonzero post-EOF fill");
+        assert!(err.to_string().contains("nonzero bytes after"), "{err}");
     }
 
     #[test]

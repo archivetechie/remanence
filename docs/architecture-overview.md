@@ -234,6 +234,12 @@ What happens when an orchestrator writes an object:
    before the whole object has landed, gated on the caller attesting it
    can replay its source from byte zero — see the [configuration
    reference](reference-configuration.md) for the admission knobs.
+   A distinct canonical-object start message handles an already-built
+   plaintext REM-OBJECT. It always uses the completed spool rather than overlap
+   mode. Before media motion the daemon proves the whole-object digest, embedded
+   object and caller identities, fixed-block alignment, member digests, final
+   manifest, deterministic layout, and zero fill after tar EOF. It then copies
+   those blocks verbatim instead of wrapping the object as one outer file.
 4. The object is laid out as a plaintext `rem-object-v1` body or sealed as a
    recipient envelope, then
    written through the parity sink. Tape I/O itself is pipelined: a
@@ -264,6 +270,12 @@ unimplemented, unlike the read side below. A WRITTEN response
 is advisory and locator-free; callers retain the source until
 `CheckpointSession` returns the committed copy set, and re-send every object
 that was not reported CHECKPOINTED after any session, stream, or daemon loss.
+The retry is the complete Object from byte zero, not a continuation fragment.
+For an open no-parity tape, the durable checkpoint journal identifies the last
+committed EOD; restart locates there and overwrites any longer uncommitted tail
+before emitting the retried Object's single trailing filemark. A multi-member
+REM-OBJECT therefore remains one ordinary tar stream for standard-tool recovery
+after a crash, rather than two tape files that tar would have to join.
 No intermediate index is written. Finalization closes the open parity epoch,
 emits one final ParityMap when sidecar metadata exists, fixes one immutable
 snapshot of that complete pre-A prefix, and emits replica A, separation AB, replica B,

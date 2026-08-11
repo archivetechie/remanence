@@ -64,6 +64,12 @@ remains individually named and checksummed in
 `_remanence/manifest.cbor`, while the tape index spends one Object row on the
 bundle rather than one row per member.
 
+Bundling is explicit today. Ordinary `rem put A B C` writes three one-member
+Objects and therefore three tape filemarks. Build one multi-member object first
+and ingest it with `rem put --stored-object` when the files should share one
+tape file and one trailing filemark. Per-member catalog rows, hashes, and
+individual restore selection remain available inside that bundle.
+
 Choose a bundle target from operational needs rather than a format-imposed row
 ceiling. Larger bundles reduce filemark, row, and catalog overhead. Smaller
 bundles reduce retry cost, staging requirements, and the amount of unrelated

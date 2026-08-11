@@ -1558,9 +1558,10 @@ message TapePoolTarget {
 
 message AppendObjectMessage {
   oneof payload {
-    AppendObjectStart  start  = 1;
-    AppendObjectChunk  chunk  = 2;
-    AppendObjectFinish finish = 3;
+    AppendObjectStart                    start           = 1;
+    AppendObjectChunk                    chunk           = 2;
+    AppendObjectFinish                   finish          = 3;
+    AppendCanonicalPlaintextObjectStart  canonical_start = 4;
   }
 }
 
@@ -1600,6 +1601,19 @@ message AppendObjectStart {
   SourceReplayCapability source_replay_capability = 7;
   // Algorithm-aware mirror of expected_content_sha256.
   Digest expected_content_digest = 8;
+}
+
+// Start a verbatim plaintext REM-OBJECT append. This is a distinct oneof arm,
+// rather than a mode flag on AppendObjectStart, so a server that predates this
+// surface rejects the unrecognized first message instead of silently wrapping
+// the complete object as one logical member.
+message AppendCanonicalPlaintextObjectStart {
+  bytes session_id                    = 1;
+  uint64 declared_size_bytes          = 2;
+  Digest expected_plaintext_digest    = 3; // required SHA-256 of all object bytes
+  SourceReplayCapability source_replay_capability = 4;
+  bytes expected_object_id            = 5; // required UUID bytes; must match global PAX
+  string expected_caller_object_id    = 6; // required; must match global PAX
 }
 
 message AppendObjectChunk {

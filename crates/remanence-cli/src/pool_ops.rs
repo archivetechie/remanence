@@ -264,6 +264,8 @@ pub fn run_archive_write(
         archive_path,
         caller_object_id,
         expected_content_sha256: None,
+        expected_object_id: None,
+        input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
         representation: representation.representation,
     };
 

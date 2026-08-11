@@ -83,6 +83,15 @@ pub(crate) struct PutArgs {
     #[arg(long, value_name = "ID")]
     id: Option<String>,
 
+    /// Treat the single input as an already-built plaintext REM-OBJECT and
+    /// write its validated bytes verbatim instead of wrapping it again.
+    #[arg(long, requires_all = ["id", "stored_object_id"])]
+    stored_object: bool,
+
+    /// Embedded REM-OBJECT UUID guard for --stored-object.
+    #[arg(long, value_name = "UUID", requires = "stored_object")]
+    stored_object_id: Option<String>,
+
     /// Extra caller metadata as key=value. Repeatable. The `path` key is
     /// reserved (it carries the member's archive path).
     #[arg(long, value_name = "KEY=VALUE")]
@@ -206,6 +215,49 @@ async fn put(
             )));
         }
     }
+    if args.stored_object && inputs.len() != 1 {
+        return Err(DaemonClientError::client(format!(
+            "--stored-object needs exactly one regular input file; got {}",
+            inputs.len()
+        )));
+    }
+    if args.stored_object && args.id.is_none() {
+        return Err(DaemonClientError::client(
+            "--stored-object requires an explicit --id matching the embedded caller id",
+        ));
+    }
+    if args.stored_object && !args.meta.is_empty() {
+        return Err(DaemonClientError::client(
+            "--meta cannot alter an already-built --stored-object",
+        ));
+    }
+    let stored_object_id = args
+        .stored_object_id
+        .as_deref()
+        .map(|value| {
+            let uuid = Uuid::parse_str(value).map_err(|_| {
+                DaemonClientError::client(
+                    "--stored-object-id must be a non-nil canonical lowercase UUID",
+                )
+            })?;
+            if uuid.is_nil() || uuid.to_string() != value {
+                return Err(DaemonClientError::client(
+                    "--stored-object-id must be a non-nil canonical lowercase UUID",
+                ));
+            }
+            Ok(*uuid.as_bytes())
+        })
+        .transpose()?;
+    if args.stored_object && stored_object_id.is_none() {
+        return Err(DaemonClientError::client(
+            "--stored-object requires --stored-object-id",
+        ));
+    }
+    if !args.stored_object && stored_object_id.is_some() {
+        return Err(DaemonClientError::client(
+            "--stored-object-id is valid only with --stored-object",
+        ));
+    }
     let extra_meta = parse_meta(&args.meta).map_err(DaemonClientError::client)?;
 
     let channel = connect_daemon(&args.endpoint)
@@ -244,6 +296,7 @@ async fn put(
             &caller_object_id,
             &extra_meta,
             args.chunk_bytes,
+            stored_object_id,
         )
         .await
         {
@@ -801,6 +854,7 @@ async fn append_one(
     caller_object_id: &str,
     extra_meta: &HashMap<String, String>,
     chunk_bytes: usize,
+    stored_object_id: Option<[u8; 16]>,
 ) -> Result<pb::ObjectRecord, DaemonClientError> {
     // Pre-hash so the daemon can admit the append in overlap mode and verify
     // the spooled bytes against a digest it received before the first chunk.
@@ -821,22 +875,33 @@ async fn append_one(
             algorithm: "sha256".to_string(),
             value: content_sha256.to_vec(),
         };
-        tx.send(pb::AppendObjectMessage {
-            payload: Some(pb::append_object_message::Payload::Start(
-                pb::AppendObjectStart {
+        let start_payload = match stored_object_id {
+            Some(object_id) => pb::append_object_message::Payload::CanonicalStart(
+                pb::AppendCanonicalPlaintextObjectStart {
                     session_id: session_id_owned.clone(),
-                    // `rem put` names the object (the archive path when the
-                    // operator gave no --id), knows the size it stat'ed,
-                    // hashes, and supplies no manifest.
-                    caller_object_id,
-                    caller_metadata,
-                    declared_size_bytes: Some(declared_size_bytes),
-                    body_format_manifest: None,
-                    expected_content_sha256: Some(content_sha256.to_vec()),
-                    expected_content_digest: Some(digest.clone()),
+                    declared_size_bytes,
+                    expected_plaintext_digest: Some(digest.clone()),
                     source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
+                    expected_object_id: object_id.to_vec(),
+                    expected_caller_object_id: caller_object_id,
                 },
-            )),
+            ),
+            None => pb::append_object_message::Payload::Start(pb::AppendObjectStart {
+                session_id: session_id_owned.clone(),
+                // `rem put` names the object (the archive path when the
+                // operator gave no --id), knows the size it stat'ed,
+                // hashes, and supplies no manifest.
+                caller_object_id,
+                caller_metadata,
+                declared_size_bytes: Some(declared_size_bytes),
+                body_format_manifest: None,
+                expected_content_sha256: Some(content_sha256.to_vec()),
+                expected_content_digest: Some(digest.clone()),
+                source_replay_capability: pb::SourceReplayCapability::ReplayFromStart as i32,
+            }),
+        };
+        tx.send(pb::AppendObjectMessage {
+            payload: Some(start_payload),
         })
         .await
         .map_err(|_| "append stream closed before Start".to_string())?;
@@ -1217,6 +1282,8 @@ mod tests {
             let mut caller_metadata = HashMap::new();
             let mut hasher = Sha256::new();
             let mut size = 0_u64;
+            let mut canonical_object_id = None;
+            let mut declared_size = None;
             // `rem put` always hashes before it sends, so the fake holds it to
             // a digest actually being present rather than to an empty vec.
             let mut expected = None;
@@ -1226,7 +1293,23 @@ mod tests {
                         assert_eq!(start.session_id, FAKE_SESSION.to_vec());
                         caller_object_id = start.caller_object_id;
                         caller_metadata = start.caller_metadata;
+                        declared_size = start.declared_size_bytes;
                         expected = start.expected_content_sha256;
+                    }
+                    pb::append_object_message::Payload::CanonicalStart(start) => {
+                        assert_eq!(start.session_id, FAKE_SESSION.to_vec());
+                        assert_eq!(
+                            start.source_replay_capability,
+                            pb::SourceReplayCapability::ReplayFromStart as i32
+                        );
+                        caller_object_id = start.expected_caller_object_id;
+                        canonical_object_id = Some(start.expected_object_id);
+                        declared_size = Some(start.declared_size_bytes);
+                        let digest = start
+                            .expected_plaintext_digest
+                            .expect("stored object start digest");
+                        assert_eq!(digest.algorithm, "sha256");
+                        expected = Some(digest.value);
                     }
                     pb::append_object_message::Payload::Chunk(chunk) => {
                         size += chunk.data.len() as u64;
@@ -1241,13 +1324,15 @@ mod tests {
                 }
             }
             let digest: [u8; 32] = hasher.finalize().into();
+            assert_eq!(declared_size, Some(size), "client-declared size mismatch");
             assert_eq!(
                 expected,
                 Some(digest.to_vec()),
                 "client-declared digest mismatch"
             );
             let record = pb::ObjectRecord {
-                object_id: Uuid::new_v4().as_bytes().to_vec(),
+                object_id: canonical_object_id
+                    .unwrap_or_else(|| Uuid::new_v4().as_bytes().to_vec()),
                 caller_object_id: Some(caller_object_id),
                 content_sha256: Some(digest.to_vec()),
                 logical_size_bytes: Some(size),
@@ -1380,6 +1465,8 @@ mod tests {
             drive: None,
             library: None,
             id: None,
+            stored_object: false,
+            stored_object_id: None,
             meta: Vec::new(),
             chunk_bytes: 8, // several chunks even for tiny test files
             no_wait: true,
@@ -1429,6 +1516,33 @@ mod tests {
         // The fake hashed what it received and asserted it matched the
         // client's declared digest, so a passing run proves byte fidelity.
         assert!(!state.aborted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn put_stored_object_uses_fail_closed_canonical_start() {
+        let state = Arc::new(FakeState::default());
+        let (endpoint, _runtime, _dir) = serve_fake(state.clone());
+        let data_dir = tempfile::tempdir().unwrap();
+        let object_path = data_dir.path().join("bundle.rem-object");
+        touch(&object_path, b"canonical object wire test");
+        let object_id = Uuid::from_bytes([0x53; 16]);
+        let mut args = put_args(vec![object_path], endpoint);
+        args.id = Some("stored-bundle-53".to_string());
+        args.stored_object = true;
+        args.stored_object_id = Some(object_id.to_string());
+
+        let (result, out, err) = run_put_blocking(&args);
+        assert!(result.is_ok(), "{result:?}\nstderr: {err}");
+        let receipt: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(receipt["objects_committed"], 1);
+        assert_eq!(receipt["objects"][0]["object_id"], object_id.to_string());
+        let records = state.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].object_id, object_id.as_bytes());
+        assert_eq!(
+            records[0].caller_object_id.as_deref(),
+            Some("stored-bundle-53")
+        );
     }
 
     #[test]
