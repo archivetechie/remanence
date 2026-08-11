@@ -175,7 +175,15 @@ paths are refused; non-regular files are skipped with a warning.
 | `rem put <PATH>... [--pool <POOL_ID>] [--library <SERIAL>]` | Write each input file as one object to a tape pool. With no `--pool` and exactly one configured pool, that pool is used; with several, the choice is real policy and must be explicit. The daemon picks the tape by the pool's selection policy, mounts it into a free drive as needed, and seals tapes by watermark. If the open is fenced by a media-readiness operation (a cold tape load), put watches it to completion and retries once. |
 | `rem put <PATH>... --tape <UUID> --pool <POOL_ID>` | Pin a specific cartridge instead of letting pool policy choose. `--pool` is the mandatory guard: the pool you believe that tape belongs to. Pinning replaces pool *selection*, never *admission* — the tape still passes every pool-mode eligibility check (data kind, lifecycle state, block size, io fences, checkpoint-batch eligibility), and a pool mismatch is a refusal naming both pools, because pools carry copy-class segregation and a silent cross-pool write is policy corruption. A cartridge that was never initialized has no UUID to pin: tape identity is minted by `rem tape init`. |
 | `rem put ... [--id <ID>] [--meta <KEY=VALUE>]...` | Caller identity and opaque metadata recorded in the catalog. `--id` needs exactly one input file; the default caller id is the member's archive path. The `path` metadata key is reserved (it carries the archive path). |
+| `rem put <OBJECT> --stored-object --stored-object-id <UUID> --id <ID> [--pool <POOL_ID>]` | Validate one already-built plaintext REM-OBJECT, then write its fixed blocks byte-for-byte through the normal daemon write path. The UUID and caller id must match the identities embedded in the object. The object must use the selected tape block size, contain a valid final manifest and regular payload members, and have canonical zero fill after tar EOF. It is fully spooled and validated before tape moves; it is never wrapped inside another REM-OBJECT. |
 | `rem put ... [--chunk-bytes <BYTES>] [--no-wait]` | Append stream chunk size (default 1 MiB), and `--no-wait` to fail fast instead of watching a media-readiness load. |
+
+The ordinary command deliberately treats each input file as a separate Object,
+so each receives its own trailing tape filemark. To store many small files with
+one filemark, first build one multi-member REM-OBJECT with `rem archive build`,
+then use `--stored-object`. Every member remains separately named and
+checksummed in the manifest and can be restored individually; there are no
+tape filemarks between members of that one Object.
 
 The receipt is committed state, not hope: it is built from the daemon's
 checkpoint barrier — with a catalog lookup for objects an automatic

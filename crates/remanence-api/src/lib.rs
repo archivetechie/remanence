@@ -76,6 +76,7 @@ mod diagnostics;
 mod io_memory;
 mod library;
 mod mount;
+mod object_fault;
 mod operations;
 mod pool_selection;
 mod pool_write;
@@ -95,7 +96,8 @@ pub use pool_write::{
     write_to_selected_tape_checkpointed, LtoGen, PoolWriteError, PoolWriteObjectCopyRecord,
     PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResources, PoolWriteResult,
     SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
-    TapeSealReason, TapeUuid, WritabilityError, WriteObjectSource, WriteObjectToPoolRequest,
+    TapeSealReason, TapeUuid, WritabilityError, WriteObjectInputKind, WriteObjectSource,
+    WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
@@ -3530,41 +3532,110 @@ impl WriteSessionApi {
         let first = next_append_message(&mut stream)
             .await?
             .ok_or_else(|| Status::invalid_argument("append stream is empty"))?;
-        let start = match first.payload {
-            Some(pb::append_object_message::Payload::Start(start)) => start,
+        let (
+            session_id,
+            caller_object_id,
+            declared_size_bytes,
+            start_digest,
+            archive_path,
+            expected_object_id,
+            input_kind,
+            logical_start,
+        ) = match first.payload {
+            Some(pb::append_object_message::Payload::Start(start)) => {
+                if start.body_format_manifest.is_some() {
+                    return Err(Status::unimplemented(
+                        "body_format_manifest is not wired in this write-session slice",
+                    ));
+                }
+                let session_id =
+                    Uuid::from_bytes(decode_uuid_bytes(&start.session_id, "session_id")?);
+                let start_digest = expected_content_digest(
+                    start.expected_content_sha256.as_deref(),
+                    start.expected_content_digest.as_ref(),
+                )?;
+                let archive_path = archive_path_from_start(&start);
+                (
+                    session_id,
+                    start.caller_object_id.clone(),
+                    start.declared_size_bytes,
+                    start_digest,
+                    archive_path,
+                    None,
+                    crate::WriteObjectInputKind::LogicalFile,
+                    Some(start),
+                )
+            }
+            Some(pb::append_object_message::Payload::CanonicalStart(start)) => {
+                if start.declared_size_bytes == 0 {
+                    return Err(Status::invalid_argument(
+                        "canonical REM object declared_size_bytes must be nonzero",
+                    ));
+                }
+                if start.source_replay_capability
+                    != pb::SourceReplayCapability::ReplayFromStart as i32
+                {
+                    return Err(Status::failed_precondition(
+                        "canonical REM object source must be replayable from byte zero",
+                    ));
+                }
+                if start.expected_caller_object_id.trim().is_empty() {
+                    return Err(Status::invalid_argument(
+                        "canonical REM object expected_caller_object_id must not be empty",
+                    ));
+                }
+                let session_id =
+                    Uuid::from_bytes(decode_uuid_bytes(&start.session_id, "session_id")?);
+                let expected_object_id =
+                    decode_uuid_bytes(&start.expected_object_id, "expected_object_id")?;
+                let object_uuid = Uuid::from_bytes(expected_object_id);
+                if object_uuid.is_nil() {
+                    return Err(Status::invalid_argument(
+                        "canonical REM object expected_object_id must not be nil",
+                    ));
+                }
+                let start_digest =
+                    expected_content_digest(None, start.expected_plaintext_digest.as_ref())?
+                        .ok_or_else(|| {
+                            Status::invalid_argument(
+                                "canonical REM object expected_plaintext_digest is required",
+                            )
+                        })?;
+                (
+                    session_id,
+                    start.expected_caller_object_id,
+                    Some(start.declared_size_bytes),
+                    Some(start_digest),
+                    std::path::PathBuf::new(),
+                    Some(expected_object_id),
+                    crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+                    None,
+                )
+            }
             _ => {
                 return Err(Status::invalid_argument(
-                    "first AppendObject message must be Start",
+                    "first AppendObject message must be Start or CanonicalStart",
                 ));
             }
         };
-        if start.body_format_manifest.is_some() {
-            return Err(Status::unimplemented(
-                "body_format_manifest is not wired in this write-session slice",
-            ));
+        if let Some(start) = logical_start {
+            let overlap_eligible = overlap_append_eligible(
+                self.state.append_staging_mode,
+                &start,
+                start_digest.as_ref(),
+            );
+            if overlap_eligible {
+                return self
+                    .append_object_overlap(
+                        stream,
+                        start,
+                        session_id,
+                        start_digest.expect("overlap eligibility requires a start digest"),
+                    )
+                    .await;
+            }
         }
-        let session_id = decode_uuid_bytes(&start.session_id, "session_id")?;
-        let session_id = Uuid::from_bytes(session_id);
-        let start_digest = expected_content_digest(
-            start.expected_content_sha256.as_deref(),
-            start.expected_content_digest.as_ref(),
-        )?;
-        let overlap_eligible = overlap_append_eligible(
-            self.state.append_staging_mode,
-            &start,
-            start_digest.as_ref(),
-        );
-        if overlap_eligible {
-            return self
-                .append_object_overlap(
-                    stream,
-                    start,
-                    session_id,
-                    start_digest.expect("overlap eligibility requires a start digest"),
-                )
-                .await;
-        }
-        let cap = append_spool_cap(start.declared_size_bytes);
+        let cap = append_spool_cap(declared_size_bytes);
         self.state.validate_spool_budget(cap)?;
         let mut spool = create_append_spool(self.state.spool_dir()?.to_path_buf(), cap).await?;
         let mut spool_permits = Vec::new();
@@ -3613,6 +3684,12 @@ impl WriteSessionApi {
                         "append stream has more than one start message",
                     ));
                 }
+                pb::append_object_message::Payload::CanonicalStart(_) => {
+                    let _ = fs::remove_file(spool.path());
+                    return Err(Status::invalid_argument(
+                        "append stream has more than one start message",
+                    ));
+                }
             }
         }
         let finish =
@@ -3627,8 +3704,16 @@ impl WriteSessionApi {
                 "Start and Finish expected_content_sha256 values disagree",
             ));
         }
+        if input_kind == crate::WriteObjectInputKind::CanonicalPlaintextRemObject
+            && Some(spool_bytes) != declared_size_bytes
+        {
+            let _ = fs::remove_file(spool.path());
+            return Err(Status::invalid_argument(format!(
+                "canonical REM object streamed {spool_bytes} bytes, expected {}",
+                declared_size_bytes.expect("canonical start requires declared size")
+            )));
+        }
         let expected_content_sha256 = start_digest.or(finish_digest);
-        let archive_path = archive_path_from_start(&start);
         let spool_path = finish_append_spool(spool).await?;
         let spool_elapsed = spool_started.elapsed();
         tracing::info!(
@@ -3637,20 +3722,23 @@ impl WriteSessionApi {
             session_id = %session_id,
             payload_bytes = spool_bytes,
             chunks = spool_chunks,
-            declared_size_bytes = start.declared_size_bytes,
+            declared_size_bytes,
             elapsed_ms = crate::diagnostics::duration_ms(spool_elapsed),
             throughput_mib_s = crate::diagnostics::mib_per_s(spool_bytes, spool_elapsed),
             "remanence_write_diag",
         );
-        let caller_object_id = start.caller_object_id;
         let append_finish_started = Instant::now();
         let record = match crate::mount::append_finish(
             &self.state,
             session_id,
-            spool_path.clone(),
-            archive_path,
-            caller_object_id,
-            expected_content_sha256,
+            crate::mount::AppendFinishRequest {
+                spool_path: spool_path.clone(),
+                archive_path,
+                caller_object_id,
+                expected_content_sha256,
+                expected_object_id,
+                input_kind,
+            },
         )
         .await
         {
@@ -3950,6 +4038,11 @@ where
                     finish = Some(next_finish);
                 }
                 pb::append_object_message::Payload::Start(_) => {
+                    return Err(Status::invalid_argument(
+                        "append stream has more than one start message",
+                    ));
+                }
+                pb::append_object_message::Payload::CanonicalStart(_) => {
                     return Err(Status::invalid_argument(
                         "append stream has more than one start message",
                     ));
@@ -10823,6 +10916,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-pool-core".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -10931,6 +11026,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-no-parity".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11021,6 +11118,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-fresh-span".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11092,6 +11191,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-batched-image".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11134,6 +11235,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-serial-image".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11193,6 +11296,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-partial-batch".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11250,6 +11355,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-short-byte-encrypted".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Encrypted { recipients },
             },
         )
@@ -11308,6 +11415,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-position-drift".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11361,6 +11470,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-no-parity".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Encrypted { recipients },
             },
         )
@@ -11439,6 +11550,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-block-mismatch".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11485,6 +11598,8 @@ BCw3Wyv2UWY=
                 archive_path: "selected-payload.bin".into(),
                 caller_object_id: "caller-selected-block-mismatch".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -11532,6 +11647,8 @@ BCw3Wyv2UWY=
                 archive_path: "plain.bin".into(),
                 caller_object_id: "caller-custom-block-plain".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11611,6 +11728,8 @@ BCw3Wyv2UWY=
                 archive_path: "secret.bin".into(),
                 caller_object_id: "caller-custom-block-encrypted".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Encrypted { recipients },
             },
         )
@@ -11697,6 +11816,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-transfer-fail".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Encrypted { recipients },
             },
             selected,
@@ -11752,6 +11873,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-plaintext-transfer-fail".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -11810,6 +11933,8 @@ BCw3Wyv2UWY=
                 archive_path: "first.bin".into(),
                 caller_object_id: "caller-retire-first".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11906,6 +12031,8 @@ BCw3Wyv2UWY=
                 archive_path: "second.bin".into(),
                 caller_object_id: "caller-retire-second".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11957,6 +12084,8 @@ BCw3Wyv2UWY=
                 archive_path: "first.bin".into(),
                 caller_object_id: "caller-no-parity-first".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -11976,6 +12105,8 @@ BCw3Wyv2UWY=
                 archive_path: "second.bin".into(),
                 caller_object_id: "caller-no-parity-second".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12068,6 +12199,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12086,6 +12219,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12138,6 +12273,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-conflict".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12155,6 +12292,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-conflict".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12213,6 +12352,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "streamed-conflict".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12237,6 +12378,8 @@ BCw3Wyv2UWY=
             archive_path: "payload.bin".into(),
             caller_object_id: "streamed-conflict".to_string(),
             expected_content_sha256: Some(conflicting_digest),
+            expected_object_id: None,
+            input_kind: crate::WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
         let error = crate::pool_write::maybe_replay_pool_write(&index, &cfg, &request)
@@ -12273,6 +12416,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: String::new(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12321,6 +12466,8 @@ BCw3Wyv2UWY=
                 archive_path: "first.bin".into(),
                 caller_object_id: "caller-parity-first".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected.clone(),
@@ -12338,6 +12485,8 @@ BCw3Wyv2UWY=
                 archive_path: "second.bin".into(),
                 caller_object_id: "caller-parity-second".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -12386,6 +12535,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-hash-mismatch".to_string(),
                 expected_content_sha256: Some(wrong_hash),
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
             selected,
@@ -12423,6 +12574,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-seal".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -12480,6 +12633,8 @@ BCw3Wyv2UWY=
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-non-regular".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 representation: PoolWriteRepresentation::Plaintext,
             },
         )
@@ -13466,10 +13621,14 @@ BCw3Wyv2UWY=
         let record = crate::mount::append_finish(
             &state,
             session_id,
-            spool_path,
-            archive_path,
-            "caller-object".to_string(),
-            None,
+            crate::mount::AppendFinishRequest {
+                spool_path,
+                archive_path,
+                caller_object_id: "caller-object".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+            },
         )
         .await
         .expect("append finish");

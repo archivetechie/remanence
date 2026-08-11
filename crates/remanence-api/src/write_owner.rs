@@ -194,6 +194,8 @@ pub(crate) enum DriveCommand {
         archive_path: PathBuf,
         caller_object_id: String,
         expected_content_sha256: Option<[u8; 32]>,
+        expected_object_id: Option<[u8; 16]>,
+        input_kind: crate::WriteObjectInputKind,
         live_write_counter: Option<Arc<crate::DriveByteCounters>>,
         reply: oneshot::Sender<Result<AppendFinishOutcome, Status>>,
     },
@@ -4181,6 +4183,8 @@ impl WriteSessionState<'_> {
             archive_path,
             caller_object_id,
             expected_content_sha256,
+            expected_object_id,
+            input_kind,
             live_write_counter,
             reply,
         } = command
@@ -4207,7 +4211,7 @@ impl WriteSessionState<'_> {
         // Any accepted append call is session activity, including a
         // catalog idempotency replay; invalidate a prior timer-close.
         self.timer_checkpoint_waiting = None;
-        let logical_size = source.size_bytes().unwrap_or(0);
+        let source_size = source.size_bytes().unwrap_or(0);
         let stream_control = source.stream_control();
         let cleanup_path = match &source {
             crate::WriteObjectSource::Path(path) => Some(path.clone()),
@@ -4255,7 +4259,9 @@ impl WriteSessionState<'_> {
             archive_path,
             caller_object_id,
             expected_content_sha256,
+            expected_object_id,
             representation: crate::PoolWriteRepresentation::Plaintext,
+            input_kind,
         };
         let append_started = Instant::now();
         let mut parity_raw_write_attempted = false;
@@ -4312,6 +4318,7 @@ impl WriteSessionState<'_> {
         }
         match result {
             Ok(result) => {
+                let logical_size = result.object.logical_size_bytes;
                 let replay = result.is_replay();
                 self.append_commit_diagnostics
                     .accumulate(result.append_commit_diagnostics());
@@ -4462,7 +4469,7 @@ impl WriteSessionState<'_> {
                     phase = "drive_append_total",
                     session_id = %session_id,
                     tape_uuid = %Uuid::from_bytes(tape_uuid),
-                    payload_bytes = logical_size,
+                    payload_bytes = source_size,
                     block_size_bytes = selected.block_size,
                     replay,
                     elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
@@ -4656,12 +4663,12 @@ impl WriteSessionState<'_> {
                     phase = "drive_append_total",
                     session_id = %session_id,
                     tape_uuid = %Uuid::from_bytes(tape_uuid),
-                    payload_bytes = logical_size,
+                    payload_bytes = source_size,
                     block_size_bytes = selected.block_size,
                     status = "error",
                     error = %status,
                     elapsed_ms = crate::diagnostics::duration_ms(append_elapsed),
-                    throughput_mib_s = crate::diagnostics::mib_per_s(logical_size, append_elapsed),
+                    throughput_mib_s = crate::diagnostics::mib_per_s(source_size, append_elapsed),
                     "remanence_write_diag",
                 );
                 if !fence_audited_here {
@@ -14391,6 +14398,8 @@ mod tests {
                 archive_path: PathBuf::from(archive_path),
                 caller_object_id: caller_object_id.to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 live_write_counter: None,
                 reply: append_tx,
             })
@@ -15944,10 +15953,14 @@ mod tests {
             let append = crate::mount::append_finish(
                 &state,
                 session_id,
-                source_path,
-                PathBuf::from(format!("payload-{session_ordinal}.bin")),
-                format!("batch-one-caller-{session_ordinal}"),
-                None,
+                crate::mount::AppendFinishRequest {
+                    spool_path: source_path,
+                    archive_path: PathBuf::from(format!("payload-{session_ordinal}.bin")),
+                    caller_object_id: format!("batch-one-caller-{session_ordinal}"),
+                    expected_content_sha256: None,
+                    expected_object_id: None,
+                    input_kind: crate::WriteObjectInputKind::LogicalFile,
+                },
             )
             .await
             .expect("append through mount dispatcher");
@@ -16029,10 +16042,14 @@ mod tests {
         let replay = crate::mount::append_finish(
             &state,
             replay_session_id,
-            replay_source,
-            PathBuf::from("payload-1.bin"),
-            "batch-one-caller-1".to_string(),
-            None,
+            crate::mount::AppendFinishRequest {
+                spool_path: replay_source,
+                archive_path: PathBuf::from("payload-1.bin"),
+                caller_object_id: "batch-one-caller-1".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+            },
         )
         .await
         .expect("replay append through mount dispatcher");
@@ -17271,6 +17288,8 @@ mod tests {
                 archive_path: PathBuf::from("../invalid"),
                 caller_object_id: "failure-test-object".to_string(),
                 expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
                 live_write_counter: None,
                 reply: append_tx,
             })
