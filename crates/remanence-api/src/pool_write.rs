@@ -14,7 +14,7 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    mpsc as std_mpsc, Arc, Mutex,
+    mpsc as std_mpsc, Arc, Mutex, OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,7 @@ use remanence_state::{
     effective_tape_pool_capacity_bytes, validate_tape_pool_capacity_invariant,
     watermark_floor_bytes, CatalogIndex, NativeObjectCopyProjectionInput, NativeObjectCopyRecord,
     NativeObjectFileProjectionInput, NativeObjectProjectionInput, NativeObjectRecord, StateError,
-    TapeJournalIndexInput, TapePoolConfig, TapeRecord, TerminalFinalizationOutcome,
+    StateHandle, TapeJournalIndexInput, TapePoolConfig, TapeRecord, TerminalFinalizationOutcome,
     TerminalFinalizationProjectionInput, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
     OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
@@ -114,6 +114,12 @@ impl ParityCapacityReservation {
 #[derive(Clone, Debug)]
 pub struct PoolWriteResources {
     io_memory: Arc<crate::io_memory::IoMemoryReservation>,
+    write_admissions: crate::write_owner::WriteAdmissionCoordinator,
+}
+
+fn direct_write_admissions() -> crate::write_owner::WriteAdmissionCoordinator {
+    static COORDINATOR: OnceLock<crate::write_owner::WriteAdmissionCoordinator> = OnceLock::new();
+    COORDINATOR.get_or_init(Default::default).clone()
 }
 
 impl PoolWriteResources {
@@ -121,6 +127,7 @@ impl PoolWriteResources {
     pub fn new(io_memory_ceiling_bytes: u64) -> Result<Self, String> {
         Ok(Self {
             io_memory: crate::io_memory::IoMemoryReservation::new(io_memory_ceiling_bytes)?,
+            write_admissions: direct_write_admissions(),
         })
     }
 
@@ -655,13 +662,35 @@ impl AppendCommitDiagnostics {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectedTape {
     /// Normalized pool id resolved through the catalog.
-    pub pool_id: String,
+    pub(crate) pool_id: String,
     /// Unique eligible tape selected inside the pool.
-    pub tape_uuid: TapeUuid,
+    pub(crate) tape_uuid: TapeUuid,
     /// Fixed block size recorded for the selected tape.
-    pub block_size: u32,
+    pub(crate) block_size: u32,
     /// Parity configuration recorded for the selected tape.
-    pub parity_config: ParityConfig,
+    pub(crate) parity_config: ParityConfig,
+}
+
+impl SelectedTape {
+    /// Return the catalog-normalized pool id that admitted this selection.
+    pub fn pool_id(&self) -> &str {
+        &self.pool_id
+    }
+
+    /// Return the selected tape UUID.
+    pub fn tape_uuid(&self) -> TapeUuid {
+        self.tape_uuid
+    }
+
+    /// Return the selected fixed block size.
+    pub fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// Return the selected parity geometry.
+    pub fn parity_config(&self) -> &ParityConfig {
+        &self.parity_config
+    }
 }
 
 /// Result of pinned-tape admission before a write session resolves media actors.
@@ -1068,6 +1097,9 @@ pub enum PoolWriteError {
     /// Block sink I/O failed outside the parity wrapper.
     #[error(transparent)]
     TapeIo(#[from] TapeIoError),
+    /// Another direct writer owns the same replay key or canonical Object UUID.
+    #[error("write identity admission conflict: {0}")]
+    WriteAdmissionConflict(String),
     /// The actual loaded drive did not report media safe for ordinary Object ingest.
     #[error(transparent)]
     ObjectWriteMedia(#[from] ObjectWriteMediaError),
@@ -2145,14 +2177,43 @@ fn finalize_direct_checkpoint_prefix(
 
 /// Verify, configure, and write one Object through the same loaded drive.
 ///
-/// The wrapper owns the safety-critical sequence: it verifies the selected
-/// tape's BOT identity, reads the current media state from that exact drive,
-/// requires positive rewritable evidence, applies fixed-block configuration,
-/// and only then constructs the hardware sink. Abstract checkpointed cores
-/// remain private so a downstream caller cannot pair drive-A evidence with a
-/// drive-B sink.
+/// The wrapper owns the safety-critical sequence: while the supplied
+/// [`StateHandle`] holds this deployment's exclusive state lock, it verifies
+/// the selected tape's current catalog binding and BOT identity, reads media
+/// state from the same drive handle, requires positive rewritable evidence,
+/// applies fixed-block configuration, and writes through that handle.
+/// Abstract checkpointed cores remain private, so a downstream caller cannot
+/// pair drive-A evidence with a drive-B sink or fabricate selection geometry.
+///
+/// The state lock coordinates Remanence processes that use the same state
+/// directory. It is not a SCSI persistent reservation: operators must exclude
+/// unrelated tape software and Remanence instances configured with another
+/// state directory from the drive for this call's duration.
 #[allow(clippy::too_many_arguments)]
 pub fn write_to_selected_drive_checkpointed(
+    state: &mut StateHandle,
+    drive: &mut DriveHandle,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+    checkpoint_journal_dir: &Path,
+    parity_journal_path: &Path,
+    resources: &PoolWriteResources,
+) -> Result<PoolWriteResult, PoolWriteError> {
+    write_to_selected_drive_checkpointed_with_catalog(
+        state.catalog_index(),
+        drive,
+        pool_cfg,
+        request,
+        selected,
+        checkpoint_journal_dir,
+        parity_journal_path,
+        resources,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_to_selected_drive_checkpointed_with_catalog(
     state: &mut CatalogIndex,
     drive: &mut DriveHandle,
     pool_cfg: &TapePoolConfig,
@@ -2162,6 +2223,14 @@ pub fn write_to_selected_drive_checkpointed(
     parity_journal_path: &Path,
     resources: &PoolWriteResources,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let mut write_admission = resources
+        .write_admissions
+        .reserve(
+            &request.pool_id,
+            &request.caller_object_id,
+            request.expected_object_id,
+        )
+        .map_err(|status| PoolWriteError::WriteAdmissionConflict(status.message().to_string()))?;
     let preflight =
         prepare_checkpointed_write(state, pool_cfg, &request, &selected, checkpoint_journal_dir)?;
     let (checkpoint_lease, prior_records) = match preflight {
@@ -2200,6 +2269,7 @@ pub fn write_to_selected_drive_checkpointed(
         resources,
         checkpoint_lease,
         prior_records,
+        Some(&mut write_admission),
     )
 }
 
@@ -2219,6 +2289,7 @@ fn prepare_checkpointed_write(
     checkpoint_journal_dir: &Path,
 ) -> Result<CheckpointedWritePreflight, PoolWriteError> {
     ensure_request_pool_matches_config(request, pool_cfg)?;
+    ensure_selected_tape_binding(state, pool_cfg, selected)?;
     if let Some(result) = maybe_replay_pool_write(state, pool_cfg, request)? {
         return Ok(CheckpointedWritePreflight::Replay(Box::new(result)));
     }
@@ -2274,6 +2345,7 @@ fn write_to_selected_tape_checkpointed(
         resources,
         checkpoint_lease,
         prior_records,
+        None,
     )
 }
 
@@ -2288,6 +2360,7 @@ fn write_to_selected_tape_checkpointed_after_preflight(
     resources: &PoolWriteResources,
     mut checkpoint_lease: remanence_state::FileCheckpointJournalLease,
     prior_records: Vec<remanence_state::CheckpointJournalRecord>,
+    write_admission: Option<&mut crate::write_owner::WriteAdmissionReservation>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
     let next_ordinal = prior_records.last().map_or(Ok(1), |record| {
         record.ordinal.checked_add(1).ok_or_else(|| {
@@ -2553,7 +2626,12 @@ fn write_to_selected_tape_checkpointed_after_preflight(
         },
     )?;
     checkpoint_lease.append(&record)?;
-    state.project_checkpoint_record(&record)?;
+    if let Err(error) = state.project_checkpoint_record(&record) {
+        if let Some(admission) = write_admission {
+            admission.quarantine_until_restart();
+        }
+        return Err(error.into());
+    }
     if let Some(seal_reason) = seal_reason {
         let mut authority_records = prior_records;
         authority_records.push(record);
@@ -7978,9 +8056,7 @@ fn ensure_selected_tape_accepts_write_inner(
     selected: &SelectedTape,
     session_has_resume_authority: bool,
 ) -> Result<(), PoolWriteError> {
-    let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
-        PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
-    })?;
+    let tape = ensure_selected_tape_binding(state, pool_cfg, selected)?;
     if tape.state != "ready" {
         return Err(PoolWriteError::InvalidInput(format!(
             "selected tape is not writable in state {}",
@@ -7995,14 +8071,7 @@ fn ensure_selected_tape_accepts_write_inner(
             conflict.quarantine_id, conflict.reason
         )));
     }
-    let tape_block_size = tape_block_size(&tape)
-        .map_err(|err| PoolWriteError::MissingTapeGeometry(err.to_string()))?;
-    if tape_block_size != u64::from(selected.block_size) {
-        return Err(PoolWriteError::MissingTapeGeometry(format!(
-            "selected block size {} does not match catalog tape block_size {tape_block_size}",
-            selected.block_size
-        )));
-    }
+    let tape_block_size = u64::from(selected.block_size);
     if tape_block_size != pool_cfg.block_size_bytes {
         return Err(PoolWriteError::InvalidInput(format!(
             "selected tape block size {tape_block_size} does not match pool configured block size {}",
@@ -8020,6 +8089,56 @@ fn ensure_selected_tape_accepts_write_inner(
         };
     }
     Ok(())
+}
+
+fn ensure_selected_tape_binding(
+    state: &CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    selected: &SelectedTape,
+) -> Result<TapeRecord, PoolWriteError> {
+    if selected.pool_id.trim() != pool_cfg.id.trim() {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "selected pool_id {} does not match pool config id {}",
+            selected.pool_id.trim(),
+            pool_cfg.id.trim()
+        )));
+    }
+    let tape = state.get_tape(&selected.tape_uuid)?.ok_or_else(|| {
+        PoolWriteError::MissingTapeGeometry("selected tape row is missing".into())
+    })?;
+    if tape.kind != "data" {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "selected tape kind {} is not data",
+            tape.kind
+        )));
+    }
+    let actual_pool_id = tape
+        .pool_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|pool_id| !pool_id.is_empty());
+    if actual_pool_id != Some(pool_cfg.id.trim()) {
+        return Err(PoolWriteError::InvalidInput(format!(
+            "selected tape catalog pool {:?} does not match required pool {}",
+            actual_pool_id,
+            pool_cfg.id.trim()
+        )));
+    }
+    let (catalog_block_size, catalog_parity) = selected_tape_geometry(&tape, &pool_cfg.id)
+        .map_err(|error| PoolWriteError::MissingTapeGeometry(error.to_string()))?;
+    if selected.block_size != catalog_block_size {
+        return Err(PoolWriteError::MissingTapeGeometry(format!(
+            "selected block size {} does not match catalog tape block_size {catalog_block_size}",
+            selected.block_size
+        )));
+    }
+    if selected.parity_config != catalog_parity {
+        return Err(PoolWriteError::MissingTapeGeometry(format!(
+            "selected parity geometry {:?} does not match catalog parity geometry {catalog_parity:?}",
+            selected.parity_config
+        )));
+    }
+    Ok(tape)
 }
 
 #[cfg(test)]
@@ -8450,26 +8569,31 @@ pub(crate) fn selected_tape_geometry(
         .and_then(|value| {
             u32::try_from(value).map_err(|_| invalid_geometry(pool_id, "block_size overflows u32"))
         })?;
-    let Some(scheme_id) = tape.scheme_id.clone() else {
-        return Ok((block_size, ParityConfig::None));
-    };
-    let data_blocks_per_stripe = tape
-        .data_blocks_per_stripe
-        .ok_or_else(|| invalid_geometry(pool_id, "data_blocks_per_stripe is null"))
-        .and_then(|value| {
-            u16::try_from(value)
-                .map_err(|_| invalid_geometry(pool_id, "data_blocks_per_stripe overflows u16"))
-        })?;
-    let parity_blocks_per_stripe = tape
-        .parity_blocks_per_stripe
-        .ok_or_else(|| invalid_geometry(pool_id, "parity_blocks_per_stripe is null"))
-        .and_then(|value| {
-            u16::try_from(value)
-                .map_err(|_| invalid_geometry(pool_id, "parity_blocks_per_stripe overflows u16"))
-        })?;
-    let stripes_per_neighborhood = tape
-        .stripes_per_neighborhood
-        .ok_or_else(|| invalid_geometry(pool_id, "stripes_per_neighborhood is null"))?;
+    let (scheme_id, data_blocks_per_stripe, parity_blocks_per_stripe, stripes_per_neighborhood) =
+        match (
+            tape.scheme_id.clone(),
+            tape.data_blocks_per_stripe,
+            tape.parity_blocks_per_stripe,
+            tape.stripes_per_neighborhood,
+        ) {
+            (None, None, None, None) => return Ok((block_size, ParityConfig::None)),
+            (Some(scheme_id), Some(data), Some(parity), Some(stripes)) => (
+                scheme_id,
+                u16::try_from(data).map_err(|_| {
+                    invalid_geometry(pool_id, "data_blocks_per_stripe overflows u16")
+                })?,
+                u16::try_from(parity).map_err(|_| {
+                    invalid_geometry(pool_id, "parity_blocks_per_stripe overflows u16")
+                })?,
+                stripes,
+            ),
+            _ => {
+                return Err(invalid_geometry(
+                    pool_id,
+                    "parity scheme columns must be either all present or all null",
+                ));
+            }
+        };
     let scheme = ParityScheme {
         id: SchemeId::new_owned(scheme_id),
         data_blocks_per_stripe,
@@ -8774,6 +8898,34 @@ mod tests {
     }
 
     #[test]
+    fn direct_write_resources_share_identity_admission_authority() {
+        let first = test_pool_write_resources();
+        let second = test_pool_write_resources();
+        let object_id = [0x5A; 16];
+        let held = first
+            .write_admissions
+            .reserve("direct-shared", "same-caller", Some(object_id))
+            .expect("first direct writer owns both identities");
+
+        let replay_conflict = second
+            .write_admissions
+            .reserve("direct-shared", "same-caller", None)
+            .expect_err("a separately constructed resource must share replay-key authority");
+        assert_eq!(replay_conflict.code(), tonic::Code::Aborted);
+        let uuid_conflict = second
+            .write_admissions
+            .reserve("other-pool", "other-caller", Some(object_id))
+            .expect_err("canonical Object UUID authority is process-wide");
+        assert_eq!(uuid_conflict.code(), tonic::Code::Aborted);
+
+        drop(held);
+        second
+            .write_admissions
+            .reserve("direct-shared", "same-caller", Some(object_id))
+            .expect("a non-durable claim releases when its owner drops");
+    }
+
+    #[test]
     fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
         const BLOCK_SIZE: u32 = 256 * 1024;
         const TAPE_UUID: TapeUuid = [0x57; 16];
@@ -8866,6 +9018,74 @@ mod tests {
         };
         let resources = test_pool_write_resources();
 
+        let mut cross_pool_cfg = pool_cfg.clone();
+        cross_pool_cfg.id = "forged-pool".to_string();
+        let mut cross_pool_selected = selected.clone();
+        cross_pool_selected.pool_id = cross_pool_cfg.id.clone();
+        let cross_pool_request = WriteObjectToPoolRequest {
+            pool_id: cross_pool_cfg.id.clone(),
+            source: WriteObjectSource::Path(temp.path().join("unreached-cross-pool-source")),
+            archive_path: "unreached-cross-pool.bin".into(),
+            caller_object_id: "direct-cross-pool-check".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let command_start = world.lock().expect("world lock").command_log.len();
+        let cross_pool = write_to_selected_drive_checkpointed_with_catalog(
+            &mut state,
+            &mut drive,
+            &cross_pool_cfg,
+            cross_pool_request,
+            cross_pool_selected,
+            &temp.path().join("checkpoints"),
+            &temp.path().join("parity.cbor"),
+            &resources,
+        )
+        .expect_err("catalog pool membership must override a forged selection");
+        assert!(matches!(cross_pool, PoolWriteError::InvalidInput(_)));
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            command_start,
+            "cross-pool selection must fail before drive preparation"
+        );
+
+        let mut wrong_parity_selected = selected.clone();
+        wrong_parity_selected.parity_config =
+            ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(BLOCK_SIZE));
+        let wrong_parity_request = WriteObjectToPoolRequest {
+            pool_id: selected.pool_id.clone(),
+            source: WriteObjectSource::Path(temp.path().join("unreached-parity-source")),
+            archive_path: "unreached-parity.bin".into(),
+            caller_object_id: "direct-parity-check".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let command_start = world.lock().expect("world lock").command_log.len();
+        let wrong_parity = write_to_selected_drive_checkpointed_with_catalog(
+            &mut state,
+            &mut drive,
+            &pool_cfg,
+            wrong_parity_request,
+            wrong_parity_selected,
+            &temp.path().join("checkpoints"),
+            &temp.path().join("parity.cbor"),
+            &resources,
+        )
+        .expect_err("catalog parity geometry must override a forged selection");
+        assert!(matches!(
+            wrong_parity,
+            PoolWriteError::MissingTapeGeometry(_)
+        ));
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            command_start,
+            "parity mismatch must fail before drive preparation"
+        );
+
         let invalid_request = WriteObjectToPoolRequest {
             pool_id: "wrong-pool".to_string(),
             source: WriteObjectSource::Path(temp.path().join("unreached-invalid-source")),
@@ -8877,7 +9097,7 @@ mod tests {
             representation: PoolWriteRepresentation::Plaintext,
         };
         let command_start = world.lock().expect("world lock").command_log.len();
-        let invalid = write_to_selected_drive_checkpointed(
+        let invalid = write_to_selected_drive_checkpointed_with_catalog(
             &mut state,
             &mut drive,
             &pool_cfg,
@@ -8897,7 +9117,7 @@ mod tests {
 
         let command_start = world.lock().expect("world lock").command_log.len();
 
-        let error = write_to_selected_drive_checkpointed(
+        let error = write_to_selected_drive_checkpointed_with_catalog(
             &mut state,
             &mut drive,
             &pool_cfg,
@@ -8956,7 +9176,7 @@ mod tests {
         };
         let command_start = world.lock().expect("world lock").command_log.len();
 
-        let result = write_to_selected_drive_checkpointed(
+        let result = write_to_selected_drive_checkpointed_with_catalog(
             &mut state,
             &mut drive,
             &pool_cfg,
@@ -9001,7 +9221,7 @@ mod tests {
             representation: PoolWriteRepresentation::Plaintext,
         };
         let command_start = world.lock().expect("world lock").command_log.len();
-        let replay = write_to_selected_drive_checkpointed(
+        let replay = write_to_selected_drive_checkpointed_with_catalog(
             &mut state,
             &mut drive,
             &pool_cfg,
@@ -11214,6 +11434,9 @@ mod tests {
                 force: false,
             })
             .expect("provision mocked LTO-9");
+        state
+            .project_tape_pool_membership(tape_uuid, pool_id)
+            .expect("assign mocked tape to its selected pool");
         let pool_cfg = TapePoolConfig {
             id: pool_id.into(),
             display_name: None,
@@ -11368,6 +11591,22 @@ mod tests {
             state: "ready".into(),
             updated_at_utc: "2026-08-09T00:00:00Z".into(),
         }
+    }
+
+    #[test]
+    fn selected_tape_geometry_rejects_partial_parity_columns() {
+        let partial = TapeRecord {
+            data_blocks_per_stripe: Some(16),
+            ..capacity_tape_record()
+        };
+        let error = selected_tape_geometry(&partial, "capacity.projection")
+            .expect_err("stray parity geometry must not be interpreted as parity-off");
+        assert!(
+            error
+                .to_string()
+                .contains("parity scheme columns must be either all present or all null"),
+            "{error}"
+        );
     }
 
     #[test]
