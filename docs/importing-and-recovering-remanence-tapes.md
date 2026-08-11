@@ -235,13 +235,15 @@ checkpoint, so concurrent drive actors cannot both write the same identity.
 
 The one-shot direct writer uses the same rule under the exclusive state lock.
 Before it selects a tape, it replays every checkpoint journal in the configured
-state directory, not just the journal for the tape it might select. This closes
-the restart window where tape A has a durable checkpoint but SQLite has not yet
+state directory, not just the journal for the tape it might select, and resolves
+an exact committed retry entirely from host state. A committed retry therefore
+does not need a writable candidate or move a cartridge. This also closes the
+restart window where tape A has a durable checkpoint but SQLite has not yet
 projected its Object identity: a retry cannot select tape B and write the same
-identity again. The drive-bound writer repeats that reconciliation and derives
-the pool policy, checkpoint directory, parity-journal path, and memory ceiling
-from the locked operator configuration rather than accepting them from its
-caller.
+identity again. The drive-bound writer repeats that reconciliation and replay
+check, then derives the pool policy, checkpoint directory, parity-journal path,
+and memory ceiling from the locked operator configuration rather than accepting
+them from its caller.
 
 If a checkpoint append reports an error and rollback also fails, Remanence does
 not pretend it knows whether the new frame is absent, torn, or complete. That

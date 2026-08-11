@@ -2200,18 +2200,7 @@ pub fn write_to_selected_drive_checkpointed(
 ) -> Result<PoolWriteResult, PoolWriteError> {
     crate::reconcile_checkpoint_journal_projections(state)
         .map_err(|status| PoolWriteError::CheckpointReconciliation(status.message().to_string()))?;
-    let pool_cfg = state
-        .config()
-        .tape_pools
-        .iter()
-        .find(|pool| pool.id.trim() == request.pool_id.trim())
-        .cloned()
-        .ok_or_else(|| {
-            PoolWriteError::InvalidInput(format!(
-                "request names unconfigured tape pool {}",
-                request.pool_id.trim()
-            ))
-        })?;
+    let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
     let checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
     let parity_journal_path = state.journal_path(selected.tape_uuid);
     let resources = PoolWriteResources::new(state.config().daemon.io_memory_ceiling)
@@ -2226,6 +2215,39 @@ pub fn write_to_selected_drive_checkpointed(
         parity_journal_path.as_path(),
         &resources,
     )
+}
+
+/// Resolve an already-committed direct write without selecting or moving tape.
+///
+/// This globally reconciles configured checkpoint journals first, then checks
+/// the exact operator-owned pool/caller replay key and content guards. The
+/// drive-bound writer repeats the same checks after selection to close races.
+pub fn replay_committed_pool_write_from_state(
+    state: &mut StateHandle,
+    request: &WriteObjectToPoolRequest,
+) -> Result<Option<PoolWriteResult>, PoolWriteError> {
+    crate::reconcile_checkpoint_journal_projections(state)
+        .map_err(|status| PoolWriteError::CheckpointReconciliation(status.message().to_string()))?;
+    let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
+    maybe_replay_pool_write(state.catalog_index(), &pool_cfg, request)
+}
+
+fn configured_direct_pool(
+    state: &StateHandle,
+    requested_pool_id: &str,
+) -> Result<TapePoolConfig, PoolWriteError> {
+    state
+        .config()
+        .tape_pools
+        .iter()
+        .find(|pool| pool.id.trim() == requested_pool_id.trim())
+        .cloned()
+        .ok_or_else(|| {
+            PoolWriteError::InvalidInput(format!(
+                "request names unconfigured tape pool {}",
+                requested_pool_id.trim()
+            ))
+        })
 }
 
 #[allow(clippy::too_many_arguments)]

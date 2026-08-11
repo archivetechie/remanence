@@ -18,9 +18,9 @@ use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
 use remanence_api::{
     load_tape_by_uuid,
     read_core::{read_object_payload, CapturePayloadSink},
-    select_tape_in_pool_for_write_session, verify_tape_identity,
-    write_to_selected_drive_checkpointed, PoolWriteObjectRecord, PoolWriteRepresentation,
-    PoolWriteResult, TapeUuid, WriteObjectToPoolRequest,
+    replay_committed_pool_write_from_state, select_tape_in_pool_for_write_session,
+    verify_tape_identity, write_to_selected_drive_checkpointed, PoolWriteObjectRecord,
+    PoolWriteRepresentation, PoolWriteResult, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -114,11 +114,6 @@ pub fn run_archive_write(
             return ExitCode::from(1);
         }
     };
-    if let Err(error) = remanence_api::reconcile_checkpoint_journal_projections(&mut state_handle) {
-        let _ = writeln!(err, "error: reconcile checkpoint authority: {error}");
-        return ExitCode::from(1);
-    }
-
     // -- Resolve the operator-owned pool policy and watermarks -------------
     let pool_cfg = match state_handle
         .config()
@@ -133,6 +128,33 @@ pub fn run_archive_write(
             return ExitCode::from(1);
         }
     };
+
+    let request = WriteObjectToPoolRequest {
+        pool_id: pool_id.clone(),
+        source: remanence_api::WriteObjectSource::Path(args.file.clone()),
+        archive_path,
+        caller_object_id,
+        expected_content_sha256: None,
+        expected_object_id: None,
+        input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
+        representation: representation.representation,
+    };
+    match replay_committed_pool_write_from_state(&mut state_handle, &request) {
+        Ok(Some(PoolWriteResult { object, .. })) => {
+            return print_archive_write_success(
+                &object,
+                &pool_id,
+                representation.recipient_epochs.as_deref(),
+                args,
+                out,
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = writeln!(err, "error: replay committed object: {error}");
+            return ExitCode::from(1);
+        }
+    }
 
     // -- Select tape (catalog-only, no hardware) --------------------------
     // No live reservations on a one-shot CLI invocation.
@@ -201,39 +223,37 @@ pub fn run_archive_write(
         }
     };
 
-    let request = WriteObjectToPoolRequest {
-        pool_id: pool_id.clone(),
-        source: remanence_api::WriteObjectSource::Path(args.file.clone()),
-        archive_path,
-        caller_object_id,
-        expected_content_sha256: None,
-        expected_object_id: None,
-        input_kind: remanence_api::WriteObjectInputKind::LogicalFile,
-        representation: representation.representation,
-    };
-
     let result =
         write_to_selected_drive_checkpointed(&mut state_handle, &mut drive, request, selected);
 
     match result {
-        Ok(PoolWriteResult { object, .. }) => {
-            if args.json_output {
-                print_locator_json_with_recipients(
-                    &object,
-                    &pool_id,
-                    representation.recipient_epochs.as_deref(),
-                    out,
-                );
-            } else {
-                print_locator_human(&object, &pool_id, out);
-            }
-            ExitCode::SUCCESS
-        }
+        Ok(PoolWriteResult { object, .. }) => print_archive_write_success(
+            &object,
+            &pool_id,
+            representation.recipient_epochs.as_deref(),
+            args,
+            out,
+        ),
         Err(e) => {
             let _ = writeln!(err, "error: write object: {e}");
             ExitCode::from(1)
         }
     }
+}
+
+fn print_archive_write_success(
+    object: &PoolWriteObjectRecord,
+    pool_id: &str,
+    recipient_epochs: Option<&[serde_json::Value]>,
+    args: &ArchiveWriteArgs,
+    out: &mut dyn Write,
+) -> ExitCode {
+    if args.json_output {
+        print_locator_json_with_recipients(object, pool_id, recipient_epochs, out);
+    } else {
+        print_locator_human(object, pool_id, out);
+    }
+    ExitCode::SUCCESS
 }
 
 struct WriteRepresentationSelection {
