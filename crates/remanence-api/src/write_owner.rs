@@ -50,6 +50,10 @@ use uuid::Uuid;
 
 mod bot_recovery;
 
+pub(crate) use crate::drive_pool::{
+    DriveKey, DrivePool, DrivePoolLifecycle, DriveReservation, ExclusiveGuard, MountedSession,
+    ParkedCartridge, SeatedCartridge, TapeReservation,
+};
 use crate::pool_write::{SelectedTape, WriteObjectToPoolRequest};
 use crate::{
     load_tape_by_uuid, pb, status_from_state_error, timestamp_from_rfc3339, verify_tape_identity,
@@ -811,427 +815,6 @@ pub(crate) struct CloseWriteActorDiagnostics {
     pub(crate) session_audit_projection: StdDuration,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MountedSession {
-    pub bay: u16,
-    pub library_serial: String,
-    pub barcode: Option<String>,
-    pub home_slot: Option<u16>,
-    pub tape_uuid: TapeUuid,
-    pub drive_uuid: Option<Vec<u8>>,
-}
-
-/// A library cartridge intentionally left seated after its session closes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SeatedCartridge {
-    pub(crate) bay: u16,
-    pub(crate) library_serial: String,
-    pub(crate) barcode: Option<String>,
-    pub(crate) home_slot: u16,
-    pub(crate) tape_uuid: Option<TapeUuid>,
-    pub(crate) prior_session_id: Option<Uuid>,
-}
-
-/// Generation-tagged idle record used to invalidate stale timeout tasks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ParkedCartridge {
-    pub(crate) seated: SeatedCartridge,
-    generation: u64,
-}
-
-#[derive(Default)]
-struct ParkedState {
-    next_generation: u64,
-    by_bay: HashMap<u16, ParkedCartridge>,
-}
-
-/// Shared actor/pool lifecycle maps used by timer-driven close-and-park.
-#[derive(Clone, Default)]
-pub(crate) struct DrivePoolLifecycle {
-    sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
-    parked: Arc<Mutex<ParkedState>>,
-    timer_park_tx: Option<mpsc::UnboundedSender<ParkedCartridge>>,
-}
-
-impl DrivePoolLifecycle {
-    pub(crate) fn with_timer_park_sender(
-        timer_park_tx: mpsc::UnboundedSender<ParkedCartridge>,
-    ) -> Self {
-        Self {
-            timer_park_tx: Some(timer_park_tx),
-            ..Self::default()
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct DrivePool {
-    changer_tx: mpsc::Sender<ChangerCommand>,
-    drives: Arc<HashMap<u16, mpsc::Sender<DriveCommand>>>,
-    reservations: Arc<HashMap<u16, AtomicBool>>,
-    sessions: Arc<Mutex<HashMap<Uuid, MountedSession>>>,
-    tape_reservations: Arc<Mutex<HashSet<TapeUuid>>>,
-    parked: Arc<Mutex<ParkedState>>,
-    shutting_down: Arc<AtomicBool>,
-}
-
-impl DrivePool {
-    #[cfg(test)]
-    pub(crate) fn new(
-        changer_tx: mpsc::Sender<ChangerCommand>,
-        drives: HashMap<u16, mpsc::Sender<DriveCommand>>,
-        reservations: Arc<HashMap<u16, AtomicBool>>,
-    ) -> Self {
-        Self::new_with_lifecycle(
-            changer_tx,
-            drives,
-            reservations,
-            DrivePoolLifecycle::default(),
-        )
-    }
-
-    pub(crate) fn new_with_lifecycle(
-        changer_tx: mpsc::Sender<ChangerCommand>,
-        drives: HashMap<u16, mpsc::Sender<DriveCommand>>,
-        reservations: Arc<HashMap<u16, AtomicBool>>,
-        lifecycle: DrivePoolLifecycle,
-    ) -> Self {
-        Self {
-            changer_tx,
-            drives: Arc::new(drives),
-            reservations,
-            sessions: lifecycle.sessions,
-            tape_reservations: Arc::new(Mutex::new(HashSet::new())),
-            parked: lifecycle.parked,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub(crate) fn changer_tx(&self) -> mpsc::Sender<ChangerCommand> {
-        self.changer_tx.clone()
-    }
-
-    pub(crate) fn drive_tx(&self, bay: u16) -> Result<mpsc::Sender<DriveCommand>, Status> {
-        self.drives
-            .get(&bay)
-            .cloned()
-            .ok_or_else(|| Status::not_found(format!("drive bay 0x{bay:04x} not available")))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reserve_free_drive(&self) -> Result<u16, Status> {
-        let mut bays = self.reservations.keys().copied().collect::<Vec<_>>();
-        bays.sort_unstable();
-        bays.into_iter()
-            .find(|bay| {
-                self.reservations.get(bay).is_some_and(|reservation| {
-                    reservation
-                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                        .is_ok()
-                })
-            })
-            .ok_or_else(|| Status::failed_precondition("all drives are busy"))
-    }
-
-    pub(crate) fn reserve_drive(&self, bay: u16) -> Result<DriveReservation, Status> {
-        if self.is_shutting_down() {
-            return Err(Status::unavailable("drive pool is shutting down"));
-        }
-        self.reserve_drive_inner(bay)
-    }
-
-    pub(crate) fn reserve_drive_for_shutdown(&self, bay: u16) -> Result<DriveReservation, Status> {
-        self.reserve_drive_inner(bay)
-    }
-
-    fn reserve_drive_inner(&self, bay: u16) -> Result<DriveReservation, Status> {
-        let reservation = self
-            .reservations
-            .get(&bay)
-            .ok_or_else(|| Status::not_found(format!("drive bay 0x{bay:04x} not available")))?;
-        reservation
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|_| Status::failed_precondition(format!("drive bay 0x{bay:04x} is busy")))?;
-        Ok(DriveReservation {
-            bay,
-            reservations: self.reservations.clone(),
-            armed: true,
-        })
-    }
-
-    pub(crate) fn release(&self, bay: u16) {
-        if let Some(reservation) = self.reservations.get(&bay) {
-            reservation.store(false, Ordering::SeqCst);
-        }
-    }
-
-    pub(crate) fn reserve_all_exclusive(&self) -> Result<(), Status> {
-        if self.is_shutting_down() {
-            return Err(Status::unavailable("drive pool is shutting down"));
-        }
-        let mut acquired = Vec::new();
-        let mut bays = self.reservations.keys().copied().collect::<Vec<_>>();
-        bays.sort_unstable();
-        for bay in bays {
-            let Some(reservation) = self.reservations.get(&bay) else {
-                continue;
-            };
-            if reservation
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                acquired.push(bay);
-            } else {
-                for acquired_bay in acquired {
-                    self.release(acquired_bay);
-                }
-                return Err(Status::failed_precondition("drives are busy"));
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn release_all(&self) {
-        release_all_reservations(&self.reservations);
-    }
-
-    pub(crate) fn busy_bays(&self) -> HashSet<u16> {
-        self.reservations
-            .iter()
-            .filter(|(_, reservation)| reservation.load(Ordering::SeqCst))
-            .map(|(bay, _)| *bay)
-            .collect()
-    }
-
-    /// Snapshot sessions by their enforcement key for advisory status only.
-    ///
-    /// The reservation atomics remain the sole authority for admission. This
-    /// projection may race with an open/close and must never gate tape I/O.
-    pub(crate) fn sessions_by_bay(&self) -> HashMap<u16, (Uuid, MountedSession)> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .iter()
-            .map(|(session_id, mounted)| (mounted.bay, (*session_id, mounted.clone())))
-            .collect()
-    }
-
-    pub(crate) fn mounted_tape_uuids(&self) -> HashSet<TapeUuid> {
-        let mut in_use = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .values()
-            .map(|mounted| mounted.tape_uuid)
-            .collect::<HashSet<_>>();
-        in_use.extend(
-            self.tape_reservations
-                .lock()
-                .unwrap_or_else(|err| err.into_inner())
-                .iter()
-                .copied(),
-        );
-        in_use
-    }
-
-    pub(crate) fn reserve_tape(&self, tape_uuid: TapeUuid) -> Result<TapeReservation, Status> {
-        self.reserve_tape_with_after_insert(tape_uuid, |_| {})
-    }
-
-    fn reserve_tape_with_after_insert(
-        &self,
-        tape_uuid: TapeUuid,
-        after_insert: impl FnOnce(&HashSet<TapeUuid>),
-    ) -> Result<TapeReservation, Status> {
-        let sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
-        if sessions
-            .values()
-            .any(|mounted| mounted.tape_uuid == tape_uuid)
-        {
-            return Err(Status::failed_precondition("tape is already mounted"));
-        }
-        let mut reservations = self
-            .tape_reservations
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if !reservations.insert(tape_uuid) {
-            return Err(Status::failed_precondition("tape is already mounted"));
-        }
-        after_insert(&reservations);
-        // Keep the sessions guard through reservation insertion. Otherwise a
-        // concurrent opener can publish a mounted session after our check but
-        // before this exact-tape owner becomes visible.
-        drop(sessions);
-        Ok(TapeReservation {
-            tape_uuid,
-            reservations: self.tape_reservations.clone(),
-        })
-    }
-
-    pub(crate) fn record_session(&self, session_id: Uuid, mounted: MountedSession) {
-        self.parked
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .by_bay
-            .remove(&mounted.bay);
-        self.sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .insert(session_id, mounted);
-    }
-
-    pub(crate) fn session(&self, session_id: Uuid) -> Result<MountedSession, Status> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| Status::not_found("session not found"))
-    }
-
-    pub(crate) fn forget_session(&self, session_id: Uuid) {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .remove(&session_id);
-    }
-
-    /// Convert a completed session reservation into an idle seated cartridge.
-    /// The bay remains reserved until all bookkeeping is published.
-    pub(crate) fn finish_session(
-        &self,
-        session_id: Uuid,
-        mounted: MountedSession,
-    ) -> Option<ParkedCartridge> {
-        let bay = mounted.bay;
-        self.forget_session(session_id);
-        let parked = mounted.home_slot.map(|home_slot| {
-            self.park_cartridge(SeatedCartridge {
-                bay: mounted.bay,
-                library_serial: mounted.library_serial,
-                barcode: mounted.barcode,
-                home_slot,
-                tape_uuid: Some(mounted.tape_uuid),
-                prior_session_id: Some(session_id),
-            })
-        });
-        self.release(bay);
-        parked
-    }
-
-    /// Register a cartridge found seated at startup or during reconciliation.
-    pub(crate) fn park_cartridge(&self, seated: SeatedCartridge) -> ParkedCartridge {
-        let mut state = self.parked.lock().unwrap_or_else(|err| err.into_inner());
-        state.next_generation = state.next_generation.wrapping_add(1).max(1);
-        let parked = ParkedCartridge {
-            seated,
-            generation: state.next_generation,
-        };
-        state.by_bay.insert(parked.seated.bay, parked.clone());
-        parked
-    }
-
-    pub(crate) fn parked_at(&self, bay: u16) -> Option<ParkedCartridge> {
-        self.parked
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .by_bay
-            .get(&bay)
-            .cloned()
-    }
-
-    pub(crate) fn parked_is_current(&self, parked: &ParkedCartridge) -> bool {
-        self.parked_at(parked.seated.bay)
-            .is_some_and(|current| current.generation == parked.generation)
-    }
-
-    pub(crate) fn forget_parked(&self, parked: &ParkedCartridge) {
-        let mut state = self.parked.lock().unwrap_or_else(|err| err.into_inner());
-        if state
-            .by_bay
-            .get(&parked.seated.bay)
-            .is_some_and(|current| current.generation == parked.generation)
-        {
-            state.by_bay.remove(&parked.seated.bay);
-        }
-    }
-
-    pub(crate) fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
-    }
-
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::SeqCst)
-    }
-
-    pub(crate) async fn poll_drive_health(
-        &self,
-        bay: u16,
-        drive_uuid: Vec<u8>,
-    ) -> Result<DriveHealthSnapshotRecord, Status> {
-        let tx = self.drive_tx(bay)?;
-        let (reply, rx) = oneshot::channel();
-        tx.send(DriveCommand::PollHealth {
-            drive_uuid,
-            trigger: "manual",
-            session_id: None,
-            tape_uuid: None,
-            reply,
-        })
-        .await
-        .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
-        rx.await
-            .map_err(|_| Status::unavailable("drive actor stopped"))?
-    }
-
-    pub(crate) fn heartbeat_drive(&self, bay: u16, drive_uuid: Vec<u8>) -> Result<(), Status> {
-        let tx = self.drive_tx(bay)?;
-        let (reply, rx) = oneshot::channel();
-        tx.blocking_send(DriveCommand::Heartbeat { drive_uuid, reply })
-            .map_err(|_| Status::unavailable("drive actor is unavailable"))?;
-        rx.blocking_recv()
-            .map_err(|_| Status::unavailable("drive actor stopped"))?
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DriveReservation {
-    bay: u16,
-    reservations: Arc<HashMap<u16, AtomicBool>>,
-    armed: bool,
-}
-
-impl DriveReservation {
-    pub(crate) fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DriveReservation {
-    fn drop(&mut self) {
-        if self.armed {
-            if let Some(reservation) = self.reservations.get(&self.bay) {
-                reservation.store(false, Ordering::SeqCst);
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TapeReservation {
-    tape_uuid: TapeUuid,
-    reservations: Arc<Mutex<HashSet<TapeUuid>>>,
-}
-
-impl Drop for TapeReservation {
-    fn drop(&mut self) {
-        self.reservations
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .remove(&self.tape_uuid);
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct WriteOwnerConfig {
     pub index_path: PathBuf,
@@ -1240,8 +823,8 @@ pub(crate) struct WriteOwnerConfig {
     pub audit_dir: PathBuf,
     pub audit_fsync: bool,
     pub audit_append_lock: Arc<std::sync::Mutex<()>>,
-    pub reservations: Arc<HashMap<u16, AtomicBool>>,
-    pub default_library_serial: Option<String>,
+    pub reservations: Arc<HashMap<crate::drive_pool::DriveKey, AtomicBool>>,
+    pub actor_library_serial: String,
     pub library_snapshot: Arc<RwLock<Arc<crate::LibrarySnapshot>>>,
     pub snapshot_miss_alarm: u32,
     pub managed_library_serials: Arc<HashSet<String>>,
@@ -1256,28 +839,12 @@ pub(crate) struct WriteOwnerConfig {
     pub checkpoint_max_objects: u64,
     pub checkpoint_max_age_seconds: u64,
     pub session_idle_seconds: u64,
-    pub lifecycle: Option<DrivePoolLifecycle>,
+    pub lifecycle: Option<crate::drive_pool::DrivePoolLifecycle>,
     /// Durable calibration-control store for the wrap-map read
     /// ordering lifecycle (design-read-ordering.md §6.5). The drive
     /// actors run the load harvest against it at session open when
     /// the open freshly mounted the cartridge.
     pub calibration_store: remanence_state::CalibrationControlStore,
-}
-
-pub(crate) struct ExclusiveGuard {
-    reservations: Arc<HashMap<u16, AtomicBool>>,
-}
-
-impl ExclusiveGuard {
-    pub(crate) fn from_reserved(reservations: Arc<HashMap<u16, AtomicBool>>) -> Self {
-        Self { reservations }
-    }
-}
-
-impl Drop for ExclusiveGuard {
-    fn drop(&mut self) {
-        release_all_reservations(&self.reservations);
-    }
 }
 
 pub(crate) struct Spool {
@@ -1353,8 +920,9 @@ pub(crate) fn spawn_changer_actor(
     cfg: WriteOwnerConfig,
 ) -> mpsc::Sender<ChangerCommand> {
     let (tx, rx) = mpsc::channel::<ChangerCommand>(16);
+    let actor_name = format!("rem-changer-actor-{}", cfg.actor_library_serial);
     std::thread::Builder::new()
-        .name("rem-changer-actor".to_string())
+        .name(actor_name)
         .spawn(move || changer_loop(&mut changer, cfg, rx))
         .expect("spawn changer actor thread");
     tx
@@ -1367,8 +935,9 @@ pub(crate) fn spawn_drive_actor(
 ) -> mpsc::Sender<DriveCommand> {
     let (tx, rx) = mpsc::channel::<DriveCommand>(16);
     let actor_tx = tx.clone();
+    let actor_name = format!("rem-drive-actor-{}-{bay:04x}", cfg.actor_library_serial);
     std::thread::Builder::new()
-        .name(format!("rem-drive-actor-{bay:04x}"))
+        .name(actor_name)
         .spawn(move || drive_loop(bay, &mut drive, cfg, actor_tx, rx))
         .expect("spawn drive actor thread");
     tx
@@ -1386,6 +955,7 @@ fn changer_loop(
                 rx,
                 format!("open catalog index: {err}"),
                 cfg.reservations.clone(),
+                cfg.actor_library_serial.clone(),
             );
             return;
         }
@@ -1425,7 +995,10 @@ fn changer_loop(
                 let _ = reply.send(result);
             }
             ChangerCommand::Reconcile { tape_uuid, handle } => {
-                let _exclusive_guard = ExclusiveGuard::from_reserved(cfg.reservations.clone());
+                let _exclusive_guard = ExclusiveGuard::from_reserved_library(
+                    cfg.reservations.clone(),
+                    cfg.actor_library_serial.clone(),
+                );
                 handle_reconcile(&mut index, &cfg, tape_uuid, handle);
                 refresh_actor_changer(changer, &cfg);
             }
@@ -1434,7 +1007,10 @@ fn changer_loop(
                 action,
                 handle,
             } => {
-                let _exclusive_guard = ExclusiveGuard::from_reserved(cfg.reservations.clone());
+                let _exclusive_guard = ExclusiveGuard::from_reserved_library(
+                    cfg.reservations.clone(),
+                    cfg.actor_library_serial.clone(),
+                );
                 handle_robotics(&mut index, &cfg, library_serial, action, handle);
                 refresh_actor_changer(changer, &cfg);
             }
@@ -1459,7 +1035,8 @@ fn refresh_actor_changer(changer: &mut ChangerHandle, cfg: &WriteOwnerConfig) {
 fn drain_failed_changer_commands(
     mut rx: mpsc::Receiver<ChangerCommand>,
     message: String,
-    reservations: Arc<HashMap<u16, AtomicBool>>,
+    reservations: Arc<HashMap<DriveKey, AtomicBool>>,
+    library_serial: String,
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -1471,15 +1048,9 @@ fn drain_failed_changer_commands(
             }
             ChangerCommand::Reconcile { handle, .. } | ChangerCommand::Robotics { handle, .. } => {
                 handle.publish_failed(message.as_str(), &[("phase", "catalog")]);
-                release_all_reservations(&reservations);
+                crate::drive_pool::release_library_reservations(&reservations, &library_serial);
             }
         }
-    }
-}
-
-fn release_all_reservations(reservations: &HashMap<u16, AtomicBool>) {
-    for reservation in reservations.values() {
-        reservation.store(false, Ordering::SeqCst);
     }
 }
 
@@ -3352,6 +2923,7 @@ fn park_timer_closed_session(cfg: &WriteOwnerConfig, session_id: Uuid) -> Result
     let Some(mounted) = mounted else {
         return Ok(());
     };
+    let drive_key = mounted.drive_key();
     let parked = mounted.home_slot.map(|home_slot| {
         let seated = SeatedCartridge {
             bay: mounted.bay,
@@ -3368,10 +2940,12 @@ fn park_timer_closed_session(cfg: &WriteOwnerConfig, session_id: Uuid) -> Result
         parked.next_generation = parked.next_generation.wrapping_add(1).max(1);
         let generation = parked.next_generation;
         let parked_cartridge = ParkedCartridge { seated, generation };
-        parked.by_bay.insert(mounted.bay, parked_cartridge.clone());
+        parked
+            .by_drive
+            .insert(drive_key.clone(), parked_cartridge.clone());
         parked_cartridge
     });
-    if let Some(reservation) = cfg.reservations.get(&mounted.bay) {
+    if let Some(reservation) = cfg.reservations.get(&drive_key) {
         reservation.store(false, Ordering::SeqCst);
     }
     if let (Some(parked), Some(timer_park_tx)) = (parked, lifecycle.timer_park_tx.as_ref()) {
@@ -9443,6 +9017,20 @@ fn handle_robotics(
     action: RoboticsAction,
     handle: crate::operations::OperationHandle,
 ) {
+    if library_serial != cfg.actor_library_serial {
+        fail_library_operation(
+            index,
+            cfg,
+            &handle,
+            &library_serial,
+            &format!(
+                "robotics request for library {library_serial} reached actor for {}",
+                cfg.actor_library_serial
+            ),
+            &[("phase", "routing")],
+        );
+        return;
+    }
     if handle.is_cancelled() {
         cancel_library_operation(
             index,
@@ -9789,11 +9377,8 @@ fn publish_library_snapshot(
     cell: &RwLock<Arc<crate::LibrarySnapshot>>,
     updated: remanence_library::Library,
 ) {
-    let mut report = cell
-        .read()
-        .unwrap_or_else(|err| err.into_inner())
-        .report
-        .clone();
+    let mut snapshot_guard = cell.write().unwrap_or_else(|err| err.into_inner());
+    let mut report = snapshot_guard.report.clone();
     match report
         .libraries
         .iter_mut()
@@ -9806,7 +9391,7 @@ fn publish_library_snapshot(
         report,
         captured_at: OffsetDateTime::now_utc(),
     });
-    *cell.write().unwrap_or_else(|err| err.into_inner()) = snapshot;
+    *snapshot_guard = snapshot;
 }
 
 fn record_library_event(
@@ -10628,20 +10213,7 @@ fn handle_reconcile(
         return;
     }
 
-    let library_serial = match cfg.default_library_serial.as_deref() {
-        Some(serial) => serial,
-        None => {
-            fail_operation(
-                index,
-                cfg,
-                &handle,
-                &tape_uuid,
-                "tape reconciliation requires exactly one configured library in this slice",
-                &[("phase", "mount")],
-            );
-            return;
-        }
-    };
+    let library_serial = cfg.actor_library_serial.as_str();
     let lib = match cfg.report.library(library_serial) {
         Some(lib) => lib,
         None => {
@@ -14897,7 +14469,7 @@ mod tests {
             audit_fsync: false,
             audit_append_lock: Arc::new(std::sync::Mutex::new(())),
             reservations: Arc::new(HashMap::new()),
-            default_library_serial: Some(serial.clone()),
+            actor_library_serial: serial.clone(),
             library_snapshot,
             snapshot_miss_alarm: 1,
             managed_library_serials: Arc::new(HashSet::from([serial])),
@@ -15078,7 +14650,8 @@ mod tests {
         let snapshot = library_snapshot_cell(library.library().clone());
         let (timer_park_tx, mut timer_park_rx) = mpsc::unbounded_channel();
         let lifecycle = DrivePoolLifecycle::with_timer_park_sender(timer_park_tx);
-        let reservations = Arc::new(HashMap::from([(0x0100, AtomicBool::new(true))]));
+        let drive_key = DriveKey::new("LIB-CHECKPOINT-IDLE", 0x0100);
+        let reservations = Arc::new(HashMap::from([(drive_key.clone(), AtomicBool::new(true))]));
         let session_id = Uuid::from_bytes([0x73; 16]);
         lifecycle
             .sessions
@@ -15115,12 +14688,12 @@ mod tests {
             .parked
             .lock()
             .expect("parked lifecycle")
-            .by_bay
-            .get(&0x0100)
+            .by_drive
+            .get(&drive_key)
             .cloned()
             .expect("parked cartridge");
         assert_eq!(parked.seated.prior_session_id, Some(session_id));
-        assert!(!reservations[&0x0100].load(Ordering::SeqCst));
+        assert!(!reservations[&drive_key].load(Ordering::SeqCst));
         assert_eq!(
             timer_park_rx
                 .try_recv()
@@ -16486,7 +16059,8 @@ mod tests {
         };
         let (changer_tx, _changer_rx) = mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0100, AtomicBool::new(false))]));
-        let pool = DrivePool::new(
+        let pool = DrivePool::new_for_library(
+            library_serial.as_str(),
             changer_tx,
             HashMap::from([(0x0100, drive_tx.clone())]),
             reservations,
@@ -17026,7 +16600,7 @@ mod tests {
             audit_fsync: false,
             audit_append_lock: Arc::new(std::sync::Mutex::new(())),
             reservations: Arc::new(HashMap::new()),
-            default_library_serial: Some(library.serial.clone()),
+            actor_library_serial: library.serial.clone(),
             library_snapshot: Arc::clone(&snapshot_cell),
             snapshot_miss_alarm: 1,
             managed_library_serials: Arc::new(HashSet::from([library.serial.clone()])),

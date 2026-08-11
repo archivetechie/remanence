@@ -4,14 +4,13 @@ use remanence_library::{
     resolve_load_target, AccessPolicy, DriveHandle, Library, LibraryHandle, LoadError, LoadPlan,
 };
 use remanence_state::{CatalogIndex, StateError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::pool_write::select_tape_in_pool_for_write_session;
 use crate::{bytes_to_hex, pb, status_from_state_error, ApiState, TapeUuid};
 
 /// Error variants from `load_tape_by_uuid`.
@@ -185,14 +184,14 @@ impl WriteSessionTarget {
 pub(crate) async fn open_write_session(
     state: &ApiState,
     target: WriteSessionTarget,
-    library_serial: String,
+    library_constraint: Option<String>,
 ) -> Result<pb::WriteSession, Status> {
     let state = state.clone();
     await_critical_task(
         "open_write_session",
-        tokio::spawn(
-            async move { open_write_session_critical(state, target, library_serial).await },
-        ),
+        tokio::spawn(async move {
+            open_write_session_critical(state, target, library_constraint).await
+        }),
     )
     .await
 }
@@ -200,17 +199,17 @@ pub(crate) async fn open_write_session(
 async fn open_write_session_critical(
     state: ApiState,
     target: WriteSessionTarget,
-    library_serial: String,
+    library_constraint: Option<String>,
 ) -> Result<pb::WriteSession, Status> {
     let pool = state.drive_pool()?.clone();
-    open_write_session_reserved(&state, &pool, target, library_serial).await
+    open_write_session_reserved(&state, &pool, target, library_constraint).await
 }
 
 async fn open_write_session_reserved(
     state: &ApiState,
     pool: &crate::write_owner::DrivePool,
     target: WriteSessionTarget,
-    library_serial: String,
+    library_constraint: Option<String>,
 ) -> Result<pb::WriteSession, Status> {
     enum ReservedWriteDisposition {
         Writable {
@@ -229,27 +228,33 @@ async fn open_write_session_reserved(
     let select_started = Instant::now();
     let mut select_attempts = 0u64;
     let disposition = match &target {
-        WriteSessionTarget::Pool { .. } => loop {
-            select_attempts = select_attempts.saturating_add(1);
-            let selected = select_tape_in_pool_for_write_session(
-                &index,
-                &pool_cfg,
-                0,
-                &pool.mounted_tape_uuids(),
-                state.checkpoint_journal_dir.as_path(),
-            )
-            .map_err(crate::write_owner::status_from_select_tape_error)?;
-            match pool.reserve_tape(selected.tape_uuid) {
-                Ok(reservation) => {
-                    break ReservedWriteDisposition::Writable {
-                        selected,
-                        reservation,
-                    };
+        WriteSessionTarget::Pool { .. } => {
+            let located_tapes =
+                located_tapes_in_operated_libraries(state, pool, library_constraint.as_deref())?;
+            let allowed_tape_uuids = located_tapes.keys().copied().collect::<HashSet<_>>();
+            loop {
+                select_attempts = select_attempts.saturating_add(1);
+                let selected = crate::pool_write::select_tape_in_pool_for_write_session_scoped(
+                    &index,
+                    &pool_cfg,
+                    0,
+                    &pool.mounted_tape_uuids(),
+                    state.checkpoint_journal_dir.as_path(),
+                    &allowed_tape_uuids,
+                )
+                .map_err(crate::write_owner::status_from_select_tape_error)?;
+                match pool.reserve_tape(selected.tape_uuid) {
+                    Ok(reservation) => {
+                        break ReservedWriteDisposition::Writable {
+                            selected,
+                            reservation,
+                        };
+                    }
+                    Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
+                    Err(err) => return Err(err),
                 }
-                Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
-                Err(err) => return Err(err),
             }
-        },
+        }
         WriteSessionTarget::PinnedTape {
             tape_uuid,
             required_pool_id,
@@ -327,17 +332,25 @@ async fn open_write_session_reserved(
             )));
         }
     };
+    let library_serial = resolve_tape_library_serial(state, pool, &tape_uuid)?;
+    if let Some(expected) = library_constraint.as_deref() {
+        if library_serial != expected {
+            return Err(Status::failed_precondition(format!(
+                "selected tape is in library {library_serial}, not constrained library {expected}"
+            )));
+        }
+    }
     let open_started = Instant::now();
     let resolve_started = Instant::now();
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(state, pool, &library_serial, &tape_uuid).await?;
     let resolve_elapsed = resolve_started.elapsed();
-    let drive = pool.drive_tx(mount.bay)?;
+    let drive = pool.drive_tx(&mount.drive_key())?;
     let pool_id_for_diag = pool_cfg.id.clone();
     let mut changer_move_ms = 0.0;
     if let Some(slot) = mount.source_slot {
         let changer_started = Instant::now();
-        changer_move(pool, slot, mount.bay).await?;
+        changer_move(pool, &mount.library_serial, slot, mount.bay).await?;
         changer_move_ms = crate::diagnostics::duration_ms(changer_started.elapsed());
     }
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -475,20 +488,12 @@ async fn tape_inventory_critical(
             tape.kind
         )));
     }
-    let library_serial = state
-        .default_library_serial
-        .as_deref()
-        .map(|serial| serial.as_str().to_string())
-        .ok_or_else(|| {
-            Status::invalid_argument(
-                "tape inventory requires exactly one configured library in this slice",
-            )
-        })?;
+    let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
-    let drive = pool.drive_tx(mount.bay)?;
+    let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
-        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+        if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
             drop(drive_reservation);
             return Err(error);
         }
@@ -563,20 +568,12 @@ async fn verify_tape_index_critical(
             tape.kind
         )));
     }
-    let library_serial = state
-        .default_library_serial
-        .as_deref()
-        .map(|serial| serial.as_str().to_string())
-        .ok_or_else(|| {
-            Status::invalid_argument(
-                "tape index verification requires exactly one configured library in this slice",
-            )
-        })?;
+    let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?;
-    let drive = pool.drive_tx(mount.bay)?;
+    let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
-        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+        if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
             drop(drive_reservation);
             return Err(error);
         }
@@ -839,20 +836,12 @@ async fn run_manual_finalize_worker(
         return Ok(());
     }
     drop(index);
-    let library_serial = state
-        .default_library_serial
-        .as_deref()
-        .map(|serial| serial.as_str().to_string())
-        .ok_or_else(|| {
-            Status::invalid_argument(
-                "manual tape finalization requires exactly one configured library in this slice",
-            )
-        })?;
+    let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(&state, &pool, library_serial.as_str(), &tape_uuid).await?;
-    let drive = pool.drive_tx(mount.bay)?;
+    let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
-        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+        if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
             drop(drive_reservation);
             return Err(error);
         }
@@ -1074,20 +1063,12 @@ async fn recover_automatic_terminal_tape(
         return Ok(());
     }
     drop(host_index);
-    let library_serial = state
-        .default_library_serial
-        .as_deref()
-        .map(|serial| serial.as_str().to_string())
-        .ok_or_else(|| {
-            Status::invalid_argument(
-                "automatic terminal recovery requires exactly one configured library",
-            )
-        })?;
+    let library_serial = resolve_tape_library_serial(state, &pool, &tape_uuid)?;
     let (mount, drive_reservation) =
         resolve_and_reserve_actor_mount(state, &pool, &library_serial, &tape_uuid).await?;
-    let drive = pool.drive_tx(mount.bay)?;
+    let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
-        if let Err(error) = changer_move(&pool, slot, mount.bay).await {
+        if let Err(error) = changer_move(&pool, &mount.library_serial, slot, mount.bay).await {
             drop(drive_reservation);
             return Err(error);
         }
@@ -1179,15 +1160,7 @@ async fn open_read_session_critical(
     let _tape_reservation = pool.reserve_tape(tape_uuid)?;
     let (mount, drive_reservation) = match target {
         ReadSessionTarget::Tape { .. } => {
-            let library_serial = state
-                .default_library_serial
-                .as_deref()
-                .map(|serial| serial.as_str().to_string())
-                .ok_or_else(|| {
-                    Status::invalid_argument(
-                        "tape-target read sessions require exactly one configured library in this slice",
-                    )
-                })?;
+            let library_serial = resolve_tape_library_serial(&state, &pool, &tape_uuid)?;
             resolve_and_reserve_actor_mount(&state, &pool, &library_serial, &tape_uuid).await?
         }
         ReadSessionTarget::LoadedDrive {
@@ -1195,7 +1168,8 @@ async fn open_read_session_critical(
             bay,
             ..
         } => {
-            let reservation = pool.reserve_drive(bay)?;
+            let drive_key = crate::drive_pool::DriveKey::new(library_serial.clone(), bay);
+            let reservation = pool.reserve_drive(&drive_key)?;
             let mount = resolve_pinned_actor_mount(&state, &library_serial, bay, &tape_uuid)?;
             ensure_actor_mount_media_readiness_admitted(&state, &library_serial, &mount)?;
             (mount, reservation)
@@ -1220,9 +1194,9 @@ async fn open_read_session_on_mount(
     tape_uuid: TapeUuid,
     resume_target: Option<crate::write_owner::ReadResumeTarget>,
 ) -> Result<pb::ReadSession, Status> {
-    let drive = pool.drive_tx(mount.bay)?;
+    let drive = pool.drive_tx(&mount.drive_key())?;
     if let Some(slot) = mount.source_slot {
-        changer_move(pool, slot, mount.bay).await?;
+        changer_move(pool, &mount.library_serial, slot, mount.bay).await?;
     }
     let (reply_tx, reply_rx) = oneshot::channel();
     let open_result: Result<pb::ReadSession, Status> = async {
@@ -1287,7 +1261,7 @@ pub(crate) async fn append_finish(
 ) -> Result<pb::ObjectRecord, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let live_write_counter = mounted
         .drive_uuid
         .as_deref()
@@ -1323,7 +1297,7 @@ pub(crate) async fn append_streamed(
 ) -> Result<crate::write_owner::AppendFinishOutcome, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let live_write_counter = mounted
         .drive_uuid
         .as_deref()
@@ -1354,7 +1328,7 @@ pub(crate) async fn get_write_session(
 ) -> Result<pb::WriteSession, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
         .send(crate::write_owner::DriveCommand::Get {
@@ -1375,7 +1349,7 @@ pub(crate) async fn checkpoint_write_session(
 ) -> Result<crate::write_owner::CheckpointActorReply, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
         .send(crate::write_owner::DriveCommand::Checkpoint {
@@ -1443,7 +1417,7 @@ async fn close_write_like_critical(
     let abort = disposition.is_abort();
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
     let close_started = Instant::now();
     let actor_close_started = Instant::now();
@@ -1523,7 +1497,7 @@ pub(crate) async fn get_read_session(
 ) -> Result<pb::ReadSession, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
         .send(crate::write_owner::DriveCommand::GetRead {
@@ -1555,7 +1529,7 @@ async fn close_read_session_critical(
 ) -> Result<pb::ReadSession, Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     let (reply_tx, reply_rx) = oneshot::channel();
     ensure_mounted_session_media_readiness_admitted(&state, "close read session", &mounted)?;
     drive
@@ -1602,7 +1576,7 @@ pub(crate) async fn read_file(
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     drive
         .send(crate::write_owner::DriveCommand::ReadFile {
             session_id,
@@ -1631,7 +1605,7 @@ pub(crate) async fn read_object_range(
 ) -> Result<(), Status> {
     let pool = state.drive_pool()?.clone();
     let mounted = pool.session(request.session_id)?;
-    let drive = pool.drive_tx(mounted.bay)?;
+    let drive = pool.drive_tx(&mounted.drive_key())?;
     drive
         .send(crate::write_owner::DriveCommand::ReadObjectRange {
             session_id: request.session_id,
@@ -1659,10 +1633,11 @@ fn finish_mounted_session(
 
 async fn changer_move(
     pool: &crate::write_owner::DrivePool,
+    library_serial: &str,
     src: u16,
     dst: u16,
 ) -> Result<(), Status> {
-    let changer = pool.changer_tx();
+    let changer = pool.changer_tx(library_serial)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     changer
         .send(crate::write_owner::ChangerCommand::Move {
@@ -1679,8 +1654,8 @@ async fn changer_move(
 
 async fn compensate_open_mount(pool: &crate::write_owner::DrivePool, mount: &ActorMount) {
     if let Some(slot) = mount.source_slot {
-        let _ = drive_unload(pool, mount.bay).await;
-        let _ = changer_move(pool, mount.bay, slot).await;
+        let _ = drive_unload(pool, &mount.drive_key()).await;
+        let _ = changer_move(pool, &mount.library_serial, mount.bay, slot).await;
     }
 }
 
@@ -1688,8 +1663,11 @@ fn should_compensate_open_mount(err: &Status) -> bool {
     !err.message().contains("media_readiness_state=")
 }
 
-async fn drive_unload(pool: &crate::write_owner::DrivePool, bay: u16) -> Result<Duration, Status> {
-    let drive = pool.drive_tx(bay)?;
+async fn drive_unload(
+    pool: &crate::write_owner::DrivePool,
+    drive_key: &crate::drive_pool::DriveKey,
+) -> Result<Duration, Status> {
+    let drive = pool.drive_tx(drive_key)?;
     let (reply_tx, reply_rx) = oneshot::channel();
     drive
         .send(crate::write_owner::DriveCommand::Unload { reply: reply_tx })
@@ -1732,11 +1710,11 @@ async fn dismount_reserved_cartridge(
     ensure_seated_cartridge_matches_snapshot(state, seated)?;
 
     let started = Instant::now();
-    let ssc_unload = drive_unload(pool, seated.bay).await?;
+    let ssc_unload = drive_unload(pool, &seated.drive_key()).await?;
     let move_started = Instant::now();
-    changer_move(pool, seated.bay, seated.home_slot).await?;
+    changer_move(pool, &seated.library_serial, seated.bay, seated.home_slot).await?;
     let changer_move = move_started.elapsed();
-    if let Some(parked) = pool.parked_at(seated.bay) {
+    if let Some(parked) = pool.parked_at(&seated.drive_key()) {
         pool.forget_parked(&parked);
     }
     let session_id = seated
@@ -1836,7 +1814,7 @@ fn schedule_idle_dismount(state: ApiState, parked: crate::write_owner::ParkedCar
             if pool.is_shutting_down() || !pool.parked_is_current(&parked) {
                 return;
             }
-            let reservation = match pool.reserve_drive(parked.seated.bay) {
+            let reservation = match pool.reserve_drive(&parked.seated.drive_key()) {
                 Ok(reservation) => reservation,
                 Err(_) => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1900,9 +1878,6 @@ pub(crate) fn register_startup_seated_cartridges(
     let Ok(pool) = state.drive_pool() else {
         return;
     };
-    let Some(configured_library_serial) = state.default_library_serial.as_deref() else {
-        return;
-    };
     let voltags = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))
         .and_then(|index| crate::library::voltag_uuid_map(&index))
@@ -1913,13 +1888,15 @@ pub(crate) fn register_startup_seated_cartridges(
     for library in report
         .libraries
         .iter()
-        .filter(|library| library.serial == configured_library_serial.as_str())
+        .filter(|library| pool.operates_library(&library.serial))
     {
         for bay in &library.drive_bays {
             let Some(home_slot) = bay.source_slot.filter(|_| bay.loaded) else {
                 continue;
             };
-            if pool.drive_tx(bay.element_address).is_err() {
+            let drive_key =
+                crate::drive_pool::DriveKey::new(library.serial.clone(), bay.element_address);
+            if pool.drive_tx(&drive_key).is_err() {
                 continue;
             }
             let tape_uuid = bay
@@ -1968,29 +1945,9 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         return Ok(());
     };
     pool.begin_shutdown();
-    let snapshot = state
-        .current_library_snapshot()
-        .ok_or_else(|| Status::not_found("library not found"))?;
-    let configured_library_serial = state.default_library_serial.as_deref().ok_or_else(|| {
-        Status::failed_precondition("drive pool has no configured library serial")
-    })?;
-    let library_drive_bays = snapshot
-        .report
-        .libraries
-        .iter()
-        .find(|library| library.serial == configured_library_serial.as_str())
-        .ok_or_else(|| {
-            Status::not_found(format!(
-                "configured library {} not found during shutdown",
-                configured_library_serial.as_str()
-            ))
-        })?
-        .drive_bays
-        .clone();
-    drop(snapshot);
     let mut failures = Vec::new();
-    for (_, (session_id, mounted)) in pool.sessions_by_bay() {
-        let drive = match pool.drive_tx(mounted.bay) {
+    for (_, (session_id, mounted)) in pool.sessions_by_drive() {
+        let drive = match pool.drive_tx(&mounted.drive_key()) {
             Ok(drive) => drive,
             Err(err) => {
                 failures.push(format!(
@@ -2053,32 +2010,25 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
             )),
         }
     }
-    let mut drive_bays = Vec::new();
-    for bay in library_drive_bays {
-        if pool.drive_tx(bay.element_address).is_ok() {
-            drive_bays.push(bay.element_address);
-        } else if bay.loaded && bay.source_slot.is_some() {
-            failures.push(format!(
-                "bay 0x{:04x}: seated cartridge has no drive actor",
-                bay.element_address
-            ));
-        }
-    }
-    for bay in drive_bays {
+    for drive_key in pool.drive_keys() {
         let reservation_wait_started = Instant::now();
         let reservation = loop {
-            match pool.reserve_drive_for_shutdown(bay) {
+            match pool.reserve_drive_for_shutdown(&drive_key) {
                 Ok(reservation) => break Some(reservation),
                 Err(err) => {
                     if err.code() == tonic::Code::NotFound
-                        || pool.sessions_by_bay().contains_key(&bay)
+                        || pool.sessions_by_drive().contains_key(&drive_key)
                     {
-                        failures.push(format!("bay 0x{bay:04x}: {err}"));
+                        failures.push(format!(
+                            "{} bay 0x{:04x}: {err}",
+                            drive_key.library_serial, drive_key.bay
+                        ));
                         break None;
                     }
                     if reservation_wait_started.elapsed() >= SHUTDOWN_RESERVATION_WAIT {
                         failures.push(format!(
-                            "bay 0x{bay:04x}: timed out waiting for an idle drive reservation"
+                            "{} bay 0x{:04x}: timed out waiting for an idle drive reservation",
+                            drive_key.library_serial, drive_key.bay
                         ));
                         break None;
                     }
@@ -2094,17 +2044,20 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 .report
                 .libraries
                 .iter()
-                .find(|library| library.serial == configured_library_serial.as_str())
+                .find(|library| library.serial == drive_key.library_serial)
                 .and_then(|library| {
                     library
                         .drive_bays
                         .iter()
-                        .find(|candidate| candidate.element_address == bay)
+                        .find(|candidate| candidate.element_address == drive_key.bay)
                         .cloned()
                 })
         });
         let Some(current) = current else {
-            failures.push(format!("bay 0x{bay:04x}: missing from shutdown inventory"));
+            failures.push(format!(
+                "{} bay 0x{:04x}: missing from shutdown inventory",
+                drive_key.library_serial, drive_key.bay
+            ));
             drop(reservation);
             continue;
         };
@@ -2112,10 +2065,10 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
             drop(reservation);
             continue;
         };
-        let parked = pool.parked_at(bay);
+        let parked = pool.parked_at(&drive_key);
         let seated = crate::write_owner::SeatedCartridge {
-            bay,
-            library_serial: configured_library_serial.to_string(),
+            bay: drive_key.bay,
+            library_serial: drive_key.library_serial.clone(),
             barcode: current.loaded_tape,
             home_slot,
             tape_uuid: parked.as_ref().and_then(|parked| parked.seated.tape_uuid),
@@ -2126,7 +2079,10 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         if let Err(err) =
             dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown).await
         {
-            failures.push(format!("bay 0x{bay:04x}: {err}"));
+            failures.push(format!(
+                "{} bay 0x{:04x}: {err}",
+                drive_key.library_serial, drive_key.bay
+            ));
         }
         drop(reservation);
     }
@@ -2150,6 +2106,120 @@ struct ActorMount {
     library_serial: String,
     drive_uuid: Option<Vec<u8>>,
     drive_serial: Option<String>,
+}
+
+impl ActorMount {
+    fn drive_key(&self) -> crate::drive_pool::DriveKey {
+        crate::drive_pool::DriveKey::new(self.library_serial.clone(), self.bay)
+    }
+}
+
+fn library_contains_barcode(library: &remanence_library::Library, barcode: &str) -> bool {
+    library
+        .drive_bays
+        .iter()
+        .any(|bay| bay.loaded && bay.loaded_tape.as_deref() == Some(barcode))
+        || library
+            .slots
+            .iter()
+            .any(|slot| slot.full && slot.cartridge.as_deref() == Some(barcode))
+}
+
+/// Resolve media ownership from the current physical inventory. Tape UUIDs are
+/// global, but changer motion must always be routed to exactly one operated
+/// logical library.
+pub(crate) fn resolve_tape_library_serial(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    tape_uuid: &TapeUuid,
+) -> Result<String, Status> {
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let tape = index
+        .get_tape(tape_uuid)
+        .map_err(status_from_state_error)?
+        .ok_or_else(|| Status::not_found("tape not found"))?;
+    let barcode = tape.voltag.as_deref().ok_or_else(|| {
+        Status::failed_precondition("tape has no catalogued voltag and cannot be located")
+    })?;
+    let snapshot = state
+        .current_library_snapshot()
+        .ok_or_else(|| Status::not_found("library snapshot unavailable"))?;
+    let mut matches = snapshot
+        .report
+        .libraries
+        .iter()
+        .filter(|library| pool.operates_library(&library.serial))
+        .filter(|library| library_contains_barcode(library, barcode))
+        .map(|library| library.serial.clone())
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+    match matches.as_slice() {
+        [library_serial] => Ok(library_serial.clone()),
+        [] => Err(Status::not_found(format!(
+            "cartridge {barcode} is not present in any library operated by this daemon"
+        ))),
+        _ => Err(Status::failed_precondition(format!(
+            "cartridge {barcode} appears in multiple operated libraries: {}",
+            matches.join(", ")
+        ))),
+    }
+}
+
+fn located_tapes_in_operated_libraries(
+    state: &ApiState,
+    pool: &crate::write_owner::DrivePool,
+    library_constraint: Option<&str>,
+) -> Result<HashMap<TapeUuid, String>, Status> {
+    if let Some(library_serial) = library_constraint {
+        if !pool.operates_library(library_serial) {
+            return Err(Status::failed_precondition(format!(
+                "library {library_serial} is not operated by this daemon"
+            )));
+        }
+    }
+    let index = CatalogIndex::open_read_only(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let voltags = crate::library::voltag_uuid_map(&index)?;
+    let snapshot = state
+        .current_library_snapshot()
+        .ok_or_else(|| Status::not_found("library snapshot unavailable"))?;
+    let mut locations = HashMap::new();
+    for library in snapshot.report.libraries.iter().filter(|library| {
+        pool.operates_library(&library.serial)
+            && library_constraint.is_none_or(|expected| expected == library.serial)
+    }) {
+        let barcodes = library
+            .drive_bays
+            .iter()
+            .filter(|bay| bay.loaded)
+            .filter_map(|bay| bay.loaded_tape.as_deref())
+            .chain(
+                library
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.full)
+                    .filter_map(|slot| slot.cartridge.as_deref()),
+            );
+        for barcode in barcodes {
+            let Some(tape_uuid) = voltags
+                .get(barcode)
+                .and_then(|bytes| <TapeUuid>::try_from(bytes.as_slice()).ok())
+            else {
+                continue;
+            };
+            if let Some(previous) = locations.insert(tape_uuid, library.serial.clone()) {
+                if previous != library.serial {
+                    return Err(Status::failed_precondition(format!(
+                        "catalogued cartridge {barcode} appears in multiple operated libraries: {previous}, {}",
+                        library.serial
+                    )));
+                }
+            }
+        }
+    }
+    Ok(locations)
 }
 
 #[derive(Debug)]
@@ -2177,12 +2247,13 @@ async fn resolve_and_reserve_actor_mount(
 ) -> Result<(ActorMount, crate::write_owner::DriveReservation), Status> {
     const ATTEMPTS: usize = 2;
     for attempt in 0..ATTEMPTS {
-        let busy_bays = pool.busy_bays();
+        let busy_bays = pool.busy_bays(library_serial);
         let plan = resolve_actor_mount(state, library_serial, tape_uuid, &busy_bays)?;
         let bay = match &plan {
             ActorMountPlan::Ready(mount) | ActorMountPlan::Evict { mount, .. } => mount.bay,
         };
-        match pool.reserve_drive(bay) {
+        let drive_key = crate::drive_pool::DriveKey::new(library_serial.to_string(), bay);
+        match pool.reserve_drive(&drive_key) {
             Ok(reservation) => match plan {
                 ActorMountPlan::Ready(mount) => {
                     ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
@@ -2190,7 +2261,7 @@ async fn resolve_and_reserve_actor_mount(
                 }
                 ActorMountPlan::Evict { mount, mut seated } => {
                     ensure_actor_mount_media_readiness_admitted(state, library_serial, &mount)?;
-                    if let Some(parked) = pool.parked_at(seated.bay) {
+                    if let Some(parked) = pool.parked_at(&seated.drive_key()) {
                         if parked.seated.library_serial == seated.library_serial
                             && parked.seated.barcode == seated.barcode
                             && parked.seated.home_slot == seated.home_slot
@@ -2644,7 +2715,7 @@ mod tests {
             min_object_size_bytes: 0,
         };
 
-        let batched = select_tape_in_pool_for_write_session(
+        let batched = crate::select_tape_in_pool_for_write_session(
             &index,
             &cfg,
             0,
@@ -2705,6 +2776,99 @@ mod tests {
     }
 
     #[test]
+    fn tape_location_resolution_selects_the_unique_operated_library() {
+        const TAPE_UUID: TapeUuid = [0xA1; 16];
+        let temp = tempfile::tempdir().expect("temporary catalog");
+        let mut index =
+            CatalogIndex::open(temp.path().join("state.sqlite")).expect("open temporary catalog");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: TAPE_UUID,
+                voltag: "LOC001L9".to_string(),
+                block_size: 256 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        let mut state = ApiState::new(index);
+        let library_a = test_library(vec![], vec![slot(0x0401, "OTHER1L9")]);
+        let mut library_b = test_library(vec![], vec![slot(0x0401, "LOC001L9")]);
+        library_b.serial = "LIB002".to_string();
+        state.library_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(crate::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    libraries: vec![library_a, library_b],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            }),
+        )));
+        let (changer_a, _) = tokio::sync::mpsc::channel(1);
+        let (changer_b, _) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([
+                ("LIB001".to_string(), changer_a),
+                ("LIB002".to_string(), changer_b),
+            ]),
+            HashMap::new(),
+            std::sync::Arc::new(HashMap::new()),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
+
+        assert_eq!(
+            resolve_tape_library_serial(&state, &pool, &TAPE_UUID)
+                .expect("resolve unique physical location"),
+            "LIB002"
+        );
+    }
+
+    #[test]
+    fn tape_location_resolution_rejects_duplicate_operated_locations() {
+        const TAPE_UUID: TapeUuid = [0xA2; 16];
+        let temp = tempfile::tempdir().expect("temporary catalog");
+        let mut index =
+            CatalogIndex::open(temp.path().join("state.sqlite")).expect("open temporary catalog");
+        index
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid: TAPE_UUID,
+                voltag: "DUP001L9".to_string(),
+                block_size: 256 * 1024,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision tape");
+        let mut state = ApiState::new(index);
+        let library_a = test_library(vec![], vec![slot(0x0401, "DUP001L9")]);
+        let mut library_b = test_library(vec![], vec![slot(0x0401, "DUP001L9")]);
+        library_b.serial = "LIB002".to_string();
+        state.library_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            std::sync::Arc::new(crate::LibrarySnapshot {
+                report: remanence_library::DiscoveryReport {
+                    libraries: vec![library_a, library_b],
+                    warnings: Vec::new(),
+                },
+                captured_at: time::OffsetDateTime::UNIX_EPOCH,
+            }),
+        )));
+        let (changer_a, _) = tokio::sync::mpsc::channel(1);
+        let (changer_b, _) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([
+                ("LIB001".to_string(), changer_a),
+                ("LIB002".to_string(), changer_b),
+            ]),
+            HashMap::new(),
+            std::sync::Arc::new(HashMap::new()),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
+
+        let err = resolve_tape_library_serial(&state, &pool, &TAPE_UUID)
+            .expect_err("duplicate physical location must fail closed");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("LIB001, LIB002"), "{err}");
+    }
+
+    #[test]
     fn actor_mount_resolution_rejects_already_loaded_busy_bay() {
         let library = test_library(
             vec![
@@ -2758,7 +2922,7 @@ mod tests {
         ));
         let _reservation = harness
             .pool
-            .reserve_drive(0x0101)
+            .reserve_drive(&crate::drive_pool::DriveKey::new("LIB001", 0x0101))
             .expect("reserve idle bay");
         dismount_reserved_cartridge(
             &harness.state,
@@ -2849,7 +3013,9 @@ mod tests {
 
         register_startup_seated_cartridges(&state, &report);
 
-        let parked = pool.parked_at(0x0101).expect("managed cartridge parked");
+        let parked = pool
+            .parked_at(&crate::drive_pool::DriveKey::new("LIB001", 0x0101))
+            .expect("managed cartridge parked");
         assert_eq!(parked.seated.library_serial, "LIB001");
         assert_eq!(parked.seated.barcode.as_deref(), Some("MAIN01L9"));
     }
@@ -3201,7 +3367,7 @@ mod tests {
                 tape_uuid: OWNED_TAPE,
                 required_pool_id: pool_id.to_string(),
             },
-            "unused-library".to_string(),
+            None,
         )
         .await
         .expect_err("pinned open must lose to the existing exact-tape owner");
@@ -3226,7 +3392,7 @@ mod tests {
                 tape_uuid: OPEN_TAPE,
                 required_pool_id: pool_id.to_string(),
             },
-            "unused-library".to_string(),
+            None,
         )
         .await
         .expect_err("host-only open recovery must reject later Object admission");
@@ -3341,7 +3507,7 @@ mod tests {
                 tape_uuid: STALE_COMPANION_TAPE,
                 required_pool_id: pool_id.to_string(),
             },
-            "unused-library".to_string(),
+            None,
         )
         .await
         .expect_err("stale companion retry must finish host-only and refuse Objects");
@@ -3412,7 +3578,7 @@ mod tests {
                 tape_uuid: SEALED_NO_COMPANION_TAPE,
                 required_pool_id: pool_id.to_string(),
             },
-            "unused-library".to_string(),
+            None,
         )
         .await
         .expect_err("sealed no-companion retry must repair host-only and refuse Objects");

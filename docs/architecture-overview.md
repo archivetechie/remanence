@@ -200,10 +200,15 @@ system role, and every RPC checks a 6-permission matrix (`Read`,
 `ReadTape`, `Write`, `Robotics`, `Lifecycle`, `OperationControl`) before
 touching state.
 
-Inside `remanence-api`, each mounted drive is a dedicated actor task that
-owns its drive handle; sessions, robotics, and reads are messages to that
-actor. This serializes hardware access per drive while letting multiple
-drives run in parallel.
+Inside `remanence-api`, every configured library has a dedicated changer actor
+and every drive has a dedicated actor that owns its handle. A drive's runtime
+identity is `(library serial, bay element address)`, because bay numbers are
+only unique within one changer. Sessions, robotics, and reads are routed
+through those composite identities. This serializes hardware access per drive
+while letting drives in the same or different libraries run in parallel. Tape
+UUID reservations are global across the daemon, and UUID-targeted operations
+require the cartridge's barcode to resolve to exactly one operated library
+before any changer command is sent.
 
 ![Layer 5 topology: orchestrator, rem, and rem-debug reach rem-daemon over gRPC; the daemon runs default-deny authorization and one actor per mounted drive; actors drive the drive and changer, and rem-debug keeps an allowlist-gated direct SCSI path](assets/daemon-topology.svg)
 

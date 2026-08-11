@@ -139,11 +139,18 @@ TIO-6 design (§10).
 
 An array-shaped allowlist of tape libraries. Libraries not listed here remain
 visible to discovery but are never mutated. Serials must be non-empty and
-unique. The current live drive-pool daemon slice requires **exactly one** entry
-and owns that library's changer and drive actors; operate additional libraries
-with separate daemon/state-directory instances. Multiple physical libraries
-may coexist on the host, and discovery must always filter by configured serial
-rather than assuming the host has only one.
+unique. The daemon opens every configured library and owns a changer actor plus
+one actor for each of its drives. Drive bays are addressed by the pair
+`(library serial, element address)`, so two libraries may safely use the same
+bay numbers. Tape UUID ownership remains global across the daemon: the same
+tape cannot be opened concurrently through different libraries.
+
+Libraries not listed here may coexist on the host and remain visible in
+discovery, but requests that could move media reject them as non-operated.
+For a request naming a tape UUID, Remanence finds its catalogued barcode in the
+current inventory and requires exactly one matching configured library. An
+absent cartridge is reported as not found; the same barcode appearing in two
+operated libraries is an ambiguity and fails closed before robotics.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -153,6 +160,9 @@ rather than assuming the host has only one.
 ```toml
 [[libraries]]
 serial = "DEC91001xx"
+
+[[libraries]]
+serial = "DEC91002xx"
 ```
 
 <!-- code-anchor: crates/remanence-state/src/config.rs @ f643f8c2 -->
@@ -228,7 +238,7 @@ Drive-stewardship settings. The whole section is optional.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `managed_libraries` | array of strings | `[]` | Library serials whose drives Remanence actively stewards (polling, cleaning, history). Empty means the configured daemon-operated library; the current drive-pool daemon slice operates exactly one library. |
+| `managed_libraries` | array of strings | `[]` | Library serials whose drives Remanence actively stewards (polling, cleaning, history). Empty means all configured daemon-operated libraries. |
 | `foreign_counter_poll` | duration string | `"60m"` | Error-counter poll cadence for foreign (unmanaged) drives. |
 | `foreign_tapealert` | bool | `false` | Opt in to reading TapeAlert flags from foreign drives. |
 | `heartbeat` | duration string | `"1h"` | Liveness cadence for managed drives. |
