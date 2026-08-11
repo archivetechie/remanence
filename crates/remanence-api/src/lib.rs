@@ -73,6 +73,7 @@ pub use remanence_parity::ParityConfig;
 mod append_ring;
 mod calibration;
 mod diagnostics;
+mod direct_replay_fault;
 mod io_memory;
 mod library;
 mod mount;
@@ -8699,7 +8700,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         std::fs::write(&source_path, PAYLOAD).expect("write exact replay source");
         let request = WriteObjectToPoolRequest {
             pool_id: "direct-replay".to_string(),
-            source: WriteObjectSource::Path(source_path),
+            source: WriteObjectSource::Path(source_path.clone()),
             archive_path: "payload.bin".into(),
             caller_object_id: "checkpoint-selection-test".to_string(),
             expected_content_sha256: None,
@@ -8707,6 +8708,45 @@ tape_catalog_dir = "{0}/cache/tapes"
             input_kind: WriteObjectInputKind::LogicalFile,
             representation: PoolWriteRepresentation::Plaintext,
         };
+        let wrong_path = replay_committed_pool_write_from_state(
+            &mut state,
+            &WriteObjectToPoolRequest {
+                pool_id: "direct-replay".to_string(),
+                source: WriteObjectSource::Path(source_path.clone()),
+                archive_path: "renamed.bin".into(),
+                caller_object_id: "checkpoint-selection-test".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect_err("journal replay must reject a changed logical member path");
+        assert!(matches!(
+            wrong_path,
+            PoolWriteError::CallerObjectIdArchivePathConflict { .. }
+        ));
+
+        let (_, recipients) = recipient_pair(0x72);
+        let wrong_representation = replay_committed_pool_write_from_state(
+            &mut state,
+            &WriteObjectToPoolRequest {
+                pool_id: "direct-replay".to_string(),
+                source: WriteObjectSource::Path(source_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "checkpoint-selection-test".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Encrypted { recipients },
+            },
+        )
+        .expect_err("journal replay must reject a changed stored representation");
+        assert!(matches!(
+            wrong_representation,
+            PoolWriteError::CallerObjectIdRepresentationConflict { .. }
+        ));
+
         let replay = replay_committed_pool_write_from_state(&mut state, &request)
             .expect("global host-only direct-write replay")
             .expect("durable checkpoint identity must replay before selection");
@@ -11597,13 +11637,15 @@ tape_catalog_dir = "{0}/cache/tapes"
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source: crate::WriteObjectSource::Path(source_path),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-encrypted-no-parity".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
                 input_kind: crate::WriteObjectInputKind::LogicalFile,
-                representation: PoolWriteRepresentation::Encrypted { recipients },
+                representation: PoolWriteRepresentation::Encrypted {
+                    recipients: recipients.clone(),
+                },
             },
         )
         .expect("write encrypted no-parity object");
@@ -11638,6 +11680,78 @@ tape_catalog_dir = "{0}/cache/tapes"
             committed.copies[0].metadata_frame_len,
             Some(metadata_frame_len)
         );
+
+        let blocks_after_commit = tape_sink.blocks.len();
+        let filemarks_after_commit = tape_sink.filemarks.clone();
+        let exact_replay = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-encrypted-no-parity".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Encrypted { recipients },
+            },
+        )
+        .expect("exact encrypted recipient replay succeeds");
+        assert!(exact_replay.is_replay());
+        assert_eq!(exact_replay.object.copies.len(), 1);
+        assert_eq!(
+            exact_replay.object.copies[0].recipient_epoch_ids.as_deref(),
+            Some(recipient_epoch_ids.as_slice())
+        );
+
+        let (_, changed_recipients) = recipient_pair(0x52);
+        let changed_recipient_error = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-encrypted-no-parity".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Encrypted {
+                    recipients: changed_recipients,
+                },
+            },
+        )
+        .expect_err("encrypted replay must preserve ordered recipient epochs");
+        assert!(matches!(
+            changed_recipient_error,
+            PoolWriteError::CallerObjectIdRepresentationConflict { .. }
+        ));
+
+        let plaintext_error = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-encrypted-no-parity".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect_err("encrypted replay must not return a plaintext request as committed");
+        assert!(matches!(
+            plaintext_error,
+            PoolWriteError::CallerObjectIdRepresentationConflict { .. }
+        ));
+        assert_eq!(tape_sink.blocks.len(), blocks_after_commit);
+        assert_eq!(tape_sink.filemarks, filemarks_after_commit);
 
         let stored_block_count =
             usize::try_from(result.expect_write_report().object_close.data_block_count)
@@ -12346,7 +12460,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             &cfg,
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
-                source: crate::WriteObjectSource::Path(source_path),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
                 archive_path: "payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
@@ -12377,6 +12491,56 @@ tape_catalog_dir = "{0}/cache/tapes"
             2,
             "replay must not append another object tape file"
         );
+
+        let selected = select_tape_in_pool(&index, &cfg, payload.len() as u64, &HashSet::new())
+            .expect("select tape before drive-bound replay recheck");
+        let mut drive_bound_sink = VecBlockSink::new();
+        let wrong_path = write_to_selected_tape(
+            &mut index,
+            &mut drive_bound_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
+                archive_path: "renamed.bin".into(),
+                caller_object_id: "caller-replay".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+            selected.clone(),
+        )
+        .expect_err("drive-bound replay must reject a changed member path");
+        assert!(matches!(
+            wrong_path,
+            PoolWriteError::CallerObjectIdArchivePathConflict { .. }
+        ));
+
+        let (_, recipients) = recipient_pair(0x62);
+        let wrong_representation = write_to_selected_tape(
+            &mut index,
+            &mut drive_bound_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "caller-replay".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Encrypted { recipients },
+            },
+            selected,
+        )
+        .expect_err("drive-bound replay must reject a changed representation");
+        assert!(matches!(
+            wrong_representation,
+            PoolWriteError::CallerObjectIdRepresentationConflict { .. }
+        ));
+        assert!(drive_bound_sink.blocks.is_empty());
+        assert!(drive_bound_sink.filemarks.is_empty());
     }
 
     #[test]

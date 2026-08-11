@@ -141,10 +141,11 @@ pub fn run_archive_write(
     };
     match replay_committed_pool_write_from_state(&mut state_handle, &request) {
         Ok(Some(PoolWriteResult { object, .. })) => {
+            let committed_recipient_epochs = committed_recipient_epochs(&object);
             return print_archive_write_success(
                 &object,
                 &pool_id,
-                representation.recipient_epochs.as_deref(),
+                committed_recipient_epochs.as_deref(),
                 args,
                 out,
             );
@@ -239,6 +240,27 @@ pub fn run_archive_write(
             ExitCode::from(1)
         }
     }
+}
+
+fn committed_recipient_epochs(object: &PoolWriteObjectRecord) -> Option<Vec<serde_json::Value>> {
+    object
+        .copies
+        .first()?
+        .recipient_epoch_ids
+        .as_ref()
+        .map(|ids| {
+            ids.iter()
+                .map(|epoch_id| {
+                    serde_json::json!({
+                        "epoch_id": epoch_id,
+                        // Labels live in the encrypted key frame, not the host
+                        // catalog. A host-only replay must not relabel an old
+                        // on-tape copy from the new command line.
+                        "label": serde_json::Value::Null,
+                    })
+                })
+                .collect()
+        })
 }
 
 fn print_archive_write_success(
@@ -1416,7 +1438,8 @@ mod tests {
     use remanence_library::model::{DriveBay, ElementLayout, IdentitySource, InstalledDrive};
     use remanence_library::{LoadError, LoadPlan, VecBlockSource};
     use remanence_state::{
-        NativeObjectCopyRecord, TapeFileRecord, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
+        NativeObjectCopyRecord, TapeFileRecord, OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+        OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
     use sha2::Digest;
     use uuid::Uuid;
@@ -1891,6 +1914,53 @@ mod tests {
         // object_id must be a valid UUID string.
         Uuid::parse_str(parsed["object_id"].as_str().unwrap())
             .expect("object_id must be a valid UUID string");
+    }
+
+    #[test]
+    fn replay_recipient_epochs_come_from_committed_copy_without_invented_labels() {
+        let committed_ids = vec![
+            "11111111111111111111111111111111".to_string(),
+            "22222222222222222222222222222222".to_string(),
+        ];
+        let object = PoolWriteObjectRecord {
+            object_id: *Uuid::new_v4().as_bytes(),
+            caller_object_id: "encrypted-replay".to_string(),
+            content_sha256: [0x41; 32],
+            logical_size_bytes: 7,
+            body_format: "rem-object-v1".to_string(),
+            created_at_utc: "2026-08-11T00:00:00Z".to_string(),
+            copies: vec![PoolWriteObjectCopyRecord {
+                tape_uuid: [0x42; 16],
+                tape_file_number: 2,
+                first_body_lba: 3,
+                pool_id: "scenario-a".to_string(),
+                representation: OBJECT_COPY_REPRESENTATION_ENCRYPTED.to_string(),
+                recipient_epoch_ids: Some(committed_ids.clone()),
+                metadata_frame_len: Some(4096),
+                plaintext_digest: Some([0x43; 32]),
+                stored_digest: Some([0x44; 32]),
+            }],
+        };
+
+        let recipient_epochs =
+            super::committed_recipient_epochs(&object).expect("committed encrypted recipients");
+        assert_eq!(recipient_epochs.len(), 2);
+        for (value, expected_id) in recipient_epochs.iter().zip(&committed_ids) {
+            assert_eq!(value["epoch_id"], expected_id.as_str());
+            assert!(value["label"].is_null());
+        }
+
+        let mut out = Vec::new();
+        super::print_locator_json_with_recipients(
+            &object,
+            "scenario-a",
+            Some(&recipient_epochs),
+            &mut out,
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out).expect("locator JSON");
+        assert_eq!(parsed["representation"], "encrypted");
+        assert_eq!(parsed["recipient_epochs"][0]["epoch_id"], committed_ids[0]);
+        assert!(parsed["recipient_epochs"][0]["label"].is_null());
     }
 
     #[test]
