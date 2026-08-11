@@ -1070,6 +1070,38 @@ pub enum PoolWriteError {
         /// Input kind supplied by the retry.
         requested_input_kind: WriteObjectInputKind,
     },
+    /// A logical-file replay changed the member path bound by the original
+    /// request.
+    #[error(
+        "caller_object_id replay changed archive path in pool {pool_id}: caller_object_id={caller_object_id:?}, existing={existing_archive_path:?}, requested={requested_archive_path:?}"
+    )]
+    CallerObjectIdArchivePathConflict {
+        /// Pool that scopes the idempotency key.
+        pool_id: String,
+        /// Opaque caller/orchestrator object id.
+        caller_object_id: String,
+        /// Path projected for the committed logical file.
+        existing_archive_path: String,
+        /// Path supplied by the retry.
+        requested_archive_path: String,
+    },
+    /// A replay changed the stored copy representation or encrypted recipient
+    /// epochs bound by the original request.
+    #[error(
+        "caller_object_id replay changed stored representation in pool {pool_id}: caller_object_id={caller_object_id:?}, existing={existing_representations:?}, requested={requested_representation} recipients={requested_recipient_epoch_ids:?}"
+    )]
+    CallerObjectIdRepresentationConflict {
+        /// Pool that scopes the idempotency key.
+        pool_id: String,
+        /// Opaque caller/orchestrator object id.
+        caller_object_id: String,
+        /// Committed representation/recipient summaries in this pool.
+        existing_representations: Vec<String>,
+        /// Representation supplied by the retry.
+        requested_representation: &'static str,
+        /// Ordered recipient epoch ids supplied by an encrypted retry.
+        requested_recipient_epoch_ids: Option<Vec<String>>,
+    },
     /// A replay candidate was found but lacks fields required for a response.
     #[error("catalog replay object {object_id} is incomplete: {reason}")]
     ReplayObjectInvalid {
@@ -2400,6 +2432,12 @@ fn write_to_selected_tape_checkpointed_after_preflight(
     prior_records: Vec<remanence_state::CheckpointJournalRecord>,
     write_admission: Option<&mut crate::write_owner::WriteAdmissionReservation>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let direct_replay_fault =
+        crate::direct_replay_fault::DirectReplayFaultPlan::from_env_for_object(
+            selected.tape_uuid,
+            &request.caller_object_id,
+        )
+        .map_err(PoolWriteError::InvalidInput)?;
     let next_ordinal = prior_records.last().map_or(Ok(1), |record| {
         record.ordinal.checked_add(1).ok_or_else(|| {
             PoolWriteError::InvalidInput("checkpoint ordinal overflows u64".to_string())
@@ -2666,6 +2704,11 @@ fn write_to_selected_tape_checkpointed_after_preflight(
     if let Err(error) = checkpoint_lease.append(&record) {
         quarantine_direct_admission_on_uncertain_append(&error, write_admission);
         return Err(error.into());
+    }
+    if let Some(fault) = direct_replay_fault.as_ref() {
+        fault
+            .abort_after_checkpoint_append(&record)
+            .map_err(PoolWriteError::InvalidInput)?;
     }
     if let Err(error) = state.project_checkpoint_record(&record) {
         if let Some(admission) = write_admission {
@@ -6170,7 +6213,7 @@ pub(crate) fn maybe_replay_pool_write(
     if request.caller_object_id.trim().is_empty() {
         return Ok(None);
     }
-    let Some(existing) = state.get_native_object_by_pool_and_caller_object_id(
+    let Some(mut existing) = state.get_native_object_by_pool_and_caller_object_id(
         pool_cfg.id.as_str(),
         request.caller_object_id.as_str(),
     )?
@@ -6200,6 +6243,63 @@ pub(crate) fn maybe_replay_pool_write(
             )));
         }
     }
+    let existing_hash = native_object_content_sha256(&existing)?;
+    let existing_files = state.list_native_object_files(existing.object_id.as_str())?;
+    let existing_input_kind =
+        committed_native_object_input_kind(&existing, existing_hash, &existing_files)?;
+    if existing_input_kind != request.input_kind {
+        return Err(PoolWriteError::CallerObjectIdInputKindConflict {
+            pool_id: pool_cfg.id.clone(),
+            caller_object_id: request.caller_object_id.clone(),
+            existing_input_kind,
+            requested_input_kind: request.input_kind,
+        });
+    }
+    if request.input_kind == WriteObjectInputKind::LogicalFile {
+        let requested_archive_path = request.archive_path.to_str().ok_or_else(|| {
+            PoolWriteError::InvalidInput(
+                "logical-file archive_path must be valid UTF-8 for replay identity".to_string(),
+            )
+        })?;
+        let existing_archive_path = existing_files
+            .first()
+            .expect("logical-file replay classification requires one member")
+            .path
+            .as_str();
+        if existing_archive_path != requested_archive_path {
+            return Err(PoolWriteError::CallerObjectIdArchivePathConflict {
+                pool_id: pool_cfg.id.clone(),
+                caller_object_id: request.caller_object_id.clone(),
+                existing_archive_path: existing_archive_path.to_string(),
+                requested_archive_path: requested_archive_path.to_string(),
+            });
+        }
+    }
+    let (requested_representation, requested_recipient_epoch_ids) =
+        requested_copy_identity(&request.representation);
+    let existing_representations = existing
+        .copies
+        .iter()
+        .filter(|copy| {
+            copy.pool_id.as_deref() == Some(pool_cfg.id.as_str()) && copy.status == "committed"
+        })
+        .map(committed_copy_identity_summary)
+        .collect::<Vec<_>>();
+    existing.copies.retain(|copy| {
+        copy.pool_id.as_deref() == Some(pool_cfg.id.as_str())
+            && copy.status == "committed"
+            && copy.representation == requested_representation
+            && copy.recipient_epoch_ids == requested_recipient_epoch_ids
+    });
+    if existing.copies.is_empty() {
+        return Err(PoolWriteError::CallerObjectIdRepresentationConflict {
+            pool_id: pool_cfg.id.clone(),
+            caller_object_id: request.caller_object_id.clone(),
+            existing_representations,
+            requested_representation,
+            requested_recipient_epoch_ids,
+        });
+    }
     let _ = request.source.size_bytes()?;
     let requested_hash = request.source.content_sha256()?;
     if let Some(expected) = request.expected_content_sha256 {
@@ -6209,16 +6309,6 @@ pub(crate) fn maybe_replay_pool_write(
                 actual: bytes_to_hex(&requested_hash),
             });
         }
-    }
-    let existing_hash = native_object_content_sha256(&existing)?;
-    let existing_input_kind = committed_native_object_input_kind(state, &existing, existing_hash)?;
-    if existing_input_kind != request.input_kind {
-        return Err(PoolWriteError::CallerObjectIdInputKindConflict {
-            pool_id: pool_cfg.id.clone(),
-            caller_object_id: request.caller_object_id.clone(),
-            existing_input_kind,
-            requested_input_kind: request.input_kind,
-        });
     }
     if existing_hash != requested_hash {
         return Err(PoolWriteError::CallerObjectIdConflict {
@@ -6241,14 +6331,13 @@ pub(crate) fn maybe_replay_pool_write(
 }
 
 fn committed_native_object_input_kind(
-    state: &CatalogIndex,
     object: &NativeObjectRecord,
     content_sha256: [u8; 32],
+    files: &[remanence_state::NativeObjectFileRecord],
 ) -> Result<WriteObjectInputKind, PoolWriteError> {
     let logical_size_bytes = object
         .logical_size_bytes
         .ok_or_else(|| replay_object_invalid(&object.object_id, "logical_size_bytes is missing"))?;
-    let files = state.list_native_object_files(object.object_id.as_str())?;
     if files.is_empty() {
         return Err(replay_object_invalid(
             &object.object_id,
@@ -6264,6 +6353,32 @@ fn committed_native_object_input_kind(
     } else {
         WriteObjectInputKind::CanonicalPlaintextRemObject
     })
+}
+
+fn requested_copy_identity(
+    representation: &PoolWriteRepresentation,
+) -> (&'static str, Option<Vec<String>>) {
+    match representation {
+        PoolWriteRepresentation::Plaintext => (OBJECT_COPY_REPRESENTATION_PLAINTEXT, None),
+        PoolWriteRepresentation::Encrypted { recipients } => (
+            OBJECT_COPY_REPRESENTATION_ENCRYPTED,
+            Some(
+                recipients
+                    .iter()
+                    .map(|recipient| bytes_to_hex(&recipient.recipient_epoch_id))
+                    .collect(),
+            ),
+        ),
+    }
+}
+
+fn committed_copy_identity_summary(copy: &NativeObjectCopyRecord) -> String {
+    match copy.recipient_epoch_ids.as_deref() {
+        Some(recipient_epoch_ids) => {
+            format!("{}:{recipient_epoch_ids:?}", copy.representation)
+        }
+        None => copy.representation.clone(),
+    }
 }
 
 fn pool_write_object_record_from_native(

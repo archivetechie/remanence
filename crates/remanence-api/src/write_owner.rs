@@ -2310,9 +2310,11 @@ impl Drop for WriteAdmissionReservation {
 fn validate_provisional_replay_guards(
     caller_object_id: &str,
     pending_input_kind: crate::WriteObjectInputKind,
+    pending_archive_path: Option<&str>,
     pending_object_id: [u8; 16],
     pending_content_sha256: [u8; 32],
     requested_input_kind: crate::WriteObjectInputKind,
+    requested_archive_path: &Path,
     expected_object_id: Option<[u8; 16]>,
     expected_content_sha256: Option<[u8; 32]>,
     requested_content_sha256: [u8; 32],
@@ -2343,6 +2345,19 @@ fn validate_provisional_replay_guards(
         return Err(Status::already_exists(format!(
             "caller_object_id replay changed input kind inside checkpoint batch: caller_object_id={caller_object_id:?}"
         )));
+    }
+    if requested_input_kind == crate::WriteObjectInputKind::LogicalFile {
+        let pending_archive_path = pending_archive_path.ok_or_else(|| {
+            Status::internal("pending logical-file replay is missing its member-path projection")
+        })?;
+        let requested_archive_path = requested_archive_path.to_str().ok_or_else(|| {
+            Status::invalid_argument("logical-file archive_path must be valid UTF-8")
+        })?;
+        if pending_archive_path != requested_archive_path {
+            return Err(Status::already_exists(format!(
+                "caller_object_id replay changed archive path inside checkpoint batch: caller_object_id={caller_object_id:?}, existing={pending_archive_path:?}, requested={requested_archive_path:?}"
+            )));
+        }
     }
     if let Some(expected) = expected_object_id {
         if expected != pending_object_id {
@@ -4430,15 +4445,35 @@ impl WriteSessionState<'_> {
                 .map(|(index, pending)| (index, (batch.batch_id, pending)))
         }) {
             let (batch_id, pending) = pending;
+            let pending_archive_path =
+                if pending.input_kind() == crate::WriteObjectInputKind::LogicalFile {
+                    match pending
+                        .checkpoint_projection()
+                        .map(|projection| projection.files.as_slice())
+                    {
+                        Some([file]) => Some(file.path.as_str()),
+                        _ => {
+                            source.remove_completed_path();
+                            let _ = reply.send(Err(Status::internal(
+                                "pending logical-file replay has an invalid member-path projection",
+                            )));
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
             let requested_hash = source.content_sha256();
             source.remove_completed_path();
             match requested_hash {
                 Ok(hash) => match validate_provisional_replay_guards(
                     &caller_object_id,
                     pending.input_kind(),
+                    pending_archive_path,
                     pending.object.object_id,
                     pending.object.content_sha256,
                     input_kind,
+                    &archive_path,
                     expected_object_id,
                     expected_content_sha256,
                     hash,
@@ -11812,7 +11847,11 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
             Status::failed_precondition(message)
         }
         PoolWriteError::CallerObjectIdConflict { .. }
-        | PoolWriteError::CallerObjectIdInputKindConflict { .. } => Status::already_exists(message),
+        | PoolWriteError::CallerObjectIdInputKindConflict { .. }
+        | PoolWriteError::CallerObjectIdArchivePathConflict { .. }
+        | PoolWriteError::CallerObjectIdRepresentationConflict { .. } => {
+            Status::already_exists(message)
+        }
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
@@ -11925,9 +11964,11 @@ mod tests {
         assert!(validate_provisional_replay_guards(
             "canonical-pending",
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            None,
             object_id,
             digest,
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            Path::new("ignored-on-canonical-replay"),
             Some(object_id),
             Some(digest),
             digest,
@@ -11937,9 +11978,11 @@ mod tests {
         let wrong_digest = validate_provisional_replay_guards(
             "canonical-pending",
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            None,
             object_id,
             digest,
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            Path::new("ignored-on-canonical-replay"),
             Some(object_id),
             Some([0x43; 32]),
             digest,
@@ -11950,9 +11993,11 @@ mod tests {
         let wrong_id = validate_provisional_replay_guards(
             "canonical-pending",
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            None,
             object_id,
             digest,
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            Path::new("ignored-on-canonical-replay"),
             Some([0x44; 16]),
             Some(digest),
             digest,
@@ -11963,15 +12008,33 @@ mod tests {
         let wrong_kind = validate_provisional_replay_guards(
             "canonical-pending",
             crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            None,
             object_id,
             digest,
             crate::WriteObjectInputKind::LogicalFile,
+            Path::new("payload.bin"),
             None,
             Some(digest),
             digest,
         )
         .expect_err("logical replay must not conflate a canonical pending object");
         assert_eq!(wrong_kind.code(), tonic::Code::AlreadyExists);
+
+        let wrong_path = validate_provisional_replay_guards(
+            "logical-pending",
+            crate::WriteObjectInputKind::LogicalFile,
+            Some("original.bin"),
+            object_id,
+            digest,
+            crate::WriteObjectInputKind::LogicalFile,
+            Path::new("renamed.bin"),
+            None,
+            Some(digest),
+            digest,
+        )
+        .expect_err("logical replay must preserve its pending member path");
+        assert_eq!(wrong_path.code(), tonic::Code::AlreadyExists);
+        assert!(wrong_path.message().contains("changed archive path"));
     }
 
     #[test]

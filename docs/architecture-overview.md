@@ -262,9 +262,14 @@ What happens when an orchestrator writes an object:
    transfer errors record a durable tape-I/O fence that blocks further
    writes — and daemon startup — until an operator releases it.
 
-Idempotency: a repeat of the same `(pool, caller_object_id)` with the
-same content returns the committed copy instead of writing twice;
-different content under a reused id is a conflict. Write sessions have
+Idempotency: a repeat of the same `(pool, caller_object_id)`, input kind,
+content, and copy intent returns the matching committed copy instead of
+writing twice. For a logical file, the archived member path is also part of
+the identity. Copy intent means plaintext versus encrypted and, for encrypted
+copies, the exact ordered recipient epoch ids. A canonical REM-OBJECT already
+binds all member paths in its bytes, so the otherwise-unused `archive_path`
+argument is ignored for that input kind. Any mismatch under a reused id is a
+conflict. Write sessions have
 no restart/resume contract — `recover_session_id` is rejected as
 unimplemented, unlike the read side below. A WRITTEN response
 is advisory and locator-free; callers retain the source until
@@ -283,7 +288,9 @@ WORM-aware recovery contract and remains available.
 One-shot direct writes globally replay the configured checkpoint-journal tree
 and resolve exact committed retries from host state before tape selection, so
 idempotent success does not require a writable tape or robot motion. They repeat
-the checks at drive-bound admission. Their pool policy, journal paths, and
+the checks at drive-bound admission. Replay returns only a copy whose stored
+representation and ordered recipient ids match the request; it never relabels
+an old copy from new retry arguments. Their pool policy, journal paths, and
 resource ceiling come from the exclusively locked state configuration. An
 append error whose rollback also fails is typed as uncertain durable authority
 and quarantines the pending identities until restart and journal reconciliation.

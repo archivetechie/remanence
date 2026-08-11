@@ -220,9 +220,13 @@ different cartridge; Remanence does not silently substitute that policy today.
 The caller must retain the source until `CheckpointSession` reports it
 committed. Session resumption is not the recovery contract: an interrupted
 session is abandoned and every uncheckpointed Object is replayed in full under
-the same caller id and content digest. If the catalog already contains that
-exact pair, the retry is an idempotent read of committed state; different bytes
-under the same caller id are refused.
+the same caller id, input kind, content digest, archived logical-file path, and
+copy intent. Copy intent is plaintext versus encrypted plus the exact ordered
+recipient epoch ids for encryption. If the catalog already contains that exact
+request, the retry is an idempotent read of the matching committed copy;
+changing any bound field under the same caller id is refused. For canonical
+REM-OBJECT ingestion, the canonical bytes already bind every member path, so
+the otherwise-unused outer `archive_path` is not part of replay identity.
 
 The canonical append surface creates an Object and its first copy as one
 checkpointed operation. Media completion can precede checkpoint/catalog
@@ -243,7 +247,10 @@ projected its Object identity: a retry cannot select tape B and write the same
 identity again. The drive-bound writer repeats that reconciliation and replay
 check, then derives the pool policy, checkpoint directory, parity-journal path,
 and memory ceiling from the locked operator configuration rather than accepting
-them from its caller.
+them from its caller. Host-only encrypted replay reports the committed ordered
+epoch ids. Because the host catalog does not retain the authenticated on-tape
+labels, those labels are reported as unknown rather than copied from the new
+retry request.
 
 If a checkpoint append reports an error and rollback also fails, Remanence does
 not pretend it knows whether the new frame is absent, torn, or complete. That
