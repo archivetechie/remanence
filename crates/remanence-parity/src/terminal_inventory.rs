@@ -5,7 +5,12 @@
 //! absolute reads. It never classifies or walks Object files. Replica payloads
 //! are decoded through the existing fixed-slot streaming codec.
 
-use crate::bootstrap::parse_bootstrap_block;
+use crate::bot_recovery::{
+    recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_with_authority,
+    BotObjectRecoveryAuthority, BotStructuralRecoveryError, BotStructuralRecoverySummary,
+};
+#[cfg(test)]
+use crate::bot_recovery::{reject_readable_foreign_bot_bootstrap, BotRecoveredObjectState};
 use crate::error::ParityError;
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::index_separation::{
@@ -160,83 +165,6 @@ pub struct BotStructuralRecoveryRequired {
     pub reason: BotStructuralRecoveryReason,
     /// A, B, and C evidence in ordinal order.
     pub replicas: [TerminalReplicaEvidence; 3],
-}
-
-/// BOT recovery classification for one physical Object candidate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BotRecoveredObjectState {
-    /// A structurally complete Object matched exact external recovery authority.
-    Recovered,
-    /// The Object is structurally complete but has no trustworthy identity row.
-    Unknown,
-    /// The scanner reached EOD before this Object's trailing filemark.
-    Incomplete,
-}
-
-/// One Object classification emitted by the explicit BOT recovery pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BotRecoveredObject {
-    /// Dense tape-file number measured from BOT.
-    pub tape_file_number: u64,
-    /// Complete fixed-block count, or zero when a torn file could not be measured.
-    pub stored_block_count: u64,
-    /// Recovered REM-OBJECT identifier when external authority survived.
-    pub object_id: Option<Vec<u8>>,
-    /// Typed recovery state.
-    pub state: BotRecoveredObjectState,
-}
-
-/// Summary of a completed BOT structural recovery pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BotStructuralRecoverySummary {
-    /// Structurally complete tape files reconstructed from BOT.
-    pub structural_entry_count: u64,
-    /// Structurally complete physical Object candidates.
-    pub complete_object_count: u64,
-    /// Objects with exact external recovery authority.
-    pub recovered_object_count: u64,
-    /// Structurally complete Objects without trustworthy identity authority.
-    pub unknown_object_count: u64,
-    /// Torn Object candidates at EOD.
-    pub incomplete_object_count: u64,
-    /// Canonical digest of the structurally complete measured map.
-    pub canonical_map_digest: [u8; 32],
-    /// Number of physical damage regions retained as recovery evidence.
-    pub damaged_region_count: u64,
-}
-
-/// Failure of the explicit BOT structural recovery path.
-#[derive(Debug, thiserror::Error)]
-pub enum BotStructuralRecoveryError {
-    /// Physical scan failed and no recovery inventory can be claimed.
-    #[error("BOT structural scan failed: {message}")]
-    Scan {
-        /// Scanner/source detail.
-        message: String,
-    },
-    /// A readable BOT Bootstrap belongs to a different expected tape identity.
-    #[error("BOT Bootstrap tape UUID does not match the required recovery identity hint")]
-    TapeIdentityMismatch,
-    /// Object recovery authority was internally conflicting.
-    #[error("conflicting BOT Object authority for tape file {tape_file_number}: {detail}")]
-    ConflictingObjectAuthority {
-        /// Dense tape-file number.
-        tape_file_number: u64,
-        /// Conflict detail.
-        detail: String,
-    },
-    /// Caller rejected an emitted Object classification.
-    #[error("BOT recovery Object visitor failed: {message}")]
-    Visitor {
-        /// Caller detail.
-        message: String,
-    },
-    /// Checked recovery accounting overflowed.
-    #[error("BOT structural recovery arithmetic overflow: {context}")]
-    ArithmeticOverflow {
-        /// Failed counter.
-        context: &'static str,
-    },
 }
 
 /// Terminal inventory either succeeded or explicitly requires BOT recovery.
@@ -404,6 +332,13 @@ pub enum TerminalIndexVerificationError {
         /// Scanner detail.
         message: String,
     },
+    /// Separately durable Object recovery authority was invalid or conflicted
+    /// with the measured physical prefix.
+    #[error("BOT Object recovery authority failed: {message}")]
+    RecoveryAuthority {
+        /// Authority validation or conflict detail.
+        message: String,
+    },
     /// The physical walk found a torn final tape file.
     #[error("physical prefix walk found incomplete tape file {tape_file_number}: {kind:?}")]
     PrefixTruncated {
@@ -512,11 +447,13 @@ pub fn read_terminal_index_inventory_summary(
 
 /// Stream candidate rows while selecting the newest valid terminal member.
 ///
-/// The tape body for each attempted member is read at most once. Events carry
-/// an attempt id because rows precede the final payload digest: consumers must
+/// On the ordinary C-to-B-to-A path, each attempted member body is read once.
+/// Independently valid conflicting envelopes may require one bounded
+/// pre-validation replay before authoritative emission. Events carry an
+/// attempt id because rows precede the final payload digest: consumers must
 /// commit only the attempt named by the returned selection and discard every
 /// explicitly rejected attempt. This preserves bounded memory and propagates
-/// downstream backpressure without weakening C-to-B-to-A fallback.
+/// downstream backpressure without weakening fallback.
 pub fn read_terminal_index_inventory_streamed<F>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
@@ -817,138 +754,6 @@ where
     Ok(TerminalInventoryOutcome::Inventory(selection))
 }
 
-/// Reconstruct and classify Object evidence by walking from BOT.
-///
-/// This is the mandatory fallback when no terminal replica survives. It emits
-/// every complete Object candidate and, when the torn tail is classifiable as
-/// an Object, one incomplete candidate. Recognisable terminal replica or
-/// separation framing is retained as control evidence and never emitted as an
-/// Object or allowed to consume an Object ordinal.
-pub fn recover_terminal_inventory_from_bot<F>(
-    source: &mut dyn RawTapeSource,
-    tape_uuid: &[u8; 16],
-    block_size: u32,
-    mut visit_object: F,
-) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
-where
-    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
-{
-    reject_readable_foreign_bot_bootstrap(source, tape_uuid, block_size)?;
-    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
-        |error| BotStructuralRecoveryError::Scan {
-            message: error.to_string(),
-        },
-    )?;
-    let mut complete_object_count = 0u64;
-    let recovered_object_count = 0u64;
-    let mut unknown_object_count = 0u64;
-    for entry in walked
-        .map
-        .entries()
-        .iter()
-        .filter(|entry| entry.kind == TapeFileKind::Object)
-    {
-        complete_object_count =
-            checked_recovery_increment(complete_object_count, "complete BOT Object count")?;
-        unknown_object_count =
-            checked_recovery_increment(unknown_object_count, "unknown BOT Object count")?;
-        let (state, object_id) = (BotRecoveredObjectState::Unknown, None);
-        visit_object(&BotRecoveredObject {
-            tape_file_number: entry.tape_file_number,
-            stored_block_count: entry.block_count,
-            object_id,
-            state,
-        })
-        .map_err(|message| BotStructuralRecoveryError::Visitor { message })?;
-    }
-    let mut incomplete_object_count = 0u64;
-    if walked.truncation_candidate_kind == Some(TapeFileKind::Object) {
-        let truncation = walked
-            .truncation
-            .ok_or_else(|| BotStructuralRecoveryError::Scan {
-                message: "scanner classified a torn Object without truncation evidence".to_string(),
-            })?;
-        incomplete_object_count = 1;
-        visit_object(&BotRecoveredObject {
-            tape_file_number: truncation.tape_file_number,
-            stored_block_count: 0,
-            object_id: None,
-            state: BotRecoveredObjectState::Incomplete,
-        })
-        .map_err(|message| BotStructuralRecoveryError::Visitor { message })?;
-    }
-
-    Ok(BotStructuralRecoverySummary {
-        structural_entry_count: walked.map.tape_file_count(),
-        complete_object_count,
-        recovered_object_count,
-        unknown_object_count,
-        incomplete_object_count,
-        canonical_map_digest: walked.map.canonical_digest().map_err(|error| {
-            BotStructuralRecoveryError::Scan {
-                message: error.to_string(),
-            }
-        })?,
-        damaged_region_count: u64::try_from(walked.damaged_regions.len()).map_err(|_| {
-            BotStructuralRecoveryError::ArithmeticOverflow {
-                context: "BOT damaged-region count",
-            }
-        })?,
-    })
-}
-
-fn reject_readable_foreign_bot_bootstrap(
-    source: &mut dyn RawTapeSource,
-    tape_uuid: &[u8; 16],
-    block_size: u32,
-) -> Result<(), BotStructuralRecoveryError> {
-    source
-        .configure_fixed_block_size(block_size)
-        .map_err(|error| bot_bootstrap_source_error("configure fixed block size", error))?;
-    source
-        .locate_physical(PhysicalPositionHint::new(0))
-        .map_err(|error| bot_bootstrap_source_error("locate BOT Bootstrap", error))?;
-    let block_size = usize::try_from(block_size).map_err(|_| {
-        BotStructuralRecoveryError::ArithmeticOverflow {
-            context: "BOT Bootstrap probe block size",
-        }
-    })?;
-    let mut block = vec![0; block_size];
-    let bytes = match source.read_record(&mut block) {
-        Ok(RawReadOutcome::Block { bytes, .. }) => bytes,
-        Ok(RawReadOutcome::Filemark { .. } | RawReadOutcome::EndOfData { .. }) => return Ok(()),
-        Err(error) if terminal_source_error_is_medium_damage(&error) => return Ok(()),
-        Err(error) => return Err(bot_bootstrap_source_error("read BOT Bootstrap", error)),
-    };
-    if bytes != block_size {
-        return Ok(());
-    }
-    if let Ok(payload) = parse_bootstrap_block(&block) {
-        if payload.tape_uuid != *tape_uuid {
-            return Err(BotStructuralRecoveryError::TapeIdentityMismatch);
-        }
-    }
-    Ok(())
-}
-
-fn bot_bootstrap_source_error(
-    operation: &'static str,
-    error: ParityError,
-) -> BotStructuralRecoveryError {
-    BotStructuralRecoveryError::Scan {
-        message: format!("{operation}: {error}"),
-    }
-}
-
-fn checked_recovery_increment(
-    value: u64,
-    context: &'static str,
-) -> Result<u64, BotStructuralRecoveryError> {
-    value
-        .checked_add(1)
-        .ok_or(BotStructuralRecoveryError::ArithmeticOverflow { context })
-}
-
 /// Perform a complete physical verification distinct from bounded inventory.
 ///
 /// Integrity damage is a typed outcome, not a transport error: a verified
@@ -959,6 +764,26 @@ pub fn verify_terminal_index_full(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut None)
+}
+
+/// Perform complete physical verification with optional checkpoint identity
+/// authority for the all-replicas-invalid BOT fallback.
+pub fn verify_terminal_index_full_with_authority(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    authority: &mut dyn BotObjectRecoveryAuthority,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut Some(authority))
+}
+
+fn verify_terminal_index_full_inner(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
     match verify_terminal_index_strict(source, tape_uuid, block_size) {
         Ok(complete) => {
@@ -984,7 +809,13 @@ pub fn verify_terminal_index_full(
             ))
         }
         Err(error) if verification_error_is_physical_damage(&error) => {
-            verify_terminal_index_after_damage(source, tape_uuid, block_size, error.to_string())
+            verify_terminal_index_after_damage(
+                source,
+                tape_uuid,
+                block_size,
+                error.to_string(),
+                authority,
+            )
         }
         Err(error) => Err(error),
     }
@@ -1012,6 +843,7 @@ fn verify_terminal_index_after_damage(
     tape_uuid: &[u8; 16],
     block_size: u32,
     initial_detail: String,
+    authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
     let inventory = match read_terminal_index_inventory_summary(source, tape_uuid, block_size) {
         Ok(inventory) => inventory,
@@ -1035,6 +867,7 @@ fn verify_terminal_index_after_damage(
                 format!(
                     "terminal replica {ordinal} failed while replaying its payload after physical damage: {error}"
                 ),
+                authority,
             );
         }
         Err(error) => return Err(inventory_error_to_verification(error)),
@@ -1048,6 +881,7 @@ fn verify_terminal_index_after_damage(
                 block_size,
                 recovery.replicas,
                 initial_detail,
+                authority,
             )
         }
     };
@@ -1071,6 +905,7 @@ fn verify_terminal_index_after_damage(
                 layout.partition,
                 layout.expected_eod_lba
             ),
+            authority,
         );
     }
     let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
@@ -1093,6 +928,7 @@ fn verify_terminal_index_after_damage(
             block_size,
             selection.replicas,
             "physical damage or truncation lies inside the canonical pre-tail prefix".to_string(),
+            authority,
         );
     }
     let prefix_len = usize::try_from(prefix_count).map_err(|_| {
@@ -1107,6 +943,7 @@ fn verify_terminal_index_after_damage(
             block_size,
             selection.replicas,
             "BOT walk ended before the canonical pre-tail prefix".to_string(),
+            authority,
         );
     };
     let verified_prefix_record_count = physical_prefix.iter().try_fold(0u64, |total, entry| {
@@ -1189,6 +1026,7 @@ fn verify_terminal_index_after_damage(
             block_size,
             replicas,
             "no terminal replica survived full payload/canonical-prefix validation".to_string(),
+            authority,
         );
     };
     let edition = replica_editions[selected_index]
@@ -1289,6 +1127,7 @@ fn terminal_recovery_required(
     block_size: u32,
     replicas: [TerminalReplicaEvidence; 3],
     detail: String,
+    authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
     source
         .configure_fixed_block_size(block_size)
@@ -1296,12 +1135,17 @@ fn terminal_recovery_required(
     let measured_eod = source
         .locate_end_of_data()
         .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
-    let bot_recovery =
-        recover_terminal_inventory_from_bot(source, tape_uuid, block_size, |_| Ok(())).map_err(
-            |error| TerminalIndexVerificationError::PrefixWalk {
-                message: error.to_string(),
-            },
-        )?;
+    let bot_recovery = match authority.as_deref_mut() {
+        Some(authority) => recover_terminal_inventory_from_bot_with_authority(
+            source,
+            tape_uuid,
+            block_size,
+            authority,
+            |_| Ok(()),
+        ),
+        None => recover_terminal_inventory_from_bot(source, tape_uuid, block_size, |_| Ok(())),
+    }
+    .map_err(bot_recovery_verification_error)?;
     Ok(TerminalIndexVerificationOutcome::RecoveryRequired(
         Box::new(TerminalIndexRecoveryRequired {
             measured_eod,
@@ -1310,6 +1154,19 @@ fn terminal_recovery_required(
             detail,
         }),
     ))
+}
+
+fn bot_recovery_verification_error(
+    error: BotStructuralRecoveryError,
+) -> TerminalIndexVerificationError {
+    match error {
+        BotStructuralRecoveryError::Scan { message } => {
+            TerminalIndexVerificationError::PrefixWalk { message }
+        }
+        other => TerminalIndexVerificationError::RecoveryAuthority {
+            message: other.to_string(),
+        },
+    }
 }
 
 /// Strict complete-evidence pass used as the healthy fast path.
@@ -2267,8 +2124,10 @@ mod tests {
         write_tape_index_replica, TapeIndexEditionDescriptor, TapeIndexReplicaObservation,
     };
     use crate::{
-        TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
-        TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
+        recover_terminal_inventory_from_bot_with_authority, BotObjectRecoveryAuthority,
+        BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, TapeIndexReplicaCounts,
+        TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
+        TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
     };
 
     const BLOCK_SIZE: u32 = 256 * 1024;
@@ -2276,6 +2135,32 @@ mod tests {
 
     #[derive(Clone)]
     struct BotOnlyRows;
+
+    struct TestBotAuthority {
+        scope: BotObjectRecoveryAuthorityScope,
+        second_scope: Option<BotObjectRecoveryAuthorityScope>,
+        rows: Vec<BotObjectRecoveryAuthorityRow>,
+        visits: u64,
+    }
+
+    impl BotObjectRecoveryAuthority for TestBotAuthority {
+        fn visit_object_rows(
+            &mut self,
+            visitor: &mut dyn FnMut(
+                &BotObjectRecoveryAuthorityRow,
+            ) -> Result<(), BotStructuralRecoveryError>,
+        ) -> Result<BotObjectRecoveryAuthorityScope, BotStructuralRecoveryError> {
+            self.visits += 1;
+            for row in &self.rows {
+                visitor(row)?;
+            }
+            Ok(if self.visits == 2 {
+                self.second_scope.unwrap_or(self.scope)
+            } else {
+                self.scope
+            })
+        }
+    }
 
     impl TapeIndexReplicaRecordSource for BotOnlyRows {
         fn visit_structural_entries(
@@ -2992,24 +2877,186 @@ mod tests {
             torn_control,
         ];
         let mut source = RecordingSource::new(records);
+        let mut authority = TestBotAuthority {
+            scope: BotObjectRecoveryAuthorityScope {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                covered_prefix_tape_file_count: 2,
+                object_row_count: 1,
+            },
+            second_scope: None,
+            rows: vec![BotObjectRecoveryAuthorityRow {
+                tape_file_number: 1,
+                stored_block_count: 2,
+                object_id: b"recovered-object".to_vec(),
+            }],
+            visits: 0,
+        };
         let mut objects = Vec::new();
-        let summary =
-            recover_terminal_inventory_from_bot(&mut source, &TAPE_UUID, BLOCK_SIZE, |object| {
+        let summary = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
                 objects.push(object.clone());
                 Ok(())
-            })
-            .expect("BOT recovery");
+            },
+        )
+        .expect("BOT recovery");
 
         assert_eq!(summary.structural_entry_count, 3);
         assert_eq!(summary.complete_object_count, 2);
-        assert_eq!(summary.recovered_object_count, 0);
-        assert_eq!(summary.unknown_object_count, 2);
+        assert_eq!(summary.recovered_object_count, 1);
+        assert_eq!(summary.unknown_object_count, 1);
         assert_eq!(summary.incomplete_object_count, 0);
+        assert_eq!(authority.visits, 2);
         assert_eq!(objects.len(), 2);
-        assert_eq!(objects[0].state, BotRecoveredObjectState::Unknown);
-        assert!(objects[0].object_id.is_none());
+        assert_eq!(objects[0].state, BotRecoveredObjectState::Recovered);
+        assert_eq!(
+            objects[0].object_id.as_deref(),
+            Some(b"recovered-object".as_slice())
+        );
         assert_eq!(objects[1].state, BotRecoveredObjectState::Unknown);
+        assert!(objects[1].object_id.is_none());
         assert!(objects.iter().all(|object| object.tape_file_number < 3));
+    }
+
+    #[test]
+    fn bot_recovery_rejects_authority_geometry_before_emitting_objects() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut authority = TestBotAuthority {
+            scope: BotObjectRecoveryAuthorityScope {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                covered_prefix_tape_file_count: 2,
+                object_row_count: 1,
+            },
+            second_scope: None,
+            rows: vec![BotObjectRecoveryAuthorityRow {
+                tape_file_number: 1,
+                stored_block_count: 2,
+                object_id: b"wrong-geometry".to_vec(),
+            }],
+            visits: 0,
+        };
+        let mut objects = Vec::new();
+        let error = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
+                objects.push(object.clone());
+                Ok(())
+            },
+        )
+        .expect_err("mismatched checkpoint geometry must fail closed");
+
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::ConflictingObjectAuthority {
+                tape_file_number: 1,
+                ..
+            }
+        ));
+        assert!(objects.is_empty());
+        assert_eq!(authority.visits, 1);
+    }
+
+    #[test]
+    fn bot_recovery_rejects_missing_authority_row_before_emitting_objects() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut authority = TestBotAuthority {
+            scope: BotObjectRecoveryAuthorityScope {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                covered_prefix_tape_file_count: 2,
+                object_row_count: 1,
+            },
+            second_scope: None,
+            rows: Vec::new(),
+            visits: 0,
+        };
+        let mut objects = Vec::new();
+        let error = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
+                objects.push(object.clone());
+                Ok(())
+            },
+        )
+        .expect_err("authority must cover every measured Object in its prefix");
+
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::ObjectAuthority { .. }
+        ));
+        assert!(objects.is_empty());
+        assert_eq!(authority.visits, 1);
+    }
+
+    #[test]
+    fn bot_recovery_rejects_nul_in_authority_object_id_before_emitting_objects() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut authority = TestBotAuthority {
+            scope: BotObjectRecoveryAuthorityScope {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                covered_prefix_tape_file_count: 2,
+                object_row_count: 1,
+            },
+            second_scope: None,
+            rows: vec![BotObjectRecoveryAuthorityRow {
+                tape_file_number: 1,
+                stored_block_count: 1,
+                object_id: b"nul\0object".to_vec(),
+            }],
+            visits: 0,
+        };
+        let mut objects = Vec::new();
+        let error = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
+                objects.push(object.clone());
+                Ok(())
+            },
+        )
+        .expect_err("NUL-bearing checkpoint identity must fail closed");
+
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::ConflictingObjectAuthority {
+                tape_file_number: 1,
+                ..
+            }
+        ));
+        assert!(objects.is_empty());
+        assert_eq!(authority.visits, 1);
     }
 
     #[test]

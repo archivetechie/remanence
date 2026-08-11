@@ -137,9 +137,13 @@ TIO-6 design (§10).
 <!-- code-anchor: crates/remanence-state/src/config.rs @ f643f8c2 -->
 ## `[[libraries]]`
 
-An array of tables, one per tape library the daemon may operate. This is the
-daemon-side allowlist: libraries not listed here are visible to discovery
-but never mutated. Serials must be non-empty and unique.
+An array-shaped allowlist of tape libraries. Libraries not listed here remain
+visible to discovery but are never mutated. Serials must be non-empty and
+unique. The current live drive-pool daemon slice requires **exactly one** entry
+and owns that library's changer and drive actors; operate additional libraries
+with separate daemon/state-directory instances. Multiple physical libraries
+may coexist on the host, and discovery must always filter by configured serial
+rather than assuming the host has only one.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
@@ -224,7 +228,7 @@ Drive-stewardship settings. The whole section is optional.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `managed_libraries` | array of strings | `[]` | Library serials whose drives Remanence actively stewards (polling, cleaning, history). Empty means "the daemon-operated libraries". |
+| `managed_libraries` | array of strings | `[]` | Library serials whose drives Remanence actively stewards (polling, cleaning, history). Empty means the configured daemon-operated library; the current drive-pool daemon slice operates exactly one library. |
 | `foreign_counter_poll` | duration string | `"60m"` | Error-counter poll cadence for foreign (unmanaged) drives. |
 | `foreign_tapealert` | bool | `false` | Opt in to reading TapeAlert flags from foreign drives. |
 | `heartbeat` | duration string | `"1h"` | Liveness cadence for managed drives. |

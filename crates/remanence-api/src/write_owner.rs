@@ -23,16 +23,16 @@ use remanence_library::{
 };
 use remanence_parity::{
     checked_bounded_resume_summary, read_terminal_index_inventory_streamed,
-    reconcile_terminal_prefix, reconcile_terminal_tail_next, recover_terminal_inventory_from_bot,
-    scan_reconstruct_filemark_map, verify_terminal_index_full, BotStructuralRecoveryReason,
-    BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink,
-    DriveHandleRawSource, FileTapeFileJournal, FileTapeFileJournalCommittedSnapshot, FilemarkMap,
-    ParityError, ParitySink, ParitySinkSessionState, PhysicalPositionHint, RawTapeSink,
-    RawWriteOutcome, TapeFileEntry, TapeFileJournal, TapeFileKind, TerminalComponentCommit,
-    TerminalComponentReconcileEvidence, TerminalInventoryOutcome, TerminalInventoryStreamEvent,
-    TerminalPrefixPlan, TerminalPrefixReconcileEvidence, TerminalReplicaEvidence,
-    TerminalReplicaFailureKind, TerminalTailAuthority, TerminalTailProgress,
-    TerminalTailStepOutcome, TerminalTailWriteError, TerminalTripleWritePlan,
+    reconcile_terminal_prefix, reconcile_terminal_tail_next, scan_reconstruct_filemark_map,
+    BotStructuralRecoveryReason, BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason,
+    DriveHandleRawSink, DriveHandleRawSource, FileTapeFileJournal,
+    FileTapeFileJournalCommittedSnapshot, FilemarkMap, ParityError, ParitySink,
+    ParitySinkSessionState, PhysicalPositionHint, RawTapeSink, RawWriteOutcome, TapeFileEntry,
+    TapeFileJournal, TapeFileKind, TerminalComponentCommit, TerminalComponentReconcileEvidence,
+    TerminalInventoryOutcome, TerminalInventoryStreamEvent, TerminalPrefixPlan,
+    TerminalPrefixReconcileEvidence, TerminalReplicaEvidence, TerminalReplicaFailureKind,
+    TerminalTailAuthority, TerminalTailProgress, TerminalTailStepOutcome, TerminalTailWriteError,
+    TerminalTripleWritePlan,
 };
 use remanence_state::{
     AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
@@ -47,6 +47,8 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 use uuid::Uuid;
+
+mod bot_recovery;
 
 use crate::pool_write::{SelectedTape, WriteObjectToPoolRequest};
 use crate::{
@@ -1589,6 +1591,7 @@ fn drive_loop(
                 let result = handle_drive_tape_inventory(
                     bay,
                     &mut index,
+                    &cfg,
                     drive,
                     tape_uuid,
                     needs_drive_load,
@@ -1616,6 +1619,7 @@ fn drive_loop(
                 let result = handle_drive_verify_tape_index(
                     bay,
                     &mut index,
+                    &cfg,
                     drive,
                     tape_uuid,
                     needs_drive_load,
@@ -8365,6 +8369,7 @@ fn prepare_drive_for_fixed_read(
 fn handle_drive_tape_inventory(
     bay: u16,
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     drive: &mut DriveHandle,
     tape_uuid: TapeUuid,
     needs_drive_load: bool,
@@ -8406,10 +8411,16 @@ fn handle_drive_tape_inventory(
     ) {
         let summary = {
             let mut source = DriveHandleRawSource::new(drive);
-            recover_terminal_inventory_from_bot(&mut source, &tape_uuid, block_size, |object| {
-                send_inventory_stream_item(stream_tx, bot_recovered_object_to_proto(object))
-                    .map_err(|error| error.message().to_string())
-            })
+            bot_recovery::recover_terminal_inventory_with_checkpoint_authority(
+                &mut source,
+                &cfg.checkpoint_journal_dir,
+                &tape_uuid,
+                block_size,
+                |object| {
+                    send_inventory_stream_item(stream_tx, bot_recovered_object_to_proto(object))
+                        .map_err(|error| error.message().to_string())
+                },
+            )
             .map_err(status_from_bot_structural_recovery_error)?
         };
         send_inventory_stream_item(
@@ -8639,7 +8650,8 @@ fn status_from_bot_structural_recovery_error(
                 "BOT structural tape recovery refused the physical identity: {error}"
             ))
         }
-        remanence_parity::BotStructuralRecoveryError::ConflictingObjectAuthority { .. }
+        remanence_parity::BotStructuralRecoveryError::ObjectAuthority { .. }
+        | remanence_parity::BotStructuralRecoveryError::ConflictingObjectAuthority { .. }
         | remanence_parity::BotStructuralRecoveryError::ArithmeticOverflow { .. } => {
             Status::data_loss(format!("BOT structural tape recovery failed: {error}"))
         }
@@ -8650,6 +8662,7 @@ fn status_from_bot_structural_recovery_error(
 fn handle_drive_verify_tape_index(
     bay: u16,
     index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
     drive: &mut DriveHandle,
     tape_uuid: TapeUuid,
     needs_drive_load: bool,
@@ -8683,8 +8696,13 @@ fn handle_drive_verify_tape_index(
 
     let outcome = {
         let mut source = DriveHandleRawSource::new(drive);
-        verify_terminal_index_full(&mut source, &tape_uuid, block_size)
-            .map_err(status_from_terminal_index_verification_error)?
+        bot_recovery::verify_terminal_index_with_checkpoint_authority(
+            &mut source,
+            &cfg.checkpoint_journal_dir,
+            &tape_uuid,
+            block_size,
+        )
+        .map_err(status_from_terminal_index_verification_error)?
     };
     Ok(terminal_verification_to_proto(tape_uuid, outcome))
 }

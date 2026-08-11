@@ -7,7 +7,7 @@
 | Status | Review draft |
 | Document version | 1.0 |
 | Version | 1.0.0-draft.4 |
-| Date | 2026-08-09 |
+| Date | 2026-08-11 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -28,9 +28,11 @@ are recorded in
 The publication tree remains unchanged.
 
 **This is a review draft.** It is published for public review and is not yet
-frozen. The draft.4 replacement is being implemented and independently checked;
-its new vectors are not yet pinned. An independent implementation built from
-the completed preparing text must eventually produce the candidate vectors.
+frozen. The draft.4 replacement is implemented in the reference tree and its
+review-only candidate vectors are pinned and independently re-derived, but the
+final committed-range review, remaining fuzz plateaus, and physical-media gate
+are still open. Candidate vectors are not publication artifacts until those
+gates close.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
@@ -1211,8 +1213,22 @@ UUID; geometry alone cannot derive, validate, or safely classify those frames.
 The walk reconstructs tape-file boundaries, validates recognisable
 ParitySidecar and control structure, and measures complete Object candidates
 by elimination. It reports each candidate's identity as unknown unless a
-separate REM-OBJECT recovery pass succeeds. It does not invent a terminal
-replica and it MUST report that terminal authority was not recovered.
+separate exact Object-recovery authority succeeds. Such authority MAY be a
+surviving fsynced host checkpoint journal or a representation-aware REM-OBJECT
+recovery pass; a rebuildable catalog projection alone is insufficient. It does
+not invent a terminal replica and it MUST report that terminal authority was
+not recovered.
+
+- **Optional Object authority.** Before emitting a recovered identifier, the
+  Scanner MUST bind the authority to the expected tape UUID and block size,
+  prove a committed structural-prefix boundary, and prove a bijection between
+  its strictly ordered Object rows and every measured complete Object below
+  that boundary. Each row MUST match the measured tape-file number and stored
+  block count and carry a 1–64-byte non-NUL Object identifier. Complete Objects at or
+  beyond the authority boundary remain unknown. A torn Object is incomplete
+  and MUST NOT inherit an authority row. Missing authority is not an error;
+  conflicting, corrupt, or non-repeatable authority MUST fail closed rather
+  than emit a guessed identity.
 
 - **Operator acknowledgement.** The walk traverses the entire medium and can
   take hours. A Scanner MUST report the fallback before starting and MUST
@@ -2010,9 +2026,11 @@ conflict; all three replicas invalid with explicit BOT fallback; and arithmetic
 overflow in every size/location formula.
 ## 18. Conformance and Freeze Criteria
 
-These criteria gate the freeze of this specification. All of them are
-satisfied as of this review draft, with the evidence recorded in the Revision
-History appendix; they are formally discharged when the document is frozen.
+These criteria gate the freeze of this specification. They are not all
+satisfied in this review draft: terminal-replica/separation fuzz plateaus,
+physical-media exercises, and final independent committed-range review remain
+open in Appendix E. Candidate-vector, proof, and hermetic/VTL results are
+pre-freeze evidence, not a declaration that the specification is frozen.
 After freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
 anything that would invalidate an existing tape, change the meaning of
@@ -2418,6 +2436,18 @@ conformance. Milestones that predate the first published revision are marked
 revisions of this specification, and the change policy of the Status section
 governs only the revisions that follow the first published one.
 
+- **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
+  geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
+  three complete terminal index replicas separated by two typed extents.
+  Adds checked streaming payload geometry, terminal capacity reservation,
+  resumable five-component finalization, manual early finalization, and the
+  explicit all-replicas-invalid BOT recovery taxonomy. Clarifies that optional
+  fsynced host checkpoint authority may recover exact Object identifiers only
+  where its tape identity, block size, committed prefix, file numbers, block
+  counts, and complete Object-row bijection agree with the physical scan. This
+  host-assisted classification changes no REM-PARITY media bytes. Draft.4
+  remains pre-freeze pending the open evidence in Appendix E.
+
 - **2026-08-08 — 1.0.0-draft.3 — review draft.** Defines *committed prefix*
   explicitly in Section 3.1 and clarifies the existing durable-boundary rule
   in Sections 3.4 and 14: when an implementation distributes the logical
@@ -2583,26 +2613,32 @@ governs only the revisions that follow the first published one.
 
 This is the live preparing-copy snapshot for the draft.4 replacement.
 
-1. **TT-1 — independent byte derivation.** A second implementation built from
-   the terminal byte tables must reproduce every candidate profile and review
-   the complete diff before any bytes are frozen.
-2. **TT-2 — negative and interruption vectors.** Pin the failures listed in
-   Section 17, including each of the five barrier boundaries, disagreement
-   between independently valid survivors, and all-replicas-invalid BOT
-   fallback.
-3. **TT-3 — default-gap media exercise.** Run the exact one-GiB separation
-   extents at every legal block size on VTL, and at least two block sizes on
-   physical tape, verifying local footer observations and filemark/EOD
-   positioning from a clean medium.
-4. **TT-4 — end-to-end lifecycle reconciliation.** Exercise the implemented
-   sole-BOT/off-tape-checkpoint grammar and prove durable
-   `Open -> Finalizing -> Finalized/RecoveryRequired` projection through
-   restart, including manual-finalization restart, while showing that Object
-   admission cannot reopen after the first finalization record.
-5. **TT-5 — external prose review.** Confirm that the completed preparing copy
-   contains no normative dependence on geometric placement, `2M+1` index
-   copies, bootstrap Object-row ceilings, or singular final Bootstrap
-   authority.
+1. **TT-1 — independent byte derivation (candidate evidence passed; freeze
+   review open).** The independent Python implementation reproduces all six
+   review profiles and their 30 component streams without calling the Rust
+   codec. A fresh final committed-range review must still bind that evidence
+   to the exact preparing-copy head before freeze.
+2. **TT-2 — negative and interruption vectors (candidate evidence passed).**
+   The review-only set currently verifies 50 hostile mutations, 14 survivor
+   selections, 68 interruption cuts, seven Object-row extension cases, and the
+   million-Object streaming profile. Publication promotion remains gated by
+   TT-5 and the other freeze criteria.
+3. **TT-3 — default-gap media exercise (partial).** The exact one-GiB layout
+   has passed the clean VTL terminal lifecycle at the production 1 MiB block
+   size. The remaining legal-size VTL legs and at least two supervised
+   physical-tape block sizes are still required, including footer,
+   filemark/EOD, PEW, and EOM observations.
+4. **TT-4 — end-to-end lifecycle reconciliation (implemented; final-head rerun
+   open).** The VTL scenario has exercised automatic and manual finalization,
+   all 68 interruption cuts, permanent Object refusal after finalization
+   starts, and eventual five-component reconciliation. Material shared-writer
+   changes after that evidence require one clean-slate rerun at the final
+   committed head.
+5. **TT-5 — external prose and committed-diff review (open).** Confirm that
+   the completed preparing copy contains no normative dependence on geometric
+   placement, `2M+1` index copies, bootstrap Object-row ceilings, or singular
+   final Bootstrap authority, and record two consecutive clean reviews of the
+   final committed implementation/specification range.
 ## Author's Address
 
 The ArchiveTech Project

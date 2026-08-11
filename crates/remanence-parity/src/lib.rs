@@ -30,6 +30,7 @@
 #![warn(unsafe_op_in_unsafe_fn)]
 
 pub mod bootstrap;
+pub mod bot_recovery;
 pub mod capacity;
 mod cbor;
 pub mod codec;
@@ -62,6 +63,12 @@ pub use bootstrap::{
     discover_bootstrap_with_candidate_block_sizes, expected_bootstrap_positions, BootstrapPayload,
     ParitySchemeRecord, BOOTSTRAP_HEADER_CRC_OFFSET, BOOTSTRAP_HEADER_LEN,
     DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
+};
+pub use bot_recovery::{
+    recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_with_authority,
+    BotObjectRecoveryAuthority, BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope,
+    BotRecoveredObject, BotRecoveredObjectState, BotStructuralRecoveryError,
+    BotStructuralRecoverySummary,
 };
 pub use capacity::{
     CapacityReserveCause, CapacityReserveRemedy, TerminalTripleCloseInput,
@@ -173,10 +180,9 @@ pub use tape_index_replica::{
 };
 pub use terminal_inventory::{
     read_terminal_index_inventory, read_terminal_index_inventory_streamed,
-    read_terminal_index_inventory_summary, recover_terminal_inventory_from_bot,
-    verify_terminal_index_full, BotRecoveredObject, BotRecoveredObjectState,
-    BotStructuralRecoveryError, BotStructuralRecoveryReason, BotStructuralRecoveryRequired,
-    BotStructuralRecoverySummary, TerminalIndexRecoveryRequired, TerminalIndexVerification,
+    read_terminal_index_inventory_summary, verify_terminal_index_full,
+    verify_terminal_index_full_with_authority, BotStructuralRecoveryReason,
+    BotStructuralRecoveryRequired, TerminalIndexRecoveryRequired, TerminalIndexVerification,
     TerminalIndexVerificationError, TerminalIndexVerificationOutcome, TerminalInventoryOutcome,
     TerminalInventoryReadError, TerminalInventorySelection, TerminalInventoryStreamEvent,
     TerminalReplicaEvidence, TerminalReplicaFailure, TerminalReplicaFailureKind,
