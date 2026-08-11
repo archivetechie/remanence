@@ -6728,12 +6728,15 @@ pub(crate) fn preflight_automatic_terminal_completion(
     };
     let previous = checkpoint
         .last_record_bounded()
-        .map_err(crate::status_from_state_error)?
-        .ok_or_else(|| {
-            Status::failed_precondition(
-                "automatic terminal completion requires checkpoint authority",
-            )
-        })?;
+        .map_err(crate::status_from_state_error)?;
+    let Some(previous) = previous else {
+        if intent.is_none() {
+            return Ok(false);
+        }
+        return Err(Status::failed_precondition(
+            "automatic terminal completion requires checkpoint authority",
+        ));
+    };
     if previous.sealed_after_write {
         let completion = previous.terminal_finalization.as_ref().ok_or_else(|| {
             Status::failed_precondition(
@@ -11618,6 +11621,71 @@ mod tests {
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    #[test]
+    fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
+        const TAPE_UUID: TapeUuid = [0xD3; 16];
+        const BLOCK_SIZE: u32 = 1024;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-empty-automatic-preflight")
+            .tempdir()
+            .expect("create automatic preflight tempdir");
+        let mut index = CatalogIndex::open(temp.path().join("rem-state.sqlite"))
+            .expect("open automatic preflight catalog");
+        let selected = SelectedTape {
+            pool_id: "fresh-open".to_string(),
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::None,
+        };
+        let pool_cfg = TapePoolConfig {
+            id: selected.pool_id.clone(),
+            display_name: None,
+            copy_class: None,
+            content_class: None,
+            selection_policy: remanence_state::PoolSelectionPolicyName::CompleteOrFill,
+            watermark_low: 0.9,
+            watermark_high: 0.95,
+            capacity_cap_bytes: None,
+            block_size_bytes: u64::from(BLOCK_SIZE),
+            min_object_size_bytes: 0,
+        };
+        let checkpoint_dir = temp.path().join("checkpoints");
+        let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
+
+        assert!(
+            !preflight_automatic_terminal_completion(
+                &mut index,
+                ManualFinalizePreflightConfig {
+                    checkpoint_journal_dir: &checkpoint_dir,
+                    audit_dir: temp.path(),
+                    audit_fsync: false,
+                    audit_append_lock: &audit_append_lock,
+                },
+                &selected,
+                &pool_cfg,
+            )
+            .expect("an empty fresh checkpoint has no terminal work"),
+            "empty fresh authority must continue to ordinary Object admission"
+        );
+        let checkpoint = remanence_state::FileCheckpointJournal::open(checkpoint_dir, TAPE_UUID)
+            .expect("reopen empty fresh checkpoint");
+        assert!(
+            checkpoint
+                .last()
+                .expect("read empty fresh checkpoint")
+                .is_none(),
+            "preflight must not synthesize checkpoint authority"
+        );
+        assert!(
+            checkpoint
+                .terminal_finalization_intent()
+                .expect("read empty fresh terminal companion")
+                .is_none(),
+            "preflight must not synthesize a terminal companion"
+        );
+    }
 
     #[test]
     fn tape_reservation_holds_session_guard_through_handoff() {
