@@ -20,8 +20,8 @@ use remanence_api::{
     read_core::{read_object_payload, CapturePayloadSink},
     require_rewritable_object_media, select_tape_in_pool_for_write_session, verify_tape_identity,
     write_to_selected_tape_checkpointed, ObjectWriteMediaError, PoolWriteObjectRecord,
-    PoolWriteRepresentation, PoolWriteResources, PoolWriteResult, TapeIdentityError, TapeUuid,
-    WriteObjectToPoolRequest,
+    PoolWriteRepresentation, PoolWriteResources, PoolWriteResult, RewritableObjectMediaAdmission,
+    TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -246,8 +246,9 @@ pub fn run_archive_write(
             return ExitCode::from(1);
         }
     };
-    let target_cfg = match archive_object_target_config(current_cfg, block_size) {
-        Ok(config) => config,
+    let (target_cfg, media_admission) = match archive_object_target_config(current_cfg, block_size)
+    {
+        Ok(prepared) => prepared,
         Err(e) => {
             let _ = writeln!(err, "error: refuse direct Object write: {e}");
             return ExitCode::from(1);
@@ -282,6 +283,7 @@ pub fn run_archive_write(
         write_to_selected_tape_checkpointed(
             state_handle.catalog_index(),
             &mut sink,
+            media_admission,
             &pool_cfg,
             request,
             selected,
@@ -315,9 +317,9 @@ pub fn run_archive_write(
 fn archive_object_target_config(
     current_cfg: TapeConfig,
     block_size: u32,
-) -> Result<TapeConfig, ObjectWriteMediaError> {
-    require_rewritable_object_media(current_cfg)?;
-    Ok(TapeConfig {
+) -> Result<(TapeConfig, RewritableObjectMediaAdmission), ObjectWriteMediaError> {
+    let media_admission = require_rewritable_object_media(current_cfg)?;
+    let target_cfg = TapeConfig {
         block_size: BlockSize::Fixed {
             size_bytes: block_size,
         },
@@ -325,7 +327,8 @@ fn archive_object_target_config(
         max_block_size_bytes: current_cfg.max_block_size_bytes,
         write_protected: current_cfg.write_protected,
         worm: current_cfg.worm,
-    })
+    };
+    Ok((target_cfg, media_admission))
 }
 
 struct WriteRepresentationSelection {
@@ -1507,17 +1510,19 @@ mod tests {
             worm,
         };
 
+        let worm = super::archive_object_target_config(current(WormMediaState::Worm), 4096)
+            .expect_err("WORM cannot mint a direct-write admission token");
+        assert_eq!(worm, remanence_api::ObjectWriteMediaError::Worm);
+        let unknown = super::archive_object_target_config(current(WormMediaState::Unknown), 4096)
+            .expect_err("unknown media cannot mint a direct-write admission token");
         assert_eq!(
-            super::archive_object_target_config(current(WormMediaState::Worm), 4096),
-            Err(remanence_api::ObjectWriteMediaError::Worm)
-        );
-        assert_eq!(
-            super::archive_object_target_config(current(WormMediaState::Unknown), 4096),
-            Err(remanence_api::ObjectWriteMediaError::UnknownWormState)
+            unknown,
+            remanence_api::ObjectWriteMediaError::UnknownWormState
         );
 
-        let target = super::archive_object_target_config(current(WormMediaState::NotWorm), 4096)
-            .expect("positive rewritable evidence yields the only MODE SELECT config");
+        let (target, _admission) =
+            super::archive_object_target_config(current(WormMediaState::NotWorm), 4096)
+                .expect("positive rewritable evidence yields config plus one-use admission");
         assert_eq!(target.block_size, BlockSize::Fixed { size_bytes: 4096 });
         assert!(!target.compression);
     }

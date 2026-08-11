@@ -815,16 +815,27 @@ pub enum ObjectWriteMediaError {
     UnknownWormState,
 }
 
+/// One-use proof that a caller checked the current drive report before an
+/// ordinary Object write.
+///
+/// The private field prevents downstream code from constructing the proof
+/// without [`require_rewritable_object_media`]. The token is deliberately not
+/// `Clone` or `Copy`: each public direct write consumes one admission.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RewritableObjectMediaAdmission {
+    _private: (),
+}
+
 /// Require positive drive evidence that ordinary Object ingest can replace a
 /// torn, uncommitted tail after restart.
 pub fn require_rewritable_object_media(
     current_cfg: TapeConfig,
-) -> Result<(), ObjectWriteMediaError> {
+) -> Result<RewritableObjectMediaAdmission, ObjectWriteMediaError> {
     if current_cfg.write_protected {
         return Err(ObjectWriteMediaError::WriteProtected);
     }
     match current_cfg.worm {
-        WormMediaState::NotWorm => Ok(()),
+        WormMediaState::NotWorm => Ok(RewritableObjectMediaAdmission { _private: () }),
         WormMediaState::Worm => Err(ObjectWriteMediaError::Worm),
         WormMediaState::Unknown => Err(ObjectWriteMediaError::UnknownWormState),
     }
@@ -1682,9 +1693,11 @@ pub fn write_object_to_pool(
 /// A hardware caller must first pass its drive configuration through
 /// [`require_rewritable_object_media`]. This lower core accepts an abstract
 /// [`BlockSink`] so hermetic and format-only callers do not have drive state.
+#[allow(clippy::too_many_arguments)]
 pub fn write_object_to_pool_checkpointed(
     state: &mut CatalogIndex,
     sink: &mut dyn BlockSink,
+    media_admission: RewritableObjectMediaAdmission,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     checkpoint_journal_dir: &Path,
@@ -1707,6 +1720,7 @@ pub fn write_object_to_pool_checkpointed(
     write_to_selected_tape_checkpointed(
         state,
         sink,
+        media_admission,
         pool_cfg,
         request,
         selected,
@@ -2188,6 +2202,7 @@ fn finalize_direct_checkpoint_prefix(
 pub fn write_to_selected_tape_checkpointed(
     state: &mut CatalogIndex,
     sink: &mut dyn BlockSink,
+    _media_admission: RewritableObjectMediaAdmission,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
@@ -8666,6 +8681,41 @@ mod tests {
     use remanence_aead::RecipientPrivateKey;
 
     use super::*;
+
+    fn test_rewritable_object_media_admission() -> RewritableObjectMediaAdmission {
+        require_rewritable_object_media(TapeConfig {
+            block_size: remanence_library::BlockSize::Variable,
+            compression: false,
+            max_block_size_bytes: 8 * 1024 * 1024,
+            write_protected: false,
+            worm: WormMediaState::NotWorm,
+        })
+        .expect("hermetic Object writer has positive rewritable-media evidence")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_to_selected_tape_checkpointed(
+        state: &mut CatalogIndex,
+        sink: &mut dyn BlockSink,
+        pool_cfg: &TapePoolConfig,
+        request: WriteObjectToPoolRequest,
+        selected: SelectedTape,
+        checkpoint_journal_dir: &Path,
+        parity_journal_path: &Path,
+        resources: &PoolWriteResources,
+    ) -> Result<PoolWriteResult, PoolWriteError> {
+        super::write_to_selected_tape_checkpointed(
+            state,
+            sink,
+            test_rewritable_object_media_admission(),
+            pool_cfg,
+            request,
+            selected,
+            checkpoint_journal_dir,
+            parity_journal_path,
+            resources,
+        )
+    }
 
     #[test]
     fn rewritable_object_media_gate_fails_closed_for_worm_and_unknown() {
