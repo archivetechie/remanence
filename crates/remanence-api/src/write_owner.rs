@@ -5977,6 +5977,7 @@ fn validate_write_media_policy(
         };
     }
     crate::pool_write::require_rewritable_object_media(current_cfg)
+        .map(|_| ())
         .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 

@@ -95,9 +95,9 @@ pub use pool_write::{
     select_tape_in_pool_for_write_session, verify_tape_identity, write_object_to_pool_checkpointed,
     write_tape_bootstrap, write_to_selected_tape_checkpointed, LtoGen, ObjectWriteMediaError,
     PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation,
-    PoolWriteResources, PoolWriteResult, SelectTapeError, SelectedTape, StreamedWriteSource,
-    TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid, WritabilityError,
-    WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
+    PoolWriteResources, PoolWriteResult, RewritableObjectMediaAdmission, SelectTapeError,
+    SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite, TapeSealReason,
+    TapeUuid, WritabilityError, WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
