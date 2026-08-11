@@ -53,10 +53,10 @@ use remanence_state::{
     OBJECT_COPY_REPRESENTATION_PLAINTEXT,
 };
 use remanence_stream::{
-    plan_prepared_object, prepare_regular_file, write_prepared_object_to_parity_from_readers,
-    FileCatalogProjection, ObjectCatalogProjection, ObjectCopyProjection, PreparedFile,
-    StreamingAuditEvent, StreamingCatalogProjection, StreamingError, StreamingObjectPlan,
-    StreamingObjectWriteReport,
+    normalize_archive_path, plan_prepared_object, prepare_regular_file,
+    write_prepared_object_to_parity_from_readers, FileCatalogProjection, ObjectCatalogProjection,
+    ObjectCopyProjection, PreparedFile, StreamingAuditEvent, StreamingCatalogProjection,
+    StreamingError, StreamingObjectPlan, StreamingObjectWriteReport,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -6256,22 +6256,18 @@ pub(crate) fn maybe_replay_pool_write(
         });
     }
     if request.input_kind == WriteObjectInputKind::LogicalFile {
-        let requested_archive_path = request.archive_path.to_str().ok_or_else(|| {
-            PoolWriteError::InvalidInput(
-                "logical-file archive_path must be valid UTF-8 for replay identity".to_string(),
-            )
-        })?;
+        let requested_archive_path = normalize_archive_path(&request.archive_path)?;
         let existing_archive_path = existing_files
             .first()
             .expect("logical-file replay classification requires one member")
             .path
             .as_str();
-        if existing_archive_path != requested_archive_path {
+        if existing_archive_path != requested_archive_path.as_str() {
             return Err(PoolWriteError::CallerObjectIdArchivePathConflict {
                 pool_id: pool_cfg.id.clone(),
                 caller_object_id: request.caller_object_id.clone(),
                 existing_archive_path: existing_archive_path.to_string(),
-                requested_archive_path: requested_archive_path.to_string(),
+                requested_archive_path,
             });
         }
     }

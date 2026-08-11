@@ -41,7 +41,7 @@ use remanence_state::{
     TapeIoFenceRecord, TapePoolConfig, TerminalFinalizationOutcome, TerminalFinalizationProjection,
     TerminalFinalizationProjectionInput,
 };
-use remanence_stream::StreamingError;
+use remanence_stream::{normalize_archive_path, StreamingError};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::{mpsc, oneshot};
@@ -2350,10 +2350,9 @@ fn validate_provisional_replay_guards(
         let pending_archive_path = pending_archive_path.ok_or_else(|| {
             Status::internal("pending logical-file replay is missing its member-path projection")
         })?;
-        let requested_archive_path = requested_archive_path.to_str().ok_or_else(|| {
-            Status::invalid_argument("logical-file archive_path must be valid UTF-8")
-        })?;
-        if pending_archive_path != requested_archive_path {
+        let requested_archive_path = normalize_archive_path(requested_archive_path)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if pending_archive_path != requested_archive_path.as_str() {
             return Err(Status::already_exists(format!(
                 "caller_object_id replay changed archive path inside checkpoint batch: caller_object_id={caller_object_id:?}, existing={pending_archive_path:?}, requested={requested_archive_path:?}"
             )));
@@ -12035,6 +12034,20 @@ mod tests {
         .expect_err("logical replay must preserve its pending member path");
         assert_eq!(wrong_path.code(), tonic::Code::AlreadyExists);
         assert!(wrong_path.message().contains("changed archive path"));
+
+        assert!(validate_provisional_replay_guards(
+            "logical-pending",
+            crate::WriteObjectInputKind::LogicalFile,
+            Some("dir/original.bin"),
+            object_id,
+            digest,
+            crate::WriteObjectInputKind::LogicalFile,
+            Path::new("./dir/./original.bin"),
+            None,
+            Some(digest),
+            digest,
+        )
+        .is_ok());
     }
 
     #[test]

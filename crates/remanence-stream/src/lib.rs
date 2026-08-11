@@ -975,7 +975,12 @@ fn sha256_file(path: &Path) -> Result<[u8; 32], StreamingError> {
     Ok(out)
 }
 
-fn normalize_archive_path(path: &Path) -> Result<String, StreamingError> {
+/// Normalize an operator-supplied member path exactly as the object writer
+/// records it.
+///
+/// Replay guards use this same function so harmless spellings such as
+/// `./dir/file` compare equal to their stored `dir/file` projection.
+pub fn normalize_archive_path(path: &Path) -> Result<String, StreamingError> {
     if path.as_os_str().is_empty() {
         return Err(StreamingError::InvalidInput(
             "archive path must not be empty".to_string(),

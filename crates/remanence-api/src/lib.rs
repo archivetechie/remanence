@@ -8701,7 +8701,7 @@ tape_catalog_dir = "{0}/cache/tapes"
         let request = WriteObjectToPoolRequest {
             pool_id: "direct-replay".to_string(),
             source: WriteObjectSource::Path(source_path.clone()),
-            archive_path: "payload.bin".into(),
+            archive_path: "./payload.bin".into(),
             caller_object_id: "checkpoint-selection-test".to_string(),
             expected_content_sha256: None,
             expected_object_id: None,
@@ -8733,7 +8733,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             &WriteObjectToPoolRequest {
                 pool_id: "direct-replay".to_string(),
                 source: WriteObjectSource::Path(source_path),
-                archive_path: "payload.bin".into(),
+                archive_path: "./payload.bin".into(),
                 caller_object_id: "checkpoint-selection-test".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
@@ -11638,7 +11638,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
                 source: crate::WriteObjectSource::Path(source_path.clone()),
-                archive_path: "payload.bin".into(),
+                archive_path: "./payload.bin".into(),
                 caller_object_id: "caller-encrypted-no-parity".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
@@ -11737,7 +11737,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
                 source: crate::WriteObjectSource::Path(source_path),
-                archive_path: "payload.bin".into(),
+                archive_path: "./payload.bin".into(),
                 caller_object_id: "caller-encrypted-no-parity".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
@@ -12441,7 +12441,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
                 source: crate::WriteObjectSource::Path(source_path.clone()),
-                archive_path: "payload.bin".into(),
+                archive_path: "./payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
@@ -12461,7 +12461,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
                 source: crate::WriteObjectSource::Path(source_path.clone()),
-                archive_path: "payload.bin".into(),
+                archive_path: "./payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
@@ -12495,6 +12495,25 @@ tape_catalog_dir = "{0}/cache/tapes"
         let selected = select_tape_in_pool(&index, &cfg, payload.len() as u64, &HashSet::new())
             .expect("select tape before drive-bound replay recheck");
         let mut drive_bound_sink = VecBlockSink::new();
+        let drive_bound_replay = write_to_selected_tape(
+            &mut index,
+            &mut drive_bound_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
+                archive_path: "./payload.bin".into(),
+                caller_object_id: "caller-replay".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+            selected.clone(),
+        )
+        .expect("drive-bound exact replay normalizes the accepted member path");
+        assert!(drive_bound_replay.is_replay());
+
         let wrong_path = write_to_selected_tape(
             &mut index,
             &mut drive_bound_sink,
@@ -12525,7 +12544,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             WriteObjectToPoolRequest {
                 pool_id: "scenario-a".to_string(),
                 source: crate::WriteObjectSource::Path(source_path),
-                archive_path: "payload.bin".into(),
+                archive_path: "./payload.bin".into(),
                 caller_object_id: "caller-replay".to_string(),
                 expected_content_sha256: None,
                 expected_object_id: None,
