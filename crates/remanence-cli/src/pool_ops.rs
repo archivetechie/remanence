@@ -18,9 +18,10 @@ use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
 use remanence_api::{
     load_tape_by_uuid,
     read_core::{read_object_payload, CapturePayloadSink},
-    select_tape_in_pool_for_write_session, verify_tape_identity,
-    write_to_selected_tape_checkpointed, PoolWriteObjectRecord, PoolWriteRepresentation,
-    PoolWriteResources, PoolWriteResult, TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
+    require_rewritable_object_media, select_tape_in_pool_for_write_session, verify_tape_identity,
+    write_to_selected_tape_checkpointed, ObjectWriteMediaError, PoolWriteObjectRecord,
+    PoolWriteRepresentation, PoolWriteResources, PoolWriteResult, TapeIdentityError, TapeUuid,
+    WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -245,15 +246,14 @@ pub fn run_archive_write(
             return ExitCode::from(1);
         }
     };
-    if let Err(e) = drive.write_config(TapeConfig {
-        block_size: BlockSize::Fixed {
-            size_bytes: block_size,
-        },
-        compression: false,
-        max_block_size_bytes: current_cfg.max_block_size_bytes,
-        write_protected: current_cfg.write_protected,
-        worm: current_cfg.worm,
-    }) {
+    let target_cfg = match archive_object_target_config(current_cfg, block_size) {
+        Ok(config) => config,
+        Err(e) => {
+            let _ = writeln!(err, "error: refuse direct Object write: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = drive.write_config(target_cfg) {
         let _ = writeln!(err, "error: set fixed-block config: {e}");
         return ExitCode::from(1);
     }
@@ -310,6 +310,22 @@ pub fn run_archive_write(
             ExitCode::from(1)
         }
     }
+}
+
+fn archive_object_target_config(
+    current_cfg: TapeConfig,
+    block_size: u32,
+) -> Result<TapeConfig, ObjectWriteMediaError> {
+    require_rewritable_object_media(current_cfg)?;
+    Ok(TapeConfig {
+        block_size: BlockSize::Fixed {
+            size_bytes: block_size,
+        },
+        compression: false,
+        max_block_size_bytes: current_cfg.max_block_size_bytes,
+        write_protected: current_cfg.write_protected,
+        worm: current_cfg.worm,
+    })
 }
 
 struct WriteRepresentationSelection {
@@ -1470,7 +1486,9 @@ mod tests {
 
     use remanence_api::{PoolWriteObjectCopyRecord, PoolWriteObjectRecord};
     use remanence_library::model::{DriveBay, ElementLayout, IdentitySource, InstalledDrive};
-    use remanence_library::{LoadError, LoadPlan, VecBlockSource};
+    use remanence_library::{
+        BlockSize, LoadError, LoadPlan, TapeConfig, VecBlockSource, WormMediaState,
+    };
     use remanence_state::{
         NativeObjectCopyRecord, TapeFileRecord, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
@@ -1478,6 +1496,31 @@ mod tests {
     use uuid::Uuid;
 
     use crate::bytes_to_hex;
+
+    #[test]
+    fn direct_archive_object_write_stops_before_mode_select_for_worm_or_unknown() {
+        let current = |worm| TapeConfig {
+            block_size: BlockSize::Variable,
+            compression: true,
+            max_block_size_bytes: 8 * 1024 * 1024,
+            write_protected: false,
+            worm,
+        };
+
+        assert_eq!(
+            super::archive_object_target_config(current(WormMediaState::Worm), 4096),
+            Err(remanence_api::ObjectWriteMediaError::Worm)
+        );
+        assert_eq!(
+            super::archive_object_target_config(current(WormMediaState::Unknown), 4096),
+            Err(remanence_api::ObjectWriteMediaError::UnknownWormState)
+        );
+
+        let target = super::archive_object_target_config(current(WormMediaState::NotWorm), 4096)
+            .expect("positive rewritable evidence yields the only MODE SELECT config");
+        assert_eq!(target.block_size, BlockSize::Fixed { size_bytes: 4096 });
+        assert!(!target.compression);
+    }
 
     // ---- bytes_to_hex ----
 

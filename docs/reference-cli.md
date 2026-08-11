@@ -317,7 +317,7 @@ journals):
 
 | Command | What it does |
 |---|---|
-| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <REMR>]... [--json]` | Write one local file to a pool-selected tape. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
+| `rem-debug archive write --library <SERIAL> --file <PATH> --pool <POOL> [--recipient <REMR>]... [--json]` | Break-glass direct write of one local file to a pool-selected tape. It applies the same positive `NotWorm` admission as daemon-owned Object writes before MODE SELECT; write-protected, WORM, and unknown media fail closed. Repeating `--recipient` 2-8 times writes the encrypted envelope; omitting it writes plaintext. The locator includes `format_version` and `recipient_epochs`. |
 | `rem-debug archive read --library <SERIAL> --locator <JSON> --out <PATH> [--private-key <REMP>]` | Read an object by locator; an encrypted copy requires the matching private key. |
 | `rem-debug archive export-object ...` | Export the complete stored object bytes (including envelope) by locator. |
 | `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
