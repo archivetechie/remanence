@@ -156,7 +156,7 @@ pub fn run_archive_write(
         }
     };
 
-    let tape_uuid = selected.tape_uuid;
+    let tape_uuid = selected.tape_uuid();
 
     // -- Open library handle ----------------------------------------------
     let lib = match report.library(&args.library) {
@@ -208,7 +208,7 @@ pub fn run_archive_write(
         representation: representation.representation,
     };
 
-    let parity_journal_path = state_handle.journal_path(selected.tape_uuid);
+    let parity_journal_path = state_handle.journal_path(selected.tape_uuid());
     let resources = match PoolWriteResources::new(state_handle.config().daemon.io_memory_ceiling) {
         Ok(resources) => resources,
         Err(error) => {
@@ -217,7 +217,7 @@ pub fn run_archive_write(
         }
     };
     let result = write_to_selected_drive_checkpointed(
-        state_handle.catalog_index(),
+        &mut state_handle,
         &mut drive,
         &pool_cfg,
         request,

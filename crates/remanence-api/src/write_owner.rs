@@ -2231,14 +2231,14 @@ pub(crate) struct WriteAdmissionCoordinator {
 }
 
 impl WriteAdmissionCoordinator {
-    fn reserve(
+    pub(crate) fn reserve(
         &self,
         pool_id: &str,
         caller_object_id: &str,
         object_id: Option<[u8; 16]>,
     ) -> Result<WriteAdmissionReservation, Status> {
         let replay_key = (!caller_object_id.trim().is_empty()).then(|| WriteReplayKey {
-            pool_id: pool_id.to_string(),
+            pool_id: pool_id.trim().to_string(),
             caller_object_id: caller_object_id.to_string(),
         });
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
@@ -2268,7 +2268,7 @@ impl WriteAdmissionCoordinator {
 }
 
 #[derive(Debug)]
-struct WriteAdmissionReservation {
+pub(crate) struct WriteAdmissionReservation {
     coordinator: WriteAdmissionCoordinator,
     replay_key: Option<WriteReplayKey>,
     object_id: Option<[u8; 16]>,
@@ -2282,7 +2282,7 @@ impl WriteAdmissionReservation {
     /// SQLite projection failed. Startup replays every checkpoint journal
     /// before admitting writes, so restarting is the point at which the
     /// durable identity becomes visible and a new coordinator is safe.
-    fn quarantine_until_restart(&mut self) {
+    pub(crate) fn quarantine_until_restart(&mut self) {
         self.release_on_drop = false;
     }
 }
@@ -11800,6 +11800,7 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         }
         PoolWriteError::TerminalCloseRequired { .. } => Status::resource_exhausted(message),
         PoolWriteError::ContentHashMismatch { .. } => Status::failed_precondition(message),
+        PoolWriteError::WriteAdmissionConflict(_) => Status::aborted(message),
         PoolWriteError::ObjectWriteMedia(_) | PoolWriteError::TapeIdentity(_) => {
             Status::failed_precondition(message)
         }
@@ -17236,6 +17237,12 @@ mod tests {
         ));
         assert_eq!(identity.code(), tonic::Code::FailedPrecondition);
         assert!(identity.message().contains("mismatch"), "{identity}");
+
+        let admission = status_from_pool_write_error(PoolWriteError::WriteAdmissionConflict(
+            "same replay key is awaiting checkpoint".to_string(),
+        ));
+        assert_eq!(admission.code(), tonic::Code::Aborted);
+        assert!(admission.message().contains("replay key"), "{admission}");
     }
 
     #[test]
