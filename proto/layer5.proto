@@ -865,7 +865,31 @@ message TapeInventoryStreamItem {
     TapeInventoryReplicaAttemptRejected replica_attempt_rejected = 4;
     TapeInventoryBotObject bot_object = 5;
     TapeInventory summary = 6;
+    TapeInventoryBotRecoveryStarted bot_recovery_started = 7;
+    TapeInventoryBotRecoveryProgress bot_recovery_progress = 8;
   }
+}
+
+// Explicit notice that terminal authority failed over to the full BOT walk.
+enum TapeInventoryBotRecoveryReason {
+  TAPE_INVENTORY_BOT_RECOVERY_REASON_UNSPECIFIED = 0;
+  TAPE_INVENTORY_BOT_RECOVERY_REASON_NO_USABLE_TERMINAL_LAYOUT = 1;
+  TAPE_INVENTORY_BOT_RECOVERY_REASON_ALL_MEMBERS_INVALID = 2;
+}
+
+message TapeInventoryBotRecoveryStarted {
+  bytes tape_uuid = 1;
+  uint32 block_size = 2;
+  TapeInventoryBotRecoveryReason reason = 3;
+}
+
+// One safe between-files progress boundary during the full BOT walk.
+message TapeInventoryBotRecoveryProgress {
+  uint64 tape_file_number = 1;
+  uint32 partition = 2;
+  uint64 position_lba = 3;
+  uint64 structural_candidate_count = 4;
+  uint64 elapsed_millis = 5;
 }
 
 message TapeInventoryReplicaAttemptStarted {

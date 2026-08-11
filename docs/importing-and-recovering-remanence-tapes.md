@@ -390,10 +390,21 @@ rem tape verify-index --tape-uuid TAPE_UUID --json
 
 Inventory attempts terminal replicas in the defined fallback order and reports
 BOT recovery explicitly if none survives. Full verification separately measures
-and validates the physical prefix and terminal structures. Stop the daemon again
-before changing host state. Restore any surviving per-tape journals and audit
-material to their configured locations, then rebuild the SQLite projection
-offline when appropriate:
+and validates the physical prefix and terminal structures.
+
+An all-indexes-invalid inventory can run for hours, so its stream announces
+`bot_recovery_started` before the full BOT walk. It then emits one
+`bot_recovery_progress` event after every complete tape file, including the
+tape-file number, partition/LBA position, candidates found so far, and elapsed
+milliseconds. Human output presents the same facts as `bot_recovery:` and
+`bot_recovery_progress:` lines. Cancellation is checked at each of these safe
+boundaries and stops before the next tape file is read. These are additive event
+types in `rem.tape.inventory.stream.v1`; use a daemon and CLI from the same draft
+build for the BOT progress surface.
+
+Stop the daemon again before changing host state. Restore any surviving per-tape
+journals and audit material to their configured locations, then rebuild the
+SQLite projection offline when appropriate:
 
 ```text
 rem rebuild-catalog-from-journals --config /path/to/config.toml

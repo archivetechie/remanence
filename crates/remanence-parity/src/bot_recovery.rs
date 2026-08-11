@@ -10,7 +10,10 @@ use crate::bootstrap::parse_bootstrap_block;
 use crate::error::ParityError;
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
-use crate::scan::scan_reconstruct_filemark_map_with_report;
+use crate::scan::{
+    scan_reconstruct_filemark_map_with_control, ControlledScanWalkOutcome, ScanWalkControl,
+    ScanWalkProgress,
+};
 use remanence_library::{scsi::decode_sense, TapeIoError};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -83,6 +86,15 @@ pub struct BotRecoveredObject {
     pub state: BotRecoveredObjectState,
 }
 
+/// One bounded control-plane event from an explicit BOT recovery walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BotStructuralRecoveryEvent {
+    /// The terminal-index path failed over to a full walk from BOT.
+    Started,
+    /// One complete tape file was crossed and the next has not been read yet.
+    Progress(ScanWalkProgress),
+}
+
 /// Summary of a completed BOT structural recovery pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BotStructuralRecoverySummary {
@@ -134,6 +146,20 @@ pub enum BotStructuralRecoveryError {
         /// Caller detail.
         message: String,
     },
+    /// The controller stopped the physical walk at a safe boundary.
+    #[error(
+        "BOT structural recovery aborted after tape file {last_tape_file_number:?}; candidates={structural_candidate_count}, position={position:?}, elapsed_ms={elapsed_millis}"
+    )]
+    Aborted {
+        /// Last complete tape file crossed, or `None` if stopped before BOT I/O.
+        last_tape_file_number: Option<u64>,
+        /// Structurally complete candidates accumulated before the stop.
+        structural_candidate_count: u64,
+        /// Best-known position, absent when stopped before the physical walk.
+        position: Option<PhysicalPositionHint>,
+        /// Saturating elapsed time since the physical walk began.
+        elapsed_millis: u64,
+    },
     /// Checked recovery accounting overflowed.
     #[error("BOT structural recovery arithmetic overflow: {context}")]
     ArithmeticOverflow {
@@ -177,7 +203,28 @@ pub fn recover_terminal_inventory_from_bot<F>(
 where
     F: FnMut(&BotRecoveredObject) -> Result<(), String>,
 {
-    recover_terminal_inventory_from_bot_with_authority(
+    recover_terminal_inventory_from_bot_controlled(
+        source,
+        tape_uuid,
+        block_size,
+        |_| ScanWalkControl::Continue,
+        visit_object,
+    )
+}
+
+/// Reconstruct BOT Object candidates with progress and between-files control.
+pub fn recover_terminal_inventory_from_bot_controlled<C, F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    visit_control: C,
+    visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    recover_terminal_inventory_from_bot_with_authority_controlled(
         source,
         tape_uuid,
         block_size,
@@ -185,6 +232,7 @@ where
             tape_uuid: *tape_uuid,
             block_size,
         },
+        visit_control,
         visit_object,
     )
 }
@@ -199,18 +247,63 @@ pub fn recover_terminal_inventory_from_bot_with_authority<A, F>(
     tape_uuid: &[u8; 16],
     block_size: u32,
     authority: &mut A,
-    mut visit_object: F,
+    visit_object: F,
 ) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
 where
     A: BotObjectRecoveryAuthority + ?Sized,
     F: FnMut(&BotRecoveredObject) -> Result<(), String>,
 {
+    recover_terminal_inventory_from_bot_with_authority_controlled(
+        source,
+        tape_uuid,
+        block_size,
+        authority,
+        |_| ScanWalkControl::Continue,
+        visit_object,
+    )
+}
+
+/// Reconstruct BOT candidates with exact authority and bounded walk control.
+pub fn recover_terminal_inventory_from_bot_with_authority_controlled<A, C, F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    authority: &mut A,
+    mut visit_control: C,
+    mut visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    A: BotObjectRecoveryAuthority + ?Sized,
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    if visit_control(&BotStructuralRecoveryEvent::Started) == ScanWalkControl::Abort {
+        return Err(BotStructuralRecoveryError::Aborted {
+            last_tape_file_number: None,
+            structural_candidate_count: 0,
+            position: None,
+            elapsed_millis: 0,
+        });
+    }
     reject_readable_foreign_bot_bootstrap(source, tape_uuid, block_size)?;
-    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
-        |error| BotStructuralRecoveryError::Scan {
+    let walked =
+        scan_reconstruct_filemark_map_with_control(source, tape_uuid, block_size, |progress| {
+            visit_control(&BotStructuralRecoveryEvent::Progress(*progress))
+        })
+        .map_err(|error| BotStructuralRecoveryError::Scan {
             message: error.to_string(),
-        },
-    )?;
+        })?;
+    let walked = match walked {
+        ControlledScanWalkOutcome::Complete(walked) => walked,
+        ControlledScanWalkOutcome::Aborted(aborted) => {
+            return Err(BotStructuralRecoveryError::Aborted {
+                last_tape_file_number: Some(aborted.last_tape_file_number),
+                structural_candidate_count: aborted.structural_candidate_count,
+                position: Some(aborted.position),
+                elapsed_millis: duration_millis_saturating(aborted.elapsed),
+            })
+        }
+    };
 
     // Pass one proves the complete authority/map bijection before an Object
     // classification can escape to the caller.
@@ -336,6 +429,10 @@ where
             }
         })?,
     })
+}
+
+fn duration_millis_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct AuthorityRowSpool {

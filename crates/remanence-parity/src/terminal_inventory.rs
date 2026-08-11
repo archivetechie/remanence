@@ -2124,10 +2124,12 @@ mod tests {
         write_tape_index_replica, TapeIndexEditionDescriptor, TapeIndexReplicaObservation,
     };
     use crate::{
+        recover_terminal_inventory_from_bot_controlled,
         recover_terminal_inventory_from_bot_with_authority, BotObjectRecoveryAuthority,
-        BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, TapeIndexReplicaCounts,
-        TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
-        TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
+        BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, BotStructuralRecoveryEvent,
+        ScanWalkControl, TapeIndexReplicaCounts, TapeIndexReplicaFileKind,
+        TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource,
+        TapeIndexReplicaScope,
     };
 
     const BLOCK_SIZE: u32 = 256 * 1024;
@@ -3246,6 +3248,83 @@ mod tests {
         assert_eq!(objects[0].tape_file_number, 1);
         assert_eq!(objects[0].state, BotRecoveredObjectState::Incomplete);
         assert_eq!(objects[0].stored_block_count, 0);
+    }
+
+    #[test]
+    fn bot_recovery_announces_fallback_and_honors_pre_scan_abort() {
+        let records = vec![Record::Block(bot_bootstrap()), Record::Filemark];
+        let mut source = RecordingSource::new(records);
+        let mut events = Vec::new();
+        let error = recover_terminal_inventory_from_bot_controlled(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |event| {
+                events.push(*event);
+                ScanWalkControl::Abort
+            },
+            |_| Ok(()),
+        )
+        .expect_err("start-boundary cancellation must stop recovery");
+
+        assert_eq!(events, vec![BotStructuralRecoveryEvent::Started]);
+        assert!(source.read_lbas.is_empty());
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::Aborted {
+                last_tape_file_number: None,
+                structural_candidate_count: 0,
+                position: None,
+                elapsed_millis: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn bot_recovery_emits_progress_before_each_between_files_decision() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut events = Vec::new();
+        let error = recover_terminal_inventory_from_bot_controlled(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |event| {
+                events.push(*event);
+                match event {
+                    BotStructuralRecoveryEvent::Started => ScanWalkControl::Continue,
+                    BotStructuralRecoveryEvent::Progress(_) => ScanWalkControl::Abort,
+                }
+            },
+            |_| Ok(()),
+        )
+        .expect_err("file-boundary cancellation must stop recovery");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], BotStructuralRecoveryEvent::Started);
+        let BotStructuralRecoveryEvent::Progress(progress) = events[1] else {
+            panic!("second event must report the completed BOT file")
+        };
+        assert_eq!(progress.tape_file_number, 0);
+        assert_eq!(progress.structural_candidate_count, 1);
+        assert!(!source.read_lbas.contains(&2));
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::Aborted {
+                last_tape_file_number: Some(0),
+                structural_candidate_count: 1,
+                position: Some(PhysicalPositionHint {
+                    partition: 0,
+                    lba: 2
+                }),
+                ..
+            }
+        ));
     }
 
     #[test]

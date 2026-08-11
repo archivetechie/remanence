@@ -32,6 +32,7 @@ use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
 };
 use remanence_library::{scsi::decode_sense, TapeIoError};
+use std::time::{Duration, Instant};
 
 /// Catalog-supplied filemark map and protection watermark for a loaded tape.
 ///
@@ -97,6 +98,54 @@ pub struct ScanWalkResult {
     /// Physical damage encountered by the scanner itself.
     pub damaged_regions: Vec<ScanDamagedRegion>,
     unreadable_one_block_objects: Vec<u64>,
+}
+
+/// One bounded progress observation after a complete tape file was crossed.
+///
+/// The reported position is the scanner's best-known position immediately
+/// after the completed file. A controller may stop the walk at this boundary;
+/// the scanner will not read the next tape file after an abort decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanWalkProgress {
+    /// Dense number of the tape file that was just crossed.
+    pub tape_file_number: u64,
+    /// Best-known physical position immediately after that tape file.
+    pub position: PhysicalPositionHint,
+    /// Structurally complete tape-file candidates accumulated so far.
+    pub structural_candidate_count: u64,
+    /// Time elapsed since the physical BOT walk began.
+    pub elapsed: Duration,
+}
+
+/// Caller decision at a safe between-files scan boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanWalkControl {
+    /// Continue with the next tape file.
+    Continue,
+    /// Stop before reading the next tape file.
+    Abort,
+}
+
+/// Evidence retained when a controller stops a BOT walk between tape files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanWalkAbort {
+    /// Last complete tape file crossed before the stop.
+    pub last_tape_file_number: u64,
+    /// Best-known physical position when the stop was honored.
+    pub position: PhysicalPositionHint,
+    /// Structurally complete tape-file candidates accumulated before the stop.
+    pub structural_candidate_count: u64,
+    /// Time elapsed since the physical BOT walk began.
+    pub elapsed: Duration,
+}
+
+/// Terminal result of a controller-aware physical BOT walk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ControlledScanWalkOutcome {
+    /// The walk reached EOD or a typed tail truncation.
+    Complete(ScanWalkResult),
+    /// The controller stopped the walk at a safe between-files boundary.
+    Aborted(ScanWalkAbort),
 }
 
 impl ScanWalkResult {
@@ -425,16 +474,49 @@ pub fn scan_reconstruct_filemark_map_with_report(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<ScanWalkResult, ParityError> {
-    let reconstructed =
-        scan_reconstruct_filemark_map_with_provenance(source, tape_uuid, block_size)?;
-    Ok(ScanWalkResult {
-        map: reconstructed.map,
-        truncation: reconstructed.truncation,
-        truncation_candidate_kind: reconstructed.truncation_candidate_kind,
-        bootstrap_candidates: reconstructed.bootstrap_candidates,
-        damaged_regions: reconstructed.damaged_regions,
-        unreadable_one_block_objects: reconstructed.unreadable_one_block_objects,
-    })
+    let outcome =
+        scan_reconstruct_filemark_map_with_control(source, tape_uuid, block_size, |_| {
+            ScanWalkControl::Continue
+        })?;
+    let ControlledScanWalkOutcome::Complete(walked) = outcome else {
+        unreachable!("an unconditional scan controller cannot abort")
+    };
+    Ok(walked)
+}
+
+/// Walk from BOT with bounded progress and a between-files stop decision.
+///
+/// The callback runs exactly once after each structurally complete tape file.
+/// Returning [`ScanWalkControl::Abort`] stops before the next tape file is read.
+pub fn scan_reconstruct_filemark_map_with_control<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mut control: F,
+) -> Result<ControlledScanWalkOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
+    match scan_reconstruct_filemark_map_with_provenance(
+        source,
+        tape_uuid,
+        block_size,
+        &mut control,
+    )? {
+        ScanReconstructionOutcome::Complete(reconstructed) => {
+            Ok(ControlledScanWalkOutcome::Complete(ScanWalkResult {
+                map: reconstructed.map,
+                truncation: reconstructed.truncation,
+                truncation_candidate_kind: reconstructed.truncation_candidate_kind,
+                bootstrap_candidates: reconstructed.bootstrap_candidates,
+                damaged_regions: reconstructed.damaged_regions,
+                unreadable_one_block_objects: reconstructed.unreadable_one_block_objects,
+            }))
+        }
+        ScanReconstructionOutcome::Aborted(aborted) => {
+            Ok(ControlledScanWalkOutcome::Aborted(aborted))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -447,11 +529,20 @@ struct ScanReconstruction {
     damaged_regions: Vec<ScanDamagedRegion>,
 }
 
-fn scan_reconstruct_filemark_map_with_provenance(
+enum ScanReconstructionOutcome {
+    Complete(ScanReconstruction),
+    Aborted(ScanWalkAbort),
+}
+
+fn scan_reconstruct_filemark_map_with_provenance<F>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
-) -> Result<ScanReconstruction, ParityError> {
+    control: &mut F,
+) -> Result<ScanReconstructionOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
     if block_size == 0 {
         return Err(ParityError::Invariant("scan block size is zero"));
     }
@@ -469,6 +560,7 @@ fn scan_reconstruct_filemark_map_with_provenance(
     let mut truncation_candidate_kind = None;
     let mut bootstrap_candidates = Vec::new();
     let mut damaged_regions = Vec::new();
+    let started_at = Instant::now();
 
     loop {
         let file_start = source.position()?;
@@ -521,6 +613,11 @@ fn scan_reconstruct_filemark_map_with_provenance(
                 }
                 source.locate_physical(measured.position_after)?;
                 saw_file = true;
+                if let Some(aborted) =
+                    scan_boundary_control(&builder, measured.position_after, started_at, control)?
+                {
+                    return Ok(ScanReconstructionOutcome::Aborted(aborted));
+                }
             }
             Err(error) if scan_read_error_is_medium_damage(&error) => {
                 damaged_regions.push(ScanDamagedRegion {
@@ -555,6 +652,11 @@ fn scan_reconstruct_filemark_map_with_provenance(
                 }
                 source.locate_physical(measured.position_after)?;
                 saw_file = true;
+                if let Some(aborted) =
+                    scan_boundary_control(&builder, measured.position_after, started_at, control)?
+                {
+                    return Ok(ScanReconstructionOutcome::Aborted(aborted));
+                }
             }
             Err(error) => return Err(error),
         }
@@ -564,14 +666,42 @@ fn scan_reconstruct_filemark_map_with_provenance(
         return Err(filemark_scan_error("scan found no tape files"));
     }
 
-    Ok(ScanReconstruction {
+    Ok(ScanReconstructionOutcome::Complete(ScanReconstruction {
         map: builder.build()?,
         unreadable_one_block_objects,
         truncation,
         truncation_candidate_kind,
         bootstrap_candidates,
         damaged_regions,
-    })
+    }))
+}
+
+fn scan_boundary_control<F>(
+    builder: &FilemarkMapBuilder,
+    position: PhysicalPositionHint,
+    started_at: Instant,
+    control: &mut F,
+) -> Result<Option<ScanWalkAbort>, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
+    let structural_candidate_count = builder.next_tape_file_number()?;
+    let progress = ScanWalkProgress {
+        tape_file_number: structural_candidate_count
+            .checked_sub(1)
+            .ok_or(ParityError::Invariant("completed scan file count is zero"))?,
+        position,
+        structural_candidate_count,
+        elapsed: started_at.elapsed(),
+    };
+    Ok(
+        (control(&progress) == ScanWalkControl::Abort).then_some(ScanWalkAbort {
+            last_tape_file_number: progress.tape_file_number,
+            position: progress.position,
+            structural_candidate_count: progress.structural_candidate_count,
+            elapsed: progress.elapsed,
+        }),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1691,6 +1821,80 @@ mod tests {
             self.calls.push(ScanCall::Position(self.cursor as u64));
             Ok(PhysicalPositionHint::new(self.cursor as u64))
         }
+    }
+
+    #[test]
+    fn controlled_walk_reports_each_file_and_aborts_before_reading_the_next() {
+        let mut bot = vec![0u8; BLOCK_SIZE as usize];
+        write_bootstrap_block(
+            &BootstrapPayload {
+                scheme: None,
+                no_parity_flag: true,
+                filemark_map_digest: None,
+                tape_uuid: TAPE_UUID,
+                written_by_version: "controlled-scan-test".to_string(),
+                written_at: String::new(),
+                sequence: 0,
+                block_size_bytes: BLOCK_SIZE,
+                drive_compression: false,
+            },
+            &mut bot,
+        )
+        .expect("BOT Bootstrap");
+        let records = vec![
+            Record::Block(bot),
+            Record::Filemark,
+            Record::Block(block(0x22)),
+            Record::Filemark,
+        ];
+        let mut source = RecordingRawSource::new(records.clone());
+        let mut progress = Vec::new();
+        let outcome = scan_reconstruct_filemark_map_with_control(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |event| {
+                progress.push(*event);
+                ScanWalkControl::Abort
+            },
+        )
+        .expect("controlled BOT walk");
+
+        let ControlledScanWalkOutcome::Aborted(aborted) = outcome else {
+            panic!("the controller must stop the walk")
+        };
+        assert_eq!(progress.len(), 1);
+        assert_eq!(progress[0].tape_file_number, 0);
+        assert_eq!(progress[0].position, PhysicalPositionHint::new(2));
+        assert_eq!(progress[0].structural_candidate_count, 1);
+        assert_eq!(aborted.last_tape_file_number, 0);
+        assert_eq!(aborted.position, PhysicalPositionHint::new(2));
+        assert_eq!(aborted.structural_candidate_count, 1);
+        assert!(
+            !source.calls.contains(&ScanCall::ReadRecord(2)),
+            "abort at file 0 must occur before reading file 1"
+        );
+
+        let mut complete_source = RecordingRawSource::new(records);
+        let mut complete_progress = Vec::new();
+        let complete = scan_reconstruct_filemark_map_with_control(
+            &mut complete_source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            |event| {
+                complete_progress.push(*event);
+                ScanWalkControl::Continue
+            },
+        )
+        .expect("complete controlled BOT walk");
+        let ControlledScanWalkOutcome::Complete(complete) = complete else {
+            panic!("continue controller must reach EOD")
+        };
+        assert_eq!(complete.map.tape_file_count(), 2);
+        assert_eq!(complete_progress.len(), 2);
+        assert_eq!(complete_progress[0].tape_file_number, 0);
+        assert_eq!(complete_progress[1].tape_file_number, 1);
+        assert_eq!(complete_progress[1].structural_candidate_count, 2);
     }
 
     fn sample_scheme() -> ParityScheme {

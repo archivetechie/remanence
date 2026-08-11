@@ -24,15 +24,15 @@ use remanence_library::{
 use remanence_parity::{
     checked_bounded_resume_summary, read_terminal_index_inventory_streamed,
     reconcile_terminal_prefix, reconcile_terminal_tail_next, scan_reconstruct_filemark_map,
-    BotStructuralRecoveryReason, BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason,
-    DriveHandleRawSink, DriveHandleRawSource, FileTapeFileJournal,
-    FileTapeFileJournalCommittedSnapshot, FilemarkMap, ParityError, ParitySink,
-    ParitySinkSessionState, PhysicalPositionHint, RawTapeSink, RawWriteOutcome, TapeFileEntry,
-    TapeFileJournal, TapeFileKind, TerminalComponentCommit, TerminalComponentReconcileEvidence,
-    TerminalInventoryOutcome, TerminalInventoryStreamEvent, TerminalPrefixPlan,
-    TerminalPrefixReconcileEvidence, TerminalReplicaEvidence, TerminalReplicaFailureKind,
-    TerminalTailAuthority, TerminalTailProgress, TerminalTailStepOutcome, TerminalTailWriteError,
-    TerminalTripleWritePlan,
+    BotStructuralRecoveryEvent, BotStructuralRecoveryReason, BoundedResumeSummary,
+    BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink, DriveHandleRawSource,
+    FileTapeFileJournal, FileTapeFileJournalCommittedSnapshot, FilemarkMap, ParityError,
+    ParitySink, ParitySinkSessionState, PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
+    ScanWalkControl, TapeFileEntry, TapeFileJournal, TapeFileKind, TerminalComponentCommit,
+    TerminalComponentReconcileEvidence, TerminalInventoryOutcome, TerminalInventoryStreamEvent,
+    TerminalPrefixPlan, TerminalPrefixReconcileEvidence, TerminalReplicaEvidence,
+    TerminalReplicaFailureKind, TerminalTailAuthority, TerminalTailProgress,
+    TerminalTailStepOutcome, TerminalTailWriteError, TerminalTripleWritePlan,
 };
 use remanence_state::{
     AlarmRecord, AuditActor, AuditEvent, AuditEventRecord, AuditSubject, CatalogIndex,
@@ -8405,17 +8405,27 @@ fn handle_drive_tape_inventory(
         })
         .map_err(status_from_terminal_inventory_read_error)?
     };
-    if matches!(
-        outcome,
-        TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)
-    ) {
+    if let TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) = &outcome {
         let summary = {
             let mut source = DriveHandleRawSource::new(drive);
-            bot_recovery::recover_terminal_inventory_with_checkpoint_authority(
+            bot_recovery::recover_terminal_inventory_with_checkpoint_authority_controlled(
                 &mut source,
                 &cfg.checkpoint_journal_dir,
                 &tape_uuid,
                 block_size,
+                |event| {
+                    let item = bot_recovery_control_event_to_proto(
+                        event,
+                        tape_uuid,
+                        block_size,
+                        recovery.reason,
+                    );
+                    if send_inventory_stream_item(stream_tx, item).is_ok() {
+                        ScanWalkControl::Continue
+                    } else {
+                        ScanWalkControl::Abort
+                    }
+                },
                 |object| {
                     send_inventory_stream_item(stream_tx, bot_recovered_object_to_proto(object))
                         .map_err(|error| error.message().to_string())
@@ -8621,6 +8631,41 @@ fn bot_recovered_object_to_proto(
     }
 }
 
+fn bot_recovery_control_event_to_proto(
+    event: &BotStructuralRecoveryEvent,
+    tape_uuid: [u8; 16],
+    block_size: u32,
+    reason: BotStructuralRecoveryReason,
+) -> pb::TapeInventoryStreamItem {
+    use pb::tape_inventory_stream_item::Item;
+    let item = match event {
+        BotStructuralRecoveryEvent::Started => {
+            Item::BotRecoveryStarted(pb::TapeInventoryBotRecoveryStarted {
+                tape_uuid: tape_uuid.to_vec(),
+                block_size,
+                reason: match reason {
+                    BotStructuralRecoveryReason::NoUsableTerminalLayout => {
+                        pb::TapeInventoryBotRecoveryReason::NoUsableTerminalLayout as i32
+                    }
+                    BotStructuralRecoveryReason::AllMembersInvalid => {
+                        pb::TapeInventoryBotRecoveryReason::AllMembersInvalid as i32
+                    }
+                },
+            })
+        }
+        BotStructuralRecoveryEvent::Progress(progress) => {
+            Item::BotRecoveryProgress(pb::TapeInventoryBotRecoveryProgress {
+                tape_file_number: progress.tape_file_number,
+                partition: progress.position.partition,
+                position_lba: progress.position.lba,
+                structural_candidate_count: progress.structural_candidate_count,
+                elapsed_millis: u64::try_from(progress.elapsed.as_millis()).unwrap_or(u64::MAX),
+            })
+        }
+    };
+    pb::TapeInventoryStreamItem { item: Some(item) }
+}
+
 fn terminal_replica_failure_kind_name(kind: TerminalReplicaFailureKind) -> &'static str {
     match kind {
         TerminalReplicaFailureKind::Missing => "missing",
@@ -8645,6 +8690,9 @@ fn status_from_bot_structural_recovery_error(
         remanence_parity::BotStructuralRecoveryError::Visitor { .. } => {
             Status::cancelled("terminal inventory receiver closed")
         }
+        remanence_parity::BotStructuralRecoveryError::Aborted { .. } => {
+            Status::cancelled(format!("BOT structural recovery was cancelled: {error}"))
+        }
         remanence_parity::BotStructuralRecoveryError::TapeIdentityMismatch => {
             Status::failed_precondition(format!(
                 "BOT structural tape recovery refused the physical identity: {error}"
@@ -8654,6 +8702,17 @@ fn status_from_bot_structural_recovery_error(
         | remanence_parity::BotStructuralRecoveryError::ConflictingObjectAuthority { .. }
         | remanence_parity::BotStructuralRecoveryError::ArithmeticOverflow { .. } => {
             Status::data_loss(format!("BOT structural tape recovery failed: {error}"))
+        }
+    }
+}
+
+fn bot_recovery_reason_detail(reason: BotStructuralRecoveryReason) -> &'static str {
+    match reason {
+        BotStructuralRecoveryReason::NoUsableTerminalLayout => {
+            "no usable terminal layout; structural recovery from BOT is required"
+        }
+        BotStructuralRecoveryReason::AllMembersInvalid => {
+            "terminal replicas A, B, and C are invalid; structural recovery from BOT is required"
         }
     }
 }
@@ -8919,14 +8978,7 @@ fn terminal_inventory_to_proto(
             }
         }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
-            let detail = match recovery.reason {
-                BotStructuralRecoveryReason::NoUsableTerminalLayout => {
-                    "no usable terminal layout; structural recovery from BOT is required"
-                }
-                BotStructuralRecoveryReason::AllMembersInvalid => {
-                    "terminal replicas A, B, and C are invalid; structural recovery from BOT is required"
-                }
-            };
+            let detail = bot_recovery_reason_detail(recovery.reason);
             pb::TapeInventory {
                 tape_uuid: tape_uuid.to_vec(),
                 outcome: pb::TapeInventoryOutcome::BotStructuralRecoveryRequired as i32,
@@ -18822,5 +18874,61 @@ mod tests {
         };
         assert_eq!(plaintext.manifest_first_chunk_lba, u64::MAX - 10);
         assert_eq!(plaintext.manifest_sha256, vec![0x5a; 32]);
+    }
+
+    #[test]
+    fn bot_recovery_control_events_preserve_start_and_boundary_evidence() {
+        let started = bot_recovery_control_event_to_proto(
+            &BotStructuralRecoveryEvent::Started,
+            RANGE_TAPE_UUID,
+            256 * 1024,
+            BotStructuralRecoveryReason::AllMembersInvalid,
+        );
+        let Some(pb::tape_inventory_stream_item::Item::BotRecoveryStarted(started)) = started.item
+        else {
+            panic!("BOT fallback must emit a typed start event")
+        };
+        assert_eq!(started.tape_uuid, RANGE_TAPE_UUID);
+        assert_eq!(started.block_size, 256 * 1024);
+        assert_eq!(
+            started.reason,
+            pb::TapeInventoryBotRecoveryReason::AllMembersInvalid as i32
+        );
+
+        let progress = bot_recovery_control_event_to_proto(
+            &BotStructuralRecoveryEvent::Progress(remanence_parity::ScanWalkProgress {
+                tape_file_number: u64::MAX - 1,
+                position: PhysicalPositionHint {
+                    partition: 1,
+                    lba: u64::MAX,
+                },
+                structural_candidate_count: u64::MAX,
+                elapsed: StdDuration::from_millis(12_345),
+            }),
+            RANGE_TAPE_UUID,
+            256 * 1024,
+            BotStructuralRecoveryReason::NoUsableTerminalLayout,
+        );
+        let Some(pb::tape_inventory_stream_item::Item::BotRecoveryProgress(progress)) =
+            progress.item
+        else {
+            panic!("BOT boundary must emit typed progress")
+        };
+        assert_eq!(progress.tape_file_number, u64::MAX - 1);
+        assert_eq!(progress.partition, 1);
+        assert_eq!(progress.position_lba, u64::MAX);
+        assert_eq!(progress.structural_candidate_count, u64::MAX);
+        assert_eq!(progress.elapsed_millis, 12_345);
+
+        let status = status_from_bot_structural_recovery_error(
+            remanence_parity::BotStructuralRecoveryError::Aborted {
+                last_tape_file_number: Some(7),
+                structural_candidate_count: 8,
+                position: Some(PhysicalPositionHint::new(99)),
+                elapsed_millis: 250,
+            },
+        );
+        assert_eq!(status.code(), tonic::Code::Cancelled);
+        assert!(status.message().contains("tape file Some(7)"));
     }
 }

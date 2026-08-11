@@ -114,6 +114,12 @@ struct StreamedAttemptCounts {
     rejected: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BotRecoveryStreamState {
+    started: bool,
+    last_progress: Option<pb::TapeInventoryBotRecoveryProgress>,
+}
+
 fn consume_inventory_stream(
     runtime: &tokio::runtime::Runtime,
     stream: &mut tonic::Streaming<pb::TapeInventoryStreamItem>,
@@ -123,6 +129,7 @@ fn consume_inventory_stream(
 ) -> Result<InventoryOutcome, DaemonClientError> {
     let mut attempts = BTreeMap::<u64, StreamedAttemptCounts>::new();
     let mut bot_rows = 0u64;
+    let mut bot_recovery = BotRecoveryStreamState::default();
     let mut summary = None;
     while let Some(message) = runtime
         .block_on(stream.message())
@@ -204,7 +211,34 @@ fn consume_inventory_stream(
                 print_inventory_attempt_rejected(&rejected, json_output, out)
                     .map_err(DaemonClientError::client)?;
             }
+            Item::BotRecoveryStarted(started) => {
+                if bot_rows != 0 {
+                    return Err(DaemonClientError::client(
+                        "daemon started BOT recovery after emitting BOT Objects",
+                    ));
+                }
+                accept_bot_recovery_started(&mut bot_recovery, &started, tape_uuid)
+                    .map_err(DaemonClientError::client)?;
+                print_inventory_bot_recovery_started(&started, json_output, out)
+                    .map_err(DaemonClientError::client)?;
+            }
+            Item::BotRecoveryProgress(progress) => {
+                if bot_rows != 0 {
+                    return Err(DaemonClientError::client(
+                        "daemon emitted BOT progress after Object classifications",
+                    ));
+                }
+                accept_bot_recovery_progress(&mut bot_recovery, &progress)
+                    .map_err(DaemonClientError::client)?;
+                print_inventory_bot_recovery_progress(&progress, json_output, out)
+                    .map_err(DaemonClientError::client)?;
+            }
             Item::BotObject(object) => {
+                if !bot_recovery.started {
+                    return Err(DaemonClientError::client(
+                        "daemon emitted a BOT Object before the recovery-start notice",
+                    ));
+                }
                 pb::TapeInventoryBotObjectState::try_from(object.state)
                     .ok()
                     .filter(|state| *state != pb::TapeInventoryBotObjectState::Unspecified)
@@ -227,6 +261,11 @@ fn consume_inventory_stream(
     let outcome = validate_inventory(&inventory, tape_uuid).map_err(DaemonClientError::client)?;
     match outcome {
         InventoryOutcome::Complete | InventoryOutcome::Degraded => {
+            if bot_recovery.started || bot_rows != 0 {
+                return Err(DaemonClientError::client(
+                    "fast inventory carried BOT recovery stream events",
+                ));
+            }
             let selected = attempts
                 .get(&inventory.selected_attempt_id)
                 .ok_or_else(|| DaemonClientError::client("summary selected an unknown attempt"))?;
@@ -241,6 +280,14 @@ fn consume_inventory_stream(
             }
         }
         InventoryOutcome::BotStructuralRecovered => {
+            let progress = bot_recovery.last_progress.ok_or_else(|| {
+                DaemonClientError::client("daemon completed BOT recovery without per-file progress")
+            })?;
+            if progress.structural_candidate_count != inventory.structural_entry_count {
+                return Err(DaemonClientError::client(
+                    "BOT summary disagrees with the final progress candidate count",
+                ));
+            }
             let expected = inventory
                 .recovered_object_count
                 .checked_add(inventory.unknown_object_count)
@@ -252,7 +299,13 @@ fn consume_inventory_stream(
                 ));
             }
         }
-        InventoryOutcome::BotStructuralRecoveryRequired => {}
+        InventoryOutcome::BotStructuralRecoveryRequired => {
+            if bot_recovery.started || bot_rows != 0 {
+                return Err(DaemonClientError::client(
+                    "unperformed BOT recovery carried recovery stream events",
+                ));
+            }
+        }
     }
     if json_output {
         print_inventory_stream_json("summary", inventory_json(&inventory, outcome)?, out)
@@ -261,6 +314,60 @@ fn consume_inventory_stream(
         print_inventory(&inventory, outcome, false, out).map_err(DaemonClientError::client)?;
     }
     Ok(outcome)
+}
+
+fn accept_bot_recovery_started(
+    state: &mut BotRecoveryStreamState,
+    started: &pb::TapeInventoryBotRecoveryStarted,
+    tape_uuid: [u8; 16],
+) -> Result<(), String> {
+    if state.started {
+        return Err("daemon emitted more than one BOT recovery-start notice".to_string());
+    }
+    if started.tape_uuid.as_slice() != tape_uuid
+        || started.block_size == 0
+        || bot_recovery_reason_name(started.reason).is_err()
+    {
+        return Err("daemon emitted an invalid BOT recovery-start notice".to_string());
+    }
+    state.started = true;
+    Ok(())
+}
+
+fn accept_bot_recovery_progress(
+    state: &mut BotRecoveryStreamState,
+    progress: &pb::TapeInventoryBotRecoveryProgress,
+) -> Result<(), String> {
+    if !state.started {
+        return Err("daemon emitted BOT progress before the recovery-start notice".to_string());
+    }
+    let expected_candidates = progress
+        .tape_file_number
+        .checked_add(1)
+        .ok_or_else(|| "BOT progress tape-file number overflows u64".to_string())?;
+    if progress.structural_candidate_count != expected_candidates {
+        return Err("BOT progress candidate count is not dense".to_string());
+    }
+    if let Some(previous) = state.last_progress.as_ref() {
+        let next_file = previous
+            .tape_file_number
+            .checked_add(1)
+            .ok_or_else(|| "previous BOT progress tape-file number overflows u64".to_string())?;
+        let next_candidate_count = previous
+            .structural_candidate_count
+            .checked_add(1)
+            .ok_or_else(|| "previous BOT progress candidate count overflows u64".to_string())?;
+        if progress.tape_file_number != next_file
+            || progress.structural_candidate_count != next_candidate_count
+            || progress.partition != previous.partition
+            || progress.position_lba < previous.position_lba
+            || progress.elapsed_millis < previous.elapsed_millis
+        {
+            return Err("BOT recovery progress is not monotone".to_string());
+        }
+    }
+    state.last_progress = Some(*progress);
+    Ok(())
 }
 
 fn active_attempt_counts(
@@ -457,6 +564,73 @@ fn bot_object_state_name(state: i32) -> Result<&'static str, String> {
             Err("unknown BOT Object state".to_string())
         }
     }
+}
+
+fn bot_recovery_reason_name(reason: i32) -> Result<&'static str, String> {
+    match pb::TapeInventoryBotRecoveryReason::try_from(reason) {
+        Ok(pb::TapeInventoryBotRecoveryReason::NoUsableTerminalLayout) => {
+            Ok("no_usable_terminal_layout")
+        }
+        Ok(pb::TapeInventoryBotRecoveryReason::AllMembersInvalid) => Ok("all_members_invalid"),
+        Ok(pb::TapeInventoryBotRecoveryReason::Unspecified) | Err(_) => {
+            Err("unknown BOT recovery reason".to_string())
+        }
+    }
+}
+
+fn print_inventory_bot_recovery_started(
+    started: &pb::TapeInventoryBotRecoveryStarted,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let reason = bot_recovery_reason_name(started.reason)?;
+    if json_output {
+        return print_inventory_stream_json(
+            "bot_recovery_started",
+            json!({
+                "tape_uuid": bytes_to_uuid_text(&started.tape_uuid),
+                "block_size": started.block_size,
+                "reason": reason,
+            }),
+            out,
+        );
+    }
+    writeln!(
+        out,
+        "bot_recovery: starting full BOT structural walk (block_size={}, reason={})",
+        started.block_size, reason
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn print_inventory_bot_recovery_progress(
+    progress: &pb::TapeInventoryBotRecoveryProgress,
+    json_output: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if json_output {
+        return print_inventory_stream_json(
+            "bot_recovery_progress",
+            json!({
+                "tape_file_number": progress.tape_file_number.to_string(),
+                "partition": progress.partition,
+                "position_lba": progress.position_lba.to_string(),
+                "structural_candidate_count": progress.structural_candidate_count.to_string(),
+                "elapsed_millis": progress.elapsed_millis.to_string(),
+            }),
+            out,
+        );
+    }
+    writeln!(
+        out,
+        "bot_recovery_progress: tape_file={} position={}:{} candidates={} elapsed_ms={}",
+        progress.tape_file_number,
+        progress.partition,
+        progress.position_lba,
+        progress.structural_candidate_count,
+        progress.elapsed_millis
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn print_inventory_bot_object(
@@ -1570,6 +1744,82 @@ mod tests {
         assert_eq!(envelope["data"]["recovered_object_count"], "1");
         assert_eq!(envelope["data"]["unknown_object_count"], "1");
         assert_eq!(envelope["data"]["incomplete_object_count"], "1");
+    }
+
+    #[test]
+    fn bot_recovery_control_output_is_stable_and_monotone() {
+        let tape_uuid = *Uuid::from_u128(1).as_bytes();
+        let started = pb::TapeInventoryBotRecoveryStarted {
+            tape_uuid: tape_uuid.to_vec(),
+            block_size: 256 * 1024,
+            reason: pb::TapeInventoryBotRecoveryReason::AllMembersInvalid as i32,
+        };
+        let first = pb::TapeInventoryBotRecoveryProgress {
+            tape_file_number: 0,
+            partition: 0,
+            position_lba: 2,
+            structural_candidate_count: 1,
+            elapsed_millis: 10,
+        };
+        let second = pb::TapeInventoryBotRecoveryProgress {
+            tape_file_number: 1,
+            partition: 0,
+            position_lba: 5,
+            structural_candidate_count: 2,
+            elapsed_millis: 15,
+        };
+        let mut state = BotRecoveryStreamState::default();
+        accept_bot_recovery_started(&mut state, &started, tape_uuid).unwrap();
+        accept_bot_recovery_progress(&mut state, &first).unwrap();
+        accept_bot_recovery_progress(&mut state, &second).unwrap();
+
+        let mut json_out = Vec::new();
+        print_inventory_bot_recovery_started(&started, true, &mut json_out).unwrap();
+        let started_json: Value = serde_json::from_slice(&json_out).unwrap();
+        assert_eq!(started_json["schema"], INVENTORY_STREAM_JSON_SCHEMA);
+        assert_eq!(started_json["event"], "bot_recovery_started");
+        assert_eq!(started_json["value"]["block_size"], 256 * 1024);
+
+        let mut human_out = Vec::new();
+        print_inventory_bot_recovery_progress(&second, false, &mut human_out).unwrap();
+        assert_eq!(
+            String::from_utf8(human_out).unwrap(),
+            "bot_recovery_progress: tape_file=1 position=0:5 candidates=2 elapsed_ms=15\n"
+        );
+
+        let skipped = pb::TapeInventoryBotRecoveryProgress {
+            tape_file_number: 3,
+            structural_candidate_count: 4,
+            ..second
+        };
+        assert_eq!(
+            accept_bot_recovery_progress(&mut state, &skipped),
+            Err("BOT recovery progress is not monotone".to_string())
+        );
+    }
+
+    #[test]
+    fn bot_recovery_progress_requires_an_exact_start_notice() {
+        let tape_uuid = *Uuid::from_u128(1).as_bytes();
+        let progress = pb::TapeInventoryBotRecoveryProgress {
+            tape_file_number: 0,
+            partition: 0,
+            position_lba: 2,
+            structural_candidate_count: 1,
+            elapsed_millis: 0,
+        };
+        let mut state = BotRecoveryStreamState::default();
+        assert_eq!(
+            accept_bot_recovery_progress(&mut state, &progress),
+            Err("daemon emitted BOT progress before the recovery-start notice".to_string())
+        );
+
+        let wrong_tape = pb::TapeInventoryBotRecoveryStarted {
+            tape_uuid: Uuid::from_u128(2).as_bytes().to_vec(),
+            block_size: 256 * 1024,
+            reason: pb::TapeInventoryBotRecoveryReason::AllMembersInvalid as i32,
+        };
+        assert!(accept_bot_recovery_started(&mut state, &wrong_tape, tape_uuid).is_err());
     }
 
     #[test]

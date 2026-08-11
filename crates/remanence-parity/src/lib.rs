@@ -65,9 +65,11 @@ pub use bootstrap::{
     DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
 };
 pub use bot_recovery::{
-    recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_with_authority,
-    BotObjectRecoveryAuthority, BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope,
-    BotRecoveredObject, BotRecoveredObjectState, BotStructuralRecoveryError,
+    recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_controlled,
+    recover_terminal_inventory_from_bot_with_authority,
+    recover_terminal_inventory_from_bot_with_authority_controlled, BotObjectRecoveryAuthority,
+    BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, BotRecoveredObject,
+    BotRecoveredObjectState, BotStructuralRecoveryError, BotStructuralRecoveryEvent,
     BotStructuralRecoverySummary,
 };
 pub use capacity::{
@@ -136,10 +138,11 @@ pub use resume::{
 };
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
-    scan_reconstruct_filemark_map_with_report, validate_scan_reconstruction_with_report,
-    CatalogFilemarkMapInput, FilemarkMapScanResult, ParityMapContentConflict,
-    ParityMapSelectionKey, ScanBootstrapCandidate, ScanDamageKind, ScanDamagedRegion,
-    ScanOverlaySource, ScanTailTruncation, ScanTailTruncationKind, ScanWalkResult,
+    scan_reconstruct_filemark_map_with_control, scan_reconstruct_filemark_map_with_report,
+    validate_scan_reconstruction_with_report, CatalogFilemarkMapInput, ControlledScanWalkOutcome,
+    FilemarkMapScanResult, ParityMapContentConflict, ParityMapSelectionKey, ScanBootstrapCandidate,
+    ScanDamageKind, ScanDamagedRegion, ScanOverlaySource, ScanTailTruncation,
+    ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl, ScanWalkProgress, ScanWalkResult,
     UnattestedTapeFile,
 };
 pub use sidecar::{
