@@ -18,17 +18,15 @@ use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
 use remanence_api::{
     load_tape_by_uuid,
     read_core::{read_object_payload, CapturePayloadSink},
-    require_rewritable_object_media, select_tape_in_pool_for_write_session, verify_tape_identity,
-    write_to_selected_tape_checkpointed, ObjectWriteMediaError, PoolWriteObjectRecord,
-    PoolWriteRepresentation, PoolWriteResources, PoolWriteResult, RewritableObjectMediaAdmission,
-    TapeIdentityError, TapeUuid, WriteObjectToPoolRequest,
+    select_tape_in_pool_for_write_session, verify_tape_identity,
+    write_to_selected_drive_checkpointed, PoolWriteObjectRecord, PoolWriteRepresentation,
+    PoolWriteResources, PoolWriteResult, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
 };
 use remanence_library::{
-    BlockSize, BlockSource, DriveHandleSink, DriveHandleSource, SpaceKind, StaticAllowlist,
-    TapeConfig,
+    BlockSize, BlockSource, DriveHandleSource, SpaceKind, StaticAllowlist, TapeConfig,
 };
 use remanence_state::{
     CatalogIndex, NativeObjectCopyRecord, StateHandle, TapeFileRecord,
@@ -159,7 +157,6 @@ pub fn run_archive_write(
     };
 
     let tape_uuid = selected.tape_uuid;
-    let block_size = selected.block_size;
 
     // -- Open library handle ----------------------------------------------
     let lib = match report.library(&args.library) {
@@ -200,65 +197,6 @@ pub fn run_archive_write(
         }
     };
 
-    // -- Verify-before-write: read bootstrap at BOT -----------------------
-    if let Err(e) = drive.rewind() {
-        let _ = writeln!(err, "error: rewind before verify: {e}");
-        return ExitCode::from(1);
-    }
-    {
-        let mut source = DriveHandleSource(&mut drive);
-        match verify_tape_identity(&mut source, &tape_uuid) {
-            Ok(()) => {}
-            Err(TapeIdentityError::AbsentBootstrap(msg)) => {
-                let _ = writeln!(
-                    err,
-                    "error: tape identity check failed (no bootstrap at BOT): {msg}"
-                );
-                let _ = writeln!(
-                    err,
-                    "       run `rem tape init` to initialise this cartridge first"
-                );
-                return ExitCode::from(1);
-            }
-            Err(TapeIdentityError::Mismatch { expected, actual }) => {
-                let _ = writeln!(
-                    err,
-                    "error: tape identity mismatch — expected {expected}, on-tape bootstrap says {actual}"
-                );
-                let _ = writeln!(
-                    err,
-                    "       the wrong cartridge may be loaded; aborting to prevent data loss"
-                );
-                return ExitCode::from(1);
-            }
-        }
-    }
-
-    // -- Rewind + fixed-block config + write object -----------------------
-    if let Err(e) = drive.rewind() {
-        let _ = writeln!(err, "error: rewind before write: {e}");
-        return ExitCode::from(1);
-    }
-    let current_cfg = match drive.read_config() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = writeln!(err, "error: read drive config before write: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let (target_cfg, media_admission) = match archive_object_target_config(current_cfg, block_size)
-    {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            let _ = writeln!(err, "error: refuse direct Object write: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    if let Err(e) = drive.write_config(target_cfg) {
-        let _ = writeln!(err, "error: set fixed-block config: {e}");
-        return ExitCode::from(1);
-    }
-
     let request = WriteObjectToPoolRequest {
         pool_id: pool_id.clone(),
         source: remanence_api::WriteObjectSource::Path(args.file.clone()),
@@ -278,20 +216,16 @@ pub fn run_archive_write(
             return ExitCode::from(1);
         }
     };
-    let result = {
-        let mut sink = DriveHandleSink(&mut drive);
-        write_to_selected_tape_checkpointed(
-            state_handle.catalog_index(),
-            &mut sink,
-            media_admission,
-            &pool_cfg,
-            request,
-            selected,
-            &checkpoint_journal_dir,
-            &parity_journal_path,
-            &resources,
-        )
-    };
+    let result = write_to_selected_drive_checkpointed(
+        state_handle.catalog_index(),
+        &mut drive,
+        &pool_cfg,
+        request,
+        selected,
+        &checkpoint_journal_dir,
+        &parity_journal_path,
+        &resources,
+    );
 
     match result {
         Ok(PoolWriteResult { object, .. }) => {
@@ -312,23 +246,6 @@ pub fn run_archive_write(
             ExitCode::from(1)
         }
     }
-}
-
-fn archive_object_target_config(
-    current_cfg: TapeConfig,
-    block_size: u32,
-) -> Result<(TapeConfig, RewritableObjectMediaAdmission), ObjectWriteMediaError> {
-    let media_admission = require_rewritable_object_media(current_cfg)?;
-    let target_cfg = TapeConfig {
-        block_size: BlockSize::Fixed {
-            size_bytes: block_size,
-        },
-        compression: false,
-        max_block_size_bytes: current_cfg.max_block_size_bytes,
-        write_protected: current_cfg.write_protected,
-        worm: current_cfg.worm,
-    };
-    Ok((target_cfg, media_admission))
 }
 
 struct WriteRepresentationSelection {
@@ -1489,9 +1406,7 @@ mod tests {
 
     use remanence_api::{PoolWriteObjectCopyRecord, PoolWriteObjectRecord};
     use remanence_library::model::{DriveBay, ElementLayout, IdentitySource, InstalledDrive};
-    use remanence_library::{
-        BlockSize, LoadError, LoadPlan, TapeConfig, VecBlockSource, WormMediaState,
-    };
+    use remanence_library::{LoadError, LoadPlan, VecBlockSource};
     use remanence_state::{
         NativeObjectCopyRecord, TapeFileRecord, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
     };
@@ -1499,33 +1414,6 @@ mod tests {
     use uuid::Uuid;
 
     use crate::bytes_to_hex;
-
-    #[test]
-    fn direct_archive_object_write_stops_before_mode_select_for_worm_or_unknown() {
-        let current = |worm| TapeConfig {
-            block_size: BlockSize::Variable,
-            compression: true,
-            max_block_size_bytes: 8 * 1024 * 1024,
-            write_protected: false,
-            worm,
-        };
-
-        let worm = super::archive_object_target_config(current(WormMediaState::Worm), 4096)
-            .expect_err("WORM cannot mint a direct-write admission token");
-        assert_eq!(worm, remanence_api::ObjectWriteMediaError::Worm);
-        let unknown = super::archive_object_target_config(current(WormMediaState::Unknown), 4096)
-            .expect_err("unknown media cannot mint a direct-write admission token");
-        assert_eq!(
-            unknown,
-            remanence_api::ObjectWriteMediaError::UnknownWormState
-        );
-
-        let (target, _admission) =
-            super::archive_object_target_config(current(WormMediaState::NotWorm), 4096)
-                .expect("positive rewritable evidence yields config plus one-use admission");
-        assert_eq!(target.block_size, BlockSize::Fixed { size_bytes: 4096 });
-        assert!(!target.compression);
-    }
 
     // ---- bytes_to_hex ----
 

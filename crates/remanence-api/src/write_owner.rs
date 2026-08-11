@@ -5977,7 +5977,6 @@ fn validate_write_media_policy(
         };
     }
     crate::pool_write::require_rewritable_object_media(current_cfg)
-        .map(|_| ())
         .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
@@ -11801,6 +11800,9 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         }
         PoolWriteError::TerminalCloseRequired { .. } => Status::resource_exhausted(message),
         PoolWriteError::ContentHashMismatch { .. } => Status::failed_precondition(message),
+        PoolWriteError::ObjectWriteMedia(_) | PoolWriteError::TapeIdentity(_) => {
+            Status::failed_precondition(message)
+        }
         PoolWriteError::CallerObjectIdConflict { .. }
         | PoolWriteError::CallerObjectIdInputKindConflict { .. } => Status::already_exists(message),
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
@@ -17219,6 +17221,21 @@ mod tests {
             },
         ));
         assert_eq!(exhausted.code(), tonic::Code::ResourceExhausted);
+
+        let worm = status_from_pool_write_error(PoolWriteError::ObjectWriteMedia(
+            crate::pool_write::ObjectWriteMediaError::Worm,
+        ));
+        assert_eq!(worm.code(), tonic::Code::FailedPrecondition);
+        assert!(worm.message().contains("WORM tape"), "{worm}");
+
+        let identity = status_from_pool_write_error(PoolWriteError::TapeIdentity(
+            crate::pool_write::TapeIdentityError::Mismatch {
+                expected: "11111111-1111-1111-1111-111111111111".to_string(),
+                actual: "22222222-2222-2222-2222-222222222222".to_string(),
+            },
+        ));
+        assert_eq!(identity.code(), tonic::Code::FailedPrecondition);
+        assert!(identity.message().contains("mismatch"), "{identity}");
     }
 
     #[test]
