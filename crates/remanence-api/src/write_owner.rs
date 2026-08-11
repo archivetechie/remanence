@@ -1246,6 +1246,9 @@ pub(crate) struct WriteOwnerConfig {
     pub cleaning: CleaningConfig,
     pub tape_io: TapeIoConfig,
     pub io_memory: Arc<crate::io_memory::IoMemoryReservation>,
+    /// Cross-drive claims that make replay-key and canonical-UUID admission
+    /// atomic through checkpoint projection.
+    pub write_admissions: WriteAdmissionCoordinator,
     pub checkpoint_journal_dir: PathBuf,
     pub checkpoint_max_bytes: u64,
     pub checkpoint_max_objects: u64,
@@ -2198,6 +2201,92 @@ struct PendingCheckpointBatch {
     used_bytes: u64,
     early_warning: bool,
     objects: Vec<crate::pool_write::PoolWriteResult>,
+    /// Daemon-wide idempotency/UUID claims remain live until this batch is
+    /// either projected or abandoned. This closes the gap between the
+    /// pre-motion catalog read and the later checkpoint transaction.
+    _write_admissions: Vec<WriteAdmissionReservation>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct WriteReplayKey {
+    pool_id: String,
+    caller_object_id: String,
+}
+
+#[derive(Debug, Default)]
+struct WriteAdmissionState {
+    replay_keys: HashSet<WriteReplayKey>,
+    object_ids: HashSet<[u8; 16]>,
+}
+
+/// Process-wide admission authority shared by every drive actor.
+///
+/// SQLite remains the durable committed authority. These short-lived claims
+/// cover only the interval from the last pre-motion catalog read through the
+/// checkpoint projection, so two drive actors cannot both write an identity
+/// that the catalog can commit only once.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WriteAdmissionCoordinator {
+    state: Arc<Mutex<WriteAdmissionState>>,
+}
+
+impl WriteAdmissionCoordinator {
+    fn reserve(
+        &self,
+        pool_id: &str,
+        caller_object_id: &str,
+        object_id: Option<[u8; 16]>,
+    ) -> Result<WriteAdmissionReservation, Status> {
+        let replay_key = (!caller_object_id.trim().is_empty()).then(|| WriteReplayKey {
+            pool_id: pool_id.to_string(),
+            caller_object_id: caller_object_id.to_string(),
+        });
+        let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        if replay_key
+            .as_ref()
+            .is_some_and(|key| state.replay_keys.contains(key))
+            || object_id.is_some_and(|id| state.object_ids.contains(&id))
+        {
+            return Err(Status::aborted(
+                "an append with the same pool/caller replay key or canonical Object UUID is still awaiting checkpoint; retry after that checkpoint completes",
+            ));
+        }
+        if let Some(key) = replay_key.as_ref() {
+            state.replay_keys.insert(key.clone());
+        }
+        if let Some(id) = object_id {
+            state.object_ids.insert(id);
+        }
+        drop(state);
+        Ok(WriteAdmissionReservation {
+            coordinator: self.clone(),
+            replay_key,
+            object_id,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WriteAdmissionReservation {
+    coordinator: WriteAdmissionCoordinator,
+    replay_key: Option<WriteReplayKey>,
+    object_id: Option<[u8; 16]>,
+}
+
+impl Drop for WriteAdmissionReservation {
+    fn drop(&mut self) {
+        let mut state = self
+            .coordinator
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(key) = self.replay_key.as_ref() {
+            state.replay_keys.remove(key);
+        }
+        if let Some(id) = self.object_id {
+            state.object_ids.remove(&id);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2520,14 +2609,22 @@ impl PendingCheckpointBatch {
             used_bytes: 0,
             early_warning: false,
             objects: Vec::new(),
+            _write_admissions: Vec::new(),
         }
     }
 
-    fn push(&mut self, logical_bytes: u64, result: crate::pool_write::PoolWriteResult) {
+    fn push(
+        &mut self,
+        logical_bytes: u64,
+        result: crate::pool_write::PoolWriteResult,
+        write_admission: WriteAdmissionReservation,
+    ) {
         self.logical_bytes = self.logical_bytes.saturating_add(logical_bytes);
         self.used_bytes = self.used_bytes.max(result.post_write_used_bytes());
         self.early_warning |= result.hardware_early_warning();
         self.objects.push(result);
+        self._write_admissions.push(write_admission);
+        debug_assert_eq!(self.objects.len(), self._write_admissions.len());
     }
 
     fn should_checkpoint(&self, cfg: &WriteOwnerConfig) -> bool {
@@ -4327,6 +4424,18 @@ impl WriteSessionState<'_> {
             representation: crate::PoolWriteRepresentation::Plaintext,
             input_kind,
         };
+        let mut write_admission = match cfg.write_admissions.reserve(
+            pool_cfg.id.as_str(),
+            request.caller_object_id.as_str(),
+            request.expected_object_id,
+        ) {
+            Ok(reservation) => Some(reservation),
+            Err(status) => {
+                request.source.remove_completed_path();
+                let _ = reply.send(Err(status));
+                return;
+            }
+        };
         let append_started = Instant::now();
         let mut parity_raw_write_attempted = false;
         let result = match crate::pool_write::maybe_replay_pool_write(
@@ -4412,7 +4521,13 @@ impl WriteSessionState<'_> {
                         .to_written_proto(batch.batch_id, provisional_ordinal);
                     let object_id = result.object.object_id;
                     let batch_id = batch.batch_id;
-                    batch.push(logical_size, result);
+                    batch.push(
+                        logical_size,
+                        result,
+                        write_admission
+                            .take()
+                            .expect("new tape write retains its admission through checkpoint"),
+                    );
                     let timer_arm_failed = if new_batch {
                         match arm_checkpoint_timer(
                             self.actor_tx.clone(),
@@ -11588,7 +11703,8 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         }
         PoolWriteError::TerminalCloseRequired { .. } => Status::resource_exhausted(message),
         PoolWriteError::ContentHashMismatch { .. } => Status::failed_precondition(message),
-        PoolWriteError::CallerObjectIdConflict { .. } => Status::already_exists(message),
+        PoolWriteError::CallerObjectIdConflict { .. }
+        | PoolWriteError::CallerObjectIdInputKindConflict { .. } => Status::already_exists(message),
         PoolWriteError::ReplayObjectInvalid { .. } => Status::internal(message),
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
@@ -11747,6 +11863,42 @@ mod tests {
         )
         .expect_err("logical replay must not conflate a canonical pending object");
         assert_eq!(wrong_kind.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn concurrent_drive_admission_allows_only_one_matching_identity() {
+        let coordinator = WriteAdmissionCoordinator::default();
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let finish = Arc::new(std::sync::Barrier::new(2));
+        let object_id = [0x73; 16];
+        let mut workers = Vec::new();
+        for caller in ["drive-a", "drive-b"] {
+            let coordinator = coordinator.clone();
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                let result = coordinator.reserve("pool", caller, Some(object_id));
+                let admitted = result.is_ok();
+                finish.wait();
+                drop(result);
+                admitted
+            }));
+        }
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("drive admission worker"))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|admitted| **admitted).count(), 1);
+
+        let replay = coordinator
+            .reserve("pool", "drive-c", Some(object_id))
+            .expect("identity becomes available after the checkpoint-held claim drops");
+        let same_key = coordinator
+            .reserve("pool", "drive-c", Some([0x74; 16]))
+            .expect_err("pool/caller replay key is independently exclusive");
+        assert_eq!(same_key.code(), tonic::Code::Aborted);
+        drop(replay);
     }
 
     #[test]
@@ -14465,6 +14617,7 @@ mod tests {
                 remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
             )
             .expect("test I/O memory manager"),
+            write_admissions: WriteAdmissionCoordinator::default(),
             checkpoint_journal_dir: std::env::temp_dir().join("rem-checkpoint-tests"),
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
@@ -16590,6 +16743,7 @@ mod tests {
             cleaning: remanence_state::CleaningConfig::default(),
             tape_io: remanence_state::TapeIoConfig::default(),
             io_memory: test_io_memory(),
+            write_admissions: WriteAdmissionCoordinator::default(),
             checkpoint_journal_dir: temp.path().join("checkpoints"),
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,

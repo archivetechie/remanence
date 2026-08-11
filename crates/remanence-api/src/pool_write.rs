@@ -987,6 +987,22 @@ pub enum PoolWriteError {
         /// Requested source content SHA-256 as lowercase hex.
         requested_content_sha256: String,
     },
+    /// A caller-object replay changed the ingestion semantics bound by the
+    /// original request.
+    #[error(
+        "caller_object_id replay changed input kind in pool {pool_id}: caller_object_id={caller_object_id:?}, existing={existing_input_kind:?}, requested={requested_input_kind:?}"
+    )]
+    CallerObjectIdInputKindConflict {
+        /// Pool that scopes the idempotency key.
+        pool_id: String,
+        /// Opaque caller/orchestrator object id.
+        caller_object_id: String,
+        /// Input kind inferred from the committed object's exact member/hash
+        /// projection.
+        existing_input_kind: WriteObjectInputKind,
+        /// Input kind supplied by the retry.
+        requested_input_kind: WriteObjectInputKind,
+    },
     /// A replay candidate was found but lacks fields required for a response.
     #[error("catalog replay object {object_id} is incomplete: {reason}")]
     ReplayObjectInvalid {
@@ -5943,6 +5959,15 @@ pub(crate) fn maybe_replay_pool_write(
         }
     }
     let existing_hash = native_object_content_sha256(&existing)?;
+    let existing_input_kind = committed_native_object_input_kind(state, &existing, existing_hash)?;
+    if existing_input_kind != request.input_kind {
+        return Err(PoolWriteError::CallerObjectIdInputKindConflict {
+            pool_id: pool_cfg.id.clone(),
+            caller_object_id: request.caller_object_id.clone(),
+            existing_input_kind,
+            requested_input_kind: request.input_kind,
+        });
+    }
     if existing_hash != requested_hash {
         return Err(PoolWriteError::CallerObjectIdConflict {
             pool_id: pool_cfg.id.clone(),
@@ -5961,6 +5986,32 @@ pub(crate) fn maybe_replay_pool_write(
         hardware_early_warning: false,
         input_kind: request.input_kind,
     }))
+}
+
+fn committed_native_object_input_kind(
+    state: &CatalogIndex,
+    object: &NativeObjectRecord,
+    content_sha256: [u8; 32],
+) -> Result<WriteObjectInputKind, PoolWriteError> {
+    let logical_size_bytes = object
+        .logical_size_bytes
+        .ok_or_else(|| replay_object_invalid(&object.object_id, "logical_size_bytes is missing"))?;
+    let files = state.list_native_object_files(object.object_id.as_str())?;
+    if files.is_empty() {
+        return Err(replay_object_invalid(
+            &object.object_id,
+            "member projection is missing, so the committed input kind cannot be proved",
+        ));
+    }
+    let is_logical_file = files.len() == 1
+        && files[0].size_bytes == logical_size_bytes
+        && files[0].file_digest_algorithm == remanence_state::DIGEST_ALGORITHM_SHA256
+        && files[0].file_sha256.as_slice() == content_sha256;
+    Ok(if is_logical_file {
+        WriteObjectInputKind::LogicalFile
+    } else {
+        WriteObjectInputKind::CanonicalPlaintextRemObject
+    })
 }
 
 fn pool_write_object_record_from_native(
@@ -6506,20 +6557,20 @@ fn regenerate_canonical_plaintext_digest(
             "canonical plaintext REM member count changed during regeneration".to_string(),
         ));
     }
-    let mut readers = Vec::<Box<dyn Read + Send>>::with_capacity(files.len());
-    for entry in payload_entries {
-        let mut file = File::open(source_path).map_err(|source| PoolWriteError::Io {
+    let shared_source = Arc::new(Mutex::new(File::open(source_path).map_err(|source| {
+        PoolWriteError::Io {
             context: "reopen canonical plaintext REM object for canonical regeneration",
             path: source_path.to_path_buf(),
             source,
-        })?;
-        file.seek(SeekFrom::Start(entry.data_offset))
-            .map_err(|source| PoolWriteError::Io {
-                context: "seek canonical plaintext REM member for canonical regeneration",
-                path: source_path.to_path_buf(),
-                source,
-            })?;
-        readers.push(Box::new(file.take(entry.size_bytes)));
+        }
+    })?));
+    let mut readers = Vec::<Box<dyn Read + Send>>::with_capacity(files.len());
+    for entry in payload_entries {
+        readers.push(Box::new(SharedFileRangeReader::new(
+            Arc::clone(&shared_source),
+            entry.data_offset,
+            entry.size_bytes,
+        )));
     }
     let mut streams = Vec::with_capacity(files.len());
     for (file, reader) in files.iter().zip(readers.iter_mut()) {
@@ -6529,6 +6580,57 @@ fn regenerate_canonical_plaintext_digest(
     let layout = write_rem_tar_object_from_readers(&mut sink, options, &mut streams)
         .map_err(StreamingError::from)?;
     Ok((layout, sink.finish()))
+}
+
+/// Lazy range reader over one shared canonical spool descriptor.
+///
+/// The deterministic writer owns one reader per member, but retaining one
+/// `File` per member would turn the process descriptor limit into an archive
+/// member-count ceiling. Each range keeps only its cursor; reads serialize the
+/// seek/read pair against the single daemon-owned spool descriptor.
+struct SharedFileRangeReader {
+    source: Arc<Mutex<File>>,
+    cursor: u64,
+    remaining: u64,
+}
+
+impl SharedFileRangeReader {
+    fn new(source: Arc<Mutex<File>>, start: u64, len: u64) -> Self {
+        Self {
+            source,
+            cursor: start,
+            remaining: len,
+        }
+    }
+}
+
+impl Read for SharedFileRangeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let wanted = usize::try_from(self.remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let mut source = self
+            .source
+            .lock()
+            .map_err(|_| io::Error::other("canonical spool range-reader lock poisoned"))?;
+        source.seek(SeekFrom::Start(self.cursor))?;
+        let read = source.read(&mut buf[..wanted])?;
+        let read_u64 = read as u64;
+        self.cursor = self.cursor.checked_add(read_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "canonical spool range-reader cursor overflow",
+            )
+        })?;
+        self.remaining = self.remaining.checked_sub(read_u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "canonical spool range-reader remaining underflow",
+            )
+        })?;
+        Ok(read)
+    }
 }
 
 fn prepare_canonical_plaintext_pool_object(
@@ -8665,6 +8767,37 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("requires expected_object_id"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_member_ranges_share_one_spool_descriptor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("many-members.bin");
+        std::fs::write(&path, vec![0x5a; 4096]).expect("write shared spool");
+        let before = std::fs::read_dir("/proc/self/fd")
+            .expect("open process fd directory")
+            .count();
+        let source = Arc::new(Mutex::new(File::open(&path).expect("open shared spool")));
+        let mut readers = (0..4096)
+            .map(|offset| {
+                SharedFileRangeReader::new(Arc::clone(&source), (offset % 4096) as u64, 1)
+            })
+            .collect::<Vec<_>>();
+        let during = std::fs::read_dir("/proc/self/fd")
+            .expect("reopen process fd directory")
+            .count();
+        assert!(
+            during <= before + 2,
+            "4096 member ranges must retain one shared file descriptor: before={before}, during={during}"
+        );
+        for reader in &mut readers {
+            let mut byte = [0u8; 1];
+            reader
+                .read_exact(&mut byte)
+                .expect("read shared member range");
+            assert_eq!(byte, [0x5a]);
+        }
     }
 
     #[test]

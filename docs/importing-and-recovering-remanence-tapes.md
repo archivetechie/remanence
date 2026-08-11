@@ -214,10 +214,14 @@ the same caller id and content digest. If the catalog already contains that
 exact pair, the retry is an idempotent read of committed state; different bytes
 under the same caller id are refused.
 
-The canonical append surface creates an Object and its first copy atomically.
-It does not attach another copy to an Object UUID that is already cataloged
-outside the exact pool/caller replay key; that collision is refused before
-tape motion.
+The canonical append surface creates an Object and its first copy as one
+checkpointed operation. Media completion can precede checkpoint/catalog
+commit, which is why an interrupted uncommitted tail may exist and must be
+rewritten whole. The surface does not attach another copy to an Object UUID
+that is already cataloged outside the exact pool/caller replay key; that
+collision is refused before tape motion. A daemon-wide claim also holds the
+pool/caller key and canonical Object UUID from pre-motion admission through
+checkpoint, so concurrent drive actors cannot both write the same identity.
 
 This mechanism depends on the host checkpoint journal for an open tape. A
 Remanence cartridge arriving from another installation does not acquire safe
