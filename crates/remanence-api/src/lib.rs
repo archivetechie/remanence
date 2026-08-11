@@ -738,6 +738,7 @@ impl ApiState {
             cleaning: config.cleaning.clone(),
             tape_io: config.tape_io.clone(),
             io_memory: Arc::clone(&io_memory),
+            write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
             checkpoint_journal_dir: config.journal.dir.join("checkpoints"),
             checkpoint_max_bytes: config.daemon.checkpoint_max_bytes,
             checkpoint_max_objects: config.daemon.checkpoint_max_objects,
@@ -12299,6 +12300,59 @@ BCw3Wyv2UWY=
     }
 
     #[test]
+    fn committed_replay_rejects_input_kind_change_before_tape_motion() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-input-kind-replay");
+        let source_path = source_dir.join("payload.bin");
+        std::fs::write(&source_path, b"same bytes, different ingestion semantics")
+            .expect("write source payload");
+        let cfg = pool_config("scenario-a");
+        let mut tape_sink = VecBlockSink::new();
+        let first = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "input-kind-replay".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("seed logical-file object");
+        let blocks_before = tape_sink.blocks.len();
+        let filemarks_before = tape_sink.filemarks.clone();
+
+        let error = crate::pool_write::maybe_replay_pool_write(
+            &index,
+            &cfg,
+            &WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path),
+                archive_path: PathBuf::new(),
+                caller_object_id: "input-kind-replay".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: Some(first.object.object_id),
+                input_kind: crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect_err("committed replay must preserve the original input kind");
+        assert!(matches!(
+            error,
+            PoolWriteError::CallerObjectIdInputKindConflict { .. }
+        ));
+        assert_eq!(tape_sink.blocks.len(), blocks_before);
+        assert_eq!(tape_sink.filemarks, filemarks_before);
+    }
+
+    #[test]
     fn pool_write_conflicts_same_pool_caller_object_id_with_different_content() {
         let mut index = test_index();
         project_pool(&mut index, "scenario-a");
@@ -12898,6 +12952,7 @@ BCw3Wyv2UWY=
                 remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES,
             )
             .expect("test I/O memory manager"),
+            write_admissions: crate::write_owner::WriteAdmissionCoordinator::default(),
             checkpoint_journal_dir: temp.path().join("checkpoints"),
             checkpoint_max_bytes: remanence_state::DEFAULT_CHECKPOINT_MAX_BYTES,
             checkpoint_max_objects: remanence_state::DEFAULT_CHECKPOINT_MAX_OBJECTS,
