@@ -12,6 +12,10 @@ use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
 use crate::scan::scan_reconstruct_filemark_map_with_report;
 use remanence_library::{scsi::decode_sense, TapeIoError};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+
+const AUTHORITY_SPOOL_ROW_PREFIX_LEN: usize = 17;
 
 /// One exact Object identity assertion from separately durable authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,15 +231,14 @@ where
         first_row_count,
     )?;
 
-    let mut complete_object_count = 0u64;
-    let mut recovered_object_count = 0u64;
-    let mut unknown_object_count = 0u64;
-
-    // Pass two replays the same frozen authority and emits only exact matches.
+    // Pass two replays the same frozen authority into an anonymous bounded-memory
+    // spool. Authority rows remain provisional until visit_object_rows returns,
+    // so no recovered identity may reach the caller during this pass.
+    let mut authority_spool = None;
     let mut second_previous_file = None;
     let mut second_row_count = 0u64;
     let second_scope = authority.visit_object_rows(&mut |row| {
-        let entry = validate_authority_row(&walked.map, row, &mut second_previous_file)?;
+        validate_authority_row(&walked.map, row, &mut second_previous_file)?;
         if row.tape_file_number >= first_scope.covered_prefix_tape_file_count {
             return Err(authority_conflict(
                 row.tape_file_number,
@@ -244,19 +247,44 @@ where
         }
         second_row_count =
             checked_recovery_increment(second_row_count, "second BOT authority Object-row count")?;
-        emit_complete_object(
-            entry,
-            Some(row.object_id.clone()),
-            &mut visit_object,
-            &mut complete_object_count,
-            &mut recovered_object_count,
-            &mut unknown_object_count,
-        )
+        if authority_spool.is_none() {
+            authority_spool = Some(AuthorityRowSpool::new()?);
+        }
+        authority_spool
+            .as_mut()
+            .expect("authority spool was initialized for a replayed row")
+            .push(row)
     })?;
     if second_scope != first_scope || second_row_count != first_row_count {
         return Err(BotStructuralRecoveryError::ObjectAuthority {
-            message: "BOT Object authority changed between validation and emission passes"
+            message: "BOT Object authority changed between validation and staging passes"
                 .to_string(),
+        });
+    }
+
+    let mut complete_object_count = 0u64;
+    let mut recovered_object_count = 0u64;
+    let mut unknown_object_count = 0u64;
+
+    // Only a complete, exact second replay makes the staged identities
+    // authoritative. The anonymous file keeps memory constant while this
+    // third bounded pass emits those committed identities.
+    let mut staged_previous_file = None;
+    if let Some(authority_spool) = authority_spool.as_mut() {
+        authority_spool.visit_rows(second_row_count, |row| {
+            let entry = validate_authority_row(&walked.map, row, &mut staged_previous_file)?;
+            emit_complete_object(
+                entry,
+                Some(row.object_id.clone()),
+                &mut visit_object,
+                &mut complete_object_count,
+                &mut recovered_object_count,
+                &mut unknown_object_count,
+            )
+        })?;
+    } else if second_row_count != 0 {
+        return Err(BotStructuralRecoveryError::ObjectAuthority {
+            message: "BOT Object authority replay counted rows without staging them".to_string(),
         });
     }
 
@@ -308,6 +336,93 @@ where
             }
         })?,
     })
+}
+
+struct AuthorityRowSpool {
+    file: File,
+}
+
+impl AuthorityRowSpool {
+    fn new() -> Result<Self, BotStructuralRecoveryError> {
+        tempfile::tempfile()
+            .map(|file| Self { file })
+            .map_err(|error| authority_spool_error("create anonymous authority spool", error))
+    }
+
+    fn push(
+        &mut self,
+        row: &BotObjectRecoveryAuthorityRow,
+    ) -> Result<(), BotStructuralRecoveryError> {
+        let object_id_len = u8::try_from(row.object_id.len()).map_err(|_| {
+            authority_conflict(
+                row.tape_file_number,
+                "Object identifier length does not fit the authority spool",
+            )
+        })?;
+        let mut prefix = [0u8; AUTHORITY_SPOOL_ROW_PREFIX_LEN];
+        prefix[..8].copy_from_slice(&row.tape_file_number.to_le_bytes());
+        prefix[8..16].copy_from_slice(&row.stored_block_count.to_le_bytes());
+        prefix[16] = object_id_len;
+        self.file
+            .write_all(&prefix)
+            .and_then(|()| self.file.write_all(&row.object_id))
+            .map_err(|error| authority_spool_error("stage an authority row", error))
+    }
+
+    fn visit_rows<F>(
+        &mut self,
+        row_count: u64,
+        mut visitor: F,
+    ) -> Result<(), BotStructuralRecoveryError>
+    where
+        F: FnMut(&BotObjectRecoveryAuthorityRow) -> Result<(), BotStructuralRecoveryError>,
+    {
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| authority_spool_error("rewind the authority spool", error))?;
+        for _ in 0..row_count {
+            let mut prefix = [0u8; AUTHORITY_SPOOL_ROW_PREFIX_LEN];
+            self.file
+                .read_exact(&mut prefix)
+                .map_err(|error| authority_spool_error("read an authority spool row", error))?;
+            let tape_file_number = u64::from_le_bytes(
+                prefix[..8]
+                    .try_into()
+                    .expect("authority spool tape-file field is eight bytes"),
+            );
+            let stored_block_count = u64::from_le_bytes(
+                prefix[8..16]
+                    .try_into()
+                    .expect("authority spool block-count field is eight bytes"),
+            );
+            let object_id_len = usize::from(prefix[16]);
+            if !(1..=64).contains(&object_id_len) {
+                return Err(authority_conflict(
+                    tape_file_number,
+                    "staged Object identifier is not 1..=64 bytes",
+                ));
+            }
+            let mut object_id = vec![0u8; object_id_len];
+            self.file
+                .read_exact(&mut object_id)
+                .map_err(|error| authority_spool_error("read a staged Object identifier", error))?;
+            visitor(&BotObjectRecoveryAuthorityRow {
+                tape_file_number,
+                stored_block_count,
+                object_id,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn authority_spool_error(
+    operation: &'static str,
+    error: std::io::Error,
+) -> BotStructuralRecoveryError {
+    BotStructuralRecoveryError::ObjectAuthority {
+        message: format!("{operation}: {error}"),
+    }
 }
 
 fn validate_authority_scope(
