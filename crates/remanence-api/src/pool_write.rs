@@ -10,7 +10,7 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -582,6 +582,7 @@ pub struct PoolWriteResult {
     checkpoint_projection: Option<remanence_state::CheckpointObjectProjection>,
     post_write_used_bytes: u64,
     hardware_early_warning: bool,
+    input_kind: WriteObjectInputKind,
 }
 
 impl PoolWriteResult {
@@ -617,6 +618,10 @@ impl PoolWriteResult {
 
     pub(crate) fn hardware_early_warning(&self) -> bool {
         self.hardware_early_warning
+    }
+
+    pub(crate) fn input_kind(&self) -> WriteObjectInputKind {
+        self.input_kind
     }
 
     /// Borrow the streaming report and panic if the result was a replay.
@@ -5833,6 +5838,7 @@ fn pool_write_result(
     sealed_after_write: bool,
     checkpoint_projection: Option<remanence_state::CheckpointObjectProjection>,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    let input_kind = request.input_kind;
     let position_lba = write_report
         .object_close
         .filemark_outcome
@@ -5874,6 +5880,7 @@ fn pool_write_result(
         checkpoint_projection,
         post_write_used_bytes,
         hardware_early_warning,
+        input_kind,
     })
 }
 
@@ -5900,6 +5907,14 @@ pub(crate) fn maybe_replay_pool_write(
         request.caller_object_id.as_str(),
     )?
     else {
+        if let Some(expected_object_id) = request.expected_object_id {
+            let object_id = Uuid::from_bytes(expected_object_id).to_string();
+            if state.get_native_object(&object_id)?.is_some() {
+                return Err(PoolWriteError::InvalidInput(format!(
+                    "canonical plaintext REM object id {object_id} already exists outside the exact pool/caller replay key; attaching another copy is not supported by this append surface"
+                )));
+            }
+        }
         return Ok(None);
     };
     if let Some(expected_object_id) = request.expected_object_id {
@@ -5944,6 +5959,7 @@ pub(crate) fn maybe_replay_pool_write(
         checkpoint_projection: None,
         post_write_used_bytes: 0,
         hardware_early_warning: false,
+        input_kind: request.input_kind,
     }))
 }
 
@@ -6396,6 +6412,125 @@ impl RemTarEntrySink for ValidateCanonicalEntrySink {
     }
 }
 
+struct CanonicalDigestSink {
+    hasher: Sha256,
+    block_size: usize,
+    next_lba: u64,
+}
+
+impl CanonicalDigestSink {
+    fn new(block_size: usize) -> Self {
+        Self {
+            hasher: Sha256::new(),
+            block_size,
+            next_lba: 0,
+        }
+    }
+
+    fn finish(self) -> [u8; 32] {
+        self.hasher.finalize().into()
+    }
+
+    fn position_value(&self) -> TapePosition {
+        TapePosition {
+            lba: self.next_lba,
+            partition: 0,
+            beginning_of_partition: self.next_lba == 0,
+            end_of_partition: false,
+            block_position_end_of_warning: false,
+        }
+    }
+}
+
+impl BlockSink for CanonicalDigestSink {
+    fn write_block(&mut self, buf: &[u8]) -> Result<WriteOutcome, TapeIoError> {
+        if buf.len() != self.block_size {
+            return Err(TapeIoError::OperationFailed(format!(
+                "canonical regeneration emitted {} bytes, expected one {}-byte block",
+                buf.len(),
+                self.block_size
+            )));
+        }
+        self.hasher.update(buf);
+        self.next_lba = self.next_lba.checked_add(1).ok_or_else(|| {
+            TapeIoError::OperationFailed("canonical regeneration LBA overflow".to_string())
+        })?;
+        Ok(WriteOutcome::from_device_position(
+            buf.len() as u32,
+            false,
+            false,
+            self.position_value(),
+        ))
+    }
+
+    fn write_filemarks(&mut self, count: u32) -> Result<WriteFilemarksOutcome, TapeIoError> {
+        if count != 0 {
+            return Err(TapeIoError::OperationFailed(
+                "canonical regeneration does not accept filemarks".to_string(),
+            ));
+        }
+        Ok(WriteFilemarksOutcome::from_device_position(
+            false,
+            false,
+            self.position_value(),
+        ))
+    }
+
+    fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+        Ok(self.position_value())
+    }
+}
+
+pub(crate) fn canonical_admission_format_error(error: FormatError) -> PoolWriteError {
+    if matches!(error, FormatError::SourceIo { .. } | FormatError::TapeIo(_)) {
+        PoolWriteError::Streaming(StreamingError::Format(error))
+    } else {
+        PoolWriteError::InvalidInput(format!(
+            "canonical plaintext REM object is malformed: {error}"
+        ))
+    }
+}
+
+fn regenerate_canonical_plaintext_digest(
+    source_path: &Path,
+    options: &RemTarObjectOptions,
+    files: &[PreparedFile],
+    entries: &[RemTarStreamEntry],
+) -> Result<(remanence_format::RemTarObjectLayout, [u8; 32]), PoolWriteError> {
+    let payload_entries = entries
+        .iter()
+        .filter(|entry| entry.path != MANIFEST_PATH)
+        .collect::<Vec<_>>();
+    if payload_entries.len() != files.len() {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM member count changed during regeneration".to_string(),
+        ));
+    }
+    let mut readers = Vec::<Box<dyn Read + Send>>::with_capacity(files.len());
+    for entry in payload_entries {
+        let mut file = File::open(source_path).map_err(|source| PoolWriteError::Io {
+            context: "reopen canonical plaintext REM object for canonical regeneration",
+            path: source_path.to_path_buf(),
+            source,
+        })?;
+        file.seek(SeekFrom::Start(entry.data_offset))
+            .map_err(|source| PoolWriteError::Io {
+                context: "seek canonical plaintext REM member for canonical regeneration",
+                path: source_path.to_path_buf(),
+                source,
+            })?;
+        readers.push(Box::new(file.take(entry.size_bytes)));
+    }
+    let mut streams = Vec::with_capacity(files.len());
+    for (file, reader) in files.iter().zip(readers.iter_mut()) {
+        streams.push(RemTarFileStream::new(file.spec.clone(), reader.as_mut()));
+    }
+    let mut sink = CanonicalDigestSink::new(options.chunk_size);
+    let layout = write_rem_tar_object_from_readers(&mut sink, options, &mut streams)
+        .map_err(StreamingError::from)?;
+    Ok((layout, sink.finish()))
+}
+
 fn prepare_canonical_plaintext_pool_object(
     request: &WriteObjectToPoolRequest,
     block_size: u32,
@@ -6428,7 +6563,7 @@ fn prepare_canonical_plaintext_pool_object(
         block_count,
         &mut entry_sink,
     )
-    .map_err(StreamingError::from)?;
+    .map_err(canonical_admission_format_error)?;
     if !report.warnings.is_empty()
         || !report.digest_mismatches.is_empty()
         || report.manifest_cbor.is_none()
@@ -6577,6 +6712,13 @@ fn prepare_canonical_plaintext_pool_object(
         ));
     }
     let content_sha256 = sha256_file(source_path)?;
+    let (_regenerated_layout, regenerated_sha256) =
+        regenerate_canonical_plaintext_digest(source_path, &options, &files, &report.entries)?;
+    if regenerated_sha256 != content_sha256 {
+        return Err(PoolWriteError::InvalidInput(
+            "canonical plaintext REM bytes differ from the deterministic writer output".to_string(),
+        ));
+    }
     Ok(PreparedPoolObject {
         content_sha256,
         object_uuid,
@@ -8478,6 +8620,35 @@ mod tests {
             digest
         );
         assert_eq!(written.blocks.concat(), std::fs::read(&path).unwrap());
+
+        let noncanonical_path = temp.path().join("noncanonical-mode.rem-object");
+        let mut noncanonical = std::fs::read(&path).expect("read canonical bytes");
+        let header_offset = usize::try_from(layout.files[0].data_offset)
+            .expect("header offset fits usize")
+            .checked_sub(512)
+            .expect("payload follows a ustar header");
+        let header = &mut noncanonical[header_offset..header_offset + 512];
+        header[100..108].copy_from_slice(b"0000777\0");
+        header[148..156].fill(b' ');
+        let checksum: u64 = header.iter().map(|byte| u64::from(*byte)).sum();
+        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        std::fs::write(&noncanonical_path, noncanonical).expect("write noncanonical object");
+        let noncanonical_request = WriteObjectToPoolRequest {
+            pool_id: "canonical-pool".to_string(),
+            source: WriteObjectSource::Path(noncanonical_path),
+            archive_path: PathBuf::new(),
+            caller_object_id: caller_object_id.to_string(),
+            expected_content_sha256: None,
+            expected_object_id: Some(*object_uuid.as_bytes()),
+            input_kind: WriteObjectInputKind::CanonicalPlaintextRemObject,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let error = match prepare_pool_object(&noncanonical_request, BLOCK_SIZE as u32) {
+            Ok(_) => panic!("noncanonical ustar mode must fail exact regeneration"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, PoolWriteError::InvalidInput(_)), "{error}");
+        assert!(error.to_string().contains("deterministic writer output"));
 
         let missing_identity_guard = WriteObjectToPoolRequest {
             pool_id: "canonical-pool".to_string(),
