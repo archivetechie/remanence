@@ -8769,27 +8769,23 @@ mod tests {
         assert!(error.to_string().contains("requires expected_object_id"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn canonical_member_ranges_share_one_spool_descriptor() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("many-members.bin");
         std::fs::write(&path, vec![0x5a; 4096]).expect("write shared spool");
-        let before = std::fs::read_dir("/proc/self/fd")
-            .expect("open process fd directory")
-            .count();
         let source = Arc::new(Mutex::new(File::open(&path).expect("open shared spool")));
         let mut readers = (0..4096)
             .map(|offset| {
                 SharedFileRangeReader::new(Arc::clone(&source), (offset % 4096) as u64, 1)
             })
             .collect::<Vec<_>>();
-        let during = std::fs::read_dir("/proc/self/fd")
-            .expect("reopen process fd directory")
-            .count();
+        assert_eq!(Arc::strong_count(&source), readers.len() + 1);
         assert!(
-            during <= before + 2,
-            "4096 member ranges must retain one shared file descriptor: before={before}, during={during}"
+            readers
+                .iter()
+                .all(|reader| Arc::ptr_eq(&reader.source, &source)),
+            "every member range must reference the one shared spool File"
         );
         for reader in &mut readers {
             let mut byte = [0u8; 1];

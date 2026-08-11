@@ -2262,6 +2262,7 @@ impl WriteAdmissionCoordinator {
             coordinator: self.clone(),
             replay_key,
             object_id,
+            release_on_drop: true,
         })
     }
 }
@@ -2271,10 +2272,26 @@ struct WriteAdmissionReservation {
     coordinator: WriteAdmissionCoordinator,
     replay_key: Option<WriteReplayKey>,
     object_id: Option<[u8; 16]>,
+    release_on_drop: bool,
+}
+
+impl WriteAdmissionReservation {
+    /// Leave this identity in the coordinator until process restart.
+    ///
+    /// This is used only after a checkpoint journal fsync succeeded but its
+    /// SQLite projection failed. Startup replays every checkpoint journal
+    /// before admitting writes, so restarting is the point at which the
+    /// durable identity becomes visible and a new coordinator is safe.
+    fn quarantine_until_restart(&mut self) {
+        self.release_on_drop = false;
+    }
 }
 
 impl Drop for WriteAdmissionReservation {
     fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
         let mut state = self
             .coordinator
             .state
@@ -2631,6 +2648,12 @@ impl PendingCheckpointBatch {
         self.logical_bytes >= cfg.checkpoint_max_bytes
             || self.objects.len() as u64 >= cfg.checkpoint_max_objects
     }
+
+    fn quarantine_write_admissions_until_restart(&mut self) {
+        for admission in &mut self._write_admissions {
+            admission.quarantine_until_restart();
+        }
+    }
 }
 
 struct BarrierOutcome {
@@ -2677,6 +2700,7 @@ fn project_checkpoint_authority_bounded(
 struct CheckpointBarrierFailure {
     status: Status,
     journal_durable: bool,
+    catalog_projected: bool,
     fence_handled: bool,
 }
 
@@ -2685,6 +2709,7 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: false,
+            catalog_projected: false,
             fence_handled: false,
         }
     }
@@ -2693,6 +2718,7 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: false,
+            catalog_projected: false,
             fence_handled: true,
         }
     }
@@ -2701,8 +2727,22 @@ impl CheckpointBarrierFailure {
         Self {
             status,
             journal_durable: true,
+            catalog_projected: false,
             fence_handled: false,
         }
+    }
+
+    fn after_projection(status: Status) -> Self {
+        Self {
+            status,
+            journal_durable: true,
+            catalog_projected: true,
+            fence_handled: false,
+        }
+    }
+
+    fn requires_identity_quarantine(&self) -> bool {
+        self.journal_durable && !self.catalog_projected
     }
 }
 
@@ -2725,23 +2765,23 @@ fn checkpointed_objects_from_catalog(
             let object = index
                 .get_native_object(object_id)
                 .map_err(|err| {
-                    CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                    CheckpointBarrierFailure::after_projection(Status::internal(format!(
                         "checkpoint is durable but catalog lookup for committed object {object_id} failed: {err}"
                     )))
                 })?
                 .ok_or_else(|| {
-                    CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                    CheckpointBarrierFailure::after_projection(Status::internal(format!(
                         "checkpoint is durable but committed object {object_id} is absent from the catalog projection"
                     )))
                 })?;
             let mut record = crate::object_record_to_proto(object).map_err(|err| {
-                CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                CheckpointBarrierFailure::after_projection(Status::internal(format!(
                     "checkpoint is durable but committed object {object_id} could not be encoded from the catalog: {}",
                     err.message()
                 )))
             })?;
             let append_info = record.append_commit_info.as_mut().ok_or_else(|| {
-                CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                CheckpointBarrierFailure::after_projection(Status::internal(format!(
                     "checkpoint is durable but committed object {object_id} has no projected copies"
                 )))
             })?;
@@ -2996,17 +3036,19 @@ fn perform_checkpoint_barrier(
             }
         };
         if trigger == remanence_state::TerminalFinalizationTrigger::OperatorCloseOut {
-            return Err(CheckpointBarrierFailure::after_journal(Status::internal(
-                "automatic checkpoint seal unexpectedly carried an operator trigger",
-            )));
+            return Err(CheckpointBarrierFailure::after_projection(
+                Status::internal(
+                    "automatic checkpoint seal unexpectedly carried an operator trigger",
+                ),
+            ));
         }
         let drive_config = drive.read_config().map_err(|error| {
-            CheckpointBarrierFailure::after_journal(Status::unavailable(format!(
+            CheckpointBarrierFailure::after_projection(Status::unavailable(format!(
                 "read terminal-finalization drive config: {error}"
             )))
         })?;
         if drive_config.write_protected {
-            return Err(CheckpointBarrierFailure::after_journal(
+            return Err(CheckpointBarrierFailure::after_projection(
                 Status::failed_precondition(
                     "tape became write-protected before terminal finalization",
                 ),
@@ -3025,7 +3067,7 @@ fn perform_checkpoint_barrier(
                 let parity_journal = parity_session
                     .and_then(|session| session.journal.take())
                     .ok_or_else(|| {
-                        CheckpointBarrierFailure::after_journal(Status::internal(
+                        CheckpointBarrierFailure::after_projection(Status::internal(
                             "automatic parity finalization has no session-owned append journal",
                         ))
                     })?;
@@ -3044,9 +3086,9 @@ fn perform_checkpoint_barrier(
                 )
             }
         }
-        .map_err(CheckpointBarrierFailure::after_journal)?;
+        .map_err(CheckpointBarrierFailure::after_projection)?;
         let final_record = result.final_record.ok_or_else(|| {
-            CheckpointBarrierFailure::after_journal(Status::unavailable(
+            CheckpointBarrierFailure::after_projection(Status::unavailable(
                 "automatic terminal finalization requires recovery before sealing can complete",
             ))
         })?;
@@ -4614,6 +4656,7 @@ impl WriteSessionState<'_> {
                                 committed
                             }
                             Err(failure) => {
+                                let quarantine_identities = failure.requires_identity_quarantine();
                                 let status = if failure.journal_durable || failure.fence_handled {
                                     failure.status
                                 } else {
@@ -4626,6 +4669,12 @@ impl WriteSessionState<'_> {
                                     )
                                 };
                                 self.append_gate.record_failure();
+                                if quarantine_identities {
+                                    self.pending_batch
+                                        .as_mut()
+                                        .expect("checkpoint failure retains its pending batch")
+                                        .quarantine_write_admissions_until_restart();
+                                }
                                 self.pending_batch = None;
                                 let _ = reply.send(Err(status));
                                 return;
@@ -5044,12 +5093,19 @@ impl WriteSessionState<'_> {
                 }
             }
             Err(failure) => {
+                let quarantine_identities = failure.requires_identity_quarantine();
                 let status = if failure.journal_durable || failure.fence_handled {
                     failure.status
                 } else {
                     fence_failed_checkpoint_batch(self.index, cfg, &selected, batch, failure.status)
                 };
                 self.append_gate.record_failure();
+                if quarantine_identities {
+                    self.pending_batch
+                        .as_mut()
+                        .expect("checkpoint failure retains its pending batch")
+                        .quarantine_write_admissions_until_restart();
+                }
                 self.pending_batch = None;
                 if let Some(reply) = reply {
                     let _ = reply.send(Err(status));
@@ -5202,6 +5258,7 @@ impl WriteSessionState<'_> {
                     self.pending_batch = None;
                 }
                 Err(failure) => {
+                    let quarantine_identities = failure.requires_identity_quarantine();
                     let status = if failure.journal_durable || failure.fence_handled {
                         failure.status
                     } else {
@@ -5214,6 +5271,12 @@ impl WriteSessionState<'_> {
                         )
                     };
                     self.append_gate.record_failure();
+                    if quarantine_identities {
+                        self.pending_batch
+                            .as_mut()
+                            .expect("checkpoint failure retains its pending batch")
+                            .quarantine_write_admissions_until_restart();
+                    }
                     self.pending_batch = None;
                     let _ = reply.send(Err(status));
                     return false;
@@ -11899,6 +11962,41 @@ mod tests {
             .expect_err("pool/caller replay key is independently exclusive");
         assert_eq!(same_key.code(), tonic::Code::Aborted);
         drop(replay);
+    }
+
+    #[test]
+    fn journal_durable_projection_failure_quarantines_identity_until_restart() {
+        let coordinator = WriteAdmissionCoordinator::default();
+        let object_id = [0x75; 16];
+        let admission = coordinator
+            .reserve("pool", "journal-owner", Some(object_id))
+            .expect("first drive owns identity");
+        let mut failed_batch = PendingCheckpointBatch::new(StdDuration::from_secs(60));
+        failed_batch._write_admissions.push(admission);
+        let failure = CheckpointBarrierFailure::after_journal(Status::internal(
+            "injected catalog projection failure after journal fsync",
+        ));
+        assert!(failure.requires_identity_quarantine());
+        failed_batch.quarantine_write_admissions_until_restart();
+        drop(failed_batch);
+
+        let second_drive = coordinator
+            .reserve("pool", "other-caller", Some(object_id))
+            .expect_err("durable unprojected UUID must remain quarantined");
+        assert_eq!(second_drive.code(), tonic::Code::Aborted);
+
+        let projected_coordinator = WriteAdmissionCoordinator::default();
+        let projected_admission = projected_coordinator
+            .reserve("pool", "projected-owner", Some([0x76; 16]))
+            .expect("projected identity starts reserved");
+        let projected_failure = CheckpointBarrierFailure::after_projection(Status::internal(
+            "injected post-projection receipt failure",
+        ));
+        assert!(!projected_failure.requires_identity_quarantine());
+        drop(projected_admission);
+        projected_coordinator
+            .reserve("pool", "new-caller", Some([0x76; 16]))
+            .expect("catalog-projected failures release the transient claim");
     }
 
     #[test]
