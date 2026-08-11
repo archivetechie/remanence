@@ -198,9 +198,10 @@ and its durable one-shot evidence must be confined beneath
 `/tmp/system-harness/scenario-wor/object-faults`. Malformed, unconfined,
 mismatched, or invalid-evidence plans fail closed. Matching durable evidence
 means the one-shot cut was already consumed and makes that exact plan inert.
-This is a scenario seam, not an operator
-recovery control; ordinary production recovery uses checkpoint EOD and a
-whole-Object source replay.
+This is a scenario seam, not an operator recovery control; ordinary production
+recovery on positively identified rewritable media uses checkpoint EOD and a
+whole-Object source replay. Ordinary Object sessions reject WORM media and an
+unknown WORM state rather than promise an impossible in-place tail rewrite.
 
 `[[tape_pool_rules]]` maps barcodes to pools by prefix. Prefixes are ASCII
 alphanumeric, matched case-insensitively, longest match wins, and each

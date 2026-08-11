@@ -5565,8 +5565,18 @@ fn handle_drive_open_write(
         return;
     }
 
-    if let Err(status) = prepare_drive_for_write(drive, &tape_uuid, selected.block_size, session_id)
-    {
+    let media_policy = if pending_terminal_intent.is_some() {
+        WriteMediaPolicy::TerminalAppend
+    } else {
+        WriteMediaPolicy::RewritableObject
+    };
+    if let Err(status) = prepare_drive_for_write(
+        drive,
+        &tape_uuid,
+        selected.block_size,
+        session_id,
+        media_policy,
+    ) {
         let _ = reply.send(Err(status));
         return;
     }
@@ -5949,11 +5959,39 @@ fn run_load_calibration_harvest(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMediaPolicy {
+    RewritableObject,
+    TerminalAppend,
+}
+
+fn validate_write_media_policy(
+    current_cfg: TapeConfig,
+    media_policy: WriteMediaPolicy,
+) -> Result<(), Status> {
+    if current_cfg.write_protected {
+        return Err(Status::failed_precondition("tape is write-protected"));
+    }
+    if media_policy == WriteMediaPolicy::TerminalAppend {
+        return Ok(());
+    }
+    match current_cfg.worm {
+        remanence_library::WormMediaState::NotWorm => Ok(()),
+        remanence_library::WormMediaState::Worm => Err(Status::failed_precondition(
+            "ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail",
+        )),
+        remanence_library::WormMediaState::Unknown => Err(Status::failed_precondition(
+            "ordinary Object writes require media positively identified as rewritable; the loaded tape's WORM state is unknown",
+        )),
+    }
+}
+
 fn prepare_drive_for_write(
     drive: &mut DriveHandle,
     tape_uuid: &TapeUuid,
     block_size: u32,
     session_id: Uuid,
+    media_policy: WriteMediaPolicy,
 ) -> Result<(), Status> {
     let prepare_started = Instant::now();
     drive
@@ -5981,6 +6019,7 @@ fn prepare_drive_for_write(
         .read_config()
         .map_err(|err| Status::internal(format!("read drive config before write: {err}")))?;
     let read_config_elapsed = read_config_started.elapsed();
+    validate_write_media_policy(current_cfg, media_policy)?;
     let target_cfg = fixed_no_compression_config(current_cfg, block_size);
     let write_config_started = Instant::now();
     drive
@@ -6143,6 +6182,7 @@ fn handle_drive_finalize_tape(
         &request.tape_uuid,
         request.block_size,
         request.candidate_operation_id,
+        WriteMediaPolicy::TerminalAppend,
     )?;
     if needs_drive_load {
         run_load_calibration_harvest(index, drive, cfg, &request.tape_uuid, barcode.as_deref());
@@ -17767,6 +17807,116 @@ mod tests {
         assert_eq!(prepared.max_block_size_bytes, current.max_block_size_bytes);
         assert_eq!(prepared.write_protected, current.write_protected);
         assert_eq!(prepared.worm, current.worm);
+    }
+
+    #[test]
+    fn object_write_media_policy_requires_positive_rewritable_evidence() {
+        let config = |write_protected, worm| TapeConfig {
+            block_size: BlockSize::Variable,
+            compression: false,
+            max_block_size_bytes: 8 * 1024 * 1024,
+            write_protected,
+            worm,
+        };
+
+        validate_write_media_policy(
+            config(false, WormMediaState::NotWorm),
+            WriteMediaPolicy::RewritableObject,
+        )
+        .expect("positively identified rewritable media is admitted");
+
+        let worm = validate_write_media_policy(
+            config(false, WormMediaState::Worm),
+            WriteMediaPolicy::RewritableObject,
+        )
+        .expect_err("WORM media cannot support whole-Object tail replacement");
+        assert_eq!(worm.code(), tonic::Code::FailedPrecondition);
+        assert!(worm.message().contains("WORM tape"), "{worm}");
+
+        let unknown = validate_write_media_policy(
+            config(false, WormMediaState::Unknown),
+            WriteMediaPolicy::RewritableObject,
+        )
+        .expect_err("unknown WORM state must fail closed");
+        assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
+        assert!(unknown.message().contains("state is unknown"), "{unknown}");
+
+        let protected = validate_write_media_policy(
+            config(true, WormMediaState::NotWorm),
+            WriteMediaPolicy::RewritableObject,
+        )
+        .expect_err("write-protected media must be refused");
+        assert_eq!(protected.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            protected.message().contains("write-protected"),
+            "{protected}"
+        );
+
+        for worm in [WormMediaState::Worm, WormMediaState::Unknown] {
+            validate_write_media_policy(config(false, worm), WriteMediaPolicy::TerminalAppend)
+                .expect("terminal recovery retains its append-only WORM policy");
+        }
+    }
+
+    #[test]
+    fn prepare_object_write_rejects_worm_before_mode_select_or_media_write() {
+        const BLOCK_SIZE: u32 = 4096;
+        let tape_uuid = [0x4D; 16];
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid,
+            written_by_version: "test".to_string(),
+            written_at: "2026-08-11T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: BLOCK_SIZE,
+            drive_compression: false,
+        };
+        let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+        let mut tape = VirtualTape::empty(1024 * 1024, BLOCK_SIZE);
+        tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
+        tape.written_bytes = u64::from(BLOCK_SIZE);
+        tape.worm = true;
+
+        let mut world =
+            VirtualWorld::single_drive("LIB-WORM-GATE", 0x0100, "DRV-WORM-GATE", 0x0400, 1);
+        world.put_tape_in_drive(0x0100, "WORM001L9", Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let mut library = open_model_library(Arc::clone(&world));
+        let serial = library.library().serial.clone();
+        let policy = remanence_library::StaticAllowlist::new([serial.as_str()]);
+        let mut drive = library
+            .open_drive(0x0100, &policy)
+            .expect("open model drive");
+        let command_start = world.lock().expect("world lock").command_log.len();
+
+        let error = prepare_drive_for_write(
+            &mut drive,
+            &tape_uuid,
+            BLOCK_SIZE,
+            Uuid::new_v4(),
+            WriteMediaPolicy::RewritableObject,
+        )
+        .expect_err("ordinary Object session must reject WORM media");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("WORM tape"), "{error}");
+
+        let opcodes = world.lock().expect("world lock").command_log[command_start..]
+            .iter()
+            .map(|command| command.opcode)
+            .collect::<Vec<_>>();
+        assert!(
+            opcodes.contains(&0x1a),
+            "the refusal must use current drive-reported media state: {opcodes:02x?}"
+        );
+        for forbidden in [0x15, 0x0a, 0x10] {
+            assert!(
+                !opcodes.contains(&forbidden),
+                "WORM refusal issued forbidden opcode 0x{forbidden:02x}: {opcodes:02x?}"
+            );
+        }
     }
 
     #[test]

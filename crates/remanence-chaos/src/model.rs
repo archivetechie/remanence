@@ -629,9 +629,19 @@ impl ModelTransport {
 
     fn mode_sense(&self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let mut world = self.world.lock().expect("virtual world lock");
-        let block_length = self.with_loaded_tape(&mut world, |tape| Ok(tape.block_size))?;
-        let compression = self.with_loaded_tape(&mut world, |tape| Ok(tape.compression))?;
-        copy_response(buf, &mode_sense_response(block_length, compression))
+        let (block_length, compression, write_protected, worm) =
+            self.with_loaded_tape(&mut world, |tape| {
+                Ok((
+                    tape.block_size,
+                    tape.compression,
+                    tape.write_protected,
+                    tape.worm,
+                ))
+            })?;
+        copy_response(
+            buf,
+            &mode_sense_response(block_length, compression, write_protected, worm),
+        )
     }
 
     fn read_position(&self, buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
@@ -1256,11 +1266,11 @@ fn rbl_response(max_block_length: u32, min_block_length: u16) -> Vec<u8> {
     buf
 }
 
-fn mode_sense_response(block_length: u32, dce: bool) -> Vec<u8> {
+fn mode_sense_response(block_length: u32, dce: bool, write_protected: bool, worm: bool) -> Vec<u8> {
     let mut buf = vec![0u8; 28];
     buf[0] = 27;
-    buf[1] = 0x98;
-    buf[2] = 0x10;
+    buf[1] = if worm { 0x9C } else { 0x98 };
+    buf[2] = if write_protected { 0x90 } else { 0x10 };
     buf[3] = 8;
     let bl = block_length.to_be_bytes();
     buf[9] = bl[1];
