@@ -1303,6 +1303,7 @@ pub fn select_tape_in_pool_for_write_session(
                 reserved_tape_uuids,
                 &CompleteOrFill,
                 checkpoint_journal_dir,
+                None,
             )
         }
         remanence_state::PoolSelectionPolicyName::FillOldest => {
@@ -1313,6 +1314,43 @@ pub fn select_tape_in_pool_for_write_session(
                 reserved_tape_uuids,
                 &FillOldest,
                 checkpoint_journal_dir,
+                None,
+            )
+        }
+    }
+}
+
+/// Select only from tapes whose current physical location is admitted by the
+/// caller. Library inventory remains outside the pure pool policy.
+pub(crate) fn select_tape_in_pool_for_write_session_scoped(
+    state: &CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    object_size: u64,
+    reserved_tape_uuids: &HashSet<TapeUuid>,
+    checkpoint_journal_dir: &Path,
+    allowed_tape_uuids: &HashSet<TapeUuid>,
+) -> Result<SelectedTape, SelectTapeError> {
+    match pool_cfg.selection_policy {
+        remanence_state::PoolSelectionPolicyName::CompleteOrFill => {
+            select_tape_in_pool_with_policy_and_batched_eligibility(
+                state,
+                pool_cfg,
+                object_size,
+                reserved_tape_uuids,
+                &CompleteOrFill,
+                checkpoint_journal_dir,
+                Some(allowed_tape_uuids),
+            )
+        }
+        remanence_state::PoolSelectionPolicyName::FillOldest => {
+            select_tape_in_pool_with_policy_and_batched_eligibility(
+                state,
+                pool_cfg,
+                object_size,
+                reserved_tape_uuids,
+                &FillOldest,
+                checkpoint_journal_dir,
+                Some(allowed_tape_uuids),
             )
         }
     }
@@ -1538,6 +1576,7 @@ pub fn select_tape_in_pool_with_policy(
         reserved_tape_uuids,
         policy,
         None,
+        None,
     )
 }
 
@@ -1548,6 +1587,7 @@ fn select_tape_in_pool_with_policy_and_batched_eligibility(
     reserved_tape_uuids: &HashSet<TapeUuid>,
     policy: &dyn PoolSelectionPolicy,
     checkpoint_journal_dir: &Path,
+    allowed_tape_uuids: Option<&HashSet<TapeUuid>>,
 ) -> Result<SelectedTape, SelectTapeError> {
     select_tape_in_pool_with_policy_and_eligibility(
         state,
@@ -1556,6 +1596,7 @@ fn select_tape_in_pool_with_policy_and_batched_eligibility(
         reserved_tape_uuids,
         policy,
         Some(checkpoint_journal_dir),
+        allowed_tape_uuids,
     )
 }
 
@@ -1566,6 +1607,7 @@ fn select_tape_in_pool_with_policy_and_eligibility(
     reserved_tape_uuids: &HashSet<TapeUuid>,
     policy: &dyn PoolSelectionPolicy,
     checkpoint_journal_dir: Option<&Path>,
+    allowed_tape_uuids: Option<&HashSet<TapeUuid>>,
 ) -> Result<SelectedTape, SelectTapeError> {
     let requested_pool_id = pool_cfg.id.trim();
     let pool =
@@ -1611,6 +1653,9 @@ fn select_tape_in_pool_with_policy_and_eligibility(
             }
         }
         let tape_uuid = tape_uuid_from_vec(tape.tape_uuid.clone(), pool_id.as_str())?;
+        if allowed_tape_uuids.is_some_and(|allowed| !allowed.contains(&tape_uuid)) {
+            continue;
+        }
         let conflicts = state
             .tape_io_admission_conflicts(&tape_uuid, tape.voltag.as_deref())
             .map_err(SelectTapeError::State)?;

@@ -74,6 +74,7 @@ mod append_ring;
 mod calibration;
 mod diagnostics;
 mod direct_replay_fault;
+mod drive_pool;
 mod io_memory;
 mod library;
 mod mount;
@@ -662,41 +663,56 @@ impl ApiState {
             report: report.clone(),
             captured_at: OffsetDateTime::now_utc(),
         })));
-        let library_serial = default_library_serial.as_ref().ok_or_else(|| {
-            Status::invalid_argument(
-                "drive-pool daemon mode requires exactly one configured library in this slice",
-            )
-        })?;
-        let lib = report.library(library_serial.as_str()).ok_or_else(|| {
-            Status::not_found(format!(
-                "library {} not found in discovery report",
-                library_serial.as_str()
-            ))
-        })?;
-        let mut library = lib
-            .open(&policy)
-            .map_err(|err| Status::internal(format!("open library: {err}")))?;
-        let mut opened_drives = Vec::new();
-        for bay in library.library().drive_bays.clone() {
-            let Some(installed) = bay.installed.as_ref() else {
-                continue;
-            };
-            if installed.sg_path.is_none() {
-                continue;
-            }
-            let bay_addr = bay.element_address;
-            let drive = library
-                .open_drive_with_tape_io(bay_addr, &policy, tape_io_runtime_config(&config.tape_io))
-                .map_err(|err| {
-                    Status::internal(format!("open drive bay 0x{bay_addr:04x}: {err}"))
-                })?;
-            opened_drives.push((bay_addr, drive));
+        if config.libraries.is_empty() {
+            return Err(Status::invalid_argument(
+                "drive-pool daemon mode requires at least one configured library",
+            ));
         }
-        reconcile_library_media_readiness_on_startup(
-            &mut index,
-            library.library(),
-            &mut opened_drives,
-        )?;
+        let mut opened_libraries = Vec::new();
+        for configured in &config.libraries {
+            let library_serial = configured.serial.trim();
+            let discovered = report.library(library_serial).ok_or_else(|| {
+                Status::not_found(format!(
+                    "configured library {library_serial} not found in discovery report"
+                ))
+            })?;
+            let mut library = discovered
+                .open(&policy)
+                .map_err(|err| Status::internal(format!("open library {library_serial}: {err}")))?;
+            let mut opened_drives = Vec::new();
+            for bay in library.library().drive_bays.clone() {
+                let Some(installed) = bay.installed.as_ref() else {
+                    continue;
+                };
+                if installed.sg_path.is_none() {
+                    continue;
+                }
+                let bay_addr = bay.element_address;
+                let drive = library
+                    .open_drive_with_tape_io(
+                        bay_addr,
+                        &policy,
+                        tape_io_runtime_config(&config.tape_io),
+                    )
+                    .map_err(|err| {
+                        Status::internal(format!(
+                            "open library {library_serial} drive bay 0x{bay_addr:04x}: {err}"
+                        ))
+                    })?;
+                opened_drives.push((bay_addr, drive));
+            }
+            if opened_drives.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "configured library {library_serial} has no openable drives"
+                )));
+            }
+            reconcile_library_media_readiness_on_startup(
+                &mut index,
+                library.library(),
+                &mut opened_drives,
+            )?;
+            opened_libraries.push((library_serial.to_string(), library, opened_drives));
+        }
         replay_checkpoint_journal_projections_with_audit(
             &mut index,
             config.journal.dir.join("checkpoints").as_path(),
@@ -704,15 +720,17 @@ impl ApiState {
             &audit_append_lock,
         )?;
         reject_active_tape_io_fences_on_startup(&index)?;
-        if opened_drives.is_empty() {
-            return Err(Status::failed_precondition(
-                "configured library has no openable drives",
-            ));
-        }
         let reservations = Arc::new(
-            opened_drives
+            opened_libraries
                 .iter()
-                .map(|(bay, _)| (*bay, AtomicBool::new(false)))
+                .flat_map(|(library_serial, _, drives)| {
+                    drives.iter().map(|(bay, _)| {
+                        (
+                            crate::drive_pool::DriveKey::new(library_serial.clone(), *bay),
+                            AtomicBool::new(false),
+                        )
+                    })
+                })
                 .collect::<HashMap<_, _>>(),
         );
         let managed_library_serials = drive_managed_library_serials(config);
@@ -730,9 +748,7 @@ impl ApiState {
             audit_fsync: config.audit.fsync,
             audit_append_lock: audit_append_lock.clone(),
             reservations: reservations.clone(),
-            default_library_serial: default_library_serial
-                .as_ref()
-                .map(|serial| serial.as_str().to_string()),
+            actor_library_serial: String::new(),
             library_snapshot: library_snapshot.clone(),
             snapshot_miss_alarm: config.drives.snapshot_miss_alarm,
             managed_library_serials: Arc::new(managed_library_serials),
@@ -749,14 +765,21 @@ impl ApiState {
             calibration_store: calibration_store.clone(),
         };
         let mut drive_txs = HashMap::new();
-        for (bay_addr, drive) in opened_drives {
-            let tx = crate::write_owner::spawn_drive_actor(bay_addr, drive, base_cfg.clone());
-            drive_txs.insert(bay_addr, tx);
+        let mut changer_txs = HashMap::new();
+        for (library_serial, library, opened_drives) in opened_libraries {
+            let mut actor_cfg = base_cfg.clone();
+            actor_cfg.actor_library_serial = library_serial.clone();
+            for (bay_addr, drive) in opened_drives {
+                let key = crate::drive_pool::DriveKey::new(library_serial.clone(), bay_addr);
+                let tx = crate::write_owner::spawn_drive_actor(bay_addr, drive, actor_cfg.clone());
+                drive_txs.insert(key, tx);
+            }
+            let changer_tx =
+                crate::write_owner::spawn_changer_actor(library.into_changer(), actor_cfg);
+            changer_txs.insert(library_serial, changer_tx);
         }
-        let changer_tx =
-            crate::write_owner::spawn_changer_actor(library.into_changer(), base_cfg.clone());
         let drive_pool = crate::write_owner::DrivePool::new_with_lifecycle(
-            changer_tx,
+            changer_txs,
             drive_txs,
             reservations.clone(),
             drive_pool_lifecycle,
@@ -875,48 +898,20 @@ impl ApiState {
             .map(|cell| cell.read().unwrap_or_else(|err| err.into_inner()).clone())
     }
 
-    pub(crate) fn busy_drive_bays(&self) -> std::collections::HashSet<u16> {
+    pub(crate) fn busy_drive_bays(&self, library_serial: &str) -> std::collections::HashSet<u16> {
         self.drive_pool
             .as_ref()
-            .map(crate::write_owner::DrivePool::busy_bays)
+            .map(|pool| pool.busy_bays(library_serial))
             .unwrap_or_default()
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn drive_uuid_for_bay(&self, bay: u16) -> Result<Option<Vec<u8>>, Status> {
-        let library_serial = if let Some(serial) = self.default_library_serial.as_deref() {
-            serial.to_string()
-        } else if let Some(snapshot) = self.current_library_snapshot() {
-            match snapshot.report.libraries.as_slice() {
-                [library] => library.serial.clone(),
-                _ => return Ok(None),
-            }
-        } else {
-            let index = self.index()?;
-            let mut serials = index
-                .list_drives(true, false)
-                .map_err(status_from_state_error)?
-                .into_iter()
-                .filter_map(|drive| {
-                    drive
-                        .last_library_serial
-                        .map(|serial| serial.trim().to_string())
-                        .filter(|serial| !serial.is_empty())
-                })
-                .collect::<std::collections::HashSet<_>>();
-            match serials.len() {
-                1 => serials
-                    .drain()
-                    .next()
-                    .expect("single drive library serial must exist"),
-                _ => return Ok(None),
-            }
-        };
-        let index = self.index()?;
-        let drive = index
-            .get_actionable_drive_at(library_serial.as_str(), i64::from(bay))
-            .map_err(status_from_state_error)?;
-        Ok(drive.map(|drive| drive.drive_uuid))
+    pub(crate) fn operates_library(&self, library_serial: &str) -> bool {
+        if let Some(pool) = self.drive_pool.as_ref() {
+            return pool.operates_library(library_serial);
+        }
+        self.default_library_serial
+            .as_deref()
+            .is_some_and(|serial| serial.as_str() == library_serial)
     }
 
     /// What the drive catalog knows about the drive occupying a changer bay.
@@ -1022,7 +1017,6 @@ impl ApiState {
             .ok_or_else(|| Status::not_found("library not found"))?;
         let index = self.index()?;
         let voltags = crate::library::voltag_uuid_map(&index)?;
-        let busy_bays = self.busy_drive_bays();
         let active_clean_run_drive_uuids = index
             .list_clean_runs(false)
             .map_err(status_from_state_error)?
@@ -1042,6 +1036,7 @@ impl ApiState {
 
         let mut libraries = Vec::new();
         for library in &snapshot.report.libraries {
+            let busy_bays = self.busy_drive_bays(&library.serial);
             let mut state = crate::library::project_library_state(
                 library,
                 &snapshot.captured_at,
@@ -1169,28 +1164,14 @@ impl ApiState {
         let Some(drive_pool) = self.drive_pool.as_ref() else {
             return Ok(Vec::new());
         };
-        let busy_bays = drive_pool.busy_bays();
-        let sessions_by_bay = drive_pool.sessions_by_bay();
-        let Some(reservation_library_serial) = self
-            .default_library_serial
-            .as_deref()
-            .map(String::as_str)
-            .or_else(|| match libraries {
-                [library_state] => library_state
-                    .library
-                    .as_ref()
-                    .map(|library| library.library_serial.as_str()),
-                _ => None,
-            })
-        else {
-            return Ok(Vec::new());
-        };
+        let busy_drives = drive_pool.busy_drives();
+        let sessions_by_drive = drive_pool.sessions_by_drive();
         let mut assignments = Vec::new();
         for library_state in libraries {
             let Some(library) = library_state.library.as_ref() else {
                 continue;
             };
-            if library.library_serial != reservation_library_serial {
+            if !drive_pool.operates_library(&library.library_serial) {
                 continue;
             }
             for drive in &library_state.drives {
@@ -1202,11 +1183,11 @@ impl ApiState {
                             Status::invalid_argument("drive element address overflows u16")
                         })
                     })?;
-                let is_busy = busy_bays.contains(&bay);
+                let drive_key =
+                    crate::drive_pool::DriveKey::new(library.library_serial.clone(), bay);
+                let is_busy = busy_drives.contains(&drive_key);
                 let session = if is_busy {
-                    sessions_by_bay
-                        .get(&bay)
-                        .filter(|(_, mounted)| mounted.library_serial == library.library_serial)
+                    sessions_by_drive.get(&drive_key)
                 } else {
                     None
                 };
@@ -1658,7 +1639,11 @@ fn touch_managed_drive_heartbeats(
             else {
                 continue;
             };
-            if let Err(err) = drive_pool.heartbeat_drive(bay, drive.drive_uuid.clone()) {
+            let Some(library_serial) = drive.last_library_serial.as_deref() else {
+                continue;
+            };
+            let drive_key = crate::drive_pool::DriveKey::new(library_serial.to_string(), bay);
+            if let Err(err) = drive_pool.heartbeat_drive(&drive_key, drive.drive_uuid.clone()) {
                 tracing::warn!(
                     "managed drive heartbeat skipped for {}: {err}",
                     drive.serial.as_deref().unwrap_or("<no serial>")
@@ -3097,7 +3082,10 @@ impl pb::catalog_server::Catalog for CatalogService {
         reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "ReconcileTape")?;
         let tape_uuid = decode_uuid_bytes(request.tape_uuid.as_slice(), "tape_uuid")?;
         let pool = self.state.drive_pool()?.clone();
-        pool.reserve_all_exclusive()?;
+        let library_serial =
+            crate::mount::resolve_tape_library_serial(&self.state, &pool, &tape_uuid)?;
+        let changer = pool.changer_tx(&library_serial)?;
+        pool.reserve_library_exclusive(&library_serial)?;
         let operation_id = Uuid::new_v4();
         if let Err(err) = self.state.record_request_received(
             actor,
@@ -3106,25 +3094,23 @@ impl pb::catalog_server::Catalog for CatalogService {
             &tape_uuid,
             None,
         ) {
-            pool.release_all();
+            pool.release_library(&library_serial);
             return Err(err);
         }
         let handle = self
             .state
             .operations
             .register(operation_id, "reconcile_tape");
-        match pool
-            .changer_tx()
-            .try_send(crate::write_owner::ChangerCommand::Reconcile {
-                tape_uuid,
-                handle: handle.clone(),
-            }) {
+        match changer.try_send(crate::write_owner::ChangerCommand::Reconcile {
+            tape_uuid,
+            handle: handle.clone(),
+        }) {
             Ok(()) => Ok(Response::new(pb::OperationRef {
                 operation_id: operation_id.as_bytes().to_vec(),
             })),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let error = "drive-session owner is busy";
-                pool.release_all();
+                pool.release_library(&library_serial);
                 self.state
                     .record_operation_failed(operation_id, "reconcile_tape", error)?;
                 handle.publish_failed(error, &[("phase", "dispatch")]);
@@ -3132,7 +3118,7 @@ impl pb::catalog_server::Catalog for CatalogService {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 let error = "drive-session owner is stopped";
-                pool.release_all();
+                pool.release_library(&library_serial);
                 self.state
                     .record_operation_failed(operation_id, "reconcile_tape", error)?;
                 handle.publish_failed(error, &[("phase", "dispatch")]);
@@ -3422,14 +3408,13 @@ impl pb::write_session_service_server::WriteSessionService for WriteSessionApi {
             }
         };
         let (tape_uuid, required_pool_id) = validate_tape_target_shape(&target)?;
-        let library_serial = self.default_library_serial_for_write_target("tape")?;
         let session = crate::mount::open_write_session(
             &self.state,
             crate::mount::WriteSessionTarget::PinnedTape {
                 tape_uuid,
                 required_pool_id,
             },
-            library_serial,
+            None,
         )
         .await?;
         Ok(Response::new(session))
@@ -3922,55 +3907,42 @@ impl WriteSessionApi {
         }
     }
 
-    /// Library for a write target that carries no library constraint of its
-    /// own (the tape target): the config must name exactly one.
-    fn default_library_serial_for_write_target(&self, target_kind: &str) -> Result<String, Status> {
-        self.state
-            .default_library_serial
-            .as_ref()
-            .map(|serial| serial.as_str().to_string())
-            .ok_or_else(|| {
-                Status::invalid_argument(format!(
-                    "{target_kind}-target write sessions require the config to \
-                     name exactly one library"
-                ))
-            })
-    }
-
     fn library_serial_for_pool_target(
         &self,
         target: &pb::TapePoolTarget,
-    ) -> Result<String, Status> {
+    ) -> Result<Option<String>, Status> {
         let serial = if target.library_uuid.is_empty() {
             self.state
                 .default_library_serial
                 .as_ref()
                 .map(|serial| serial.as_str().to_string())
-                .ok_or_else(|| {
-                    Status::invalid_argument(
-                        "pool target library_uuid is required when config does not name exactly one library",
-                    )
-                })?
         } else {
             let requested = decode_uuid_bytes(target.library_uuid.as_slice(), "library_uuid")?;
             let snapshot = self
                 .state
                 .current_library_snapshot()
                 .ok_or_else(|| Status::not_found("library not found"))?;
-            snapshot
+            let serial = snapshot
                 .report
                 .libraries
                 .iter()
                 .find(|library| crate::library::library_uuid(&library.serial) == requested)
                 .map(|library| library.serial.clone())
-                .ok_or_else(|| Status::not_found("library not found"))?
+                .ok_or_else(|| Status::not_found("library not found"))?;
+            if !self.state.operates_library(&serial) {
+                return Err(Status::failed_precondition(format!(
+                    "library {serial} is discovered but is not operated by this daemon"
+                )));
+            }
+            Some(serial)
         };
-        let serial = serial.trim().to_string();
-        if serial.is_empty() {
-            Err(Status::invalid_argument("library serial must not be empty"))
-        } else {
-            Ok(serial)
+        if serial
+            .as_deref()
+            .is_some_and(|serial| serial.trim().is_empty())
+        {
+            return Err(Status::invalid_argument("library serial must not be empty"));
         }
+        Ok(serial.map(|serial| serial.trim().to_string()))
     }
 }
 
@@ -4664,7 +4636,7 @@ fn select_read_target(
                 "drive_element_address",
             )?;
             let library_serial = resolve_read_target_library_serial(state, &target.library_uuid)?;
-            if state.busy_drive_bays().contains(&bay) {
+            if state.busy_drive_bays(&library_serial).contains(&bay) {
                 return Err(Status::failed_precondition(format!(
                     "drive bay 0x{bay:04x} is busy"
                 )));
@@ -4742,11 +4714,7 @@ fn resolve_read_target_library_serial(
         .find(|library| crate::library::library_uuid(&library.serial) == requested)
         .map(|library| library.serial.clone())
         .ok_or_else(|| Status::not_found("library not found"))?;
-    if state
-        .default_library_serial
-        .as_deref()
-        .is_some_and(|operated| operated.as_str() != library_serial)
-    {
+    if !state.operates_library(&library_serial) {
         return Err(Status::failed_precondition(format!(
             "library {library_serial} is discovered but is not operated by this daemon"
         )));
@@ -9795,6 +9763,7 @@ tape_catalog_dir = "{0}/cache/tapes"
 
     fn state_with_library_snapshot(serial: &str) -> ApiState {
         let mut state = empty_pool_state();
+        state.default_library_serial = Some(Arc::new(serial.to_string()));
         state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
             report: DiscoveryReport {
                 libraries: vec![test_library(serial)],
@@ -10872,6 +10841,29 @@ tape_catalog_dir = "{0}/cache/tapes"
 
         assert_eq!(selected.pool_id, "camera.copy-a");
         assert_eq!(selected.tape_uuid, POOL_WRITE_TAPE_UUID);
+    }
+
+    #[test]
+    fn write_session_selection_respects_the_physical_library_scope() {
+        let mut index = test_index();
+        project_pool(&mut index, "camera.copy-a");
+        project_eligible_tape(&mut index, "camera.copy-a", POOL_WRITE_TAPE_UUID);
+        project_eligible_tape(&mut index, "camera.copy-a", SECOND_POOL_WRITE_TAPE_UUID);
+        let cfg = pool_config("camera.copy-a");
+        let allowed = HashSet::from([SECOND_POOL_WRITE_TAPE_UUID]);
+        let checkpoint_dir = tempfile::tempdir().expect("checkpoint dir");
+
+        let selected = crate::pool_write::select_tape_in_pool_for_write_session_scoped(
+            &index,
+            &cfg,
+            123,
+            &HashSet::new(),
+            checkpoint_dir.path(),
+            &allowed,
+        )
+        .expect("select tape from physical library scope");
+
+        assert_eq!(selected.tape_uuid, SECOND_POOL_WRITE_TAPE_UUID);
     }
 
     #[test]
@@ -13120,7 +13112,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         }))));
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, drive_rx) = tokio::sync::mpsc::channel(1);
-        state.drive_pool = Some(crate::write_owner::DrivePool::new(
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            serial,
             changer_tx,
             HashMap::from([(1, drive_tx)]),
             Arc::new(HashMap::from([(1, AtomicBool::new(busy))])),
@@ -13244,7 +13237,10 @@ tape_catalog_dir = "{0}/cache/tapes"
             report: report.clone(),
             captured_at: OffsetDateTime::UNIX_EPOCH,
         })));
-        let reservations = Arc::new(HashMap::from([(BAY, AtomicBool::new(false))]));
+        let reservations = Arc::new(HashMap::from([(
+            crate::drive_pool::DriveKey::new(LIBRARY_SERIAL, BAY),
+            AtomicBool::new(false),
+        )]));
 
         let mut state = ApiState::new(index);
         let owner_config = crate::write_owner::WriteOwnerConfig {
@@ -13255,7 +13251,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             audit_fsync: false,
             audit_append_lock: Arc::clone(&state.audit_append_lock),
             reservations: Arc::clone(&reservations),
-            default_library_serial: Some(LIBRARY_SERIAL.to_string()),
+            actor_library_serial: LIBRARY_SERIAL.to_string(),
             library_snapshot: Arc::clone(&library_snapshot),
             snapshot_miss_alarm: 1,
             managed_library_serials: Arc::new(HashSet::from([LIBRARY_SERIAL.to_string()])),
@@ -13277,10 +13273,14 @@ tape_catalog_dir = "{0}/cache/tapes"
         let drive_tx = crate::write_owner::spawn_drive_actor(BAY, drive, owner_config.clone());
         let changer_tx =
             crate::write_owner::spawn_changer_actor(library.into_changer(), owner_config);
-        state.drive_pool = Some(crate::write_owner::DrivePool::new(
-            changer_tx,
-            HashMap::from([(BAY, drive_tx)]),
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([(LIBRARY_SERIAL.to_string(), changer_tx)]),
+            HashMap::from([(
+                crate::drive_pool::DriveKey::new(LIBRARY_SERIAL, BAY),
+                drive_tx,
+            )]),
             reservations,
+            crate::drive_pool::DrivePoolLifecycle::default(),
         ));
         state.default_library_serial = Some(Arc::new(LIBRARY_SERIAL.to_string()));
         state.library_snapshot = Some(library_snapshot);
@@ -13727,23 +13727,40 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn drive_pool_reserves_bays_independently() {
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let key1 = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        let key2 = crate::drive_pool::DriveKey::new("LIB001", 0x0102);
         let reservations = Arc::new(HashMap::from([
-            (0x0101, AtomicBool::new(false)),
-            (0x0102, AtomicBool::new(false)),
+            (key1.clone(), AtomicBool::new(false)),
+            (key2, AtomicBool::new(false)),
         ]));
-        let pool =
-            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB001".to_string(), changer_tx)]),
+            HashMap::new(),
+            reservations.clone(),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
 
-        assert_eq!(pool.reserve_free_drive().expect("first bay"), 0x0101);
-        assert_eq!(pool.reserve_free_drive().expect("second bay"), 0x0102);
         assert_eq!(
-            pool.reserve_free_drive().expect_err("pool full").code(),
+            pool.reserve_free_drive("LIB001").expect("first bay").bay,
+            0x0101
+        );
+        assert_eq!(
+            pool.reserve_free_drive("LIB001").expect("second bay").bay,
+            0x0102
+        );
+        assert_eq!(
+            pool.reserve_free_drive("LIB001")
+                .expect_err("pool full")
+                .code(),
             tonic::Code::FailedPrecondition
         );
-        pool.release(0x0101);
-        assert_eq!(pool.reserve_free_drive().expect("released bay"), 0x0101);
+        pool.release(&key1);
+        assert_eq!(
+            pool.reserve_free_drive("LIB001").expect("released bay").bay,
+            0x0101
+        );
         assert!(reservations
-            .get(&0x0101)
+            .get(&key1)
             .expect("reservation")
             .load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -13751,13 +13768,20 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn drive_pool_exclusive_reservation_rolls_back_on_busy_bay() {
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let key1 = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        let key2 = crate::drive_pool::DriveKey::new("LIB001", 0x0102);
+        let key3 = crate::drive_pool::DriveKey::new("LIB001", 0x0103);
         let reservations = Arc::new(HashMap::from([
-            (0x0101, AtomicBool::new(false)),
-            (0x0102, AtomicBool::new(true)),
-            (0x0103, AtomicBool::new(false)),
+            (key1.clone(), AtomicBool::new(false)),
+            (key2.clone(), AtomicBool::new(true)),
+            (key3.clone(), AtomicBool::new(false)),
         ]));
-        let pool =
-            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB001".to_string(), changer_tx)]),
+            HashMap::new(),
+            reservations.clone(),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
 
         assert_eq!(
             pool.reserve_all_exclusive()
@@ -13766,15 +13790,15 @@ tape_catalog_dir = "{0}/cache/tapes"
             tonic::Code::FailedPrecondition
         );
         assert!(!reservations
-            .get(&0x0101)
+            .get(&key1)
             .expect("rolled back")
             .load(std::sync::atomic::Ordering::SeqCst));
         assert!(reservations
-            .get(&0x0102)
+            .get(&key2)
             .expect("busy remains busy")
             .load(std::sync::atomic::Ordering::SeqCst));
         assert!(!reservations
-            .get(&0x0103)
+            .get(&key3)
             .expect("unvisited remains free")
             .load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -13782,22 +13806,27 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn drive_pool_shutdown_closes_normal_admission_but_keeps_cleanup_reservation() {
         let bay = 0x0101;
+        let key = crate::drive_pool::DriveKey::new("LIB001", bay);
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
-        let reservations = Arc::new(HashMap::from([(bay, AtomicBool::new(false))]));
-        let pool =
-            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+        let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(false))]));
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB001".to_string(), changer_tx)]),
+            HashMap::new(),
+            reservations.clone(),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
 
         pool.begin_shutdown();
 
         let err = pool
-            .reserve_drive(bay)
+            .reserve_drive(&key)
             .expect_err("normal admission must close during shutdown");
         assert_eq!(err.code(), tonic::Code::Unavailable);
         let cleanup = pool
-            .reserve_drive_for_shutdown(bay)
+            .reserve_drive_for_shutdown(&key)
             .expect("shutdown cleanup keeps a reservation path");
         assert!(reservations
-            .get(&bay)
+            .get(&key)
             .expect("reservation")
             .load(std::sync::atomic::Ordering::SeqCst));
         drop(cleanup);
@@ -13806,16 +13835,22 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn drive_pool_exclusive_guard_drop_releases_all_bays() {
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let key1 = crate::drive_pool::DriveKey::new("LIB001", 0x0101);
+        let key2 = crate::drive_pool::DriveKey::new("LIB001", 0x0102);
         let reservations = Arc::new(HashMap::from([
-            (0x0101, AtomicBool::new(false)),
-            (0x0102, AtomicBool::new(false)),
+            (key1, AtomicBool::new(false)),
+            (key2, AtomicBool::new(false)),
         ]));
-        let pool =
-            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB001".to_string(), changer_tx)]),
+            HashMap::new(),
+            reservations.clone(),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
 
         pool.reserve_all_exclusive().expect("reserve all");
         assert_eq!(
-            pool.reserve_free_drive()
+            pool.reserve_free_drive("LIB001")
                 .expect_err("exclusive reservation holds all bays")
                 .code(),
             tonic::Code::FailedPrecondition
@@ -13823,7 +13858,10 @@ tape_catalog_dir = "{0}/cache/tapes"
         drop(crate::write_owner::ExclusiveGuard::from_reserved(
             reservations.clone(),
         ));
-        assert_eq!(pool.reserve_free_drive().expect("released bay"), 0x0101);
+        assert_eq!(
+            pool.reserve_free_drive("LIB001").expect("released bay").bay,
+            0x0101
+        );
     }
 
     #[test]
@@ -13853,10 +13891,15 @@ tape_catalog_dir = "{0}/cache/tapes"
     #[test]
     fn drive_pool_close_parks_cartridge_and_follow_on_session_claims_it() {
         let bay = 0x0101;
+        let key = crate::drive_pool::DriveKey::new("LIB-A", bay);
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
-        let reservations = Arc::new(HashMap::from([(bay, AtomicBool::new(true))]));
-        let pool =
-            crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations.clone());
+        let reservations = Arc::new(HashMap::from([(key.clone(), AtomicBool::new(true))]));
+        let pool = crate::write_owner::DrivePool::new_with_lifecycle(
+            HashMap::from([("LIB-A".to_string(), changer_tx)]),
+            HashMap::new(),
+            reservations.clone(),
+            crate::drive_pool::DrivePoolLifecycle::default(),
+        );
         let first_session = Uuid::new_v4();
         let mounted = crate::write_owner::MountedSession {
             bay,
@@ -13874,14 +13917,16 @@ tape_catalog_dir = "{0}/cache/tapes"
         assert!(pool.parked_is_current(&parked));
         assert_eq!(parked.seated.prior_session_id, Some(first_session));
         assert!(!reservations
-            .get(&bay)
+            .get(&key)
             .expect("reservation")
             .load(std::sync::atomic::Ordering::SeqCst));
         assert!(!pool.mounted_tape_uuids().contains(&TAPE_UUID));
 
         let follow_on = Uuid::new_v4();
         pool.record_session(follow_on, mounted);
-        assert!(pool.parked_at(bay).is_none());
+        assert!(pool
+            .parked_at(&crate::drive_pool::DriveKey::new("LIB-A", bay))
+            .is_none());
         assert!(pool.mounted_tape_uuids().contains(&TAPE_UUID));
     }
 
@@ -13973,7 +14018,8 @@ tape_catalog_dir = "{0}/cache/tapes"
             bay,
             std::sync::atomic::AtomicBool::new(false),
         )]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             std::collections::HashMap::from([(bay, drive_tx)]),
             reservations,
@@ -14069,7 +14115,8 @@ tape_catalog_dir = "{0}/cache/tapes"
             bay,
             std::sync::atomic::AtomicBool::new(false),
         )]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             std::collections::HashMap::from([(bay, drive_tx)]),
             reservations,
@@ -14165,7 +14212,8 @@ tape_catalog_dir = "{0}/cache/tapes"
             bay,
             std::sync::atomic::AtomicBool::new(false),
         )]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             std::collections::HashMap::from([(bay, drive_tx)]),
             reservations,
@@ -14732,7 +14780,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             .library_serial_for_pool_target(&target)
             .expect("library UUID resolves to serial");
 
-        assert_eq!(serial, "LIB001");
+        assert_eq!(serial.as_deref(), Some("LIB001"));
     }
 
     #[test]
@@ -14802,7 +14850,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             HashMap::from([(0x0101, drive_tx)]),
             reservations,
@@ -14891,7 +14940,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             HashMap::from([(0x0101, drive_tx)]),
             reservations,
@@ -14976,7 +15026,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             HashMap::from([(0x0101, drive_tx)]),
             reservations,
@@ -15065,7 +15116,8 @@ tape_catalog_dir = "{0}/cache/tapes"
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let (drive_tx, mut drive_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
-        let pool = crate::write_owner::DrivePool::new(
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "LIB-A",
             changer_tx,
             HashMap::from([(0x0101, drive_tx)]),
             reservations,

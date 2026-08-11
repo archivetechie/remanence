@@ -427,12 +427,7 @@ impl LibraryServiceApi {
             .find(|library| library_uuid(&library.serial) == requested)
             .map(|library| library.serial.clone())
             .ok_or_else(|| Status::not_found("library not found"))?;
-        if self
-            .state
-            .default_library_serial
-            .as_deref()
-            .is_some_and(|operated| operated.as_str() != library_serial)
-        {
+        if !self.state.operates_library(&library_serial) {
             return Err(Status::failed_precondition(format!(
                 "library {library_serial} is discovered but is not operated by this daemon"
             )));
@@ -450,11 +445,12 @@ impl LibraryServiceApi {
     ) -> Result<Response<pb::OperationRef>, Status> {
         let library_serial = self.resolve_library_serial(library_uuid)?;
         let pool = self.state.drive_pool()?.clone();
-        pool.reserve_all_exclusive()?;
+        let changer = pool.changer_tx(&library_serial)?;
+        pool.reserve_library_exclusive(&library_serial)?;
         let index = match self.state.index() {
             Ok(index) => index,
             Err(err) => {
-                pool.release_all();
+                pool.release_library(&library_serial);
                 return Err(err);
             }
         };
@@ -466,7 +462,7 @@ impl LibraryServiceApi {
             None,
             true,
         ) {
-            pool.release_all();
+            pool.release_library(&library_serial);
             return Err(err);
         }
         let operation_id = Uuid::new_v4();
@@ -477,23 +473,21 @@ impl LibraryServiceApi {
             &library_serial,
             detail,
         ) {
-            pool.release_all();
+            pool.release_library(&library_serial);
             return Err(err);
         }
         let handle = self.state.operations.register(operation_id, operation_kind);
-        match pool
-            .changer_tx()
-            .try_send(crate::write_owner::ChangerCommand::Robotics {
-                library_serial,
-                action,
-                handle: handle.clone(),
-            }) {
+        match changer.try_send(crate::write_owner::ChangerCommand::Robotics {
+            library_serial: library_serial.clone(),
+            action,
+            handle: handle.clone(),
+        }) {
             Ok(()) => Ok(Response::new(pb::OperationRef {
                 operation_id: operation_id.as_bytes().to_vec(),
             })),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 let error = "drive-session owner is busy";
-                pool.release_all();
+                pool.release_library(&library_serial);
                 if let Err(err) =
                     self.state
                         .record_operation_failed(operation_id, operation_kind, error)
@@ -507,7 +501,7 @@ impl LibraryServiceApi {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 let error = "drive-session owner is stopped";
-                pool.release_all();
+                pool.release_library(&library_serial);
                 if let Err(err) =
                     self.state
                         .record_operation_failed(operation_id, operation_kind, error)
@@ -570,7 +564,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             .ok_or_else(|| Status::not_found("library not found"))?;
         let index = self.state.index()?;
         let voltags = voltag_uuid_map(&index)?;
-        let busy_bays = self.state.busy_drive_bays();
+        let busy_bays = self.state.busy_drive_bays(&library.serial);
         let fenced_bays = fenced_drive_bays(&index, library.serial.as_str())?;
         Ok(Response::new(project_library_state(
             library,
@@ -757,7 +751,11 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             .last_element_address
             .and_then(|value| u16::try_from(value).ok())
         {
-            if self.state.busy_drive_bays().contains(&element) {
+            if drive
+                .last_library_serial
+                .as_deref()
+                .is_some_and(|serial| self.state.busy_drive_bays(serial).contains(&element))
+            {
                 return Err(Status::failed_precondition(
                     "drive has an active session or reserved operation",
                 ));
@@ -852,10 +850,16 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             .last_element_address
             .and_then(|value| u16::try_from(value).ok())
             .ok_or_else(|| Status::failed_precondition("drive has no current bay"))?;
+        let library_serial = drive.last_library_serial.clone().ok_or_else(|| {
+            Status::failed_precondition("drive has no current library assignment")
+        })?;
         let snapshot = self
             .state
             .drive_pool()?
-            .poll_drive_health(bay, drive.drive_uuid)
+            .poll_drive_health(
+                &crate::drive_pool::DriveKey::new(library_serial, bay),
+                drive.drive_uuid,
+            )
             .await?;
         Ok(Response::new(drive_snapshot_to_proto(snapshot)))
     }
@@ -1041,12 +1045,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 record.state
             )));
         }
-        if self
-            .state
-            .default_library_serial
-            .as_deref()
-            .is_some_and(|serial| serial.as_str() != record.library_serial)
-        {
+        if !self.state.operates_library(&record.library_serial) {
             return Err(Status::failed_precondition(format!(
                 "media-readiness operation {operation_id} belongs to library {}, which this daemon does not operate",
                 record.library_serial
@@ -1093,8 +1092,9 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         }
 
         let pool = self.state.drive_pool()?.clone();
-        let reservation = pool.reserve_drive(bay)?;
-        let drive_tx = pool.drive_tx(bay)?;
+        let drive_key = crate::drive_pool::DriveKey::new(record.library_serial.clone(), bay);
+        let reservation = pool.reserve_drive(&drive_key)?;
+        let drive_tx = pool.drive_tx(&drive_key)?;
         let handle = self
             .state
             .operations
@@ -1307,6 +1307,7 @@ mod tests {
 
     fn state_with_snapshot() -> ApiState {
         let mut state = ApiState::new(test_index());
+        state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
             crate::LibrarySnapshot {
                 report: DiscoveryReport {
@@ -1616,7 +1617,8 @@ mod tests {
     async fn get_library_succeeds_while_owner_busy() {
         let mut state = state_with_snapshot();
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
-        state.drive_pool = Some(crate::write_owner::DrivePool::new(
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
             changer_tx,
             HashMap::new(),
             Arc::new(HashMap::from([(1, AtomicBool::new(true))])),
@@ -1830,7 +1832,8 @@ mod tests {
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(0x0101, AtomicBool::new(true))]));
         let mut state = ApiState::new(index);
-        state.drive_pool = Some(crate::write_owner::DrivePool::new(
+        state.drive_pool = Some(crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
             changer_tx,
             HashMap::new(),
             reservations,
@@ -1964,7 +1967,12 @@ mod tests {
         state.index_path = Arc::new(index.path().to_path_buf());
         let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
         let reservations = Arc::new(HashMap::from([(1, AtomicBool::new(false))]));
-        let pool = crate::write_owner::DrivePool::new(changer_tx, HashMap::new(), reservations);
+        let pool = crate::write_owner::DrivePool::new_for_library(
+            "DEC418146K_LL02",
+            changer_tx,
+            HashMap::new(),
+            reservations,
+        );
         state.drive_pool = Some(pool.clone());
 
         let idle = state
@@ -1987,7 +1995,9 @@ mod tests {
         );
         assert!(assignment.current_session_id.is_none());
 
-        let _reservation = pool.reserve_drive(1).expect("reserve bay for live session");
+        let _reservation = pool
+            .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
+            .expect("reserve bay for live session");
         let session_id = Uuid::new_v4();
         let tape_uuid = Uuid::new_v4();
         pool.record_session(
@@ -2023,7 +2033,7 @@ mod tests {
         );
 
         let second = pool
-            .reserve_drive(1)
+            .reserve_drive(&crate::drive_pool::DriveKey::new("DEC418146K_LL02", 1))
             .expect_err("atomic bay reservation must still reject a second open");
         assert_eq!(second.code(), tonic::Code::FailedPrecondition);
     }
