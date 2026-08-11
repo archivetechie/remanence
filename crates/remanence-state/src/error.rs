@@ -38,6 +38,10 @@ pub enum StateError {
     /// Layer 3c journal replay failed while rebuilding projections.
     #[error("journal replay failed: {0}")]
     JournalReplayFailed(String),
+    /// A checkpoint append failed and rollback could not prove that no new
+    /// durable authority remains in the journal.
+    #[error("checkpoint journal append authority is uncertain: {0}")]
+    CheckpointAppendAuthorityUncertain(String),
     /// SQLite projection migration failed.
     #[error("index migration failed: {0}")]
     IndexMigrationFailed(String),
@@ -133,6 +137,12 @@ impl StateError {
     /// True when the failure represents a held state lock.
     pub fn is_state_lock_held(&self) -> bool {
         matches!(self, Self::StateLockHeld(_))
+    }
+
+    /// True when a failed checkpoint append may nevertheless have left
+    /// replayable durable authority behind.
+    pub fn is_checkpoint_append_authority_uncertain(&self) -> bool {
+        matches!(self, Self::CheckpointAppendAuthorityUncertain(_))
     }
 }
 

@@ -26,8 +26,8 @@ use remanence_state::{
     DriveCorrelationRollupRecord, DriveHealthSnapshotInput, DriveHealthSnapshotRecord,
     FileAuditLog, MediaReadinessOperationRecord, MediaReadinessTransitionInput,
     NativeObjectCopyRecord, NativeObjectFileRecord, NativeObjectRecord, OperationRecord, RemConfig,
-    SourceLayer, StateError, TapeFileRecord, TapeIoConfig, TapePoolConfig, TapePoolRecord,
-    TapeRecord,
+    SourceLayer, StateError, StateHandle, TapeFileRecord, TapeIoConfig, TapePoolConfig,
+    TapePoolRecord, TapeRecord,
 };
 use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
@@ -2716,6 +2716,24 @@ fn replay_checkpoint_journal_projections_with_audit(
         }
     }
     Ok(())
+}
+
+/// Reconcile every configured checkpoint journal into the locked local state.
+///
+/// One-shot writers call this before catalog selection and again at the
+/// drive-bound admission boundary. The global replay closes the crash window
+/// in which a checkpoint became durable on tape A but SQLite had not yet made
+/// its Object identities visible before a retry considered tape B.
+pub fn reconcile_checkpoint_journal_projections(state: &mut StateHandle) -> Result<(), Status> {
+    let checkpoint_dir = state.paths().journal_dir.join("checkpoints");
+    let audit_dir = state.paths().audit_dir.clone();
+    let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
+    replay_checkpoint_journal_projections_with_audit(
+        state.catalog_index(),
+        checkpoint_dir.as_path(),
+        audit_dir.as_path(),
+        &audit_append_lock,
+    )
 }
 
 fn live_status_config_from(config: &remanence_state::LiveStatusConfig) -> Duration {
@@ -8592,6 +8610,91 @@ BCw3Wyv2UWY=
                 sealed_after_write: false,
             })
             .expect("append checkpoint record");
+    }
+
+    #[test]
+    fn direct_reconciliation_projects_cross_tape_identity_before_retry_selection() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-direct-global-checkpoint-replay-")
+            .tempdir()
+            .expect("tempdir");
+        let config_text = format!(
+            r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+read_only = false
+
+[[tape_pools]]
+id = "direct-replay"
+
+[[tape_pool_rules]]
+prefix = "DRP"
+pool_id = "direct-replay"
+
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "{0}/audit"
+fsync = true
+
+[index]
+sqlite_path = "{0}/index/rem-state.sqlite"
+
+[cache]
+tape_catalog_dir = "{0}/cache/tapes"
+"#,
+            temp.path().display()
+        );
+        let config = remanence_state::parse_config_toml(&config_text).expect("parse config");
+        let paths =
+            remanence_state::StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let checkpoint_dir = paths.journal_dir.join("checkpoints");
+        let mut state = StateHandle::open_with_config(paths, config).expect("open locked state");
+        let tape_uuid = [0x93; 16];
+        state
+            .catalog_index()
+            .provision_tape(ProvisionTapeInput {
+                tape_uuid,
+                voltag: "DRP001L9".to_string(),
+                block_size: API_SESSION_BLOCK_SIZE,
+                parity: ParityConfig::None,
+                force: false,
+            })
+            .expect("provision first tape");
+        state
+            .catalog_index()
+            .project_tape_pool_membership(tape_uuid, "direct-replay")
+            .expect("assign first tape");
+        append_checkpoint_record(&checkpoint_dir, tape_uuid);
+        assert!(
+            state
+                .catalog_index()
+                .get_native_object_by_pool_and_caller_object_id(
+                    "direct-replay",
+                    "checkpoint-selection-test",
+                )
+                .expect("query pre-reconcile identity")
+                .is_none(),
+            "the test must begin at the journal-fsync before-SQLite crash cut"
+        );
+
+        reconcile_checkpoint_journal_projections(&mut state)
+            .expect("global direct-write reconciliation");
+
+        assert!(
+            state
+                .catalog_index()
+                .get_native_object_by_pool_and_caller_object_id(
+                    "direct-replay",
+                    "checkpoint-selection-test",
+                )
+                .expect("query reconciled identity")
+                .is_some(),
+            "a retry must see tape A's identity before it can select tape B"
+        );
     }
 
     fn restart_cycle_checkpoint_record(

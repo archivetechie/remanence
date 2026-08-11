@@ -20,7 +20,7 @@ use remanence_api::{
     read_core::{read_object_payload, CapturePayloadSink},
     select_tape_in_pool_for_write_session, verify_tape_identity,
     write_to_selected_drive_checkpointed, PoolWriteObjectRecord, PoolWriteRepresentation,
-    PoolWriteResources, PoolWriteResult, TapeUuid, WriteObjectToPoolRequest,
+    PoolWriteResult, TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
@@ -114,8 +114,12 @@ pub fn run_archive_write(
             return ExitCode::from(1);
         }
     };
+    if let Err(error) = remanence_api::reconcile_checkpoint_journal_projections(&mut state_handle) {
+        let _ = writeln!(err, "error: reconcile checkpoint authority: {error}");
+        return ExitCode::from(1);
+    }
 
-    // -- Resolve the pool config (caller-supplied policy, watermarks, etc.) --
+    // -- Resolve the operator-owned pool policy and watermarks -------------
     let pool_cfg = match state_handle
         .config()
         .tape_pools
@@ -208,24 +212,8 @@ pub fn run_archive_write(
         representation: representation.representation,
     };
 
-    let parity_journal_path = state_handle.journal_path(selected.tape_uuid());
-    let resources = match PoolWriteResources::new(state_handle.config().daemon.io_memory_ceiling) {
-        Ok(resources) => resources,
-        Err(error) => {
-            let _ = writeln!(err, "error: configure write resources: {error}");
-            return ExitCode::from(1);
-        }
-    };
-    let result = write_to_selected_drive_checkpointed(
-        &mut state_handle,
-        &mut drive,
-        &pool_cfg,
-        request,
-        selected,
-        &checkpoint_journal_dir,
-        &parity_journal_path,
-        &resources,
-    );
+    let result =
+        write_to_selected_drive_checkpointed(&mut state_handle, &mut drive, request, selected);
 
     match result {
         Ok(PoolWriteResult { object, .. }) => {
