@@ -1232,7 +1232,9 @@ not recovered.
 
 - **Operator acknowledgement.** The walk traverses the entire medium and can
   take hours. A Scanner MUST report the fallback before starting and MUST
-  remain abortable between tape files.
+  remain abortable between tape files. The fallback notice precedes BOT recovery
+  I/O. A streaming Scanner emits exactly one start notice, followed by one
+  progress event for every structurally complete tape file crossed.
 - **Identity and geometry hints.** A Scanner MUST accept hints supplied out of
   band (catalog, journal, medium auxiliary memory, operator): expected tape
   UUID, block size, expected tape-file count, expected capacity. Expected tape
@@ -1252,7 +1254,10 @@ not recovered.
   the candidates found, and the drive's best-known position — or state
   explicitly that position is indeterminate when the drive cannot report one.
   An operator who aborts is planning a next step and needs to know where the
-  head is.
+  head is. Once the between-files controller returns `Abort`, the Scanner MUST
+  NOT read the first record of the next tape file. An abort accepted before the
+  first tape file reports no last ordinal, zero candidates, and an indeterminate
+  position.
 - **Positioning-failure bound.** During this BOT structural walk, inter-file
   positioning commands (SPACE and any LOCATE issued between tape files) are
   governed by this bullet; a read failure remains a read failure and does not

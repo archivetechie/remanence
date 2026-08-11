@@ -8,22 +8,25 @@
 use std::path::Path;
 
 use remanence_parity::{
-    recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_with_authority,
-    verify_terminal_index_full, verify_terminal_index_full_with_authority, BotRecoveredObject,
-    BotStructuralRecoveryError, BotStructuralRecoverySummary, RawTapeSource,
+    recover_terminal_inventory_from_bot_controlled,
+    recover_terminal_inventory_from_bot_with_authority_controlled, verify_terminal_index_full,
+    verify_terminal_index_full_with_authority, BotRecoveredObject, BotStructuralRecoveryError,
+    BotStructuralRecoveryEvent, BotStructuralRecoverySummary, RawTapeSource, ScanWalkControl,
     TerminalIndexVerificationError, TerminalIndexVerificationOutcome,
 };
 use remanence_state::CheckpointBotRecoveryAuthority;
 
-/// Run BOT recovery with checkpoint identity authority when it exists.
-pub(super) fn recover_terminal_inventory_with_checkpoint_authority<F>(
+/// Run checkpoint-assisted BOT recovery with bounded progress and cancellation.
+pub(super) fn recover_terminal_inventory_with_checkpoint_authority_controlled<C, F>(
     source: &mut dyn RawTapeSource,
     checkpoint_journal_dir: &Path,
     tape_uuid: &[u8; 16],
     block_size: u32,
+    visit_control: C,
     visit_object: F,
 ) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
 where
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
     F: FnMut(&BotRecoveredObject) -> Result<(), String>,
 {
     let authority =
@@ -32,14 +35,21 @@ where
                 message: error.to_string(),
             })?;
     match authority {
-        Some(mut authority) => recover_terminal_inventory_from_bot_with_authority(
+        Some(mut authority) => recover_terminal_inventory_from_bot_with_authority_controlled(
             source,
             tape_uuid,
             block_size,
             &mut authority,
+            visit_control,
             visit_object,
         ),
-        None => recover_terminal_inventory_from_bot(source, tape_uuid, block_size, visit_object),
+        None => recover_terminal_inventory_from_bot_controlled(
+            source,
+            tape_uuid,
+            block_size,
+            visit_control,
+            visit_object,
+        ),
     }
 }
 
