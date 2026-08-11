@@ -26,9 +26,9 @@ use remanence_format::{
     RemTarStreamEntry, FORMAT_ID, MANIFEST_PATH,
 };
 use remanence_library::{
-    BlockSink, BlockSource, FileBlockSource, PipelinedWriteDiagnostics, TapeConfig, TapeIoError,
-    TapePosition, VecBlockSink, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
-    WriteOutcome,
+    BlockSink, BlockSize, BlockSource, DriveHandle, DriveHandleSink, DriveHandleSource,
+    FileBlockSource, PipelinedWriteDiagnostics, TapeConfig, TapeIoError, TapePosition,
+    VecBlockSink, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
 use remanence_parity::{
     bootstrap::{parse_bootstrap_block, write_bootstrap_block},
@@ -815,27 +815,16 @@ pub enum ObjectWriteMediaError {
     UnknownWormState,
 }
 
-/// One-use proof that a caller checked the current drive report before an
-/// ordinary Object write.
-///
-/// The private field prevents downstream code from constructing the proof
-/// without [`require_rewritable_object_media`]. The token is deliberately not
-/// `Clone` or `Copy`: each public direct write consumes one admission.
-#[derive(Debug, PartialEq, Eq)]
-pub struct RewritableObjectMediaAdmission {
-    _private: (),
-}
-
 /// Require positive drive evidence that ordinary Object ingest can replace a
 /// torn, uncommitted tail after restart.
-pub fn require_rewritable_object_media(
+pub(crate) fn require_rewritable_object_media(
     current_cfg: TapeConfig,
-) -> Result<RewritableObjectMediaAdmission, ObjectWriteMediaError> {
+) -> Result<(), ObjectWriteMediaError> {
     if current_cfg.write_protected {
         return Err(ObjectWriteMediaError::WriteProtected);
     }
     match current_cfg.worm {
-        WormMediaState::NotWorm => Ok(RewritableObjectMediaAdmission { _private: () }),
+        WormMediaState::NotWorm => Ok(()),
         WormMediaState::Worm => Err(ObjectWriteMediaError::Worm),
         WormMediaState::Unknown => Err(ObjectWriteMediaError::UnknownWormState),
     }
@@ -1079,6 +1068,12 @@ pub enum PoolWriteError {
     /// Block sink I/O failed outside the parity wrapper.
     #[error(transparent)]
     TapeIo(#[from] TapeIoError),
+    /// The actual loaded drive did not report media safe for ordinary Object ingest.
+    #[error(transparent)]
+    ObjectWriteMedia(#[from] ObjectWriteMediaError),
+    /// BOT identity did not match the selected tape.
+    #[error(transparent)]
+    TapeIdentity(#[from] TapeIdentityError),
     /// A transfer's primary failure survived a secondary safety/plumbing failure.
     #[error("{primary}; secondary {context}: {secondary}")]
     TransferWithSecondary {
@@ -1688,48 +1683,6 @@ pub fn write_object_to_pool(
     )
 }
 
-/// Select a checkpoint-eligible tape and run the direct batch-of-one core.
-///
-/// A hardware caller must first pass its drive configuration through
-/// [`require_rewritable_object_media`]. This lower core accepts an abstract
-/// [`BlockSink`] so hermetic and format-only callers do not have drive state.
-#[allow(clippy::too_many_arguments)]
-pub fn write_object_to_pool_checkpointed(
-    state: &mut CatalogIndex,
-    sink: &mut dyn BlockSink,
-    media_admission: RewritableObjectMediaAdmission,
-    pool_cfg: &TapePoolConfig,
-    request: WriteObjectToPoolRequest,
-    checkpoint_journal_dir: &Path,
-    parity_journal_path_for: impl FnOnce(TapeUuid) -> PathBuf,
-    resources: &PoolWriteResources,
-) -> Result<PoolWriteResult, PoolWriteError> {
-    ensure_request_pool_matches_config(&request, pool_cfg)?;
-    if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
-        return Ok(result);
-    }
-    let source_size = request.source.size_bytes()?;
-    let selected = select_tape_in_pool_for_write_session(
-        state,
-        pool_cfg,
-        source_size,
-        &HashSet::new(),
-        checkpoint_journal_dir,
-    )?;
-    let parity_journal_path = parity_journal_path_for(selected.tape_uuid);
-    write_to_selected_tape_checkpointed(
-        state,
-        sink,
-        media_admission,
-        pool_cfg,
-        request,
-        selected,
-        checkpoint_journal_dir,
-        &parity_journal_path,
-        resources,
-    )
-}
-
 /// Write one regular file to a previously selected tape without re-running
 /// pool tape selection.
 ///
@@ -2190,19 +2143,18 @@ fn finalize_direct_checkpoint_prefix(
     }
 }
 
-/// Write one object and complete one shared checkpoint barrier.
+/// Verify, configure, and write one Object through the same loaded drive.
 ///
-/// This is the daemon-independent batch-of-one core used by direct-SCSI
-/// callers. Both checkpoint and Layer 3c journals are the same per-tape files
-/// used by daemon sessions, so a later mount resumes from identical durable
-/// state. Before constructing a hardware-backed sink, the caller must pass the
-/// loaded drive's current configuration through
-/// [`require_rewritable_object_media`].
+/// The wrapper owns the safety-critical sequence: it verifies the selected
+/// tape's BOT identity, reads the current media state from that exact drive,
+/// requires positive rewritable evidence, applies fixed-block configuration,
+/// and only then constructs the hardware sink. Abstract checkpointed cores
+/// remain private so a downstream caller cannot pair drive-A evidence with a
+/// drive-B sink.
 #[allow(clippy::too_many_arguments)]
-pub fn write_to_selected_tape_checkpointed(
+pub fn write_to_selected_drive_checkpointed(
     state: &mut CatalogIndex,
-    sink: &mut dyn BlockSink,
-    _media_admission: RewritableObjectMediaAdmission,
+    drive: &mut DriveHandle,
     pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
@@ -2210,22 +2162,133 @@ pub fn write_to_selected_tape_checkpointed(
     parity_journal_path: &Path,
     resources: &PoolWriteResources,
 ) -> Result<PoolWriteResult, PoolWriteError> {
-    ensure_request_pool_matches_config(&request, pool_cfg)?;
-    if let Some(result) = maybe_replay_pool_write(state, pool_cfg, &request)? {
-        return Ok(result);
+    let preflight =
+        prepare_checkpointed_write(state, pool_cfg, &request, &selected, checkpoint_journal_dir)?;
+    let (checkpoint_lease, prior_records) = match preflight {
+        CheckpointedWritePreflight::Replay(result) => return Ok(*result),
+        CheckpointedWritePreflight::Ready {
+            checkpoint_lease,
+            prior_records,
+        } => (checkpoint_lease, prior_records),
+    };
+
+    drive.rewind()?;
+    {
+        let mut source = DriveHandleSource(drive);
+        verify_tape_identity(&mut source, &selected.tape_uuid)?;
+    }
+    drive.rewind()?;
+    let current_cfg = drive.read_config()?;
+    require_rewritable_object_media(current_cfg)?;
+    drive.write_config(TapeConfig {
+        block_size: BlockSize::Fixed {
+            size_bytes: selected.block_size,
+        },
+        compression: false,
+        max_block_size_bytes: current_cfg.max_block_size_bytes,
+        write_protected: current_cfg.write_protected,
+        worm: current_cfg.worm,
+    })?;
+    let mut sink = DriveHandleSink(drive);
+    write_to_selected_tape_checkpointed_after_preflight(
+        state,
+        &mut sink,
+        pool_cfg,
+        request,
+        selected,
+        parity_journal_path,
+        resources,
+        checkpoint_lease,
+        prior_records,
+    )
+}
+
+enum CheckpointedWritePreflight {
+    Replay(Box<PoolWriteResult>),
+    Ready {
+        checkpoint_lease: remanence_state::FileCheckpointJournalLease,
+        prior_records: Vec<remanence_state::CheckpointJournalRecord>,
+    },
+}
+
+fn prepare_checkpointed_write(
+    state: &mut CatalogIndex,
+    pool_cfg: &TapePoolConfig,
+    request: &WriteObjectToPoolRequest,
+    selected: &SelectedTape,
+    checkpoint_journal_dir: &Path,
+) -> Result<CheckpointedWritePreflight, PoolWriteError> {
+    ensure_request_pool_matches_config(request, pool_cfg)?;
+    if let Some(result) = maybe_replay_pool_write(state, pool_cfg, request)? {
+        return Ok(CheckpointedWritePreflight::Replay(Box::new(result)));
     }
     let checkpoint_journal =
         remanence_state::FileCheckpointJournal::open(checkpoint_journal_dir, selected.tape_uuid)?;
-    let mut checkpoint_lease = checkpoint_journal.acquire_exclusive()?;
+    let checkpoint_lease = checkpoint_journal.acquire_exclusive()?;
     let mut last_checkpoint = None;
     checkpoint_lease.for_each_record_bounded(|record| {
         state.project_checkpoint_record(record)?;
         last_checkpoint = Some(record.clone());
         Ok(())
     })?;
+    if let Some(result) = maybe_replay_pool_write(state, pool_cfg, request)? {
+        return Ok(CheckpointedWritePreflight::Replay(Box::new(result)));
+    }
     let prior_records: Vec<_> = last_checkpoint.into_iter().collect();
-    ensure_empty_checkpoint_matches_catalog_freshness(state, &selected, &prior_records)?;
-    ensure_selected_tape_accepts_session_write(state, pool_cfg, &selected)?;
+    ensure_empty_checkpoint_matches_catalog_freshness(state, selected, &prior_records)?;
+    ensure_selected_tape_accepts_session_write(state, pool_cfg, selected)?;
+    Ok(CheckpointedWritePreflight::Ready {
+        checkpoint_lease,
+        prior_records,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn write_to_selected_tape_checkpointed(
+    state: &mut CatalogIndex,
+    sink: &mut dyn BlockSink,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+    checkpoint_journal_dir: &Path,
+    parity_journal_path: &Path,
+    resources: &PoolWriteResources,
+) -> Result<PoolWriteResult, PoolWriteError> {
+    let preflight =
+        prepare_checkpointed_write(state, pool_cfg, &request, &selected, checkpoint_journal_dir)?;
+    let (checkpoint_lease, prior_records) = match preflight {
+        CheckpointedWritePreflight::Replay(result) => return Ok(*result),
+        CheckpointedWritePreflight::Ready {
+            checkpoint_lease,
+            prior_records,
+        } => (checkpoint_lease, prior_records),
+    };
+    write_to_selected_tape_checkpointed_after_preflight(
+        state,
+        sink,
+        pool_cfg,
+        request,
+        selected,
+        parity_journal_path,
+        resources,
+        checkpoint_lease,
+        prior_records,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_to_selected_tape_checkpointed_after_preflight(
+    state: &mut CatalogIndex,
+    sink: &mut dyn BlockSink,
+    pool_cfg: &TapePoolConfig,
+    request: WriteObjectToPoolRequest,
+    selected: SelectedTape,
+    parity_journal_path: &Path,
+    resources: &PoolWriteResources,
+    mut checkpoint_lease: remanence_state::FileCheckpointJournalLease,
+    prior_records: Vec<remanence_state::CheckpointJournalRecord>,
+) -> Result<PoolWriteResult, PoolWriteError> {
     let next_ordinal = prior_records.last().map_or(Ok(1), |record| {
         record.ordinal.checked_add(1).ok_or_else(|| {
             PoolWriteError::InvalidInput("checkpoint ordinal overflows u64".to_string())
@@ -8677,45 +8740,12 @@ fn uuid_text(value: [u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     use remanence_aead::RecipientPrivateKey;
+    use remanence_chaos::model::{ModelTransport, Record, VirtualTape, VirtualWorld};
 
     use super::*;
-
-    fn test_rewritable_object_media_admission() -> RewritableObjectMediaAdmission {
-        require_rewritable_object_media(TapeConfig {
-            block_size: remanence_library::BlockSize::Variable,
-            compression: false,
-            max_block_size_bytes: 8 * 1024 * 1024,
-            write_protected: false,
-            worm: WormMediaState::NotWorm,
-        })
-        .expect("hermetic Object writer has positive rewritable-media evidence")
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn write_to_selected_tape_checkpointed(
-        state: &mut CatalogIndex,
-        sink: &mut dyn BlockSink,
-        pool_cfg: &TapePoolConfig,
-        request: WriteObjectToPoolRequest,
-        selected: SelectedTape,
-        checkpoint_journal_dir: &Path,
-        parity_journal_path: &Path,
-        resources: &PoolWriteResources,
-    ) -> Result<PoolWriteResult, PoolWriteError> {
-        super::write_to_selected_tape_checkpointed(
-            state,
-            sink,
-            test_rewritable_object_media_admission(),
-            pool_cfg,
-            request,
-            selected,
-            checkpoint_journal_dir,
-            parity_journal_path,
-            resources,
-        )
-    }
 
     #[test]
     fn rewritable_object_media_gate_fails_closed_for_worm_and_unknown() {
@@ -8740,6 +8770,258 @@ mod tests {
         assert_eq!(
             require_rewritable_object_media(config(true, WormMediaState::NotWorm)),
             Err(ObjectWriteMediaError::WriteProtected)
+        );
+    }
+
+    #[test]
+    fn selected_drive_writer_binds_media_check_and_write_to_one_drive() {
+        const BLOCK_SIZE: u32 = 256 * 1024;
+        const TAPE_UUID: TapeUuid = [0x57; 16];
+        const LIBRARY_SERIAL: &str = "LIB-DIRECT-WORM";
+        const DRIVE_BAY: u16 = 0x0100;
+
+        let bootstrap = BootstrapPayload {
+            scheme: None,
+            no_parity_flag: true,
+            filemark_map_digest: None,
+            tape_uuid: TAPE_UUID,
+            written_by_version: "test".to_string(),
+            written_at: "2026-08-11T00:00:00Z".to_string(),
+            sequence: 0,
+            block_size_bytes: BLOCK_SIZE,
+            drive_compression: false,
+        };
+        let mut bootstrap_block = vec![0u8; BLOCK_SIZE as usize];
+        write_bootstrap_block(&bootstrap, &mut bootstrap_block).expect("encode bootstrap");
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE);
+        tape.records = vec![Record::Block(bootstrap_block), Record::Filemark];
+        tape.written_bytes = u64::from(BLOCK_SIZE);
+        tape.worm = true;
+
+        let mut world =
+            VirtualWorld::single_drive(LIBRARY_SERIAL, DRIVE_BAY, "DRV-DIRECT-WORM", 0x0400, 1);
+        world.put_tape_in_drive(DRIVE_BAY, "WORM002L9", Some(0x0400), tape);
+        let world = Arc::new(Mutex::new(world));
+        let library = world.lock().expect("world lock").library_snapshot();
+        let policy = remanence_library::StaticAllowlist::new([LIBRARY_SERIAL]);
+        let transport_world = Arc::clone(&world);
+        let mut library = library
+            .open_with(&policy, move |path| {
+                let role = transport_world
+                    .lock()
+                    .expect("world lock")
+                    .role_for_path(path)
+                    .expect("known model path");
+                Ok::<_, remanence_library::IoErrorKind>(Box::new(ModelTransport::new(
+                    Arc::clone(&transport_world),
+                    role,
+                ))
+                    as Box<dyn remanence_library::SgTransport>)
+            })
+            .expect("open model library");
+        let mut drive = library
+            .open_drive(DRIVE_BAY, &policy)
+            .expect("open model drive");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut state =
+            CatalogIndex::open(temp.path().join("state.sqlite")).expect("open empty test catalog");
+        let selected = SelectedTape {
+            pool_id: "direct-worm".to_string(),
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            parity_config: ParityConfig::None,
+        };
+        state
+            .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
+                pool_id: selected.pool_id.clone(),
+                display_name: None,
+                copy_class: None,
+                content_class: None,
+                created_at_utc: None,
+            })
+            .expect("project pool");
+        state
+            .provision_tape(remanence_state::ProvisionTapeInput {
+                tape_uuid: selected.tape_uuid,
+                voltag: "WORM002L9".to_string(),
+                block_size: selected.block_size,
+                parity: selected.parity_config.clone(),
+                force: false,
+            })
+            .expect("provision selected tape");
+        state
+            .project_tape_pool_membership(selected.tape_uuid, &selected.pool_id)
+            .expect("assign selected tape to pool");
+        let pool_cfg = test_capacity_pool_config(&selected);
+        let request = WriteObjectToPoolRequest {
+            pool_id: selected.pool_id.clone(),
+            source: WriteObjectSource::Path(temp.path().join("unreached-source")),
+            archive_path: "unreached.bin".into(),
+            caller_object_id: "direct-worm-check".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let resources = test_pool_write_resources();
+
+        let invalid_request = WriteObjectToPoolRequest {
+            pool_id: "wrong-pool".to_string(),
+            source: WriteObjectSource::Path(temp.path().join("unreached-invalid-source")),
+            archive_path: "unreached-invalid.bin".into(),
+            caller_object_id: "direct-invalid-check".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let command_start = world.lock().expect("world lock").command_log.len();
+        let invalid = write_to_selected_drive_checkpointed(
+            &mut state,
+            &mut drive,
+            &pool_cfg,
+            invalid_request,
+            selected.clone(),
+            &temp.path().join("checkpoints"),
+            &temp.path().join("parity.cbor"),
+            &resources,
+        )
+        .expect_err("request validation must precede drive preparation");
+        assert!(matches!(invalid, PoolWriteError::InvalidInput(_)));
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            command_start,
+            "invalid requests must not issue drive commands"
+        );
+
+        let command_start = world.lock().expect("world lock").command_log.len();
+
+        let error = write_to_selected_drive_checkpointed(
+            &mut state,
+            &mut drive,
+            &pool_cfg,
+            request,
+            selected.clone(),
+            &temp.path().join("checkpoints"),
+            &temp.path().join("parity.cbor"),
+            &resources,
+        )
+        .expect_err("the drive's WORM report must refuse the write");
+        assert!(
+            matches!(
+                error,
+                PoolWriteError::ObjectWriteMedia(ObjectWriteMediaError::Worm)
+            ),
+            "{error:?}"
+        );
+
+        let opcodes = world.lock().expect("world lock").command_log[command_start..]
+            .iter()
+            .map(|command| command.opcode)
+            .collect::<Vec<_>>();
+        assert!(
+            opcodes.contains(&0x01) && opcodes.contains(&0x08),
+            "the same drive must rewind and read the selected tape's BOT identity: {opcodes:02x?}"
+        );
+        assert!(
+            opcodes.contains(&0x1a),
+            "the same drive must supply current MODE SENSE media state: {opcodes:02x?}"
+        );
+        for forbidden in [0x15, 0x0a, 0x10] {
+            assert!(
+                !opcodes.contains(&forbidden),
+                "WORM refusal issued forbidden opcode 0x{forbidden:02x}: {opcodes:02x?}"
+            );
+        }
+
+        world
+            .lock()
+            .expect("world lock")
+            .tapes
+            .get_mut("WORM002L9")
+            .expect("loaded model tape")
+            .worm = false;
+        let source_path = temp.path().join("rewritable-source.bin");
+        std::fs::write(&source_path, b"drive-bound write succeeds\n").expect("write test source");
+        let request = WriteObjectToPoolRequest {
+            pool_id: selected.pool_id.clone(),
+            source: WriteObjectSource::Path(source_path.clone()),
+            archive_path: "rewritable.bin".into(),
+            caller_object_id: "direct-rewritable-check".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let command_start = world.lock().expect("world lock").command_log.len();
+
+        let result = write_to_selected_drive_checkpointed(
+            &mut state,
+            &mut drive,
+            &pool_cfg,
+            request,
+            selected,
+            &temp.path().join("checkpoints"),
+            &temp.path().join("parity.cbor"),
+            &resources,
+        )
+        .expect("positive rewritable evidence permits the same drive to write");
+        assert_eq!(result.object.copies.len(), 1);
+
+        let opcodes = world.lock().expect("world lock").command_log[command_start..]
+            .iter()
+            .map(|command| command.opcode)
+            .collect::<Vec<_>>();
+        let mode_sense = opcodes
+            .iter()
+            .position(|opcode| *opcode == 0x1a)
+            .expect("MODE SENSE must precede admission");
+        let mode_select = opcodes
+            .iter()
+            .position(|opcode| *opcode == 0x15)
+            .expect("MODE SELECT must configure the admitted drive");
+        let first_write = opcodes
+            .iter()
+            .position(|opcode| matches!(*opcode, 0x0a | 0x10))
+            .expect("the admitted drive must receive media writes");
+        assert!(
+            mode_sense < mode_select && mode_select < first_write,
+            "drive sequence must be identity/media check, configuration, then write: {opcodes:02x?}"
+        );
+
+        let replay_request = WriteObjectToPoolRequest {
+            pool_id: pool_cfg.id.clone(),
+            source: WriteObjectSource::Path(source_path),
+            archive_path: "rewritable.bin".into(),
+            caller_object_id: "direct-rewritable-check".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let command_start = world.lock().expect("world lock").command_log.len();
+        let replay = write_to_selected_drive_checkpointed(
+            &mut state,
+            &mut drive,
+            &pool_cfg,
+            replay_request,
+            SelectedTape {
+                pool_id: pool_cfg.id.clone(),
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                parity_config: ParityConfig::None,
+            },
+            &temp.path().join("checkpoints"),
+            &temp.path().join("parity.cbor"),
+            &resources,
+        )
+        .expect("exact replay returns committed result");
+        assert_eq!(replay.object.object_id, result.object.object_id);
+        assert_eq!(
+            world.lock().expect("world lock").command_log.len(),
+            command_start,
+            "an exact replay must return before drive preparation"
         );
     }
 
