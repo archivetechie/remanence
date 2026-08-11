@@ -214,6 +214,11 @@ the same caller id and content digest. If the catalog already contains that
 exact pair, the retry is an idempotent read of committed state; different bytes
 under the same caller id are refused.
 
+The canonical append surface creates an Object and its first copy atomically.
+It does not attach another copy to an Object UUID that is already cataloged
+outside the exact pool/caller replay key; that collision is refused before
+tape motion.
+
 This mechanism depends on the host checkpoint journal for an open tape. A
 Remanence cartridge arriving from another installation does not acquire safe
 append authority merely because its Bootstrap can be adopted. Transfer the

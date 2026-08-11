@@ -12249,6 +12249,56 @@ BCw3Wyv2UWY=
     }
 
     #[test]
+    fn canonical_uuid_collision_is_rejected_before_tape_motion() {
+        let mut index = test_index();
+        project_pool(&mut index, "scenario-a");
+        project_no_parity_tape(&mut index, "scenario-a", POOL_WRITE_TAPE_UUID);
+        let source_dir = temp_dir("remanence-api-canonical-uuid-collision");
+        let source_path = source_dir.join("payload.bin");
+        std::fs::write(&source_path, b"already committed logical source")
+            .expect("write source payload");
+        let cfg = pool_config("scenario-a");
+        let mut tape_sink = VecBlockSink::new();
+        let first = write_object_to_pool(
+            &mut index,
+            &mut tape_sink,
+            &cfg,
+            WriteObjectToPoolRequest {
+                pool_id: "scenario-a".to_string(),
+                source: crate::WriteObjectSource::Path(source_path.clone()),
+                archive_path: "payload.bin".into(),
+                caller_object_id: "original-caller".to_string(),
+                expected_content_sha256: None,
+                expected_object_id: None,
+                input_kind: crate::WriteObjectInputKind::LogicalFile,
+                representation: PoolWriteRepresentation::Plaintext,
+            },
+        )
+        .expect("seed existing object UUID");
+        let blocks_before = tape_sink.blocks.len();
+        let filemarks_before = tape_sink.filemarks.clone();
+
+        let collision = WriteObjectToPoolRequest {
+            pool_id: "scenario-a".to_string(),
+            source: crate::WriteObjectSource::Path(source_path),
+            archive_path: PathBuf::new(),
+            caller_object_id: "different-caller".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: Some(first.object.object_id),
+            input_kind: crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let error = crate::pool_write::maybe_replay_pool_write(&index, &cfg, &collision)
+            .expect_err("global object UUID collision must fail before append");
+        assert!(
+            error.to_string().contains("already exists outside"),
+            "{error}"
+        );
+        assert_eq!(tape_sink.blocks.len(), blocks_before);
+        assert_eq!(tape_sink.filemarks, filemarks_before);
+    }
+
+    #[test]
     fn pool_write_conflicts_same_pool_caller_object_id_with_different_content() {
         let mut index = test_index();
         project_pool(&mut index, "scenario-a");

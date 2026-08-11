@@ -195,8 +195,10 @@ Object-body write-command boundary. It is inert unless
 `REM_WOR_OBJECT_FAULT_ENABLE=whole-object-recovery-v1-abort` and
 `REM_WOR_OBJECT_FAULT_PLAN` are both present. The exact-tape, exact-caller plan
 and its durable one-shot evidence must be confined beneath
-`/tmp/system-harness/scenario-wor/object-faults`. Malformed, unconfined, stale,
-or cross-object plans fail closed. This is a scenario seam, not an operator
+`/tmp/system-harness/scenario-wor/object-faults`. Malformed, unconfined,
+mismatched, or invalid-evidence plans fail closed. Matching durable evidence
+means the one-shot cut was already consumed and makes that exact plan inert.
+This is a scenario seam, not an operator
 recovery control; ordinary production recovery uses checkpoint EOD and a
 whole-Object source replay.
 

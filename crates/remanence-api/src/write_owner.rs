@@ -2200,6 +2200,63 @@ struct PendingCheckpointBatch {
     objects: Vec<crate::pool_write::PoolWriteResult>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_provisional_replay_guards(
+    caller_object_id: &str,
+    pending_input_kind: crate::WriteObjectInputKind,
+    pending_object_id: [u8; 16],
+    pending_content_sha256: [u8; 32],
+    requested_input_kind: crate::WriteObjectInputKind,
+    expected_object_id: Option<[u8; 16]>,
+    expected_content_sha256: Option<[u8; 32]>,
+    requested_content_sha256: [u8; 32],
+) -> Result<(), Status> {
+    match (requested_input_kind, expected_object_id) {
+        (crate::WriteObjectInputKind::LogicalFile, Some(_)) => {
+            return Err(Status::invalid_argument(
+                "expected_object_id is valid only for canonical plaintext REM object ingestion",
+            ));
+        }
+        (crate::WriteObjectInputKind::CanonicalPlaintextRemObject, None) => {
+            return Err(Status::invalid_argument(
+                "canonical plaintext REM object ingestion requires expected_object_id",
+            ));
+        }
+        _ => {}
+    }
+    if let Some(expected) = expected_content_sha256 {
+        if expected != requested_content_sha256 {
+            return Err(Status::failed_precondition(format!(
+                "content SHA-256 guard mismatch inside checkpoint batch: expected={}, requested={}",
+                crate::bytes_to_hex(&expected),
+                crate::bytes_to_hex(&requested_content_sha256),
+            )));
+        }
+    }
+    if pending_input_kind != requested_input_kind {
+        return Err(Status::already_exists(format!(
+            "caller_object_id replay changed input kind inside checkpoint batch: caller_object_id={caller_object_id:?}"
+        )));
+    }
+    if let Some(expected) = expected_object_id {
+        if expected != pending_object_id {
+            return Err(Status::invalid_argument(format!(
+                "canonical plaintext REM object replay identity mismatch inside checkpoint batch: committed={}, expected={}",
+                Uuid::from_bytes(pending_object_id),
+                Uuid::from_bytes(expected),
+            )));
+        }
+    }
+    if requested_content_sha256 != pending_content_sha256 {
+        return Err(Status::already_exists(format!(
+            "caller_object_id replay conflict inside checkpoint batch: caller_object_id={caller_object_id:?}, existing content_sha256={}, requested content_sha256={}",
+            crate::bytes_to_hex(&pending_content_sha256),
+            crate::bytes_to_hex(&requested_content_sha256),
+        )));
+    }
+    Ok(())
+}
+
 struct ParityActorSession {
     scheme: remanence_parity::ParityScheme,
     sink_state: Option<ParitySinkSessionState>,
@@ -4230,23 +4287,30 @@ impl WriteSessionState<'_> {
             let requested_hash = source.content_sha256();
             source.remove_completed_path();
             match requested_hash {
-                Ok(hash) if hash == pending.object.content_sha256 => {
-                    let provisional_ordinal = provisional_index as u64 + 1;
-                    let record = pending
-                        .object
-                        .to_written_proto(batch_id, provisional_ordinal);
-                    let _ = reply.send(Ok(AppendFinishOutcome {
-                        record,
-                        replay: true,
-                    }));
-                }
-                Ok(hash) => {
-                    let _ = reply.send(Err(Status::already_exists(format!(
-                        "caller_object_id replay conflict inside checkpoint batch: caller_object_id={caller_object_id:?}, existing content_sha256={}, requested content_sha256={}",
-                        crate::bytes_to_hex(&pending.object.content_sha256),
-                        crate::bytes_to_hex(&hash),
-                    ))));
-                }
+                Ok(hash) => match validate_provisional_replay_guards(
+                    &caller_object_id,
+                    pending.input_kind(),
+                    pending.object.object_id,
+                    pending.object.content_sha256,
+                    input_kind,
+                    expected_object_id,
+                    expected_content_sha256,
+                    hash,
+                ) {
+                    Ok(()) => {
+                        let provisional_ordinal = provisional_index as u64 + 1;
+                        let record = pending
+                            .object
+                            .to_written_proto(batch_id, provisional_ordinal);
+                        let _ = reply.send(Ok(AppendFinishOutcome {
+                            record,
+                            replay: true,
+                        }));
+                    }
+                    Err(status) => {
+                        let _ = reply.send(Err(status));
+                    }
+                },
                 Err(err) => {
                     let _ = reply.send(Err(status_from_pool_write_error(err)));
                 }
@@ -11628,6 +11692,74 @@ mod tests {
 
     const RANGE_OBJECT_ID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const RANGE_TAPE_UUID: [u8; 16] = [0xAB; 16];
+
+    #[test]
+    fn provisional_replay_enforces_digest_identity_and_input_kind_guards() {
+        let object_id = [0x41; 16];
+        let digest = [0x42; 32];
+        assert!(validate_provisional_replay_guards(
+            "canonical-pending",
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            object_id,
+            digest,
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            Some(object_id),
+            Some(digest),
+            digest,
+        )
+        .is_ok());
+
+        let wrong_digest = validate_provisional_replay_guards(
+            "canonical-pending",
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            object_id,
+            digest,
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            Some(object_id),
+            Some([0x43; 32]),
+            digest,
+        )
+        .expect_err("wrong caller digest guard must fail");
+        assert_eq!(wrong_digest.code(), tonic::Code::FailedPrecondition);
+
+        let wrong_id = validate_provisional_replay_guards(
+            "canonical-pending",
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            object_id,
+            digest,
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            Some([0x44; 16]),
+            Some(digest),
+            digest,
+        )
+        .expect_err("wrong object identity guard must fail");
+        assert_eq!(wrong_id.code(), tonic::Code::InvalidArgument);
+
+        let wrong_kind = validate_provisional_replay_guards(
+            "canonical-pending",
+            crate::WriteObjectInputKind::CanonicalPlaintextRemObject,
+            object_id,
+            digest,
+            crate::WriteObjectInputKind::LogicalFile,
+            None,
+            Some(digest),
+            digest,
+        )
+        .expect_err("logical replay must not conflate a canonical pending object");
+        assert_eq!(wrong_kind.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn malformed_canonical_caller_bytes_map_to_invalid_argument() {
+        let error = crate::pool_write::canonical_admission_format_error(FormatError::Parse(
+            "hostile truncated pax record".to_string(),
+        ));
+        let status = status_from_pool_write_error(error);
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status
+            .message()
+            .contains("canonical plaintext REM object is malformed"));
+    }
 
     #[test]
     fn automatic_terminal_preflight_accepts_empty_fresh_authority() {
