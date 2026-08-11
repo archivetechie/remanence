@@ -26,8 +26,9 @@ use remanence_format::{
     RemTarStreamEntry, FORMAT_ID, MANIFEST_PATH,
 };
 use remanence_library::{
-    BlockSink, BlockSource, FileBlockSource, PipelinedWriteDiagnostics, TapeIoError, TapePosition,
-    VecBlockSink, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    BlockSink, BlockSource, FileBlockSource, PipelinedWriteDiagnostics, TapeConfig, TapeIoError,
+    TapePosition, VecBlockSink, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome,
+    WriteOutcome,
 };
 use remanence_parity::{
     bootstrap::{parse_bootstrap_block, write_bootstrap_block},
@@ -790,6 +791,43 @@ pub enum WritabilityError {
         /// Fence reason.
         reason: String,
     },
+}
+
+/// Drive-reported media state that cannot support ordinary Object ingest.
+///
+/// Whole-Object restart recovery may replace an uncommitted tail. Callers
+/// must obtain this positive rewritable-media check before MODE SELECT or any
+/// Object write; append-only terminal finalization uses a separate policy.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ObjectWriteMediaError {
+    /// The loaded cartridge reports its write-protect switch active.
+    #[error("tape is write-protected")]
+    WriteProtected,
+    /// The loaded cartridge is positively identified as WORM.
+    #[error(
+        "ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail"
+    )]
+    Worm,
+    /// The drive did not provide recognized rewritable/WORM media evidence.
+    #[error(
+        "ordinary Object writes require media positively identified as rewritable; the loaded tape's WORM state is unknown"
+    )]
+    UnknownWormState,
+}
+
+/// Require positive drive evidence that ordinary Object ingest can replace a
+/// torn, uncommitted tail after restart.
+pub fn require_rewritable_object_media(
+    current_cfg: TapeConfig,
+) -> Result<(), ObjectWriteMediaError> {
+    if current_cfg.write_protected {
+        return Err(ObjectWriteMediaError::WriteProtected);
+    }
+    match current_cfg.worm {
+        WormMediaState::NotWorm => Ok(()),
+        WormMediaState::Worm => Err(ObjectWriteMediaError::Worm),
+        WormMediaState::Unknown => Err(ObjectWriteMediaError::UnknownWormState),
+    }
 }
 
 /// Reason an active tape should be sealed after a write boundary.
@@ -1640,6 +1678,10 @@ pub fn write_object_to_pool(
 }
 
 /// Select a checkpoint-eligible tape and run the direct batch-of-one core.
+///
+/// A hardware caller must first pass its drive configuration through
+/// [`require_rewritable_object_media`]. This lower core accepts an abstract
+/// [`BlockSink`] so hermetic and format-only callers do not have drive state.
 pub fn write_object_to_pool_checkpointed(
     state: &mut CatalogIndex,
     sink: &mut dyn BlockSink,
@@ -2139,7 +2181,9 @@ fn finalize_direct_checkpoint_prefix(
 /// This is the daemon-independent batch-of-one core used by direct-SCSI
 /// callers. Both checkpoint and Layer 3c journals are the same per-tape files
 /// used by daemon sessions, so a later mount resumes from identical durable
-/// state.
+/// state. Before constructing a hardware-backed sink, the caller must pass the
+/// loaded drive's current configuration through
+/// [`require_rewritable_object_media`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_to_selected_tape_checkpointed(
     state: &mut CatalogIndex,
@@ -8622,6 +8666,32 @@ mod tests {
     use remanence_aead::RecipientPrivateKey;
 
     use super::*;
+
+    #[test]
+    fn rewritable_object_media_gate_fails_closed_for_worm_and_unknown() {
+        let config = |write_protected, worm| TapeConfig {
+            block_size: remanence_library::BlockSize::Variable,
+            compression: false,
+            max_block_size_bytes: 8 * 1024 * 1024,
+            write_protected,
+            worm,
+        };
+
+        require_rewritable_object_media(config(false, WormMediaState::NotWorm))
+            .expect("positive rewritable evidence is admitted");
+        assert_eq!(
+            require_rewritable_object_media(config(false, WormMediaState::Worm)),
+            Err(ObjectWriteMediaError::Worm)
+        );
+        assert_eq!(
+            require_rewritable_object_media(config(false, WormMediaState::Unknown)),
+            Err(ObjectWriteMediaError::UnknownWormState)
+        );
+        assert_eq!(
+            require_rewritable_object_media(config(true, WormMediaState::NotWorm)),
+            Err(ObjectWriteMediaError::WriteProtected)
+        );
+    }
 
     fn test_pool_write_resources() -> PoolWriteResources {
         PoolWriteResources::new(remanence_state::DEFAULT_IO_MEMORY_CEILING_BYTES)

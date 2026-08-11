@@ -91,13 +91,13 @@ pub use mount::{load_tape_by_uuid, LoadByUuidError};
 pub use pool_write::{
     build_tape_bootstrap, can_read, can_write, check_writability_preconditions,
     lto_generation_from_drive_product, lto_generation_from_voltag, raw_capacity_bytes,
-    seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
-    verify_tape_identity, write_object_to_pool_checkpointed, write_tape_bootstrap,
-    write_to_selected_tape_checkpointed, LtoGen, PoolWriteError, PoolWriteObjectCopyRecord,
-    PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResources, PoolWriteResult,
-    SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite,
-    TapeSealReason, TapeUuid, WritabilityError, WriteObjectInputKind, WriteObjectSource,
-    WriteObjectToPoolRequest,
+    require_rewritable_object_media, seal_decision_after_write, select_tape_in_pool,
+    select_tape_in_pool_for_write_session, verify_tape_identity, write_object_to_pool_checkpointed,
+    write_tape_bootstrap, write_to_selected_tape_checkpointed, LtoGen, ObjectWriteMediaError,
+    PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation,
+    PoolWriteResources, PoolWriteResult, SelectTapeError, SelectedTape, StreamedWriteSource,
+    TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid, WritabilityError,
+    WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};

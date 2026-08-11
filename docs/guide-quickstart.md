@@ -293,7 +293,9 @@ walkthrough instead uses `rem-debug`, which drives the same pool
 machinery directly against hardware without a daemon — useful for a
 first hands-on write, at the cost of the break-glass gauntlet. Note the
 `--allow` flag: every state-changing `rem-debug` command must name the
-library it may touch.
+library it may touch. Direct Object writes still require the drive to report
+the loaded cartridge as rewritable; write-protected, WORM, and unknown media
+are refused before MODE SELECT or any tape write.
 
 ```sh
 rem-debug --allow <SERIAL> archive write \

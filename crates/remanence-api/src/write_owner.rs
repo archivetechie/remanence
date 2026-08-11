@@ -5969,21 +5969,15 @@ fn validate_write_media_policy(
     current_cfg: TapeConfig,
     media_policy: WriteMediaPolicy,
 ) -> Result<(), Status> {
-    if current_cfg.write_protected {
-        return Err(Status::failed_precondition("tape is write-protected"));
-    }
     if media_policy == WriteMediaPolicy::TerminalAppend {
-        return Ok(());
+        return if current_cfg.write_protected {
+            Err(Status::failed_precondition("tape is write-protected"))
+        } else {
+            Ok(())
+        };
     }
-    match current_cfg.worm {
-        remanence_library::WormMediaState::NotWorm => Ok(()),
-        remanence_library::WormMediaState::Worm => Err(Status::failed_precondition(
-            "ordinary Object writes require rewritable media; a WORM tape cannot replace an interrupted uncommitted Object tail",
-        )),
-        remanence_library::WormMediaState::Unknown => Err(Status::failed_precondition(
-            "ordinary Object writes require media positively identified as rewritable; the loaded tape's WORM state is unknown",
-        )),
-    }
+    crate::pool_write::require_rewritable_object_media(current_cfg)
+        .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
 fn prepare_drive_for_write(
