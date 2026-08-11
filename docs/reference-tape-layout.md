@@ -22,8 +22,10 @@ A cartridge is a sequence of tape files separated by filemarks, written in
 fixed-size records. Six structural kinds are emitted by the replacement draft:
 `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), `ParityMap` (3),
 `TapeIndexReplica` (4), and `IndexSeparationExtent` (5).
-Structural file numbers, block counts,
-ordinals, sequences, and positions are carried as `u64`; the closed block-size
+Scale-derived file numbers, block counts, data ordinals, edition sequences,
+and logical-block positions are carried as `u64`. Closed-topology fields use
+their bounded widths instead: replica/gap ordinals and component kinds are
+`u16`, while partitions and block sizes are `u32`. The closed block-size
 profile remains 256 KiB, 512 KiB, and 1 MiB.
 
 - **Bootstrap** at tape file 0 is the volume label and geometry root: tape UUID,
@@ -195,15 +197,23 @@ reports degraded redundancy. Surviving replicas must agree on tape, edition,
 scope, counts, canonical payload/map digests, block/compression facts, writer
 facts, and the planned layout. If none survives, the truthful fallback is a
 structural scan from BOT; missing terminal authority is never an empty
-inventory. Full verification is a separate operation that walks the measured
-prefix and checks every surviving replica and both separation extents.
+inventory. When a matching fsynced checkpoint journal survives, the BOT walk
+can recover exact Object identifiers only for its measured committed prefix;
+complete Objects beyond that boundary remain unknown and a torn tail remains
+incomplete. A foreign tape without local authority stays unknown rather than
+causing Remanence to invent a journal. Full verification is a separate
+operation that walks the measured prefix and checks every surviving replica
+and both separation extents.
 
 The catalog inventory RPC is server-streamed. It emits the complete structural
 map and Object recovery rows from each attempted member under a bounded
 `attempt_id`; those rows are provisional until the final summary selects that
 attempt. A rejected attempt is named explicitly before fallback continues.
-Consumers therefore commit only the selected attempt, while the drive reads
-each attempted capsule body once and remains backpressured by the receiver.
+Consumers therefore commit only the selected attempt. On the ordinary
+newest-to-oldest path the drive reads each attempted capsule body once and
+remains backpressured by the receiver; independently valid conflicting
+candidates may require one bounded replay before the reader can fail closed or
+emit a selected authority.
 
 <!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs -->
 ## Tape identity
@@ -232,7 +242,7 @@ the [configuration reference](reference-configuration.md)):
   the barrier-proved physical EOD and replayable catalog projection.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
-- **SQLite index** — schema version 14, tracked via `PRAGMA
+- **SQLite index** — schema version 18, tracked via `PRAGMA
   user_version`, with tables for tapes, pools, tape files, objects,
   copies, files, catalog units, sessions, operations, idempotency keys,
   media-readiness records, tape-I/O fences, and the drive-stewardship set

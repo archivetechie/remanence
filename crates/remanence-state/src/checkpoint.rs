@@ -11,6 +11,10 @@
 //! Opening the backing file directly is not a valid write-admission path and
 //! would bypass the durable Finalizing fence.
 
+mod bot_recovery_authority;
+
+pub use bot_recovery_authority::CheckpointBotRecoveryAuthority;
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -4388,6 +4392,102 @@ mod tests {
         record.objects[0].object_recovery_row.tape_file_number = 2;
         record.objects[0].object_recovery_row.object_id = object_uuid.to_string().into_bytes();
         record
+    }
+
+    #[test]
+    fn bot_recovery_authority_does_not_create_a_missing_journal() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x31; 16];
+        let path = checkpoint_journal_path(dir.path(), tape_uuid);
+
+        let authority = CheckpointBotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
+            .expect("probe missing checkpoint authority");
+
+        assert!(authority.is_none());
+        assert!(!path.exists(), "foreign recovery must not invent authority");
+    }
+
+    #[test]
+    fn bot_recovery_authority_streams_exact_checkpoint_rows_and_scope() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x32; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        lease
+            .append(&record(tape_uuid))
+            .expect("append first checkpoint");
+        lease
+            .append(&second_record(tape_uuid))
+            .expect("append second checkpoint");
+        drop(lease);
+
+        let mut authority =
+            CheckpointBotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
+                .expect("open checkpoint recovery authority")
+                .expect("checkpoint authority exists");
+        let mut rows = Vec::new();
+        let scope = remanence_parity::BotObjectRecoveryAuthority::visit_object_rows(
+            &mut authority,
+            &mut |row| {
+                rows.push((
+                    row.tape_file_number,
+                    row.stored_block_count,
+                    row.object_id.clone(),
+                ));
+                Ok(())
+            },
+        )
+        .expect("stream checkpoint Object authority");
+
+        assert_eq!(scope.tape_uuid, tape_uuid);
+        assert_eq!(scope.block_size, 256 * 1024);
+        assert_eq!(scope.covered_prefix_tape_file_count, 3);
+        assert_eq!(scope.object_row_count, 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, 3);
+        assert_eq!(rows[1].0, 2);
+        assert_eq!(rows[1].1, 3);
+    }
+
+    #[test]
+    fn bot_recovery_authority_reads_the_ordinary_prefix_of_a_sealed_journal() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x33; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let prior = record(tape_uuid);
+        journal.append(&prior).expect("append ordinary authority");
+        let initial = finalization_intent(tape_uuid);
+        let completed = completed_finalization_intent(tape_uuid);
+        let terminal = structured_terminal_record(&prior, completed);
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        advance_test_finalization_to_replica_c(&mut lease, &initial);
+        lease
+            .append_terminal_finalization(std::slice::from_ref(&terminal))
+            .expect("append terminal completion");
+        drop(lease);
+
+        let mut authority =
+            CheckpointBotRecoveryAuthority::try_open(dir.path(), tape_uuid, 256 * 1024)
+                .expect("open sealed checkpoint recovery authority")
+                .expect("checkpoint authority exists");
+        let mut rows = Vec::new();
+        let scope = remanence_parity::BotObjectRecoveryAuthority::visit_object_rows(
+            &mut authority,
+            &mut |row| {
+                rows.push(row.clone());
+                Ok(())
+            },
+        )
+        .expect("stream ordinary prefix from sealed checkpoint");
+
+        assert_eq!(
+            scope.covered_prefix_tape_file_count,
+            prior.next_tape_file_number
+        );
+        assert_eq!(scope.object_row_count, prior.committed_object_count);
+        assert_eq!(rows.len(), prior.objects.len());
+        assert_eq!(rows[0].tape_file_number, 1);
     }
 
     #[test]

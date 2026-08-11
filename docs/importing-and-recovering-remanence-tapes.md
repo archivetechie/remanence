@@ -74,6 +74,48 @@ as ordinary catalog authority. An LTFS cartridge in the same shipment needs a
 distribution with an LTFS adapter; the stock Remanence tools will reject it as
 unrecognized or unsupported rather than guessing.
 
+## How Object names survive damaged terminal indexes
+
+A healthy finalized tape carries its complete Object inventory in each of the
+three terminal index replicas. If all three replicas are unusable, Remanence
+has to scan every filemark-delimited tape file from the beginning. That scan
+can prove that an Object-shaped tape file is complete, but its position alone
+does not reveal the Object's name.
+
+Production inventory and full verification therefore use surviving host
+checkpoint authority when it is available. The per-tape checkpoint journal was
+fsynced only after each Object body and trailing filemark were durable. During
+the BOT scan, Remanence replays that journal without loading all Object rows
+into memory and accepts a name only when all of these facts agree:
+
+- the journal is for the same tape UUID and fixed block size;
+- its committed prefix is present in the measured tape layout;
+- every journal Object names the same tape-file number and block count that the
+  physical scan measured; and
+- journal rows and measured Objects are an exact one-to-one match throughout
+  that committed prefix.
+
+The resulting classifications are deliberately simple:
+
+| Classification | Meaning |
+|---|---|
+| `Recovered` | The Object tape file is physically complete and an exact fsynced checkpoint row supplied its Object identifier. |
+| `Unknown` | The Object tape file is physically complete, but no trustworthy local identity authority covers it. |
+| `Incomplete` | EOD was reached before the Object's trailing filemark; Remanence never applies a checkpoint name to it. |
+
+This matters after a crash: a complete Object may physically follow the last
+fsynced checkpoint. It is reported as `Unknown`, not falsely promoted to
+`Recovered`. A corrupt or geometrically conflicting journal fails closed as a
+data-loss error instead of being silently ignored.
+
+A foreign Remanence tape normally has no checkpoint journal at the receiving
+site. Remanence does not create one merely because inventory was requested, so
+an all-indexes-invalid foreign tape reports complete candidates as `Unknown`.
+Transferring the matching checkpoint journal can preserve exact Object names;
+otherwise deeper REM-OBJECT inspection or operator recovery is needed. In
+either case, these recovery results remain inspection evidence: they do not by
+themselves populate the ordinary writable SQLite catalog.
+
 In plain terms, adoption records the native tape's identity, geometry, pool,
 and conservative lifecycle state. It does not rewrite the tape, decrypt or
 restore Objects, or invent file and index records.

@@ -33,12 +33,13 @@ pub use calibration::{
 };
 pub use checkpoint::{
     list_checkpoint_journals, tape_uuid_from_checkpoint_path, validate_parity_resume_authority,
-    CheckpointBoundedReplayMetrics, CheckpointJournalRecord, CheckpointObjectProjection,
-    CheckpointObjectRecoveryRepresentation, CheckpointObjectRecoveryRow,
-    CheckpointTerminalIndexRecordSource, CheckpointTerminalRecoveryAuthority,
-    FileCheckpointJournal, FileCheckpointJournalLease, ManualTerminalFinalizationIdentity,
-    TerminalFinalizationComponent, TerminalFinalizationComponentKind, TerminalFinalizationIntent,
-    TerminalFinalizationLayout, TerminalFinalizationPrefixPlan, TerminalFinalizationProgress,
+    CheckpointBotRecoveryAuthority, CheckpointBoundedReplayMetrics, CheckpointJournalRecord,
+    CheckpointObjectProjection, CheckpointObjectRecoveryRepresentation,
+    CheckpointObjectRecoveryRow, CheckpointTerminalIndexRecordSource,
+    CheckpointTerminalRecoveryAuthority, FileCheckpointJournal, FileCheckpointJournalLease,
+    ManualTerminalFinalizationIdentity, TerminalFinalizationComponent,
+    TerminalFinalizationComponentKind, TerminalFinalizationIntent, TerminalFinalizationLayout,
+    TerminalFinalizationPrefixPlan, TerminalFinalizationProgress,
     TerminalFinalizationSidecarDirectoryEntry, TerminalFinalizationTrigger,
     TerminalIndexAuthorityReplayMetrics, TerminalIndexAuthoritySummary,
 };
