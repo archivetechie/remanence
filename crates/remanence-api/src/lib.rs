@@ -91,12 +91,13 @@ pub use mount::{load_tape_by_uuid, LoadByUuidError};
 pub use pool_write::{
     build_tape_bootstrap, can_read, can_write, check_writability_preconditions,
     lto_generation_from_drive_product, lto_generation_from_voltag, raw_capacity_bytes,
-    seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
-    verify_tape_identity, write_tape_bootstrap, write_to_selected_drive_checkpointed, LtoGen,
-    ObjectWriteMediaError, PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord,
-    PoolWriteRepresentation, PoolWriteResources, PoolWriteResult, SelectTapeError, SelectedTape,
-    StreamedWriteSource, TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid,
-    WritabilityError, WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
+    replay_committed_pool_write_from_state, seal_decision_after_write, select_tape_in_pool,
+    select_tape_in_pool_for_write_session, verify_tape_identity, write_tape_bootstrap,
+    write_to_selected_drive_checkpointed, LtoGen, ObjectWriteMediaError, PoolWriteError,
+    PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResources,
+    PoolWriteResult, SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError,
+    TapePositionAfterWrite, TapeSealReason, TapeUuid, WritabilityError, WriteObjectInputKind,
+    WriteObjectSource, WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
@@ -8548,7 +8549,9 @@ BCw3Wyv2UWY=
     }
 
     fn append_checkpoint_record(checkpoint_dir: &Path, tape_uuid: [u8; 16]) {
+        const PAYLOAD: &[u8] = b"checkpoint selection test payload";
         let object_uuid = Uuid::from_bytes([0x51; 16]);
+        let content_sha256 = Sha256::digest(PAYLOAD).to_vec();
         let journal = remanence_state::FileCheckpointJournal::open(checkpoint_dir, tape_uuid)
             .expect("open checkpoint journal");
         journal
@@ -8566,12 +8569,22 @@ BCw3Wyv2UWY=
                         object_id: object_uuid.to_string(),
                         caller_object_id: Some("checkpoint-selection-test".to_string()),
                         body_format: "rem-object-v1".to_string(),
-                        logical_size_bytes: Some(1),
-                        content_hash: Some(vec![0x11; 32]),
+                        logical_size_bytes: Some(PAYLOAD.len() as u64),
+                        content_hash: Some(content_sha256.clone()),
                         metadata_hash: Some(vec![0x22; 32]),
                         created_at_utc: Some("2026-07-21T00:00:00Z".to_string()),
                     },
-                    files: Vec::new(),
+                    files: vec![NativeObjectFileProjectionInput {
+                        object_id: object_uuid.to_string(),
+                        file_id: "checkpoint-selection-file".to_string(),
+                        path: "payload.bin".to_string(),
+                        size_bytes: PAYLOAD.len() as u64,
+                        file_sha256: content_sha256,
+                        first_chunk_lba: Some(1),
+                        chunk_count: 1,
+                        mtime: Some("0".to_string()),
+                        executable: Some(false),
+                    }],
                     copy: NativeObjectCopyProjectionInput {
                         object_id: object_uuid.to_string(),
                         tape_uuid,
@@ -8614,6 +8627,7 @@ BCw3Wyv2UWY=
 
     #[test]
     fn direct_reconciliation_projects_cross_tape_identity_before_retry_selection() {
+        const PAYLOAD: &[u8] = b"checkpoint selection test payload";
         let temp = tempfile::Builder::new()
             .prefix("remanence-direct-global-checkpoint-replay-")
             .tempdir()
@@ -8681,8 +8695,22 @@ tape_catalog_dir = "{0}/cache/tapes"
             "the test must begin at the journal-fsync before-SQLite crash cut"
         );
 
-        reconcile_checkpoint_journal_projections(&mut state)
-            .expect("global direct-write reconciliation");
+        let source_path = temp.path().join("payload.bin");
+        std::fs::write(&source_path, PAYLOAD).expect("write exact replay source");
+        let request = WriteObjectToPoolRequest {
+            pool_id: "direct-replay".to_string(),
+            source: WriteObjectSource::Path(source_path),
+            archive_path: "payload.bin".into(),
+            caller_object_id: "checkpoint-selection-test".to_string(),
+            expected_content_sha256: None,
+            expected_object_id: None,
+            input_kind: WriteObjectInputKind::LogicalFile,
+            representation: PoolWriteRepresentation::Plaintext,
+        };
+        let replay = replay_committed_pool_write_from_state(&mut state, &request)
+            .expect("global host-only direct-write replay")
+            .expect("durable checkpoint identity must replay before selection");
+        assert!(replay.is_replay());
 
         assert!(
             state

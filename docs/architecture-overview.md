@@ -281,11 +281,12 @@ would have to join. Ordinary Object admission requires the drive to report
 not safely be replaced. Append-only terminal-index finalization has a separate
 WORM-aware recovery contract and remains available.
 One-shot direct writes globally replay the configured checkpoint-journal tree
-before tape selection and again at drive-bound admission. Their pool policy,
-journal paths, and resource ceiling come from the exclusively locked state
-configuration. An append error whose rollback also fails is typed as uncertain
-durable authority and quarantines the pending identities until restart and
-journal reconciliation.
+and resolve exact committed retries from host state before tape selection, so
+idempotent success does not require a writable tape or robot motion. They repeat
+the checks at drive-bound admission. Their pool policy, journal paths, and
+resource ceiling come from the exclusively locked state configuration. An
+append error whose rollback also fails is typed as uncertain durable authority
+and quarantines the pending identities until restart and journal reconciliation.
 No intermediate index is written. Finalization closes the open parity epoch,
 emits one final ParityMap when sidecar metadata exists, fixes one immutable
 snapshot of that complete pre-A prefix, and emits replica A, separation AB, replica B,
