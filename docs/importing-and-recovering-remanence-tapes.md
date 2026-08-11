@@ -97,9 +97,10 @@ For a site-to-site transfer, the destination must understand the tape's draft
 Bootstrap and on-tape format version. Its configuration also needs a pool rule
 that maps the barcode to an existing pool. Adoption does not decrypt or restore
 Objects; encrypted Objects still need their recovery keys. A WORM cartridge is
-safe for this read-only identity step, but remains non-writable. A genuine LTFS,
-tar, or other foreign-format cartridge requires a separate format-specific
-adapter and import pipeline. Adoption never converts it into a Remanence tape.
+safe for this read-only identity step, but remains ineligible for ordinary
+Object writes. A genuine LTFS, tar, or other foreign-format cartridge requires
+a separate format-specific adapter and import pipeline. Adoption never converts
+it into a Remanence tape.
 
 ## Safety model
 
@@ -199,13 +200,22 @@ filemarks between them.
 
 If the host stops while writing the body, the tail may contain some physical
 blocks but it has no committed Object delimiter or catalog projection. On an
-open no-parity tape, the last durable checkpoint journal records the EOD after
-the previous complete Object. After restart, a new write session positions at
-that checkpoint EOD and the caller sends the interrupted Object again from byte
-zero. The rewrite replaces the uncommitted tail; only the completed retry gets
-one filemark and enters the catalog. This preserves the useful fallback: a
-stock tar implementation sees one complete tar stream for the Object, not two
-pieces that require Remanence-specific joining.
+open, parity-off, rewritable tape, the last durable checkpoint journal records
+the EOD after the previous complete Object. After restart, a new write session
+positions at that checkpoint EOD and the caller sends the interrupted Object
+again from byte zero. The rewrite replaces the uncommitted tail; only the
+completed retry gets one filemark and enters the catalog. This preserves the
+useful fallback: a stock tar implementation sees one complete tar stream for
+the Object, not two pieces that require Remanence-specific joining.
+
+This guarantee cannot be implemented in place on WORM media: the incomplete
+tail cannot be erased. Remanence therefore admits ordinary Object sessions only
+when the drive positively reports `NotWorm`; `Worm` and `Unknown` both fail
+closed before drive mode is changed. Read-only adoption and recovery remain
+safe on WORM, and terminal-index finalization uses its own append-only,
+WORM-aware recovery path. A future WORM Object-ingest design would need an
+explicit abandon-and-replay lifecycle, normally replaying the whole Object on a
+different cartridge; Remanence does not silently substitute that policy today.
 
 The caller must retain the source until `CheckpointSession` reports it
 committed. Session resumption is not the recovery contract: an interrupted

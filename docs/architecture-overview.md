@@ -271,11 +271,15 @@ is advisory and locator-free; callers retain the source until
 `CheckpointSession` returns the committed copy set, and re-send every object
 that was not reported CHECKPOINTED after any session, stream, or daemon loss.
 The retry is the complete Object from byte zero, not a continuation fragment.
-For an open no-parity tape, the durable checkpoint journal identifies the last
-committed EOD; restart locates there and overwrites any longer uncommitted tail
-before emitting the retried Object's single trailing filemark. A multi-member
-REM-OBJECT therefore remains one ordinary tar stream for standard-tool recovery
-after a crash, rather than two tape files that tar would have to join.
+For an open, parity-off, rewritable tape, the durable checkpoint journal
+identifies the last committed EOD; restart locates there and overwrites any
+longer uncommitted tail before emitting the retried Object's single trailing
+filemark. A multi-member REM-OBJECT therefore remains one ordinary tar stream
+for standard-tool recovery after a crash, rather than two tape files that tar
+would have to join. Ordinary Object admission requires the drive to report
+`NotWorm`; WORM and unknown media fail closed because an interrupted tail could
+not safely be replaced. Append-only terminal-index finalization has a separate
+WORM-aware recovery contract and remains available.
 No intermediate index is written. Finalization closes the open parity epoch,
 emits one final ParityMap when sidecar metadata exists, fixes one immutable
 snapshot of that complete pre-A prefix, and emits replica A, separation AB, replica B,

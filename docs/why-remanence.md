@@ -431,9 +431,10 @@ Honest non-goals, so you can rule it out fast if it doesn't fit:
 - **No replication across libraries or hosts.** A single
   Remanence daemon manages every library on its host; multi-host
   coordination is the orchestrator's.
-- **No write-once-read-many enforcement** beyond what the
-  hardware itself does. We expose the SCSI primitives; policy
-  decisions belong upstream.
+- **No ordinary Object ingest onto WORM media.** Whole-Object crash recovery
+  replaces an uncommitted tail, so write sessions require the drive to
+  positively report rewritable media. Read-only recovery and the append-only
+  terminal-index finalization path remain WORM-aware.
 
 If any of these are deal-breakers, Remanence is the wrong tool.
 

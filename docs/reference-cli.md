@@ -163,7 +163,10 @@ capacity reserve, media-readiness fences, and checkpoint durability
 apply unchanged. There is deliberately no daemon-less write path: a put
 that bypassed the daemon would also bypass every safety the daemon
 exists to enforce. It takes `--endpoint` and `--json` like the other
-daemon-backed commands.
+daemon-backed commands. The loaded cartridge must be positively reported as
+rewritable (`NotWorm`); WORM or unknown media are refused before drive mode is
+changed because whole-Object restart recovery may need to replace an
+uncommitted tail.
 
 One input file becomes one object whose single member carries the file's
 archive path; directories are walked recursively, `tar`-style, one
