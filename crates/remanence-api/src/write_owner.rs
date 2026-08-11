@@ -3001,13 +3001,20 @@ fn perform_checkpoint_barrier(
     .map_err(|err| CheckpointBarrierFailure::before_journal(status_from_pool_write_error(err)))?;
     let filemark_drain = drain_started.elapsed();
     let projection_started = Instant::now();
-    journal.append(&record).map_err(|err| {
-        CheckpointBarrierFailure::before_journal(Status::internal(format!(
-            "checkpoint batch {} journal fsync failed; re-send all {} WRITTEN objects: {err}",
-            batch.batch_id,
-            batch.objects.len(),
-        )))
-    })?;
+    if let Err(err) = journal.append(&record) {
+        return Err(if err.is_checkpoint_append_authority_uncertain() {
+            CheckpointBarrierFailure::after_journal(Status::internal(format!(
+                "checkpoint batch {} journal append failed with durable authority uncertain; close the session and retry only after journal reconciliation: {err}",
+                batch.batch_id,
+            )))
+        } else {
+            CheckpointBarrierFailure::before_journal(Status::internal(format!(
+                "checkpoint batch {} journal fsync failed with rollback proved; re-send all {} WRITTEN objects: {err}",
+                batch.batch_id,
+                batch.objects.len(),
+            )))
+        });
+    }
     *checkpoint_ordinal = next_ordinal;
     *tape_committed_object_count = next_committed_count;
     index
@@ -11810,6 +11817,7 @@ pub(crate) fn status_from_pool_write_error(err: PoolWriteError) -> Status {
         PoolWriteError::Streaming(streaming) => status_from_streaming_error(&streaming, message),
         PoolWriteError::Parity(parity) => status_from_parity_error(&parity, message),
         PoolWriteError::PhysicalUsedBytesOverflow { .. }
+        | PoolWriteError::CheckpointReconciliation(_)
         | PoolWriteError::Io { .. }
         | PoolWriteError::TapeIo(_)
         | PoolWriteError::TransferWithSecondary { .. }

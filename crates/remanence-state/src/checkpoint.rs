@@ -12,7 +12,7 @@
 //! would bypass the durable Finalizing fence.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{Flock, FlockArg};
@@ -34,6 +34,30 @@ const CHECKPOINT_FINALIZATION_INTENT_VERSION: u16 = 2;
 const CHECKPOINT_RECORD_PREFIX_LEN: u64 = 2 + 4;
 const MAX_CHECKPOINT_RECORD_LEN: u64 = 64 * 1024 * 1024;
 const MAX_FINALIZATION_INTENT_LEN: u64 = MAX_CHECKPOINT_RECORD_LEN;
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CHECKPOINT_FRAME_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_CHECKPOINT_FRAME_ROLLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn write_checkpoint_frame(file: &mut File, frame: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_CHECKPOINT_FRAME_WRITE.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other("injected checkpoint frame write failure"));
+    }
+    file.write_all(frame).and_then(|_| file.sync_all())
+}
+
+fn rollback_checkpoint_frame(file: &mut File, append_start: u64) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_CHECKPOINT_FRAME_ROLLBACK.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other(
+            "injected checkpoint frame rollback failure",
+        ));
+    }
+    file.set_len(append_start).and_then(|_| file.sync_all())
+}
 
 /// Durable trigger that permanently closes Object admission on a tape.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -2682,17 +2706,10 @@ impl FileCheckpointJournalLease {
             .file
             .seek(SeekFrom::End(0))
             .map_err(|err| StateError::io_at("seek checkpoint journal", &self.path, err))?;
-        if let Err(err) = self
-            .file
-            .write_all(&frame)
-            .and_then(|_| self.file.sync_all())
-        {
-            let rollback = self
-                .file
-                .set_len(append_start)
-                .and_then(|_| self.file.sync_all());
+        if let Err(err) = write_checkpoint_frame(&mut self.file, &frame) {
+            let rollback = rollback_checkpoint_frame(&mut self.file, append_start);
             if let Err(rollback_err) = rollback {
-                return Err(StateError::JournalReplayFailed(format!(
+                return Err(StateError::CheckpointAppendAuthorityUncertain(format!(
                     "checkpoint append failed ({err}); rollback to offset {append_start} failed ({rollback_err})"
                 )));
             }
@@ -4926,6 +4943,23 @@ mod tests {
             journal.replay().expect("replay parity checkpoint"),
             vec![record]
         );
+    }
+
+    #[test]
+    fn append_and_rollback_failure_is_typed_as_uncertain_authority() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x26; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
+        FAIL_NEXT_CHECKPOINT_FRAME_WRITE.with(|fail| fail.set(true));
+        FAIL_NEXT_CHECKPOINT_FRAME_ROLLBACK.with(|fail| fail.set(true));
+
+        let error = lease
+            .append(&record(tape_uuid))
+            .expect_err("failed rollback must make append authority uncertain");
+
+        assert!(error.is_checkpoint_append_authority_uncertain(), "{error}");
+        assert!(error.to_string().contains("rollback"), "{error}");
     }
 
     #[test]

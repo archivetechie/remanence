@@ -233,6 +233,24 @@ collision is refused before tape motion. A daemon-wide claim also holds the
 pool/caller key and canonical Object UUID from pre-motion admission through
 checkpoint, so concurrent drive actors cannot both write the same identity.
 
+The one-shot direct writer uses the same rule under the exclusive state lock.
+Before it selects a tape, it replays every checkpoint journal in the configured
+state directory, not just the journal for the tape it might select. This closes
+the restart window where tape A has a durable checkpoint but SQLite has not yet
+projected its Object identity: a retry cannot select tape B and write the same
+identity again. The drive-bound writer repeats that reconciliation and derives
+the pool policy, checkpoint directory, parity-journal path, and memory ceiling
+from the locked operator configuration rather than accepting them from its
+caller.
+
+If a checkpoint append reports an error and rollback also fails, Remanence does
+not pretend it knows whether the new frame is absent, torn, or complete. That
+is a distinct `checkpoint append authority uncertain` state. The affected
+Object identities remain quarantined for the life of the process, the write
+fails closed, and a later process must reconcile the journal before admitting
+a retry. A complete valid frame is projected; a torn trailing frame is not
+treated as committed authority.
+
 This mechanism depends on the host checkpoint journal for an open tape. A
 Remanence cartridge arriving from another installation does not acquire safe
 append authority merely because its Bootstrap can be adopted. Transfer the

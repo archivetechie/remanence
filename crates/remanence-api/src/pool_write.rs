@@ -1100,6 +1100,9 @@ pub enum PoolWriteError {
     /// Another direct writer owns the same replay key or canonical Object UUID.
     #[error("write identity admission conflict: {0}")]
     WriteAdmissionConflict(String),
+    /// Durable checkpoint authority could not be reconciled before admission.
+    #[error("checkpoint authority reconciliation failed: {0}")]
+    CheckpointReconciliation(String),
     /// The actual loaded drive did not report media safe for ordinary Object ingest.
     #[error(transparent)]
     ObjectWriteMedia(#[from] ObjectWriteMediaError),
@@ -2189,26 +2192,39 @@ fn finalize_direct_checkpoint_prefix(
 /// directory. It is not a SCSI persistent reservation: operators must exclude
 /// unrelated tape software and Remanence instances configured with another
 /// state directory from the drive for this call's duration.
-#[allow(clippy::too_many_arguments)]
 pub fn write_to_selected_drive_checkpointed(
     state: &mut StateHandle,
     drive: &mut DriveHandle,
-    pool_cfg: &TapePoolConfig,
     request: WriteObjectToPoolRequest,
     selected: SelectedTape,
-    checkpoint_journal_dir: &Path,
-    parity_journal_path: &Path,
-    resources: &PoolWriteResources,
 ) -> Result<PoolWriteResult, PoolWriteError> {
+    crate::reconcile_checkpoint_journal_projections(state)
+        .map_err(|status| PoolWriteError::CheckpointReconciliation(status.message().to_string()))?;
+    let pool_cfg = state
+        .config()
+        .tape_pools
+        .iter()
+        .find(|pool| pool.id.trim() == request.pool_id.trim())
+        .cloned()
+        .ok_or_else(|| {
+            PoolWriteError::InvalidInput(format!(
+                "request names unconfigured tape pool {}",
+                request.pool_id.trim()
+            ))
+        })?;
+    let checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
+    let parity_journal_path = state.journal_path(selected.tape_uuid);
+    let resources = PoolWriteResources::new(state.config().daemon.io_memory_ceiling)
+        .map_err(PoolWriteError::InvalidInput)?;
     write_to_selected_drive_checkpointed_with_catalog(
         state.catalog_index(),
         drive,
-        pool_cfg,
+        &pool_cfg,
         request,
         selected,
-        checkpoint_journal_dir,
-        parity_journal_path,
-        resources,
+        checkpoint_journal_dir.as_path(),
+        parity_journal_path.as_path(),
+        &resources,
     )
 }
 
@@ -2625,7 +2641,10 @@ fn write_to_selected_tape_checkpointed_after_preflight(
             early_warning: result.hardware_early_warning || sync.early_warning,
         },
     )?;
-    checkpoint_lease.append(&record)?;
+    if let Err(error) = checkpoint_lease.append(&record) {
+        quarantine_direct_admission_on_uncertain_append(&error, write_admission);
+        return Err(error.into());
+    }
     if let Err(error) = state.project_checkpoint_record(&record) {
         if let Some(admission) = write_admission {
             admission.quarantine_until_restart();
@@ -2679,6 +2698,17 @@ fn write_to_selected_tape_checkpointed_after_preflight(
         result.sealed_after_write = true;
     }
     Ok(result)
+}
+
+fn quarantine_direct_admission_on_uncertain_append(
+    error: &StateError,
+    admission: Option<&mut crate::write_owner::WriteAdmissionReservation>,
+) {
+    if error.is_checkpoint_append_authority_uncertain() {
+        if let Some(admission) = admission {
+            admission.quarantine_until_restart();
+        }
+    }
 }
 
 pub(crate) fn project_fresh_parity_bootstrap_bundle(
@@ -8923,6 +8953,27 @@ mod tests {
             .write_admissions
             .reserve("direct-shared", "same-caller", Some(object_id))
             .expect("a non-durable claim releases when its owner drops");
+    }
+
+    #[test]
+    fn uncertain_checkpoint_append_quarantines_direct_identity_until_restart() {
+        let resources = test_pool_write_resources();
+        let object_id = [0x5B; 16];
+        let mut held = resources
+            .write_admissions
+            .reserve("direct-uncertain", "uncertain-caller", Some(object_id))
+            .expect("reserve direct identity");
+        let error = StateError::CheckpointAppendAuthorityUncertain(
+            "injected append and rollback failure".to_string(),
+        );
+        quarantine_direct_admission_on_uncertain_append(&error, Some(&mut held));
+        drop(held);
+
+        let conflict = resources
+            .write_admissions
+            .reserve("direct-uncertain", "uncertain-caller", Some(object_id))
+            .expect_err("uncertain durable authority must remain quarantined");
+        assert_eq!(conflict.code(), tonic::Code::Aborted);
     }
 
     #[test]
