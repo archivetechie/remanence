@@ -2139,6 +2139,7 @@ mod tests {
     struct TestBotAuthority {
         scope: BotObjectRecoveryAuthorityScope,
         second_scope: Option<BotObjectRecoveryAuthorityScope>,
+        fail_after_rows_on_second_visit: Option<usize>,
         rows: Vec<BotObjectRecoveryAuthorityRow>,
         visits: u64,
     }
@@ -2151,8 +2152,13 @@ mod tests {
             ) -> Result<(), BotStructuralRecoveryError>,
         ) -> Result<BotObjectRecoveryAuthorityScope, BotStructuralRecoveryError> {
             self.visits += 1;
-            for row in &self.rows {
+            for (index, row) in self.rows.iter().enumerate() {
                 visitor(row)?;
+                if self.visits == 2 && self.fail_after_rows_on_second_visit == Some(index + 1) {
+                    return Err(BotStructuralRecoveryError::ObjectAuthority {
+                        message: "injected late second authority replay failure".to_string(),
+                    });
+                }
             }
             Ok(if self.visits == 2 {
                 self.second_scope.unwrap_or(self.scope)
@@ -2885,6 +2891,7 @@ mod tests {
                 object_row_count: 1,
             },
             second_scope: None,
+            fail_after_rows_on_second_visit: None,
             rows: vec![BotObjectRecoveryAuthorityRow {
                 tape_file_number: 1,
                 stored_block_count: 2,
@@ -2939,6 +2946,7 @@ mod tests {
                 object_row_count: 1,
             },
             second_scope: None,
+            fail_after_rows_on_second_visit: None,
             rows: vec![BotObjectRecoveryAuthorityRow {
                 tape_file_number: 1,
                 stored_block_count: 2,
@@ -2987,6 +2995,7 @@ mod tests {
                 object_row_count: 1,
             },
             second_scope: None,
+            fail_after_rows_on_second_visit: None,
             rows: Vec::new(),
             visits: 0,
         };
@@ -3028,6 +3037,7 @@ mod tests {
                 object_row_count: 1,
             },
             second_scope: None,
+            fail_after_rows_on_second_visit: None,
             rows: vec![BotObjectRecoveryAuthorityRow {
                 tape_file_number: 1,
                 stored_block_count: 1,
@@ -3057,6 +3067,162 @@ mod tests {
         ));
         assert!(objects.is_empty());
         assert_eq!(authority.visits, 1);
+    }
+
+    #[test]
+    fn bot_recovery_discards_staged_identities_when_second_scope_changes() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let scope = BotObjectRecoveryAuthorityScope {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            covered_prefix_tape_file_count: 2,
+            object_row_count: 1,
+        };
+        let mut authority = TestBotAuthority {
+            scope,
+            second_scope: Some(BotObjectRecoveryAuthorityScope {
+                object_row_count: 2,
+                ..scope
+            }),
+            fail_after_rows_on_second_visit: None,
+            rows: vec![BotObjectRecoveryAuthorityRow {
+                tape_file_number: 1,
+                stored_block_count: 1,
+                object_id: b"provisional-scope-object".to_vec(),
+            }],
+            visits: 0,
+        };
+        let mut objects = Vec::new();
+        let error = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
+                objects.push(object.clone());
+                Ok(())
+            },
+        )
+        .expect_err("changed second scope must discard provisional identities");
+
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::ObjectAuthority { message }
+                if message.contains("changed between validation and staging passes")
+        ));
+        assert!(objects.is_empty());
+        assert_eq!(authority.visits, 2);
+    }
+
+    #[test]
+    fn bot_recovery_discards_staged_identities_after_late_second_replay_failure() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut authority = TestBotAuthority {
+            scope: BotObjectRecoveryAuthorityScope {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                covered_prefix_tape_file_count: 2,
+                object_row_count: 1,
+            },
+            second_scope: None,
+            fail_after_rows_on_second_visit: Some(1),
+            rows: vec![BotObjectRecoveryAuthorityRow {
+                tape_file_number: 1,
+                stored_block_count: 1,
+                object_id: b"provisional-replay-object".to_vec(),
+            }],
+            visits: 0,
+        };
+        let mut objects = Vec::new();
+        let error = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
+                objects.push(object.clone());
+                Ok(())
+            },
+        )
+        .expect_err("late replay failure must discard provisional identities");
+
+        assert!(matches!(
+            error,
+            BotStructuralRecoveryError::ObjectAuthority { message }
+                if message.contains("injected late second authority replay failure")
+        ));
+        assert!(objects.is_empty());
+        assert_eq!(authority.visits, 2);
+    }
+
+    #[test]
+    fn bot_recovery_emits_exact_unknown_and_torn_states_after_authority_commits() {
+        let records = vec![
+            Record::Block(bot_bootstrap()),
+            Record::Filemark,
+            Record::Block(vec![0x10; BLOCK_SIZE as usize]),
+            Record::Filemark,
+            Record::Block(vec![0x20; BLOCK_SIZE as usize]),
+            Record::Filemark,
+            Record::Block(vec![0x30; BLOCK_SIZE as usize]),
+        ];
+        let mut source = RecordingSource::new(records);
+        let mut authority = TestBotAuthority {
+            scope: BotObjectRecoveryAuthorityScope {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                covered_prefix_tape_file_count: 2,
+                object_row_count: 1,
+            },
+            second_scope: None,
+            fail_after_rows_on_second_visit: None,
+            rows: vec![BotObjectRecoveryAuthorityRow {
+                tape_file_number: 1,
+                stored_block_count: 1,
+                object_id: b"committed-object".to_vec(),
+            }],
+            visits: 0,
+        };
+        let mut objects = Vec::new();
+        let summary = recover_terminal_inventory_from_bot_with_authority(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut authority,
+            |object| {
+                objects.push(object.clone());
+                Ok(())
+            },
+        )
+        .expect("exact authority and physical tail must classify successfully");
+
+        assert_eq!(authority.visits, 2);
+        assert_eq!(summary.complete_object_count, 2);
+        assert_eq!(summary.recovered_object_count, 1);
+        assert_eq!(summary.unknown_object_count, 1);
+        assert_eq!(summary.incomplete_object_count, 1);
+        assert_eq!(objects.len(), 3);
+        assert_eq!(objects[0].state, BotRecoveredObjectState::Recovered);
+        assert_eq!(
+            objects[0].object_id.as_deref(),
+            Some(b"committed-object".as_slice())
+        );
+        assert_eq!(objects[1].state, BotRecoveredObjectState::Unknown);
+        assert!(objects[1].object_id.is_none());
+        assert_eq!(objects[2].state, BotRecoveredObjectState::Incomplete);
+        assert!(objects[2].object_id.is_none());
     }
 
     #[test]

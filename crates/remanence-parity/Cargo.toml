@@ -30,6 +30,7 @@ nix       = { workspace = true }
 serde     = { workspace = true }
 time      = { workspace = true }
 tracing   = { workspace = true }
+tempfile  = { workspace = true }
 
 # Error enum.
 thiserror = { workspace = true }
