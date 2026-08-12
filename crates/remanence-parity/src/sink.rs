@@ -47,8 +47,8 @@ use crate::parity_map::{
     SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 use crate::raw::{
-    raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
-    RawWriteOutcome,
+    locate_physical_exact, raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome,
+    RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
 use crate::resume::{
     checked_bounded_resume_summary, streamed_filemark_map_digest, BoundedResumeSummary,
@@ -616,7 +616,7 @@ pub fn reconcile_terminal_prefix(
     let start = PhysicalPositionHint::new(plan.start_lba);
     if source
         .configure_fixed_block_size(block_size)
-        .and_then(|()| source.locate_physical(start))
+        .and_then(|()| locate_physical_exact(source, start))
         .is_err()
     {
         return TerminalPrefixReconcileEvidence::Unproved;
@@ -633,7 +633,7 @@ pub fn reconcile_terminal_prefix(
             return TerminalPrefixReconcileEvidence::Unproved;
         };
         let file_start = PhysicalPositionHint::new(start_lba);
-        if source.locate_physical(file_start).is_err() {
+        if locate_physical_exact(source, file_start).is_err() {
             return TerminalPrefixReconcileEvidence::Unproved;
         }
         let mut blocks = Vec::new();
@@ -648,7 +648,7 @@ pub fn reconcile_terminal_prefix(
                         && block_index == 0
                         && position_after.lba == plan.start_lba =>
                 {
-                    if source.locate_physical(start).is_err() {
+                    if locate_physical_exact(source, start).is_err() {
                         return TerminalPrefixReconcileEvidence::Unproved;
                     }
                     return TerminalPrefixReconcileEvidence::Absent;
@@ -783,7 +783,7 @@ fn classify_terminal_prefix_torn(
     start: PhysicalPositionHint,
     rewritable: bool,
 ) -> TerminalPrefixReconcileEvidence {
-    if source.locate_physical(start).is_err() {
+    if locate_physical_exact(source, start).is_err() {
         return TerminalPrefixReconcileEvidence::Unproved;
     }
     if rewritable {

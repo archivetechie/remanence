@@ -15,7 +15,7 @@
 //! Discovery uses the raw tape adapter so candidate block-size probes are real
 //! fixed-block reads rather than buffer-size changes.
 
-use remanence_library::{scsi::decode_sense, TapeIoError};
+use remanence_library::TapeIoError;
 
 use crate::cbor::IntegerMapKeyTracker;
 use crate::diagnostic_text::{
@@ -24,7 +24,9 @@ use crate::diagnostic_text::{
 };
 use crate::error::ParityError;
 use crate::filemark_map::{sole_bot_filemark_map_digest, FilemarkMapDigest};
-use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::raw::{
+    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+};
 use crate::sidecar::crc64_xz;
 
 /// Magic at byte 0 of every bootstrap block.
@@ -547,19 +549,7 @@ fn try_read_bootstrap_at(
 }
 
 fn bootstrap_read_error_can_continue(err: &TapeIoError) -> bool {
-    match err {
-        TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
-            sense,
-            ..
-        }) => {
-            // IBM LTO SCSI Reference GA32-0928-08 Annex B Table B.4 defines
-            // sense key 3 as Medium Error. Fixed-format and descriptor-format
-            // sense carry that key at different offsets, so use Layer 1's
-            // shared decoder instead of duplicating the byte layout here.
-            decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03)
-        }
-        _ => false,
-    }
+    tape_error_is_current_medium_damage(err)
 }
 
 // ====================================================================
@@ -2096,6 +2086,28 @@ mod tests {
             }
             other => panic!("expected raw read error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn candidate_fallback_rejects_deferred_medium_errors() {
+        let check_condition = |sense| {
+            TapeIoError::CheckCondition(remanence_library::scsi::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            })
+        };
+        assert!(bootstrap_read_error_can_continue(&check_condition(vec![
+            0x70, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0,
+        ])));
+        assert!(bootstrap_read_error_can_continue(&check_condition(vec![
+            0x72, 0x03, 0x11, 0x00,
+        ])));
+        assert!(!bootstrap_read_error_can_continue(&check_condition(vec![
+            0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0,
+        ])));
+        assert!(!bootstrap_read_error_can_continue(&check_condition(vec![
+            0x73, 0x03, 0x11, 0x00,
+        ])));
     }
 
     #[test]

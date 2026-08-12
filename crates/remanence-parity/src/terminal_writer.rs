@@ -16,8 +16,8 @@ use crate::index_separation::{
 };
 use crate::journal::{CommittedBundle, CommittedBundleKind, TapeFileEntry};
 use crate::raw::{
-    raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
-    RawWriteOutcome,
+    locate_physical_exact, raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome,
+    RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
 use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header, plan_tape_index_replica,
@@ -171,7 +171,7 @@ pub fn reconcile_terminal_tail_next(
     };
     if source
         .configure_fixed_block_size(plan.edition.descriptor.block_size)
-        .and_then(|()| source.locate_physical(start))
+        .and_then(|()| locate_physical_exact(source, start))
         .is_err()
     {
         return TerminalComponentReconcileEvidence::Unproved;
@@ -185,7 +185,7 @@ pub fn reconcile_terminal_tail_next(
         Ok(RawReadOutcome::EndOfData { position_after })
             if position_after.partition == start.partition && position_after.lba == start.lba =>
         {
-            if source.locate_physical(start).is_err() {
+            if locate_physical_exact(source, start).is_err() {
                 return TerminalComponentReconcileEvidence::Unproved;
             }
             return TerminalComponentReconcileEvidence::Absent;
@@ -205,7 +205,7 @@ pub fn reconcile_terminal_tail_next(
         lba: footer_lba,
     };
     let mut footer_block = vec![0; block_size];
-    if source.locate_physical(footer_position).is_err() {
+    if locate_physical_exact(source, footer_position).is_err() {
         return TerminalComponentReconcileEvidence::Unproved;
     }
     match source.read_record(&mut footer_block) {
@@ -246,7 +246,7 @@ pub fn reconcile_terminal_tail_next(
             None => return TerminalComponentReconcileEvidence::Unproved,
         },
     };
-    if source.locate_physical(filemark_position).is_err() {
+    if locate_physical_exact(source, filemark_position).is_err() {
         return TerminalComponentReconcileEvidence::Unproved;
     }
     let Some(expected_position_after_lba) = filemark_position.lba.checked_add(1) else {
@@ -273,7 +273,7 @@ fn classify_torn_at_start(
     start: PhysicalPositionHint,
     rewritable: bool,
 ) -> TerminalComponentReconcileEvidence {
-    if source.locate_physical(start).is_err() {
+    if locate_physical_exact(source, start).is_err() {
         return TerminalComponentReconcileEvidence::Unproved;
     }
     if rewritable {
@@ -331,7 +331,7 @@ fn validate_physical_replica(
         partition: plan.edition.descriptor.terminal_layout.partition,
         lba: payload_start_lba,
     };
-    if source.locate_physical(payload_start).is_err() {
+    if locate_physical_exact(source, payload_start).is_err() {
         return PhysicalComponentValidation::Unproved;
     }
     let mut blocks = RawReplicaPayload {
@@ -415,7 +415,7 @@ fn validate_physical_separation(
         partition: plan.edition.descriptor.terminal_layout.partition,
         lba: interior_start_lba,
     };
-    if source.locate_physical(interior_start).is_err() {
+    if locate_physical_exact(source, interior_start).is_err() {
         return PhysicalComponentValidation::Unproved;
     }
     let mut blocks = RawSeparationInterior {
@@ -1065,6 +1065,7 @@ mod tests {
         cursor: PhysicalPositionHint,
         read_fault: Option<(u64, ReadFaultKind)>,
         locate_fault_lba: Option<u64>,
+        locate_mismatch: Option<(u64, PhysicalPositionHint)>,
     }
 
     impl<'a> FaultingRawSource<'a> {
@@ -1075,6 +1076,7 @@ mod tests {
                 cursor,
                 read_fault: None,
                 locate_fault_lba: None,
+                locate_mismatch: None,
             }
         }
 
@@ -1085,6 +1087,11 @@ mod tests {
 
         fn fail_locate(mut self, lba: u64) -> Self {
             self.locate_fault_lba = Some(lba);
+            self
+        }
+
+        fn mislocate(mut self, requested_lba: u64, observed: PhysicalPositionHint) -> Self {
+            self.locate_mismatch = Some((requested_lba, observed));
             self
         }
     }
@@ -1131,6 +1138,13 @@ mod tests {
                 return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
                     "injected locate failure".to_string(),
                 )));
+            }
+            if let Some((requested_lba, observed)) = self.locate_mismatch {
+                if hint.lba == requested_lba {
+                    self.inner.locate_physical(observed)?;
+                    self.cursor = observed;
+                    return Ok(());
+                }
             }
             self.inner.locate_physical(hint)?;
             self.cursor = hint;
@@ -1659,6 +1673,87 @@ mod tests {
                 "failed LOCATE to lba {lba} says nothing about record damage"
             );
         }
+    }
+
+    #[test]
+    fn successful_mislocate_never_becomes_terminal_overwrite_authority() {
+        let plan = test_plan();
+        let mut sink = MemorySink::new(2);
+        let mut authority = MemoryAuthority::default();
+        let mut records = MinimalSource;
+        write_terminal_tail(&mut sink, &mut records, &mut authority, &plan)
+            .expect("complete terminal tail fixture writes");
+
+        let replica = plan.component(0);
+        for requested_lba in [
+            replica.planned_start_lba,
+            replica.planned_start_lba + 1,
+            replica.planned_start_lba + replica.record_count - 1,
+            replica.planned_start_lba + replica.record_count,
+        ] {
+            for observed in [
+                PhysicalPositionHint::new(requested_lba.saturating_add(1)),
+                PhysicalPositionHint {
+                    partition: 1,
+                    lba: requested_lba,
+                },
+            ] {
+                let mut source =
+                    FaultingRawSource::new(&mut sink).mislocate(requested_lba, observed);
+                assert_eq!(
+                    reconcile_terminal_tail_next(
+                        &mut source,
+                        &plan,
+                        TerminalTailProgress::BeforeReplicaA,
+                        true,
+                    ),
+                    TerminalComponentReconcileEvidence::Unproved,
+                    "successful LOCATE mismatch at {requested_lba} must fail closed"
+                );
+            }
+        }
+
+        let component = plan.component(0);
+        let evidence = {
+            let mut source = FaultingRawSource::new(&mut sink).mislocate(
+                component.planned_start_lba,
+                PhysicalPositionHint::new(component.planned_start_lba + 1),
+            );
+            reconcile_terminal_tail_next(
+                &mut source,
+                &plan,
+                TerminalTailProgress::BeforeReplicaA,
+                true,
+            )
+        };
+        let counts = (
+            sink.block_writes,
+            sink.filemarks,
+            sink.barriers,
+            sink.overwrite_locates,
+        );
+        let mut authority = MemoryAuthority {
+            evidence,
+            ..MemoryAuthority::default()
+        };
+        let mut records = MinimalSource;
+        assert!(matches!(
+            write_terminal_tail_step(&mut sink, &mut records, &mut authority, &plan),
+            Ok(TerminalTailStepOutcome::RecoveryRequired {
+                evidence: TerminalComponentReconcileEvidence::Unproved,
+                ..
+            })
+        ));
+        assert_eq!(
+            (
+                sink.block_writes,
+                sink.filemarks,
+                sink.barriers,
+                sink.overwrite_locates,
+            ),
+            counts,
+            "a successful wrong-position LOCATE must not cause destructive media motion"
+        );
     }
 
     #[test]

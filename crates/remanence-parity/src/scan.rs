@@ -22,7 +22,9 @@ use crate::parity_map::{
     classify_parity_map_header_block, parse_parity_map_tape_file_with_unreadable_blocks,
     DecodedParityMapTapeFile, SidecarEpochDirectory,
 };
-use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::raw::{
+    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+};
 use crate::sidecar::{
     classify_sidecar_header_block, parse_sidecar_footer_block, parse_sidecar_index_blocks,
     SidecarFooter, SidecarHeader,
@@ -31,7 +33,8 @@ use crate::tape_index_replica::{
     derive_tape_index_replica_footer_magic, derive_tape_index_replica_header_magic,
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
 };
-use remanence_library::{scsi::decode_sense, TapeIoError};
+#[cfg(test)]
+use remanence_library::TapeIoError;
 use std::time::{Duration, Instant};
 
 /// Catalog-supplied filemark map and protection watermark for a loaded tape.
@@ -1154,12 +1157,7 @@ fn read_optional_fixed_block_at(
 }
 
 fn scan_read_error_is_medium_damage(error: &ParityError) -> bool {
-    match error {
-        ParityError::TapeIo(TapeIoError::CheckCondition(
-            remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-        )) => decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03),
-        _ => false,
-    }
+    matches!(error, ParityError::TapeIo(error) if tape_error_is_current_medium_damage(error))
 }
 
 fn sidecar_header_matches_footer(header: &SidecarHeader, footer: &SidecarFooter) -> bool {
@@ -1674,6 +1672,8 @@ mod tests {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum TestReadFault {
         Medium,
+        DeferredFixedMedium,
+        DeferredDescriptorMedium,
         Hardware,
         Transport,
     }
@@ -1684,6 +1684,18 @@ mod tests {
                 Self::Medium => TapeIoError::CheckCondition(
                     remanence_library::scsi::ScsiError::CheckCondition {
                         sense: vec![0x72, 0x03, 0x11, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::DeferredFixedMedium => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::DeferredDescriptorMedium => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x73, 0x03, 0x11, 0x00],
                         bytes_transferred: 0,
                     },
                 ),
@@ -2018,7 +2030,12 @@ mod tests {
             region.start.lba == 2 && region.kind == ScanDamageKind::UnreadableTapeFileHead
         }));
 
-        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+        for fault in [
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
             let mut source = RecordingRawSource::new(vec![
                 Record::Block(bot.clone()),
                 Record::Filemark,
@@ -2029,7 +2046,9 @@ mod tests {
                 scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
                     .expect_err("non-medium head failures must abort the structural walk");
             match fault {
-                TestReadFault::Hardware => assert!(matches!(
+                TestReadFault::DeferredFixedMedium
+                | TestReadFault::DeferredDescriptorMedium
+                | TestReadFault::Hardware => assert!(matches!(
                     error,
                     ParityError::TapeIo(TapeIoError::CheckCondition(_))
                 )),
@@ -2037,7 +2056,7 @@ mod tests {
                     error,
                     ParityError::TapeIo(TapeIoError::Transport(_))
                 )),
-                TestReadFault::Medium => unreachable!("medium case was tested separately"),
+                TestReadFault::Medium => unreachable!("current-medium case was tested separately"),
             }
         }
     }
@@ -2064,7 +2083,12 @@ mod tests {
         assert_eq!(walked.map.entries()[1].kind, TapeFileKind::Object);
         assert_eq!(walked.map.entries()[1].block_count, 2);
 
-        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+        for fault in [
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
             let mut source = RecordingRawSource::new(records_for(fault));
             let error =
                 scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
@@ -2072,7 +2096,9 @@ mod tests {
                         "non-medium optional-probe failures must abort the structural walk",
                     );
             match fault {
-                TestReadFault::Hardware => assert!(matches!(
+                TestReadFault::DeferredFixedMedium
+                | TestReadFault::DeferredDescriptorMedium
+                | TestReadFault::Hardware => assert!(matches!(
                     error,
                     ParityError::TapeIo(TapeIoError::CheckCondition(_))
                 )),
@@ -2080,7 +2106,7 @@ mod tests {
                     error,
                     ParityError::TapeIo(TapeIoError::Transport(_))
                 )),
-                TestReadFault::Medium => unreachable!("medium case was tested separately"),
+                TestReadFault::Medium => unreachable!("current-medium case was tested separately"),
             }
         }
     }

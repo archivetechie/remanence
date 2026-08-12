@@ -406,6 +406,7 @@ struct FaultingPrefixSource {
     inner: RecordingRawTapeSource,
     read_fault: Option<(u64, PrefixReadFaultKind)>,
     position_fails: bool,
+    locate_mismatch: Option<(u64, PhysicalPositionHint)>,
 }
 
 impl FaultingPrefixSource {
@@ -414,6 +415,7 @@ impl FaultingPrefixSource {
             inner,
             read_fault: Some((lba, kind)),
             position_fails: false,
+            locate_mismatch: None,
         }
     }
 
@@ -422,6 +424,20 @@ impl FaultingPrefixSource {
             inner,
             read_fault: None,
             position_fails: true,
+            locate_mismatch: None,
+        }
+    }
+
+    fn mislocate(
+        inner: RecordingRawTapeSource,
+        requested_lba: u64,
+        observed: PhysicalPositionHint,
+    ) -> Self {
+        Self {
+            inner,
+            read_fault: None,
+            position_fails: false,
+            locate_mismatch: Some((requested_lba, observed)),
         }
     }
 }
@@ -464,6 +480,11 @@ impl RawTapeSource for FaultingPrefixSource {
     }
 
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        if let Some((requested_lba, observed)) = self.locate_mismatch {
+            if hint.lba == requested_lba {
+                return self.inner.locate_physical(observed);
+            }
+        }
         self.inner.locate_physical(hint)
     }
 
@@ -1532,6 +1553,60 @@ fn terminal_prefix_read_failures_only_authorize_overwrite_for_proved_damage() {
         TerminalPrefixReconcileEvidence::Unproved,
         "failed final position proof must not become torn-media evidence"
     );
+}
+
+#[test]
+fn successful_mislocate_never_becomes_terminal_prefix_overwrite_authority() {
+    let block_size: u32 = 1024;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    let plan = {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            small_scheme(),
+            sample_uuid(),
+            block_size,
+        )
+        .expect("journaled sink opens");
+        start_object(&mut sink, 5, block_size);
+        for seed in 1..=5 {
+            sink.write_block(&fixed_block(seed, block_size))
+                .expect("object block writes");
+        }
+        sink.finish_object().expect("object closes");
+        let plan = sink
+            .plan_terminal_index_close()
+            .expect("terminal prefix preflight plans");
+        sink.close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+            .expect("terminal prefix fixture closes");
+        plan
+    };
+    let base = RecordingRawTapeSource::from_sink(&raw);
+    let mut file_starts: Vec<u64> = plan
+        .committed_bundle
+        .entries
+        .iter()
+        .map(|entry| entry.physical_start_hint.expect("entry start is planned"))
+        .collect();
+    file_starts.push(plan.start_lba);
+    file_starts.sort_unstable();
+    file_starts.dedup();
+    for requested_lba in file_starts {
+        for observed in [
+            PhysicalPositionHint::new(requested_lba.saturating_add(1)),
+            PhysicalPositionHint {
+                partition: 1,
+                lba: requested_lba,
+            },
+        ] {
+            let mut source = FaultingPrefixSource::mislocate(base.clone(), requested_lba, observed);
+            assert_eq!(
+                reconcile_terminal_prefix(&mut source, &plan, &sample_uuid(), block_size, true),
+                TerminalPrefixReconcileEvidence::Unproved,
+            );
+        }
+    }
 }
 
 #[test]
