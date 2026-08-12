@@ -1,6 +1,7 @@
 # REM-PARITY terminal index byte draft
 
-**Status:** in-progress byte candidate for independent review; not frozen.
+**Status:** independently re-derived pre-freeze byte candidate; nonphysical
+implementation/VTL evidence passed; supervised physical validation open.
 **Date:** 2026-08-09.
 **Architecture:** terminal triple-index replacement with three complete final
 replicas and two typed separation extents.
