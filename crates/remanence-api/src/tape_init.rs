@@ -11,7 +11,7 @@ use remanence_parity::{
 };
 use remanence_state::{CatalogIndex, StateError, TapeRecord};
 
-use crate::{build_tape_bootstrap, write_tape_bootstrap, PoolWriteError, TapeUuid};
+use crate::pool_write::{build_tape_bootstrap, write_tape_bootstrap, PoolWriteError, TapeUuid};
 
 const BOT_CLASSIFY_READ_BYTES: usize = 1024 * 1024;
 

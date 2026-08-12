@@ -40,10 +40,12 @@ use remanence_order::{
 use remanence_state::{CalibrationControlStore, CatalogIndex};
 use tonic::{Code, Request, Response, Status};
 
+use crate::api_state::ApiState;
+use crate::auth::{authorize_request, AuthPermission};
 use crate::calibration::{
     media_code_of, servable_wrap_map, WrapMapServeOutcome, WrapMapServeRefusal,
 };
-use crate::{authorize_request, pb, pb_rpc, ApiState, AuthPermission};
+use crate::{pb, pb_rpc};
 
 /// Canonical type URL for the vendored `google.rpc.BadRequest` detail.
 const BAD_REQUEST_TYPE_URL: &str = "type.googleapis.com/google.rpc.BadRequest";

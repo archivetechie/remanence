@@ -210,6 +210,11 @@ UUID reservations are global across the daemon, and UUID-targeted operations
 require the cartridge's barcode to resolve to exactly one operated library
 before any changer command is sent.
 
+The crate is organized as thin public façades over focused service, daemon
+state, drive-owner, and pool-writer modules. The module map and the ownership
+rules that keep new work out of the former monoliths are documented in
+[Remanence API module organization](api-module-organization.md).
+
 ![Layer 5 topology: orchestrator, rem, and rem-debug reach rem-daemon over gRPC; the daemon runs default-deny authorization and one actor per mounted drive; actors drive the drive and changer, and rem-debug keeps an allowlist-gated direct SCSI path](assets/daemon-topology.svg)
 
 *Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` keeps an allowlist-gated direct SCSI path for break-glass work.*

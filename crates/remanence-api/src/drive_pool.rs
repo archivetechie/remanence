@@ -9,7 +9,9 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::write_owner::{ChangerCommand, DriveCommand};
-use crate::{DriveHealthSnapshotRecord, TapeUuid};
+use remanence_state::DriveHealthSnapshotRecord;
+
+use crate::pool_write::TapeUuid;
 
 /// A drive bay is only unique within one logical library.
 #[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq)]
