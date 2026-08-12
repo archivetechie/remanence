@@ -47,7 +47,8 @@ use crate::parity_map::{
     SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 use crate::raw::{
-    PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome,
+    raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
+    RawWriteOutcome,
 };
 use crate::resume::{
     checked_bounded_resume_summary, streamed_filemark_map_digest, BoundedResumeSummary,
@@ -652,7 +653,10 @@ pub fn reconcile_terminal_prefix(
                     }
                     return TerminalPrefixReconcileEvidence::Absent;
                 }
-                _ => return classify_terminal_prefix_torn(source, start, rewritable),
+                Ok(_) => return classify_terminal_prefix_torn(source, start, rewritable),
+                Err(error) => {
+                    return classify_terminal_prefix_read_error(source, start, rewritable, &error);
+                }
             }
         }
         let valid = match entry.kind {
@@ -697,14 +701,18 @@ pub fn reconcile_terminal_prefix(
         match source.read_record(&mut block) {
             Ok(RawReadOutcome::Filemark { position_after })
                 if position_after.lba == expected_position_after => {}
-            _ => return classify_terminal_prefix_torn(source, start, rewritable),
+            Ok(_) => return classify_terminal_prefix_torn(source, start, rewritable),
+            Err(error) => {
+                return classify_terminal_prefix_read_error(source, start, rewritable, &error);
+            }
         }
     }
     match source.position() {
         Ok(position) if position.lba == plan.tail_start_lba => {
             TerminalPrefixReconcileEvidence::Complete
         }
-        _ => classify_terminal_prefix_torn(source, start, rewritable),
+        Ok(_) => classify_terminal_prefix_torn(source, start, rewritable),
+        Err(_) => TerminalPrefixReconcileEvidence::Unproved,
     }
 }
 
@@ -782,6 +790,19 @@ fn classify_terminal_prefix_torn(
         TerminalPrefixReconcileEvidence::TornRewritable
     } else {
         TerminalPrefixReconcileEvidence::TornWorm
+    }
+}
+
+fn classify_terminal_prefix_read_error(
+    source: &mut dyn RawTapeSource,
+    start: PhysicalPositionHint,
+    rewritable: bool,
+    error: &ParityError,
+) -> TerminalPrefixReconcileEvidence {
+    if raw_read_error_proves_damage(error) {
+        classify_terminal_prefix_torn(source, start, rewritable)
+    } else {
+        TerminalPrefixReconcileEvidence::Unproved
     }
 }
 

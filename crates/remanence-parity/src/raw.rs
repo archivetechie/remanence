@@ -20,6 +20,36 @@ use remanence_library::{
 
 use crate::error::ParityError;
 
+/// Whether a failed raw READ positively establishes damaged media.
+///
+/// Only a current `MEDIUM ERROR` sense or a consumed over-size record is
+/// evidence about the bytes on tape. Transport, reset, target-state, and
+/// adapter failures leave the component unresolved: callers must not turn
+/// those failures into overwrite authority.
+pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
+    if matches!(
+        error,
+        ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { .. })
+    ) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        matches!(
+            error,
+            ParityError::TapeIo(TapeIoError::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
+            )) if decode_sense(sense)
+                .is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x03)
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = error;
+        false
+    }
+}
+
 /// Physical block-address hint used by raw tape operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PhysicalPositionHint {
@@ -1888,6 +1918,44 @@ mod tests {
             sense,
             bytes_transferred: 0,
         })
+    }
+
+    fn read_error(error: TapeIoError) -> ParityError {
+        ParityError::TapeIo(error)
+    }
+
+    #[test]
+    fn raw_read_damage_classifier_is_strictly_fail_closed() {
+        let mut deferred_medium = fixed_sense(0x03, 0x11, 0x00);
+        deferred_medium[0] = 0x71;
+        assert!(raw_read_error_proves_damage(&read_error(check_condition(
+            fixed_sense(0x03, 0x11, 0x00),
+        ))));
+        assert!(raw_read_error_proves_damage(&read_error(
+            TapeIoError::ReadBufferTooSmall {
+                actual: 4097,
+                provided: 4096,
+            },
+        )));
+
+        for error in [
+            TapeIoError::Transport(remanence_library::scsi::ScsiError::TransportError {
+                status: 0,
+                host_status: 0,
+                driver_status: 0x06,
+                info: 1,
+                sense: Vec::new(),
+            }),
+            check_condition(fixed_sense(0x04, 0x44, 0x00)),
+            check_condition(deferred_medium),
+            TapeIoError::OperationFailed("adapter failure".to_string()),
+            TapeIoError::FilemarkEncountered,
+        ] {
+            assert!(
+                !raw_read_error_proves_damage(&read_error(error)),
+                "non-medium or completion-unknown read failure must remain unproved"
+            );
+        }
     }
 
     #[test]
