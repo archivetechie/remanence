@@ -28,11 +28,12 @@ are recorded in
 The publication tree remains unchanged.
 
 **This is a review draft.** It is published for public review and is not yet
-frozen. The draft.4 replacement is implemented in the reference tree and its
-review-only candidate vectors are pinned and independently re-derived, but the
-final committed-range review, remaining fuzz plateaus, and physical-media gate
-are still open. Candidate vectors are not publication artifacts until those
-gates close.
+frozen. The draft.4 replacement is implemented in the reference tree. Its
+review-only candidate vectors are pinned and independently re-derived, its
+fuzz plateaus and nonphysical lifecycle/VTL gates have passed, and review
+proceeds incrementally from the last recorded clean baseline. The supervised
+physical-media gate remains open. Candidate vectors are not publication
+artifacts until the freeze gates close.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
@@ -2011,8 +2012,8 @@ record size: 256 KiB, 512 KiB, and 1 MiB. Every profile contains five byte
 streams in the exact A/gap-AB/B/gap-BC/C order. Filemarks and EOD are recorded
 as structural expectations in `MANIFEST.tsv`, not encoded into those files.
 Compact gaps use the Section 8 byte-draft test profile `E = 3*B` (header, one
-zero interior record, footer); default one-GiB gaps remain an integration/VTL
-obligation.
+zero interior record, footer). The default one-GiB gaps are exercised by the
+VTL matrix and remain part of the supervised physical-media obligation.
 
 The generator is
 `crates/remanence-parity/examples/generate_terminal_index_vectors.rs`. The
@@ -2020,8 +2021,9 @@ independent verifier `tools/verify_terminal_index_vectors.py` re-derives
 HMAC role magics, CRC-64/XZ, full-file SHA-256, header hashes, local
 observations, record formulas, component ordering, dense file numbers, logical
 positions, zero gap interiors, and terminal EOD without calling the Rust
-codec. Candidate bytes remain mutable until the diff gate and an independent
-implementation review are complete.
+codec. Candidate bytes remain mutable until the specification freezes; the
+recorded independent derivation and incremental implementation review are
+pre-freeze evidence rather than publication.
 
 Before freeze, negative candidates MUST cover at least: bad role magic; CRC
 failure; reserved/padding nonzero; ordinal/count mismatch; payload slot
@@ -2032,10 +2034,10 @@ overflow in every size/location formula.
 ## 18. Conformance and Freeze Criteria
 
 These criteria gate the freeze of this specification. They are not all
-satisfied in this review draft: terminal-replica/separation fuzz plateaus,
-physical-media exercises, and final independent committed-range review remain
-open in Appendix E. Candidate-vector, proof, and hermetic/VTL results are
-pre-freeze evidence, not a declaration that the specification is frozen.
+satisfied in this review draft: the supervised physical-media exercises remain
+open in Appendix E. Candidate-vector, proof, hermetic, VTL, and incremental
+review results are pre-freeze evidence, not a declaration that the
+specification is frozen.
 After freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
 anything that would invalidate an existing tape, change the meaning of
@@ -2618,32 +2620,35 @@ governs only the revisions that follow the first published one.
 
 This is the live preparing-copy snapshot for the draft.4 replacement.
 
-1. **TT-1 — independent byte derivation (candidate evidence passed; freeze
-   review open).** The independent Python implementation reproduces all six
-   review profiles and their 30 component streams without calling the Rust
-   codec. A fresh final committed-range review must still bind that evidence
-   to the exact preparing-copy head before freeze.
+1. **TT-1 — independent byte derivation (candidate evidence passed).** The
+   independent Python implementation reproduces all six review profiles and
+   their 30 component streams without calling the Rust codec. Incremental
+   reviews bind later changes to the last recorded clean baseline; an untouched
+   byte-contract region does not lose its accepted review status.
 2. **TT-2 — negative and interruption vectors (candidate evidence passed).**
    The review-only set currently verifies 50 hostile mutations, 14 survivor
    selections, 68 interruption cuts, seven Object-row extension cases, and the
    million-Object streaming profile. Publication promotion remains gated by
    TT-5 and the other freeze criteria.
-3. **TT-3 — default-gap media exercise (partial).** The exact one-GiB layout
-   has passed the clean VTL terminal lifecycle at the production 1 MiB block
-   size. The remaining legal-size VTL legs and at least two supervised
-   physical-tape block sizes are still required, including footer,
+3. **TT-3 — default-gap media exercise (VTL passed; physical open).** The exact
+   one-GiB layout has passed clean VTL writes and independent full verification
+   at all three legal block sizes. The 256 KiB and 512 KiB legs respectively
+   proved 4,096 and 2,048 records per separation extent, compression disabled,
+   five dense terminal files, their filemarks, and exact EOD. At least two
+   supervised physical-tape block sizes are still required, including footer,
    filemark/EOD, PEW, and EOM observations.
-4. **TT-4 — end-to-end lifecycle reconciliation (implemented; final-head rerun
-   open).** The VTL scenario has exercised automatic and manual finalization,
-   all 68 interruption cuts, permanent Object refusal after finalization
-   starts, and eventual five-component reconciliation. Material shared-writer
-   changes after that evidence require one clean-slate rerun at the final
-   committed head.
-5. **TT-5 — external prose and committed-diff review (open).** Confirm that
-   the completed preparing copy contains no normative dependence on geometric
-   placement, `2M+1` index copies, bootstrap Object-row ceilings, or singular
-   final Bootstrap authority, and record two consecutive clean reviews of the
-   final committed implementation/specification range.
+4. **TT-4 — end-to-end lifecycle reconciliation (implemented and rerun).** The
+   VTL scenarios have exercised automatic and manual finalization, all 68
+   interruption cuts, permanent Object refusal after finalization starts,
+   eventual five-component reconciliation, sole-BOT checkpoint replay, and
+   the full default-gap matrix. Each affected member ran from its own clean
+   slate at the recorded implementation head.
+5. **TT-5 — external prose and incremental-diff review.** The preparing copy
+   has no normative dependence on geometric placement, `2M+1` index copies,
+   bootstrap Object-row ceilings, or singular final Bootstrap authority.
+   Review is incremental from the last recorded clean baseline; two
+   consecutive clean reviews of the then-current increment satisfy the gate,
+   and later commits reopen only the regions they touch.
 ## Author's Address
 
 The ArchiveTech Project
