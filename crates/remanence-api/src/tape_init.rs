@@ -438,9 +438,20 @@ pub fn classify_bot_identity_bytes(bot_bytes: &[u8]) -> BotIdentityClassificatio
 pub fn probe_bot_identity_from_source(
     source: &mut dyn remanence_library::BlockSource,
 ) -> BotIdentityClassification {
-    if let Err(error) = source.locate(0) {
+    let located = match source.locate(0) {
+        Ok(position) => position,
+        Err(error) => {
+            return BotIdentityClassification::ReadError {
+                detail: bounded_detail(format!("locate BOT: {error}")),
+            };
+        }
+    };
+    if located.partition != 0 || located.lba != 0 {
         return BotIdentityClassification::ReadError {
-            detail: bounded_detail(format!("locate BOT: {error}")),
+            detail: bounded_detail(format!(
+                "locate BOT returned partition {} lba {}, expected partition 0 lba 0",
+                located.partition, located.lba
+            )),
         };
     }
     let mut block = vec![0u8; BOT_CLASSIFY_READ_BYTES];
@@ -1006,6 +1017,7 @@ mod tests {
     struct ScriptedSource {
         reads: VecDeque<ScriptRead>,
         calls: Vec<&'static str>,
+        locate_position: TapePosition,
     }
 
     impl ScriptedSource {
@@ -1013,7 +1025,21 @@ mod tests {
             Self {
                 reads: reads.into_iter().collect(),
                 calls: Vec::new(),
+                locate_position: TapePosition {
+                    lba: 0,
+                    partition: 0,
+                    beginning_of_partition: true,
+                    end_of_partition: false,
+                    block_position_end_of_warning: false,
+                },
             }
+        }
+
+        fn with_locate_position(mut self, partition: u32, lba: u64) -> Self {
+            self.locate_position.partition = partition;
+            self.locate_position.lba = lba;
+            self.locate_position.beginning_of_partition = partition == 0 && lba == 0;
+            self
         }
     }
 
@@ -1048,13 +1074,7 @@ mod tests {
         fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
             assert_eq!(lba, 0);
             self.calls.push("locate");
-            Ok(TapePosition {
-                lba,
-                partition: 0,
-                beginning_of_partition: true,
-                end_of_partition: false,
-                block_position_end_of_warning: false,
-            })
+            Ok(self.locate_position)
         }
 
         fn space(&mut self, _count: i64, _kind: SpaceKind) -> Result<SpaceResult, TapeIoError> {
@@ -1600,6 +1620,39 @@ mod tests {
             BootstrapTailClassification::ExactBootstrapFilemarkEod
         );
         assert_eq!(source.calls, ["locate", "read", "read", "read"]);
+    }
+
+    fn assert_adoption_rejects_wrong_locate(partition: u32, lba: u64) {
+        let mut source = ScriptedSource::new([
+            ScriptRead::Data(canonical_adoption_block(ADOPTION_UUID)),
+            ScriptRead::Filemark,
+            ScriptRead::Eod,
+        ])
+        .with_locate_position(partition, lba);
+
+        let result = classify_bootstrap_adoption_from_source(&mut source);
+
+        assert!(result.payload.is_none());
+        let BootstrapTailClassification::InvalidBot(BotIdentityClassification::ReadError {
+            detail,
+        }) = result.tail
+        else {
+            panic!("wrong-position locate must remain a BOT read error");
+        };
+        assert!(detail.contains(&format!("partition {partition} lba {lba}")));
+        assert!(detail.contains("expected partition 0 lba 0"));
+        assert_eq!(source.calls, ["locate"]);
+        assert_eq!(source.reads.len(), 3, "no non-BOT record may be consumed");
+    }
+
+    #[test]
+    fn adoption_recheck_rejects_successful_wrong_lba_before_read() {
+        assert_adoption_rejects_wrong_locate(0, 1);
+    }
+
+    #[test]
+    fn adoption_recheck_rejects_successful_wrong_partition_before_read() {
+        assert_adoption_rejects_wrong_locate(1, 0);
     }
 
     #[test]

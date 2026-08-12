@@ -74,6 +74,7 @@ mod append_ring;
 mod calibration;
 mod diagnostics;
 mod direct_replay_fault;
+mod drive_mode;
 mod drive_pool;
 mod io_memory;
 mod library;
@@ -2728,12 +2729,27 @@ pub fn reconcile_checkpoint_journal_projections(state: &mut StateHandle) -> Resu
     let checkpoint_dir = state.paths().journal_dir.join("checkpoints");
     let audit_dir = state.paths().audit_dir.clone();
     let audit_append_lock = Arc::new(std::sync::Mutex::new(()));
-    replay_checkpoint_journal_projections_with_audit(
+    let replay = replay_checkpoint_journal_projections_with_audit(
         state.catalog_index(),
         checkpoint_dir.as_path(),
         audit_dir.as_path(),
         &audit_append_lock,
-    )
+    );
+    let refresh = state.refresh_audit_append_cursor();
+    match (replay, refresh) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(primary), Ok(())) => Err(primary),
+        (Ok(()), Err(refresh)) => Err(Status::internal(format!(
+            "refresh audit append cursor after checkpoint reconciliation: {refresh}"
+        ))),
+        (Err(primary), Err(refresh)) => Err(Status::new(
+            primary.code(),
+            format!(
+                "{}; secondary audit-cursor refresh failure: {refresh}",
+                primary.message()
+            ),
+        )),
+    }
 }
 
 fn live_status_config_from(config: &remanence_state::LiveStatusConfig) -> Duration {

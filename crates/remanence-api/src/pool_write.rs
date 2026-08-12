@@ -26,9 +26,9 @@ use remanence_format::{
     RemTarStreamEntry, FORMAT_ID, MANIFEST_PATH,
 };
 use remanence_library::{
-    BlockSink, BlockSize, BlockSource, DriveHandle, DriveHandleSink, DriveHandleSource,
-    FileBlockSource, PipelinedWriteDiagnostics, TapeConfig, TapeIoError, TapePosition,
-    VecBlockSink, WormMediaState, WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
+    BlockSink, BlockSource, DriveHandle, DriveHandleSink, DriveHandleSource, FileBlockSource,
+    PipelinedWriteDiagnostics, TapeConfig, TapeIoError, TapePosition, VecBlockSink, WormMediaState,
+    WriteBatchOutcome, WriteFilemarksOutcome, WriteOutcome,
 };
 use remanence_parity::{
     bootstrap::{parse_bootstrap_block, write_bootstrap_block},
@@ -2282,7 +2282,7 @@ pub fn write_to_selected_drive_checkpointed(
     let parity_journal_path = state.journal_path(selected.tape_uuid);
     let resources = PoolWriteResources::new(state.config().daemon.io_memory_ceiling)
         .map_err(PoolWriteError::InvalidInput)?;
-    write_to_selected_drive_checkpointed_with_catalog(
+    let result = write_to_selected_drive_checkpointed_with_catalog(
         state.catalog_index(),
         drive,
         &pool_cfg,
@@ -2291,7 +2291,24 @@ pub fn write_to_selected_drive_checkpointed(
         checkpoint_journal_dir.as_path(),
         parity_journal_path.as_path(),
         &resources,
-    )
+    )?;
+    finish_direct_write_host_suffix(state, &result)?;
+    Ok(result)
+}
+
+fn finish_direct_write_host_suffix(
+    state: &mut StateHandle,
+    result: &PoolWriteResult,
+) -> Result<(), PoolWriteError> {
+    if !result.sealed_after_write() {
+        return Ok(());
+    }
+    // The sealed checkpoint, not the in-memory result flag, is the authority
+    // for this host-only suffix. Replaying it publishes the exactly-once
+    // TapeSealed audit fact without touching media and repairs the same crash
+    // cut on the next invocation.
+    crate::reconcile_checkpoint_journal_projections(state)
+        .map_err(|status| PoolWriteError::CheckpointReconciliation(status.message().to_string()))
 }
 
 /// Resolve an already-committed direct write without selecting or moving tape.
@@ -2364,15 +2381,7 @@ fn write_to_selected_drive_checkpointed_with_catalog(
     drive.rewind()?;
     let current_cfg = drive.read_config()?;
     require_rewritable_object_media(current_cfg)?;
-    drive.write_config(TapeConfig {
-        block_size: BlockSize::Fixed {
-            size_bytes: selected.block_size,
-        },
-        compression: false,
-        max_block_size_bytes: current_cfg.max_block_size_bytes,
-        write_protected: current_cfg.write_protected,
-        worm: current_cfg.worm,
-    })?;
+    crate::drive_mode::configure_fixed_uncompressed_write(drive, current_cfg, selected.block_size)?;
     let mut sink = DriveHandleSink(drive);
     write_to_selected_tape_checkpointed_after_preflight(
         state,
@@ -9422,9 +9431,13 @@ mod tests {
             .iter()
             .map(|command| command.opcode)
             .collect::<Vec<_>>();
-        let mode_sense = opcodes
+        let mode_senses = opcodes
             .iter()
-            .position(|opcode| *opcode == 0x1a)
+            .enumerate()
+            .filter_map(|(index, opcode)| (*opcode == 0x1a).then_some(index))
+            .collect::<Vec<_>>();
+        let mode_sense = *mode_senses
+            .first()
             .expect("MODE SENSE must precede admission");
         let mode_select = opcodes
             .iter()
@@ -9434,9 +9447,16 @@ mod tests {
             .iter()
             .position(|opcode| matches!(*opcode, 0x0a | 0x10))
             .expect("the admitted drive must receive media writes");
+        let verified_mode_sense = mode_senses
+            .iter()
+            .copied()
+            .find(|index| *index > mode_select)
+            .expect("MODE SENSE must verify MODE SELECT");
         assert!(
-            mode_sense < mode_select && mode_select < first_write,
-            "drive sequence must be identity/media check, configuration, then write: {opcodes:02x?}"
+            mode_sense < mode_select
+                && mode_select < verified_mode_sense
+                && verified_mode_sense < first_write,
+            "drive sequence must be media check, MODE SELECT, verified MODE SENSE, then write: {opcodes:02x?}"
         );
 
         let replay_request = WriteObjectToPoolRequest {
@@ -12891,11 +12911,43 @@ mod tests {
             .prefix("remanence-terminal-success-")
             .tempdir()
             .expect("tempdir");
-        let mut index =
-            CatalogIndex::open(temp.path().join("rem-state.sqlite")).expect("open catalog");
         let pool_id = "terminal.success";
         let tape_uuid = [0x99; 16];
         let block_size = 1024 * 1024;
+        let config_text = format!(
+            r#"
+[daemon]
+state_dir = "{0}"
+default_idle_timeout_seconds = 1800
+read_only = false
+
+[[tape_pools]]
+id = "{1}"
+
+[journal]
+dir = "{0}/journals"
+require_trusted_volume = false
+
+[audit]
+dir = "{0}/audit"
+fsync = true
+
+[index]
+sqlite_path = "{0}/index/rem-state.sqlite"
+
+[cache]
+tape_catalog_dir = "{0}/cache/tapes"
+"#,
+            temp.path().display(),
+            pool_id
+        );
+        let config = remanence_state::parse_config_toml(&config_text).expect("parse config");
+        let paths =
+            remanence_state::StatePaths::from_config(temp.path().join("config.toml"), &config);
+        let checkpoint_dir = paths.journal_dir.join("checkpoints");
+        let audit_dir = paths.audit_dir.clone();
+        let mut state = StateHandle::open_with_config(paths, config).expect("open locked state");
+        let index = state.catalog_index();
         index
             .upsert_tape_pool_projection(remanence_state::TapePoolProjectionInput {
                 pool_id: pool_id.to_string(),
@@ -12930,13 +12982,12 @@ mod tests {
             min_object_size_bytes: 0,
         };
         let selected =
-            select_tape_in_pool(&index, &cfg, 7, &HashSet::new()).expect("fresh tape selects");
+            select_tape_in_pool(index, &cfg, 7, &HashSet::new()).expect("fresh tape selects");
         let payload_path = temp.path().join("payload.bin");
         std::fs::write(&payload_path, b"terminal authority payload").expect("write payload");
-        let checkpoint_dir = temp.path().join("checkpoints");
         let mut sink = SparseBlockSink::default();
         let result = write_to_selected_tape_checkpointed(
-            &mut index,
+            index,
             &mut sink,
             &cfg,
             WriteObjectToPoolRequest {
@@ -12995,6 +13046,53 @@ mod tests {
             .expect("tape exists");
         assert_eq!(tape.state, "sealed");
         assert_eq!(tape.written_extent_lba, Some(terminal.eod_lba));
+
+        finish_direct_write_host_suffix(&mut state, &result)
+            .expect("publish direct sealed host suffix");
+        finish_direct_write_host_suffix(&mut state, &result)
+            .expect("direct sealed host suffix is idempotent");
+
+        let session_id = Uuid::from_u128(0x9901);
+        state
+            .audit()
+            .append(remanence_state::AuditEventRecord {
+                actor: remanence_state::AuditActor::System,
+                source_layer: remanence_state::SourceLayer::Layer5,
+                operation_id: None,
+                session_id: Some(session_id),
+                idempotency_key: None,
+                event: remanence_state::AuditEvent::SessionOpened,
+                subject: remanence_state::AuditSubject {
+                    kind: "write".to_string(),
+                    id: Some(session_id.to_string()),
+                },
+                detail: std::collections::BTreeMap::from([(
+                    "session_kind".to_string(),
+                    ciborium::value::Value::Text("write".to_string()),
+                )]),
+            })
+            .expect("held state audit cursor remains append-safe after external seal fact");
+        let audit = remanence_state::FileAuditLog::replay(&audit_dir)
+            .expect("replay direct sealing audit chain");
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|record| {
+                    record.event == remanence_state::AuditEvent::TapeSealed
+                        && crate::audit_subject_matches_tape(record, tape_uuid)
+                })
+                .count(),
+            1,
+            "direct completion must publish exactly one TapeSealed fact before returning"
+        );
+        assert!(audit
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(
+            audit.last().map(|record| &record.event),
+            Some(&remanence_state::AuditEvent::SessionOpened),
+            "refresh must keep StateHandle's cached append cursor on the durable chain"
+        );
     }
 
     #[test]
