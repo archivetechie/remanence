@@ -146,4 +146,4 @@ What it buys, in exchange:
 For where the transport sits in the crate stack, see the
 [architecture overview](architecture-overview.md).
 
-<!-- code-anchor: crates/remanence-scsi/src/locate.rs crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-library/src/discovery.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-scsi/src/locate.rs crates/remanence-library/src/handle/tape_io/mod.rs crates/remanence-library/src/discovery.rs @ 244bc6de -->

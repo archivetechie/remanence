@@ -1,6 +1,6 @@
 # CLI reference
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/main.rs crates/remanence-cli/src/rem_debug.rs @ 244bc6de -->
 ## The binaries
 
 Remanence ships two command-line tools built from `crates/remanence-cli`,
@@ -53,7 +53,7 @@ Conventions shared across both CLIs:
 Both binaries print full usage with `--help` at every level; this page is a
 map, not a substitute for it.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-library/src/handle/tape_io/readiness.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-library/src/handle/tape_io/readiness.rs @ 244bc6de -->
 ## Exit codes
 
 Most subcommands exit 0 on success and 1 on failure (2 appears for a few
@@ -76,7 +76,7 @@ finer taxonomy so scripts can branch on what the drive reported:
 The `--json` output carries the same decoding in structured form
 (`recommended_next_command`, `operator_action` fields).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
 ## Discovery and hot-plug
 
 | Command | What it does |
@@ -89,7 +89,7 @@ Discovery is read-only but still issues SCSI commands, so it needs the
 `tape` group and `CAP_SYS_RAWIO` (see the [quickstart](guide-quickstart.md)
 and [troubleshooting](guide-troubleshooting.md)).
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
 ## Daemon queries
 
 All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
@@ -104,7 +104,7 @@ All of these speak gRPC to `rem-daemon` and take `--endpoint` and `--json`.
 | `rem catalog pools` / `rem catalog pool <POOL_ID>` | Tape pool definitions and membership. |
 | `rem catalog units [--origin all\|native\|foreign]` | Catalog units across native REM-OBJECT objects and foreign (scanned legacy) archives. |
 | `rem catalog unit <UNIT_ID>` / `rem catalog entries <UNIT_ID>` | One unit, or the entries inside it. |
-| `rem top [--once] [--json]` | Live TUI over daemon state; `--once` takes a single snapshot. |
+| `rem top [--once] [--json]` | Live TUI over daemon state; `--once` takes a single snapshot. In the TUI, `l` cycles the focused library when more than one is configured, `s` toggles the slot view, `p`/space pauses, and `?` shows help. |
 | `rem alarms [--all]` / `rem alarms ack <CONDITION_KEY>` | List standing alarms (with `--all`, cleared ones too) or acknowledge one. |
 
 Note: `GetLiveStatus` also carries an advisory `drive_assignments`
@@ -112,7 +112,7 @@ projection (per-bay busy/idle state, keyed `(library_serial, bay)`) for
 an external arbitration client — `rem top` does not currently render
 this field; it's wire-only today.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
 ## Drive stewardship
 
 Drive-fleet management through the daemon. A drive is addressed by serial
@@ -129,7 +129,7 @@ or UUID.
 | `rem drive retire <DRIVE> --reason <TEXT>` | Remove a drive from the managed fleet. A retired drive keeps its identity and still appears in `rem top` marked retired, but is excluded from every selection and mount path. Reversible with `reinstate`. |
 | `rem drive reinstate <DRIVE> --reason <TEXT>` | Return a retired drive to service. Records the reason alongside the retirement it reverses. Does not clear `fenced` or restore `actionable` — those are separate judgements. |
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
 ## Tape lifecycle
 
 Initialization, readiness, quarantine, and retirement run against local
@@ -155,7 +155,7 @@ local SCSI discovery.
 | `rem tape inventory --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Stream the complete bounded terminal inventory by locating EOD and selecting C, then B, then A. Human output labels every pre-summary row `provisional`; the final summary names the authoritative `attempt_id`. `--json` emits NDJSON events under `rem.tape.inventory.stream.v1` and ends with exactly one `summary` event. Consumers must commit only that summary's selected attempt. Rejected attempts make fallback evidence explicit; no surviving replica triggers a `bot_recovery_started` notice followed by per-tape-file `bot_recovery_progress` events and streamed BOT classifications rather than empty success. Cancellation is honored at those between-file boundaries. During BOT fallback, an exact surviving checkpoint journal can classify matching complete Objects as recovered; later or foreign Objects without that authority remain unknown. |
 | `rem tape verify-index --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Perform the distinct full physical verification: measure EOD, walk the prefix, compare the canonical map, and validate all three replicas and both separation extents. Its all-replicas-invalid BOT outcome applies the same checkpoint-assisted recovered/unknown/incomplete classification as inventory. |
 
-<!-- code-anchor: crates/remanence-cli/src/put.rs @ 836da0af -->
+<!-- code-anchor: crates/remanence-cli/src/put.rs @ 244bc6de -->
 ## Writing to tape
 
 `rem put` archives local files onto tape through the daemon — the same
@@ -177,7 +177,7 @@ paths are refused; non-regular files are skipped with a warning.
 | Command | What it does |
 |---|---|
 | `rem put <PATH>... [--pool <POOL_ID>] [--library <SERIAL>]` | Write each input file as one object to a tape pool. With no `--pool` and exactly one configured pool, that pool is used; with several, the choice is real policy and must be explicit. `--library` restricts selection and mounting to that configured library; without it, the daemon may choose an eligible cartridge in any configured library. The selected tape's barcode must appear in exactly one operated library before robotics begins. The daemon mounts it into a free drive in that library and seals tapes by watermark. If the open is fenced by a media-readiness operation (a cold tape load), put watches it to completion and retries once. |
-| `rem put <PATH>... --tape <UUID> --pool <POOL_ID>` | Pin a specific cartridge instead of letting pool policy choose. `--pool` is the mandatory guard: the pool you believe that tape belongs to. Pinning replaces pool *selection*, never *admission* — the tape still passes every pool-mode eligibility check (data kind, lifecycle state, block size, io fences, checkpoint-batch eligibility), and a pool mismatch is a refusal naming both pools, because pools carry copy-class segregation and a silent cross-pool write is policy corruption. A cartridge that was never initialized has no UUID to pin: tape identity is minted by `rem tape init`. |
+| `rem put <PATH>... --tape <UUID> --pool <POOL_ID>` | Pin a specific cartridge instead of letting pool policy choose. `--pool` is the mandatory guard: the pool you believe that tape belongs to; `--tape` and `--library` are mutually exclusive, since pinning a tape already implies its library. Pinning replaces pool *selection*, never *admission* — the tape still passes every pool-mode eligibility check (data kind, lifecycle state, block size, io fences, checkpoint-batch eligibility), and a pool mismatch is a refusal naming both pools, because pools carry copy-class segregation and a silent cross-pool write is policy corruption. A cartridge that was never initialized has no UUID to pin: tape identity is minted by `rem tape init`. |
 | `rem put ... [--id <ID>] [--meta <KEY=VALUE>]...` | Caller identity and opaque metadata recorded in the catalog. `--id` needs exactly one input file; the default caller id is the member's archive path. The `path` metadata key is reserved (it carries the archive path). |
 | `rem put <OBJECT> --stored-object --stored-object-id <UUID> --id <ID> [--pool <POOL_ID>]` | Validate one already-built plaintext REM-OBJECT, then write its fixed blocks byte-for-byte through the normal daemon write path. The UUID and caller id must match the identities embedded in the object. The object must use the selected tape block size, exactly match the deterministic writer output, contain a valid final manifest and regular payload members, and have canonical zero fill after tar EOF. It is fully spooled and validated before tape moves; it is never wrapped inside another REM-OBJECT. An exact `(pool, caller id, canonical input kind, content, stored representation)` retry is idempotent; changing input kind or stored representation under the same replay key is refused both before and after checkpoint. Canonical bytes already bind their member paths, so an outer archive-path value is irrelevant for this input kind. This append surface refuses a UUID that already exists outside that exact replay key rather than attempting to attach an additional copy after media motion. |
 | `rem put ... [--chunk-bytes <BYTES>] [--no-wait]` | Append stream chunk size (default 1 MiB), and `--no-wait` to fail fast instead of watching a media-readiness load. |
@@ -204,7 +204,7 @@ declared but not wired; the daemon rejects it. Targeting a tape with no
 pool assignment is likewise declared (`allow_unpooled` in the API) and
 rejected until a workflow needs it.
 
-<!-- code-anchor: crates/remanence-cli/src/get.rs @ 7bb2dca1 -->
+<!-- code-anchor: crates/remanence-cli/src/get.rs @ 244bc6de -->
 ## Restoring from tape
 
 `rem get` is put's counterpart: it restores an object's members from tape
@@ -230,7 +230,7 @@ the private key). Member paths from the catalog are sanitized with the
 same rules put applies on ingest — `..` refuses, absolute prefixes strip
 — so a restore never writes outside `--dest`, whatever the catalog says.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ ac3ff8bf -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-cli/src/archive_map.rs crates/remanence-aead/src/wrap.rs @ 244bc6de -->
 ## Archive objects (local, no tape)
 
 `rem archive` builds and reads portable REM-OBJECT object files on local disk.
@@ -301,7 +301,7 @@ it never substitutes labels from the new retry request.
   `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk/stored-range geometry.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/freeze_drill.rs @ 244bc6de -->
 ## rem-debug extras
 
 Everything above exists in `rem-debug` too. What `rem-debug` adds:
@@ -337,12 +337,13 @@ Destructive maintenance:
 | `rem-debug catalog reset-preflight [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Read-only admission for a scoped catalog reset. It enumerates every data and cleaning tape, rejects any bound label outside the two exact selector sets, and returns a source-bound token plus `source_schema_version`. Schema 16/17 clean-break predecessors are inspectable only when preservation is empty and every bound tape is explicitly allowed to be erased; they are never migrated or accepted for preservation. |
 | `rem-debug catalog reset --i-understand-this-erases-the-catalog [--expected-preflight-token <SHA256>] [--preserve-tape-voltag <VOLTAG>]... [--allow-erase-tape-voltag <VOLTAG>]...` | Destructively reset local catalog state from the configured paths. Any scoped reset requires the exact current preflight token and repeats selector and source-schema admission under the exclusive state lock before mutation. |
 | `rem-debug dev write-dump-to-tape --dump <PATH> --tape <SERIAL> --bay <BAY> --i-understand-this-overwrites-the-loaded-tape` | Overwrite the loaded scratch tape with raw dump bytes (test fixture setup). |
+| `rem-debug tape freeze-drill --allow <SERIAL> --device </dev/sgN> --block-size <BYTES> --damage-plan <PLAN> --report <PATH.json> [--data-mib <MIB>] [--default-index-separation] [--yes-i-know-scratch] [--allow-derived <SERIAL>]` | Run one destructive §18.4 fault-injected scratch-tape round-trip: write drill objects through a full terminal-index finalization, then inject a chosen read-side medium-error damage plan and verify recovery. `--damage-plan` is one of `bootstrap-copy0`, `sidecar-head`, `object-span`, `terminal-replica-c`, or `combined` (the maximal conforming set). `--yes-i-know-scratch` permits overwriting the tape when BOT cannot be read; `--default-index-separation` uses the production 1 GiB separation extent instead of the compact drill profile. Writes a stable JSON report to `--report`. |
 
 The `--allow-derived <SERIAL>` flag additionally permits operating drive
 bays whose identity was derived rather than read from the device; it must
 be a subset of `--allow`.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
 ## Catalog rebuild
 
 `rem rebuild-catalog-from-journals [--config <PATH>]` rebuilds the SQLite

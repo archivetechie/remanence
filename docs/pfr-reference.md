@@ -489,6 +489,7 @@ per-block > 1.
 
 ---
 
+<!-- code-anchor: crates/remanence-order crates/remanence-scsi/src/read_end_of_wrap_position.rs crates/remanence-scsi/src/report_supported_opcodes.rs crates/remanence-api/src/read_plan.rs crates/remanence-api/src/calibration.rs @ 244bc6de -->
 ## 8. Read ordering and batch restore
 
 Ordering is not a PFR feature in itself — it is a multi-target restore
@@ -517,11 +518,19 @@ around 50% for recalls of fewer than 500 files.
 
 ### 8.2 Why rem does not use it
 
-**Not yet built.** As of this writing there is no `READ END OF WRAP
-POSITION` implementation anywhere in `remanence-scsi`, and no wrap-order
-computation or cache in the write or read path — same status as the
-batched RPC in §8.4. The rest of this section describes the intended
-design and the reasoning that shaped it, not shipped behavior.
+**Built, and live behind an advisory RPC.** `READ END OF WRAP POSITION` is
+implemented in `remanence-scsi`, and the wrap-order computation and cost
+model ship as `remanence-order`, a dependency-free crate. `remanence-api`
+harvests a drive's wrap map once per load and answers it through the gRPC
+`ReadPlanService.PlanBatchRead` RPC (see [architecture
+overview](architecture-overview.md#read-order-planning)) — a plan that
+never touches media and commits nothing, so the read contract in §8.3
+below is unchanged. No in-tree CLI issues this RPC yet; it exists today for
+an external orchestrator client. The batched-execution RPC in §8.4 remains
+unbuilt — planning an order and executing a batch of reads are different
+things, and only the former exists. The rest of this section describes the
+design and the reasoning that shaped it, which now matches shipped
+behavior.
 
 RAO is available on **LTO-9 and later full-height drives only**. It is
 not available on LTO-9 half-height, nor on LTO-8 or earlier. The
@@ -596,8 +605,9 @@ validity window attaches to it.
 ### 8.4 Batched execution — planned, not yet built
 
 A future `ReadService.BatchReadRange` RPC will accept a batch of read
-targets against one session and stream the results back. It is worth
-recording why, because the reason is not the drive feature above.
+targets against one session and stream the results back — distinct from
+§8.2's `PlanBatchRead`, which only plans an order and never reads. It is
+worth recording why, because the reason is not the drive feature above.
 
 When a drive stops streaming it must halt, back up and resume. The HP
 LTO-6 technical reference gives the mean cost of that reposition as

@@ -68,7 +68,7 @@ verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
 
-<!-- code-anchor: Cargo.toml @ f643f8c2 -->
+<!-- code-anchor: Cargo.toml @ 244bc6de -->
 ## Build
 
 Rust 1.85+, Linux. No system dependencies for the default build:
@@ -94,7 +94,7 @@ cargo test --workspace --exclude remanence-chaos
 Hardware-touching tests are ignored by default and opt in via
 environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
 ## Quickstart
 
 The native object format works against local files, no tape required:
@@ -167,7 +167,7 @@ REM-OBJECT files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
-<!-- code-anchor: Cargo.toml @ f643f8c2 -->
+<!-- code-anchor: Cargo.toml @ 244bc6de -->
 ## Repository layout
 
 ```text
@@ -179,6 +179,7 @@ crates/remanence-format-driver  Published format-driver traits and foreign-adapt
 crates/remanence-format         Native rem-object-v1 body format
 crates/remanence-parity         Layer 3c sidecar parity and recovery
 crates/remanence-stream         Restore/recovery streaming composition
+crates/remanence-order          Dependency-free read-order planner (wrap-map geometry, cost model, solver) behind remanence-api's PlanBatchRead RPC
 crates/remanence-state          Layer 4 catalog, audit, config, lock
 crates/remanence-api            Layer 5 gRPC service implementations
 crates/remanence-daemon         rem-daemon service host
