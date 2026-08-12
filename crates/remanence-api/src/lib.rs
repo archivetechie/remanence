@@ -996,19 +996,32 @@ impl ApiState {
     }
 
     async fn live_status_response(&self) -> Result<pb::GetLiveStatusResponse, Status> {
+        self.live_status_response_inner(true)
+    }
+
+    async fn fresh_live_status_response(&self) -> Result<pb::GetLiveStatusResponse, Status> {
+        self.live_status_response_inner(false)
+    }
+
+    fn live_status_response_inner(
+        &self,
+        allow_cached: bool,
+    ) -> Result<pb::GetLiveStatusResponse, Status> {
         let snapshot_at = OffsetDateTime::now_utc();
-        if let Some(cached) = self
-            .live_status
-            .cache
-            .read()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-        {
-            if snapshot_at - cached.0 < self.live_status.min_poll_interval {
-                let mut response = cached.1;
-                self.refresh_live_observations(&mut response);
-                response.drive_assignments = self.drive_assignments(&response.libraries)?;
-                return Ok(response);
+        if allow_cached {
+            if let Some(cached) = self
+                .live_status
+                .cache
+                .read()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone()
+            {
+                if snapshot_at - cached.0 < self.live_status.min_poll_interval {
+                    let mut response = cached.1;
+                    self.refresh_live_observations(&mut response);
+                    response.drive_assignments = self.drive_assignments(&response.libraries)?;
+                    return Ok(response);
+                }
             }
         }
 

@@ -210,28 +210,6 @@ pub(crate) fn voltag_uuid_map(index: &CatalogIndex) -> Result<HashMap<String, Ve
     Ok(map)
 }
 
-fn fenced_drive_bays(index: &CatalogIndex, library_serial: &str) -> Result<HashSet<u16>, Status> {
-    let mut bays = HashSet::new();
-    for drive in index
-        .list_drives(true, true)
-        .map_err(crate::status_from_state_error)?
-    {
-        if !drive.fenced {
-            continue;
-        }
-        if drive.last_library_serial.as_deref() != Some(library_serial) {
-            continue;
-        }
-        if let Some(bay) = drive
-            .last_element_address
-            .and_then(|value| u16::try_from(value).ok())
-        {
-            bays.insert(bay);
-        }
-    }
-    Ok(bays)
-}
-
 fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
     pb::DriveCatalogEntry {
         drive_uuid: record.drive_uuid,
@@ -552,27 +530,21 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         crate::authorize_request(&request, crate::AuthPermission::Read)?;
         let requested =
             crate::decode_uuid_bytes(&request.into_inner().library_uuid, "library_uuid")?;
-        let snapshot = self
-            .state
-            .current_library_snapshot()
-            .ok_or_else(|| Status::not_found("library not found"))?;
-        let library = snapshot
-            .report
+        // GetLibrary promises the current inventory snapshot. Unlike the
+        // polling-oriented GetLiveStatus surface, it must not reuse a response
+        // cached before a just-completed changer refresh.
+        let response = self.state.fresh_live_status_response().await?;
+        let library = response
             .libraries
-            .iter()
-            .find(|library| library_uuid(&library.serial) == requested)
+            .into_iter()
+            .find(|state| {
+                state
+                    .library
+                    .as_ref()
+                    .is_some_and(|library| library.library_uuid.as_slice() == requested)
+            })
             .ok_or_else(|| Status::not_found("library not found"))?;
-        let index = self.state.index()?;
-        let voltags = voltag_uuid_map(&index)?;
-        let busy_bays = self.state.busy_drive_bays(&library.serial);
-        let fenced_bays = fenced_drive_bays(&index, library.serial.as_str())?;
-        Ok(Response::new(project_library_state(
-            library,
-            &snapshot.captured_at,
-            &voltags,
-            &busy_bays,
-            &fenced_bays,
-        )))
+        Ok(Response::new(library))
     }
 
     async fn refresh_inventory(
@@ -1326,6 +1298,16 @@ mod tests {
         identity_source: &str,
         bay: i64,
     ) -> Vec<u8> {
+        observe_test_drive_in_library(index, serial, identity_source, "DEC418146K_LL02", bay)
+    }
+
+    fn observe_test_drive_in_library(
+        index: &mut CatalogIndex,
+        serial: &str,
+        identity_source: &str,
+        library_serial: &str,
+        bay: i64,
+    ) -> Vec<u8> {
         index
             .observe_drive(DriveObservationInput {
                 serial: serial.to_string(),
@@ -1334,7 +1316,7 @@ mod tests {
                 product: Some("Ultrium 9-SCSI".to_string()),
                 firmware_rev: Some("R1.0".to_string()),
                 managed: "rem".to_string(),
-                library_serial: Some("DEC418146K_LL02".to_string()),
+                library_serial: Some(library_serial.to_string()),
                 element_address: Some(bay),
                 observed_at_utc: Some("2026-07-04T00:00:00Z".to_string()),
             })
@@ -1558,8 +1540,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_library_returns_state_for_known_uuid() {
-        let response = state_with_snapshot()
+    async fn get_library_returns_catalog_enriched_state_for_known_uuid() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "8031BDC7D1", "DvcidInline", 1);
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+        let response = state
             .library_service()
             .get_library(Request::new(pb::GetLibraryRequest {
                 library_uuid: library_uuid("DEC418146K_LL02").to_vec(),
@@ -1574,7 +1560,174 @@ mod tests {
         assert_eq!(response.drives.len(), 1);
         assert_eq!(response.slots.len(), 1);
         assert!(response.drives[0].loaded_tape_uuid.is_none());
+        assert_eq!(
+            response.drives[0].drive_uuid.as_deref(),
+            Some(drive_uuid.as_slice())
+        );
+        assert_eq!(
+            response.drives[0].catalog_state,
+            pb::DriveCatalogState::Cataloged as i32
+        );
         assert_eq!(response.last_inventory_at.expect("timestamp").seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn get_library_bypasses_a_live_status_response_cached_before_refresh() {
+        let state = state_with_snapshot();
+        state
+            .live_status_response()
+            .await
+            .expect("seed live-status cache");
+
+        let mut refreshed_library = mk_library();
+        refreshed_library.drive_bays[0]
+            .installed
+            .as_mut()
+            .expect("refreshed drive")
+            .serial = "REFRESHED-DRIVE".to_string();
+        *state
+            .library_snapshot
+            .as_ref()
+            .expect("library snapshot")
+            .write()
+            .expect("snapshot write lock") = Arc::new(crate::LibrarySnapshot {
+            report: DiscoveryReport {
+                libraries: vec![refreshed_library],
+                warnings: Vec::new(),
+            },
+            captured_at: OffsetDateTime::UNIX_EPOCH,
+        });
+
+        let response = state
+            .library_service()
+            .get_library(Request::new(pb::GetLibraryRequest {
+                library_uuid: library_uuid("DEC418146K_LL02").to_vec(),
+            }))
+            .await
+            .expect("get refreshed library")
+            .into_inner();
+
+        assert_eq!(
+            response.drives[0].drive_serial.as_deref(),
+            Some("REFRESHED-DRIVE")
+        );
+    }
+
+    /// Regression: identical changer bay numbers must not cross library boundaries.
+    #[tokio::test]
+    async fn get_library_scopes_same_bay_drive_identity_to_requested_library() {
+        let first_library = mk_library();
+        let mut second_library = mk_library();
+        second_library.serial = "SECOND-LIBRARY".to_string();
+        second_library.drive_bays[0]
+            .installed
+            .as_mut()
+            .expect("second library drive")
+            .serial = "SECOND-DRIVE".to_string();
+
+        let mut index = test_index();
+        let first_drive_uuid = observe_test_drive_in_library(
+            &mut index,
+            "8031BDC7D1",
+            "DvcidInline",
+            first_library.serial.as_str(),
+            1,
+        );
+        let second_drive_uuid = observe_test_drive_in_library(
+            &mut index,
+            "SECOND-DRIVE",
+            "DvcidInline",
+            second_library.serial.as_str(),
+            1,
+        );
+        assert_ne!(first_drive_uuid, second_drive_uuid);
+
+        let mut state = ApiState::new(index);
+        state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
+            crate::LibrarySnapshot {
+                report: DiscoveryReport {
+                    libraries: vec![first_library, second_library],
+                    warnings: Vec::new(),
+                },
+                captured_at: OffsetDateTime::UNIX_EPOCH,
+            },
+        ))));
+
+        let response = state
+            .library_service()
+            .get_library(Request::new(pb::GetLibraryRequest {
+                library_uuid: library_uuid("SECOND-LIBRARY").to_vec(),
+            }))
+            .await
+            .expect("get second library")
+            .into_inner();
+
+        assert_eq!(
+            response.library.expect("library").library_serial,
+            "SECOND-LIBRARY"
+        );
+        assert_eq!(response.drives.len(), 1);
+        assert_eq!(
+            response.drives[0].drive_serial.as_deref(),
+            Some("SECOND-DRIVE")
+        );
+        assert_eq!(
+            response.drives[0].drive_uuid.as_deref(),
+            Some(second_drive_uuid.as_slice())
+        );
+        assert_ne!(
+            response.drives[0].drive_uuid.as_deref(),
+            Some(first_drive_uuid.as_slice())
+        );
+        assert_eq!(
+            response.drives[0].catalog_state,
+            pb::DriveCatalogState::Cataloged as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn get_library_explains_a_genuinely_uncatalogued_bay() {
+        let response = state_with_snapshot()
+            .library_service()
+            .get_library(Request::new(pb::GetLibraryRequest {
+                library_uuid: library_uuid("DEC418146K_LL02").to_vec(),
+            }))
+            .await
+            .expect("get library")
+            .into_inner();
+
+        assert!(response.drives[0].drive_uuid.is_none());
+        assert_eq!(
+            response.drives[0].catalog_state,
+            pb::DriveCatalogState::Uncatalogued as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn get_library_preserves_retired_drive_identity() {
+        let mut index = test_index();
+        let drive_uuid = observe_test_drive(&mut index, "8031BDC7D1", "DvcidInline", 1);
+        index
+            .retire_drive(drive_uuid.as_slice(), "get-library regression")
+            .expect("retire drive")
+            .expect("drive exists");
+        let mut state = state_with_snapshot();
+        state.index_path = Arc::new(index.path().to_path_buf());
+
+        let response = state
+            .library_service()
+            .get_library(Request::new(pb::GetLibraryRequest {
+                library_uuid: library_uuid("DEC418146K_LL02").to_vec(),
+            }))
+            .await
+            .expect("get library")
+            .into_inner();
+
+        assert_eq!(response.drives[0].drive_uuid, Some(drive_uuid));
+        assert_eq!(
+            response.drives[0].catalog_state,
+            pb::DriveCatalogState::Retired as i32
+        );
     }
 
     #[tokio::test]
