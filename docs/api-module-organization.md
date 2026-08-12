@@ -78,3 +78,24 @@ their original test names and private-item access, keeping the organization
 change reviewable without rewriting fixtures at the same time. The crate's
 unit, documentation, formatting, lint, workspace, release-build, and
 clean-slate scenario gates remain the behavioral proof for this refactor.
+
+## Verification evidence
+
+The decomposition is committed at Remanence
+`f559f17d5581c29e0b8552172cc424837c22966b`. At that head:
+
+- `cargo test -p remanence-api --all-targets` passed 515 unit tests and one
+  documentation test.
+- `cargo test --workspace --all-targets`, `cargo fmt --all -- --check`,
+  warning-denied workspace Clippy, and `cargo build --release` all completed
+  successfully.
+- Clean-slate strict-freshness System scenarios passed for same-tape append,
+  operator `put`, parity-checkpoint replay, whole-object crash recovery,
+  terminal-index finalization/recovery, and live status. The terminal-index
+  run completed all 12 steps, including manual early finalization and its
+  fault/recovery matrix.
+
+These are behavior checks, not merely source-layout checks: they exercise the
+extracted ingress, pool selection, mounted write-session, checkpoint,
+terminal-finalization, inventory, readback, and recovery paths through the
+release daemon and CLI.
