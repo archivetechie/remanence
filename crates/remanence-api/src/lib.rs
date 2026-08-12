@@ -7842,6 +7842,24 @@ mod tests {
         assert_ne!(
             baseline,
             manual_finalize_request_fingerprint(
+                [0x12; 16],
+                Some("slow-pool"),
+                "service:operator-a",
+                b"ship copy offsite",
+            )
+        );
+        assert_ne!(
+            baseline,
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                Some("other-slow-pool"),
+                "service:operator-a",
+                b"ship copy offsite",
+            )
+        );
+        assert_ne!(
+            baseline,
+            manual_finalize_request_fingerprint(
                 tape_uuid,
                 Some("slow-pool"),
                 "service:operator-b",
@@ -7866,6 +7884,71 @@ mod tests {
                 b"ship copy offsite",
             )
         );
+    }
+
+    #[test]
+    fn manual_finalize_changed_fields_conflict_after_catalog_restart() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-manual-finalize-idempotency-restart")
+            .tempdir()
+            .expect("tempdir");
+        let index_path = temp.path().join("rem-state.sqlite");
+        let actor_fingerprint = "service:operator-a";
+        let idempotency_key = Uuid::from_u128(0xf101);
+        let operation_id = Uuid::from_u128(0xf102);
+        let tape_uuid = [0x11; 16];
+        let baseline = manual_finalize_request_fingerprint(
+            tape_uuid,
+            Some("slow-pool"),
+            actor_fingerprint,
+            b"ship copy offsite",
+        );
+        CatalogIndex::open(&index_path)
+            .expect("open catalog")
+            .register_idempotency_request(
+                actor_fingerprint,
+                FINALIZE_TAPE_OPERATION_KIND,
+                idempotency_key,
+                baseline,
+                operation_id,
+                Some("2026-08-12T00:00:00Z"),
+            )
+            .expect("register baseline request");
+
+        let changed_fingerprints = [
+            manual_finalize_request_fingerprint(
+                [0x12; 16],
+                Some("slow-pool"),
+                actor_fingerprint,
+                b"ship copy offsite",
+            ),
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                Some("other-slow-pool"),
+                actor_fingerprint,
+                b"ship copy offsite",
+            ),
+            manual_finalize_request_fingerprint(
+                tape_uuid,
+                Some("slow-pool"),
+                actor_fingerprint,
+                b"ship the copy offsite",
+            ),
+        ];
+        for changed_fingerprint in changed_fingerprints {
+            let conflict = CatalogIndex::open(&index_path)
+                .expect("restart catalog")
+                .register_idempotency_request(
+                    actor_fingerprint,
+                    FINALIZE_TAPE_OPERATION_KIND,
+                    idempotency_key,
+                    changed_fingerprint,
+                    Uuid::new_v4(),
+                    None,
+                )
+                .expect_err("changed request must conflict after restart");
+            assert!(matches!(conflict, StateError::IdempotencyConflict(_)));
+        }
     }
 
     #[test]

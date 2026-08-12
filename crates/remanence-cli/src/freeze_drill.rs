@@ -23,14 +23,14 @@ use remanence_format::{
 };
 use remanence_library::{DriveHandle, DriveHandleSource, SgTransport};
 use remanence_parity::{
-    checked_tape_index_replica_layout, default_scheme_for_block_size, plan_index_separation,
-    plan_tape_index_edition, plan_tape_index_replica, read_terminal_index_inventory,
-    scan_reconstruct_filemark_map_with_report, write_terminal_tail, CommittedBundle,
-    CommittedBundleKind, CommittedState, DriveHandleRawSink, DriveHandleRawSource, FilemarkMap,
-    IndexSeparationDescriptor, JournalError, ObjectParitySource, ObjectRecoveryRepresentation,
-    OpenTrust, ParityAuditHook, ParityError, ParityScheme, ParitySink, RecoveryEvent,
-    RecoveryOutcome, ScanDamageKind, ScopedFilemarkMap, TapeFileEntry, TapeFileJournal,
-    TapeFileKind, TapeFileMapEntry, TapeFilePosition, TapeIndexEditionDescriptor,
+    checked_tape_index_replica_layout, default_scheme_for_block_size, index_separation_records,
+    plan_index_separation, plan_tape_index_edition, plan_tape_index_replica,
+    read_terminal_index_inventory, scan_reconstruct_filemark_map_with_report, write_terminal_tail,
+    CommittedBundle, CommittedBundleKind, CommittedState, DriveHandleRawSink, DriveHandleRawSource,
+    FilemarkMap, IndexSeparationDescriptor, JournalError, ObjectParitySource,
+    ObjectRecoveryRepresentation, OpenTrust, ParityAuditHook, ParityError, ParityScheme,
+    ParitySink, RecoveryEvent, RecoveryOutcome, ScanDamageKind, ScopedFilemarkMap, TapeFileEntry,
+    TapeFileJournal, TapeFileKind, TapeFileMapEntry, TapeFilePosition, TapeIndexEditionDescriptor,
     TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
     TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
     TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalInventoryOutcome,
@@ -109,6 +109,8 @@ impl DamagePlan {
 pub(crate) struct DrillSettings {
     block_size: u32,
     data_mib: u64,
+    default_index_separation: bool,
+    gap_records: u64,
     damage_plan: DamagePlan,
     unreadable_bot_ack: bool,
     scheme: ParityScheme,
@@ -118,6 +120,7 @@ impl DrillSettings {
     fn live(
         block_size: u32,
         data_mib: u64,
+        default_index_separation: bool,
         damage_plan: DamagePlan,
         unreadable_bot_ack: bool,
     ) -> Result<Self, String> {
@@ -128,9 +131,17 @@ impl DrillSettings {
         data_mib
             .checked_mul(MIB)
             .ok_or_else(|| "--data-mib byte count overflows u64".to_string())?;
+        let gap_records = if default_index_separation {
+            index_separation_records(block_size, DEFAULT_INDEX_SEPARATION_BYTES)
+                .map_err(|error| format!("derive default index separation: {error}"))?
+        } else {
+            DRILL_GAP_RECORDS
+        };
         Ok(Self {
             block_size,
             data_mib,
+            default_index_separation,
+            gap_records,
             damage_plan,
             unreadable_bot_ack,
             scheme: default_scheme_for_block_size(block_size),
@@ -199,6 +210,12 @@ pub(crate) struct FreezeDrillReport {
     data_mib: u64,
     #[serde(serialize_with = "serialize_decimal_u64")]
     data_bytes: u64,
+    terminal_gap_profile: &'static str,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    index_separation_bytes: u64,
+    #[serde(serialize_with = "serialize_decimal_u64")]
+    index_separation_records: u64,
+    compression_verified_off: bool,
     damage_plan: DamagePlan,
     faulted_blocks: Vec<FaultedBlock>,
     #[serde(serialize_with = "serialize_decimal_u64_slice")]
@@ -580,6 +597,7 @@ fn filemark_entry_from_terminal(entry: &TapeIndexReplicaMapEntry) -> TapeFileMap
 fn plan_drill_terminal_tail(
     tape_uuid: [u8; 16],
     block_size: u32,
+    gap_records: u64,
     prefix: &TerminalPrefixPlan,
     committed: &CommittedState,
     expected_objects: &[ExpectedObject],
@@ -613,7 +631,7 @@ fn plan_drill_terminal_tail(
         structural_entry_count,
         prefix.tail_start_lba,
         replica_records,
-        DRILL_GAP_RECORDS,
+        gap_records,
     )
     .map_err(|error| format!("plan freeze-drill terminal tail layout: {error}"))?;
     let mut edition_hasher = Sha256::new();
@@ -644,6 +662,15 @@ fn plan_drill_terminal_tail(
         &mut planning_rows,
     )
     .map_err(|error| format!("plan freeze-drill terminal edition: {error}"))?;
+    if gap_records
+        .checked_mul(u64::from(block_size))
+        .ok_or_else(|| "freeze-drill separation byte count overflows u64".to_string())?
+        == DEFAULT_INDEX_SEPARATION_BYTES
+    {
+        let plan = TerminalTripleWritePlan::new(edition)
+            .map_err(|error| format!("assemble default freeze-drill terminal plan: {error}"))?;
+        return Ok((rows, plan));
+    }
     let replicas = [
         plan_tape_index_replica(edition.clone(), 1)
             .map_err(|error| format!("plan freeze-drill replica A: {error}"))?,
@@ -653,13 +680,16 @@ fn plan_drill_terminal_tail(
             .map_err(|error| format!("plan freeze-drill replica C: {error}"))?,
     ];
     let separation = |gap_ordinal| {
+        let nominal_extent_bytes = gap_records
+            .checked_mul(u64::from(block_size))
+            .ok_or_else(|| "freeze-drill separation byte count overflows u64".to_string())?;
         plan_index_separation(IndexSeparationDescriptor {
             tape_uuid,
             edition_id,
             gap_ordinal,
             block_size,
-            nominal_extent_bytes: DRILL_GAP_RECORDS * u64::from(block_size),
-            total_records: DRILL_GAP_RECORDS,
+            nominal_extent_bytes,
+            total_records: gap_records,
             compression_enabled: false,
             terminal_layout: layout,
         })
@@ -844,6 +874,7 @@ fn write_drill_tape(
     let (mut terminal_rows, terminal_plan) = plan_drill_terminal_tail(
         tape_uuid,
         settings.block_size,
+        settings.gap_records,
         &prefix_plan,
         &committed,
         &expected_objects,
@@ -1336,6 +1367,19 @@ fn run_drill(
             .data_mib
             .checked_mul(MIB)
             .ok_or_else(|| "report payload byte count overflows u64".to_string())?,
+        terminal_gap_profile: if settings.default_index_separation {
+            "default_1gib"
+        } else {
+            "compact"
+        },
+        index_separation_bytes: settings
+            .gap_records
+            .checked_mul(u64::from(settings.block_size))
+            .ok_or_else(|| "report separation byte count overflows u64".to_string())?,
+        index_separation_records: settings.gap_records,
+        // The raw writer returns success only after MODE SENSE confirms this
+        // exact write precondition.
+        compression_verified_off: true,
         damage_plan: settings.damage_plan,
         faulted_blocks,
         observed_fault_lbas: recovery.observed_fault_lbas,
@@ -1464,6 +1508,7 @@ pub(crate) struct LiveDrillRequest<'a> {
     pub(crate) device: &'a Path,
     pub(crate) block_size: u32,
     pub(crate) data_mib: u64,
+    pub(crate) default_index_separation: bool,
     pub(crate) damage_plan: DamagePlan,
     pub(crate) unreadable_bot_ack: bool,
     pub(crate) report_path: &'a Path,
@@ -1480,6 +1525,7 @@ pub(crate) fn run_live(
         let settings = DrillSettings::live(
             request.block_size,
             request.data_mib,
+            request.default_index_separation,
             request.damage_plan,
             request.unreadable_bot_ack,
         )?;
@@ -1606,6 +1652,8 @@ mod tests {
                     DrillSettings {
                         block_size,
                         data_mib: 1,
+                        default_index_separation: false,
+                        gap_records: DRILL_GAP_RECORDS,
                         damage_plan,
                         unreadable_bot_ack: false,
                         scheme: test_scheme(block_size),
@@ -1690,6 +1738,8 @@ mod tests {
             &DrillSettings {
                 block_size,
                 data_mib: 1,
+                default_index_separation: false,
+                gap_records: DRILL_GAP_RECORDS,
                 damage_plan: DamagePlan::TerminalReplicaC,
                 unreadable_bot_ack: false,
                 scheme: test_scheme(block_size),
@@ -1764,6 +1814,8 @@ mod tests {
         let settings = |damage_plan| DrillSettings {
             block_size,
             data_mib: 1,
+            default_index_separation: false,
+            gap_records: DRILL_GAP_RECORDS,
             damage_plan,
             unreadable_bot_ack: false,
             scheme: test_scheme(block_size),
@@ -1802,8 +1854,14 @@ mod tests {
 
     #[test]
     fn live_settings_reject_zero_volume_and_unknown_block_size() {
-        assert!(DrillSettings::live(262_144, 0, DamagePlan::ObjectSpan, false).is_err());
-        assert!(DrillSettings::live(4096, 1, DamagePlan::ObjectSpan, false).is_err());
+        assert!(DrillSettings::live(262_144, 0, false, DamagePlan::ObjectSpan, false).is_err());
+        assert!(DrillSettings::live(4096, 1, false, DamagePlan::ObjectSpan, false).is_err());
+        assert_eq!(
+            DrillSettings::live(262_144, 1, true, DamagePlan::ObjectSpan, false)
+                .expect("default separation settings")
+                .gap_records,
+            4096
+        );
     }
 
     #[test]
@@ -1818,6 +1876,7 @@ mod tests {
             "524288",
             "--data-mib",
             "32",
+            "--default-index-separation",
             "--damage-plan",
             "terminal-replica-c",
             "--yes-i-know-scratch",
@@ -1834,6 +1893,7 @@ mod tests {
         assert_eq!(args.device, Path::new("/dev/sg7"));
         assert_eq!(args.block_size.bytes(), 524_288);
         assert_eq!(args.data_mib, 32);
+        assert!(args.default_index_separation);
         assert_eq!(args.damage_plan, DamagePlan::TerminalReplicaC);
         assert!(args.yes_i_know_scratch);
         assert_eq!(args.report, Path::new("/tmp/freeze-report.json"));
@@ -1847,6 +1907,10 @@ mod tests {
             block_size_bytes: 262_144,
             data_mib: u64::MAX,
             data_bytes: u64::MAX,
+            terminal_gap_profile: "default_1gib",
+            index_separation_bytes: u64::MAX,
+            index_separation_records: u64::MAX,
+            compression_verified_off: true,
             damage_plan: DamagePlan::Combined,
             faulted_blocks: vec![FaultedBlock {
                 lba: u64::MAX,
@@ -1887,6 +1951,8 @@ mod tests {
         for pointer in [
             "/data_mib",
             "/data_bytes",
+            "/index_separation_bytes",
+            "/index_separation_records",
             "/faulted_blocks/0/lba",
             "/observed_fault_lbas/0",
             "/scan/bootstrap_generation_used",
