@@ -16,7 +16,8 @@ use crate::index_separation::{
 };
 use crate::journal::{CommittedBundle, CommittedBundleKind, TapeFileEntry};
 use crate::raw::{
-    PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome,
+    raw_read_error_proves_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
+    RawWriteOutcome,
 };
 use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header, plan_tape_index_replica,
@@ -190,7 +191,8 @@ pub fn reconcile_terminal_tail_next(
             return TerminalComponentReconcileEvidence::Absent;
         }
         Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block_size => {}
-        _ => return classify_torn_at_start(source, start, rewritable),
+        Ok(_) => return classify_torn_at_start(source, start, rewritable),
+        Err(error) => return classify_tail_read_error(source, start, rewritable, &error),
     }
 
     let footer_lba =
@@ -203,14 +205,16 @@ pub fn reconcile_terminal_tail_next(
         lba: footer_lba,
     };
     let mut footer_block = vec![0; block_size];
-    let footer_read = source
-        .locate_physical(footer_position)
-        .and_then(|()| source.read_record(&mut footer_block));
-    if !matches!(footer_read, Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block_size) {
-        return classify_torn_at_start(source, start, rewritable);
+    if source.locate_physical(footer_position).is_err() {
+        return TerminalComponentReconcileEvidence::Unproved;
+    }
+    match source.read_record(&mut footer_block) {
+        Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block_size => {}
+        Ok(_) => return classify_torn_at_start(source, start, rewritable),
+        Err(error) => return classify_tail_read_error(source, start, rewritable, &error),
     }
 
-    let valid = match component.kind {
+    let validation = match component.kind {
         TerminalTailComponentKind::TapeIndexReplica => {
             validate_physical_replica(source, plan, component_index, &header_block, &footer_block)
         }
@@ -222,8 +226,14 @@ pub fn reconcile_terminal_tail_next(
             &footer_block,
         ),
     };
-    if !valid {
-        return classify_torn_at_start(source, start, rewritable);
+    match validation {
+        PhysicalComponentValidation::Valid => {}
+        PhysicalComponentValidation::Invalid => {
+            return classify_torn_at_start(source, start, rewritable);
+        }
+        PhysicalComponentValidation::Unproved => {
+            return TerminalComponentReconcileEvidence::Unproved;
+        }
     }
 
     let filemark_position = PhysicalPositionHint {
@@ -249,7 +259,8 @@ pub fn reconcile_terminal_tail_next(
         {
             TerminalComponentReconcileEvidence::Complete
         }
-        _ => classify_torn_at_start(source, start, rewritable),
+        Ok(_) => classify_torn_at_start(source, start, rewritable),
+        Err(error) => classify_tail_read_error(source, start, rewritable, &error),
     }
 }
 
@@ -272,50 +283,77 @@ fn classify_torn_at_start(
     }
 }
 
+fn classify_tail_read_error(
+    source: &mut dyn RawTapeSource,
+    start: PhysicalPositionHint,
+    rewritable: bool,
+    error: &ParityError,
+) -> TerminalComponentReconcileEvidence {
+    if raw_read_error_proves_damage(error) {
+        classify_torn_at_start(source, start, rewritable)
+    } else {
+        TerminalComponentReconcileEvidence::Unproved
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PhysicalComponentValidation {
+    Valid,
+    Invalid,
+    Unproved,
+}
+
 fn validate_physical_replica(
     source: &mut dyn RawTapeSource,
     plan: &TerminalTripleWritePlan,
     component_index: usize,
     header_block: &[u8],
     footer_block: &[u8],
-) -> bool {
+) -> PhysicalComponentValidation {
     let expected = &plan.replicas[component_index / 2];
     let Ok(header) =
         parse_tape_index_replica_header(header_block, &plan.edition.descriptor.tape_uuid)
     else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     let Ok(footer) =
         parse_tape_index_bootstrap_footer(footer_block, &plan.edition.descriptor.tape_uuid)
     else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     if &header.plan != expected || &footer.plan != expected {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     }
     let Some(payload_start_lba) = expected.component.planned_start_lba.checked_add(1) else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     let payload_start = PhysicalPositionHint {
         partition: plan.edition.descriptor.terminal_layout.partition,
         lba: payload_start_lba,
     };
     if source.locate_physical(payload_start).is_err() {
-        return false;
+        return PhysicalComponentValidation::Unproved;
     }
     let mut blocks = RawReplicaPayload {
         source,
         remaining: expected.edition.replica_layout.payload_record_count,
         block_size: expected.edition.descriptor.block_size as usize,
+        unproved_read: false,
     };
-    validate_tape_index_replica_payload(&header, &footer, &mut blocks, |_| Ok(()), |_| Ok(()))
-        .is_ok()
+    let result =
+        validate_tape_index_replica_payload(&header, &footer, &mut blocks, |_| Ok(()), |_| Ok(()));
+    match result {
+        Ok(_) => PhysicalComponentValidation::Valid,
+        Err(_) if blocks.unproved_read => PhysicalComponentValidation::Unproved,
+        Err(_) => PhysicalComponentValidation::Invalid,
+    }
 }
 
 struct RawReplicaPayload<'a> {
     source: &'a mut dyn RawTapeSource,
     remaining: u64,
     block_size: usize,
+    unproved_read: bool,
 }
 
 impl TapeIndexReplicaPayloadBlockSource for RawReplicaPayload<'_> {
@@ -329,7 +367,13 @@ impl TapeIndexReplicaPayloadBlockSource for RawReplicaPayload<'_> {
                 Ok(RawReadOutcome::Block { bytes, .. }) if bytes == self.block_size => {
                     visitor(&block)?;
                 }
-                _ => {
+                Ok(_) => {
+                    return Err(TapeIndexReplicaError::Payload {
+                        message: "physical payload is torn or unreadable".to_string(),
+                    });
+                }
+                Err(error) => {
+                    self.unproved_read = !raw_read_error_proves_damage(&error);
                     return Err(TapeIndexReplicaError::Payload {
                         message: "physical payload is torn or unreadable".to_string(),
                     });
@@ -346,46 +390,53 @@ fn validate_physical_separation(
     component_index: usize,
     header_block: &[u8],
     footer_block: &[u8],
-) -> bool {
+) -> PhysicalComponentValidation {
     let expected = &plan.separations[component_index / 2];
     let Ok(header) =
         parse_index_separation_header(header_block, &plan.edition.descriptor.tape_uuid)
     else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     let Ok(footer) =
         parse_index_separation_footer(footer_block, &plan.edition.descriptor.tape_uuid)
     else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     if &header.plan != expected || &footer.plan != expected {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     }
     let Some(interior_start_lba) = expected.component.planned_start_lba.checked_add(1) else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     let Some(interior_record_count) = expected.descriptor.total_records.checked_sub(2) else {
-        return false;
+        return PhysicalComponentValidation::Invalid;
     };
     let interior_start = PhysicalPositionHint {
         partition: plan.edition.descriptor.terminal_layout.partition,
         lba: interior_start_lba,
     };
     if source.locate_physical(interior_start).is_err() {
-        return false;
+        return PhysicalComponentValidation::Unproved;
     }
     let mut blocks = RawSeparationInterior {
         source,
         remaining: interior_record_count,
         block_size: expected.descriptor.block_size as usize,
+        unproved_read: false,
     };
-    validate_index_separation_full(&header, &footer, &mut blocks).is_ok()
+    let result = validate_index_separation_full(&header, &footer, &mut blocks);
+    match result {
+        Ok(_) => PhysicalComponentValidation::Valid,
+        Err(_) if blocks.unproved_read => PhysicalComponentValidation::Unproved,
+        Err(_) => PhysicalComponentValidation::Invalid,
+    }
 }
 
 struct RawSeparationInterior<'a> {
     source: &'a mut dyn RawTapeSource,
     remaining: u64,
     block_size: usize,
+    unproved_read: bool,
 }
 
 impl IndexSeparationInteriorBlockSource for RawSeparationInterior<'_> {
@@ -399,7 +450,13 @@ impl IndexSeparationInteriorBlockSource for RawSeparationInterior<'_> {
                 Ok(RawReadOutcome::Block { bytes, .. }) if bytes == self.block_size => {
                     visitor(&block)?;
                 }
-                _ => {
+                Ok(_) => {
+                    return Err(IndexSeparationError::PhysicalSource(
+                        "physical separation is torn or unreadable".to_string(),
+                    ));
+                }
+                Err(error) => {
+                    self.unproved_read = !raw_read_error_proves_damage(&error);
                     return Err(IndexSeparationError::PhysicalSource(
                         "physical separation is torn or unreadable".to_string(),
                     ));
@@ -885,6 +942,8 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    use remanence_library::{scsi::ScsiError, TapeIoError};
+
     use crate::raw::SpaceFilemarksOutcome;
     use crate::tape_index_replica::{
         checked_tape_index_replica_layout, plan_tape_index_edition, TapeIndexEditionDescriptor,
@@ -932,7 +991,7 @@ mod tests {
         let replica_records = checked_tape_index_replica_layout(BLOCK_SIZE, counts)
             .expect("replica geometry")
             .replica_record_count;
-        let layout = TerminalTailLayout::new(0, BLOCK_SIZE, 1, 2, replica_records, 2)
+        let layout = TerminalTailLayout::new(0, BLOCK_SIZE, 1, 2, replica_records, 3)
             .expect("terminal layout");
         let descriptor = TapeIndexEditionDescriptor {
             tape_uuid: [0x71; 16],
@@ -963,8 +1022,8 @@ mod tests {
                 edition_id: edition.descriptor.edition_id,
                 gap_ordinal: ordinal,
                 block_size: BLOCK_SIZE,
-                nominal_extent_bytes: u64::from(BLOCK_SIZE) * 2,
-                total_records: 2,
+                nominal_extent_bytes: u64::from(BLOCK_SIZE) * 3,
+                total_records: 3,
                 compression_enabled: false,
                 terminal_layout: layout,
             })
@@ -991,6 +1050,121 @@ mod tests {
         overwrite_locates: usize,
         blocks: BTreeMap<u64, Vec<u8>>,
         filemark_lbas: BTreeSet<u64>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadFaultKind {
+        Transport,
+        Medium,
+        Hardware,
+        BufferTooSmall,
+    }
+
+    struct FaultingRawSource<'a> {
+        inner: &'a mut dyn RawTapeSource,
+        cursor: PhysicalPositionHint,
+        read_fault: Option<(u64, ReadFaultKind)>,
+        locate_fault_lba: Option<u64>,
+    }
+
+    impl<'a> FaultingRawSource<'a> {
+        fn new(inner: &'a mut dyn RawTapeSource) -> Self {
+            let cursor = inner.position().expect("fixture position is readable");
+            Self {
+                inner,
+                cursor,
+                read_fault: None,
+                locate_fault_lba: None,
+            }
+        }
+
+        fn fail_read(mut self, lba: u64, kind: ReadFaultKind) -> Self {
+            self.read_fault = Some((lba, kind));
+            self
+        }
+
+        fn fail_locate(mut self, lba: u64) -> Self {
+            self.locate_fault_lba = Some(lba);
+            self
+        }
+    }
+
+    fn injected_read_error(kind: ReadFaultKind) -> ParityError {
+        let error = match kind {
+            ReadFaultKind::Transport => TapeIoError::Transport(ScsiError::TransportError {
+                status: 0,
+                host_status: 0,
+                driver_status: 0x06,
+                info: 1,
+                sense: Vec::new(),
+            }),
+            ReadFaultKind::Medium | ReadFaultKind::Hardware => {
+                let mut sense = vec![0u8; 18];
+                sense[0] = 0x70;
+                sense[2] = match kind {
+                    ReadFaultKind::Medium => 0x03,
+                    ReadFaultKind::Hardware => 0x04,
+                    _ => unreachable!(),
+                };
+                sense[7] = 10;
+                sense[12] = 0x11;
+                TapeIoError::CheckCondition(ScsiError::CheckCondition {
+                    sense,
+                    bytes_transferred: 0,
+                })
+            }
+            ReadFaultKind::BufferTooSmall => TapeIoError::ReadBufferTooSmall {
+                actual: BLOCK_SIZE.saturating_add(1),
+                provided: BLOCK_SIZE,
+            },
+        };
+        ParityError::TapeIo(error)
+    }
+
+    impl RawTapeSource for FaultingRawSource<'_> {
+        fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+            self.inner.configure_fixed_block_size(block_size)
+        }
+
+        fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            if self.locate_fault_lba == Some(hint.lba) {
+                return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
+                    "injected locate failure".to_string(),
+                )));
+            }
+            self.inner.locate_physical(hint)?;
+            self.cursor = hint;
+            Ok(())
+        }
+
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            let position = self.inner.locate_end_of_data()?;
+            self.cursor = position;
+            Ok(position)
+        }
+
+        fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+            let outcome = self.inner.space_filemarks(count)?;
+            self.cursor = outcome.position_after;
+            Ok(outcome)
+        }
+
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            if let Some((lba, kind)) = self.read_fault {
+                if self.cursor.lba == lba {
+                    return Err(injected_read_error(kind));
+                }
+            }
+            let outcome = self.inner.read_record(buf)?;
+            self.cursor = outcome.position_after();
+            Ok(outcome)
+        }
+
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            let position = self.inner.position()?;
+            self.cursor = position;
+            Ok(position)
+        }
     }
 
     impl MemorySink {
@@ -1408,6 +1582,138 @@ mod tests {
             ),
             TerminalComponentReconcileEvidence::TornWorm
         );
+    }
+
+    #[test]
+    fn read_failures_only_authorize_rewrite_when_the_record_is_proved_damaged() {
+        let plan = test_plan();
+        let mut sink = MemorySink::new(2);
+        let mut authority = MemoryAuthority::default();
+        let mut records = MinimalSource;
+        write_terminal_tail(&mut sink, &mut records, &mut authority, &plan)
+            .expect("complete terminal tail fixture writes");
+
+        for component_index in [0usize, 1] {
+            let progress = match component_index {
+                0 => TerminalTailProgress::BeforeReplicaA,
+                1 => TerminalTailProgress::AfterReplicaA,
+                _ => unreachable!(),
+            };
+            let component = plan.component(component_index);
+            let read_lbas = [
+                component.planned_start_lba,
+                component.planned_start_lba + 1,
+                component.planned_start_lba + component.record_count - 1,
+                component.planned_start_lba + component.record_count,
+            ];
+            for lba in read_lbas {
+                for kind in [ReadFaultKind::Transport, ReadFaultKind::Hardware] {
+                    let mut source = FaultingRawSource::new(&mut sink).fail_read(lba, kind);
+                    assert_eq!(
+                        reconcile_terminal_tail_next(&mut source, &plan, progress, true),
+                        TerminalComponentReconcileEvidence::Unproved,
+                        "non-medium {kind:?} failure at component {component_index} lba {lba} must not authorize overwrite"
+                    );
+                }
+                for kind in [ReadFaultKind::Medium, ReadFaultKind::BufferTooSmall] {
+                    let mut source = FaultingRawSource::new(&mut sink).fail_read(lba, kind);
+                    assert_eq!(
+                        reconcile_terminal_tail_next(&mut source, &plan, progress, true),
+                        TerminalComponentReconcileEvidence::TornRewritable,
+                        "proved damage {kind:?} at component {component_index} lba {lba} should remain repairable"
+                    );
+                    let mut source = FaultingRawSource::new(&mut sink).fail_read(lba, kind);
+                    assert_eq!(
+                        reconcile_terminal_tail_next(&mut source, &plan, progress, false),
+                        TerminalComponentReconcileEvidence::TornWorm,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn positioning_failures_never_become_torn_media_evidence() {
+        let plan = test_plan();
+        let mut sink = MemorySink::new(2);
+        let mut authority = MemoryAuthority::default();
+        let mut records = MinimalSource;
+        write_terminal_tail(&mut sink, &mut records, &mut authority, &plan)
+            .expect("complete terminal tail fixture writes");
+        let replica = plan.component(0);
+        for lba in [
+            replica.planned_start_lba,
+            replica.planned_start_lba + 1,
+            replica.planned_start_lba + replica.record_count - 1,
+            replica.planned_start_lba + replica.record_count,
+        ] {
+            let mut source = FaultingRawSource::new(&mut sink).fail_locate(lba);
+            assert_eq!(
+                reconcile_terminal_tail_next(
+                    &mut source,
+                    &plan,
+                    TerminalTailProgress::BeforeReplicaA,
+                    true,
+                ),
+                TerminalComponentReconcileEvidence::Unproved,
+                "failed LOCATE to lba {lba} says nothing about record damage"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_failed_reconciliation_cannot_move_or_overwrite_media() {
+        let plan = test_plan();
+        let mut sink = MemorySink::new(2);
+        let mut completed = MemoryAuthority::default();
+        let mut records = MinimalSource;
+        write_terminal_tail(&mut sink, &mut records, &mut completed, &plan)
+            .expect("complete terminal tail fixture writes");
+        let component = plan.component(0);
+        let evidence = {
+            let mut source = FaultingRawSource::new(&mut sink)
+                .fail_read(component.planned_start_lba, ReadFaultKind::Transport);
+            reconcile_terminal_tail_next(
+                &mut source,
+                &plan,
+                TerminalTailProgress::BeforeReplicaA,
+                true,
+            )
+        };
+        assert_eq!(evidence, TerminalComponentReconcileEvidence::Unproved);
+
+        let mut authority = MemoryAuthority {
+            evidence,
+            ..MemoryAuthority::default()
+        };
+        let counts = (
+            sink.block_writes,
+            sink.filemarks,
+            sink.barriers,
+            sink.overwrite_locates,
+        );
+        let mut records = MinimalSource;
+        assert_eq!(
+            write_terminal_tail_step(&mut sink, &mut records, &mut authority, &plan)
+                .expect("unproved media returns a typed recovery outcome"),
+            TerminalTailStepOutcome::RecoveryRequired {
+                progress: TerminalTailProgress::BeforeReplicaA,
+                component,
+                evidence: TerminalComponentReconcileEvidence::Unproved,
+            }
+        );
+        assert_eq!(
+            (
+                sink.block_writes,
+                sink.filemarks,
+                sink.barriers,
+                sink.overwrite_locates,
+            ),
+            counts,
+            "completion-unknown reconciliation must cause no media motion"
+        );
+        assert_eq!(authority.progress, TerminalTailProgress::BeforeReplicaA);
+        assert!(authority.commits.is_empty());
     }
 
     #[test]

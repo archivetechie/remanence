@@ -1,4 +1,6 @@
 use super::*;
+use remanence_library::scsi::ScsiError;
+
 use crate::filemark_map::TapeFileMapEntry;
 use crate::model::SchemeId;
 use crate::raw::{RawReadOutcome, RawTapeSource, SpaceFilemarksOutcome};
@@ -385,11 +387,112 @@ enum RecordedTapeRecord {
     Filemark,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RecordingRawTapeSource {
     records: Vec<RecordedTapeRecord>,
     cursor: u64,
     configured_block_size: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PrefixReadFaultKind {
+    Transport,
+    Medium,
+    Hardware,
+    BufferTooSmall,
+}
+
+struct FaultingPrefixSource {
+    inner: RecordingRawTapeSource,
+    read_fault: Option<(u64, PrefixReadFaultKind)>,
+    position_fails: bool,
+}
+
+impl FaultingPrefixSource {
+    fn fail_read(inner: RecordingRawTapeSource, lba: u64, kind: PrefixReadFaultKind) -> Self {
+        Self {
+            inner,
+            read_fault: Some((lba, kind)),
+            position_fails: false,
+        }
+    }
+
+    fn fail_position(inner: RecordingRawTapeSource) -> Self {
+        Self {
+            inner,
+            read_fault: None,
+            position_fails: true,
+        }
+    }
+}
+
+fn injected_prefix_read_error(kind: PrefixReadFaultKind, block_size: u32) -> ParityError {
+    let error = match kind {
+        PrefixReadFaultKind::Transport => TapeIoError::Transport(ScsiError::TransportError {
+            status: 0,
+            host_status: 0,
+            driver_status: 0x06,
+            info: 1,
+            sense: Vec::new(),
+        }),
+        PrefixReadFaultKind::Medium | PrefixReadFaultKind::Hardware => {
+            let mut sense = vec![0u8; 18];
+            sense[0] = 0x70;
+            sense[2] = match kind {
+                PrefixReadFaultKind::Medium => 0x03,
+                PrefixReadFaultKind::Hardware => 0x04,
+                _ => unreachable!(),
+            };
+            sense[7] = 10;
+            sense[12] = 0x11;
+            TapeIoError::CheckCondition(ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            })
+        }
+        PrefixReadFaultKind::BufferTooSmall => TapeIoError::ReadBufferTooSmall {
+            actual: block_size.saturating_add(1),
+            provided: block_size,
+        },
+    };
+    ParityError::TapeIo(error)
+}
+
+impl RawTapeSource for FaultingPrefixSource {
+    fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+        self.inner.configure_fixed_block_size(block_size)
+    }
+
+    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        self.inner.locate_physical(hint)
+    }
+
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.locate_end_of_data()
+    }
+
+    fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+        self.inner.space_filemarks(count)
+    }
+
+    fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+        if let Some((lba, kind)) = self.read_fault {
+            if self.inner.cursor == lba {
+                let block_size = self.inner.configured_block_size.unwrap_or(0);
+                return Err(injected_prefix_read_error(kind, block_size));
+            }
+        }
+        self.inner.read_record(buf)
+    }
+
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        if self.position_fails {
+            return Err(ParityError::TapeIo(TapeIoError::OperationFailed(
+                "injected terminal-prefix position failure".to_string(),
+            )));
+        }
+        self.inner.position()
+    }
 }
 
 impl RecordingRawTapeSource {
@@ -1354,6 +1457,114 @@ fn terminal_prefix_close_emits_sidecar_and_parity_map_without_bootstrap() {
         "post-barrier position must be re-read before journal authority"
     );
     assert!(raw.events.contains(&RawSinkEvent::SyncBarrier));
+}
+
+#[test]
+fn terminal_prefix_read_failures_only_authorize_overwrite_for_proved_damage() {
+    let block_size: u32 = 1024;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    let plan = {
+        let mut sink = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            small_scheme(),
+            sample_uuid(),
+            block_size,
+        )
+        .expect("journaled sink opens");
+        start_object(&mut sink, 5, block_size);
+        for seed in 1..=5 {
+            sink.write_block(&fixed_block(seed, block_size))
+                .expect("object block writes");
+        }
+        sink.finish_object().expect("object closes");
+        let plan = sink
+            .plan_terminal_index_close()
+            .expect("terminal prefix preflight plans");
+        sink.close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
+            .expect("terminal prefix fixture closes");
+        plan
+    };
+    let base = RecordingRawTapeSource::from_sink(&raw);
+    let entry = plan
+        .committed_bundle
+        .entries
+        .first()
+        .expect("fixture contains a terminal-prefix entry");
+    let start_lba = entry.physical_start_hint.expect("entry start is planned");
+    let filemark_lba = start_lba
+        .checked_add(entry.block_count)
+        .expect("entry filemark lba fits u64");
+
+    for lba in [start_lba, filemark_lba] {
+        for kind in [
+            PrefixReadFaultKind::Transport,
+            PrefixReadFaultKind::Hardware,
+        ] {
+            let mut source = FaultingPrefixSource::fail_read(base.clone(), lba, kind);
+            assert_eq!(
+                reconcile_terminal_prefix(&mut source, &plan, &sample_uuid(), block_size, true),
+                TerminalPrefixReconcileEvidence::Unproved,
+                "non-medium {kind:?} failure at lba {lba} must not authorize overwrite"
+            );
+        }
+        for kind in [
+            PrefixReadFaultKind::Medium,
+            PrefixReadFaultKind::BufferTooSmall,
+        ] {
+            let mut source = FaultingPrefixSource::fail_read(base.clone(), lba, kind);
+            assert_eq!(
+                reconcile_terminal_prefix(&mut source, &plan, &sample_uuid(), block_size, true),
+                TerminalPrefixReconcileEvidence::TornRewritable,
+            );
+            let mut source = FaultingPrefixSource::fail_read(base.clone(), lba, kind);
+            assert_eq!(
+                reconcile_terminal_prefix(&mut source, &plan, &sample_uuid(), block_size, false),
+                TerminalPrefixReconcileEvidence::TornWorm,
+            );
+        }
+    }
+
+    let mut source = FaultingPrefixSource::fail_position(base);
+    assert_eq!(
+        reconcile_terminal_prefix(&mut source, &plan, &sample_uuid(), block_size, true),
+        TerminalPrefixReconcileEvidence::Unproved,
+        "failed final position proof must not become torn-media evidence"
+    );
+}
+
+#[test]
+fn unproved_terminal_prefix_causes_no_media_or_journal_motion() {
+    let block_size: u32 = 1024;
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    let mut sink = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        small_scheme(),
+        sample_uuid(),
+        block_size,
+    )
+    .expect("journaled sink opens");
+    start_object(&mut sink, 5, block_size);
+    for seed in 1..=5 {
+        sink.write_block(&fixed_block(seed, block_size))
+            .expect("object block writes");
+    }
+    sink.finish_object().expect("object closes");
+    let plan = sink
+        .plan_terminal_index_close()
+        .expect("terminal prefix preflight plans");
+    let error = sink
+        .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Unproved)
+        .expect_err("unproved prefix must require operator recovery");
+    assert!(error.to_string().contains("requires recovery"));
+    assert_eq!(raw.cursor, plan.start_lba);
+    assert!(journal
+        .bundles
+        .iter()
+        .all(|bundle| bundle.kind != CommittedBundleKind::TerminalPrefix));
 }
 
 #[test]
