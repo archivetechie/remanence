@@ -1,7 +1,8 @@
 # REM-PARITY terminal index byte draft
 
 **Status:** independently re-derived pre-freeze byte candidate; nonphysical
-implementation/VTL evidence passed; supervised physical validation open.
+implementation/VTL evidence passed; dedicated terminal-format fuzz plateaus
+and supervised physical validation open.
 **Date:** 2026-08-09.
 **Architecture:** terminal triple-index replacement with three complete final
 replicas and two typed separation extents.

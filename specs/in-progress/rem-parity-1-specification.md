@@ -30,9 +30,10 @@ The publication tree remains unchanged.
 **This is a review draft.** It is published for public review and is not yet
 frozen. The draft.4 replacement is implemented in the reference tree. Its
 review-only candidate vectors are pinned and independently re-derived, its
-fuzz plateaus and nonphysical lifecycle/VTL gates have passed, and review
-proceeds incrementally from the last recorded clean baseline. The supervised
-physical-media gate remains open. Candidate vectors are not publication
+proof and nonphysical lifecycle/VTL gates have passed, and review proceeds
+incrementally from the last recorded clean baseline. Dedicated coverage-guided
+terminal-replica/separation/parser-walk fuzz plateaus and the supervised
+physical-media gate remain open. Candidate vectors are not publication
 artifacts until the freeze gates close.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
@@ -2034,10 +2035,10 @@ overflow in every size/location formula.
 ## 18. Conformance and Freeze Criteria
 
 These criteria gate the freeze of this specification. They are not all
-satisfied in this review draft: the supervised physical-media exercises remain
-open in Appendix E. Candidate-vector, proof, hermetic, VTL, and incremental
-review results are pre-freeze evidence, not a declaration that the
-specification is frozen.
+satisfied in this review draft: dedicated terminal-format fuzz plateaus and
+the supervised physical-media exercises remain open in Appendix E.
+Candidate-vector, proof, hermetic, VTL, and incremental review results are
+pre-freeze evidence, not a declaration that the specification is frozen.
 After freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
 anything that would invalidate an existing tape, change the meaning of
@@ -2649,6 +2650,13 @@ This is the live preparing-copy snapshot for the draft.4 replacement.
    Review is incremental from the last recorded clean baseline; two
    consecutive clean reviews of the then-current increment satisfy the gate,
    and later commits reopen only the regions they touch.
+6. **TT-6 — terminal-format fuzz plateaus (open).** Existing campaigns cover
+   bootstrap, sidecar, ParityMap, and the pre-terminal scan walk. They predate
+   the draft.4 terminal format: there is not yet a dedicated coverage-guided
+   terminal-replica parser campaign, separation parser campaign, or scan-walk
+   campaign whose generator reaches terminal kinds at the legal 256 KiB,
+   512 KiB, and 1 MiB record sizes. Criterion 18.3 remains open until those
+   targets, committed corpus replay, and measured plateau reports exist.
 ## Author's Address
 
 The ArchiveTech Project
