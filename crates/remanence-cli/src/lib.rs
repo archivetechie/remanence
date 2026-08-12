@@ -2035,6 +2035,11 @@ struct TapeFreezeDrillArgs {
     #[arg(long, default_value_t = 512)]
     data_mib: u64,
 
+    /// Use the production default one-GiB separation extent instead of the
+    /// compact three-record drill profile.
+    #[arg(long)]
+    default_index_separation: bool,
+
     /// Read-side medium-error arrangement to inject.
     #[arg(long, value_enum)]
     damage_plan: freeze_drill::DamagePlan,
@@ -4252,6 +4257,7 @@ where
                     device: &args.device,
                     block_size: args.block_size.bytes(),
                     data_mib: args.data_mib,
+                    default_index_separation: args.default_index_separation,
                     damage_plan: args.damage_plan,
                     unreadable_bot_ack: args.yes_i_know_scratch,
                     report_path: &args.report,
