@@ -3,7 +3,7 @@
 How the pieces of Remanence fit together, grounded in the code as it is
 today. For byte formats see the [tape layout reference](reference-tape-layout.md).
 
-<!-- code-anchor: Cargo.toml @ f643f8c2 -->
+<!-- code-anchor: Cargo.toml @ 244bc6de -->
 ## The layer model
 
 Remanence is organized as a strict stack. Each layer only knows about the
@@ -37,11 +37,16 @@ decrypted and restored with nothing but the object bytes and one matching
 recipient private key — no daemon, no catalog, no config file — for the
 scenario where the rest of the stack is unavailable or untrusted.
 
+Another sits beside Layer 5 rather than inside the stack: `remanence-order`
+is a dependency-free, pure-computation crate with no Remanence dependencies
+of its own. `remanence-api` is its only caller — see [Read-order
+planning](#read-order-planning) below.
+
 ![Workspace crate map: layer 5 cli, api, daemon over layer 4 state over layer 3 format, aead, parity, format-driver over layer 2 library over layer 1 scsi, with the format-free platform seam between layers 3 and 2](assets/layer-map.svg)
 
 *Fig. 1 — The workspace as a strict stack: each layer depends only on the one below it, and the format-defining crates sit directly above the format-free platform seam.*
 
-<!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ 244bc6de -->
 ## Layers 1 and 2: the tape platform
 
 `remanence-scsi` is the leaf crate: it builds CDBs, dispatches them
@@ -73,9 +78,14 @@ batch/handoff reads and `prove_read_position`, a real SCSI READ POSITION
 proof) — so format-parsing code that only holds a `BlockRead` cannot
 issue LOCATE, SPACE, or READ POSITION by type; a compile-fail test
 enforces this. Readiness classification (bootstrap validation, media
-state machine) and the udev hot-plug watcher also live here.
+state machine) and the udev hot-plug watcher also live here. Every
+write-direction CDB additionally funnels through one media-write fence
+(`MediaFencedTransport`) that durably advances the volume's write epoch and
+marks it uncalibrated before the first media-modifying command of a load —
+see [Read-order planning](#read-order-planning) below for what that epoch
+fences.
 
-<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ 244bc6de -->
 ### The platform seam
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
@@ -88,7 +98,7 @@ the entire core workspace contains no concrete foreign-format adapter. An
 external project can build its own layout and catalog on the platform crates
 without inheriting Remanence's formats.
 
-<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ 244bc6de -->
 ## Layer 3: formats and parity
 
 Six crates share this layer:
@@ -115,9 +125,11 @@ Six crates share this layer:
   wrapped by `remanence-format`, which is the funnel used by the CLI,
   API, and `rem-recover`.
 - `remanence-parity` owns the physical tape layout: bootstrap blocks,
-  filemark discipline, Reed-Solomon sidecar parity, resume, and the
-  catalog-less scan that reconstructs a tape's structure from the media
-  alone. On clean reads it is transparent; on medium errors it
+  filemark discipline, Reed-Solomon sidecar parity, resume, and catalog-less
+  recovery — primarily the terminal triple index, three complete inventories
+  written at the tape's tail and read from EOD without walking a single
+  Object, with a full BOT structural scan as the fallback when no terminal
+  replica survives. On clean reads it is transparent; on medium errors it
   reconstructs missing blocks.
 - `remanence-format-driver` publishes the normalized reader traits and the
   explicit registry used by auxiliary, read-only foreign-format adapters.
@@ -138,7 +150,7 @@ streaming, and ranged opens use a REMP `--private-key`; its epoch id selects
 the matching key-frame slot. `rem-recover` provides the same encrypted open without
 the daemon, catalog, or config.
 
-<!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/lib.rs crates/remanence-state/src/state.rs @ 244bc6de -->
 ## Layer 4: state
 
 `remanence-state` holds everything the daemon remembers: the validated
@@ -149,8 +161,8 @@ journals to regenerate it, and opening it read-only refuses to migrate.
 Schema version 18 today, tracked in SQLite's `user_version`, with tables
 for tapes, pools, tape files, objects/copies/files, catalog units,
 sessions, operations, idempotency keys, media-readiness records,
-tape-I/O fences, and the drive-stewardship set (drives, events, health
-snapshots, clean runs, alarms).
+tape-I/O fences, wrap-map cache rows, and the drive-stewardship set (drives,
+events, health snapshots, clean runs, alarms).
 
 `rem-daemon` holds the kernel `flock` on `<state_dir>/state.lock` for its
 complete process lifetime. `StateHandle`-based `rem-debug` mutations (tape
@@ -173,12 +185,12 @@ ordinary clean-break refusal.
 The recovery/import boundary and its deliberately identity-only authority are
 described in [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
-<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 244bc6de -->
 ## Layer 5: daemon and API
 
 The gRPC contract (package `remanence.api.v1`, defined in
 `proto/layer5.proto`) is still an implementation draft with no
-wire-stability promise. `rem-daemon` serves all six of its services
+wire-stability promise. `rem-daemon` serves all seven of its services
 today:
 
 | Service | Surface |
@@ -186,8 +198,9 @@ today:
 | `Daemon` | health, version, operation lifecycle (get/list/cancel/watch) |
 | `LibraryService` | inventory, drive stewardship, alarms, live status (incl. an advisory `drive_assignments` projection of the per-bay reservation state, for an external arbitration client — read-only, cannot gate a mount), robotics (move/load/unload); `ImportElement`/`ExportElement` and `StreamLibraryEvents` are defined but return unimplemented |
 | `Catalog` | tapes, pools, tape files, object enumeration, catalog units, reconcile; scoped/paginated enumeration is not wired yet (only the unscoped, unpaginated case works) |
-| `WriteSessionService` | open (pool targets only — drive/tape targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; opt-in batched durability is parity-off only, and write-session restart (`recover_session_id`) remains unimplemented — RM3's app-restart contract below covers reads only |
+| `WriteSessionService` | open (pool and pinned-tape targets — drive targets are unimplemented), client-streamed append, explicit checkpoint, close, abort; opt-in batched durability is parity-off only, and write-session restart (`recover_session_id`) remains unimplemented — RM3's app-restart contract below covers reads only |
 | `ReadSessionService` | open (tape targets only), server-streamed object/file/byte-range reads, close; `OpenReadSession` accepts an optional resume target so a client that lost its session across a restart can reopen against durable coordinates (tape UUID, object/file id, file-boundary offset) instead — see [The read path](#the-read-path) |
+| `ReadPlanService` | `PlanBatchRead` — an advisory, no-tape-motion read-ordering RPC for a batch of targets on one tape; consumed by no in-tree client yet — see [Read-order planning](#read-order-planning) |
 | `Audit` | registered on both the Unix socket and mTLS TCP listeners; its one RPC, `QueryAudit`, streams the append-only audit log back incrementally paged |
 
 Transports: a Unix socket (peer-uid gated to root or the daemon user,
@@ -219,14 +232,17 @@ rules that keep new work out of the former monoliths are documented in
 
 *Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` keeps an allowlist-gated direct SCSI path for break-glass work.*
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 244bc6de -->
 ## The write path
 
 What happens when an orchestrator writes an object:
 
 1. `OpenWriteSession` names a tape pool. The daemon selects a tape by the
    pool's policy and watermarks, reserves it, robots it into a free
-   drive, and hands the session to that drive's actor.
+   drive, and hands the session to that drive's actor. A request may
+   instead pin a specific tape UUID, subject to the same pool, writability,
+   and fencing checks pool selection would apply — see [`rem put
+   --tape`](reference-cli.md#writing-to-tape).
 2. The actor prepares the drive: rewind, read the bootstrap at BOT, and
    verify the tape UUID matches the catalog's expectation. A tape that
    cannot prove its identity is never written.
@@ -320,7 +336,7 @@ and no second terminal triple. SQLite is a replayable projection. On a
 finalized cartridge the three terminal replicas, selected C then B then A with
 agreement required between survivors, provide catalog-less tape authority.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 244bc6de -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and
@@ -368,6 +384,34 @@ plaintext range to the minimal span of AEAD chunks that cover it, and a
 bounded streaming decrypt authenticates and trims exactly those chunks —
 this is what the CLI's `archive covering-range`/`archive extract-stream`
 pair does locally, decoupled from any gRPC read session.
+
+<!-- code-anchor: crates/remanence-order crates/remanence-api/src/calibration.rs crates/remanence-api/src/read_plan.rs crates/remanence-state/src/calibration.rs crates/remanence-scsi/src/read_end_of_wrap_position.rs crates/remanence-scsi/src/report_supported_opcodes.rs @ 244bc6de -->
+## Read-order planning
+
+`remanence-order` is a dependency-free, pure-computation crate — geometry
+tables, an exact-rational cost model, and a deterministic ordering solver —
+that `remanence-api` calls to answer `ReadPlanService.PlanBatchRead`: given a
+batch of read targets on one tape, it returns a recommended visitation order
+and per-hop time estimates. A plan never touches media and commits nothing;
+it is advice a caller may ignore, and no in-tree CLI issues this RPC yet — it
+exists today for an external orchestrator client. See [pfr-reference.md
+§8](pfr-reference.md#8-read-ordering-and-batch-restore) for the full design
+rationale.
+
+The plan draws on a wrap map harvested once per drive load, gated on the
+drive actually needing that load: after an RSOC (Report Supported Opcodes)
+probe confirms support, the actor issues `READ END OF WRAP POSITION`
+(`A3h/1Fh/45h`, long form) and validates the result through `remanence-order`
+before installing it. The map, the write epoch that fences it, and a
+monotonic calibration generation live in a durable calibration-control store
+under `remanence-state` (`<state_dir>/calibration/control.remcalibration`,
+outside the rebuildable SQLite catalog), plus a `wrap_maps` SQLite row for
+fast lookup. Any media-modifying command in the same load durably advances
+the write epoch and marks the volume uncalibrated again — see [Layers 1 and
+2](#layers-1-and-2-the-tape-platform) for the media-write fence that
+enforces this — so a stale map is never served. Media the drive can't
+recognize, or where drive compression defeats deterministic wrap
+boundaries, is recognized as unsupported and skipped rather than guessed at.
 
 <!-- code-anchor: none -->
 ## Design invariants worth internalizing

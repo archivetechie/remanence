@@ -15,7 +15,7 @@ to Remanence's host state. Everything the catalog knows is either written
 to the tape itself or rebuildable from journals; the SQLite index is a
 cache, never the truth.
 
-<!-- code-anchor: crates/remanence-parity/src/terminal_tail.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/index_separation.rs -->
+<!-- code-anchor: crates/remanence-parity/src/terminal_tail.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/index_separation.rs @ 244bc6de -->
 ## Tape files and filemarks
 
 A cartridge is a sequence of tape files separated by filemarks, written in
@@ -78,7 +78,7 @@ HMAC-SHA-256 keyed by the tape UUID, so blocks from one tape cannot
 masquerade as another's. All parity-layer structures carry CRC-64/XZ
 checksums.
 
-<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ 244bc6de -->
 ## Parity scheme
 
 Erasure coding is Reed-Solomon over GF(2^8) with a Cauchy matrix; the
@@ -127,7 +127,7 @@ a promise, it is the format.
 
 *Fig. 2 — A rem-object-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
 
-<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 244bc6de -->
 ## The encrypted envelope: REMO
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
@@ -215,7 +215,7 @@ remains backpressured by the receiver; independently valid conflicting
 candidates may require one bounded replay before the reader can fail closed or
 emit a selected authority.
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 244bc6de -->
 ## Tape identity
 
 A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
@@ -228,7 +228,7 @@ recycle-skew issue when something outside Remanence rewrites a cartridge
 under an existing barcode (see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ 244bc6de -->
 ## On disk: durable records and rebuildable state
 
 The host-side state, for completeness (paths are operator-configured; see
@@ -245,12 +245,18 @@ the [configuration reference](reference-configuration.md)):
 - **SQLite index** — schema version 18, tracked via `PRAGMA
   user_version`, with tables for tapes, pools, tape files, objects,
   copies, files, catalog units, sessions, operations, idempotency keys,
-  media-readiness records, tape-I/O fences, and the drive-stewardship set
-  (drives, events, health snapshots, cleaning runs, alarms). It is a
-  projection: `rem rebuild-catalog-from-journals` regenerates it from the
-  journals and audit log.
+  media-readiness records, tape-I/O fences, wrap-map cache rows, and the
+  drive-stewardship set (drives, events, health snapshots, cleaning runs,
+  alarms). It is a projection: `rem rebuild-catalog-from-journals`
+  regenerates it from the journals and audit log.
 - **Per-tape catalog caches** — regenerable per-tape files under the
   configured cache directory.
+- **Calibration-control store** (`calibration/control.remcalibration`) — a
+  durable, append-only record of each volume's write epoch and read-order
+  calibration state (see [architecture
+  overview](architecture-overview.md#read-order-planning)). Unlike the
+  SQLite index, this store is never rebuilt or reset; a catalog rebuild or
+  reset only marks every cached wrap map uncalibrated again.
 
 For parity tapes, the tape-file journal and checkpoint journal are both
 required authority. Replay first discards Layer 3c bundles beyond its last

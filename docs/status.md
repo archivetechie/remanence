@@ -1,4 +1,4 @@
-<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 9befe674 -->
+<!-- code-anchor: Cargo.toml crates proto/layer5.proto @ 244bc6de -->
 # What works, and what does not
 
 This page is the detailed counterpart to the Status section of the root
@@ -43,8 +43,8 @@ not have to stream a whole object.
 
 **The on-tape formats.** The `rem-object-v1` object body, the REM-ENCRYPT
 encrypted representation, and Reed-Solomon sidecar parity with recovery,
-resume, and catalog-less scan. All three are specified, implemented, and pinned
-by the test vectors that ship with the source.
+resume, and a catalog-less terminal-index scan. All three are specified,
+implemented, and pinned by the test vectors that ship with the source.
 
 **Encryption.** Each object gets a fresh key, wrapped to one or more recipients
 using HPKE with the X-Wing hybrid KEM — ML-KEM-768 combined with X25519 — and
@@ -79,9 +79,10 @@ way to narrow a role to particular pools, tapes, or objects.
 
 **Some daemon operations are not implemented.** Library import and export
 through the mailslot, library-event streaming, and write-session restart all
-return `unimplemented`, as do drive-targeted and tape-targeted write sessions.
-Caller-supplied `idempotency_key` values are rejected; write-session replay
-detection exists but does not use that field.
+return `unimplemented`, as do drive-targeted write sessions (a pool-targeted
+or pinned-tape write session both work). Caller-supplied `idempotency_key`
+values are rejected; write-session replay detection exists but does not use
+that field.
 
 **Appending to a parity tape is session-only.** A committed parity tape can
 accept further objects through a write session, but the single-object write

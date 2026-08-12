@@ -1,6 +1,6 @@
 # Configuration reference
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ 2830f1c -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs @ 244bc6de -->
 ## The config file
 
 Remanence reads a single TOML file. There is no config-file search path and
@@ -47,7 +47,7 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 `TiB`/`T`/`TB`, `PiB`/`P`/`PB`. Every suffix is a power of 1024 — `KB` means
 1024 bytes here, not 1000.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs @ 2830f1c -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs @ 244bc6de -->
 ## `[daemon]` (required)
 
 | Key | Type | Default | Meaning |
@@ -134,7 +134,7 @@ park-indefinitely-for-slow-but-alive-clients policy coherent; it is
 verified by the half-open-while-parked integration test required by the
 TIO-6 design (§10).
 
-<!-- code-anchor: crates/remanence-state/src/config.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs @ 244bc6de -->
 ## `[[libraries]]`
 
 An array-shaped allowlist of tape libraries. Libraries not listed here remain
@@ -165,7 +165,7 @@ serial = "DEC91001xx"
 serial = "DEC91002xx"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs @ 244bc6de -->
 ## `[[tape_pools]]` and `[[tape_pool_rules]]`
 
 Tape pools group cartridges for write targeting; a write session names a
@@ -231,7 +231,7 @@ prefix = "RMA"
 pool_id = "archive-a"
 ```
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/lib.rs @ 244bc6de -->
 ## `[drives]`
 
 Drive-stewardship settings. The whole section is optional.
@@ -268,7 +268,7 @@ Serves `rem top` and the live-status RPC. Optional.
 | `foreign_changer_poll` | duration string | `"60s"` | Inventory poll cadence for foreign changers while live-status clients are active. |
 | `foreign_poll_lease` | duration string | `"5m"` | How recently a client must have polled to count as active. |
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-library/src/handle/mod.rs @ 244bc6de -->
 ## `[tape_io]`
 
 Tape I/O batching and staging-ring settings. Optional. Fixed-block pipelined
@@ -296,7 +296,7 @@ actually starts (`"read reservoir N bytes is smaller than minimum pool M
 bytes"`) — a config that passes validation can still refuse the first
 read if these two settings are mismatched.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs @ c802887b -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-api/src/lib.rs @ 244bc6de -->
 ## `[journal]`, `[audit]`, `[index]`, `[cache]` (required)
 
 These four sections place the durable state. They are deliberately
@@ -313,7 +313,7 @@ minimal config above puts them there.
 | `index.sqlite_path` | absolute path | required | The SQLite catalog projection file. The filename is yours to choose; `rem-state.sqlite` is the conventional name. This file is a rebuildable cache — see `rem rebuild-catalog-from-journals`. |
 | `cache.tape_catalog_dir` | absolute path | required | Directory of per-tape catalog cache files. |
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ 2830f1c -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-chaos/src/lib.rs crates/remanence-state/src/audit.rs @ 244bc6de -->
 ## Environment variables
 
 Remanence reads very little from the environment; configuration belongs in
@@ -331,7 +331,7 @@ the config file.
 Hardware integration tests read additional `REM_QUADSTOR_*` variables; they
 are documented in the test modules and are never read by production code.
 
-<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-state/src/paths.rs crates/remanence-state/src/lock.rs crates/remanence-daemon/src/lib.rs crates/remanence-state/src/calibration.rs @ 244bc6de -->
 ## What ends up on disk
 
 For the minimal config above, a running daemon owns:
@@ -347,6 +347,12 @@ For the minimal config above, a running daemon owns:
 /var/lib/rem/audit/*.remaudit     daily append-only audit segments
 /var/lib/rem/rem-state.sqlite     rebuildable SQLite catalog projection
 /var/lib/rem/tape-catalog/        per-tape catalog cache files
+/var/lib/rem/calibration/control.remcalibration
+                                 durable calibration-control store: per-volume write
+                                 epoch and read-order calibration state (see
+                                 architecture-overview.md#read-order-planning);
+                                 independent of the SQLite projection, never
+                                 rebuilt or reset
 ```
 
 On parity tapes, the matching `.remjournal` and `.remcheckpoint` histories are

@@ -10,7 +10,7 @@ Commands in the local sections were run as written against the current
 tree; hardware sections are marked, because they need a library (real or
 virtual) and host privileges.
 
-<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ f643f8c2 -->
+<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 244bc6de -->
 ## Build
 
 You need Rust 1.85 or newer. The workspace builds on stock Linux with no
@@ -47,7 +47,7 @@ cargo test --workspace --exclude remanence-chaos
 Hardware and large-memory tests are `#[ignore]`d by default and opt in
 through environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-cli/src/archive_ingest.rs @ 244bc6de -->
 ## First archive, no tape required
 
 Build a stored object from a directory, look inside it, and restore it.
@@ -96,7 +96,7 @@ never depends on host state.
 
 *Fig. 1 — The local round trip: build a rem-object-v1 object from a directory, read it back, and prove the copies identical — the same bytes a tape write stores as the object body.*
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ ac3ff8bf -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/xwing.rs @ 244bc6de -->
 ## The encrypted variant
 
 The encrypted representation wraps the same tar stream in an
@@ -156,7 +156,7 @@ disaster-recovery path of last resort. For streaming and partial retrieval,
 `archive extract-stream` and `archive covering-range` use the same
 `--private-key` epoch-selection contract.
 
-<!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-library/src/discovery.rs crates/remanence-cli/src/lib.rs Makefile @ 244bc6de -->
 ## Talking to a library (requires hardware)
 
 From here on you need a tape library — a real chassis or a virtual one
@@ -191,7 +191,7 @@ rem library <SERIAL> --slots
 Both commands take `--json` for scripting. Discovery is read-only: it
 issues INQUIRY, VPD, and READ ELEMENT STATUS, and moves nothing.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ 2830f1c -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-state/src/config.rs @ 244bc6de -->
 ## Running the daemon (requires hardware)
 
 The daemon needs a config file. A minimal one, using `/var/lib/rem` for
@@ -254,7 +254,7 @@ rem catalog pools
 If your state dir is not `/var/lib/rem`, pass `--endpoint
 unix:<state_dir>/rem.sock` — the CLI default assumes that path.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs crates/remanence-api/src/tape_init.rs @ 244bc6de -->
 ## Initializing a tape (requires hardware, writes to media)
 
 A fresh cartridge must be initialized before a pool will accept it:
@@ -282,7 +282,7 @@ can take an hour or more. `rem tape wait-ready --wait` polls until the
 medium is genuinely usable, and its defaults (2.5h timeout, 30s
 interval) are sized for exactly this.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/put.rs @ 836da0af -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/put.rs @ 244bc6de -->
 ## First write to tape (requires hardware, writes to media)
 
 With a running daemon, the normal write is one command — `rem put

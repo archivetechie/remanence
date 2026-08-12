@@ -3,7 +3,7 @@
 Project-internal terms and the tape-industry vocabulary Remanence leans
 on. Definitions reflect what the code does today, not aspirations.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ 244bc6de -->
 ## Formats and objects
 
 **REM-OBJECT** — REM-OBJECT, the native stored-object format. One REM-OBJECT
@@ -98,7 +98,7 @@ entries.
 separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ c802887b -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 244bc6de -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
@@ -195,7 +195,7 @@ drive, tape, or library resource (for example a repeated cleaning
 failure or a fenced tape awaiting release) until an operator
 acknowledges or clears it. Listed and acknowledged with `rem alarms`.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs crates/remanence-api/src/calibration.rs crates/remanence-state/src/calibration.rs @ 244bc6de -->
 ## Safety machinery
 
 **allowlist** — the explicit list of library serials a process may
@@ -228,7 +228,25 @@ tapes, never in batch).
 
 **media optimization / conditioning** — the one-time calibration pass an
 LTO-9 cartridge performs on first load; can exceed an hour and is why
-readiness waits default to 2.5h.
+readiness waits default to 2.5h. Unrelated to the read-order **calibration**
+state below, despite the shared word.
+
+**calibration (read-order)** — the per-volume state (`Uncalibrated` /
+`Calibrated` / `UnsupportedFormat`) tracking whether a durable **wrap map**
+is safe to serve for [read-order
+planning](architecture-overview.md#read-order-planning). Harvested once per
+drive load and invalidated by the **write epoch** below; not to be confused
+with **media optimization / conditioning** above.
+
+**write epoch** — a durable, per-volume counter that the media-write fence
+advances before the first media-modifying command of a load. A **wrap map**
+whose recorded epoch doesn't match the volume's current epoch is stale and
+is never served.
+
+**wrap map** — the per-drive-load record of which logical block ends each
+tape wrap, harvested via `READ END OF WRAP POSITION` and validated by the
+`remanence-order` crate; the input to [read-order
+planning](architecture-overview.md#read-order-planning).
 
 **poison** — a fail-closed "don't proceed" mark set after a failed data
 command, at two independent scopes. *Transfer poison* discards the rest
@@ -295,9 +313,10 @@ library's scanner. A label, not an identity.
 
 **volume label** — the identifying record traditional tape systems write
 first on a cartridge (the ANSI VOL1 record, the LTFS volume label).
-Remanence has no separate label structure; the sequence-0 bootstrap at
-BOT carries that role, and then grows into a recovery index as copies
-repeat down the tape. See **bootstrap**.
+Remanence has no separate label structure; the sole BOT bootstrap carries
+that role. The recovery index is a separate structure — the terminal triple
+index (A/gap/B/gap/C) written at the tape's tail during finalization, not
+repeated bootstrap copies. See **bootstrap** and **terminal replica**.
 
 **BOT / EOM** — beginning of tape / end of media.
 
