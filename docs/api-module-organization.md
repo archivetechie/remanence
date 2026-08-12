@@ -99,3 +99,13 @@ These are behavior checks, not merely source-layout checks: they exercise the
 extracted ingress, pool selection, mounted write-session, checkpoint,
 terminal-finalization, inventory, readback, and recovery paths through the
 release daemon and CLI.
+
+## Independent incremental review
+
+The exact range from the last recorded clean baseline
+`7f6861c2f5b7dcd8237e22696c15d229ee0ccb3e` through evidence head
+`bbd28c4d3b4b55401cdee9a90fe187a3943d897c` passed two consecutive
+independent incremental reviews on 2026-08-12 with zero actionable findings.
+The reviewers checked the moved function set, public re-exports, module
+dependency direction, focused façades, relevant live receipts, and the clean
+worktree. Untouched regions retain their previously reviewed-clean status.
