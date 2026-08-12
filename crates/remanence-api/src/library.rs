@@ -22,7 +22,8 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::{pb, ApiState};
+use crate::api_state::ApiState;
+use crate::pb;
 
 /// Fixed namespace for deterministic UUIDv5 library identities.
 ///
@@ -198,7 +199,7 @@ pub(crate) fn voltag_uuid_map(index: &CatalogIndex) -> Result<HashMap<String, Ve
     let mut map = HashMap::new();
     for tape in index
         .list_tapes(None, remanence_state::TapeKindFilter::Data)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
     {
         if let Some(voltag) = tape.voltag {
             let voltag = voltag.trim().to_string();
@@ -227,8 +228,12 @@ fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
         state: record.state,
         cleaning_due: record.cleaning_due,
         fenced: record.fenced,
-        first_seen_utc: crate::timestamp_from_rfc3339(record.first_seen_utc.as_str()),
-        last_seen_utc: crate::timestamp_from_rfc3339(record.last_seen_utc.as_str()),
+        first_seen_utc: crate::catalog_conversion::timestamp_from_rfc3339(
+            record.first_seen_utc.as_str(),
+        ),
+        last_seen_utc: crate::catalog_conversion::timestamp_from_rfc3339(
+            record.last_seen_utc.as_str(),
+        ),
         last_library_serial: record.last_library_serial,
         // NOTE: a None here means either "never seen in a library" or "the
         // stored bay number would not fit a u32", and those are not the same
@@ -245,7 +250,7 @@ fn drive_record_to_proto(record: DriveRecord) -> pb::DriveCatalogEntry {
         retired_at_utc: record
             .retired_at_utc
             .as_deref()
-            .and_then(crate::timestamp_from_rfc3339),
+            .and_then(crate::catalog_conversion::timestamp_from_rfc3339),
         retire_reason: record.retire_reason,
         correlation_rollups: Vec::new(),
     }
@@ -258,7 +263,7 @@ fn drive_record_to_proto_with_rollups(
     let mut drive = drive_record_to_proto(record);
     drive.correlation_rollups = rollups
         .into_iter()
-        .map(crate::correlation_rollup_to_proto)
+        .map(crate::catalog_conversion::correlation_rollup_to_proto)
         .collect();
     drive
 }
@@ -268,7 +273,7 @@ fn drive_event_to_proto(record: DriveEventRecord) -> pb::DriveHistoryEvent {
         event_id: u64::try_from(record.event_id).unwrap_or_default(),
         drive_uuid: record.drive_uuid,
         event_kind: record.event_kind,
-        at_utc: crate::timestamp_from_rfc3339(record.at_utc.as_str()),
+        at_utc: crate::catalog_conversion::timestamp_from_rfc3339(record.at_utc.as_str()),
         library_serial: record.library_serial.unwrap_or_default(),
         element_address: record
             .element_address
@@ -288,7 +293,7 @@ fn drive_snapshot_to_proto(record: DriveHealthSnapshotRecord) -> pb::DriveHealth
     pb::DriveHealthSnapshot {
         snapshot_id: u64::try_from(record.snapshot_id).unwrap_or_default(),
         drive_uuid: record.drive_uuid,
-        at_utc: crate::timestamp_from_rfc3339(record.at_utc.as_str()),
+        at_utc: crate::catalog_conversion::timestamp_from_rfc3339(record.at_utc.as_str()),
         trigger: record.trigger,
         session_id: record.session_id,
         tape_alert_flags: record.tape_alert_flags,
@@ -319,13 +324,17 @@ pub(crate) fn alarm_to_proto(record: AlarmRecord) -> pb::Alarm {
         kind: record.kind,
         severity: record.severity,
         state: record.state,
-        first_seen_utc: crate::timestamp_from_rfc3339(record.first_seen_utc.as_str()),
-        last_seen_utc: crate::timestamp_from_rfc3339(record.last_seen_utc.as_str()),
+        first_seen_utc: crate::catalog_conversion::timestamp_from_rfc3339(
+            record.first_seen_utc.as_str(),
+        ),
+        last_seen_utc: crate::catalog_conversion::timestamp_from_rfc3339(
+            record.last_seen_utc.as_str(),
+        ),
         acked_by: record.acked_by.unwrap_or_default(),
         acked_at_utc: record
             .acked_at_utc
             .as_deref()
-            .and_then(crate::timestamp_from_rfc3339),
+            .and_then(crate::catalog_conversion::timestamp_from_rfc3339),
         detail: record.detail.unwrap_or_default(),
     }
 }
@@ -393,7 +402,8 @@ impl LibraryServiceApi {
                     )
                 });
         }
-        let requested = crate::decode_uuid_bytes(requested_library_uuid, "library_uuid")?;
+        let requested =
+            crate::catalog_conversion::decode_uuid_bytes(requested_library_uuid, "library_uuid")?;
         let snapshot = self
             .state
             .current_library_snapshot()
@@ -432,7 +442,7 @@ impl LibraryServiceApi {
                 return Err(err);
             }
         };
-        if let Err(err) = crate::ensure_media_readiness_admitted(
+        if let Err(err) = crate::startup_media_readiness::ensure_media_readiness_admitted(
             &index,
             operation_kind,
             &library_serial,
@@ -510,7 +520,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<()>,
     ) -> Result<Response<pb::ListLibrariesResponse>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         let libraries = match self.state.current_library_snapshot() {
             Some(snapshot) => snapshot
                 .report
@@ -527,9 +537,11 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::GetLibraryRequest>,
     ) -> Result<Response<pb::LibraryState>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
-        let requested =
-            crate::decode_uuid_bytes(&request.into_inner().library_uuid, "library_uuid")?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
+        let requested = crate::catalog_conversion::decode_uuid_bytes(
+            &request.into_inner().library_uuid,
+            "library_uuid",
+        )?;
         // GetLibrary promises the current inventory snapshot. Unlike the
         // polling-oriented GetLiveStatus surface, it must not reuse a response
         // cached before a just-completed changer refresh.
@@ -551,9 +563,10 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::RefreshInventoryRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(
+        crate::catalog_conversion::reject_unimplemented_idempotency(
             request.idempotency_key.as_ref(),
             "RefreshInventory",
         )?;
@@ -571,14 +584,14 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::ListDrivesRequest>,
     ) -> Result<Response<pb::ListDrivesResponse>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         let request = request.into_inner();
-        crate::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        crate::catalog_request::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
         let drives = self
             .state
             .index()?
             .list_drives(request.include_foreign, request.include_retired)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .into_iter()
             .map(drive_record_to_proto)
             .collect();
@@ -592,16 +605,16 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::GetDriveRequest>,
     ) -> Result<Response<pb::DriveCatalogEntry>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         let selector = request.into_inner().drive;
         let index = self.state.index()?;
         let drive = index
             .get_drive_by_selector(selector.as_str())
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         let rollups = index
             .drive_tape_correlation_rollups(&drive.drive_uuid)
-            .map_err(crate::status_from_state_error)?;
+            .map_err(crate::startup_media_readiness::status_from_state_error)?;
         Ok(Response::new(drive_record_to_proto_with_rollups(
             drive, rollups,
         )))
@@ -611,18 +624,18 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::GetDriveHistoryRequest>,
     ) -> Result<Response<pb::GetDriveHistoryResponse>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         let request = request.into_inner();
-        crate::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        crate::catalog_request::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
         let index = self.state.index()?;
         let drive = index
             .get_drive_by_selector(request.drive.as_str())
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         let events = if request.include_events || !request.include_snapshots {
             index
                 .list_drive_events(&drive.drive_uuid)
-                .map_err(crate::status_from_state_error)?
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
                 .into_iter()
                 .map(drive_event_to_proto)
                 .collect()
@@ -632,7 +645,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         let snapshots = if request.include_snapshots {
             index
                 .list_drive_health_snapshots(&drive.drive_uuid)
-                .map_err(crate::status_from_state_error)?
+                .map_err(crate::startup_media_readiness::status_from_state_error)?
                 .into_iter()
                 .map(drive_snapshot_to_proto)
                 .collect()
@@ -651,15 +664,15 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::AnnotateDriveRequest>,
     ) -> Result<Response<pb::DriveCatalogEntry>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Write)?;
+        let actor = crate::auth::authorize_request(&request, crate::auth::AuthPermission::Write)?;
         let request = request.into_inner();
-        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         validate_iso_date(request.purchase_date.as_str(), "purchase_date")?;
         validate_iso_date(request.warranty_until.as_str(), "warranty_until")?;
         let mut index = self.state.index_write()?;
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         ensure_mutable_drive(&drive, request.allow_derived_identity)?;
         let drive_uuid = request.drive_uuid.clone();
@@ -674,7 +687,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 notes_set: (!request.notes_set.is_empty()).then_some(request.notes_set),
                 annotated_at_utc: None,
             })
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         let mut detail = BTreeMap::new();
         detail.insert(
@@ -704,9 +717,10 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::RetireDriveRequest>,
     ) -> Result<Response<pb::RetireDriveResponse>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Lifecycle)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Lifecycle)?;
         let request = request.into_inner();
-        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         // Retirement no longer carries a permanence acknowledgement: it is
         // reversible through ReinstateDrive. The reason remains mandatory —
         // it is what the audit trail and the reinstatement record cite.
@@ -716,7 +730,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         let mut index = self.state.index_write()?;
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         ensure_mutable_drive(&drive, request.allow_derived_identity)?;
         if let Some(element) = drive
@@ -735,7 +749,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         }
         let outcome = index
             .retire_drive(&request.drive_uuid, request.reason.as_str())
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         if outcome.newly_retired {
             let mut detail = BTreeMap::new();
@@ -761,21 +775,22 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::ReinstateDriveRequest>,
     ) -> Result<Response<pb::ReinstateDriveResponse>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Lifecycle)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Lifecycle)?;
         let request = request.into_inner();
-        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         if request.reason.trim().is_empty() {
             return Err(Status::invalid_argument("reason must not be empty"));
         }
         let mut index = self.state.index_write()?;
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         ensure_mutable_drive(&drive, request.allow_derived_identity)?;
         let outcome = index
             .reinstate_drive(&request.drive_uuid, request.reason.as_str())
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         if outcome.newly_reinstated {
             let mut detail = BTreeMap::new();
@@ -801,13 +816,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::PollDriveRequest>,
     ) -> Result<Response<pb::DriveHealthSnapshot>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
         let drive = self
             .state
             .index()?
             .get_drive_by_selector(request.drive.as_str())
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         ensure_mutable_drive(&drive, request.allow_derived_identity)?;
         if drive.managed != "rem" {
@@ -840,13 +855,14 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::CleanDriveRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
+        crate::catalog_conversion::decode_uuid_bytes(&request.drive_uuid, "drive_uuid")?;
         let index = self.state.index_write()?;
         let drive = index
             .get_drive_by_uuid(&request.drive_uuid)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("drive not found"))?;
         ensure_mutable_drive(&drive, request.allow_derived_identity)?;
         if drive.managed != "rem" {
@@ -887,14 +903,14 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::ListAlarmsRequest>,
     ) -> Result<Response<pb::ListAlarmsResponse>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         let request = request.into_inner();
-        crate::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
+        crate::catalog_request::ensure_unpaged(request.page_token.as_ref(), request.page_size)?;
         let alarms = self
             .state
             .index()?
             .list_alarms(request.include_cleared)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .into_iter()
             .map(alarm_to_proto)
             .collect();
@@ -908,13 +924,17 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::AckAlarmRequest>,
     ) -> Result<Response<pb::Alarm>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "AckAlarm")?;
+        crate::catalog_conversion::reject_unimplemented_idempotency(
+            request.idempotency_key.as_ref(),
+            "AckAlarm",
+        )?;
         let mut index = self.state.index_write()?;
         let alarm = index
             .ack_alarm(request.condition_key.as_str(), actor_label(&actor).as_str())
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("alarm not found or already cleared"))?;
         self.state
             .record_alarm_acked(actor, request.condition_key.as_str())?;
@@ -925,7 +945,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::GetLiveStatusRequest>,
     ) -> Result<Response<pb::GetLiveStatusResponse>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         let response = self.state.live_status_response().await?;
         Ok(Response::new(response))
     }
@@ -934,9 +954,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::MoveMediumRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "MoveMedium")?;
+        crate::catalog_conversion::reject_unimplemented_idempotency(
+            request.idempotency_key.as_ref(),
+            "MoveMedium",
+        )?;
         let src = narrow_element(request.source_element_address, "source_element_address")?;
         let dst = narrow_element(
             request.destination_element_address,
@@ -959,9 +983,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::LoadDriveRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "LoadDrive")?;
+        crate::catalog_conversion::reject_unimplemented_idempotency(
+            request.idempotency_key.as_ref(),
+            "LoadDrive",
+        )?;
         let slot = narrow_element(request.slot_element_address, "slot_element_address")?;
         let bay = narrow_element(request.drive_element_address, "drive_element_address")?;
         let mut detail = BTreeMap::new();
@@ -985,14 +1013,14 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::ResumeMediaReadinessRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::OperationControl)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::OperationControl)?;
         let request = request.into_inner();
         if request.timeout_seconds == 0 || request.poll_interval_seconds == 0 {
             return Err(Status::invalid_argument(
                 "media-readiness timeout and poll interval must be non-zero",
             ));
         }
-        let operation_uuid = crate::decode_uuid_bytes(
+        let operation_uuid = crate::catalog_conversion::decode_uuid_bytes(
             request.operation_id.as_slice(),
             "media_readiness_operation_id",
         )?;
@@ -1001,7 +1029,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
             .state
             .index()?
             .media_readiness_operation(operation_id)
-            .map_err(crate::status_from_state_error)?
+            .map_err(crate::startup_media_readiness::status_from_state_error)?
             .ok_or_else(|| Status::not_found("media-readiness operation not found"))?;
         const RESUMABLE_STATES: &[&str] = &[
             "planned",
@@ -1109,9 +1137,13 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::UnloadDriveRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        let actor = crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        let actor =
+            crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "UnloadDrive")?;
+        crate::catalog_conversion::reject_unimplemented_idempotency(
+            request.idempotency_key.as_ref(),
+            "UnloadDrive",
+        )?;
         let bay = narrow_element(request.drive_element_address, "drive_element_address")?;
         let destination = if request.destination_slot_address == 0 {
             None
@@ -1140,9 +1172,12 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::ImportElementRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "ImportElement")?;
+        crate::catalog_conversion::reject_unimplemented_idempotency(
+            request.idempotency_key.as_ref(),
+            "ImportElement",
+        )?;
         Err(Status::unimplemented("ImportElement is S6b"))
     }
 
@@ -1150,9 +1185,12 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::ExportElementRequest>,
     ) -> Result<Response<pb::OperationRef>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Robotics)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Robotics)?;
         let request = request.into_inner();
-        crate::reject_unimplemented_idempotency(request.idempotency_key.as_ref(), "ExportElement")?;
+        crate::catalog_conversion::reject_unimplemented_idempotency(
+            request.idempotency_key.as_ref(),
+            "ExportElement",
+        )?;
         Err(Status::unimplemented("ExportElement is S6b"))
     }
 
@@ -1163,7 +1201,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         &self,
         request: Request<pb::StreamLibraryEventsRequest>,
     ) -> Result<Response<Self::StreamLibraryEventsStream>, Status> {
-        crate::authorize_request(&request, crate::AuthPermission::Read)?;
+        crate::auth::authorize_request(&request, crate::auth::AuthPermission::Read)?;
         Err(Status::unimplemented("StreamLibraryEvents is S6c"))
     }
 }
@@ -1281,7 +1319,7 @@ mod tests {
         let mut state = ApiState::new(test_index());
         state.default_library_serial = Some(Arc::new("DEC418146K_LL02".to_string()));
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::LibrarySnapshot {
+            crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
                     libraries: vec![mk_library()],
                     warnings: Vec::new(),
@@ -1590,7 +1628,7 @@ mod tests {
             .as_ref()
             .expect("library snapshot")
             .write()
-            .expect("snapshot write lock") = Arc::new(crate::LibrarySnapshot {
+            .expect("snapshot write lock") = Arc::new(crate::live_status::LibrarySnapshot {
             report: DiscoveryReport {
                 libraries: vec![refreshed_library],
                 warnings: Vec::new(),
@@ -1644,7 +1682,7 @@ mod tests {
 
         let mut state = ApiState::new(index);
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::LibrarySnapshot {
+            crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
                     libraries: vec![first_library, second_library],
                     warnings: Vec::new(),
@@ -1871,7 +1909,7 @@ mod tests {
         second_library.serial = "D2LIB".to_string();
         let current = state.current_library_snapshot().expect("library snapshot");
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::LibrarySnapshot {
+            crate::live_status::LibrarySnapshot {
                 report: DiscoveryReport {
                     libraries: vec![current.report.libraries[0].clone(), second_library],
                     warnings: Vec::new(),

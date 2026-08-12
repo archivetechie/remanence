@@ -282,7 +282,7 @@ fn timestamp_now() -> prost_types::Timestamp {
 }
 
 fn state_matches(record_state: &str, filter_state: &str) -> bool {
-    let state = crate::operation_state(record_state);
+    let state = crate::catalog_conversion::operation_state(record_state);
     match filter_state.trim().to_ascii_lowercase().as_str() {
         "queued" => state == pb::OperationState::Queued,
         "running" => state == pb::OperationState::Running,

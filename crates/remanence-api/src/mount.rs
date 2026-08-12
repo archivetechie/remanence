@@ -11,7 +11,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use uuid::Uuid;
 
-use crate::{bytes_to_hex, pb, status_from_state_error, ApiState, TapeUuid};
+use crate::api_state::ApiState;
+use crate::hex_encoding::bytes_to_hex;
+use crate::pb;
+use crate::pool_write::TapeUuid;
+use crate::startup_media_readiness::status_from_state_error;
 
 /// Error variants from `load_tape_by_uuid`.
 #[derive(Debug)]
@@ -480,7 +484,7 @@ async fn tape_inventory_critical(
         .map_err(|error| Status::internal(error.to_string()))?;
     let tape = index
         .get_tape(&tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("tape not found"))?;
     if tape.kind != "data" {
         return Err(Status::failed_precondition(format!(
@@ -560,7 +564,7 @@ async fn verify_tape_index_critical(
         .map_err(|error| Status::internal(error.to_string()))?;
     let tape = index
         .get_tape(&tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("tape not found"))?;
     if tape.kind != "data" {
         return Err(Status::failed_precondition(format!(
@@ -642,7 +646,7 @@ pub(crate) async fn manual_finalize_tape(
         .map_err(|error| Status::internal(error.to_string()))?;
     let tape = index
         .get_tape(&admission.tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("tape not found"))?;
     if tape.kind != "data" {
         return Err(Status::failed_precondition(format!(
@@ -652,7 +656,7 @@ pub(crate) async fn manual_finalize_tape(
     }
     let assignment = index
         .get_tape_assignment_snapshot(&admission.tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("tape assignment vanished"))?;
     match (&assignment.pool_id, &admission.expected_pool_id) {
         (Some(actual), Some(expected)) if actual == expected => {}
@@ -674,7 +678,7 @@ pub(crate) async fn manual_finalize_tape(
             "finalize_tape",
             admission.idempotency_key,
         )
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
     {
         if scope.request_fingerprint.as_slice() != admission.request_fingerprint {
             return Err(Status::already_exists(
@@ -737,7 +741,7 @@ pub(crate) async fn manual_finalize_tape(
     }
     let projection = index
         .terminal_finalization(&admission.tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| {
             Status::internal("durably accepted FinalizeTape has no finalization projection")
         })?;
@@ -781,7 +785,7 @@ fn rejoin_accepted_manual_finalization(
             "finalize_tape",
             admission.idempotency_key,
         )
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
     else {
         return Ok(None);
     };
@@ -792,7 +796,7 @@ fn rejoin_accepted_manual_finalization(
     }
     let Some(projection) = index
         .terminal_finalization(&admission.tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
     else {
         return Ok(None);
     };
@@ -818,7 +822,7 @@ async fn run_manual_finalize_worker(
         .map_err(|error| Status::internal(error.to_string()))?;
     let barcode = index
         .get_tape(&tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .and_then(|tape| tape.voltag);
     if crate::write_owner::preflight_manual_finalize_tape(
         &mut index,
@@ -983,11 +987,11 @@ fn manual_finalize_request_from_intent(
         .map_err(|error| Status::internal(error.to_string()))?;
     let tape = index
         .get_tape(&intent.tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("manual terminal-recovery tape not found"))?;
     let assignment = index
         .get_tape_assignment_snapshot(&intent.tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("manual terminal-recovery assignment vanished"))?;
     if assignment.pool_id != manual.assigned_pool_id
         || assignment.assignment_generation != manual.assignment_generation
@@ -1030,7 +1034,7 @@ async fn recover_automatic_terminal_tape(
         .map_err(|error| Status::internal(error.to_string()))?;
     let tape = index
         .get_tape(&tape_uuid)
-        .map_err(crate::status_from_state_error)?
+        .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| Status::not_found("terminal-recovery tape not found"))?;
     let pool_id = tape.pool_id.as_deref().ok_or_else(|| {
         Status::failed_precondition(
@@ -1115,7 +1119,7 @@ async fn recover_automatic_terminal_tape(
     let projection = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|error| Status::internal(error.to_string()))?
         .terminal_finalization(&tape_uuid)
-        .map_err(crate::status_from_state_error)?;
+        .map_err(crate::startup_media_readiness::status_from_state_error)?;
     if projection.is_some_and(|projection| {
         projection.outcome == remanence_state::TerminalFinalizationOutcome::Finalized
     }) {
@@ -1748,7 +1752,7 @@ fn ensure_seated_cartridge_media_readiness_admitted(
 ) -> Result<(), Status> {
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
-    crate::ensure_media_readiness_admitted(
+    crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
         reason.as_str(),
         seated.library_serial.as_str(),
@@ -2421,7 +2425,7 @@ fn ensure_actor_mount_media_readiness_admitted(
 ) -> Result<(), Status> {
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
-    crate::ensure_media_readiness_admitted(
+    crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
         "open session",
         library_serial,
@@ -2442,7 +2446,7 @@ fn ensure_mounted_session_media_readiness_admitted(
 ) -> Result<(), Status> {
     let index = CatalogIndex::open_read_only(state.index_path.as_ref())
         .map_err(|err| Status::internal(err.to_string()))?;
-    crate::ensure_media_readiness_admitted(
+    crate::startup_media_readiness::ensure_media_readiness_admitted(
         &index,
         action,
         mounted.library_serial.as_str(),
@@ -2795,7 +2799,7 @@ mod tests {
         let mut library_b = test_library(vec![], vec![slot(0x0401, "LOC001L9")]);
         library_b.serial = "LIB002".to_string();
         state.library_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            std::sync::Arc::new(crate::LibrarySnapshot {
+            std::sync::Arc::new(crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
                     libraries: vec![library_a, library_b],
                     warnings: Vec::new(),
@@ -2842,7 +2846,7 @@ mod tests {
         let mut library_b = test_library(vec![], vec![slot(0x0401, "DUP001L9")]);
         library_b.serial = "LIB002".to_string();
         state.library_snapshot = Some(std::sync::Arc::new(std::sync::RwLock::new(
-            std::sync::Arc::new(crate::LibrarySnapshot {
+            std::sync::Arc::new(crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
                     libraries: vec![library_a, library_b],
                     warnings: Vec::new(),
@@ -3703,7 +3707,7 @@ mod tests {
         let mut loaded = drive_bay(0x0101, true, Some("ASY001L9"));
         loaded.source_slot = None;
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::LibrarySnapshot {
+            crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
                     libraries: vec![test_library(vec![loaded], vec![])],
                     warnings: Vec::new(),
@@ -4041,7 +4045,7 @@ mod tests {
         loaded.source_slot = Some(0x0401);
         let library = test_library(vec![loaded], vec![empty_slot(0x0401)]);
         state.library_snapshot = Some(Arc::new(std::sync::RwLock::new(Arc::new(
-            crate::LibrarySnapshot {
+            crate::live_status::LibrarySnapshot {
                 report: remanence_library::DiscoveryReport {
                     libraries: vec![library],
                     warnings: Vec::new(),

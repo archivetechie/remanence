@@ -37,7 +37,7 @@ use remanence_state::{
     VolumeCalibrationState, WrapMapCacheRecord, WritePathTrust,
 };
 
-use crate::TapeUuid;
+use crate::pool_write::TapeUuid;
 
 /// Convert one on-the-wire REOWP descriptor into the planner's shape.
 /// This u16-to-u32 widening is owned by the harvest layer precisely so
