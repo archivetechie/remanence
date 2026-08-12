@@ -27,19 +27,23 @@ use crate::error::ParityError;
 /// adapter failures leave the component unresolved: callers must not turn
 /// those failures into overwrite authority.
 pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
-    if matches!(
+    matches!(
         error,
         ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { .. })
-    ) {
-        return true;
-    }
+    ) || matches!(
+        error,
+        ParityError::TapeIo(error) if tape_error_is_current_medium_damage(error)
+    )
+}
+
+pub(crate) fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(
             error,
-            ParityError::TapeIo(TapeIoError::CheckCondition(
+            TapeIoError::CheckCondition(
                 remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-            )) if decode_sense(sense)
+            ) if decode_sense(sense)
                 .is_some_and(|decoded| !decoded.is_deferred() && decoded.key == 0x03)
         )
     }
@@ -48,6 +52,30 @@ pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
         let _ = error;
         false
     }
+}
+
+pub(crate) fn locate_physical_exact(
+    source: &mut dyn RawTapeSource,
+    hint: PhysicalPositionHint,
+) -> Result<(), ParityError> {
+    source.locate_physical(hint)?;
+    let observed = source.position()?;
+    validate_locate_position(hint, observed, "raw source")?;
+    Ok(())
+}
+
+fn validate_locate_position(
+    expected: PhysicalPositionHint,
+    observed: PhysicalPositionHint,
+    adapter: &'static str,
+) -> Result<PhysicalPositionHint, ParityError> {
+    if observed != expected {
+        return Err(ParityError::SessionOpen(format!(
+            "{adapter} locate returned partition {} lba {}, expected partition {} lba {}",
+            observed.partition, observed.lba, expected.partition, expected.lba
+        )));
+    }
+    Ok(observed)
 }
 
 /// Physical block-address hint used by raw tape operations.
@@ -442,6 +470,14 @@ impl RawTapeSource for ImageDirectoryRawSource {
         self.cursor = usize::try_from(hint.lba)
             .map_err(|_| image_source_error("image LBA does not fit usize"))?
             .min(self.records.len());
+        validate_locate_position(
+            hint,
+            PhysicalPositionHint::new(
+                u64::try_from(self.cursor)
+                    .map_err(|_| image_source_error("image cursor exceeds u64::MAX"))?,
+            ),
+            "image raw source",
+        )?;
         Ok(())
     }
 
@@ -684,6 +720,7 @@ impl RawTapeSource for BlockSourceRawTapeSource<'_> {
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
         let position = self.inner.locate(hint.lba)?;
         self.cursor_hint = position.into();
+        validate_locate_position(hint, self.cursor_hint, "block-source raw adapter")?;
         Ok(())
     }
 
@@ -941,8 +978,9 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
     }
 
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
-        let position = self.drive.locate(hint.lba)?;
-        self.cursor_hint = Some(position.into());
+        let observed = self.drive.locate(hint.lba)?.into();
+        self.cursor_hint = Some(observed);
+        validate_locate_position(hint, observed, "drive raw source")?;
         Ok(())
     }
 
@@ -1091,6 +1129,40 @@ mod compat_tests {
 
     type TestTransportFactory = Box<dyn FnMut(&Path) -> Result<Box<dyn SgTransport>, IoErrorKind>>;
 
+    struct MispositioningBlockSource {
+        inner: VecBlockSource,
+        partition: u32,
+        lba_offset: u64,
+    }
+
+    impl remanence_library::BlockRead for MispositioningBlockSource {
+        fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+            self.inner.read_block(buf)
+        }
+    }
+
+    impl BlockSource for MispositioningBlockSource {
+        fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+            let mut observed = self.inner.locate(lba.saturating_add(self.lba_offset))?;
+            observed.partition = self.partition;
+            Ok(observed)
+        }
+
+        fn space(
+            &mut self,
+            count: i64,
+            kind: SpaceKind,
+        ) -> Result<remanence_library::SpaceResult, TapeIoError> {
+            self.inner.space(count, kind)
+        }
+
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            let mut observed = self.inner.position()?;
+            observed.partition = self.partition;
+            Ok(observed)
+        }
+    }
+
     #[test]
     fn image_tape_file_number_parser_preserves_full_u64_domain() {
         for number in [u64::from(u32::MAX) + 1, (1_u64 << 53) + 1, u64::MAX] {
@@ -1145,6 +1217,37 @@ mod compat_tests {
                 }
             )) if sense == [0x72, 0x03, 0x11, 0x00]
         ));
+    }
+
+    #[test]
+    fn image_source_rejects_a_successful_out_of_range_locate() {
+        let mut source = ImageDirectoryRawSource::from_tape_files(vec![vec![0; 4]], 4)
+            .expect("construct image source");
+        source
+            .configure_fixed_block_size(4)
+            .expect("configure image source");
+        let error = source
+            .locate_physical(PhysicalPositionHint::new(3))
+            .expect_err("clamped image position must not impersonate requested LBA");
+        assert!(error.to_string().contains("expected partition 0 lba 3"));
+    }
+
+    #[test]
+    fn block_source_raw_adapter_rejects_wrong_lba_and_partition() {
+        for (partition, lba_offset) in [(0, 1), (1, 0)] {
+            let mut source = MispositioningBlockSource {
+                inner: VecBlockSource::new(vec![vec![0; 4]; 4]),
+                partition,
+                lba_offset,
+            };
+            let mut raw = BlockSourceRawTapeSource::new(&mut source);
+            let error = raw
+                .locate_physical(PhysicalPositionHint::new(1))
+                .expect_err("compatibility adapter must reject a mismatched LOCATE result");
+            assert!(error
+                .to_string()
+                .contains("block-source raw adapter locate"));
+        }
     }
 
     #[test]
@@ -1788,6 +1891,49 @@ mod compat_tests {
         assert!(!handle.is_dirty());
     }
 
+    #[test]
+    fn drive_handle_raw_source_rejects_wrong_locate_lba_and_partition() {
+        for (serial, observed) in [
+            ("LIB_RAW_LC_LBA", PhysicalPositionHint::new(43)),
+            (
+                "LIB_RAW_LC_PART",
+                PhysicalPositionHint {
+                    partition: 1,
+                    lba: 42,
+                },
+            ),
+        ] {
+            let lib = open_drive_test_lib(serial);
+            let policy = StaticAllowlist::new([serial]);
+            let (factory, log) = multi_recording_factory(vec![
+                (
+                    PathBuf::from("/dev/sg-mock"),
+                    vec![changer_inquiry_response(), vpd80_response(serial)],
+                ),
+                (
+                    PathBuf::from("/dev/sg-drive-mock"),
+                    vec![
+                        lto9_inquiry_response(),
+                        vpd80_response("DRV_A"),
+                        read_position_long_response(0, observed.partition, observed.lba),
+                    ],
+                ),
+            ]);
+            let mut handle = lib.open_with(&policy, factory).expect("library opens");
+
+            let error = {
+                let mut drive = handle.open_drive(0x0100, &policy).expect("drive opens");
+                let mut raw = DriveHandleRawSource::new(&mut drive);
+                raw.locate_physical(PhysicalPositionHint::new(42))
+                    .expect_err("drive adapter must reject the observed LOCATE mismatch")
+            };
+            assert!(error.to_string().contains("drive raw source locate"));
+            let opcodes: Vec<u8> = log.borrow().iter().map(|cdb| cdb[0]).collect();
+            assert!(opcodes.windows(2).any(|window| window == [0x92, 0x34]));
+            assert!(!handle.is_dirty());
+        }
+    }
+
     #[derive(Default)]
     struct DurabilityMockRawTapeSink {
         position: u64,
@@ -1928,8 +2074,13 @@ mod tests {
     fn raw_read_damage_classifier_is_strictly_fail_closed() {
         let mut deferred_medium = fixed_sense(0x03, 0x11, 0x00);
         deferred_medium[0] = 0x71;
+        let current_descriptor_medium = vec![0x72, 0x03, 0x11, 0x00];
+        let deferred_descriptor_medium = vec![0x73, 0x03, 0x11, 0x00];
         assert!(raw_read_error_proves_damage(&read_error(check_condition(
             fixed_sense(0x03, 0x11, 0x00),
+        ))));
+        assert!(raw_read_error_proves_damage(&read_error(check_condition(
+            current_descriptor_medium,
         ))));
         assert!(raw_read_error_proves_damage(&read_error(
             TapeIoError::ReadBufferTooSmall {
@@ -1948,6 +2099,7 @@ mod tests {
             }),
             check_condition(fixed_sense(0x04, 0x44, 0x00)),
             check_condition(deferred_medium),
+            check_condition(deferred_descriptor_medium),
             TapeIoError::OperationFailed("adapter failure".to_string()),
             TapeIoError::FilemarkEncountered,
         ] {

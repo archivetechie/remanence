@@ -17,7 +17,9 @@ use crate::index_separation::{
     parse_index_separation_footer, parse_index_separation_header, validate_index_separation_full,
     validate_index_separation_pair, IndexSeparationError, IndexSeparationInteriorBlockSource,
 };
-use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::raw::{
+    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+};
 use crate::scan::{scan_reconstruct_filemark_map_with_report, ScanDamageKind};
 use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
@@ -30,7 +32,8 @@ use crate::terminal_tail::{
     validate_terminal_index_block_size_hint, TerminalTailLayout, TERMINAL_INDEX_REPLICA_COUNT,
     TERMINAL_TAIL_COMPONENT_COUNT,
 };
-use remanence_library::{scsi::decode_sense, TapeIoError};
+#[cfg(test)]
+use remanence_library::TapeIoError;
 use std::cell::RefCell;
 
 /// Typed stage at which one terminal member failed validation.
@@ -2005,12 +2008,7 @@ fn terminal_candidate_error_is_damage(error: &ParityError) -> bool {
 }
 
 fn terminal_source_error_is_medium_damage(error: &ParityError) -> bool {
-    matches!(
-        error,
-        ParityError::TapeIo(TapeIoError::CheckCondition(
-            remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-        )) if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03)
-    )
+    matches!(error, ParityError::TapeIo(error) if tape_error_is_current_medium_damage(error))
 }
 
 fn selected_member_error(
@@ -2213,6 +2211,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TestReadFault {
         Medium,
+        DeferredFixedMedium,
+        DeferredDescriptorMedium,
         Hardware,
         Transport,
     }
@@ -2223,6 +2223,18 @@ mod tests {
                 Self::Medium => TapeIoError::CheckCondition(
                     remanence_library::scsi::ScsiError::CheckCondition {
                         sense: vec![0x72, 0x03, 0x11, 0x00],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::DeferredFixedMedium => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x71, 0x00, 0x03, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x11, 0],
+                        bytes_transferred: 0,
+                    },
+                ),
+                Self::DeferredDescriptorMedium => TapeIoError::CheckCondition(
+                    remanence_library::scsi::ScsiError::CheckCondition {
+                        sense: vec![0x73, 0x03, 0x11, 0x00],
                         bytes_transferred: 0,
                     },
                 ),
@@ -2765,7 +2777,12 @@ mod tests {
 
     #[test]
     fn full_verify_after_replica_damage_propagates_non_medium_separation_failures() {
-        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+        for fault in [
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
             let mut fixture = triple_fixture();
             corrupt_replica_payload(&mut fixture, 1);
             let separation_lba = fixture
@@ -3388,7 +3405,12 @@ mod tests {
             ));
         }
 
-        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+        for fault in [
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
             let records = vec![Record::Block(bot_bootstrap()), Record::Filemark];
             let mut read_source = RecordingSource::new(records).with_read_fault(0, fault);
             let error =
@@ -3414,7 +3436,12 @@ mod tests {
             TerminalIndexVerificationOutcome::RecoveryRequired(_)
         ));
 
-        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+        for fault in [
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
             let mut source =
                 RecordingSource::new(fixture.records.clone()).with_read_fault(0, fault);
             let error = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
@@ -3495,7 +3522,12 @@ mod tests {
 
     #[test]
     fn non_medium_payload_errors_abort_without_fallback() {
-        for fault in [TestReadFault::Hardware, TestReadFault::Transport] {
+        for fault in [
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+            TestReadFault::Hardware,
+            TestReadFault::Transport,
+        ] {
             let fixture = triple_fixture();
             let c_payload_lba = fixture
                 .layout

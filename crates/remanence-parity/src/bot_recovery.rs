@@ -9,12 +9,13 @@
 use crate::bootstrap::parse_bootstrap_block;
 use crate::error::ParityError;
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
-use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::raw::{
+    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+};
 use crate::scan::{
     scan_reconstruct_filemark_map_with_control, ControlledScanWalkOutcome, ScanWalkControl,
     ScanWalkProgress,
 };
-use remanence_library::{scsi::decode_sense, TapeIoError};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -725,12 +726,7 @@ fn bot_bootstrap_source_error(
 }
 
 fn bot_source_error_is_medium_damage(error: &ParityError) -> bool {
-    matches!(
-        error,
-        ParityError::TapeIo(TapeIoError::CheckCondition(
-            remanence_library::scsi::ScsiError::CheckCondition { sense, .. },
-        )) if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x03)
-    )
+    matches!(error, ParityError::TapeIo(error) if tape_error_is_current_medium_damage(error))
 }
 
 fn checked_recovery_increment(
