@@ -640,6 +640,23 @@ impl StateHandle {
         &mut self.audit
     }
 
+    /// Reopen the audit sink after a coordinated external append.
+    ///
+    /// `FileAuditLog` caches the next sequence and previous hash. A caller
+    /// holding this exclusive state handle may use a separately opened log to
+    /// force-fsync a recovery fact; it must refresh this cursor before any
+    /// later append through [`Self::audit`].
+    pub fn refresh_audit_append_cursor(&mut self) -> Result<(), StateError> {
+        self.audit = FileAuditLog::open_with_clock_forward_tolerance(
+            &self.paths.audit_dir,
+            self.config.audit.fsync,
+            Some(Duration::seconds(
+                self.config.audit.clock_forward_tolerance_seconds as i64,
+            )),
+        )?;
+        Ok(())
+    }
+
     /// Return the mutable catalog projection owner.
     pub fn catalog_index(&mut self) -> &mut CatalogIndex {
         &mut self.index

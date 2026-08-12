@@ -56,6 +56,12 @@ pub struct VirtualTape {
     pub block_size: u32,
     /// Hardware compression flag reported by MODE SENSE.
     pub compression: bool,
+    /// Test-only device quirk: acknowledge MODE SELECT while retaining the
+    /// prior block size reported by subsequent MODE SENSE.
+    pub retain_block_size_on_mode_select: bool,
+    /// Test-only device quirk: acknowledge MODE SELECT while retaining the
+    /// prior compression state reported by subsequent MODE SENSE.
+    pub retain_compression_on_mode_select: bool,
     /// TapeAlert flags currently reported for this cartridge.
     pub tape_alert_flags: BTreeSet<u8>,
     /// Whether this cartridge is a cleaning cartridge.
@@ -77,6 +83,8 @@ impl VirtualTape {
             worm: false,
             block_size,
             compression: false,
+            retain_block_size_on_mode_select: false,
+            retain_compression_on_mode_select: false,
             tape_alert_flags: BTreeSet::new(),
             cleaning_cart: false,
             cleaning_cart_expired: false,
@@ -931,13 +939,16 @@ impl ModelTransport {
             if buf.len() >= 12 {
                 let block_length =
                     ((buf[9] as u32) << 16) | ((buf[10] as u32) << 8) | buf[11] as u32;
-                if block_length != 0 {
+                if block_length != 0 && !tape.retain_block_size_on_mode_select {
                     tape.block_size = block_length;
                 }
             }
             let page_offset = buf.get(3).copied().map(|bdl| 4 + bdl as usize);
             if let Some(page_offset) = page_offset {
-                if buf.len() > page_offset + 2 && (buf[page_offset] & 0x3f) == 0x0f {
+                if buf.len() > page_offset + 2
+                    && (buf[page_offset] & 0x3f) == 0x0f
+                    && !tape.retain_compression_on_mode_select
+                {
                     tape.compression = buf[page_offset + 2] & 0x80 != 0;
                 }
             }

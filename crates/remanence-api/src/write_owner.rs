@@ -15,11 +15,10 @@ use ciborium::value::Value as CborValue;
 use remanence_format::error::FormatError;
 use remanence_format::model::BodyLba;
 use remanence_library::{
-    classify_media_readiness_error_ref, BlockSize, BlockSource, ChangerHandle, DiscoveryReport,
-    DriveHandle, DriveHandleSink, DriveHandleSource, DriveOpError, LoadError, MediaFamily,
-    MediaReadiness, MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions,
-    ReadBatchOutcome, SpaceKind, SpaceResult, StaticAllowlist, TapeConfig, TapeIoError,
-    TapePosition,
+    classify_media_readiness_error_ref, BlockSource, ChangerHandle, DiscoveryReport, DriveHandle,
+    DriveHandleSink, DriveHandleSource, DriveOpError, LoadError, MediaFamily, MediaReadiness,
+    MediaReadinessPoll, MediaReadinessWaitEvent, MediaReadinessWaitOptions, ReadBatchOutcome,
+    SpaceKind, SpaceResult, StaticAllowlist, TapeConfig, TapeIoError, TapePosition,
 };
 use remanence_parity::{
     checked_bounded_resume_summary, read_terminal_index_inventory_streamed,
@@ -5633,11 +5632,12 @@ fn prepare_drive_for_write(
         .map_err(|err| Status::internal(format!("read drive config before write: {err}")))?;
     let read_config_elapsed = read_config_started.elapsed();
     validate_write_media_policy(current_cfg, media_policy)?;
-    let target_cfg = fixed_no_compression_config(current_cfg, block_size);
     let write_config_started = Instant::now();
-    drive
-        .write_config(target_cfg)
-        .map_err(|err| Status::internal(format!("set fixed-block config: {err}")))?;
+    let (target_cfg, verified_cfg) =
+        crate::drive_mode::configure_fixed_uncompressed_write(drive, current_cfg, block_size)
+            .map_err(|err| {
+                Status::failed_precondition(format!("verify fixed-block write config: {err}"))
+            })?;
     let staging_ring_buffers = drive.staging_ring_buffers();
     let effective_batch_blocks = drive.requested_write_batch_blocks().min(
         drive
@@ -5659,6 +5659,8 @@ fn prepare_drive_for_write(
         prior_compression = current_cfg.compression,
         target_block_size = ?target_cfg.block_size,
         target_compression = target_cfg.compression,
+        verified_block_size = ?verified_cfg.block_size,
+        verified_compression = verified_cfg.compression,
         staging_ring_buffers,
         effective_batch_blocks,
         effective_ring_bytes,
@@ -7868,18 +7870,6 @@ const fn manual_finalize_progress_name(
     }
 }
 
-fn fixed_no_compression_config(current_cfg: TapeConfig, block_size: u32) -> TapeConfig {
-    TapeConfig {
-        block_size: BlockSize::Fixed {
-            size_bytes: block_size,
-        },
-        compression: false,
-        max_block_size_bytes: current_cfg.max_block_size_bytes,
-        write_protected: current_cfg.write_protected,
-        worm: current_cfg.worm,
-    }
-}
-
 fn prepare_drive_for_read(
     index: &CatalogIndex,
     drive: &mut DriveHandle,
@@ -7911,7 +7901,7 @@ fn prepare_drive_for_fixed_read(
     let current_cfg = drive
         .read_config()
         .map_err(|err| Status::internal(format!("read drive config: {err}")))?;
-    let target_cfg = fixed_no_compression_config(current_cfg, block_size);
+    let target_cfg = crate::drive_mode::fixed_uncompressed_target(current_cfg, block_size);
     drive
         .write_config(target_cfg)
         .map_err(|err| Status::internal(format!("set fixed read config: {err}")))?;
@@ -17538,28 +17528,9 @@ mod tests {
     }
 
     #[test]
-    fn fixed_no_compression_config_preserves_drive_reported_fields() {
-        let current = TapeConfig {
-            block_size: BlockSize::Variable,
-            compression: true,
-            max_block_size_bytes: 8 * 1024 * 1024,
-            write_protected: true,
-            worm: WormMediaState::Unknown,
-        };
-
-        let prepared = fixed_no_compression_config(current, 4096);
-
-        assert_eq!(prepared.block_size, BlockSize::Fixed { size_bytes: 4096 });
-        assert!(!prepared.compression);
-        assert_eq!(prepared.max_block_size_bytes, current.max_block_size_bytes);
-        assert_eq!(prepared.write_protected, current.write_protected);
-        assert_eq!(prepared.worm, current.worm);
-    }
-
-    #[test]
     fn object_write_media_policy_requires_positive_rewritable_evidence() {
         let config = |write_protected, worm| TapeConfig {
-            block_size: BlockSize::Variable,
+            block_size: remanence_library::BlockSize::Variable,
             compression: false,
             max_block_size_bytes: 8 * 1024 * 1024,
             write_protected,
