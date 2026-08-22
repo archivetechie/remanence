@@ -15,24 +15,34 @@ documents and published artifacts themselves.
 
 ---
 
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-parity/src/sidecar.rs crates/remanence-parity/src/parity_map.rs crates/remanence-parity/src/index_separation.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/tape_index.rs @ 56139ae0 -->
 ## Tape layer (REM-PARITY)
 
 ### 1. The bootstrap block — `schema_major`
 
 - **What it is.** The bootstrap is the tape's self-description block,
-  written at the start of the tape and repeated along it. `schema_major` is
-  its generation number — the field that says "this is bootstrap format
-  generation 1."
-- **Where.** Two bytes at offset 0x08 of every bootstrap block.
+  written once at the tape's beginning (BOT). `schema_major` is its
+  generation number — the field that says which bootstrap format
+  generation wrote this tape.
+- **Where.** Two bytes at offset 0x08 of the bootstrap block.
   Normative: REM-PARITY §8.1.
-- **Current value.** 1.
+- **Current value.** 2. Generation 1 wrote a bootstrap block repeated at
+  intervals down the tape, recovered by rescanning those copies.
+  Generation 2 replaced that design with the sole-BOT bootstrap plus the
+  three-replica terminal index written at the tail (see
+  **Terminal Object rows** below) — this is the only generation the
+  current software writes or accepts. No published REM-PARITY revision
+  describes generation 2 yet: the published copy (1.0.0-draft.1) still
+  describes generation 1 only. Generation 2 exists as a not-yet-published
+  revision in preparation (1.0.0-draft.4; see
+  `specs/in-progress/README.md`), which the shipped code already matches.
 - **Unknown value.** A reader MUST reject a bootstrap whose `schema_major`
-  is not 1. This is deliberate and safe: a different major means a
+  is not 2. This is deliberate and safe: a different major means a
   different format generation, and refusing loudly is the correct answer.
 - **How it changes.** Only a new major version of REM-PARITY — a separate
-  document — may assign 2. Version-1 readers then correctly refuse
-  generation-2 tapes by this very field, and generation-2 documents govern
-  their own tapes.
+  document — may assign the next value. Generation-2 readers then
+  correctly refuse tapes from that future generation by this very field,
+  and its own documents govern its own tapes.
 
 ### 2. The bootstrap block — `schema_minor`
 

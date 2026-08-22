@@ -31,6 +31,9 @@ format specifications — and their plain-language companion — live in
 - [reference-extended-attributes.md](reference-extended-attributes.md) —
   what file metadata is preserved, how it is stored, and how it behaves on
   restore (including the standard-`tar` fallback).
+- [reference-foreign-format-adapters.md](reference-foreign-format-adapters.md)
+  — the read-only compatibility boundary for older archive formats, and
+  where adapter crates live relative to core.
 
 ## Deeper background
 
@@ -44,6 +47,15 @@ format specifications — and their plain-language companion — live in
 - [pfr-reference.md](pfr-reference.md) — partial-file restore mechanics.
 - [reference-extract-stream-protocol.md](reference-extract-stream-protocol.md)
   — the ranged-ciphertext extract-stream contract.
+- [encryption-explained.md](encryption-explained.md) — why REM-ENCRYPT
+  seals objects in software instead of relying on LTO drive-level
+  encryption, and what an operator still has to manage themselves.
+- [versioning-explained.md](versioning-explained.md) — the three-question
+  change policy that governs every format revision, in plain language.
+- [versioning-register.md](versioning-register.md) — every versioned
+  component (bootstrap, sidecar, object, encryption registries, the
+  documents themselves), one entry each: current value, what an unknown
+  value means, how it can ever change.
 - [formal-verification-status.md](formal-verification-status.md) — what
   is Lean-proved, and what is deliberately not.
 
