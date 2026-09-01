@@ -1,3 +1,4 @@
+<!-- code-anchor: specs/publication tools/check_spec_versioning.py @ 9a7ce06a -->
 # How These Formats Change — and What Never Does
 
 *A plain-language companion to the versioning and revision policy of the
@@ -223,12 +224,17 @@ apply to the tapes written under it.
 
 Every document's version has three parts, always: **major.minor.errata**.
 
-- **1.0.0** — the first published revision of the 1.0 line. (This is where
-  the documents stand today.)
+- **1.0.0** — the first published revision of the 1.0 line.
 - **1.0.1** — the same rules, better text.
 - **1.1.0** — the format gained something, under the three conditions.
 - **2.0.0** — a different format, in a separate document, coexisting with
   version 1 rather than replacing it.
+
+A revision still open for public comment carries a `-draft.N` suffix on that
+three-part core — it names the revision it anticipates and orders before it,
+without being that revision yet. All three specifications are there today:
+each stands at **1.0.0-draft.1**, open for comment, and becomes 1.0.0 only
+once it is frozen.
 
 The document's title and filename carry only the major line ("REM-PARITY
 Format", file `rem-parity-1-specification.md`), so filenames never churn
@@ -415,9 +421,9 @@ depends on care alone — that is true of documentation everywhere — so it
 does not depend on care here. An automated check runs on every change to
 the documents: the change policy must read identically in all three,
 every version number in a document must agree with itself, revision
-histories must stay in order, and every registry reference must resolve.
-If any of that slips, the build fails before a reader ever sees the
-inconsistency.
+histories must stay in order, and every appendix cross-reference must
+resolve. If any of that slips, the build fails before a reader ever sees
+the inconsistency.
 
 ## In plain terms
 
