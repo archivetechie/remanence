@@ -45,7 +45,7 @@ rand_core           = "=0.9.3"
 hmac                = "0.12"
 hyper-util          = "0.1"
 libc                = "0.2"
-nix                 = { version = "0.29", features = ["ioctl", "fs"] }
+nix                 = { version = "0.31", features = ["ioctl", "fs"] }
 reed-solomon-erasure = { version = "6", features = ["simd-accel"] }
 rusqlite            = { version = "0.32", features = ["bundled"] }
 serde               = { version = "1",   features = ["derive"] }
