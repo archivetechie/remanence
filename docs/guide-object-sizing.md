@@ -1,6 +1,6 @@
 # Object sizing for terminal-index tapes
 
-REM-PARITY draft.4 no longer stores a cumulative Object directory in a
+REM-PARITY generation 2 no longer stores a cumulative Object directory in a
 one-block checkpoint or final bootstrap. The final inventory is streamed into
 three complete terminal replicas, so there is no fixed per-tape Object-count
 ceiling and no bootstrap row-budget table.

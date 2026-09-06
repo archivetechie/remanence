@@ -34,7 +34,7 @@ documents and published artifacts themselves.
   current software writes or accepts. No published REM-PARITY revision
   describes generation 2 yet: the published copy (1.0.0-draft.1) still
   describes generation 1 only. Generation 2 exists as a not-yet-published
-  revision in preparation (1.0.0-draft.4; see
+  revision in preparation (1.0.0-draft.5; see
   `specs/in-progress/README.md`), which the shipped code already matches.
 - **Unknown value.** A reader MUST reject a bootstrap whose `schema_major`
   is not 2. This is deliberate and safe: a different major means a
