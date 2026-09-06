@@ -6,8 +6,8 @@
       "name": "The ArchiveTech Project"
     }
   ],
-  "description": "Remanence is open Rust infrastructure for writing archives to LTO tape and reading them back decades later: library control, tape I/O, erasure-coded parity, and a self-describing on-tape object format. The repository is the reference implementation of REM-OBJECT — a constrained POSIX pax tar container with per-file SHA-256 identities, closed-form byte-range addressing, and a deterministic CBOR manifest — its separately versioned REM-ENCRYPT profile (HPKE Base over the X-Wing hybrid KEM: X25519 + ML-KEM-768, per draft-connolly-cfrg-xwing-kem-10), and the REM-PARITY 1.0 tape format for catalog-less, parity-protected recovery from bare tape. The specifications and their pinned test-vector archive are in specs/publication/. Licensing is a permissive split: the Rust reference implementation is Apache-2.0, the specification prose is CC-BY-4.0, and the conformance test vectors are CC0-1.0.",
-  "license": "apache-2.0",
+  "description": "Remanence is open Rust infrastructure for writing archives to LTO tape and reading them back decades later: library control, tape I/O, erasure-coded parity, and a self-describing on-tape object format. The repository implements REM-OBJECT, its REM-ENCRYPT profile, and an experimental generation-2 REM-PARITY layout; the REM-PARITY publication candidate still describes generation 1. Licensing is path-specific: Rust code is Apache-2.0, specification prose is CC-BY-4.0, conformance vectors and fixtures are CC0-1.0, and vendored IETF drafts retain their original terms. See LICENSING.md.",
+  "license": "other-open",
   "keywords": [
     "digital preservation",
     "archival storage",

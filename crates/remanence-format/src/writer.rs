@@ -364,7 +364,7 @@ fn write_fixed_blocks<S: BlockSink + ?Sized>(
     bytes: &[u8],
 ) -> Result<u64, FormatError> {
     crate::pax::validate_chunk_size(chunk_size)?;
-    if bytes.is_empty() || bytes.len() % chunk_size != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(chunk_size) {
         return Err(FormatError::layout(
             "encrypted object bytes are not a positive multiple of chunk_size",
         ));

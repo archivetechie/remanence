@@ -58,6 +58,8 @@ format specifications — and their plain-language companion — live in
   value means, how it can ever change.
 - [formal-verification-status.md](formal-verification-status.md) — what
   is Lean-proved, and what is deliberately not.
+- [decision-log.md](decision-log.md) — public format and compatibility
+  decisions that affect independent implementations.
 
 This page lists every current document in this directory. Internal
 engineering records (design iterations, review transcripts, dispatch

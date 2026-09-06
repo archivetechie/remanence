@@ -788,7 +788,7 @@ fn parse_archive_chunk_size(s: &str) -> Result<usize, String> {
     if bytes == 0 {
         return Err("chunk size must be greater than zero".to_string());
     }
-    if bytes % 512 != 0 {
+    if !bytes.is_multiple_of(512) {
         return Err(format!("chunk size {bytes} must be a multiple of 512"));
     }
     usize::try_from(bytes).map_err(|_| format!("chunk size {s:?} is too large for this host"))
@@ -13121,7 +13121,7 @@ fn scan_rem_object_entry_locators<R: Read + Seek>(
                         "non-regular REM-OBJECT entry {path:?} has size {size}"
                     ));
                 }
-                if size > 0 && offset % chunk_size as u64 != 0 {
+                if size > 0 && !offset.is_multiple_of(chunk_size as u64) {
                     return Err(format!(
                         "REM-OBJECT entry {path:?} payload starts at unaligned offset {offset}"
                     ));
@@ -13569,7 +13569,7 @@ fn plaintext_blocks_from_bytes(bytes: &[u8], chunk_size: usize) -> Result<Vec<Ve
     if bytes.is_empty() {
         return Err("decrypted plaintext REM-OBJECT is empty".to_string());
     }
-    if bytes.len() % chunk_size != 0 {
+    if !bytes.len().is_multiple_of(chunk_size) {
         return Err(format!(
             "decrypted plaintext REM-OBJECT size {} is not a multiple of chunk size {chunk_size}",
             bytes.len()
@@ -14911,8 +14911,7 @@ where
         Err(s) => {
             let _ = writeln!(err, "error: {s}");
             print_setcap_hint_if_error_text_matches(&s, err);
-            // Per `docs/layer2b-design.md` §5.1, state-changing ops
-            // can leave the snapshot dirty in three operationally
+            // State-changing ops can leave the snapshot dirty in three operationally
             // distinct ways — composed-op partial failure, IE-port
             // vendor divergence (success path), or a completion-
             // unknown transport failure on a single CDB. Read the

@@ -328,7 +328,7 @@ fn sidecar_directory_entry_from_journal(
         .checked_sub(parity_blocks)
         .and_then(|value| value.checked_sub(1))
         .ok_or(ParityError::Invariant("sidecar block geometry underflows"))?;
-    if replicated_index_blocks == 0 || replicated_index_blocks % 2 != 0 {
+    if replicated_index_blocks == 0 || !replicated_index_blocks.is_multiple_of(2) {
         return Err(ParityError::Invariant(
             "sidecar block geometry cannot recover replicated index size",
         ));
@@ -1387,8 +1387,7 @@ fn rebuild_open_epoch_from_plan(
 /// Write resume-rebuilt sidecars through the raw tape sink, commit each one
 /// after its synchronous filemark barrier, and finish the append plan.
 ///
-/// This is the Layer 3c half of `docs/layer3c-design.md` §7.8 steps 8-9:
-/// rebuilt sidecars are ordinary sidecar tape files. The `commit_sidecar`
+/// Rebuilt sidecars are ordinary sidecar tape files. The `commit_sidecar`
 /// callback is supplied by Layer 5 and must run the same catalog transaction
 /// path used for sidecars emitted during normal object close. It is invoked
 /// only after all sidecar blocks have written, the synchronous filemark has returned,
@@ -4099,7 +4098,7 @@ mod tests {
             )];
             next_file += 1;
             let total = object_ordinal + 1;
-            let closes_epoch = total % 12 == 0;
+            let closes_epoch = total.is_multiple_of(12);
             if closes_epoch {
                 let epoch_id = total / 12 - 1;
                 entries.push(journal_entry(

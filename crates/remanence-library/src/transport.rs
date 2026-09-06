@@ -415,8 +415,7 @@ impl LinuxSgTransport {
     /// authorise several of these opcodes, and because any future
     /// `SG_DXFER_TO_DEV` CDBs we add (MODE SELECT, etc.) won't
     /// surprise-fail on a read-only fd. Capability checks
-    /// (`CAP_SYS_RAWIO`) are a separate gate — see
-    /// `docs/layer2b-design.md` §2.1.
+    /// (`CAP_SYS_RAWIO`) are a separate gate.
     pub fn open_rw(path: &std::path::Path) -> Result<Self, std::io::Error> {
         use std::fs::OpenOptions;
         let file = OpenOptions::new().read(true).write(true).open(path)?;

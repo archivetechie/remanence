@@ -6,8 +6,8 @@
 | --- | --- |
 | Status | Review draft |
 | Document version | 1.0 |
-| Version | 1.0.0-draft.1 |
-| Date | 2026-07-31 |
+| Version | 1.0.0-draft.2 |
+| Date | 2026-09-06 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -23,6 +23,12 @@ pinned, so what is under review is not whether the design works but whether
 *this text describes it correctly and completely* — an independent
 implementation built from these words alone should produce the published
 vectors, and where it would not, the text is wrong and we want to know.
+
+The implementation that produced these generation-1 vectors remains available
+in the v0.1.0/v1.0.0 release history. Current `main` implements the incompatible
+generation-2 replacement in `specs/in-progress/` and rejects this document's
+`schema_major = 1` bootstrap. This review copy is therefore not a description
+of the current writer or reader.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
@@ -52,8 +58,10 @@ independent axes. None is a proxy for another, and no arithmetic relates
 them. In particular, `schema_minor` is not this document's version number;
 Section 8.1.1 is its registry.
 
-**Which copy governs.** The normative text of this document is the revision
-deposited under the concept DOI above. Every other copy — in the project
+**Which copy governs.** The concept DOI above is reserved, but no revision of
+this document has yet been deposited. Until the first deposit is published,
+this repository copy is the public review text but is not a deposited normative
+revision. Once a revision is deposited, its deposited text governs. Every other copy — in the project
 repository, inside a Remanence source release, on a mirror, or printed — is a
 convenience copy. A copy carrying the same version string as a deposited
 revision is byte-identical to it or it is defective; where they differ, the
@@ -2202,7 +2210,9 @@ The criteria were:
 
 1. At least one complete implementation implements this document in every
    role — Writer, Scanner, Recoverer, Resumer, Verifier — with no known
-   divergences from this document.
+   divergences from this document. The generation-1 release implementation
+   supplied that evidence; current `main` is an explicitly incompatible
+   generation-2 implementation and is not claimed as this reference reader.
 2. The Section 17 fixtures are present in the companion archive and pass, including the
    damage matrix and the byte-pinned minimal tape image. Every
    **[pinned-at-generation]** value is independently re-derived by a second
@@ -2223,6 +2233,12 @@ The criteria were:
    proven byte-identical to the Section 5.1/6.1 definitions via the
    Section 17 vectors. Not a format change — but freeze SHOULD wait for it,
    so adopting an accelerator never silently changes emitted bytes.
+
+Criterion 5 was exercised by an AI system under a clean-room, no-hint
+protocol: it had the specification and generic language/library facilities,
+but no implementation source. That is technical independence, not the social
+independence of a second institution; a human or institutional reproduction
+remains explicitly invited under RP-4.
 
 ## 19. IANA Considerations
 
@@ -2575,6 +2591,11 @@ conformance. Milestones that predate the first published revision are marked
 revisions of this specification, and the change policy of the Status section
 governs only the revisions that follow the first published one.
 
+- **2026-09-06 — 1.0.0-draft.2 — review-draft errata.** States that the
+  concept DOI is reserved pending the first deposit and identifies the
+  clean-room criterion-5 implementer as an AI system rather than implying an
+  unaffiliated human institution. It also makes the current generation-2
+  implementation divergence explicit. No tape obligation or vector changed.
 - **2026-07-31 — 1.0.0-draft.1 — review draft.** Published for public review;
   not yet frozen. On freezing this becomes version 1.0.0, the first published
   revision, and the change policy in the Status section governs everything

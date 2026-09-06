@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: >-
-  If you use Remanence or implement the REM-OBJECT / REM-PARITY formats, please cite
-  it as below.
+  If you use the Remanence software, please cite it as below. The format
+  specification DOIs are reserved but not yet published.
 title: "Remanence: open tape archival infrastructure and the REM-OBJECT format"
 type: software
 authors:
@@ -22,8 +22,9 @@ abstract: >-
   tar container with
   per-file SHA-256 identities, closed-form byte-range addressing, a
   deterministic CBOR manifest — its separately versioned REM-ENCRYPT profile,
-  and the REM-PARITY 1.0 tape format for catalog-less,
-  parity-protected recovery from bare tape.
+  and the generation-1 REM-PARITY tape layout for catalog-less,
+  parity-protected recovery from bare tape. Later repository revisions use an
+  incompatible experimental generation-2 REM-PARITY layout.
 keywords:
   - digital preservation
   - archival storage

@@ -13,7 +13,7 @@ virtual) and host privileges.
 <!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 244bc6de -->
 ## Build
 
-You need Rust 1.85 or newer. The workspace builds on stock Linux with no
+You need Rust 1.88 or newer. The workspace builds on stock Linux with no
 system dependencies:
 
 ```sh
@@ -40,8 +40,8 @@ To run the test suite the way CI does:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings
-cargo test --workspace --exclude remanence-chaos
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 Hardware and large-memory tests are `#[ignore]`d by default and opt in
@@ -151,8 +151,10 @@ rem-recover --object demo-enc.rem-object --private-key recovery.remp --out recov
 diff -r src recovered && echo identical
 ```
 
-`rem-recover` needs no daemon, catalog, or config file — it's the
-disaster-recovery path of last resort. For streaming and partial retrieval,
+`rem-recover` needs no daemon, catalog, or config file. It is the
+disaster-recovery path of last resort for an encrypted envelope; a plaintext
+REM-OBJECT remains an ordinary pax archive and can be inspected or extracted
+with `bsdtar`. For streaming and partial retrieval,
 `archive extract-stream` and `archive covering-range` use the same
 `--private-key` epoch-selection contract.
 

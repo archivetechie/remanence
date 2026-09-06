@@ -1,6 +1,7 @@
 # POSIX pax / ustar Reference
 
-Local reference for the Layer 3b `rem-tar-v1` implementation.
+Local reference for the POSIX pax archive carried inside a `rem-object-v1`
+object.
 
 - Official source: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/pax.html
 - Downloaded local copy: `pax-posix-2024.html`

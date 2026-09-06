@@ -7,9 +7,11 @@ and independent implementations of the published formats.
 
 ## Ground rules
 
-- **The specifications are the contract.** The on-disk and on-tape formats
-  are defined by the documents in `specs/publication/`, not by this
-  implementation's behavior. If the code and a specification disagree,
+- **The specifications are the contract.** REM-OBJECT and REM-ENCRYPT are
+  defined by the review documents in `specs/publication/`, not by this
+  implementation's behavior. REM-PARITY is temporarily split: the publication
+  candidate defines generation 1 while current code follows the generation-2
+  replacement in `specs/in-progress/`. If code and its governing text disagree,
   that is a bug in one of them — please report it either way. Changes that
   would alter published bytes are effectively format revisions and need a
   specification change first.
@@ -28,8 +30,8 @@ Build and test as CI does:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings
-cargo test --workspace --exclude remanence-chaos
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 Hardware-touching tests are ignored by default and opt in via environment

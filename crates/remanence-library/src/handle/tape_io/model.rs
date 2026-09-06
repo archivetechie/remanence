@@ -718,7 +718,7 @@ impl ReadBuffer {
 
     /// True when the first visible byte is aligned to the system page size.
     pub fn is_page_aligned(&self) -> bool {
-        (self.as_slice().as_ptr() as usize) % system_page_size() == 0
+        (self.as_slice().as_ptr() as usize).is_multiple_of(system_page_size())
     }
 }
 

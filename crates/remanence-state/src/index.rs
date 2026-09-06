@@ -678,8 +678,7 @@ pub struct TapeIoFenceRecord {
     pub release_ack: Option<String>,
 }
 
-/// One raw REOWP wrap descriptor exactly as harvested — design
-/// `design-read-ordering.md` §6.4. The cache stores these unchanged;
+/// One raw REOWP wrap descriptor exactly as harvested. The cache stores these unchanged;
 /// wrap starts are derived at planning time, and no synthetic EOD
 /// boundary is ever materialised into this list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10440,7 +10439,7 @@ fn parse_uuid_bytes(value: &str) -> Option<Vec<u8>> {
 
 fn parse_hex(value: &str) -> Option<Vec<u8>> {
     let hex = value.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

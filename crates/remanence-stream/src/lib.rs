@@ -1052,7 +1052,7 @@ fn format_sink_io(context: impl Into<String>, path: &Path, source: io::Error) ->
 }
 
 fn restore_path_error(path: &Path, message: impl Into<String>) -> FormatError {
-    FormatError::Parse(format!(
+    FormatError::RestoreDestination(format!(
         "restore path {} {}",
         path.display(),
         message.into()
@@ -1398,7 +1398,7 @@ impl FilesystemRestoreSink {
             .native_destinations
             .insert(resolved.collision_key, archive_path.to_string())
         {
-            return Err(FormatError::invalid_path(format!(
+            return Err(FormatError::RestoreDestination(format!(
                 "restore entries {previous:?} and {archive_path:?} collide after native case folding and Unicode normalization at {}",
                 resolved.destination.display()
             )));
@@ -2630,7 +2630,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                StreamingError::Format(FormatError::InvalidPath(message))
+                StreamingError::Format(FormatError::RestoreDestination(message))
                     if message.contains("collide after native case folding")
             ),
             "{error}"
@@ -2689,7 +2689,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                StreamingError::Format(FormatError::InvalidPath(message))
+                StreamingError::Format(FormatError::RestoreDestination(message))
                     if message.contains("collide")
             ),
             "{error}"
@@ -2987,6 +2987,7 @@ mod tests {
 
         let err = sink.begin_file(&entry).unwrap_err();
 
+        assert!(matches!(err, FormatError::RestoreDestination(_)), "{err}");
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!outside.path().join("file.txt").exists());
     }
@@ -3023,6 +3024,13 @@ mod tests {
         )
         .unwrap_err();
 
+        assert!(
+            matches!(
+                err,
+                StreamingError::Format(FormatError::RestoreDestination(_))
+            ),
+            "{err}"
+        );
         assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!outside.path().join("file.txt").exists());
     }

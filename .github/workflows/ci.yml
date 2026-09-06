@@ -37,10 +37,12 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Guard core dependency graph
         run: |
+          # Prospective guard: keep the core graph clean if remanence-bru is
+          # introduced later. Its current absence is not a reason to remove it.
           for package in remanence-cli remanence-api; do
             if cargo tree -p "$package" -e normal --no-default-features | grep -q 'remanence-bru '; then
               echo "$package default core graph must not depend on remanence-bru" >&2
@@ -50,7 +52,12 @@ jobs:
           done
 
       - name: Run tests
-        run: cargo test --workspace --exclude remanence-chaos
+        run: cargo test --workspace
+
+      - name: Build warning-free API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace
 
       - name: Verify REM-OBJECT vectors and plaintext interop
         run: python3 tools/verify_rem_object_vectors_independent.py --check-plaintext-interop
@@ -58,10 +65,19 @@ jobs:
       - name: Verify publication vectors and specification consistency
         run: |
           python3 tools/verify_publication_test_vectors.py
+          python3 tools/test_check_spec_versioning.py
           python3 tools/check_spec_versioning.py
 
-      - name: Execute the published damage matrix against the Recoverer
+      - name: Assert the published/current REM-PARITY compatibility boundary
         run: cargo test -p remanence-parity --test publication_damage_matrix
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo fetch --manifest-path fuzz/Cargo.toml --locked
+          cargo audit --file Cargo.lock
+          cargo audit --file fuzz/Cargo.lock
+          cargo audit --file fieldtest/tools/remfield-io/Cargo.lock
 
       # A ratchet, not a wall. Fails only on fields that entered the contract
       # WITHOUT a presence verdict -- the ones that predate the gate are listed
@@ -86,12 +102,81 @@ jobs:
 
       - name: Replay committed fuzz corpora
         run: |
+          cargo fetch --manifest-path fuzz/Cargo.toml --locked
           for target in \
             rem_object_envelope_header \
             rem_object_envelope_metadata_cbor \
+            rem_object_key_frame \
             rem_object_manifest_cbor \
             rem_object_plaintext_tar_loop \
-            rem_object_whole_object_open_verify
+            rem_object_whole_object_open_verify \
+            rem_parity_bootstrap_parse \
+            rem_parity_bootstrap_structured \
+            rem_parity_map_parse \
+            rem_parity_scan_walk \
+            rem_parity_sidecar_parse
           do
-            cargo fuzz run "$target" -- -runs=0
+            CARGO_NET_OFFLINE=true cargo fuzz run "$target" -- -runs=0
           done
+
+  msrv:
+    name: Rust 1.88 minimum-version check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Check workspace at MSRV
+        run: cargo check --workspace --all-targets --locked
+
+  static-recovery:
+    name: Static rem-recover artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools file
+      - name: Build and verify static recovery binary
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p rem-recover
+          file target/x86_64-unknown-linux-musl/release/rem-recover | grep -E 'statically linked|static-pie linked'
+          sha256sum target/x86_64-unknown-linux-musl/release/rem-recover > rem-recover-x86_64-musl.sha256
+      - name: Upload recovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rem-recover-x86_64-musl
+          path: |
+            target/x86_64-unknown-linux-musl/release/rem-recover
+            rem-recover-x86_64-musl.sha256
+
+  coverage:
+    name: Coverage measurement
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust and LLVM tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Install protoc and coverage runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libarchive-tools attr
+          cargo install cargo-llvm-cov --locked
+      - name: Measure workspace coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info

@@ -1,7 +1,6 @@
 //! Sidecar epoch directory and `parity_map` tape-file codec.
 //!
-//! The Layer 3c v0.4.4 implementation addendum v0.2 makes the sidecar
-//! directory a root-of-trust input for catalog-less reconstruction. This
+//! The sidecar directory is a root-of-trust input for catalog-less reconstruction. This
 //! module owns that compact directory model plus the replicated
 //! `parity_map` control tape-file format: primary header/payload copy, tail
 //! copy, and footer locator.
@@ -98,7 +97,7 @@ const KNOWN_DIRECTORY_FLAGS: u32 = SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH
     | SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
     | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD;
 
-/// Structural sidecar-directory entry from addendum v0.2 §3.2.
+/// Structural sidecar-directory entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidecarEpochDirectoryEntry {
     /// Filemark-delimited tape-file number of the parity sidecar.
@@ -799,7 +798,7 @@ pub fn parse_parity_map_tape_file_with_unreadable_blocks(
 ) -> Result<DecodedParityMapTapeFile, ParityError> {
     let measured_total = u64::try_from(blocks.len())
         .map_err(|_| parity_map_parse("parity-map measured block count overflows u64"))?;
-    if measured_total < 3 || measured_total % 2 == 0 {
+    if measured_total < 3 || measured_total.is_multiple_of(2) {
         return Err(parity_map_parse(format!(
             "parity-map measured block count {measured_total} cannot have layout 2M+1"
         )));

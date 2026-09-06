@@ -4,7 +4,7 @@
 //
 // Only `BadRequest` is declared: it is the one detail type the Remanence
 // API emits (PlanBatchRead names malformed-request offenders by target
-// index through it, per design-read-ordering.md §9). Omitting the sibling
+// index through it). Omitting the sibling
 // detail messages and the later-added FieldViolation reason/localization
 // fields is wire-compatible with the canonical definition.
 

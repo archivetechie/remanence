@@ -4,6 +4,25 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
+## Unreleased
+
+- Disclosed the REM-PARITY generation boundary: released generation-1 tapes
+  and vectors are incompatible with the generation-2 terminal-index reader and
+  writer on `main`.
+- Corrected the specification publication state: concept DOIs are reserved and
+  the first deposits remain pending; advanced the edited review copies to new
+  draft identifiers.
+- Replaced the vacuous published damage-matrix pass with an explicit,
+  generation-checked compatibility rejection test.
+- Documented REMP/REMR key-file bytes, transport trust boundaries, and recovery
+  streaming semantics; added distinct `rem-recover` failure exit classes and
+  `rem-daemon --version`.
+- Expanded CI to include the chaos crate, all fuzz corpora, docs with warnings
+  denied, MSRV verification, dependency auditing, and a static recovery binary.
+- Corrected the declared MSRV from Rust 1.85 to the dependency floor of 1.88.
+- Updated `h2` from 0.4.14 to 0.4.16 for RUSTSEC-2026-0258 and `anyhow`
+  to 1.0.103 for RUSTSEC-2026-0190.
+
 ## v0.1.0 — 2026-08-07
 
 **Version renumbered downward: v1.0.0 → v0.1.0. No code changed.**
@@ -46,8 +65,8 @@ was ever published to crates.io, so no dependency resolution is affected.
 
 First release of the Remanence reference implementation, distributed with the
 format documents as a **review draft** (they were marked "Draft for review";
-the specifications reached their first published revision on 2026-07-31 and
-are deposited separately — see each document's Status section). Archived:
+their concept DOIs were later reserved, but their first separate deposits are
+still pending — see each document's Status section). Archived:
 concept DOI
 [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570), version DOI
 [10.5281/zenodo.21551571](https://doi.org/10.5281/zenodo.21551571).

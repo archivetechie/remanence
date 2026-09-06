@@ -1,0 +1,23 @@
+# Runtime dependency licenses accepted for Remanence binary distributions.
+# cargo-about fails release packaging if the graph cannot be satisfied by this
+# list, turning an unfamiliar license into an explicit maintainer decision.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "BSL-1.0",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+]
+workarounds = ["ring", "rustls"]
+private = { ignore = true }

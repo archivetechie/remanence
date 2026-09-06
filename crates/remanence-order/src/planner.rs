@@ -1,4 +1,4 @@
-//! The planner: targets in, an order out — design-read-ordering.md §8.
+//! The planner: targets in, an order out.
 //!
 //! The solver is nearest-neighbour construction followed by 2-opt and
 //! Or-opt improvement (§8.5). It is deterministic: no randomness

@@ -11,9 +11,8 @@
 //! Two newtype wrappers — [`DriveHandleSink`] and
 //! [`DriveHandleSource`] — adapt the existing [`DriveHandle`]
 //! methods into the trait surface. Wrappers are explicit at every
-//! call site (rather than a blanket impl) so the dep graph + the
-//! orphan rule stay simple. The pattern is documented in
-//! `docs/layer3b-design.md` §4.5.
+//! call site (rather than a blanket impl) so the dependency graph and
+//! orphan rule stay simple.
 //!
 //! ### Errors
 //!
@@ -82,7 +81,7 @@ pub trait BlockSink {
             ));
         }
         let block_size = block_size_bytes as usize;
-        if buf.is_empty() || buf.len() % block_size != 0 {
+        if buf.is_empty() || !buf.len().is_multiple_of(block_size) {
             return Err(TapeIoError::OperationFailed(
                 "write_block_batch buffer must contain whole records".to_string(),
             ));
@@ -261,7 +260,7 @@ pub trait BlockRead {
 /// [`VecBlockSource`] for tests. Format decoders accept [`BlockRead`] instead.
 pub trait BlockSource: BlockRead {
     /// Read one fixed-size batch. The default loops through
-    /// [`Self::read_block`] and never intentionally crosses `remaining`.
+    /// [`BlockRead::read_block`] and never intentionally crosses `remaining`.
     fn read_block_batch(
         &mut self,
         buf: &mut [u8],
@@ -408,8 +407,7 @@ pub trait BlockSource: BlockRead {
 /// ```
 ///
 /// Picking a newtype over a blanket impl avoids orphan-rule
-/// surprises and makes the adapter explicit at the call site (the
-/// rationale is in `docs/layer3b-design.md` §4.5).
+/// surprises and makes the adapter explicit at the call site.
 pub struct DriveHandleSink<'a>(pub &'a mut DriveHandle);
 
 impl BlockSink for DriveHandleSink<'_> {
@@ -756,7 +754,7 @@ impl FileBlockSource {
             .map_err(|err| file_operation_error("stat file block source", err))?
             .len();
         let block_size_u64 = block_size as u64;
-        if len % block_size_u64 != 0 {
+        if !len.is_multiple_of(block_size_u64) {
             return Err(TapeIoError::OperationFailed(format!(
                 "file block source length {len} is not a multiple of block size {block_size}"
             )));

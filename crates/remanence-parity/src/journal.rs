@@ -2905,7 +2905,7 @@ mod tests {
             u64::MAX,
         ];
         for (index, tape_file_number) in boundaries.into_iter().enumerate() {
-            let kind = if index % 2 == 0 {
+            let kind = if index.is_multiple_of(2) {
                 TapeFileKind::TapeIndexReplica
             } else {
                 TapeFileKind::IndexSeparationExtent

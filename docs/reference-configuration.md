@@ -73,10 +73,29 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 is the only write mode. Configurations that still contain the key are
 rejected so an obsolete `per_object` value cannot silently change meaning.
 
+### Transport trust boundaries
+
+The Unix socket and the optional TCP listener have deliberately different
+authorization boundaries:
+
+- The Unix socket accepts only a peer whose kernel-reported uid is root or the
+  daemon's own uid. Once admitted, that local caller is trusted, receives the
+  `System` role when it sends no role header, and self-identifies the audit
+  actor through `x-remanence-actor`. Deployments must therefore protect both
+  the `0700` socket directory and access to the daemon account.
+- The TCP listener requires a client certificate signed by the configured CA.
+  Its explicit `remanence-role` subject attribute selects the role; otherwise
+  access defaults to read-only. Certificate revocation is not implemented, so
+  removing a client currently requires rotating the trusted CA or issuing a
+  replacement trust bundle and restarting the daemon.
+
+Authenticated API clients can currently receive internal-error text that may
+include host paths or SQLite diagnostics. Treat both transports as
+administrative interfaces rather than exposing them to untrusted tenants.
+
 ### I/O memory ceiling deployment note (TIO-6 R2)
 
-Specified by `design-tape-io-read-pipeline-v0.1.md` §4.6. The daemon unit must
-run under a cgroup memory limit
+The daemon unit must run under a cgroup memory limit
 (systemd `MemoryMax`) with `io_memory_ceiling` + daemon baseline headroom
 ≤ `MemoryMax` (guidance: leave ≥ 2 GiB), and `LimitMEMLOCK` sized ≥ the
 ceiling (a safe upper bound: only read-reservoir slabs are actually
@@ -117,8 +136,8 @@ surface exists, client implementations must set these values directly.
 
 ### HTTP/2 keepalive (dead-peer detection) — TIO-6 R2 transport defaults
 
-Specified by `design-tape-io-read-pipeline-v0.1.md` §4.5. Like the windows,
-these are compiled transport defaults, not configuration keys:
+Like the windows, these are compiled transport defaults, not configuration
+keys:
 
 - **Server (tonic builder, both listeners — TCP/mTLS and Unix socket):**
   `http2_keepalive_interval = 30 s`, `http2_keepalive_timeout = 20 s`.

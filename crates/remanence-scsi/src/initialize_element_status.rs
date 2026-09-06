@@ -6,9 +6,8 @@
 //! reason. The CDB has no data phase.
 //!
 //! The "with range" variant (`0x37`) is deliberately not implemented
-//! — see `docs/layer2b-design.md` §3.2 for the rationale (single-
-//! digit-second full rescan on 40-slot libraries is not worth the
-//! extra surface).
+//! because a single-digit-second full rescan on 40-slot libraries is
+//! not worth the extra surface.
 
 /// SCSI opcode for INITIALIZE ELEMENT STATUS.
 pub const OPCODE: u8 = 0x07;

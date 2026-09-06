@@ -1,7 +1,6 @@
 //! Layer 3a — tape I/O methods on [`DriveHandle`](super::DriveHandle).
 //!
-//! See `docs/layer3a-design.md` for the full design. This module is
-//! a **child** of `handle` (not a sibling), which lets it see the
+//! This module is a **child** of `handle` (not a sibling), which lets it see the
 //! private fields of `LibraryHandle` and `DriveHandle` — necessary
 //! for the data-path methods (`rewind`, `locate`, `space`, `position`,
 //! `read_block`, `write_block`, `write_filemarks`, `read_config`,
@@ -9,15 +8,10 @@
 //! emit audit events on the parent's hook, and flip the parent's
 //! dirty bit via `DriveHandle`'s shared state on transport errors.
 //!
-//! Method bodies arrive incrementally across Step 9.4–9.7. Step 9.4
-//! lands [`super::DriveHandle::rewind`] and
-//! [`super::DriveHandle::position`] — the simplest pair (one no-data
-//! CDB + one in-data CDB) that exercises the new transport plumbing
-//! end-to-end. Subsequent steps add
-//! `locate`/`space`/`read_block`/`write_block`/etc.
+//! It implements positioning, readiness, block I/O, filemark operations,
+//! media fencing, and the pipelined transfer paths used by higher layers.
 
-/// The media-dispatch gate and pre-dispatch write fence (design
-/// `design-read-ordering.md` §6.5 / D4b).
+/// The media-dispatch gate and pre-dispatch write fence.
 pub mod media_gate;
 pub mod model;
 /// Media readiness classification for TEST UNIT READY probes.
@@ -264,8 +258,7 @@ pub enum TapeIoError {
 
     /// The pre-dispatch media-write fence could not durably advance
     /// the loaded volume's `write_epoch`, so the media-modifying CDB
-    /// was refused before dispatch (design `design-read-ordering.md`
-    /// §6.5). **No command reached the drive**: position and mode
+    /// was refused before dispatch. **No command reached the drive**: position and mode
     /// state are unchanged, the snapshot stays clean, and this is not
     /// a completion-unknown signal. Retrying the write re-runs the
     /// fence.
@@ -753,8 +746,7 @@ impl super::DriveHandle {
     }
 
     /// Issue READ END OF WRAP POSITION (`A3h/1Fh/45h`, long form) and
-    /// parse the response — the wrap-map harvest read (design
-    /// `design-read-ordering.md` §6.5).
+    /// parse the response — the wrap-map harvest read.
     ///
     /// Read-direction only; issuing it never modifies media or drive
     /// state. The returned data is the drive's **load snapshot**: valid
@@ -2633,8 +2625,7 @@ impl super::DriveHandle {
         }
     }
 
-    /// Install the durable calibration-control fence for the current
-    /// load (design `design-read-ordering.md` §6.5). The layer that
+    /// Install the durable calibration-control fence for the current load. The layer that
     /// harvests the wrap map at load binds the loaded volume's
     /// durable control row to a [`MediaWriteFence`] and installs it
     /// here — Layer 3a never learns a `tape_uuid`. Installation
@@ -3016,7 +3007,7 @@ fn validate_fixed_batch(
         )));
     }
     let block_size = block_size_bytes as usize;
-    if bytes % block_size != 0 {
+    if !bytes.is_multiple_of(block_size) {
         return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
             "fixed batch buffer length must be an exact multiple of block_size_bytes",
         )));

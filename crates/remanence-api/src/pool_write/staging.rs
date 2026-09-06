@@ -673,7 +673,7 @@ impl BlockSink for StagedBlockSink {
     ) -> Result<WriteBatchOutcome, TapeIoError> {
         if block_size_bytes as usize != self.caps.block_size
             || buf.is_empty()
-            || buf.len() % self.caps.block_size != 0
+            || !buf.len().is_multiple_of(self.caps.block_size)
         {
             return Err(TapeIoError::OperationFailed(
                 "pipelined batch must contain whole configured records".into(),
@@ -1403,7 +1403,7 @@ pub(crate) fn records_in_staged_batch(
         ));
     }
     let block_size = block_size_bytes as usize;
-    if data.is_empty() || data.len() % block_size != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(block_size) {
         return Err(TapeIoError::OperationFailed(
             "staged write batch must contain whole records".to_string(),
         ));

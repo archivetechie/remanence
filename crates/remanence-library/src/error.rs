@@ -45,7 +45,7 @@ pub enum DiscoveryError {
 /// Cleanly-serialisable replacement for `std::io::Error` inside
 /// [`DiscoveryWarning::DeviceUnreachable`]. We deliberately don't store
 /// the raw error — the model types are `Clone + PartialEq` value structs
-/// (see `docs/layer2-design.md` §3) and `std::io::Error` is neither.
+/// and `std::io::Error` is neither.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IoErrorKind {
     /// Mapped variant of `std::io::ErrorKind` — string for stability across
@@ -228,7 +228,7 @@ pub enum OpenError {
 }
 
 // =====================================================================
-//  Layer 2b error vocabulary — see docs/layer2b-design.md §4.2
+//  Layer 2b error vocabulary
 // =====================================================================
 
 /// Errors from `LibraryHandle::move_medium` and other single-CDB
@@ -324,7 +324,7 @@ pub enum DriveOpError {
 
 /// Errors from the composed `LibraryHandle::load`. Each variant names
 /// the phase that failed and (in the docstring) the resulting snapshot
-/// state — see `docs/layer2b-design.md` §5.1 for the full table.
+/// state.
 #[derive(Debug, Error)]
 pub enum LoadError {
     /// The requested barcode is not currently visible in any drive bay or slot.
@@ -433,8 +433,7 @@ pub enum RescanError {
 
 /// Non-fatal observations produced by reconciliation. Both
 /// `LibraryHandle::rescan` and `LibraryHandle::refresh` route these
-/// through the audit hook as [`AuditEvent::Warning`] events (per
-/// `docs/layer2b-design.md` §5.2 / §5.3). They do **not** flow back
+/// through the audit hook as [`AuditEvent::Warning`] events. They do **not** flow back
 /// through the return value of either entry point — the operator-
 /// facing surface for both is plain `Result<…>`, and per-bay change
 /// detail lives in the audit log.
@@ -494,7 +493,7 @@ pub enum RescanWarning {
 }
 
 // =====================================================================
-//  Audit event vocabulary — docs/layer2b-design.md §6 property 7
+//  Audit event vocabulary
 // =====================================================================
 
 /// One audit-relevant event observed by the audit hook. The four kinds:

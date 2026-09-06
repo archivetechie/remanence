@@ -1,7 +1,7 @@
 //! Exact rational arithmetic for longitudinal tape positions.
 //!
-//! The mapping in design-read-ordering.md §6.4 produces a longitudinal
-//! fraction per block whose denominator is the span of the block's wrap.
+//! Block mapping produces a longitudinal fraction per block whose denominator
+//! is the span of the block's wrap.
 //! Those fractions are stored and compared exactly — no floating point
 //! anywhere in stored or compared values. Comparison uses a
 //! continued-fraction descent rather than cross-multiplication, so it is

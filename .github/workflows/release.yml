@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  linux-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify signed tag, main ancestry, and successful CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
+          test "$(git rev-parse "$GITHUB_REF_NAME^{}")" = "$GITHUB_SHA"
+          workspace_versions=$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]')
+          test "$GITHUB_REF_NAME" = "v$workspace_versions" || {
+            echo "release tag $GITHUB_REF_NAME does not match workspace version $workspace_versions" >&2
+            exit 1
+          }
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          tag_oid=$(git rev-parse "$GITHUB_REF_NAME^{tag}")
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_oid" \
+            --jq 'if .verification.verified then true else error("tag signature is not GitHub-verified") end' \
+            >/dev/null
+          gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$GITHUB_SHA" \
+            -f status=success \
+            --jq 'if any(.workflow_runs[]; .conclusion == "success") then true else error("tagged commit has no successful main CI run") end' \
+            >/dev/null
+      - name: Install Rust and musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            protobuf-compiler musl-tools libarchive-tools attr
+          cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: Run release gates
+        run: |
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build Linux binaries
+        run: |
+          cargo build --release --locked -p remanence-cli -p remanence-daemon
+          cargo build --release --locked --target x86_64-unknown-linux-musl -p rem-recover
+      - name: Package and checksum artifacts
+        run: |
+          install -d dist/remanence-x86_64-linux dist/rem-recover-x86_64-linux-musl
+          cargo about generate about.hbs > dist/THIRD-PARTY-LICENSES.html
+          test -s dist/THIRD-PARTY-LICENSES.html
+          install -m 0755 target/release/rem target/release/rem-debug target/release/rem-daemon dist/remanence-x86_64-linux/
+          install -m 0755 target/x86_64-unknown-linux-musl/release/rem-recover dist/rem-recover-x86_64-linux-musl/
+          install -m 0644 LICENSE-APACHE-2.0 dist/remanence-x86_64-linux/
+          install -m 0644 LICENSE-APACHE-2.0 dist/rem-recover-x86_64-linux-musl/
+          install -m 0644 dist/THIRD-PARTY-LICENSES.html dist/remanence-x86_64-linux/
+          install -m 0644 dist/THIRD-PARTY-LICENSES.html dist/rem-recover-x86_64-linux-musl/
+          tar -C dist -czf dist/remanence-x86_64-linux.tar.gz remanence-x86_64-linux
+          tar -C dist -czf dist/rem-recover-x86_64-linux-musl.tar.gz rem-recover-x86_64-linux-musl
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Create GitHub release and attach artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes

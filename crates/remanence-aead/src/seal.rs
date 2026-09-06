@@ -99,7 +99,7 @@ where
     validate_chunk_size(options.common.chunk_size)?;
     crate::header::object_id_field(&options.common.object_id)?;
     let chunk = u64::from(options.common.chunk_size);
-    if options.common.plaintext_size == 0 || options.common.plaintext_size % chunk != 0 {
+    if options.common.plaintext_size == 0 || !options.common.plaintext_size.is_multiple_of(chunk) {
         return Err(RemObjectAeadError::InvalidInput(
             "envelope seal requires non-empty, chunk-aligned plaintext".to_string(),
         ));

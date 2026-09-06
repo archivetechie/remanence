@@ -19,8 +19,7 @@ pub struct StatePaths {
     pub sqlite_path: PathBuf,
     /// Directory containing per-tape catalog caches.
     pub tape_cache_dir: PathBuf,
-    /// Directory holding the durable calibration-control store
-    /// (design-read-ordering.md §4.3). Deliberately derived from
+    /// Directory holding the durable calibration-control store. Deliberately derived from
     /// `state_dir` and **not** cleared by catalog reset: the
     /// `calibration_generation` allocator inside must never restart,
     /// or a generation could be re-issued and resurrect a cached

@@ -2,9 +2,8 @@
 //!
 //! A sidecar begins with a primary header/index copy, continues with raw
 //! parity-shard blocks, repeats the header/index copy at the tail, and ends
-//! with a footer locator. This module implements the fixed binary surface from
-//! `docs/layer3c-design.md` §5.5 as tightened by
-//! `docs/remanence-3c-implementation-addendum-v0.2.md`: little-endian fields,
+//! with a footer locator. This module implements the fixed binary surface:
+//! little-endian fields,
 //! HMAC-derived per-tape magic, CRC-64/XZ for every sidecar CRC, and index
 //! packing that never splits a parity or data-CRC entry across block
 //! boundaries.
@@ -155,7 +154,7 @@ fn pack_index_segment(
 
     let entries_per_spill = spill_capacity / entry_len;
     let complete_spill_blocks = remaining_count / entries_per_spill;
-    let partial_spill_block = u64::from(remaining_count % entries_per_spill != 0);
+    let partial_spill_block = u64::from(!remaining_count.is_multiple_of(entries_per_spill));
     let added_blocks = complete_spill_blocks
         .checked_add(partial_spill_block)
         .ok_or_else(|| sidecar_parse("sidecar added index blocks overflow u64"))?;

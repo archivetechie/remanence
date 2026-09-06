@@ -585,7 +585,7 @@ pub(crate) fn prepare_canonical_plaintext_pool_object(
         }
     };
     let source_size = source_file_size(source_path)?;
-    if source_size == 0 || source_size % u64::from(block_size) != 0 {
+    if source_size == 0 || !source_size.is_multiple_of(u64::from(block_size)) {
         return Err(PoolWriteError::InvalidInput(format!(
             "canonical plaintext REM object size {source_size} is not a nonzero multiple of selected block size {block_size}"
         )));
@@ -848,7 +848,8 @@ pub(crate) fn seal_prepared_object(
     let block_count = u64::try_from(sealed.len() / prepared.options.chunk_size).map_err(|_| {
         PoolWriteError::InvalidInput("sealed REM-OBJECT block count overflow".to_string())
     })?;
-    if sealed.len() % prepared.options.chunk_size != 0 || block_count != envelope.stored_size_blocks
+    if !sealed.len().is_multiple_of(prepared.options.chunk_size)
+        || block_count != envelope.stored_size_blocks
     {
         return Err(PoolWriteError::InvalidInput(
             "sealed REM-OBJECT bytes do not match envelope block count".to_string(),
@@ -896,7 +897,7 @@ pub(crate) fn write_fixed_blocks(
     block_size: usize,
     bytes: &[u8],
 ) -> Result<u64, PoolWriteError> {
-    if bytes.len() % block_size != 0 {
+    if !bytes.len().is_multiple_of(block_size) {
         return Err(PoolWriteError::InvalidInput(
             "stored REM-OBJECT bytes are not block aligned".to_string(),
         ));

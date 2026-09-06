@@ -1,4 +1,4 @@
-//! Pure-state-machine coalescer. See `docs/layer2c-design.md` §3.3.
+//! Pure-state-machine coalescer.
 //!
 //! The coalescer takes raw `(event, now)` pushes and a separate
 //! `tick(now)` poke for time advancement. It returns at most one

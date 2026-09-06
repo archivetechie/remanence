@@ -1,18 +1,15 @@
 //! Remanence Layer 2 — logical-library discovery, identity, and
 //! policy-gated handles.
 //!
-//! Discovery is read-only and returns a [`DiscoveryReport`]. The
-//! handle type that gates state-changing operations behind an
-//! [`AccessPolicy`] check and live identity revalidation against the
-//! changer's VPD 0x80 serial is `LibraryHandle`, which lands in
-//! `docs/layer2-design.md` §7.6 alongside the orchestrating
-//! `discover()` entry point.
+//! Discovery is read-only and returns a [`DiscoveryReport`]. [`LibraryHandle`]
+//! gates state-changing operations behind an [`AccessPolicy`] check and live
+//! identity revalidation against the changer's VPD 0x80 serial.
 //!
-//! This crate currently exposes the value types (`Library`,
-//! `DriveBay`, `InstalledDrive`, `Slot`, `IePort`, `ElementLayout`,
-//! `ElementException`) and the pure `Library::from_captures(...)` builder. The discovery
-//! orchestration that issues live SCSI calls and walks sysfs lands
-//! incrementally — see `docs/layer2-design.md` §7.
+//! The crate exposes the library value model, pure capture builder, live Linux
+//! discovery, policy-gated changer and drive handles, tape I/O, and hot-plug
+//! observation. The public architecture and configuration contracts are in the
+//! repository's `docs/architecture-overview.md` and
+//! `docs/reference-configuration.md`.
 
 #![warn(missing_docs)]
 

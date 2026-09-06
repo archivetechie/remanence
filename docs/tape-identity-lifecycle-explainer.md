@@ -1,8 +1,7 @@
 # Why tapes need a lifecycle — the recycle problem, explained
 
-**Companion to:** `docs/tape-identity-lifecycle-design-v0.1.md` (the
-normative design). This document is the *why*: what actually goes wrong
-today, walked through step by step, and why the fix has the shape it
+This document explains what actually goes wrong today, walked through step by
+step, and why the fix has the shape it
 has. Nothing here is normative.
 
 ---

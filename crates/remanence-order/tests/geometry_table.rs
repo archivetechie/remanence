@@ -45,8 +45,8 @@ fn every_row_carries_its_expected_source() {
             112,
             32,
             3584,
-            "Track and channel counts as previously established from the HP LTO Ultrium \
-             Technical Reference Manual lineage (Volume 4); design-read-ordering.md \u{a7}6.3.",
+            "Track and channel counts from the HP LTO Ultrium \
+             Technical Reference Manual lineage (Volume 4).",
         ),
         (
             "LTO-8",
@@ -55,8 +55,7 @@ fn every_row_carries_its_expected_source() {
             208,
             32,
             6656,
-            "Published LTO-8 specification tables and CERN EOSCTA operations notes; \
-             design-read-ordering.md \u{a7}6.3.",
+            "Published LTO-8 specification tables and CERN EOSCTA operations notes.",
         ),
         (
             "LTO-9",
@@ -65,7 +64,7 @@ fn every_row_carries_its_expected_source() {
             280,
             32,
             8960,
-            "HPE published LTO-9 figures; design-read-ordering.md \u{a7}6.3.",
+            "HPE published LTO-9 figures.",
         ),
         (
             "LTO-10",
@@ -75,7 +74,7 @@ fn every_row_carries_its_expected_source() {
             32,
             15104,
             "Published LTO-10 structural figures; media code LA per IBM TS4300 \
-             'Bar code label' Table 2; design-read-ordering.md \u{a7}6.3.",
+             'Bar code label' Table 2.",
         ),
         (
             "LTO-10",
@@ -85,7 +84,7 @@ fn every_row_carries_its_expected_source() {
             32,
             15104,
             "Published LTO-10 structural figures; media code PA per IBM TS4300 \
-             'Bar code label' Table 2; design-read-ordering.md \u{a7}6.3.",
+             'Bar code label' Table 2.",
         ),
     ];
     assert_eq!(STRUCTURAL_TABLE.len(), expected.len());

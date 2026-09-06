@@ -199,7 +199,7 @@ fn validate_wrap_suite(wrap_suite: u8) -> Result<()> {
 
 /// Validate a REM-OBJECT body block / AEAD chunk size.
 pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
-    if chunk_size == 0 || chunk_size % 512 != 0 {
+    if chunk_size == 0 || !chunk_size.is_multiple_of(512) {
         return Err(RemObjectAeadError::InvalidChunkSize);
     }
     Ok(())

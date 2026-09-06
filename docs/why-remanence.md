@@ -481,8 +481,8 @@ You probably want something else if:
   the Reed-Solomon tape layout, sidecars, and catalog-less bootstrap recovery.
 - [Architecture overview](architecture-overview.md) — the shipped layer stack,
   write/read paths, catalog, audit log, journals, and daemon surface.
-- `layer2-design.md`, `layer2b-design.md`, `layer2c-design.md` — the
-  original design documents for the tape-platform layers.
+- Git history — the original tape-platform design iterations and their review
+  trail; durable contracts are distilled into the current public references.
 - `pfr-reference.md` — partial-file-restore mechanics, including the
   prior-art comparison with LTFS extents.
 - `INSTALL.md` — operator runbook for the dev/reference deployment.

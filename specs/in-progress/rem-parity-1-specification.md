@@ -6,8 +6,8 @@
 | --- | --- |
 | Status | Review draft |
 | Document version | 1.0 |
-| Version | 1.0.0-draft.4 |
-| Date | 2026-08-11 |
+| Version | 1.0.0-draft.5 |
+| Date | 2026-09-06 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719156](https://doi.org/10.5281/zenodo.21719156) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -48,7 +48,7 @@ appendix of this document is only a snapshot taken when this revision was fixed.
 On freezing, the format this document defines becomes final: no tape it
 validates will ever be invalidated, no reader guarantee will be withdrawn, and
 the discovery guarantee of Section 8.4 will stand for the life of
-`schema_major` 1. The document itself may still be revised even then, in
+`schema_major` 2. The document itself may still be revised even then, in
 exactly the three ways set out below.
 
 No standards body has reviewed or adopted it. There is no ISO number, no RFC,
@@ -64,8 +64,10 @@ independent axes. None is a proxy for another, and no arithmetic relates
 them. In particular, `schema_minor` is not this document's version number;
 Section 8.1.1 is its registry.
 
-**Which copy governs.** The normative text of this document is the revision
-deposited under the concept DOI above. Every other copy — in the project
+**Which copy governs.** The concept DOI above is reserved, but no revision of
+this document has yet been deposited. Until the first deposit is published,
+this repository copy is a review draft and not a deposited normative revision.
+Once a revision is deposited, its deposited text governs. Every other copy — in the project
 repository, inside a Remanence source release, on a mirror, or printed — is a
 convenience copy. A copy carrying the same version string as a deposited
 revision is byte-identical to it or it is defective; where they differ, the
@@ -89,7 +91,7 @@ by three questions, asked in order.
 2. Does a reader conforming only to an earlier revision lose the ability to
    identify a newer tape and refuse it cleanly? Then it is also a **major**.
    (This is why the discovery-candidate block sizes of Section 8.4 are
-   frozen for the life of `schema_major` 1: a scanner that cannot rotate to
+   frozen for the life of `schema_major` 2: a scanner that cannot rotate to
    a tape's block size does not fail with a diagnosis — it reports no
    bootstrap at all, which is indistinguishable from a blank or destroyed
    medium.)
@@ -2070,6 +2072,12 @@ The criteria were:
    Section 17 vectors. Not a format change — but freeze SHOULD wait for it,
    so adopting an accelerator never silently changes emitted bytes.
 
+Criterion 5 was exercised by an AI system under a clean-room, no-hint
+protocol: it had the specification and generic language/library facilities,
+but no implementation source. That is technical independence, not the social
+independence of a second institution; a human or institutional reproduction
+remains explicitly invited under RP-4.
+
 ## 19. IANA Considerations
 
 This document has no IANA actions. The identifiers this specification
@@ -2444,6 +2452,11 @@ conformance. Milestones that predate the first published revision are marked
 revisions of this specification, and the change policy of the Status section
 governs only the revisions that follow the first published one.
 
+- **2026-09-06 — 1.0.0-draft.5 — replacement review draft.** States that the
+  concept DOI remains reserved pending the first deposit, corrects the
+  generation-number references in the shared status policy, and identifies
+  the criterion-5 clean-room exercise as technical independence by an AI
+  system rather than organizational independence. No tape byte changed.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.

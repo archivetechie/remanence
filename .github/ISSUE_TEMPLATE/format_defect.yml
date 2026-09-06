@@ -1,0 +1,28 @@
+name: Format specification defect
+description: Report an ambiguity, contradiction, or interoperability problem.
+title: "spec: "
+labels: [specification]
+body:
+  - type: dropdown
+    id: document
+    attributes:
+      label: Document
+      options:
+        - REM-OBJECT Core
+        - REM-ENCRYPT
+        - REM-PARITY
+        - Test vectors
+        - Other public documentation
+    validations:
+      required: true
+  - type: textarea
+    id: defect
+    attributes:
+      label: Defect and impact
+      description: Cite the section or vector and explain the interoperability impact.
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed resolution

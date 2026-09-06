@@ -1,5 +1,4 @@
-//! Load-time wrap-map harvest and the serve path — design
-//! `design-read-ordering.md` §6.5, prompt P4.
+//! Load-time wrap-map harvest and the serve path.
 //!
 //! **Harvest-and-install is one act.** [`harvest_and_install_calibration`]
 //! is the only place in the codebase that installs a real

@@ -248,6 +248,7 @@ None of these touch tape; they are the easiest way to exercise the format.
 | `rem archive extract-stream --private-key <REMP> [--range <START:LEN> --authenticated-prefix <FILE> --stored-range-start <BYTE>]` | Stream-decrypt an envelope from stdin to stdout with per-chunk authentication and bounded memory. With the three ranged flags together, re-authenticate the header/key-frame/metadata prefix and decrypt only the covering ciphertext frames beginning at `--stored-range-start`. |
 | `rem archive covering-range --private-key <REMP> --object-id <ID> --file-id <ID> --range <START:LEN>` | Authenticate an envelope header/key-frame/metadata prefix from stdin and print the smallest covering stored-ciphertext range (`stored_range_start`, `stored_range_len`, `first_chunk`, `chunk_count`). See [`reference-extract-stream-protocol.md`](reference-extract-stream-protocol.md). |
 | `rem restore --object <FILE> --dest <DIR> [--private-key <REMP>]` | Top-level native-restore alias with the same key contract as `extract`. |
+
 | `rem archive list` | List native objects from the local catalog (no tape access). |
 | `rem archive formats` | Print JSON describing the foreign-format adapters linked into this binary; stock Remanence returns an empty list. |
 | `rem archive probe --format <ID> --dump <FILE>` | Ask a registered foreign-format adapter to identify a dump without streaming it. |
@@ -259,6 +260,35 @@ These commands are generic, but the stock Remanence binaries register no
 foreign formats and fail closed with a “not registered in this distribution”
 error. An adapter distribution supplies the accepted IDs and parser code; see
 the [foreign-format adapter reference](reference-foreign-format-adapters.md).
+
+### Recipient key-file formats
+
+REMP and REMR are complete binary records, not raw key bytes. All offsets are
+from the start of the file, labels are 0–32 printable ASCII bytes (`0x20`–`0x7e`),
+and parsers reject trailing bytes.
+
+| REMP offset | Length | Field |
+| ---: | ---: | --- |
+| 0 | 4 | magic `REMP` |
+| 4 | 16 | opaque recipient epoch id |
+| 20 | 1 | label length `L` |
+| 21 | `L` | epoch label |
+| `21 + L` | 32 | canonical X-Wing private seed |
+
+The exact REMP length is `53 + L` bytes. Treat the entire file as secret.
+
+| REMR offset | Length | Field |
+| ---: | ---: | --- |
+| 0 | 4 | magic `REMR` |
+| 4 | 1 | key-frame slot index |
+| 5 | 16 | opaque recipient epoch id |
+| 21 | 1 | label length `L` |
+| 22 | `L` | epoch label |
+| `22 + L` | 1216 | X-Wing public key: ML-KEM-768 encapsulation key followed by X25519 public key |
+
+The exact REMR length is `1238 + L` bytes. The slot, epoch id, and label are
+copied into envelope recipient slots; the public-key encoding is validated
+when the record is parsed.
 
 ### Encryption flag matrix
 
@@ -377,3 +407,14 @@ writing files out, and refuses to overwrite existing output unless
 
 Use this deliberately small binary when the full CLI stack is unavailable;
 ordinary local restores can use `rem archive extract --private-key`.
+
+`rem-recover` uses stable process exit classes so unattended recovery tooling
+can distinguish failures:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | recovery completed |
+| 2 | command-line usage error (from `clap`) |
+| 3 | malformed REMP key file or recipient epoch not present in the object |
+| 4 | corrupt/nonconforming envelope or inner REM-OBJECT; also a matching-epoch authenticated unwrap failure, which cannot distinguish a damaged recipient slot from an incorrect REMP seed |
+| 5 | host filesystem, staging, input, or output I/O failure |

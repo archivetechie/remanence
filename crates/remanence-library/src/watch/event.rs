@@ -1,4 +1,4 @@
-//! Value types for hot-plug events. See `docs/layer2c-design.md` §3.
+//! Value types for hot-plug events.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

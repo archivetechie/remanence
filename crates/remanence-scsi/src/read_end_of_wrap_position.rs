@@ -20,8 +20,7 @@
 //! return data is a snapshot the drive takes at load. GA32-0928-09
 //! states it is "valid at load" and "becomes stale on any write
 //! operation" — re-issuing the command later in the same load does not
-//! refresh it. Harvest timing and cache invalidation live above Layer 1
-//! (design-read-ordering.md §6.5).
+//! refresh it. Harvest timing and cache invalidation live above Layer 1.
 //!
 //! Only the **long form** (`RA=1`) is implemented: one response listing
 //! every reported wrap. The short form (`RA=0`, one wrap picked by the
@@ -205,7 +204,7 @@ pub fn parse_response(buf: &[u8]) -> Result<EndOfWrapPositions, ScsiError> {
         });
     }
     let descriptor_bytes = declared - 2;
-    if descriptor_bytes % DESCRIPTOR_LEN != 0 {
+    if !descriptor_bytes.is_multiple_of(DESCRIPTOR_LEN) {
         return Err(ScsiError::InvalidResponse {
             offset: 0,
             detail: "REOWP response data length does not describe whole 12-byte wrap descriptors",

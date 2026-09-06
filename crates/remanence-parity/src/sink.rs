@@ -919,7 +919,6 @@ pub struct BoundedResumeWriterSeed<'a> {
 /// parity sink forwards each fixed block to the raw tape sink while updating
 /// per-stripe parity accumulators. Completed epochs are emitted later as
 /// sidecar tape files, never as inline parity blocks in the object stream.
-/// See `docs/layer3c-design.md` §5-§7.
 #[allow(missing_debug_implementations)]
 pub struct ParitySink<'a> {
     backend: ParitySinkBackend<'a>,
@@ -2182,7 +2181,7 @@ impl<'a> ParitySink<'a> {
     /// On success, `finish()` emits only any pending final partial sidecar;
     /// the sole Bootstrap remains the tape-file-0 BOT record.
     ///
-    /// **Partial epoch strategy** (`docs/layer3c-design.md` §5.4):
+    /// **Partial epoch strategy**:
     /// if `data_blocks_in_neighborhood` is between 0 and `S × k`,
     /// `finish()` computes parity over real data plus implicit zero shards and
     /// emits a final sidecar. It does not write zero padding blocks to tape.
@@ -2864,7 +2863,7 @@ impl<'a> ParitySink<'a> {
 
     /// Internal: record one object-data block in epoch accounting.
     /// `stripe_index = n % S`, `row = n / S` per the row-major
-    /// interleave (`docs/layer3c-design-v0.2.md` §5.2). Returns
+    /// interleave. Returns
     /// the (stripe_index, row) the block landed at.
     ///
     /// Object writes update parity accumulators and drop the shard; object data
