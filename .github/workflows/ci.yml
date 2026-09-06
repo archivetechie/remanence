@@ -126,7 +126,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+        uses: dtolnay/rust-toolchain@1.120
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Check workspace at MSRV
