@@ -1,4 +1,4 @@
-//! The positioning cost model — design-read-ordering.md §7.1.
+//! The positioning cost model.
 //!
 //! Physical decomposition with fixed priors:
 //!

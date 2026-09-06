@@ -1,7 +1,7 @@
 // Remanence Layer 5 — gRPC API surface (DRAFT v0.1).
 //
-// Status: design draft. Generated into remanence-api; no wire-stability promise.
-// Authoritative reference for terminology and contracts: docs/spec-v0.4.md.
+// Status: implemented pre-stability contract; no wire-stability promise yet.
+// This file is authoritative for Layer 5 field numbers and RPC contracts.
 //
 // Transport: HTTPS/2 with mTLS authentication (mutual cert auth at the channel
 // layer; per-request authorization is enforced server-side per audit policy).
@@ -15,7 +15,7 @@
 //     authoritative.
 //   - "Object" identity is by Remanence-assigned object UUID. The orchestrator's
 //     own identifier rides as `caller_object_id` (an opaque string) and is
-//     stored on tape alongside the data per docs/spec-v0.4.md §4.2.
+//     stored with the REM-OBJECT identity metadata.
 //   - Idempotency: fields are reserved on state-changing RPCs. Until per-RPC
 //     replay is implemented, non-empty keys fail fast with UNIMPLEMENTED rather
 //     than being silently accepted.
@@ -23,13 +23,11 @@
 //   - Cancellation: long-running operations return an `operation_id`; cancel
 //     via Daemon.CancelOperation.
 //
-// What this draft does NOT yet pin:
+// What this contract does NOT yet pin:
 //   - Concrete enum values for error codes beyond the canonical gRPC status.
-//   - Detailed write-format-specific options (rem-tar-v1 vs future formats).
-//   - Multi-library naming and routing details.
-//   - Subscription/notification streams (operation updates, library events).
-//   - Per-RPC authorization is enforced by the server using the role model in
-//     docs/spec-v0.4.md §11.6; certificate subject encoding is deployment policy.
+//   - Detailed write-format-specific options beyond opaque adapter metadata.
+//   - Per-RPC authorization is enforced by the server; certificate subject
+//     encoding and transport trust are deployment policy.
 
 syntax = "proto3";
 
@@ -43,7 +41,7 @@ import "google/protobuf/empty.proto";
 // =============================================================================
 
 // Opaque identifier the caller supplies to deduplicate retries of a state-
-// changing RPC. Per layer4 addendum §6.1: persisted with actor fingerprint.
+// changing RPC. When implemented it is persisted with the actor fingerprint.
 message IdempotencyKey {
   // Caller-provided UUID. 16 bytes. Must be unique per (actor, request).
   bytes value = 1;
@@ -657,7 +655,7 @@ message LibraryEvent {
 //
 // This is the orchestrator's primary read surface. It powers the rebuildable-
 // index discipline: every query here can be answered from on-tape state alone
-// (the SQLite index is a cache; see layer4 addendum §6).
+// (the SQLite index is a rebuildable cache, not the durable authority).
 // =============================================================================
 
 service Catalog {
@@ -678,7 +676,7 @@ service Catalog {
   // Stream every object on a tape, in order. This is the core enumeration RPC
   // the orchestrator calls to (re)build its catalog. Each item carries the
   // logical identity (content_sha256) plus the on-tape locator (tape + file +
-  // BodyLba per rem-tar-v1 §2.1).
+  // object-local body LBA for `rem-object-v1`).
   rpc EnumerateObjects (EnumerateObjectsRequest) returns (stream ObjectRecord);
 
   // Single-object lookup.
@@ -701,7 +699,7 @@ service Catalog {
   rpc GetTapeFinalization (GetTapeFinalizationRequest) returns (TapeFinalization);
 
   // Body-format-aware queries. The daemon delegates to the registered
-  // format adapter (rem-tar-v1, rem-tar-legacy, rem-bru, future).
+  // format adapter (`rem-object-v1` or a separately distributed foreign adapter).
   rpc ListFilesInObject (ListFilesInObjectRequest) returns (ListFilesInObjectResponse);
   rpc GetFile           (GetFileRequest)           returns (FileRecord);
 
@@ -724,14 +722,14 @@ service Catalog {
 message Tape {
   bytes tape_uuid              = 1;  // primary key: always known
   optional string voltag       = 2;  // tapes.voltag is nullable
-  // "rem-tar-v1", "tar-legacy", "bru", ... Absent until something has read the
+  // "rem-object-v1", "tar-legacy", "bru", ... Absent until something has read the
   // volume far enough to say; an inventoried tape has a barcode and no format.
   optional string body_format  = 3;
   // Absent means nobody has read the volume's block size. It is never zero: a
   // zero block size is not a tape, and treating unknown as 0 is precisely the
   // conflation field 13 was written to avoid.
   optional uint64 block_size_bytes = 4;
-  // Parity scheme summary (per layer4 addendum tapes table). All three columns
+  // Parity scheme summary projected from tape authority. All three columns
   // are nullable and are absent together on an unscanned volume; an unprotected
   // tape is a scheme that says so, not a scheme of zero parity blocks.
   optional uint32 data_blocks_per_stripe   = 5;
@@ -1147,7 +1145,7 @@ message ObjectRecord {
   // Nullable in `objects`: the orchestrator need not supply one, and absent is
   // not the same as an orchestrator that supplied an empty string.
   optional string caller_object_id = 2;  // opaque string from orchestrator (§4.2)
-  // The logical-asset identity Sutradhara keys on. For rem-tar-v1 this is the
+  // The logical-asset identity Sutradhara keys on. For rem-object-v1 this is the
   // canonical manifest_sha256 / content hash of the object's contents.
   // Nullable: an object catalogued before its content was hashed has none, and
   // the objects_content_hash_idx index is explicitly partial on `is not null`.
@@ -1172,7 +1170,7 @@ message ObjectCopy {
   bytes  tape_uuid             = 1;
   uint64 tape_file_number      = 2;
   // Within the object, the first BodyLba block of the first file's data.
-  // Per rem-tar-v1 §2.1 BodyLba is per-object and starts at 0.
+  // For rem-object-v1, BodyLba is per-object and starts at 0.
   uint64 first_body_lba        = 3;
   // Catalog-recorded freshness: when did scrub last confirm this copy?
   google.protobuf.Timestamp last_verified_at = 4;
@@ -1198,7 +1196,7 @@ message ObjectCopy {
   optional uint64 global_end_block   = 10;
 }
 
-// A single payload file inside an object (rem-tar-v1: one pax entry).
+// A single payload file inside an object (rem-object-v1: one pax entry).
 message FileRecord {
   bytes object_id              = 1;
   // file_id is per-object; UUID assigned by the writer and recorded in pax.
@@ -1206,7 +1204,7 @@ message FileRecord {
   string path                  = 3;
   uint64 size_bytes            = 4;
   bytes  file_sha256           = 5;
-  // BodyLba within the object where this file's data starts (rem-tar-v1
+  // BodyLba within the object where this file's data starts (rem-object-v1
   // chunk-aligned start). The only nullable column in `object_files`: LBA 0 is
   // a real and common address -- the very start of the body -- so it cannot
   // also stand for "not recorded". Every other field here is NOT NULL, because
@@ -1319,7 +1317,7 @@ message GetFileRequest {
 message CatalogUnit {
   bytes unit_id                    = 1;
   bytes tape_uuid                  = 2;
-  string format_id                 = 3; // "rem-tar-v1", "bru", "tar-legacy", ...
+  string format_id                 = 3; // "rem-object-v1", "bru", "tar-legacy", ...
   CatalogUnitOriginKind origin_kind = 4;
   google.protobuf.Timestamp discovered_at = 5;
 
@@ -1604,12 +1602,12 @@ message AppendObjectStart {
   // with NULL; see tools/wire-presence-ledger.txt for that mismatch.
   string caller_object_id             = 2;
   map<string, string> caller_metadata = 3; // §4.2 opaque metadata
-  // Declared size for capacity-reserve planning (rem-tar-v1 §9.1 P1
+  // Declared size for capacity-reserve planning (`rem-object-v1`
   // projected_size_blocks). Absent means the caller does not know, and the
   // daemon estimates. Zero is a declaration that the object is empty, which is
   // an ordinary object -- the same reason ObjectRecord.size_bytes is optional.
   optional uint64 declared_size_bytes = 4;
-  // For rem-tar-v1: pre-supplied per-file manifest (paths, sizes, hashes,
+  // For rem-object-v1: pre-supplied per-file manifest (paths, sizes, hashes,
   // optional pre-computed file_sha256). The writer validates and writes
   // accordingly. The exact shape is body-format-specific; this draft leaves
   // it as a serialized blob owned by the format adapter. Absent means the
@@ -1803,7 +1801,6 @@ message BytesChunk {
 // =============================================================================
 // READ PLAN SERVICE — batch read ordering over one volume.
 //
-// Contract of record: design-read-ordering.md §§9 and 11 (private journal).
 // The RPC accepts targets to *reason about*: it requires no read session,
 // performs no tape motion, and returns an ordering with per-hop positioning
 // estimates. The read surface (ReadSessionService) is unchanged — callers
@@ -1914,7 +1911,7 @@ message PlanBatchReadResponse {
 // =============================================================================
 // AUDIT SERVICE — read-only audit log queries.
 //
-// The append-only audit log is daemon-authoritative (layer4 addendum §5).
+// The append-only audit log is daemon-authoritative.
 // Layer 5 exposes query-only surface; mutations only happen through the
 // other services.
 // =============================================================================
@@ -1937,7 +1934,7 @@ message AuditEntry {
   string source_layer          = 4; // "layer2", "layer3a", "layer3c", "layer5"
   bytes  operation_id          = 5;
   bytes  session_id            = 6;
-  string event_kind            = 7; // see layer4 addendum §5.2
+  string event_kind            = 7;
   // Free-form structured detail; CBOR-encoded in the on-disk log, JSON-ified
   // here for client convenience.
   string detail_json           = 8;

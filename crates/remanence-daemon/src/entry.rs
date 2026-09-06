@@ -6,7 +6,11 @@ use std::process::ExitCode;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(name = "rem-daemon", about = "Remanence Layer 5 catalog daemon")]
+#[command(
+    name = "rem-daemon",
+    version,
+    about = "Remanence Layer 5 catalog daemon"
+)]
 struct Args {
     /// Path to the daemon config TOML.
     #[arg(long, value_name = "PATH", default_value = "/etc/rem/config.toml")]
@@ -209,6 +213,23 @@ fn init_tracing() {
         .json()
         .flatten_event(true)
         .try_init();
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn version_flag_exits_without_loading_configuration() {
+        let error = Args::try_parse_from(["rem-daemon", "--version"])
+            .expect_err("--version exits after printing the package version");
+        assert_eq!(error.kind(), ErrorKind::DisplayVersion);
+        assert!(
+            error.to_string().contains(env!("CARGO_PKG_VERSION")),
+            "version output must contain the package version: {error}"
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

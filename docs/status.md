@@ -22,8 +22,8 @@ library-robotics operations.
 
 One qualification matters more than any of the capability detail below. The
 format specifications are review drafts until 31 July 2027. What is under
-review is whether they describe the implemented formats correctly, not whether
-the design works — so the expected outcome is corrections to the text. But a
+review for REM-OBJECT and REM-ENCRYPT is whether they describe the implemented
+formats correctly. REM-PARITY has a known generation split described below. A
 review finding could still change what goes on tape, and the promise that no
 tape a format validates will ever be invalidated takes effect at the freeze,
 not today. Material written during the review window should be treated as
@@ -41,10 +41,11 @@ the earlier non-pipelined mode has been removed. Reads are served through a
 host-RAM reservoir that supports ranged access, so a partial-file restore does
 not have to stream a whole object.
 
-**The on-tape formats.** The `rem-object-v1` object body, the REM-ENCRYPT
-encrypted representation, and Reed-Solomon sidecar parity with recovery,
-resume, and a catalog-less terminal-index scan. All three are specified,
-implemented, and pinned by the test vectors that ship with the source.
+**The on-tape formats.** The `rem-object-v1` object body and REM-ENCRYPT
+encrypted representation match their review specifications and pinned vectors.
+Reed-Solomon sidecar parity, resume, and catalog-less terminal-index recovery
+are implemented for REM-PARITY generation 2; the published-directory parity
+text and publication vectors still describe generation 1.
 
 **Encryption.** Each object gets a fresh key, wrapped to one or more recipients
 using HPKE with the X-Wing hybrid KEM — ML-KEM-768 combined with X25519 — and
@@ -64,14 +65,30 @@ socket and optionally over mTLS TCP.
 **Operator tools.** `rem` and `rem-debug`, including a destructive-safety
 gauntlet for tape initialization and quarantine tooling for suspect media.
 Object build, inspect and extract work on local files with no tape hardware at
-all. A separate `rem-recover` binary decrypts and extracts archive objects with
-no daemon, catalog, or configuration file — the disaster-recovery path of last
-resort.
+all. A separate `rem-recover` binary decrypts and extracts encrypted envelope
+objects with no daemon, catalog, or configuration file. Plaintext REM-OBJECTs
+remain ordinary pax archives readable with `bsdtar`.
 
 **Testing.** Chaos fault-injection, fuzzing of the format parsers, and
 Lean/Aeneas proofs over the parity and format cores in [`verif/`](../verif).
 
 ## What does not work yet
+
+### The REM-PARITY generation boundary
+
+Current software writes and accepts only bootstrap `schema_major = 2`, whose
+terminal authority is three complete index replicas separated by typed extents.
+The repository copy under `specs/publication/` and its frozen vectors define
+`schema_major = 1`. Consequently current software cannot read tapes written by
+the v0.1.0/v1.0.0 release, and an implementation of the generation-1 review
+text cannot read tapes written by current `main`. Generation 2 is documented in
+`specs/in-progress/`; it has not yet replaced the generation-1 publication
+candidate or vectors.
+
+The specification concept DOIs are reserved but their first deposits are still
+pending. Until publication catches up, keep source material for every tape and
+do not describe a current generation-2 tape as conforming to the generation-1
+REM-PARITY review document.
 
 **Authorization is coarse.** It is a role matrix with no scope below the role:
 a client is readonly, operator, orchestrator, admin or system, and there is no
@@ -97,6 +114,7 @@ tape hardware is episodic rather than continuous.
 
 That is the honest shape of the risk. The formats are the part that has to last
 decades, and they are the part with specifications, pinned vectors, an
-independent clean-room recovery drill, and formal proofs over their cores. The
+an AI-system clean-room recovery drill (technically independent of the source,
+but not an independent institution), and formal proofs over their cores. The
 software around them is younger than the formats it implements. Restore and
 verify real material from your own hardware before relying on either.

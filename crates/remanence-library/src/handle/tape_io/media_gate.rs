@@ -2,8 +2,7 @@
 //! write-direction CDB reaches a drive's transport, and the
 //! media-write fence that runs inside it.
 //!
-//! Design of record: `design-read-ordering.md` §6.5 and decision D4b
-//! (kept in the private journal repo). The wrap map describing a
+//! The wrap map describing a
 //! cartridge's geometry is only valid while that cartridge has not
 //! been written since the map was harvested. The guarantee is
 //! enforced here: before the **first media-modifying CDB of a load**
@@ -18,12 +17,12 @@
 //! safe, never the reverse.
 //!
 //! Why this is a *structural* funnel rather than a convention: the
-//! drive transport is wrapped in [`MediaFencedTransport`], whose
-//! inner [`SgTransport`] is private to this module. Code elsewhere in
+//! drive transport is wrapped in `MediaFencedTransport`, whose
+//! inner [`crate::transport::SgTransport`] is private to this module. Code elsewhere in
 //! the `handle` tree — including Layer 3a's own methods — cannot name
 //! `execute_out`, nor `execute_none` for a media-modifying opcode, on
 //! the drive transport at all. The only write-direction path is
-//! [`MediaFencedTransport::dispatch_media_cdb`] (via its two typed
+//! `MediaFencedTransport::dispatch_media_cdb` (via its two typed
 //! shims), and the fence lives inside it. Adding a ninth independent
 //! dispatch site is a compile error, not a review finding.
 //!

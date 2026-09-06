@@ -29,3 +29,11 @@ you prefer otherwise.
   sections. Ambiguities or weaknesses in the *specifications* are security
   reports too, and in some ways the more important kind: implementations
   can be patched, published formats are forever.
+- The optional TCP listener authenticates clients against a configured CA but
+  does not implement CRL or OCSP revocation. Revoke access by rotating the
+  trust bundle and restarting the daemon.
+- The Unix socket is an administrative trust boundary: kernel peer credentials
+  restrict it to root or the daemon uid, after which the client self-identifies
+  its audit actor. Internal API errors may expose host paths or SQLite details
+  to an authenticated client; do not expose either transport to untrusted
+  tenants.

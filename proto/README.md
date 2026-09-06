@@ -1,77 +1,72 @@
 # Remanence Layer 5 — gRPC API protos
 
-**Status: implementation draft.** `layer5.proto` is compiled by
-`crates/remanence-api`, but it is not a wire-stable contract and has no
-published version. Expect breakage while Layer 5 fills out the remaining
-services.
+**Status: implemented, pre-stability contract.** `layer5.proto` is compiled by
+`crates/remanence-api` and served by `rem-daemon`. It uses the
+`remanence.api.v1` package namespace, but the project has not made a wire
+stability promise for that namespace. Breaking changes remain possible while
+the software is alpha and must be coordinated with known generated-binding
+consumers.
 
-## Why this exists now
+## Scope
 
-Layer 5 is partially implemented: the Daemon, Catalog, WriteSessionService,
-ReadSessionService, operations, LibraryService inspection/mutation methods, UDS
-transport, and mTLS TCP transport are live in `crates/remanence-api` and
-`crates/remanence-daemon`. Authorization depth, audit-query RPCs, ranged reads,
-and live library events remain. The orchestrator above Remanence —
-[Sutradhara](https://github.com/archivetechie/sutradhara) — needs to design against
-the gRPC contract to avoid pinning architecture to assumptions that do not
-survive contact with the real API. Keeping the proto explicit:
+The file is the single source of truth for the Layer 5 wire contract. It
+defines Daemon, LibraryService, Catalog, WriteSessionService,
+ReadSessionService, ReadPlanService, and Audit services. The implementation
+includes Unix-socket transport, optional mTLS TCP transport, role-based
+authorization, catalog and audit streams, pool-targeted or pinned-tape write
+sessions, whole-object and ranged reads, read planning, library inspection and
+robotics, drive stewardship, alarms, and live status.
 
-1. Forces the contract into a single artifact, instead of being scattered across spec sections.
-2. Lets Sutradhara design its `StorageBackend` trait against a concrete interface.
-3. Surfaces holes in the Remanence spec that only show up when you try to write the messages.
+Some declared operations intentionally return `UNIMPLEMENTED`; the current
+list belongs in [the status page](../docs/status.md), not in a second contract
+copy here.
 
 ## Authoritative references
 
-The proto is derived from the consolidated spec; if they conflict, the spec wins:
+- [`layer5.proto`](layer5.proto) is authoritative for field numbers, presence,
+  services, and RPC behavior.
+- [REM-OBJECT](../specs/publication/rem-object-core-1-specification.md) and
+  [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md) define the
+  object and envelope bytes carried through the API.
+- The current generation-2 tape implementation follows the
+  [REM-PARITY revision in preparation](../specs/in-progress/rem-parity-1-specification.md),
+  while the publication candidate still describes generation 1.
+- [Architecture](../docs/architecture-overview.md) and
+  [configuration](../docs/reference-configuration.md) describe deployment and
+  transport trust boundaries.
 
-- `docs/spec-v0.4.md` — consolidated source of truth, especially §4 (orchestrator boundary and caller-object-id pattern), §8 (rem-tar-v1 body format), §9 (Layer 3c parity/session semantics), §10 (Layer 4 state, audit, SQLite, idempotency), and §11 (Layer 5 gRPC API).
+## Stable intent and evolving surfaces
 
-## What's pinned vs. what's not
+| Stable intent | Still evolving or explicitly unsupported |
+| --- | --- |
+| Explicit library identity; no implicit single-library default | Exact wire-stability declaration for the `remanence.api.v1` namespace |
+| REM-OBJECT identity, digests, and opaque body-format manifests | Caller-supplied idempotency keys: fields are reserved and non-empty values are rejected with `UNIMPLEMENTED` |
+| Native object catalog plus additive native/foreign unit discovery | Persistent per-entry cache shape for foreign formats |
+| Pool-targeted and pinned-tape write admission | Runtime pool-assignment mutation; pool membership is configuration/catalog policy |
+| Server streaming with bounded producer channels | Write-session restart and the operations listed as unimplemented in `docs/status.md` |
+| Explicit open/close/abort/checkpoint session lifecycle | Cross-tape transaction semantics |
 
-| Pinned (high confidence) | Not pinned (placeholder) |
-|---|---|
-| mTLS transport | Authorization scopes / role model |
-| Service boundary: Daemon, LibraryService, Catalog, WriteSessionService, ReadSessionService, Audit | Exact wire-stability promise / proto version field |
-| caller-object-id + caller-metadata on every write | Body-format-specific `AppendObjectStart.body_format_manifest` shape |
-| Idempotency key on every state-changing RPC | Notification streams for multi-tenant scenarios |
-| Server-streaming for: enumerate, watch operation, read bytes, library events | Quota / rate-limit semantics |
-| Object identity by Remanence UUID; content addressed by SHA-256 | Multi-library naming/routing details |
-| Native object catalog hot path stays `Catalog.EnumerateObjects`; cross-source native/foreign discovery is additive via `Catalog.EnumerateUnits` | Persistent per-foreign-entry cache shape |
-| Tape-pool visibility: `ListTapePools`, `Tape.pool_id`, `ObjectCopy.pool_id`, and pool-targeted write-session requests | Pool assignment management RPC shape |
-| Sessions are first-class with explicit Open/Close/Abort/Checkpoint | Cross-tape transactional semantics |
+Foreign-format metadata stays behind opaque adapter-owned bytes rather than a
+wire `oneof`; the core API does not acquire BRU- or tar-specific locator types.
+Multiple-library routing stays explicit because several libraries can expose
+the same element addresses and must never be selected by convenience default.
 
 ## Generation
 
-Rust generation is wired through `crates/remanence-api/build.rs` using
-`tonic-prost-build`; generated bindings are included by
-`crates/remanence-api/src/lib.rs` with `tonic::include_proto!`. The checked-in
-source of truth remains this `.proto` file, not generated Rust.
+Rust generation runs from `crates/remanence-api/build.rs` through
+`tonic-prost-build`; generated bindings are included with
+`tonic::include_proto!`. The checked-in `.proto` is the source of truth, not
+generated Rust.
 
-Python generation for Sutradhara is not shipped from this repository.
+Python bindings used by consumers are generated and maintained by those
+consumers; this repository does not ship them.
 
-## Versioning policy (when this graduates to v1)
+## Compatibility policy
 
-- Package name `remanence.api.v1` is reserved for the first stable contract.
-- Until then, breaking changes are allowed without ceremony — but they should be discussed in `docs/` first.
-- After v1: additive only. Field deprecation rather than removal; new RPCs in new services rather than churning existing ones.
-
-## Open questions tracked here
-
-These are visible in the `.proto` as comments but worth surfacing:
-
-1. **Format-adapter message shapes.** `AppendObjectStart.body_format_manifest` is currently `bytes`. The format adapter (rem-tar-v1, rem-tar-legacy, rem-bru) defines the inner shape. Should this be a `oneof` per known format, or stay opaque? Trade-off: type safety vs. format pluggability.
-2. **Multi-library routing.** Most RPCs take a `library_uuid`. For deployments with multiple libraries this is fine; for the single-library default it's noise. Consider a `DefaultLibrary` convention.
-3. **Operation cancellation completion-uncertainty.** `OperationStatus.state == UNKNOWN` covers Layer 4's `CompletionUnknown`. Make sure clients are guided to GetOperation again after a delay rather than treating UNKNOWN as terminal.
-4. **Foreign entry caching.** `CatalogUnit` supports foreign read-only archive
-   units, but v1 should not expose BRU/tar physical locators as public schema.
-   Decide after real tape scans whether to persist per-entry cache rows or
-   serve `ListEntriesInUnit` by re-running the driver's scan.
-5. **Tape-pool assignment management.** The catalog exposes pool definitions
-   and current tape membership, and write-session requests can target or guard
-   by pool. The operator/API flow for assigning and moving blank tapes between
-   pools is still a management-surface question.
-
-Closed in the current implementation: `EnumerateObjects` / `EnumerateUnits`
-server back-pressure uses bounded channel-backed streams over read-only SQLite
-query handles, so the daemon does not materialize full catalog scans before
-emitting the first response.
+Before a wire-stability declaration, breaking changes require coordinated
+consumer updates but no compatibility guarantee is implied by the package
+suffix. Once the namespace is declared stable, changes are additive: fields
+are deprecated rather than reused or removed, and new behavior is introduced
+through new fields, RPCs, or services. The wire-presence census in CI prevents
+new scalar fields from entering the contract without an explicit presence
+decision.

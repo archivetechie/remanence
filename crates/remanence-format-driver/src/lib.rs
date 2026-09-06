@@ -177,6 +177,10 @@ pub enum FormatError {
         source: std::io::Error,
     },
 
+    /// The host destination rejected an otherwise valid restore operation.
+    #[error("restore destination rejected: {0}")]
+    RestoreDestination(String),
+
     /// The underlying block sink/source failed.
     #[error(transparent)]
     TapeIo(#[from] TapeIoError),

@@ -4,7 +4,7 @@
 //! `ObjectParityState`, `ObjectParityStateUpdateRange`, `FinalGeometry`,
 //! and read-path audit events.
 //!
-//! See `docs/layer3c-design.md` for the active v0.4.4 sidecar-only design.
+//! See the public REM-PARITY specification for the format contract.
 
 use serde::{Deserialize, Serialize};
 
@@ -111,16 +111,14 @@ impl ParityScheme {
     /// Maximum contiguous damage (in blocks) one neighborhood
     /// can recover from, assuming damage hits stripe positions
     /// roughly uniformly within the neighborhood. Equal to
-    /// `stripes_per_neighborhood × m`. Per
-    /// `docs/layer3c-design-v0.2.md` §5.2: damage up to S×m
+    /// `stripes_per_neighborhood × m`: damage up to S×m
     /// blocks affects at most `m` blocks per stripe and all
     /// stripes recover.
     pub fn contiguous_damage_threshold(&self) -> u64 {
         self.stripes_per_neighborhood as u64 * self.parity_blocks_per_stripe as u64
     }
 
-    /// Validate the scheme parameters against
-    /// `docs/layer3c-design-v0.2.md` §11.3 constraints. Returns
+    /// Validate the scheme parameters against the format constraints. Returns
     /// `Ok(&self)` on success or a descriptive
     /// [`crate::ParityError::InvalidScheme`] on failure.
     ///
@@ -172,8 +170,7 @@ impl ParityScheme {
         let neighborhood = self.neighborhood_blocks();
         if neighborhood > u32::MAX as u64 {
             return Err(crate::error::ParityError::InvalidScheme(format!(
-                "neighborhood_blocks = S × (k + m) = {neighborhood} > u32::MAX = 4 G blocks \
-                 (per docs/layer3c-design-v0.2.md §11.3)"
+                "neighborhood_blocks = S × (k + m) = {neighborhood} > u32::MAX = 4 G blocks"
             )));
         }
         Ok(self)
@@ -265,11 +262,11 @@ pub enum SidecarMetadataHealth {
     BothCopiesUsable,
     /// The primary copy was usable, but the tail copy was unavailable.
     ///
-    /// This is the addendum's `SidecarMetadataCopyLost` audit case.
+    /// Audit case for losing one sidecar metadata copy.
     TailCopyLost,
     /// The tail copy was usable, but the primary copy was unavailable.
     ///
-    /// This is the addendum's `SidecarPrimaryHeaderLost` audit case.
+    /// Audit case for losing the sidecar primary header.
     PrimaryHeaderLost,
 }
 
@@ -325,8 +322,7 @@ pub enum ObjectParityState {
 /// Catalog predicate for recomputing object parity states after a sidecar
 /// advances the tape protection watermark.
 ///
-/// Layer 5 can translate this directly into the range update required by
-/// `docs/layer3c-design.md` §7.2.1:
+/// Layer 5 can translate this directly into the required range update:
 ///
 /// ```text
 /// first_parity_data_ordinal < first_parity_data_ordinal_upper_exclusive
@@ -429,7 +425,6 @@ impl ObjectParityState {
     /// Derive the catalog summary from the object's ordinal range and the
     /// tape protection watermark.
     ///
-    /// This implements `docs/layer3c-design.md` §7.2.1 / §10.1:
     /// `protected` iff `ordinal_end_exclusive <= W`, `pending` iff
     /// `first_parity_data_ordinal >= W`, and `partial` otherwise.
     pub fn from_ordinals(

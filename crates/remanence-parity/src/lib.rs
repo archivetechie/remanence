@@ -9,7 +9,9 @@
 //! medium-error / servo-damage the wrapper reconstructs missing
 //! blocks from parity.
 //!
-//! See `docs/layer3c-design.md` for the current sidecar-only design.
+//! The public on-tape contract is documented in
+//! `specs/in-progress/rem-parity-1-specification.md`; generation compatibility
+//! is summarized in `docs/reference-tape-layout.md`.
 //!
 //! ### Crate position
 //!
@@ -220,7 +222,7 @@ pub enum ParityConfig {
 
 /// Parse a CLI-style parity argument into a [`ParityConfig`].
 ///
-/// Accepted forms (matches `docs/layer3c-design.md` §11.4):
+/// Accepted forms:
 ///
 /// - `"default"` → [`default_scheme`] at
 ///   [`DEFAULT_SCHEME_BLOCK_SIZE_BYTES`]

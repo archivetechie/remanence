@@ -315,7 +315,7 @@ fn parse_opened_encrypted_object(
             supplied: chunk_size,
         });
     }
-    if plaintext.len() % chunk_size != 0 {
+    if !plaintext.len().is_multiple_of(chunk_size) {
         return Err(FormatError::parse(
             "decrypted REM-OBJECT plaintext is not chunk aligned",
         ));
@@ -533,7 +533,7 @@ where
                 let entry_chunk_count =
                     validate_declared_chunk_count(&path, &pending_pax, size, chunk_size)?;
                 let data_offset = reader.offset();
-                if size > 0 && data_offset % chunk_size as u64 != 0 {
+                if size > 0 && !data_offset.is_multiple_of(chunk_size as u64) {
                     return Err(FormatError::ChunkAlignmentViolation { path, data_offset });
                 }
                 let entry = RemTarStreamEntry {
@@ -709,7 +709,7 @@ fn parse_rem_tar_bytes_with_mode_and_manifest_anchor(
                     &seen_regular_paths,
                 )?;
                 let data_offset = offset as u64;
-                if size > 0 && data_offset % chunk_size as u64 != 0 {
+                if size > 0 && !data_offset.is_multiple_of(chunk_size as u64) {
                     return Err(FormatError::ChunkAlignmentViolation { path, data_offset });
                 }
                 let expected_digest = regular_file_sha256(&path, entry_type, &pending_pax)?;

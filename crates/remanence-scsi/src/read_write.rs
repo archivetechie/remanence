@@ -9,10 +9,9 @@
 //! `0x8A` are best-known from SBC for disks), but HPE LTO drives
 //! do not implement them — only the 6-byte forms — and rem does not
 //! need them, since READ(6) / WRITE(6)'s 24-bit transfer length
-//! covers any LTO block size (max 16 MiB). The earlier
-//! `docs/layer3a-design.md` SCSI table mentioned 0x88 / 0x8A as a
-//! design option; that row is now a strikethrough explaining the
-//! drop with this rationale.
+//! covers any LTO block size (max 16 MiB). The 16-byte variants
+//! (opcodes 0x88 / 0x8A) therefore add surface without extending the
+//! supported LTO transfer range.
 //!
 //! Mode bits in byte 1:
 //! - **FIXED** (bit 0): 0 = variable-block mode (transfer length =

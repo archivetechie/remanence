@@ -6,9 +6,8 @@
 //!   - 0x80 — Unit Serial Number ([`UnitSerial`])
 //!   - 0x83 — Device Identification ([`DeviceIdentification`])
 //!
-//! More pages (0xB0 *Block Limits*, 0xC0 / 0xCC / 0xD0 vendor-specific, …)
-//! will land here as Layer 1 needs them. Build the matching CDB with
-//! [`crate::inquiry::build_cdb_vpd`].
+//! Build the matching CDB with [`crate::inquiry::build_cdb_vpd`]. Unsupported
+//! standard or vendor-specific pages are deliberately outside this parser.
 
 use crate::error::ScsiError;
 use crate::inquiry::DeviceType;

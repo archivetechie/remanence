@@ -25,14 +25,17 @@ read side by side: where a top-level number is absent from one document, the
 other owns it. This document omits Section 5 (the encrypted representation,
 owned by REM-ENCRYPT); REM-ENCRYPT omits Sections 4, 9, and 14 (the plaintext
 representation, the parity relationship, and conformance, owned here).
+Subsection numbers are shared as well: a gap below a common top-level section
+means the corresponding subsection is defined by the companion specification,
+not that text is missing from this document.
 
 **Status of This Document**
 
 | | |
 | --- | --- |
 | Status | Review draft |
-| Version | 1.0.0-draft.1 |
-| Date | 2026-07-31 |
+| Version | 1.0.0-draft.2 |
+| Date | 2026-09-06 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -61,15 +64,17 @@ No standards body has reviewed or adopted it. It was written by the same
 people who wrote the implementation, so the stability of this document is our
 own undertaking rather than anyone else's approval.
 
-**Which copy governs.** The normative text of this document is the revision
-deposited under the concept DOI above. Every other copy — in the project
+**Which copy governs.** The concept DOI above is reserved, but no revision of
+this document has yet been deposited. Until the first deposit is published,
+this repository copy is the public review text but is not a deposited normative
+revision. Once a revision is deposited, its deposited text governs. Every other copy — in the project
 repository, inside a Remanence source release, on a mirror, or printed — is a
 convenience copy. A copy carrying the same version string as a deposited
 revision is byte-identical to it or it is defective; where they differ, the
 deposit governs. A version string is never reused for different bytes, so
 naming a version names one exact text no matter which copy you hold. The
 reference implementation is informative: where it and this document disagree,
-this document is the fixed point (Section 18, criterion 1), and the divergence
+this document is the fixed point, and the divergence
 is a defect in the implementation.
 
 **Deciding what a change is.** Every revision of this document is classified
@@ -1184,8 +1189,10 @@ projected_size_blocks = total_size_bytes / chunk_size
 
 This is the only block-level zero fill in the stream, and it is tar-safe: it
 lies beyond the archive EOF where standard tar already stops. Readers MUST NOT
-interpret bytes after the EOF records; Verifiers (Section 7.4) MUST confirm
-the fill is all-zero and report a nonzero fill as a nonconformity. A writer
+interpret bytes after the EOF records as archive members. A Reader MAY stop at
+the EOF records or MAY validate the remaining fill and reject a nonzero byte as
+a nonconformity. Verifiers (Section 7.4) MUST confirm the fill is all-zero and
+report a nonzero fill as a nonconformity. A writer
 whose emitted block count differs from its planned `projected_size_blocks`
 MUST fail the object rather than complete it.
 
@@ -2063,6 +2070,11 @@ framing the stream already provides (self-description, digests).
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
+- **2026-09-06 — 1.0.0-draft.2 — review-draft errata.** Clarifies that shared
+  numbering extends to subsections, removes a dead REM-PARITY Section 18
+  cross-reference, states the reserved-but-not-deposited publication status,
+  and makes explicit that a Reader may reject nonzero post-EOF fill while a
+  Verifier must check it. No valid object or vector changed.
 - **2026-07-31 — 1.0.0-draft.1 — review draft.** The first revision of this
   document published under its own identifier, and the first offered for public
   review. Comments close 30 April 2027; the document freezes 31 July 2027.

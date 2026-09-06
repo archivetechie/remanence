@@ -51,12 +51,12 @@ fn physical_lpos_on_both_sides_of_every_wrap_boundary() {
         assert_eq!(first_after.wrap_index, w);
 
         // Exact longitudinal positions by wrap parity.
-        let expected_before = if (w - 1) % 2 == 0 {
+        let expected_before = if (w - 1).is_multiple_of(2) {
             Ratio::new(s - 1, s).unwrap() // forward: near the far end
         } else {
             Ratio::new(1, s).unwrap() // reverse: near the load point
         };
-        let expected_after = if w % 2 == 0 {
+        let expected_after = if w.is_multiple_of(2) {
             Ratio::ZERO // forward wrap starts at the load-point end
         } else {
             Ratio::ONE // reverse wrap starts at the far end
@@ -85,7 +85,7 @@ fn direction_follows_wrap_parity() {
     let map = uniform_map(8, 100, 50);
     for w in 0u64..8 {
         let pos = map.locate(w * 100 + 5).unwrap();
-        let expected = if w % 2 == 0 {
+        let expected = if w.is_multiple_of(2) {
             TapeDirection::Forward
         } else {
             TapeDirection::Reverse

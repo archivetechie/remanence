@@ -44,7 +44,7 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<InspectReport> {
     )?;
     let stored_size_bytes =
         u64::try_from(bytes.len()).map_err(|_| RemObjectAeadError::SizeOverflow)?;
-    if stored_size_bytes % u64::from(header.chunk_size) != 0 {
+    if !stored_size_bytes.is_multiple_of(u64::from(header.chunk_size)) {
         return Err(RemObjectAeadError::TrailingData);
     }
     if stored_size_bytes

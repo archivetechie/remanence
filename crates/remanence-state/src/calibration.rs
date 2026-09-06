@@ -1,5 +1,4 @@
-//! The durable calibration-control store — design
-//! `design-read-ordering.md` §§4.3, 6.5 and decision D4b/D13.
+//! The durable calibration-control store.
 //!
 //! This store is the authority on whether a cached wrap map may be
 //! served. It holds, per volume: the durable `write_epoch`, the

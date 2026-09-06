@@ -1,5 +1,5 @@
 //! Trait surface for hot-plug event sources, plus the
-//! [`HotplugReceiver`] newtype. See `docs/layer2c-design.md` §3.2 / §5.
+//! [`HotplugReceiver`] newtype.
 
 use std::time::Duration;
 

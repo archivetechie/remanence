@@ -94,7 +94,7 @@ pub fn stream_nonce(counter: u64, final_chunk: bool) -> [u8; 12] {
 /// Return `P / C`, rejecting zero or non-multiple plaintext sizes.
 pub fn chunk_count(plaintext_size: u64, chunk_size: u32) -> Result<u64> {
     let chunk = u64::from(chunk_size);
-    if chunk == 0 || plaintext_size == 0 || plaintext_size % chunk != 0 {
+    if chunk == 0 || plaintext_size == 0 || !plaintext_size.is_multiple_of(chunk) {
         return Err(RemObjectAeadError::InvalidMetadataField);
     }
     Ok(plaintext_size / chunk)

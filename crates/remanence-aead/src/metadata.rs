@@ -62,7 +62,7 @@ impl RemObjectMetadata {
     pub fn validate(&self, chunk_size: u32) -> Result<()> {
         validate_chunk_size(chunk_size)?;
         let chunk = u64::from(chunk_size);
-        if self.plaintext_size == 0 || self.plaintext_size % chunk != 0 {
+        if self.plaintext_size == 0 || !self.plaintext_size.is_multiple_of(chunk) {
             return Err(RemObjectAeadError::InvalidMetadataField);
         }
         let chunk_count = self.plaintext_size / chunk;

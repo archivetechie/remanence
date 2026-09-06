@@ -8,11 +8,12 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use remanence_aead::{
-    open, KeyFrame, OpenReport, RecipientPrivateKey, RemObjectHeader, REM_OBJECT_HEADER_LEN,
+    open, KeyFrame, OpenReport, RecipientPrivateKey, RemObjectAeadError, RemObjectHeader,
+    REM_OBJECT_HEADER_LEN,
 };
 use remanence_format::{stream_rem_tar_object, FormatError, RemTarEntrySink, RemTarStreamEntry};
 use remanence_library::FileBlockSource;
-use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions};
+use remanence_stream::{restore_object_to_directory, FilesystemRestoreOptions, StreamingError};
 use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
@@ -61,17 +62,76 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("error: write recovery summary: {error}");
-                    ExitCode::from(1)
+                    ExitCode::from(RecoveryFailureKind::Io.exit_code())
                 }
             }
         }
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::from(1)
+            ExitCode::from(error.kind.exit_code())
         }
     }
 }
 
+/// Stable process-level failure classes for disaster-recovery automation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryFailureKind {
+    /// The REMP file is invalid or does not open a matching recipient slot.
+    Key,
+    /// The stored envelope or authenticated inner REM-OBJECT is invalid.
+    Object,
+    /// Host filesystem or stream I/O failed.
+    Io,
+}
+
+impl RecoveryFailureKind {
+    const fn exit_code(self) -> u8 {
+        match self {
+            Self::Key => 3,
+            Self::Object => 4,
+            Self::Io => 5,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecoveryFailure {
+    kind: RecoveryFailureKind,
+    message: String,
+}
+
+impl RecoveryFailure {
+    fn key(message: impl Into<String>) -> Self {
+        Self {
+            kind: RecoveryFailureKind::Key,
+            message: message.into(),
+        }
+    }
+
+    fn object(message: impl Into<String>) -> Self {
+        Self {
+            kind: RecoveryFailureKind::Object,
+            message: message.into(),
+        }
+    }
+
+    fn io(message: impl Into<String>) -> Self {
+        Self {
+            kind: RecoveryFailureKind::Io,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+type RecoveryResult<T> = Result<T, RecoveryFailure>;
+
+#[derive(Debug)]
 struct RecoverySummary {
     files_written: u64,
     bytes_written: u64,
@@ -108,44 +168,48 @@ fn write_recovery_summary(
     Ok(())
 }
 
-fn recover(args: &Args) -> Result<RecoverySummary, String> {
-    let mut encrypted = File::open(&args.object)
-        .map_err(|error| format!("open object {}: {error}", args.object.display()))?;
+fn recover(args: &Args) -> RecoveryResult<RecoverySummary> {
+    let mut encrypted = File::open(&args.object).map_err(|error| {
+        RecoveryFailure::io(format!("open object {}: {error}", args.object.display()))
+    })?;
     let mut header_bytes = [0u8; REM_OBJECT_HEADER_LEN];
     encrypted
         .read_exact(&mut header_bytes)
-        .map_err(|error| format!("read object header: {error}"))?;
+        .map_err(|error| object_read_failure("read object header", error))?;
     let header = RemObjectHeader::parse(&header_bytes)
-        .map_err(|error| format!("parse object header: {error}"))?;
+        .map_err(|error| RecoveryFailure::object(format!("parse object header: {error}")))?;
     let mut key_frame_bytes = vec![0u8; header.key_frame_len as usize];
     encrypted
         .read_exact(&mut key_frame_bytes)
-        .map_err(|error| format!("read object key frame: {error}"))?;
+        .map_err(|error| object_read_failure("read object key frame", error))?;
     let key_frame = KeyFrame::parse(&key_frame_bytes)
-        .map_err(|error| format!("parse object key frame: {error}"))?;
+        .map_err(|error| RecoveryFailure::object(format!("parse object key frame: {error}")))?;
     encrypted
         .seek(SeekFrom::Start(0))
-        .map_err(|error| format!("rewind encrypted object: {error}"))?;
+        .map_err(|error| RecoveryFailure::io(format!("rewind encrypted object: {error}")))?;
     let staging_dir = args
         .staging_dir
         .as_deref()
         .unwrap_or_else(|| default_staging_dir(&args.out));
     let mut staged = SecurePlaintextStage::new_in(staging_dir)?;
     let opened = open_object(args, &mut encrypted, &key_frame, staged.as_file_mut())?;
-    staged
-        .as_file_mut()
-        .sync_all()
-        .map_err(|error| format!("sync authenticated plaintext staging file: {error}"))?;
+    staged.as_file_mut().sync_all().map_err(|error| {
+        RecoveryFailure::io(format!(
+            "sync authenticated plaintext staging file: {error}"
+        ))
+    })?;
     let chunk_size = usize::try_from(header.chunk_size)
-        .map_err(|_| "REM-OBJECT chunk size does not fit this host".to_string())?;
+        .map_err(|_| RecoveryFailure::object("REM-OBJECT chunk size does not fit this host"))?;
     let block_count = opened
         .metadata
         .plaintext_size
         .checked_div(chunk_size as u64)
-        .ok_or_else(|| "plaintext block count division failed".to_string())?;
+        .ok_or_else(|| RecoveryFailure::object("plaintext block count division failed"))?;
 
-    let mut validation_source = FileBlockSource::open(staged.path(), chunk_size)
-        .map_err(|error| format!("open authenticated plaintext stage: {error}"))?;
+    let mut validation_source =
+        FileBlockSource::open(staged.path(), chunk_size).map_err(|error| {
+            RecoveryFailure::io(format!("open authenticated plaintext stage: {error}"))
+        })?;
     let mut discard = DiscardEntrySink;
     let inner = stream_rem_tar_object(
         &mut validation_source,
@@ -153,17 +217,19 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
         block_count,
         &mut discard,
     )
-    .map_err(|error| format!("validate decrypted REM-OBJECT members: {error}"))?;
-    let inner_object_id = inner
-        .global_pax
-        .get("REMANENCE.object_id")
-        .ok_or_else(|| "decrypted REM-OBJECT is missing REMANENCE.object_id".to_string())?;
+    .map_err(validation_failure)?;
+    let inner_object_id = inner.global_pax.get("REMANENCE.object_id").ok_or_else(|| {
+        RecoveryFailure::object("decrypted REM-OBJECT is missing REMANENCE.object_id")
+    })?;
     if inner_object_id != &header.object_id {
-        return Err("decrypted inner object_id does not match envelope header".to_string());
+        return Err(RecoveryFailure::object(
+            "decrypted inner object_id does not match envelope header",
+        ));
     }
 
-    let mut restore_source = FileBlockSource::open(staged.path(), chunk_size)
-        .map_err(|error| format!("reopen authenticated plaintext stage: {error}"))?;
+    let mut restore_source = FileBlockSource::open(staged.path(), chunk_size).map_err(|error| {
+        RecoveryFailure::io(format!("reopen authenticated plaintext stage: {error}"))
+    })?;
     let restored = restore_object_to_directory(
         &mut restore_source,
         chunk_size,
@@ -171,7 +237,7 @@ fn recover(args: &Args) -> Result<RecoverySummary, String> {
         &args.out,
         recovery_restore_options(args),
     )
-    .map_err(|error| format!("restore plaintext members: {error}"))?;
+    .map_err(restore_failure)?;
     Ok(RecoverySummary {
         files_written: restored.files_written,
         bytes_written: restored.bytes_written,
@@ -211,14 +277,22 @@ fn open_object<R: Read, W: std::io::Write>(
     encrypted: &mut R,
     key_frame: &KeyFrame,
     output: &mut W,
-) -> Result<OpenReport, String> {
+) -> RecoveryResult<OpenReport> {
     let path = &args.private_key;
-    let mut bytes = fs::read(path)
-        .map_err(|error| format!("read recipient private key {}: {error}", path.display()))?;
+    let mut bytes = fs::read(path).map_err(|error| {
+        RecoveryFailure::io(format!(
+            "read recipient private key {}: {error}",
+            path.display()
+        ))
+    })?;
     let parsed = RecipientPrivateKey::parse(&bytes);
     bytes.zeroize();
-    let key = parsed
-        .map_err(|error| format!("parse recipient private key {}: {error}", path.display()))?;
+    let key = parsed.map_err(|error| {
+        RecoveryFailure::key(format!(
+            "parse recipient private key {}: {error}",
+            path.display()
+        ))
+    })?;
     if !key_frame
         .slots
         .iter()
@@ -230,28 +304,79 @@ fn open_object<R: Read, W: std::io::Write>(
             .map(|slot| slot.epoch_label.as_str())
             .collect::<Vec<_>>()
             .join("/");
-        return Err(format!(
+        return Err(RecoveryFailure::key(format!(
             "object wants epoch {wanted}; you supplied {}",
             key.epoch_label
-        ));
+        )));
     }
-    open(encrypted, output, &key).map_err(|error| format!("open REM-OBJECT envelope: {error}"))
+    open(encrypted, output, &key).map_err(|error| match error {
+        RemObjectAeadError::RecipientEpochMismatch => {
+            RecoveryFailure::key(format!("open REM-OBJECT envelope: {error}"))
+        }
+        // A matching epoch with a failed authenticated unwrap is inherently
+        // ambiguous: either the REMP seed or the recipient slot is damaged.
+        // Classify it as object/copy failure so automation tries another copy
+        // without claiming that a syntactically valid escrow key is wrong.
+        RemObjectAeadError::HpkeFailed => {
+            RecoveryFailure::object(format!("open REM-OBJECT envelope: {error}"))
+        }
+        RemObjectAeadError::Io(_) => {
+            RecoveryFailure::io(format!("open REM-OBJECT envelope: {error}"))
+        }
+        _ => RecoveryFailure::object(format!("open REM-OBJECT envelope: {error}")),
+    })
+}
+
+fn object_read_failure(context: &str, error: std::io::Error) -> RecoveryFailure {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        RecoveryFailure::object(format!("{context}: {error}"))
+    } else {
+        RecoveryFailure::io(format!("{context}: {error}"))
+    }
+}
+
+fn validation_failure(error: FormatError) -> RecoveryFailure {
+    let message = format!("validate decrypted REM-OBJECT members: {error}");
+    if matches!(
+        &error,
+        FormatError::SourceIo { .. } | FormatError::TapeIo(_)
+    ) {
+        RecoveryFailure::io(message)
+    } else {
+        RecoveryFailure::object(message)
+    }
+}
+
+fn restore_failure(error: StreamingError) -> RecoveryFailure {
+    match error {
+        StreamingError::Io { .. }
+        | StreamingError::InvalidInput(_)
+        | StreamingError::InvalidXattrNamespacePrefix { .. } => {
+            RecoveryFailure::io(format!("restore plaintext members: {error}"))
+        }
+        StreamingError::Format(
+            FormatError::SourceIo { .. }
+            | FormatError::RestoreDestination(_)
+            | FormatError::TapeIo(_),
+        ) => RecoveryFailure::io(format!("restore plaintext members: {error}")),
+        _ => RecoveryFailure::object(format!("restore plaintext members: {error}")),
+    }
 }
 
 /// Plaintext staging file that is truncated before its directory entry is removed.
 struct SecurePlaintextStage(tempfile::NamedTempFile);
 
 impl SecurePlaintextStage {
-    fn new_in(directory: &Path) -> Result<Self, String> {
+    fn new_in(directory: &Path) -> RecoveryResult<Self> {
         tempfile::Builder::new()
             .prefix(".rem-recover-plaintext.")
             .tempfile_in(directory)
             .map(Self)
             .map_err(|error| {
-                format!(
+                RecoveryFailure::io(format!(
                     "create secure plaintext staging file in {}: {error}",
                     directory.display()
-                )
+                ))
             })
     }
 
@@ -349,7 +474,7 @@ mod tests {
         let private_key = temp.path().join("safe.remp");
         let out = temp.path().join("out");
         fs::create_dir(&out).unwrap();
-        fs::write(&object, sealed).unwrap();
+        fs::write(&object, &sealed).unwrap();
         fs::write(&private_key, safe.serialize()).unwrap();
         let summary = recover(&Args {
             object: object.clone(),
@@ -368,7 +493,7 @@ mod tests {
         let wrong_path = temp.path().join("wrong.remp");
         fs::write(&wrong_path, wrong.serialize()).unwrap();
         let error = recover(&Args {
-            object,
+            object: object.clone(),
             private_key: wrong_path,
             out: temp.path().join("wrong-out"),
             staging_dir: None,
@@ -377,8 +502,46 @@ mod tests {
         })
         .err()
         .unwrap();
-        assert!(error.contains("object wants epoch safe-2026/escrow-2026"));
-        assert!(error.contains("you supplied wrong-2026"));
+        assert_eq!(error.kind, RecoveryFailureKind::Key);
+        assert!(error
+            .to_string()
+            .contains("object wants epoch safe-2026/escrow-2026"));
+        assert!(error.to_string().contains("you supplied wrong-2026"));
+
+        // Fixed-width HPKE fields remain structurally parseable after a bit
+        // flip, so authenticated unwrap is the first place this damage is
+        // detectable. It is an object/copy failure, not a key-selection hint.
+        let mut damaged = sealed.clone();
+        let first_enc_offset = REM_OBJECT_HEADER_LEN + 5 + 1 + 16 + 1 + "safe-2026".len();
+        damaged[first_enc_offset] ^= 0x01;
+        let damaged_object = temp.path().join("damaged.rem-object");
+        fs::write(&damaged_object, damaged).unwrap();
+        let damaged_error = recover(&Args {
+            object: damaged_object,
+            private_key: temp.path().join("safe.remp"),
+            out: temp.path().join("damaged-out"),
+            staging_dir: None,
+            overwrite: false,
+            xattr_namespaces: Vec::new(),
+        })
+        .expect_err("damaged recipient slot must fail authenticated unwrap");
+        assert_eq!(damaged_error.kind, RecoveryFailureKind::Object);
+
+        // A well-formed but incorrect seed carrying the matching epoch id is
+        // indistinguishable at this layer from the damaged-slot case above.
+        let wrong_seed = RecipientPrivateKey::new([1; 16], "safe-2026", [9; 32]).unwrap();
+        let wrong_seed_path = temp.path().join("wrong-seed.remp");
+        fs::write(&wrong_seed_path, wrong_seed.serialize()).unwrap();
+        let ambiguous_error = recover(&Args {
+            object,
+            private_key: wrong_seed_path,
+            out: temp.path().join("ambiguous-out"),
+            staging_dir: None,
+            overwrite: false,
+            xattr_namespaces: Vec::new(),
+        })
+        .expect_err("matching epoch with wrong seed must fail authenticated unwrap");
+        assert_eq!(ambiguous_error.kind, RecoveryFailureKind::Object);
     }
 
     #[test]
@@ -564,5 +727,65 @@ mod tests {
         let mut err = Vec::new();
         write_recovery_summary(&no_skips, &mut out, &mut err).unwrap();
         assert!(err.is_empty());
+    }
+
+    #[test]
+    fn recovery_failure_classes_have_stable_distinct_exit_codes() {
+        assert_eq!(RecoveryFailureKind::Key.exit_code(), 3);
+        assert_eq!(RecoveryFailureKind::Object.exit_code(), 4);
+        assert_eq!(RecoveryFailureKind::Io.exit_code(), 5);
+
+        let disk_error = StreamingError::Format(FormatError::SourceIo {
+            context: "write restore file".to_string(),
+            source: std::io::Error::from_raw_os_error(28),
+        });
+        assert_eq!(restore_failure(disk_error).kind, RecoveryFailureKind::Io);
+        assert_eq!(
+            restore_failure(StreamingError::Format(FormatError::RestoreDestination(
+                "restore path out/link escapes through a symlink".to_string()
+            )))
+            .kind,
+            RecoveryFailureKind::Io
+        );
+        assert_eq!(
+            restore_failure(StreamingError::InvalidInput(
+                "restore root must not be a symlink".to_string()
+            ))
+            .kind,
+            RecoveryFailureKind::Io
+        );
+
+        let staged_read_error = FormatError::SourceIo {
+            context: "read staged plaintext".to_string(),
+            source: std::io::Error::from_raw_os_error(5),
+        };
+        assert_eq!(
+            validation_failure(staged_read_error).kind,
+            RecoveryFailureKind::Io
+        );
+        assert_eq!(
+            validation_failure(FormatError::parse("bad tar header")).kind,
+            RecoveryFailureKind::Object
+        );
+    }
+
+    #[test]
+    fn truncated_object_is_classified_as_object_damage() {
+        let temp = tempfile::tempdir().unwrap();
+        let object = temp.path().join("truncated.rem-object");
+        let private_key = temp.path().join("unused.remp");
+        fs::write(&object, b"REMO").unwrap();
+
+        let error = recover(&Args {
+            object,
+            private_key,
+            out: temp.path().join("out"),
+            staging_dir: None,
+            overwrite: false,
+            xattr_namespaces: Vec::new(),
+        })
+        .expect_err("truncated envelope must fail");
+
+        assert_eq!(error.kind, RecoveryFailureKind::Object);
     }
 }

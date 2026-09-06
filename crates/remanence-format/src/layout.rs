@@ -255,7 +255,7 @@ pub(crate) fn plan_one_file(
         offset,
         TAR_RECORD_SIZE as u64 + pax_body_padded as u64 + TAR_RECORD_SIZE as u64,
     )?;
-    if spec.size_bytes > 0 && data_offset % chunk_size as u64 != 0 {
+    if spec.size_bytes > 0 && !data_offset.is_multiple_of(chunk_size as u64) {
         return Err(FormatError::layout("file data offset is not chunk aligned"));
     }
 

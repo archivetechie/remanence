@@ -1,6 +1,5 @@
 //! DriveHandle-level tests for the media-dispatch gate and the
-//! pre-dispatch media-write fence (design `design-read-ordering.md`
-//! §6.5 / D4b), plus the source audit that keeps the gate the sole
+//! pre-dispatch media-write fence, plus the source audit that keeps the gate the sole
 //! write-direction dispatcher.
 //!
 //! The failure paths carry the weight here: fence-not-durable refusal

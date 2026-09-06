@@ -1,7 +1,7 @@
 //! Layer 3b — pluggable tape body formats for Remanence.
 //!
-//! This crate starts with `rem-object-v1`, the default body format in
-//! `docs/spec-v0.4.md` §8.  A `rem-object-v1` object is a complete POSIX
+//! This crate provides `rem-object-v1`, the default body format described by
+//! the public REM-OBJECT specification. A `rem-object-v1` object is a complete POSIX
 //! pax tar archive in one tape file, streamed through
 //! [`remanence_library::BlockSink`].  The implementation keeps the
 //! body-format layer independent of Layer 3c: callers compose it with

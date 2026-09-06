@@ -1,4 +1,4 @@
-//! Linux udev-backed [`HotplugSource`]. See `docs/layer2c-design.md` §4.
+//! Linux udev-backed [`HotplugSource`].
 //!
 //! Uses `tokio-udev` to subscribe to the `scsi_generic` and `scsi_tape`
 //! subsystems. Because `tokio_udev::AsyncMonitorSocket` wraps libudev
@@ -205,8 +205,7 @@ fn translate(ev: &tokio_udev::Event) -> Option<HotplugEvent> {
 
 /// The async loop that drives the coalescer.
 ///
-/// Bursts are delivered via `try_send`, not `send().await`. This is
-/// deliberate per `docs/layer2c-design.md` §6: the watcher is a
+/// Bursts are delivered via `try_send`, not `send().await`. The watcher is a
 /// **notifier**, not a queue. If the consumer is slow enough to fill
 /// the 64-slot channel, we drop the burst rather than blocking the
 /// loop and stalling udev intake. The consumer's periodic refresh is

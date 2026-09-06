@@ -1,13 +1,12 @@
-//! `LibraryHandle` + `Library::open(policy)` — the safety scaffold from
-//! `docs/layer2-design.md` §5.2 and §7.6.
+//! `LibraryHandle` + `Library::open(policy)` — the policy and identity safety
+//! boundary for library operations.
 //!
 //! A [`LibraryHandle`] is the *only* type from which Layer 2b will hang
 //! state-changing operations. Acquiring one requires, in order:
 //!
 //! 1. **Policy check.** The provided [`AccessPolicy`] must allow the
 //!    library's serial. Discovery surfaces every library on the host;
-//!    `open()` is what makes one targetable. (Spec v0.2 §8.2 hard
-//!    requirement.)
+//!    `open()` is what makes one targetable.
 //!
 //! 2. **Derived-identity check.** If any drive bay in the library has
 //!    `IdentitySource::Derived` (drive serial inferred from topology
@@ -25,11 +24,10 @@
 //!    pointing at a tape drive) is [`OpenError::IdentityChanged`] —
 //!    the caller should re-run `discover()`.
 //!
-//! [`LibraryHandle::move_medium`] is the first state-changing
-//! operation that hangs off this handle (Layer 2b §7.3). Composed
-//! ops (`load` / `unload` / `export` / `import`) and the `rescan` /
-//! `refresh` lifecycle follow in subsequent §7.x chunks. Every
-//! state-changing operation routes through this handle so the two
+//! State-changing operations include direct media movement, composed
+//! `load` / `unload` / `export` / `import` flows, and the `rescan` /
+//! `refresh` lifecycle. Every state-changing operation routes through this
+//! handle so the two
 //! safety properties (policy gate + identity revalidation) are
 //! non-skippable by construction.
 
@@ -51,9 +49,7 @@ use crate::ops;
 use crate::transport::{SgTransport, TimeoutClass};
 
 // Layer 3a — child module so its `impl DriveHandle { ... }` block
-// can see this module's private fields. See `docs/layer3a-design.md`
-// §2 for the rationale; codex 97997d71 caught an earlier sibling-
-// module attempt that lacked this visibility. Public so the value
+// can see this module's private fields. Public so the value
 // types + error enum re-export cleanly at the crate root.
 pub mod tape_io;
 
@@ -278,8 +274,7 @@ pub struct LibraryHandle {
 pub(crate) struct DirtyState {
     /// True when the snapshot is no longer guaranteed to reflect the
     /// physical library — set on partial-failure composed ops, on
-    /// `refresh()` shape-mismatch outcomes (per
-    /// `docs/layer2b-design.md` §5.1 / §5.3), and on direct
+    /// `refresh()` shape-mismatch outcomes, and on direct
     /// `DriveHandle::*` transport errors (Layer 3a + the
     /// completion-unknown path of Layer 2b's direct
     /// `DriveHandle::{load, unload}`). Cleared by a successful
@@ -436,8 +431,7 @@ impl ChangerHandle {
     }
 
     /// Re-read the library's element state by reissuing RES against
-    /// the open transport, then reconcile against the prior snapshot
-    /// per `docs/layer2b-design.md` §5.2 / §5.3.
+    /// the open transport, then reconcile against the prior snapshot.
     ///
     /// On normal completion the handle's `library` is replaced with
     /// the reconciled value and `is_dirty()` is cleared. On a
@@ -509,8 +503,7 @@ impl ChangerHandle {
     }
 
     /// Issue INITIALIZE ELEMENT STATUS, then re-read the element
-    /// state and reconcile it against the prior snapshot per
-    /// `docs/layer2b-design.md` §3.2 / §5.2.
+    /// state and reconcile it against the prior snapshot.
     ///
     /// Unlike [`Self::refresh`], `rescan` returns
     /// [`RescanError::SnapshotMismatch`] when the post-init element
@@ -662,7 +655,7 @@ impl ChangerHandle {
     /// at element `src` to element `dst`. Robot address is taken from
     /// `library.layout.robot_address`; INVERT is always 0.
     ///
-    /// **Validation order** (matches `docs/layer2b-design.md` §3.1):
+    /// **Validation order**:
     /// snapshot-level preflight (via the `ops::plan_move` helper) →
     /// derived-identity policy check → CDB. On preflight failure no
     /// CDB is issued, an [`AuditEvent::Refused`] event is fired, and
@@ -680,8 +673,7 @@ impl ChangerHandle {
     /// have moved partway. **Dirty-state on success:** when either
     /// endpoint is an IE port, `is_dirty()` is `true` with cause
     /// [`DirtyCause::VendorSemantics`] (HPE parks visibly,
-    /// Quadstor vaults — the snapshot patch may not match
-    /// reality). See `docs/layer2b-design.md` §5.1.
+    /// Quadstor vaults — the snapshot patch may not match reality).
     ///
     /// [`is_dirty()`]: Self::is_dirty
     pub fn move_medium(
@@ -1092,8 +1084,7 @@ impl LibraryHandle {
     /// `LOAD` on the drive at `bay`. Returns [`LoadError`] with
     /// phase-aware variants and per-variant snapshot semantics.
     ///
-    /// Dirty-state breakdown — see [`LoadError`] variant docs and
-    /// `docs/layer2b-design.md` §5.1 for the canonical table:
+    /// Dirty-state breakdown — see [`LoadError`] variant docs:
     ///
     /// - [`LoadError::Move`] — changer MOVE phase failed. The
     ///   physical state matches what [`Self::move_medium`] would
@@ -1194,8 +1185,7 @@ impl LibraryHandle {
     ///   (cartridge still in the bay, matching the snapshot);
     ///   a transport error / driver timeout sets `is_dirty()` with
     ///   cause `DirtyCause::CompletionUnknown` because the
-    ///   cartridge may have moved partway. See
-    ///   `docs/layer2b-design.md` §5.1 for the full table.
+    ///   cartridge may have moved partway.
     pub fn unload(
         &mut self,
         bay: u16,
@@ -1473,7 +1463,7 @@ impl ChangerHandle {
 /// critical section, and auto-deref makes the guard ergonomic to use
 /// directly.
 ///
-/// **Caveats** (per `docs/layer2b-design.md` §3.3 / §6 property 8):
+/// **Caveats**:
 /// - `Drop` is best-effort, **not** a guarantee — it doesn't run on
 ///   `SIGKILL`, on aborts, on host crashes, or on power loss. Daemon
 ///   normal paths should ALSO call [`Self::release`] so the ALLOW
@@ -1583,8 +1573,7 @@ pub struct DriveHandle {
     /// Open transport to the drive's `/dev/sgN`, wrapped in the
     /// media-dispatch gate: write-direction CDBs are only reachable
     /// through [`tape_io::media_gate::MediaFencedTransport`]'s single
-    /// gate function, which runs the pre-dispatch media-write fence
-    /// (design `design-read-ordering.md` §6.5 / D4b). The raw
+    /// gate function, which runs the pre-dispatch media-write fence. The raw
     /// [`SgTransport`] is private to that module by construction.
     transport: tape_io::media_gate::MediaFencedTransport,
     /// Drive-reported variable WRITE block limit, populated by
@@ -1912,9 +1901,8 @@ impl DriveHandle {
                 Ok(())
             }
             Err(e) => {
-                // Step 9.1d (codex 97997d71) closed the TODO that
-                // used to sit here: `DriveHandle` shares the parent
-                // `LibraryHandle`'s dirty state, so completion-
+                // `DriveHandle` shares the parent `LibraryHandle`'s dirty
+                // state, so completion-
                 // unknown transport errors flip the parent dirty bit
                 // directly. The audit event still carries the
                 // `dirty: …` field for callers that consume the
@@ -1954,7 +1942,7 @@ fn fire_audit(hook: &mut Option<AuditHook>, event: &AuditEvent<'_>) {
 
 /// Fire one [`AuditEvent::Warning`] per `RescanWarning`, in order.
 /// Used by `rescan` and `refresh` to route reconciliation
-/// observations to the audit log per `docs/layer2b-design.md` §5.2.
+/// observations to the audit log.
 fn fire_warnings(
     hook: &mut Option<AuditHook>,
     library_serial: &str,

@@ -609,7 +609,7 @@ struct ArchiveVerifyReceipt {
 /// Hex-decode a `2*N`-char string into `N` bytes.
 pub(crate) fn hex_to_bytes(s: &str) -> Result<Vec<u8>, String> {
     let bytes = s.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(format!("hex string has odd length {}", bytes.len()));
     }
 

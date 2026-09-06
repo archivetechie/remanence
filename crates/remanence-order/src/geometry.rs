@@ -1,4 +1,4 @@
-//! Structural cartridge geometry — design-read-ordering.md §6.3.
+//! Structural cartridge geometry.
 //!
 //! Wrap boundaries come from the drive via the cached REOWP map, never
 //! from this table. The table supplies only the structural constants that
@@ -68,8 +68,8 @@ pub const STRUCTURAL_TABLE: [StructuralRow; 5] = [
         wraps: 112,
         channels: 32,
         data_tracks: 3584,
-        source: "Track and channel counts as previously established from the HP LTO Ultrium \
-                 Technical Reference Manual lineage (Volume 4); design-read-ordering.md \u{a7}6.3.",
+        source: "Track and channel counts from the HP LTO Ultrium \
+                 Technical Reference Manual lineage (Volume 4).",
     },
     StructuralRow {
         cartridge_generation: "LTO-8",
@@ -79,8 +79,7 @@ pub const STRUCTURAL_TABLE: [StructuralRow; 5] = [
         wraps: 208,
         channels: 32,
         data_tracks: 6656,
-        source: "Published LTO-8 specification tables and CERN EOSCTA operations notes; \
-                 design-read-ordering.md \u{a7}6.3.",
+        source: "Published LTO-8 specification tables and CERN EOSCTA operations notes.",
     },
     StructuralRow {
         cartridge_generation: "LTO-9",
@@ -90,7 +89,7 @@ pub const STRUCTURAL_TABLE: [StructuralRow; 5] = [
         wraps: 280,
         channels: 32,
         data_tracks: 8960,
-        source: "HPE published LTO-9 figures; design-read-ordering.md \u{a7}6.3.",
+        source: "HPE published LTO-9 figures.",
     },
     StructuralRow {
         cartridge_generation: "LTO-10",
@@ -101,7 +100,7 @@ pub const STRUCTURAL_TABLE: [StructuralRow; 5] = [
         channels: 32,
         data_tracks: 15104,
         source: "Published LTO-10 structural figures; media code LA per IBM TS4300 \
-                 'Bar code label' Table 2; design-read-ordering.md \u{a7}6.3.",
+                 'Bar code label' Table 2.",
     },
     StructuralRow {
         cartridge_generation: "LTO-10",
@@ -112,7 +111,7 @@ pub const STRUCTURAL_TABLE: [StructuralRow; 5] = [
         channels: 32,
         data_tracks: 15104,
         source: "Published LTO-10 structural figures; media code PA per IBM TS4300 \
-                 'Bar code label' Table 2; design-read-ordering.md \u{a7}6.3.",
+                 'Bar code label' Table 2.",
     },
 ];
 
@@ -124,8 +123,8 @@ const PRE_REOWP_REASON: &str = "Predates READ END OF WRAP POSITION, so exact wra
      are unobtainable; the arithmetic fallback is measurably worse than not ordering \
      (design \u{a7}6.2).";
 
-const PRE_REOWP_SOURCE: &str = "design-read-ordering.md \u{a7}\u{a7}6.2-6.3; IBM LTO SCSI \
-     Reference GA32-0928-09 Table A.1 (REOWP listed for generations 7-10 only).";
+const PRE_REOWP_SOURCE: &str = "IBM LTO SCSI Reference GA32-0928-09 Table A.1 \
+     (REOWP listed for generations 7-10 only).";
 
 /// Recognised-but-unsupported keys — design §6.3 and D4a.
 ///
@@ -136,7 +135,7 @@ pub const UNSUPPORTED_TABLE: [UnsupportedRow; 7] = [
         cartridge_generation: "M8",
         recording_format: "M8",
         reason: M8_REASON,
-        source: "design-read-ordering.md \u{a7}6.3.",
+        source: "M8 uses LTO-7 drive geometry with LTO-8 media capacity.",
     },
     UnsupportedRow {
         cartridge_generation: "LTO-6",

@@ -62,8 +62,7 @@ pub(crate) struct WriteOwnerConfig {
     pub checkpoint_max_age_seconds: u64,
     pub session_idle_seconds: u64,
     pub lifecycle: Option<crate::drive_pool::DrivePoolLifecycle>,
-    /// Durable calibration-control store for the wrap-map read
-    /// ordering lifecycle (design-read-ordering.md §6.5). The drive
+    /// Durable calibration-control store for the wrap-map read-ordering lifecycle. The drive
     /// actors run the load harvest against it at session open when
     /// the open freshly mounted the cartridge.
     pub calibration_store: remanence_state::CalibrationControlStore,

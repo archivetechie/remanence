@@ -44,8 +44,7 @@ pub struct MovePatch {
 ///
 /// Runs the snapshot-level preflight checks first; on failure returns
 /// the appropriate [`MoveError`] variant and the snapshot is left
-/// unmodified. On success, `src` is drained and `dst` is filled
-/// according to the patch rules in `docs/layer2b-design.md` §5.1:
+/// unmodified. On success, `src` is drained and `dst` is filled:
 ///
 /// - Slot / IE source clears `full` and `cartridge`. Drive-bay source
 ///   clears `loaded`, `loaded_tape`, and `source_slot`.
@@ -155,7 +154,7 @@ pub(crate) fn plan_move(library: &Library, src: u16, dst: u16) -> Result<MovePla
 
 /// Apply a previously-validated [`MovePlan`] to the snapshot. Cannot
 /// fail — all validation happened in [`plan_move`]. Patches `src`
-/// (drain) then `dst` (fill) per `docs/layer2b-design.md` §5.1.
+/// (drain) then `dst` (fill).
 pub(crate) fn apply_planned_move(library: &mut Library, plan: &MovePlan) {
     match plan.src_idx {
         ElementIdx::Drive(i) => {
@@ -284,8 +283,7 @@ fn find_element(library: &Library, addr: u16) -> Option<ElementIdx> {
 /// slot_count, or ie_count) — that's the structural-mismatch case
 /// the caller has to escalate.
 ///
-/// Implements the four sub-cases in `docs/layer2b-design.md` §5.2 for
-/// drive-bay reconciliation:
+/// Implements the four drive-bay reconciliation sub-cases:
 ///
 /// - **Match by element address.** For each post-RES bay, look up the
 ///   pre-RES bay at the same address.

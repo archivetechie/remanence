@@ -6,12 +6,12 @@ edition     .workspace = true
 rust-version.workspace = true
 authors     .workspace = true
 license = "Apache-2.0"
+publish.workspace = true
 repository  .workspace = true
 
 # Deliberately empty. This crate is pure: no I/O, no async, no SCSI, no
 # database, and no dependency on remanence-library, remanence-state or
-# remanence-scsi. If a change here seems to need one of those, the change
-# is wrong — see design-read-ordering.md §4.3 and prompt P1.
+# remanence-scsi. Integration belongs in the calling layers.
 [dependencies]
 
 [lints.rust]

@@ -1116,8 +1116,7 @@ fn parity_error_to_tape_io_error(err: ParityError) -> TapeIoError {
     }
 }
 
-/// Heuristic: is this error one the parity layer should attempt
-/// to recover from? Per `docs/layer3c-design.md` §8.3.
+/// Heuristic: is this error one the parity layer should attempt to recover from?
 ///
 /// MEDIUM_ERROR (sense key 0x03) always routes to recovery — LTO
 /// ECC gave up on a sector.

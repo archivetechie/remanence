@@ -113,14 +113,14 @@ fn solver_within_bound_of_exhaustive_optimum_up_to_ten_targets() {
         let seeds = if n >= 9 { 3 } else { 6 };
         for seed in 0..seeds {
             let mut rng = SplitMix64(0xC0FF_EE00 + (n as u64) * 1000 + seed);
-            let map = if seed % 2 == 0 {
+            let map = if seed.is_multiple_of(2) {
                 uniform_map(280, 1000, 500)
             } else {
                 jitter_map(120, 900, 400, 0xFEED + seed)
             };
             let extent = map.mapped_extent_lba();
             let targets = random_targets(&mut rng, n, extent);
-            let start = if seed % 3 == 0 {
+            let start = if seed.is_multiple_of(3) {
                 None
             } else {
                 Some(rng.below(extent))

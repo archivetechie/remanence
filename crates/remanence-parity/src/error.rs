@@ -22,8 +22,7 @@ pub enum ParityError {
     TapeIo(#[from] TapeIoError),
 
     /// Caller-supplied [`ParityScheme`](crate::ParityScheme)
-    /// failed validation (`m=0`, `k<2`, etc.) — see
-    /// `docs/layer3c-design-v0.2.md` §11.3.
+    /// failed validation (`m=0`, `k<2`, etc.).
     #[error("invalid parity scheme: {0}")]
     InvalidScheme(String),
 
@@ -199,7 +198,7 @@ pub enum ParityError {
     },
 
     /// A bulk recovery plan would exceed the operator-configured recovery
-    /// memory budget from Layer 3c §9.3 / addendum v0.2 §6.5.
+    /// memory budget.
     #[error(
         "bulk recovery plan needs {needed_bytes} bytes but the cap is {max_recovery_cache_bytes} bytes; allow_windowed_recovery={allow_windowed_recovery} (§9.3 -- enable windowed recovery or raise the cap)"
     )]

@@ -6,10 +6,11 @@ edition     .workspace = true
 rust-version.workspace = true
 authors     .workspace = true
 license = "Apache-2.0"
+publish.workspace = true
 repository  .workspace = true
 
 [dependencies]
-# Sibling layer (not stacked) — see docs/layer3c-design-v0.2.md §3.
+# Sibling layer (not stacked): parity and body-format compose above this crate.
 # remanence-format is NOT a dep; the BlockSink / BlockSource
 # traits live in remanence-library::block_io so 3b and 3c can
 # both depend on the library crate as true siblings.

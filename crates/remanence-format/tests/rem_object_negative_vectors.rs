@@ -84,6 +84,7 @@ fn format_error_name(error: &FormatError) -> &'static str {
         }
         FormatError::IncompleteBlockWrite { .. } => "IncompleteBlockWrite",
         FormatError::SourceIo { .. } => "SourceIo",
+        FormatError::RestoreDestination(_) => "RestoreDestination",
         FormatError::TapeIo(_) => "TapeIo",
     }
 }
@@ -1254,7 +1255,7 @@ fn envelope_from_metadata_plaintext(
     let chunk_size =
         usize::try_from(options.chunk_size).map_err(|_| RemObjectAeadError::InvalidChunkSize)?;
     if plaintext.len() as u64 != options.plaintext_size
-        || plaintext.len() % chunk_size != 0
+        || !plaintext.len().is_multiple_of(chunk_size)
         || plaintext.is_empty()
     {
         return Err(RemObjectAeadError::InvalidInput(
@@ -1335,7 +1336,7 @@ fn envelope_with_extra_payload_chunk(
     let chunk_size =
         usize::try_from(options.chunk_size).map_err(|_| RemObjectAeadError::InvalidChunkSize)?;
     if plaintext.len() as u64 != options.plaintext_size
-        || plaintext.len() % chunk_size != 0
+        || !plaintext.len().is_multiple_of(chunk_size)
         || plaintext.is_empty()
     {
         return Err(RemObjectAeadError::InvalidInput(

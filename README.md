@@ -29,7 +29,7 @@ whatever orchestrator calls its API.
 The project exists because the long-horizon archive niche is served
 mostly by proprietary systems whose on-tape formats die with their
 vendors, and by tooling that treats tape like a disk. Remanence takes
-the opposite bets: the format on tape is published and readable with
+the opposite bets: the object format is publicly specified and readable with
 stock `tar`, every tape self-describes so no database is ever the single
 copy of the truth, and when the hardware leaves the software uncertain
 about physical state, the software stops rather than guesses. The
@@ -49,12 +49,17 @@ its Zenodo deposit remain in place, marked as superseded, because the format
 specifications cite them and an archiving project should correct its claims in
 public rather than erase them.
 
-The three on-tape formats are specified, implemented, and pinned by test
-vectors that ship with the source. **Their version numbers are unchanged and
-remain at 1.0** — they are versioned independently of this software, and the
-renumbering above says nothing about them.
+REM-OBJECT and REM-ENCRYPT are specified, implemented, and pinned by the test
+vectors that ship with the source. **REM-PARITY is currently split across two
+generations:** the repository review specification and published vector archive
+describe `schema_major = 1`, while current `main` writes and accepts only the
+terminal-triple-index replacement at `schema_major = 2`. The replacement text
+is under `specs/in-progress/` and is not yet a published specification. Tapes
+written by the v0.1.0/v1.0.0 binaries use generation 1 and are not readable by
+current `main`.
 
-Their specifications are published as review drafts. What is under review is
+The specification review copies are public, but their concept DOIs are reserved
+and the first deposits are still pending. What is under review is
 whether the documents describe the formats correctly and completely, not
 whether the design works — but the documents are not final until they freeze on
 31 July 2027, and the guarantee that no tape a format validates will ever be
@@ -71,7 +76,7 @@ verify real material on your own equipment before you rely on it.
 <!-- code-anchor: Cargo.toml @ 244bc6de -->
 ## Build
 
-Rust 1.85+, Linux. No system dependencies for the default build:
+Rust 1.88+, Linux. No system dependencies for the default build:
 
 ```sh
 cargo build --release
@@ -87,8 +92,8 @@ Tests and lints, as CI runs them:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --exclude remanence-chaos --all-targets -- -D warnings
-cargo test --workspace --exclude remanence-chaos
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 Hardware-touching tests are ignored by default and opt in via
@@ -185,7 +190,7 @@ crates/remanence-api            Layer 5 gRPC service implementations
 crates/remanence-daemon         rem-daemon service host
 crates/remanence-cli            rem and rem-debug binaries
 crates/rem-recover       Standalone catalogless REM-OBJECT disaster-recovery binary
-crates/remanence-chaos          Fault-injection scaffolding (excluded from CI gates)
+crates/remanence-chaos          Fault-injection scaffolding (included in CI gates)
 specs/publication/              Published format specifications + test vectors
 docs/                           Guides and references (see docs/README.md)
 proto/                          Layer 5 protobuf contract
@@ -209,10 +214,13 @@ please do not open a public issue for suspected vulnerabilities.
 Release history lives in [CHANGELOG.md](CHANGELOG.md). Released
 versions are archived on Zenodo. To cite the software, use its concept DOI
 [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) (see
-[CITATION.cff](CITATION.cff)). To cite a *format*, use that document's own
-concept DOI, named in the document's Status section — the specifications are
-deposited separately from the code, so that a citation of the format names an
-immutable text rather than a software release.
+[CITATION.cff](CITATION.cff)). The format documents carry reserved concept DOIs
+in their Status sections, but their first deposits are pending. Until those
+records are published, cite the repository commit and document version rather
+than treating a reserved DOI as a resolvable publication.
+
+Maintainer release procedure and artifact policy are in
+[RELEASING.md](RELEASING.md).
 
 ## License
 

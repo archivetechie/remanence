@@ -3,8 +3,7 @@
 //! Locks (`prevent=true`) or unlocks (`prevent=false`) operator
 //! removal of media. On a tape library this gates the front-panel
 //! eject button and any operator-initiated mailslot eject. Used by
-//! Layer 2b's `RemovalLockGuard` (see `docs/layer2b-design.md` §3.3)
-//! around multi-step sequences.
+//! `RemovalLockGuard` around multi-step sequences.
 
 /// SCSI opcode for PREVENT/ALLOW MEDIUM REMOVAL.
 pub const OPCODE: u8 = 0x1E;

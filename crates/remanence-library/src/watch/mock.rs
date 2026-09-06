@@ -1,5 +1,4 @@
 //! In-memory mock [`HotplugSource`] for unit tests.
-//! See `docs/layer2c-design.md` §5, §8.
 //!
 //! Tests inject pre-built [`Coalesced`] bursts via [`MockHotplugSource::inject`];
 //! the mock relays them to the receiver. The coalescer is exercised

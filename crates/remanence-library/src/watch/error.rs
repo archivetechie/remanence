@@ -1,4 +1,4 @@
-//! Watcher error type. See `docs/layer2c-design.md` §6.
+//! Watcher error type.
 
 use thiserror::Error;
 

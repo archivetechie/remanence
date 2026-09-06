@@ -1,7 +1,6 @@
 //! Layer 2c — hot-plug watcher.
 //!
-//! See `docs/layer2c-design.md` for the full design. This module is
-//! notification-only: it emits [`Coalesced`] bursts when OS hot-plug
+//! This module is notification-only: it emits [`Coalesced`] bursts when OS hot-plug
 //! events touch the SCSI subsystems
 //! (`scsi_generic` + `scsi_tape` on Linux). Consumers (Layer 5) decide
 //! whether to `refresh`, `rescan`, or re-`discover` in response.

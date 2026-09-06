@@ -9,8 +9,8 @@ this text and a specification disagree, the specification wins.*
 | | |
 | --- | --- |
 | Status | Informative companion |
-| Version | 1.0 |
-| Date | 2026-07-31 |
+| Version | 1.1 |
+| Date | 2026-09-06 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719163](https://doi.org/10.5281/zenodo.21719163) |
 
@@ -24,13 +24,14 @@ passage can be made clearer or a specification moves. If something here is
 confusing or wrong, that is worth reporting exactly as a specification defect is:
 see <https://archivetech.org/spec/issues>.
 
-**Which copy governs.** The text of this companion is the revision deposited
-under the concept DOI above; every other copy is a convenience copy, and a copy
-carrying the same version string is byte-identical to it or defective. Where
-this companion and a specification disagree, the specification governs.
+**Which copy governs.** The concept DOI above is reserved, but this companion
+has not yet been deposited. Until the first deposit is published, this
+repository copy is the public review text. Once a revision is deposited, its
+deposited text governs over convenience copies. Where this companion and a
+specification disagree, the specification governs.
 
-It is versioned and deposited nonetheless, so that a citation of it names one
-exact text. Its version has two components and neither carries the
+It is versioned, and each published revision will be deposited so that a
+citation names one exact text. Its version has two components and neither carries the
 erratum / minor / major meaning the specifications' numbers carry, because that
 classification describes changes to obligations and this document imposes none.
 The first component is the generation of the formats explained here; it changes
@@ -323,8 +324,9 @@ Three consequences follow, each of them intended:
   open the object with nothing but the object itself; a small standalone
   recovery tool exists precisely so that this remains possible on a bare
   machine, decades from now, with no surrounding infrastructure.
-- **Two locks on every box, held apart.** Every object is sealed to at
-  least two recipients. In the recommended arrangement, one is the
+- **Two locks on every box, held apart.** Implementations default to sealing an
+  object to at least two recipients; an operator may explicitly opt into one
+  independently protected recipient. In the recommended arrangement, one is the
   operational key used for day-to-day restores; the other is a recovery
   key whose private half is generated on an offline machine, split into
   shares held by different people, and never present on any server. The
@@ -340,7 +342,9 @@ the ability to restore a fragment from the middle of a large object.
 
 It is worth stating plainly what each party is left with. An attacker
 holding a stolen tape learns how many objects it contains and how large
-they are, and nothing further — no file names, no counts, no structure.
+they are, plus clear envelope and tape-routing metadata: object identifiers,
+recipient epoch identifiers and labels, chunk sizing, and writer timestamps.
+File names, member counts, and member structure remain encrypted.
 The rightful owner, thirty years from now, needs the tape, the
 specification, the recovery tool or any implementation of the
 specification, and one recipient private key out of escrow; and that is
@@ -545,6 +549,9 @@ re-deposited on its own schedule.
 
 ## Revision History (Informative)
 
+- **2026-09-06 — 1.1.** Corrects the single-recipient opt-in and metadata
+  disclosure descriptions, and records that the first DOI deposit remains
+  pending.
 - **2026-07-31 — 1.0.** First revision of this companion to carry a version, a
   status and a DOI of its own. Published alongside the first review drafts of the
   specifications it explains.

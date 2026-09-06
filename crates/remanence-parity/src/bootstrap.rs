@@ -7,7 +7,7 @@
 //! the filemark-map digest that validates catalog-less
 //! reconstruction.
 //!
-//! On-tape layout per `docs/layer3c-design.md` v0.4.4 §5.6: a
+//! The on-tape layout is a
 //! fixed header with `cbor_payload_len` covered by the header
 //! CRC-64/XZ, followed by a CBOR payload, a payload CRC-64/XZ,
 //! and zero padding to fill one tape block.
@@ -32,9 +32,8 @@ use crate::sidecar::crc64_xz;
 /// Magic at byte 0 of every bootstrap block.
 pub const BOOTSTRAP_MAGIC: [u8; 8] = *b"REM\x00BOO\x01";
 
-/// Schema-major version this writer emits / this reader
-/// accepts. Major bumps require an explicit migration plan
-/// documented in `docs/layer3c-design.md`.
+/// Schema-major version this writer emits / this reader accepts. Major bumps
+/// require an explicit migration plan and a public compatibility statement.
 pub const BOOTSTRAP_SCHEMA_MAJOR: u16 = 2;
 
 /// Schema-minor version this writer emits. Reader accepts

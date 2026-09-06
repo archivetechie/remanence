@@ -44,7 +44,7 @@ pub fn with_alignment_pad(
     base_records: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, FormatError> {
     validate_chunk_size(chunk_size)?;
-    if offset % TAR_RECORD_SIZE as u64 != 0 {
+    if !offset.is_multiple_of(TAR_RECORD_SIZE as u64) {
         return Err(FormatError::invalid(
             "pax alignment offset must be a multiple of 512",
         ));
@@ -131,7 +131,7 @@ pub(crate) fn validate_chunk_size(chunk_size: usize) -> Result<(), FormatError> 
     if chunk_size == 0 {
         return Err(FormatError::invalid("chunk_size must be non-zero"));
     }
-    if chunk_size % TAR_RECORD_SIZE != 0 {
+    if !chunk_size.is_multiple_of(TAR_RECORD_SIZE) {
         return Err(FormatError::invalid(
             "chunk_size must be a positive multiple of 512",
         ));

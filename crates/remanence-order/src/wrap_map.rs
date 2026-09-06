@@ -1,5 +1,4 @@
-//! The per-volume wrap map and the block-to-position mapping —
-//! design-read-ordering.md §6.4, implemented exactly.
+//! The per-volume wrap map and the block-to-position mapping.
 //!
 //! The map is built from long-form REOWP descriptors kept exactly as
 //! harvested: `(partition, wrap_number, end_loi)`. Descriptors with
@@ -389,7 +388,7 @@ impl WrapMap {
         };
         let frac = Ratio::new(offset as i128, denominator as i128)
             .expect("map denominators are validated positive");
-        let direction = if wrap_index % 2 == 0 {
+        let direction = if wrap_index.is_multiple_of(2) {
             TapeDirection::Forward
         } else {
             TapeDirection::Reverse

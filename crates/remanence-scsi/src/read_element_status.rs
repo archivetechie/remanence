@@ -55,12 +55,12 @@ pub const OPCODE: u8 = 0xB8;
 /// (≈49 elements), but **insufficient** for a fully populated 7-module
 /// MSL3040 stack (up to ≈300 elements). Production discovery (Layer 2)
 /// uses [`FULL_NUM_ELEMENTS`] together with a two-phase allocation
-/// probe — see `docs/layer2-design.md` §4.2.
+/// probe.
 pub const SAFE_NUM_ELEMENTS: u16 = 0x0100;
 
 /// "Give me everything" element count. Pair with the
 /// [`PROBE_ALLOC_LEN`] / `byte_count+8` two-phase allocation pattern
-/// from `docs/layer2-design.md` §4.2 to read arbitrarily large
+/// to read arbitrarily large
 /// libraries without truncating.
 pub const FULL_NUM_ELEMENTS: u16 = 0xFFFF;
 
@@ -286,7 +286,7 @@ pub fn parse(buf: &[u8]) -> Result<ElementStatusData, ScsiError> {
         // A page's byte count must be an exact multiple of the descriptor
         // length. Anything else is malformed framing — a hostile target
         // could exploit "slack" to hide bytes after a descriptor.
-        if page_bytes % desc_len != 0 {
+        if !page_bytes.is_multiple_of(desc_len) {
             return Err(ScsiError::InvalidResponse {
                 offset: cursor - PAGE_HEADER_LEN + 5,
                 detail: "page byte count is not a multiple of element-descriptor length",
@@ -469,7 +469,7 @@ fn mutate_element_descriptor(
         let page_bytes = ((page[cursor + 5] as usize) << 16)
             | ((page[cursor + 6] as usize) << 8)
             | page[cursor + 7] as usize;
-        if desc_len < COMMON_DESC_LEN || page_bytes % desc_len != 0 {
+        if desc_len < COMMON_DESC_LEN || !page_bytes.is_multiple_of(desc_len) {
             return false;
         }
         let Some(desc_start) = cursor.checked_add(PAGE_HEADER_LEN) else {

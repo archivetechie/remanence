@@ -7,8 +7,7 @@
 //! built, because nothing in rem consumes it.
 //!
 //! This exists so capability detection can ask the drive itself instead
-//! of inferring support from an INQUIRY-derived generation table
-//! (design-read-ordering.md, P2): a drive that surprises us then
+//! of inferring support from an INQUIRY-derived generation table: a drive that surprises us then
 //! degrades instead of erroring. First consumer:
 //! [`crate::read_end_of_wrap_position::capability_probe_cdb`].
 

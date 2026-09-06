@@ -16,8 +16,8 @@ Checked:
   3. The pinned vector-archive SHA is identical at every site that quotes it.
   4. No document cites the retired software version-DOI as its own.
   5. Cross-reference titles use the canonical citation forms.
-  6. Every "Appendix X" reference inside a document resolves to an appendix
-     heading that exists in that document.
+  6. Every local "Section N" and "Appendix X" reference resolves to a heading
+     that exists in that document.
   7. No version string is reused for different bytes: if a document's current
      version appears in DEPOSITED.sha256, the repository copy must hash to the
      digest recorded there. This is what makes each document's "the deposited
@@ -102,6 +102,56 @@ def policy_core(text: str, noun: str) -> str:
     return re.sub(r"\s+", " ", core).strip()
 
 
+SECTION_NUMBER = r"\d+(?:\.\d+)*"
+SECTION_LIST = rf"{SECTION_NUMBER}(?:(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s+through\s+|\s+to\s+|\s*[-–]\s*){SECTION_NUMBER})*"
+
+
+def unresolved_section_references(text: str) -> set[int]:
+    """Return local `Section N` references with no top-level heading.
+
+    The paired REM-OBJECT/REM-ENCRYPT documents explicitly say they omit
+    sections owned by the other document. Those declarations explain a gap;
+    they are not local cross-references and are excluded deliberately.
+    """
+    have = {int(value) for value in re.findall(r"^## (\d+)\.", text, re.M)}
+    # Historical entries describe references that were removed; they are not
+    # active cross-references in the document body.
+    active_text = re.sub(
+        r"^## (?:Appendix [A-Z]\. )?Revision History.*?(?=^## |\Z)",
+        "",
+        text,
+        flags=re.M | re.S,
+    )
+    # An omission declaration explains numbering owned by the companion; it is
+    # not itself a cross-reference. Remove only the declaration, rather than
+    # globally exempting its numbers, so a later `See Section N` still resolves.
+    active_text = re.sub(
+        rf"\bomits?\s+Sections?\s+{SECTION_LIST}",
+        "",
+        active_text,
+        flags=re.I,
+    )
+    unresolved: set[int] = set()
+    for match in re.finditer(rf"\bSections?\s+({SECTION_LIST})", active_text):
+        section_list = match.group(1)
+        referenced = {
+            int(value.split(".", 1)[0])
+            for value in re.findall(SECTION_NUMBER, section_list)
+        }
+        for start, end in re.findall(
+            rf"({SECTION_NUMBER})\s*(?:through|to|[-–])\s*({SECTION_NUMBER})",
+            section_list,
+            flags=re.I,
+        ):
+            start_top = int(start.split(".", 1)[0])
+            end_top = int(end.split(".", 1)[0])
+            referenced.update(range(min(start_top, end_top), max(start_top, end_top) + 1))
+        for section in referenced:
+            if section not in have:
+                unresolved.add(section)
+    return unresolved
+
+
 def main() -> int:
     texts = {name: (PUB / name).read_text() for name in SPECS}
 
@@ -164,14 +214,16 @@ def main() -> int:
     # 5. Citation title forms.
     corpus = dict(texts)
     corpus[COMPANION] = (PUB / COMPANION).read_text()
-    for n, t in corpus.items():
+    title_corpus = dict(corpus)
+    title_corpus["specs/README.md"] = (ROOT / "specs" / "README.md").read_text()
+    for n, t in title_corpus.items():
         for bad in BANNED_TITLE_FORMS:
             if bad in t:
                 fail(f"{n}: non-canonical citation form {bad!r}")
 
     # 6b. Revision histories strictly newest-first.
     for n, t in corpus.items():
-        for m in re.finditer(r"^## Appendix [A-Z]\. Revision History.*?(?=^## |\Z)",
+        for m in re.finditer(r"^## (?:Appendix [A-Z]\. )?Revision History.*?(?=^## |\Z)",
                              t, re.M | re.S):
             dates = re.findall(r"^- \*\*(\d{4}-\d{2}-\d{2})", m.group(0), re.M)
             if dates != sorted(dates, reverse=True):
@@ -183,6 +235,8 @@ def main() -> int:
         for ref in set(re.findall(r"Appendix ([A-Z])(?:[ .,;)]|$)", t)):
             if ref not in have:
                 fail(f"{n}: reference to Appendix {ref} but no such appendix")
+        for ref in sorted(unresolved_section_references(t)):
+            fail(f"{n}: reference to Section {ref} but no such top-level section")
 
     # 7. A version string is never reused for different bytes.
     #
@@ -277,7 +331,10 @@ def main() -> int:
                 if ref not in have:
                     fail(f"in-progress/{name}: reference to Appendix {ref} but no "
                          "such appendix")
-            for m in re.finditer(r"^## Appendix [A-Z]\. Revision History.*?(?=^## |\Z)",
+            for ref in sorted(unresolved_section_references(wtext)):
+                fail(f"in-progress/{name}: reference to Section {ref} but no such "
+                     "top-level section")
+            for m in re.finditer(r"^## (?:Appendix [A-Z]\. )?Revision History.*?(?=^## |\Z)",
                                  wtext, re.M | re.S):
                 dates = re.findall(r"^- \*\*(\d{4}-\d{2}-\d{2})", m.group(0), re.M)
                 if dates != sorted(dates, reverse=True):

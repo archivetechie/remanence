@@ -31,6 +31,12 @@ pub struct OpenReport {
 }
 
 /// Open an envelope object with a matching recipient private key.
+///
+/// Each authenticated plaintext chunk is written as soon as it is verified.
+/// A later whole-object digest, footer, fill, or trailing-data failure is still
+/// returned to the caller, but bytes already written are not rolled back.
+/// Callers that must publish atomically should write to staging and discard it
+/// unless this function returns `Ok`.
 pub fn open<R: Read, W: Write>(
     mut input: R,
     mut output: W,

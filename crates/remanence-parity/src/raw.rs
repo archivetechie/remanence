@@ -420,7 +420,7 @@ impl ImageDirectoryRawSource {
             .map_err(|_| image_source_error("image block size does not fit usize"))?;
         let mut records = Vec::new();
         for (tape_file_index, bytes) in self.tape_files.iter().enumerate() {
-            if bytes.len() % block_size != 0 {
+            if !bytes.len().is_multiple_of(block_size) {
                 let location = self.directory.as_ref().map_or_else(
                     || "in-memory image".to_string(),
                     |path| path.display().to_string(),

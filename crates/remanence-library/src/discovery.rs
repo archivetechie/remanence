@@ -1,7 +1,6 @@
 //! `discover()` — the read-only orchestration that walks `/dev/sg*`,
 //! classifies each device, probes changers and tapes, and assembles a
-//! [`DiscoveryReport`]. See `docs/layer2-design.md` §4 for the
-//! algorithm; this is its implementation.
+//! [`DiscoveryReport`].
 
 use std::path::{Path, PathBuf};
 
@@ -128,9 +127,7 @@ where
 
 /// The standard Linux entry point — walk `/dev/sg*` via sysfs, open
 /// each through [`LinuxSgTransport`](crate::transport::LinuxSgTransport),
-/// and build a [`DiscoveryReport`]. This is the name
-/// `docs/layer2-design.md` §4 refers to; tests use [`discover_with`]
-/// directly with a
+/// and build a [`DiscoveryReport`]. Tests use [`discover_with`] directly with a
 /// [`FixtureTransport`](crate::transport::FixtureTransport).
 ///
 /// Linux-only. Other OSes need to use [`discover_with`] with their own
@@ -219,8 +216,7 @@ fn probe_changer<T: SgTransport>(
     Some(Library::from_captures(captures))
 }
 
-/// READ ELEMENT STATUS probe with the full DVCID fallback ladder from
-/// `docs/layer2-design.md` §4.2.1.
+/// READ ELEMENT STATUS probe with the full DVCID fallback ladder.
 ///
 /// **Primary call** (element_type=0, DVCID=1, CurData=1) uses the
 /// two-phase allocation pattern: 8-byte header to learn `byte_count`,
@@ -935,8 +931,7 @@ mod tests {
     fn no_state_changing_cdbs_during_discovery() {
         // Capture every CDB that discovery issues against a single
         // Quadstor /dev/sg4 changer probe, and assert none of them are
-        // state-changing opcodes (the spec v0.2 §8.2 / layer2-design
-        // §6 safety requirement).
+        // state-changing opcodes (a discovery safety requirement).
         use crate::transport::RecordingLog;
 
         let mut scripts = HashMap::new();

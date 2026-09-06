@@ -1,9 +1,7 @@
 //! remanence-order — the pure batch read-ordering planner for serpentine
 //! tape.
 //!
-//! Design of record: `design-read-ordering.md` §§6.3–6.4, 7 and 8
-//! (private journal). The crate holds the whole of the planning logic
-//! and none of the integration:
+//! The crate holds the whole of the planning logic and none of the integration:
 //!
 //! - [`geometry`] — the structural cartridge table (§6.3): bands, wraps
 //!   per band, channels, data tracks, with unsupported formats

@@ -1,6 +1,6 @@
 //! Physical tape read primitives for foreign-format readers.
 //!
-//! [`BlockSource`] is the object-local read surface used by native Remanence
+//! [`crate::BlockSource`] is the object-local read surface used by native Remanence
 //! body formats. Legacy or foreign tape formats sometimes need to decode the
 //! physical tape stream first: variable-size records, filemarks, and the
 //! drive's current block-size mode. This module provides that read-side

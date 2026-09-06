@@ -1,5 +1,4 @@
-//! The `PlanBatchRead` RPC — design-read-ordering.md §§6.3, 8.3, 9 and
-//! 11; prompt P5.
+//! The `PlanBatchRead` RPC.
 //!
 //! The handler resolves cartridge facts by the §6.3 matrix, fetches the
 //! volume's cached wrap map through the P4 serve path, and calls the

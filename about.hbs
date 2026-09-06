@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Remanence third-party licenses</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem auto; max-width: 70rem; padding: 0 1rem; }
+    pre { border: 1px solid #ccc; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Remanence third-party licenses</h1>
+  <p>This file contains the selected license texts for Rust crates in the Remanence runtime dependency graph.</p>
+  {{#each licenses}}
+  <section>
+    <h2 id="{{id}}-{{@index}}">{{name}}</h2>
+    <p>Used by:</p>
+    <ul>
+      {{#each used_by}}
+      <li>{{crate.name}} {{crate.version}}</li>
+      {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </section>
+  {{/each}}
+</body>
+</html>

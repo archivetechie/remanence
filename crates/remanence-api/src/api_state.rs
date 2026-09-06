@@ -71,8 +71,7 @@ pub struct ApiState {
     pub(crate) api_version: String,
     pub(crate) rust_target: String,
     pub(crate) foreign_formats: ForeignFormatRegistry,
-    /// Durable calibration-control store handle (wrap-map read
-    /// ordering, design-read-ordering.md §§4.3/6.5). One instance per
+    /// Durable calibration-control store handle for wrap-map read ordering. One instance per
     /// process; clones share state.
     pub(crate) calibration_store: CalibrationControlStore,
 }

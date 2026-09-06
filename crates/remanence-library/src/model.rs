@@ -1,5 +1,4 @@
 //! Value types — `Library`, `DriveBay`, `InstalledDrive`, etc.
-//! See `docs/layer2-design.md` §3.
 //!
 //! Everything in this module is plain `Clone + PartialEq` data. No
 //! interior mutability, no async, no lifetimes leaking. Snapshots are
@@ -38,7 +37,7 @@ impl DiscoveryReport {
 /// slots, and import/export ports. On HPE MSL hardware this often
 /// corresponds to a *partition* of a physical chassis; on simpler
 /// libraries it's the whole box. From this crate's perspective the
-/// distinction is irrelevant — see `docs/layer2-design.md` §3.2.
+/// distinction is irrelevant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Library {
     /// Stable, human-readable identity. Whatever the changer returns in
@@ -290,11 +289,11 @@ pub fn resolve_load_target(lib: &Library, voltag: &str) -> Result<LoadPlan, Load
 }
 
 // ====================================================================
-//  AccessPolicy — daemon-owned allowlist (spec v0.2 §8.2)
+//  AccessPolicy — daemon-owned allowlist
 // ====================================================================
 
-/// Hook for the daemon's library allowlist. Spec v0.2 §8.2 makes the
-/// allowlist a defense-in-depth requirement: state-changing operations
+/// Hook for the daemon's library allowlist. The allowlist is a
+/// defense-in-depth requirement: state-changing operations
 /// must refuse for any library serial not on the operator-configured
 /// list. Real daemon deployments back this with a config-file-driven
 /// implementation; tests and CLI helpers can use [`StaticAllowlist`].
