@@ -150,7 +150,7 @@ jobs:
           file target/x86_64-unknown-linux-musl/release/rem-recover | grep -E 'statically linked|static-pie linked'
           sha256sum target/x86_64-unknown-linux-musl/release/rem-recover > rem-recover-x86_64-musl.sha256
       - name: Upload recovery artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rem-recover-x86_64-musl
           path: |
@@ -176,7 +176,7 @@ jobs:
       - name: Measure workspace coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
       - name: Upload coverage data
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lcov
           path: lcov.info
