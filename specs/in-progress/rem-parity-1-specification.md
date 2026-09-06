@@ -28,9 +28,9 @@ are recorded in
 The publication tree remains unchanged.
 
 **This is a review draft.** It is published for public review and is not yet
-frozen. The draft.4 replacement is implemented in the reference tree. Its
-review-only candidate vectors are pinned and independently re-derived, its
-proof and nonphysical lifecycle/VTL gates have passed, and review proceeds
+frozen. The current generation-2 replacement is implemented in the reference
+tree. Its review-only candidate vectors are pinned and independently re-derived,
+its proof and nonphysical lifecycle/VTL gates have passed, and review proceeds
 incrementally from the last recorded clean baseline. Dedicated coverage-guided
 terminal-replica/separation/parser-walk fuzz plateaus and the supervised
 physical-media gate remain open. Candidate vectors are not publication
@@ -948,7 +948,7 @@ and parity scheme. It is the only
 structure in this format with a fixed (non-derived) magic, because the
 reader does not yet know the tape UUID when searching for it.
 
-The replacement profile writes no later Bootstrap copy. Every draft.4
+The replacement profile writes no later Bootstrap copy. Every generation-2
 Bootstrap is Object-count independent: its payload contains no Object recovery
 rows, including on a no-parity tape. Host checkpoint operations do not emit a
 Bootstrap. Keys 2, 20, 21, and 30
@@ -1155,12 +1155,13 @@ EOD
 ```
 
 The candidate byte layout, digest domains, and field tables are defined in the
-[terminal byte draft](supporting/rem-parity-terminal-index-byte-draft.md) while draft.4
-remains experimental. Each replica uses one full header record, one or more
-payload records, and one full local footer record. Each default gap includes
-its header and footer within `ceil(1 GiB/block_size)` records. The shared
-planned layout is computed before A; local observations in a footer MUST equal
-that plan, but planned future components never prove their existence.
+[terminal byte draft](supporting/rem-parity-terminal-index-byte-draft.md) while
+the preparing copy remains experimental. Each replica uses one full header
+record, one or more payload records, and one full local footer record. Each
+default gap includes its header and footer within `ceil(1 GiB/block_size)`
+records. The shared planned layout is computed before A; local observations in
+a footer MUST equal that plan, but planned future components never prove their
+existence.
 
 ### 8.4. Discovery (Reader)
 
@@ -1507,10 +1508,10 @@ zero. The header/footer version is 2. The payload immediately follows byte
 | 0xC8… | | payload in headers; zero fill in footer |
 
 The ParityMap is parity-closeout metadata and one structural row in the fixed
-pre-A prefix; it is not terminal inventory authority. A draft.4 Writer MUST NOT
-emit intermediate ParityMaps, checkpoint indexes, or a singular final index.
-The complete authoritative inventory is the fixed-slot payload repeated in
-full by replicas A, B, and C.
+pre-A prefix; it is not terminal inventory authority. A generation-2 Writer
+MUST NOT emit intermediate ParityMaps, checkpoint indexes, or a singular final
+index. The complete authoritative inventory is the fixed-slot payload repeated
+in full by replicas A, B, and C.
 
 ### 10.1. Structural rows
 
@@ -2196,8 +2197,8 @@ SHA-256 of these 25 bytes is
 
 ### A.4. A Minimal Tape, End to End
 
-A smallest-useful finalized draft.4 tape has the sole BOT Bootstrap followed by
-its Object/ParitySidecar prefix and the exact terminal suffix:
+A smallest-useful finalized generation-2 tape has the sole BOT Bootstrap
+followed by its Object/ParitySidecar prefix and the exact terminal suffix:
 
 ```text
 file 0   Bootstrap
@@ -2440,7 +2441,8 @@ REM-PARITY media byte.
 
 The published draft.1 closed-item snapshot remains in the immutable publication
 copy. It described the checkpoint-bootstrap/parity-map design and does not
-establish draft.4 conformance. Replacement work is tracked in Appendix E; only
+establish conformance to the generation-2 replacement. Replacement work is
+tracked in Appendix E; only
 items verified against the terminal triple may be closed in a later preparing
 revision.
 ## Appendix D. Revision History (Informative)
@@ -2632,7 +2634,8 @@ governs only the revisions that follow the first published one.
 
 ## Appendix E. Open Items (Informative)
 
-This is the live preparing-copy snapshot for the draft.4 replacement.
+This is the live preparing-copy snapshot for the current generation-2
+replacement.
 
 1. **TT-1 — independent byte derivation (candidate evidence passed).** The
    independent Python implementation reproduces all six review profiles and
@@ -2665,7 +2668,8 @@ This is the live preparing-copy snapshot for the draft.4 replacement.
    and later commits reopen only the regions they touch.
 6. **TT-6 — terminal-format fuzz plateaus (open).** Existing campaigns cover
    bootstrap, sidecar, ParityMap, and the pre-terminal scan walk. They predate
-   the draft.4 terminal format: there is not yet a dedicated coverage-guided
+   the generation-2 terminal format introduced in draft.4: there is not yet a
+   dedicated coverage-guided
    terminal-replica parser campaign, separation parser campaign, or scan-walk
    campaign whose generator reaches terminal kinds at the legal 256 KiB,
    512 KiB, and 1 MiB record sizes. Criterion 18.3 remains open until those

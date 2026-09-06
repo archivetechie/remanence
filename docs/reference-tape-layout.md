@@ -5,8 +5,8 @@ the stable formats lives in the published specifications —
 [REM-OBJECT Core](../specs/publication/rem-object-core-1-specification.md),
 [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md), and
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md). The
-terminal triple index described below is the experimental draft.4 replacement;
-its candidate byte tables are in the
+terminal triple index described below is the experimental generation-2
+replacement in the current preparing copy; its candidate byte tables are in the
 [in-progress byte draft](../specs/in-progress/supporting/rem-parity-terminal-index-byte-draft.md).
 It is not part of the unchanged publication baseline.
 
