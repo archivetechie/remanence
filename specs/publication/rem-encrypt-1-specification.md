@@ -37,8 +37,8 @@ not that text is missing from this document.
 | | |
 | --- | --- |
 | Status | Review draft |
-| Version | 1.0.0-draft.2 |
-| Date | 2026-09-06 |
+| Version | 1.0.0-draft.3 |
+| Date | 2026-09-10 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719161](https://doi.org/10.5281/zenodo.21719161) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -408,6 +408,17 @@ supplied private key's epoch id; absence is a hard mismatch.
 
 Suite `0x02` freezes the byte-level construction from
 `draft-connolly-cfrg-xwing-kem-10`; later revisions do not silently alter it.
+
+The standing of that document has changed since it was pinned, and the
+construction has not. The standalone draft expired on 3 September 2026
+without adoption by a working group. The identical construction is carried
+forward by the IRTF Crypto Forum Research Group as the `MLKEM768-X25519`
+instance of [CONCRETE-HYBRID-KEMS], which states that it is identical to
+X-Wing, and is registered for HPKE under KEM identifier `0x647a` in
+[HPKE-PQ], an IETF working-group document intended for the standards track.
+This document continues to pin draft-10 and its known-answer files, and the
+rule below stands: a successor that is wire-identical keeps `0x02`; one that
+differs on the wire takes a new `wrap_suite`.
 
 For a 32-byte seed:
 
@@ -805,7 +816,7 @@ produces `InvalidSuite`.
 | `0x00` | reserved / invalid | REM-ENCRYPT 1.0 | — |
 | `0x01` | **permanently forbidden** | REM-ENCRYPT 1.0 | Legacy X25519-only assignment; pre-production and never shipped |
 | `0x02` | **current** | REM-ENCRYPT 1.0 | X-Wing from `draft-connolly-cfrg-xwing-kem-10` |
-| `0x03` | reserved | REM-ENCRYPT 1.0 (consumable by a future revision) | A future X-Wing construction that differs on the wire from draft-10 |
+| `0x03` | reserved | REM-ENCRYPT 1.0 (consumable by a future revision) | A future X-Wing / MLKEM768-X25519 construction that differs on the wire from draft-10 |
 | all others | unassigned | a future revision | — |
 
 Per Section 5.3.1, a wire-identical final X-Wing RFC keeps `0x02`; only its
@@ -1198,10 +1209,26 @@ part of suite `0x02`; this document makes no IANA request.
   `draft-connolly-cfrg-xwing-kem-10`, 2 March 2026,
   <https://datatracker.ietf.org/doc/html/draft-connolly-cfrg-xwing-kem-10>;
   a copy is pinned in this repository's `specs/publication/provenance/`.
-  Internet-Drafts expire: if a wire-identical RFC supersedes the draft,
-  `wrap_suite 0x02` is retained (Section 10.3) and this citation is updated
-  by an erratum; a construction that differs on the wire consumes the
-  reserved `0x03` through a minor revision instead.
+  The draft expired on 3 September 2026; the pinned copy, not the
+  datatracker, is the text this document freezes. If a wire-identical RFC
+  supersedes the draft, `wrap_suite 0x02` is retained (Section 10.3) and this
+  citation is updated by an erratum; a construction that differs on the wire
+  consumes the reserved `0x03` through a minor revision instead.
+- [CONCRETE-HYBRID-KEMS] — "Concrete Hybrid PQ/T Key
+  Encapsulation Mechanisms", `draft-irtf-cfrg-concrete-hybrid-kems-04`,
+  6 July 2026,
+  <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-concrete-hybrid-kems-04>.
+  Its `MLKEM768-X25519` instance is stated to be identical to the X-Wing
+  construction of [XWING-DRAFT10].
+- [HYBRID-KEMS] — "Hybrid PQ/T Key Encapsulation Mechanisms",
+  `draft-irtf-cfrg-hybrid-kems-11`,
+  <https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-hybrid-kems-11>.
+  The generic framework that [CONCRETE-HYBRID-KEMS] instantiates.
+- [HPKE-PQ] — "Post-Quantum and Post-Quantum/Traditional Hybrid Algorithms
+  for HPKE", `draft-ietf-hpke-pq-05`, 6 July 2026,
+  <https://datatracker.ietf.org/doc/draft-ietf-hpke-pq/>. Registers
+  `MLKEM768-X25519` for HPKE under KEM identifier `0x647a`, citing
+  [CONCRETE-HYBRID-KEMS].
 - [AEAD-COMMIT] — Albertini, A., et al., "How to Abuse and Fix
   Authenticated Encryption Without Key Commitment", USENIX Security 2022,
   <https://www.usenix.org/conference/usenixsecurity22/presentation/albertini>.
@@ -1288,6 +1315,13 @@ Catalogless recovery trades direct manifest positioning for sequential open.
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
+- **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Records the current
+  standing of the pinned X-Wing draft: expired on 3 September 2026, its
+  construction carried forward identically as `MLKEM768-X25519` by the CFRG
+  and registered for HPKE as KEM `0x647a`; adds the three informative
+  references and retargets open item RE-2 at RFC publication. The pinned
+  construction, its known-answer files, `wrap_suite` `0x02`, and `kem_id`
+  `0x647a` are unchanged. No envelope obligation or vector changed.
 - **2026-09-06 — 1.0.0-draft.2 — review-draft errata.** Clarifies that shared
   numbering extends to subsections, removes a dead REM-PARITY Section 18
   cross-reference, and states the reserved-but-not-deposited publication
@@ -1337,10 +1371,16 @@ project. For this document that includes the HPKE transcript and the key
 schedule, where a divergence produces objects nobody else can open.
 
 **RE-2 · The X-Wing draft dependency · open, monitored.** This document pins
-`draft-connolly-cfrg-xwing-kem-10`, an Internet-Draft. Section 10.3 already
-states the intended handling: a wire-identical final RFC keeps `wrap_suite`
-`0x02` and changes only the citation, while a construction differing on the wire
-consumes the reserved `0x03`. No action is required until the draft advances.
+`draft-connolly-cfrg-xwing-kem-10`, an individual Internet-Draft that expired
+on 3 September 2026 without working-group adoption. Its construction has been
+adopted, identically, as the `MLKEM768-X25519` instance of
+[CONCRETE-HYBRID-KEMS] and registered for HPKE as KEM `0x647a` in [HPKE-PQ]
+(Section 5.3.1). The event monitored is the publication of either of those
+documents as an RFC. At that point the known-answer files of Section 13.3 are
+re-run against the RFC text; if they match, the citation moves to the RFC by
+erratum and `wrap_suite` `0x02` is unchanged, as Section 10.3 already
+provides. If they do not match, the reserved `0x03` is consumed through a
+minor revision and this document says so. No action is required before then.
 
 
 ## Author's Address
