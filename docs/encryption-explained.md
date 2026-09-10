@@ -220,8 +220,11 @@ object.
 
 **The framing is our own work, and it has not yet been reviewed outside the
 project.** The primitives are standardised — HPKE, HKDF, ChaCha20-Poly1305,
-ML-KEM — but the wrap suite freezes an X-Wing Internet-Draft under a
-project-assigned identifier, and the envelope around all of it is ours.
+ML-KEM — but the wrap suite freezes X-Wing at revision 10 of its Internet-Draft
+under a project-assigned identifier, and the envelope around all of it is ours.
+(That standalone draft has since expired; the CFRG carries the identical
+construction forward as MLKEM768-X25519, and the HPKE working group registers
+it as KEM 0x647a. The pinned bytes are unchanged.)
 REM-ENCRYPT is a review draft: no standards body has reviewed or adopted it, and
 no one outside the project has yet built an implementation from the specification
 text alone. What exists is the published specification, pinned test vectors, and a
