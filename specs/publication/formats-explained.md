@@ -241,6 +241,12 @@ still be restored whole, or opened and picked from when someone genuinely
 needs one file out of it; but it costs the tape one stream, and the
 manifest one record, instead of ten thousand. Files that deserve
 individual identity keep it; the rest are carried in bulk, deliberately.
+The wrapper is a convention above the format rather than part of it, which is
+why the specification describes it in an informative appendix of the
+REM-OBJECT Core Format, titled *Packing Many Small Files*, rather than in its
+normative text; that appendix also
+explains why the format's alignment rule makes very small members expensive in
+the first place.
 
 **It is a tar file with discipline.** The object is a POSIX pax tar
 stream — the modern, standardized flavor of tar. Two rules give it its

@@ -92,7 +92,8 @@ entry of every REM-OBJECT object (`_remanence/manifest.cbor`).
 **blob wrapper** — an ingest artifact: a dense subtree of non-compliant
 files packed into a `.remwrap.tar` member (with a generated
 `.remwrap.idx` sibling index) instead of thousands of individual
-entries.
+entries. The convention, the index fields, and the single-file recovery
+procedure are described in REM-OBJECT Core Format Appendix E (informative).
 
 **foreign-format adapter** — an auxiliary, read-only parser linked into a
 separate Remanence distribution. Core Remanence owns the normalized reader and

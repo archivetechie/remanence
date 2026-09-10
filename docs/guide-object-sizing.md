@@ -70,6 +70,15 @@ and ingest it with `rem put --stored-object` when the files should share one
 tape file and one trailing filemark. Per-member catalog rows, hashes, and
 individual restore selection remain available inside that bundle.
 
+Bundling has a floor as well as a ceiling. Every non-empty member starts on a
+chunk boundary, so each one advances the stream by at least one tape block
+(256 KiB, 512 KiB, or 1 MiB). Members of a few hundred kilobytes or more lose
+little to this; a subtree of very small files loses most of its space, and for
+that case, and for files the format cannot represent natively, `rem archive
+build --rules` can wrap the subtree into one `.remwrap.tar` member with a
+`.remwrap.idx` index beside it. REM-OBJECT Core Format Appendix E describes the
+convention and how one inner file is recovered from it.
+
 Choose a bundle target from operational needs rather than a format-imposed row
 ceiling. Larger bundles reduce filemark, row, and catalog overhead. Smaller
 bundles reduce retry cost, staging requirements, and the amount of unrelated

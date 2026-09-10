@@ -34,8 +34,8 @@ not that text is missing from this document.
 | | |
 | --- | --- |
 | Status | Review draft |
-| Version | 1.0.0-draft.2 |
-| Date | 2026-09-06 |
+| Version | 1.0.0-draft.3 |
+| Date | 2026-09-10 |
 | License | CC-BY-4.0 |
 | Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) |
 | Reference implementation (informative) | Zenodo concept DOI [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) — software deposit, Apache-2.0 |
@@ -178,6 +178,7 @@ construction is deterministic.
 - Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
 - Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
 - Appendix D. [Open Items (Informative)](#appendix-d-open-items-informative)
+- Appendix E. [Packing Many Small Files (Informative)](#appendix-e-packing-many-small-files-informative)
 - [Author's Address](#authors-address)
 
 ---
@@ -2070,6 +2071,12 @@ framing the stream already provides (self-description, digests).
 Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
+- **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
+  an informative description of the capacity cost the alignment rule imposes
+  on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper
+  convention the reference implementation layers above the format, including
+  how one inner file is recovered from a wrapper. No normative text changed;
+  no valid object or vector changed.
 - **2026-09-06 — 1.0.0-draft.2 — review-draft errata.** Clarifies that shared
   numbering extends to subsections, removes a dead REM-PARITY Section 18
   cross-reference, states the reserved-but-not-deposited publication status,
@@ -2125,6 +2132,134 @@ dependency on an external retrieval path. It would require a reserved object
 identity in this document and classification support in REM-PARITY; it is
 recorded there as RP-3. *Comment invited.*
 
+
+## Appendix E. Packing Many Small Files (Informative)
+
+This appendix describes a cost that follows from the alignment rule, and the
+convention the reference implementation uses to avoid it. Nothing here is
+normative. An object that never uses the convention is conformant, a Reader
+that does not recognise it is conformant, and the two members the convention
+produces are ordinary regular entries governed entirely by Section 4.
+
+### E.1. What Alignment Costs
+
+Section 4.6.3 requires every non-empty entry's payload to begin on a chunk
+boundary, and achieves it inside the entry's own pax header, where standard
+tools do not see it. The space between the end of one payload and the next
+chunk boundary is taken up by the next entry's headers and pad, so the stream
+advances by at least one chunk for every non-empty entry, whatever its size.
+On tape `chunk_size` is the tape block size, so a 1 KiB file occupies
+256 KiB, 512 KiB, or 1 MiB of the stream depending on the block size the
+cartridge was written with, and nearly all of that space carries nothing.
+For entries of a few hundred kilobytes or more the loss is a fraction of one
+chunk per entry and rarely matters. For a tree of very small files it is most
+of the space.
+
+The cost is the price of closed-form range addressing (Section 4.6.4): the
+position of any byte of any file follows by arithmetic from the manifest,
+with no scan and no index lookup, and that property depends on every payload
+starting on the grid. The format does not offer a dense layout that trades
+the property away. Where the trade is wanted, it is made above the format, as
+described next.
+
+### E.2. When It Matters
+
+Two kinds of input meet the cost. The first is a subtree of very small files:
+an application's cache directory, a thumbnail forest, the contents of a
+decommissioned workstation archived beside the masters. The second is a file
+that cannot be represented as a native entry at all: a path or symlink target
+that is not valid UTF-8 (Section 4.6.6), a file type the format does not
+carry (a device node, socket, or FIFO), or extended attributes outside the
+portable set the writer accepts. The reference implementation applies the
+same answer to both.
+
+### E.3. The Wrapper Convention
+
+The writer packs the subtree with an ordinary pax-format tar into a single
+regular entry, and writes a small index beside it as a second regular entry.
+For a subtree at canonical relative path `<path>`, the two entries are:
+
+| Entry | Content |
+| --- | --- |
+| `<path>.remwrap.tar` | The subtree as one pax-format tar stream, produced by the system's tar program. The reference implementation invokes it with `--format pax --xattrs`. |
+| `<path>.remwrap.idx` | A JSON document describing the wrapper, with the fields below. |
+
+The index document has three fields:
+
+| Field | Meaning |
+| --- | --- |
+| `format` | The string `remanence-remwrap-idx-v1`. |
+| `tar_engine` | An object recording the tar program used (`program`, `version`) and the exact `create_invocation` and `extract_invocation` argument lists, so a later reader knows what produced the wrapper and how to unpack it. |
+| `entries` | An array with one element per inner entry of the wrapper, in wrapper order. |
+
+Each element of `entries` carries:
+
+| Field | Meaning |
+| --- | --- |
+| `path` | The inner entry's path, rendered as text: valid UTF-8 is kept as is, a backslash is doubled, and control bytes (0x00–0x1F, 0x7F) and bytes that are not valid UTF-8 are written as `\xNN`. An inner file whose name is not valid UTF-8 is therefore still listable. |
+| `kind` | `regular`, `symlink`, `directory`, or `other`. |
+| `offset` | The byte offset of the inner entry's data within the wrapper's bytes. |
+| `length` | The inner entry's payload length in bytes for a regular entry; `0` otherwise. |
+| `sha256` | The SHA-256 of the inner file's payload bytes, as lowercase hex. Present for regular entries; absent otherwise. |
+| `mtime` | The inner entry's modification time as recorded in the wrapper's tar headers, as a string. |
+
+Both entries are ordinary members of the object. Each begins on a chunk
+boundary, each carries its own `REMANENCE.file_sha256`, and each is listed in
+the manifest like any other file. The wrapper's inner files are not members:
+they have no entry of their own, no `REMANENCE.file_id`, and no manifest
+record. The index is a convenience of the convention rather than a
+requirement of it; a writer may omit it, in which case only whole-wrapper
+restore is available.
+
+### E.4. Recovering One Inner File
+
+A reader that understands the convention recovers a single inner file without
+reading the wrapper in full:
+
+1. Locate `<path>.remwrap.idx` and `<path>.remwrap.tar` through the manifest,
+   or through a catalog derived from it.
+2. Read the index entry in full and verify it against its
+   `REMANENCE.file_sha256`.
+3. Find the element of `entries` whose `path` is the file wanted, and confirm
+   its `kind` is `regular`.
+4. Read exactly `[offset, offset + length)` of the wrapper entry's payload,
+   using the range addressing of Section 4.6.4 applied to the wrapper entry.
+5. Verify the bytes read against the element's `sha256`.
+
+Under the encrypted representation the same steps apply, because
+range addressing is preserved through the envelope (REM-ENCRYPT Section 6);
+the index and the wrapper range are fetched as ciphertext chunks and
+decrypted, and nothing else in the object is opened. The reference
+implementation exposes the procedure as `rem archive extract` with
+`--blob-entry` and `--blob-member`, for both representations.
+
+Without any of this, standard tools still suffice: extract the object with
+`tar`, then extract `<path>.remwrap.tar` with `tar` again. The index remains a
+readable JSON file beside it.
+
+### E.5. What the Convention Gives Up
+
+An inner file is not a member of the object, so nothing in Section 4 speaks
+about it. It does not appear in the manifest, it has no identity of its own,
+and a Verifier that checks every member has checked the wrapper and the index
+as two files, not the inner files individually. Fixity for an inner file is
+the `sha256` in its index element, whose own integrity rests on the index
+entry's `REMANENCE.file_sha256` and, through it, on the manifest and the
+object digests of Section 7. Byte-range restore inside an inner file is not
+offered by the reference tools, although the wrapper entry itself is
+range-addressable and a reader could compose the two offsets.
+
+### E.6. Whose Decision It Is
+
+The reference implementation wraps a subtree in two situations only: when an
+ingest rule names the subtree, or when a file cannot be represented as a
+native entry for one of the reasons in Section E.2, in which case that file,
+or the directory holding it, is wrapped on its own. It never wraps by size.
+Its scan mode reports a directory as a candidate for wrapping when at least
+ninety per cent of at least one hundred files under it cannot be represented
+natively, but the report is a suggestion and changes nothing. The choice of
+what to bundle into one object, and what to wrap inside it, is the writer's
+policy, and it belongs above this document.
 
 ## Author's Address
 
