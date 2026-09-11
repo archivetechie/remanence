@@ -1,4 +1,4 @@
-<!-- code-anchor: specs/publication tools/check_spec_versioning.py @ 9a7ce06a -->
+<!-- code-anchor: specs/publication tools/check_spec_versioning.py @ 1dd451b2 -->
 # How These Formats Change — and What Never Does
 
 *A plain-language companion to the versioning and revision policy of the
@@ -232,9 +232,12 @@ Every document's version has three parts, always: **major.minor.errata**.
 
 A revision still open for public comment carries a `-draft.N` suffix on that
 three-part core — it names the revision it anticipates and orders before it,
-without being that revision yet. All three specifications are there today:
-each stands at **1.0.0-draft.1**, open for comment, and becomes 1.0.0 only
-once it is frozen.
+without being that revision yet. All three specifications are there today,
+open for comment and each becoming 1.0.0 only once it is frozen; the `-draft.N`
+number climbs independently per document as review produces text changes
+(REM-OBJECT and REM-ENCRYPT are at 1.0.0-draft.3, REM-PARITY at 1.0.0-draft.2
+as of this writing — see [versioning-register.md](versioning-register.md#18-the-specification-documents)
+for current values).
 
 The document's title and filename carry only the major line ("REM-PARITY
 Format", file `rem-parity-1-specification.md`), so filenames never churn

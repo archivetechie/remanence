@@ -3,7 +3,7 @@
 How the pieces of Remanence fit together, grounded in the code as it is
 today. For byte formats see the [tape layout reference](reference-tape-layout.md).
 
-<!-- code-anchor: Cargo.toml @ 244bc6de -->
+<!-- code-anchor: Cargo.toml @ 1dd451b2 -->
 ## The layer model
 
 Remanence is organized as a strict stack. Each layer only knows about the
@@ -46,7 +46,7 @@ planning](#read-order-planning) below.
 
 *Fig. 1 — The workspace as a strict stack: each layer depends only on the one below it, and the format-defining crates sit directly above the format-free platform seam.*
 
-<!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-scsi/src/lib.rs crates/remanence-library/src/lib.rs @ 1dd451b2 -->
 ## Layers 1 and 2: the tape platform
 
 `remanence-scsi` is the leaf crate: it builds CDBs, dispatches them
@@ -85,7 +85,7 @@ marks it uncalibrated before the first media-modifying command of a load —
 see [Read-order planning](#read-order-planning) below for what that epoch
 fences.
 
-<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ 244bc6de -->
+<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ 1dd451b2 -->
 ### The platform seam
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
@@ -98,7 +98,7 @@ the entire core workspace contains no concrete foreign-format adapter. An
 external project can build its own layout and catalog on the platform crates
 without inheriting Remanence's formats.
 
-<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-format/src/lib.rs crates/remanence-parity/src/lib.rs crates/remanence-aead/src/lib.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/header.rs crates/remanence-format-driver/src/lib.rs crates/remanence-stream/src/lib.rs crates/remanence-crc/src/lib.rs @ 1dd451b2 -->
 ## Layer 3: formats and parity
 
 Six crates share this layer:
@@ -185,7 +185,7 @@ ordinary clean-break refusal.
 The recovery/import boundary and its deliberately identity-only authority are
 described in [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
-<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 1dd451b2 -->
 ## Layer 5: daemon and API
 
 The gRPC contract (package `remanence.api.v1`, defined in
@@ -232,7 +232,7 @@ rules that keep new work out of the former monoliths are documented in
 
 *Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` keeps an allowlist-gated direct SCSI path for break-glass work.*
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 1dd451b2 -->
 ## The write path
 
 What happens when an orchestrator writes an object:
@@ -336,7 +336,7 @@ and no second terminal triple. SQLite is a replayable projection. On a
 finalized cartridge the three terminal replicas, selected C then B then A with
 agreement required between survivors, provide catalog-less tape authority.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 1dd451b2 -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and
@@ -385,7 +385,7 @@ bounded streaming decrypt authenticates and trims exactly those chunks —
 this is what the CLI's `archive covering-range`/`archive extract-stream`
 pair does locally, decoupled from any gRPC read session.
 
-<!-- code-anchor: crates/remanence-order crates/remanence-api/src/calibration.rs crates/remanence-api/src/read_plan.rs crates/remanence-state/src/calibration.rs crates/remanence-scsi/src/read_end_of_wrap_position.rs crates/remanence-scsi/src/report_supported_opcodes.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-order crates/remanence-api/src/calibration.rs crates/remanence-api/src/read_plan.rs crates/remanence-state/src/calibration.rs crates/remanence-scsi/src/read_end_of_wrap_position.rs crates/remanence-scsi/src/report_supported_opcodes.rs @ 1dd451b2 -->
 ## Read-order planning
 
 `remanence-order` is a dependency-free, pure-computation crate — geometry

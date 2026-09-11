@@ -3,7 +3,7 @@
 Project-internal terms and the tape-industry vocabulary Remanence leans
 on. Definitions reflect what the code does today, not aspirations.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ 1dd451b2 -->
 ## Formats and objects
 
 **REM-OBJECT** — REM-OBJECT, the native stored-object format. One REM-OBJECT
@@ -99,7 +99,7 @@ procedure are described in REM-OBJECT Core Format Appendix E (informative).
 separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 1dd451b2 -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
@@ -196,7 +196,7 @@ drive, tape, or library resource (for example a repeated cleaning
 failure or a fenced tape awaiting release) until an operator
 acknowledges or clears it. Listed and acknowledged with `rem alarms`.
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs crates/remanence-api/src/calibration.rs crates/remanence-state/src/calibration.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-library/src/handle/mod.rs crates/remanence-state/src/index.rs crates/remanence-api/src/calibration.rs crates/remanence-state/src/calibration.rs @ 1dd451b2 -->
 ## Safety machinery
 
 **allowlist** — the explicit list of library serials a process may

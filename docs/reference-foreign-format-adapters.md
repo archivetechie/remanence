@@ -1,4 +1,4 @@
-<!-- code-anchor: crates/remanence-format-driver/src/lib.rs crates/remanence-cli/src/lib.rs @ 56139ae0 -->
+<!-- code-anchor: crates/remanence-format-driver/src/lib.rs crates/remanence-cli/src/lib.rs @ 1dd451b2 -->
 # Foreign-format adapters
 
 Remanence can expose files from an older archive format through the same
