@@ -489,7 +489,7 @@ per-block > 1.
 
 ---
 
-<!-- code-anchor: crates/remanence-order crates/remanence-scsi/src/read_end_of_wrap_position.rs crates/remanence-scsi/src/report_supported_opcodes.rs crates/remanence-api/src/read_plan.rs crates/remanence-api/src/calibration.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-order crates/remanence-scsi/src/read_end_of_wrap_position.rs crates/remanence-scsi/src/report_supported_opcodes.rs crates/remanence-api/src/read_plan.rs crates/remanence-api/src/calibration.rs @ 1dd451b2 -->
 ## 8. Read ordering and batch restore
 
 Ordering is not a PFR feature in itself — it is a multi-target restore

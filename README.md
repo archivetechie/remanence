@@ -73,7 +73,7 @@ verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
 
-<!-- code-anchor: Cargo.toml @ 244bc6de -->
+<!-- code-anchor: Cargo.toml @ 1dd451b2 -->
 ## Build
 
 Rust 1.88+, Linux. No system dependencies for the default build:
@@ -99,7 +99,7 @@ cargo test --workspace
 Hardware-touching tests are ignored by default and opt in via
 environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 1dd451b2 -->
 ## Quickstart
 
 The native object format works against local files, no tape required:
@@ -172,7 +172,7 @@ REM-OBJECT files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
-<!-- code-anchor: Cargo.toml @ 244bc6de -->
+<!-- code-anchor: Cargo.toml @ 1dd451b2 -->
 ## Repository layout
 
 ```text

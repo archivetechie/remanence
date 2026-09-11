@@ -15,7 +15,7 @@ documents and published artifacts themselves.
 
 ---
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-parity/src/sidecar.rs crates/remanence-parity/src/parity_map.rs crates/remanence-parity/src/index_separation.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/tape_index.rs @ 56139ae0 -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-parity/src/sidecar.rs crates/remanence-parity/src/parity_map.rs crates/remanence-parity/src/index_separation.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/tape_index.rs @ 1dd451b2 -->
 ## Tape layer (REM-PARITY)
 
 ### 1. The bootstrap block — `schema_major`
@@ -32,10 +32,11 @@ documents and published artifacts themselves.
   three-replica terminal index written at the tail (see
   **Terminal Object rows** below) — this is the only generation the
   current software writes or accepts. No published REM-PARITY revision
-  describes generation 2 yet: the published copy (1.0.0-draft.1) still
-  describes generation 1 only. Generation 2 exists as a not-yet-published
-  revision in preparation (1.0.0-draft.5; see
-  `specs/in-progress/README.md`), which the shipped code already matches.
+  describes generation 2 yet: the published copy (1.0.0-draft.2) still
+  describes generation 1 only, and says so explicitly in its own Status
+  section. Generation 2 exists as a not-yet-published revision in
+  preparation (1.0.0-draft.5; see `specs/in-progress/README.md`), which
+  the shipped code already matches.
 - **Unknown value.** A reader MUST reject a bootstrap whose `schema_major`
   is not 2. This is deliberate and safe: a different major means a
   different format generation, and refusing loudly is the correct answer.
@@ -300,13 +301,18 @@ each magic label ends in a version byte. The active labels cover the BOT
 
 - **What.** Three normative specifications and one informative companion,
   each independently versioned major.minor.errata.
-- **Current.** All four are **review drafts** at 1.0.0-draft.1, open for
-  comment until 30 April 2027 and freezing 31 July 2027. Copies of these
-  documents circulated earlier inside a software release, without DOIs of
-  their own and reachable only by unpacking the source archive; these are the
-  first revisions published as documents. The documents version independently
-  from here, so their numbers may diverge later even though they start
-  together.
+- **Current.** The three normative specifications are **review drafts**, open
+  for comment until 30 April 2027 and freezing 31 July 2027: REM-OBJECT and
+  REM-ENCRYPT at 1.0.0-draft.3, REM-PARITY at 1.0.0-draft.2. They started
+  together at 1.0.0-draft.1 and have since diverged, as this page's own
+  "How they change" note below predicted they would — review has produced
+  more text changes on some documents than others. The fourth,
+  `formats-explained.md`, is an informative companion versioned separately
+  (currently 1.1, status "Informative companion") and is not part of the
+  review-draft freeze schedule. Copies of the three normative documents
+  circulated earlier inside a software release, without DOIs of their own and
+  reachable only by unpacking the source archive; these are the first
+  revisions published as documents.
 - **How they change.** The three-question policy in each document's Status
   section — the subject of [versioning-explained.md](versioning-explained.md).
   Titles and filenames carry the major line only; each revision is

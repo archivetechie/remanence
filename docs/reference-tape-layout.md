@@ -78,7 +78,7 @@ HMAC-SHA-256 keyed by the tape UUID, so blocks from one tape cannot
 masquerade as another's. All parity-layer structures carry CRC-64/XZ
 checksums.
 
-<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ 1dd451b2 -->
 ## Parity scheme
 
 Erasure coding is Reed-Solomon over GF(2^8) with a Cauchy matrix; the
@@ -104,7 +104,7 @@ Object commit and the exact terminal reserve: parity closeout, three replica
 charges, two gap charges, and safety allowance. Each header, footer, record,
 and filemark is charged once.
 
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ 1dd451b2 -->
 ## The stored object: rem-object-v1
 
 A plaintext stored object is a POSIX pax tar archive — the format id is
@@ -127,7 +127,7 @@ a promise, it is the format.
 
 *Fig. 2 — A rem-object-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
 
-<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 1dd451b2 -->
 ## The encrypted envelope: REMO
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
@@ -215,7 +215,7 @@ remains backpressured by the receiver; independently valid conflicting
 candidates may require one bounded replay before the reader can fail closed or
 emit a selected authority.
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 1dd451b2 -->
 ## Tape identity
 
 A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
@@ -228,7 +228,7 @@ recycle-skew issue when something outside Remanence rewrites a cartridge
 under an existing barcode (see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ 1dd451b2 -->
 ## On disk: durable records and rebuildable state
 
 The host-side state, for completeness (paths are operator-configured; see

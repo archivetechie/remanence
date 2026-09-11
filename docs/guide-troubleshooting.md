@@ -5,7 +5,7 @@ recurring theme: when the stack cannot prove what state the hardware is in,
 it stops and says so rather than guessing. Most of what looks like an outage
 is a fence doing its job.
 
-<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 1dd451b2 -->
 ## Discovery finds no libraries
 
 `rem libraries` reporting `no tape libraries reachable on this host` has
@@ -42,7 +42,7 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
 is not loaded).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 1dd451b2 -->
 ## Media-readiness fences and quarantine
 
 Remanence classifies TEST UNIT READY results into an explicit readiness
@@ -91,7 +91,7 @@ The `--ack` text is recorded. The fence is deliberately annoying: its
 whole purpose is that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
-<!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 1dd451b2 -->
 ## Dirty snapshots and completion-unknown
 
 For every state-changing SCSI command, Remanence distinguishes "the device
@@ -112,7 +112,7 @@ poison the write transfer or the whole write session. All three are
 independent "don't trust what you can't prove" mechanisms at different
 layers — seeing one does not imply the others tripped too.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs crates/remanence-daemon/src/tls.rs crates/remanence-state/src/error.rs crates/remanence-state/src/config.rs @ 1dd451b2 -->
 ## The daemon refuses to start
 
 `rem-daemon` checks its world in order and exits 1 with a specific
@@ -145,7 +145,7 @@ the same lock, so another daemon or maintenance command receives the ownership
 error above even if it uses a different socket path. The Unix-socket liveness
 probe remains a separate check for a stale or already-listening socket.
 
-<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/write_admission.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-api/src/pool_write.rs crates/remanence-parity/src/error.rs crates/remanence-api/src/pool_write/selection.rs crates/remanence-api/src/write_admission.rs @ 1dd451b2 -->
 ## Writes are refused
 
 Pool writes fail closed on a set of preconditions. The common refusals:
@@ -201,7 +201,7 @@ is fenced by quarantine ...` (see fences above), and `tape ... carries
 committed data but no adopted checkpoint journal; batched append
 positioning would be unsafe`.
 
-<!-- code-anchor: crates/remanence-daemon/src/entry.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-daemon/src/entry.rs @ 1dd451b2 -->
 ## Reading the logs
 
 The daemon logs JSON to stderr, one flattened object per event, filtered
