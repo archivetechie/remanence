@@ -1,3 +1,4 @@
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/tar.rs crates/remanence-format/src/writer.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-stream/src/lib.rs crates/rem-recover/src/main.rs @ 3c0f50b3 -->
 # Extended attributes and file metadata
 
 This reference explains what file metadata Remanence preserves in a REM-OBJECT
@@ -32,6 +33,19 @@ per-entry `metadata_preservation_data` map — **not** as pax
 consequential choice, and it is what makes the standard-tool recovery path
 (below) safe by construction. A generic tar reader has no knowledge of the
 REM-OBJECT manifest; to it, the manifest is simply one extra file in the archive.
+
+This is the path for every natively representable entry. An entry with a
+non-native file type, or with a single kept attribute value over 4 KiB, or
+with a kept-attribute total over 16 KiB, is instead wrapped: `rem archive
+build` stores it as an ordinary `tar --xattrs` blob (named
+`<path>.remwrap.tar`, itself one regular entry in the outer manifest), and
+the attributes it keeps by policy do appear there as real, filtered
+`SCHILY.xattr.*`/`LIBARCHIVE.xattr.*` pax records. This does not weaken the
+recovery guarantee below — a plain `tar x` on the outer archive does not
+recurse into a nested `.remwrap.tar`, so those attributes still are not
+reapplied by the standard-tool path — but a reader inspecting a wrapped
+entry's bytes directly, rather than restoring through `rem`, will find pax
+xattr records there.
 
 ## Capture
 
@@ -109,11 +123,14 @@ Remanence binary at all — **does not reapply any extended attribute.** Such
 a recovery restores the file bytes, the directory structure, symlinks and
 hardlinks, and writes the manifest as one ordinary file
 (`_remanence/manifest.cbor`) containing the attribute data as inert bytes,
-applied to nothing. A `security.capability` in a REM-OBJECT object cannot be
-reconstituted by `tar`, even with `tar --xattrs`, because there is no
-attribute record in the tar stream for it to find. Combined with the
-exclusion of ownership and setuid/setgid mode bits, the standard-tool path
-cannot escalate privilege through file metadata.
+applied to nothing. For a natively represented entry, a `security.capability`
+cannot be reconstituted by `tar`, even with `tar --xattrs`, because there is
+no attribute record in the outer tar stream for it to find. A wrapped entry
+(see above) does carry a real pax record for it, but one level deeper, inside
+a nested `.remwrap.tar` blob that a single non-recursive `tar x` never opens
+— the attribute is present in the archive but still not reapplied. Combined
+with the exclusion of ownership and setuid/setgid mode bits, the
+standard-tool path cannot escalate privilege through file metadata.
 
 This yields a clean division of responsibility: the recovery path that
 anyone can run with a forty-year-old tool is inherently safe, and the only
