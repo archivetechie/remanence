@@ -1,3 +1,4 @@
+<!-- code-anchor: verif Makefile @ 3c0f50b3 -->
 # Formal verification status
 
 This document is the reviewer-facing inventory for Remanence formal proof work.
@@ -23,12 +24,13 @@ Each proof area has two layers:
 - A Lean proof over Aeneas-generated definitions plus hand-written
   specification theorems in `verif/<area>/lean`.
 
-Most extraction crates also have a Rust `drift_guard` test. That test pins
+Every extraction crate has a Rust `drift_guard` test. That test pins
 selected production snippets and selected extraction snippets. It is a useful
 change detector, but it is not a semantic proof that the extraction and
-production code are identical. The capacity and pool-admission extractions add
-compiled-production behavioral matrices, and the inventory freshly regenerates
-their Aeneas output and compares it byte-for-byte with the checked-in Lean
+production code are identical. The capacity and pool-admission extractions
+additionally add compiled-production behavioral matrices. Separately, the
+inventory freshly regenerates the Aeneas output for capacity, sidecar-layout,
+and pool-admission and compares it byte-for-byte with the checked-in Lean
 definitions.
 
 Current Lean builds replay external Aeneas files that warn about `sorry` in
