@@ -152,7 +152,225 @@ def unresolved_section_references(text: str) -> set[int]:
     return unresolved
 
 
+# Structural rules use one preprocessing boundary. Existing publication-PARITY
+# top-level reference semantics above remain intentionally unchanged.
+from collections import Counter
+import html
+import unicodedata
+
+DEEP_NUMBER = r"\d+(?:\.\d+)*"
+DEEP_LIST = rf"{DEEP_NUMBER}(?:(?:\s*,\s*(?:(?:and|or)\s+)?|\s+(?:and|or|through|to)\s+|\s*[/–-]\s*){DEEP_NUMBER})*"
+COMPANIONS = {"Core": "rem-object-core-1-specification.md", "REM-OBJECT": "rem-object-core-1-specification.md",
+              "[REMOBJECT]": "rem-object-core-1-specification.md", "REM-ENCRYPT": "rem-encrypt-1-specification.md",
+              "[REMENCRYPT]": "rem-encrypt-1-specification.md", "REM-PARITY": "rem-parity-1-specification.md",
+              "[REMPARITY]": "rem-parity-1-specification.md"}
+ATTRIBUTOR = r"(?:\[[^\]\r\n]+\]|RFC\s+\d+|Core|REM-OBJECT|REM-ENCRYPT|REM-PARITY)"
+
+
+def document_views(text: str) -> tuple[str, str]:
+    """Return active prose (fences kept) and full text (fences blanked)."""
+    lines = text.splitlines(keepends=True)
+    full = []
+    fence = None
+    for line in lines:
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence is None and marker:
+            fence = marker.group(1)
+            full.append("\n" if line.endswith("\n") else "")
+        elif fence is not None:
+            if re.match(r"^ {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*$", line):
+                fence = None
+            full.append("\n" if line.endswith("\n") else "")
+        else:
+            full.append(line)
+    active_lines = list(lines)
+    historical = False
+    for i, line in enumerate(full):
+        if re.match(r"^## ", line):
+            historical = bool(re.match(r"^## (?:Appendix [A-Z]\. )?Revision History", line))
+        if historical:
+            active_lines[i] = "\n" if lines[i].endswith("\n") else ""
+    active = "".join(active_lines)
+    active = re.sub(rf"\bomits?\s+(?:Sections?\s+|§§?\s*){DEEP_LIST}",
+                    lambda m: "\n" * m.group().count("\n"), active, flags=re.I)
+    return active, "".join(full)
+
+
+def discovered_documents(root: pathlib.Path = ROOT) -> dict[str, str]:
+    """Discover every recognized specification copy, excluding support files."""
+    return {str(path.relative_to(root / "specs")): path.read_text()
+            for folder in ("publication", "in-progress")
+            for path in sorted((root / "specs" / folder).glob("*.md"))
+            if path.name in SPECS or path.name == COMPANION}
+
+
+def headings(text: str) -> list[str]:
+    return re.findall(r"^ {0,3}#{1,6}\s+(.+?)(?:\s+#+)?\s*$", document_views(text)[1], re.M)
+
+
+def section_numbers(text: str) -> set[str]:
+    return {m.group(1) for heading in headings(text)
+            if (m := re.match(r"(\d+(?:\.\d+)*)(?:\.|\s|$)", heading))}
+
+
+def expand_references(value: str) -> list[str]:
+    numbers = re.findall(DEEP_NUMBER, value)
+    for first, last in re.findall(rf"({DEEP_NUMBER})\s*(?:through|to|[-–])\s*({DEEP_NUMBER})", value):
+        left, right = first.split("."), last.split(".")
+        if left[:-1] != right[:-1]:
+            # A cross-level range has no unambiguous set of section numbers.
+            numbers.append("invalid-range:" + first + "–" + last)
+            continue
+        low, high = sorted((int(left[-1]), int(right[-1])))
+        if high - low > 10000:
+            numbers.append("invalid-range:" + first + "–" + last)
+            continue
+        numbers.extend(".".join([*left[:-1], str(n)]) for n in range(low + 1, high))
+    return numbers
+
+
+def section_references(text: str) -> list[tuple[str, str, str]]:
+    """Lex references with attribution, preserving occurrence multiplicity."""
+    active, _ = document_views(text)
+    occurrences = []
+    for match in re.finditer(rf"(?:\bSections?\s+|§§?\s*)({DEEP_LIST})", active):
+        prefix = re.search(rf"(?<!\w)({ATTRIBUTOR})[\W_]*$", active[:match.start()])
+        suffix = re.match(rf"\s+of\s+({ATTRIBUTOR})", active[match.end():])
+        tag = suffix.group(1) if suffix else prefix.group(1) if prefix else None
+        attribution = COMPANIONS.get(tag, "external" if tag else "local")
+        # Context is the complete containing paragraph, insensitive to wrapping.
+        start = active.rfind("\n\n", 0, match.start())
+        start = start + 2 if start >= 0 else 0
+        end = active.find("\n\n", match.end())
+        context = re.sub(r"\s+", " ", active[max(0, start):end if end >= 0 else len(active)]).strip()
+        for number in expand_references(match.group(1)):
+            occurrences.append((attribution, number, context))
+    return occurrences
+
+
+def deep_unresolved(name: str, documents: dict[str, str]) -> Counter:
+    """Resolve local and companion references at their full numbered depth."""
+    failures = Counter()
+    for attribution, number, context in section_references(documents[name]):
+        if attribution == "external":
+            continue
+        target = name if attribution == "local" else next((p for p in ("in-progress/" + attribution, "publication/" + attribution) if p in documents), None)
+        if target is None or number not in section_numbers(documents[target]):
+            failures[(name, attribution, number, context)] += 1
+    return failures
+
+
+def heading_slugs(text: str) -> list[str]:
+    """Port GitHub heading slug behavior, including duplicate-name collisions."""
+    seen = set()
+    output = []
+    for heading in headings(text):
+        plain = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+        plain = html.unescape(re.sub(r"<[^>]+>", "", plain))
+        plain = re.sub(r"\\([\\`*{}\[\]()#+.!_-])", r"\1", plain)
+        plain = plain.replace("`", "").replace("*", "")
+        base = "".join(c for c in plain.lower() if c in " -" or unicodedata.category(c).startswith(("L", "M")) or unicodedata.category(c) in {"Nd", "Nl", "Pc"}).replace(" ", "-")
+        slug, count = base, 0
+        while slug in seen:
+            count += 1
+            slug = f"{base}-{count}"
+        seen.add(slug)
+        output.append(slug)
+    return output
+
+
+def anchor_occurrences(name: str, text: str) -> Counter:
+    _, full = document_views(text)
+    return Counter((name, match.group(1), re.sub(r"\s+", " ", match.group(0)))
+                   for match in re.finditer(r"\[[^\]\n]*\]\(#([^\s)]+)\)", full))
+
+
+def unresolved_anchors(name: str, text: str) -> Counter:
+    slugs = set(heading_slugs(text))
+    return Counter({key: count for key, count in anchor_occurrences(name, text).items() if key[1] not in slugs})
+
+
+def reconcile_known(actual: Counter, known: Counter) -> list[str]:
+    """Both a new defect and an obsolete exception are failures, occurrence by occurrence."""
+    return ([f"unlisted {key!r} ({count} occurrence(s))" for key, count in (actual - known).items()]
+            + [f"stale known entry {key!r} ({count} occurrence(s))" for key, count in (known - actual).items()])
+
+
+def heading_spacing(text: str) -> list[int]:
+    _, full = document_views(text)
+    original = text.splitlines()
+    return [i + 1 for i, line in enumerate(full.splitlines())
+            if i and re.match(r"^ {0,3}#{1,6}\s", line) and original[i-1].strip()]
+
+
+def unresolved_appendices(text: str) -> set[str]:
+    active, _ = document_views(text)
+    have = set()
+    for heading in headings(text):
+        match = re.match(r"(?:Appendix )?([A-Z](?:\.\d+)*)(?:\.|\s|$)", heading)
+        if match:
+            have.add(match.group(1))
+    return set(re.findall(r"\bAppendix ([A-Z](?:\.\d+)*)", active)) - have
+
+
+def readme_state_findings(root: pathlib.Path, documents: dict[str, str]) -> list[str]:
+    """Validate the preparing-copy table as a bijection, then compare versions."""
+    path = root / "specs/in-progress/README.md"
+    if not path.is_file():
+        return ["in-progress README missing"]
+    text = path.read_text()
+    section = re.search(r"^## Current state\s*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+    if not section:
+        return ["in-progress README Current state table missing"]
+    rows = [line.strip().strip("|").split("|") for line in section.group(1).splitlines() if line.startswith("|")]
+    if not rows or [c.strip() for c in rows[0]][:3] != ["Document", "Preparing", "Published"]:
+        return ["in-progress README Current state columns missing"]
+    mapping = {"REM-PARITY": "rem-parity-1-specification.md", "REM-OBJECT": "rem-object-core-1-specification.md", "REM-ENCRYPT": "rem-encrypt-1-specification.md", "formats-explained": COMPANION}
+    expected = {name.removeprefix("in-progress/") for name in documents if name.startswith("in-progress/")}
+    seen, errors = Counter(), []
+    for row in rows[2:]:
+        row = [c.strip() for c in row]
+        name = mapping.get(row[0])
+        if name is None or len(row) < 3:
+            errors.append("unknown or malformed preparing row: " + row[0])
+            continue
+        seen[name] += 1
+        for prefix, cell in (("in-progress/", row[1]), ("publication/", row[2])):
+            content = documents.get(prefix + name)
+            match = re.search(r"^\| Version \| (\S+) \|", content or "", re.M)
+            actual = cell.split()[0] if prefix == "in-progress/" and cell.split() else cell
+            if not match or actual != match.group(1):
+                errors.append(f"README {prefix}{name}: missing file/version or mismatched cell {cell!r}")
+    if seen != Counter(expected):
+        errors.append(f"README is not a bijection: expected {sorted(expected)}, observed {dict(seen)}")
+    return errors
+
+
+KNOWN_REFERENCES = Counter({('in-progress/rem-parity-1-specification.md', 'local', '10.5', 'Excluded by construction: `copy_kind`, the reserved fields, `copy_generation`, the hash field itself, and all CRC fields. Both copies of one sidecar therefore carry the same hash, and the epoch directory (Section 10.5) can verify a surviving header copy independently of *which* copy survived. Readers MUST verify the hash on every index parse.'): 1})
+KNOWN_ANCHORS = Counter({('in-progress/rem-parity-1-specification.md', 'appendix-c-open-items-closed-before-publication-informative', '[Open Items Closed Before Publication (Informative)](#appendix-c-open-items-closed-before-publication-informative)'): 1})
+
+
+def structural_findings(root: pathlib.Path = ROOT) -> list[str]:
+    documents = discovered_documents(root)
+    refs, anchors, errors = Counter(), Counter(), []
+    for name, text in documents.items():
+        if name != "publication/rem-parity-1-specification.md":
+            refs.update(deep_unresolved(name, documents))
+        anchors.update(unresolved_anchors(name, text))
+        errors.extend(f"{name}:{line}: heading needs preceding blank line" for line in heading_spacing(text))
+        errors.extend(f"{name}: unresolved Appendix {ref}" for ref in sorted(unresolved_appendices(text)))
+    errors.extend(reconcile_known(refs, KNOWN_REFERENCES))
+    errors.extend(reconcile_known(anchors, KNOWN_ANCHORS))
+    errors.extend(readme_state_findings(root, documents))
+    for key, count in (refs & KNOWN_REFERENCES).items():
+        print(f"known L1: {key!r} ({count})")
+    for key, count in (anchors & KNOWN_ANCHORS).items():
+        print(f"known L2: {key!r} ({count})")
+    return errors
+
+
 def main() -> int:
+    findings.clear()
     texts = {name: (PUB / name).read_text() for name in SPECS}
 
     # 1. Version rows.
@@ -229,14 +447,10 @@ def main() -> int:
             if dates != sorted(dates, reverse=True):
                 fail(f"{n}: revision history not newest-first: {dates}")
 
-    # 6. Appendix references resolve.
-    for n, t in corpus.items():
-        have = set(re.findall(r"^## Appendix ([A-Z])\.", t, re.M))
-        for ref in set(re.findall(r"Appendix ([A-Z])(?:[ .,;)]|$)", t)):
-            if ref not in have:
-                fail(f"{n}: reference to Appendix {ref} but no such appendix")
-        for ref in sorted(unresolved_section_references(t)):
-            fail(f"{n}: reference to Section {ref} but no such top-level section")
+    # Publication PARITY alone retains the original top-level reference check.
+    for ref in sorted(unresolved_section_references(texts["rem-parity-1-specification.md"])):
+        fail(f"rem-parity-1-specification.md: unresolved top-level Section {ref}")
+    findings.extend(structural_findings(ROOT))
 
     # 7. A version string is never reused for different bytes.
     #
@@ -326,14 +540,6 @@ def main() -> int:
                 elif cores.get(ref_name) and wcore != cores[ref_name]:
                     fail(f"in-progress/{name}: change-policy core diverges from the "
                          f"published {ref_name}")
-            have = set(re.findall(r"^## Appendix ([A-Z])\.", wtext, re.M))
-            for ref in set(re.findall(r"Appendix ([A-Z])(?:[ .,;)]|$)", wtext)):
-                if ref not in have:
-                    fail(f"in-progress/{name}: reference to Appendix {ref} but no "
-                         "such appendix")
-            for ref in sorted(unresolved_section_references(wtext)):
-                fail(f"in-progress/{name}: reference to Section {ref} but no such "
-                     "top-level section")
             for m in re.finditer(r"^## (?:Appendix [A-Z]\. )?Revision History.*?(?=^## |\Z)",
                                  wtext, re.M | re.S):
                 dates = re.findall(r"^- \*\*(\d{4}-\d{2}-\d{2})", m.group(0), re.M)

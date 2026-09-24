@@ -1,0 +1,444 @@
+# GitHub-rendered heading anchors (external slug oracle for linter rule L2).
+# Fetched 2026-09-24 from github.com/archivetechie/remanence/blob/main/<file> at remanence commit e6bbbbd3; one row per ATX heading outside fences, in document order.
+# columns: file<TAB>heading text<TAB>anchor
+specs/in-progress/rem-parity-1-specification.md	Rem Tape Parity (REM-PARITY) Format	rem-tape-parity-rem-parity-format
+specs/in-progress/rem-parity-1-specification.md	Version 1.0 — Specification	version-10--specification
+specs/in-progress/rem-parity-1-specification.md	Status of This Document	status-of-this-document
+specs/in-progress/rem-parity-1-specification.md	Abstract	abstract
+specs/in-progress/rem-parity-1-specification.md	Table of Contents	table-of-contents
+specs/in-progress/rem-parity-1-specification.md	1. Introduction	1-introduction
+specs/in-progress/rem-parity-1-specification.md	1.1. Purpose and Design Goals	11-purpose-and-design-goals
+specs/in-progress/rem-parity-1-specification.md	1.2. One Tape, Many Objects	12-one-tape-many-objects
+specs/in-progress/rem-parity-1-specification.md	1.3. Relationship to Adjacent Components	13-relationship-to-adjacent-components
+specs/in-progress/rem-parity-1-specification.md	1.4. Non-Goals	14-non-goals
+specs/in-progress/rem-parity-1-specification.md	2. Conventions and Terminology	2-conventions-and-terminology
+specs/in-progress/rem-parity-1-specification.md	2.1. Requirements Language	21-requirements-language
+specs/in-progress/rem-parity-1-specification.md	2.2. Conformance Roles	22-conformance-roles
+specs/in-progress/rem-parity-1-specification.md	2.3. Definitions	23-definitions
+specs/in-progress/rem-parity-1-specification.md	2.4. Integer, Byte, and Text Conventions	24-integer-byte-and-text-conventions
+specs/in-progress/rem-parity-1-specification.md	2.5. Constants	25-constants
+specs/in-progress/rem-parity-1-specification.md	3. Tape Model and Address Spaces	3-tape-model-and-address-spaces
+specs/in-progress/rem-parity-1-specification.md	3.1. Tape Files	31-tape-files
+specs/in-progress/rem-parity-1-specification.md	3.2. Address Spaces	32-address-spaces
+specs/in-progress/rem-parity-1-specification.md	3.3. Ordinal-to-Stripe Mapping	33-ordinal-to-stripe-mapping
+specs/in-progress/rem-parity-1-specification.md	3.4. The Durable Boundary	34-the-durable-boundary
+specs/in-progress/rem-parity-1-specification.md	3.5. Requirements on the Tape I/O Layer	35-requirements-on-the-tape-io-layer
+specs/in-progress/rem-parity-1-specification.md	4. The Object Contract	4-the-object-contract
+specs/in-progress/rem-parity-1-specification.md	4.1. Objects Are Opaque Block Strings	41-objects-are-opaque-block-strings
+specs/in-progress/rem-parity-1-specification.md	4.2. What the Format Provides to Objects	42-what-the-format-provides-to-objects
+specs/in-progress/rem-parity-1-specification.md	4.3. What the Format Requires of Payload Formats	43-what-the-format-requires-of-payload-formats
+specs/in-progress/rem-parity-1-specification.md	4.4. Payload Format Bindings (Informative)	44-payload-format-bindings-informative
+specs/in-progress/rem-parity-1-specification.md	5. Common Primitives	5-common-primitives
+specs/in-progress/rem-parity-1-specification.md	5.1. CRC-64/XZ	51-crc-64xz
+specs/in-progress/rem-parity-1-specification.md	5.2. HMAC-Derived Magics	52-hmac-derived-magics
+specs/in-progress/rem-parity-1-specification.md	5.3. Deterministic CBOR	53-deterministic-cbor
+specs/in-progress/rem-parity-1-specification.md	6. The Erasure Scheme rs-cauchy-gf256-v1	6-the-erasure-scheme-rs-cauchy-gf256-v1
+specs/in-progress/rem-parity-1-specification.md	6.1. The Field GF(2⁸)	61-the-field-gf2
+specs/in-progress/rem-parity-1-specification.md	6.2. The Cauchy Generator	62-the-cauchy-generator
+specs/in-progress/rem-parity-1-specification.md	6.3. Encoding	63-encoding
+specs/in-progress/rem-parity-1-specification.md	6.4. Implicit Zeros	64-implicit-zeros
+specs/in-progress/rem-parity-1-specification.md	6.5. Reconstruction	65-reconstruction
+specs/in-progress/rem-parity-1-specification.md	6.6. Scheme Parameters and Profiles	66-scheme-parameters-and-profiles
+specs/in-progress/rem-parity-1-specification.md	6.7. Per-Shard CRCs	67-per-shard-crcs
+specs/in-progress/rem-parity-1-specification.md	6.8. Normative Vectors	68-normative-vectors
+specs/in-progress/rem-parity-1-specification.md	7. The Filemark Map and the Canonical Digest	7-the-filemark-map-and-the-canonical-digest
+specs/in-progress/rem-parity-1-specification.md	7.1. Entries	71-entries
+specs/in-progress/rem-parity-1-specification.md	7.2. Validity	72-validity
+specs/in-progress/rem-parity-1-specification.md	7.3. The Canonical Digest	73-the-canonical-digest
+specs/in-progress/rem-parity-1-specification.md	7.4. The Digest Record and Scope	74-the-digest-record-and-scope
+specs/in-progress/rem-parity-1-specification.md	8. BOT Bootstrap and Terminal Index	8-bot-bootstrap-and-terminal-index
+specs/in-progress/rem-parity-1-specification.md	8.1. Fixed Frame (one block, exactly)	81-fixed-frame-one-block-exactly
+specs/in-progress/rem-parity-1-specification.md	8.1.1. Schema Minor Registry	811-schema-minor-registry
+specs/in-progress/rem-parity-1-specification.md	8.2. CBOR Payload	82-cbor-payload
+specs/in-progress/rem-parity-1-specification.md	8.2.1. Terminal REM-OBJECT Recovery Rows	821-terminal-rem-object-recovery-rows
+specs/in-progress/rem-parity-1-specification.md	8.3. Placement (Writer)	83-placement-writer
+specs/in-progress/rem-parity-1-specification.md	8.4. Discovery (Reader)	84-discovery-reader
+specs/in-progress/rem-parity-1-specification.md	8.4.1. All-Replicas-Invalid BOT Walk	841-all-replicas-invalid-bot-walk
+specs/in-progress/rem-parity-1-specification.md	8.5. Authoritative Selection	85-authoritative-selection
+specs/in-progress/rem-parity-1-specification.md	9. The Parity Sidecar Tape File	9-the-parity-sidecar-tape-file
+specs/in-progress/rem-parity-1-specification.md	9.1. Structure	91-structure
+specs/in-progress/rem-parity-1-specification.md	9.2. The Header Block (block 0 of each copy) — all little-endian	92-the-header-block-block-0-of-each-copy--all-little-endian
+specs/in-progress/rem-parity-1-specification.md	9.3. The Index Entry Stream	93-the-index-entry-stream
+specs/in-progress/rem-parity-1-specification.md	9.4. Index Layout Computation	94-index-layout-computation
+specs/in-progress/rem-parity-1-specification.md	9.5. The Canonical Metadata Hash	95-the-canonical-metadata-hash
+specs/in-progress/rem-parity-1-specification.md	9.6. The Footer Block (last block) — all little-endian	96-the-footer-block-last-block--all-little-endian
+specs/in-progress/rem-parity-1-specification.md	10. Final ParityMap and Terminal Inventory	10-final-paritymap-and-terminal-inventory
+specs/in-progress/rem-parity-1-specification.md	10.1. Structural rows	101-structural-rows
+specs/in-progress/rem-parity-1-specification.md	10.2. Object recovery rows	102-object-recovery-rows
+specs/in-progress/rem-parity-1-specification.md	10.3. Framing and digests	103-framing-and-digests
+specs/in-progress/rem-parity-1-specification.md	11. Writer Obligations	11-writer-obligations
+specs/in-progress/rem-parity-1-specification.md	11.1. Commit Discipline (per tape file)	111-commit-discipline-per-tape-file
+specs/in-progress/rem-parity-1-specification.md	11.2. Epochs and Sidecars	112-epochs-and-sidecars
+specs/in-progress/rem-parity-1-specification.md	11.3. Finalization	113-finalization
+specs/in-progress/rem-parity-1-specification.md	11.4. Session Preconditions	114-session-preconditions
+specs/in-progress/rem-parity-1-specification.md	12. Scanner Obligations	12-scanner-obligations
+specs/in-progress/rem-parity-1-specification.md	12.1. Inputs and Authority	121-inputs-and-authority
+specs/in-progress/rem-parity-1-specification.md	12.2. The Walk	122-the-walk
+specs/in-progress/rem-parity-1-specification.md	12.3. The Classification Ladder (in order)	123-the-classification-ladder-in-order
+specs/in-progress/rem-parity-1-specification.md	12.4. Terminal Replica Validation	124-terminal-replica-validation
+specs/in-progress/rem-parity-1-specification.md	12.5. Epoch Isolation	125-epoch-isolation
+specs/in-progress/rem-parity-1-specification.md	12.6. Terminal Completeness	126-terminal-completeness
+specs/in-progress/rem-parity-1-specification.md	13. Recoverer Obligations	13-recoverer-obligations
+specs/in-progress/rem-parity-1-specification.md	13.1. Inputs	131-inputs
+specs/in-progress/rem-parity-1-specification.md	13.2. Fail Before I/O	132-fail-before-io
+specs/in-progress/rem-parity-1-specification.md	13.3. Acquiring the Sidecar Index	133-acquiring-the-sidecar-index
+specs/in-progress/rem-parity-1-specification.md	13.4. Erasure Taxonomy	134-erasure-taxonomy
+specs/in-progress/rem-parity-1-specification.md	13.5. Reconstruction and Release	135-reconstruction-and-release
+specs/in-progress/rem-parity-1-specification.md	13.6. Bulk Recovery (Informative)	136-bulk-recovery-informative
+specs/in-progress/rem-parity-1-specification.md	14. Resumer Obligations	14-resumer-obligations
+specs/in-progress/rem-parity-1-specification.md	15. Errors	15-errors
+specs/in-progress/rem-parity-1-specification.md	16. Security Considerations	16-security-considerations
+specs/in-progress/rem-parity-1-specification.md	16.1. No Authentication	161-no-authentication
+specs/in-progress/rem-parity-1-specification.md	16.2. Hostile-Input Posture	162-hostile-input-posture
+specs/in-progress/rem-parity-1-specification.md	16.3. Compression Interaction	163-compression-interaction
+specs/in-progress/rem-parity-1-specification.md	16.4. Structure Leakage and Confidential Payloads	164-structure-leakage-and-confidential-payloads
+specs/in-progress/rem-parity-1-specification.md	17. Test Vectors	17-test-vectors
+specs/in-progress/rem-parity-1-specification.md	18. Conformance and Freeze Criteria	18-conformance-and-freeze-criteria
+specs/in-progress/rem-parity-1-specification.md	19. IANA Considerations	19-iana-considerations
+specs/in-progress/rem-parity-1-specification.md	20. References	20-references
+specs/in-progress/rem-parity-1-specification.md	20.1. Normative References	201-normative-references
+specs/in-progress/rem-parity-1-specification.md	20.2. Informative References	202-informative-references
+specs/in-progress/rem-parity-1-specification.md	Appendix A. Worked Examples (Informative)	appendix-a-worked-examples-informative
+specs/in-progress/rem-parity-1-specification.md	A.1. The Default Geometry	a1-the-default-geometry
+specs/in-progress/rem-parity-1-specification.md	A.2. Sidecar Index Layout at the Default Geometry	a2-sidecar-index-layout-at-the-default-geometry
+specs/in-progress/rem-parity-1-specification.md	A.3. The Canonical Digest Vector	a3-the-canonical-digest-vector
+specs/in-progress/rem-parity-1-specification.md	A.4. A Minimal Tape, End to End	a4-a-minimal-tape-end-to-end
+specs/in-progress/rem-parity-1-specification.md	Appendix B. Design Rationale (Informative)	appendix-b-design-rationale-informative
+specs/in-progress/rem-parity-1-specification.md	B.1. Parity lives in separate tape files	b1-parity-lives-in-separate-tape-files
+specs/in-progress/rem-parity-1-specification.md	B.2. The interleave (data and parity)	b2-the-interleave-data-and-parity
+specs/in-progress/rem-parity-1-specification.md	B.3. Implicit zeros instead of padding blocks	b3-implicit-zeros-instead-of-padding-blocks
+specs/in-progress/rem-parity-1-specification.md	B.4. Derived magics	b4-derived-magics
+specs/in-progress/rem-parity-1-specification.md	B.5. The bootstrap endianness mix is frozen	b5-the-bootstrap-endianness-mix-is-frozen
+specs/in-progress/rem-parity-1-specification.md	B.6. The canonical digest excludes positions, hashes, and health	b6-the-canonical-digest-excludes-positions-hashes-and-health
+specs/in-progress/rem-parity-1-specification.md	B.7. Three complete replicas are separated physically	b7-three-complete-replicas-are-separated-physically
+specs/in-progress/rem-parity-1-specification.md	B.8. Checkpoint authority stays off tape	b8-checkpoint-authority-stays-off-tape
+specs/in-progress/rem-parity-1-specification.md	B.9. Content-blind classification	b9-content-blind-classification
+specs/in-progress/rem-parity-1-specification.md	B.10. At most one open epoch	b10-at-most-one-open-epoch
+specs/in-progress/rem-parity-1-specification.md	B.11. Sidecar metadata is replicated head and tail, with a locator	b11-sidecar-metadata-is-replicated-head-and-tail-with-a-locator
+specs/in-progress/rem-parity-1-specification.md	B.12. The reference off-tape journals are not a media format	b12-the-reference-off-tape-journals-are-not-a-media-format
+specs/in-progress/rem-parity-1-specification.md	Appendix C. Draft.1 Historical Closure Record (Informative)	appendix-c-draft1-historical-closure-record-informative
+specs/in-progress/rem-parity-1-specification.md	Appendix D. Revision History (Informative)	appendix-d-revision-history-informative
+specs/in-progress/rem-parity-1-specification.md	Appendix E. Open Items (Informative)	appendix-e-open-items-informative
+specs/in-progress/rem-parity-1-specification.md	Author's Address	authors-address
+specs/publication/formats-explained.md	The Remanence Formats, Explained	the-remanence-formats-explained
+specs/publication/formats-explained.md	1. The problem	1-the-problem
+specs/publication/formats-explained.md	2. The landscape, and the gap	2-the-landscape-and-the-gap
+specs/publication/formats-explained.md	3. Who this is for	3-who-this-is-for
+specs/publication/formats-explained.md	4. The bets	4-the-bets
+specs/publication/formats-explained.md	5. A tour of one archive object	5-a-tour-of-one-archive-object
+specs/publication/formats-explained.md	6. Encryption without a hostage situation	6-encryption-without-a-hostage-situation
+specs/publication/formats-explained.md	7. The tape knows itself	7-the-tape-knows-itself
+specs/publication/formats-explained.md	8. What the formats refuse to do	8-what-the-formats-refuse-to-do
+specs/publication/formats-explained.md	9. Why you can trust an implementation — including ours	9-why-you-can-trust-an-implementation--including-ours
+specs/publication/formats-explained.md	10. What Remanence is — and is not	10-what-remanence-is--and-is-not
+specs/publication/formats-explained.md	11. Where to go from here	11-where-to-go-from-here
+specs/publication/formats-explained.md	12. A note on maturity	12-a-note-on-maturity
+specs/publication/formats-explained.md	Open Items (Informative)	open-items-informative
+specs/publication/formats-explained.md	Revision History (Informative)	revision-history-informative
+specs/publication/rem-encrypt-1-specification.md	REM-ENCRYPT 1.0	rem-encrypt-10
+specs/publication/rem-encrypt-1-specification.md	1. Introduction	1-introduction
+specs/publication/rem-encrypt-1-specification.md	1.1. Identifiers and Versioning	11-identifiers-and-versioning
+specs/publication/rem-encrypt-1-specification.md	1.2. Status of This Document	12-status-of-this-document
+specs/publication/rem-encrypt-1-specification.md	1.3. Purpose and Boundary	13-purpose-and-boundary
+specs/publication/rem-encrypt-1-specification.md	1.4. Design Goals	14-design-goals
+specs/publication/rem-encrypt-1-specification.md	1.5. Non-Goals	15-non-goals
+specs/publication/rem-encrypt-1-specification.md	2. Conventions and Terminology	2-conventions-and-terminology
+specs/publication/rem-encrypt-1-specification.md	2.1. Requirements Language	21-requirements-language
+specs/publication/rem-encrypt-1-specification.md	2.2. Conformance Roles	22-conformance-roles
+specs/publication/rem-encrypt-1-specification.md	2.3. Definitions	23-definitions
+specs/publication/rem-encrypt-1-specification.md	2.4. Integer, Byte, and Text Conventions	24-integer-byte-and-text-conventions
+specs/publication/rem-encrypt-1-specification.md	2.5. Constants	25-constants
+specs/publication/rem-encrypt-1-specification.md	3. Relationship to REM-OBJECT Core	3-relationship-to-rem-object-core
+specs/publication/rem-encrypt-1-specification.md	3.1. Wrapped Bytes and Identity	31-wrapped-bytes-and-identity
+specs/publication/rem-encrypt-1-specification.md	3.2. Representation Detection	32-representation-detection
+specs/publication/rem-encrypt-1-specification.md	3.3. Shared Obligations	33-shared-obligations
+specs/publication/rem-encrypt-1-specification.md	5. Encrypted Representation	5-encrypted-representation
+specs/publication/rem-encrypt-1-specification.md	5.1. Frame Sequence and Version Gate	51-frame-sequence-and-version-gate
+specs/publication/rem-encrypt-1-specification.md	5.2. Scalar Header	52-scalar-header
+specs/publication/rem-encrypt-1-specification.md	5.3. The Key Frame and HPKE Wrapping	53-the-key-frame-and-hpke-wrapping
+specs/publication/rem-encrypt-1-specification.md	5.3.1. Frozen X-Wing Construction	531-frozen-x-wing-construction
+specs/publication/rem-encrypt-1-specification.md	5.4. Key Inputs and Identification	54-key-inputs-and-identification
+specs/publication/rem-encrypt-1-specification.md	5.5. Salt and Object-Key Derivation	55-salt-and-object-key-derivation
+specs/publication/rem-encrypt-1-specification.md	5.6. Metadata Frame	56-metadata-frame
+specs/publication/rem-encrypt-1-specification.md	5.7. Payload Frame	57-payload-frame
+specs/publication/rem-encrypt-1-specification.md	5.8. Footer, Fill, and Geometry	58-footer-fill-and-geometry
+specs/publication/rem-encrypt-1-specification.md	5.9. Sealing	59-sealing
+specs/publication/rem-encrypt-1-specification.md	5.10. Opening, Recovery, and Keyless Inspection	510-opening-recovery-and-keyless-inspection
+specs/publication/rem-encrypt-1-specification.md	6. Partial File Restore	6-partial-file-restore
+specs/publication/rem-encrypt-1-specification.md	6.3. Ciphertext Mapping	63-ciphertext-mapping
+specs/publication/rem-encrypt-1-specification.md	6.4. Stored-Block Mapping	64-stored-block-mapping
+specs/publication/rem-encrypt-1-specification.md	7. Envelope Verification Chain	7-envelope-verification-chain
+specs/publication/rem-encrypt-1-specification.md	7.1. The Chain of Trust	71-the-chain-of-trust
+specs/publication/rem-encrypt-1-specification.md	7.2. Write-Path Verification	72-write-path-verification
+specs/publication/rem-encrypt-1-specification.md	7.3. Post-Write Re-Verification	73-post-write-re-verification
+specs/publication/rem-encrypt-1-specification.md	7.4. Encrypted Verifier Profiles	74-encrypted-verifier-profiles
+specs/publication/rem-encrypt-1-specification.md	8. Storage Bindings	8-storage-bindings
+specs/publication/rem-encrypt-1-specification.md	8.1. Backend Records for Encrypted Copies	81-backend-records-for-encrypted-copies
+specs/publication/rem-encrypt-1-specification.md	8.2. Tape Bootstrap and Catalogless Recovery	82-tape-bootstrap-and-catalogless-recovery
+specs/publication/rem-encrypt-1-specification.md	10. Versioning and Registries	10-versioning-and-registries
+specs/publication/rem-encrypt-1-specification.md	10.1. `format_version` Registry	101-format_version-registry
+specs/publication/rem-encrypt-1-specification.md	10.2. `suite_id` Registry	102-suite_id-registry
+specs/publication/rem-encrypt-1-specification.md	10.3. `wrap_suite` Registry	103-wrap_suite-registry
+specs/publication/rem-encrypt-1-specification.md	10.4. Assignment and Deprecation Policy	104-assignment-and-deprecation-policy
+specs/publication/rem-encrypt-1-specification.md	11. Errors	11-errors
+specs/publication/rem-encrypt-1-specification.md	11.2. Envelope Errors	112-envelope-errors
+specs/publication/rem-encrypt-1-specification.md	12. Security Considerations	12-security-considerations
+specs/publication/rem-encrypt-1-specification.md	12.1. Per-Object Key Uniqueness	121-per-object-key-uniqueness
+specs/publication/rem-encrypt-1-specification.md	12.2. Key Separation and Nonce Safety	122-key-separation-and-nonce-safety
+specs/publication/rem-encrypt-1-specification.md	12.3. Binding Without AAD	123-binding-without-aad
+specs/publication/rem-encrypt-1-specification.md	12.4. Fail-Closed	124-fail-closed
+specs/publication/rem-encrypt-1-specification.md	12.5. Confidentiality Boundary, Public Facts, and Catalog Trust	125-confidentiality-boundary-public-facts-and-catalog-trust
+specs/publication/rem-encrypt-1-specification.md	12.7. Non-Committing AEAD	127-non-committing-aead
+specs/publication/rem-encrypt-1-specification.md	12.8. Key Rotation and Epoch Longevity	128-key-rotation-and-epoch-longevity
+specs/publication/rem-encrypt-1-specification.md	12.9. Envelope Hostile-Input Discharge	129-envelope-hostile-input-discharge
+specs/publication/rem-encrypt-1-specification.md	12.11. Threat Model and Secret Handling	1211-threat-model-and-secret-handling
+specs/publication/rem-encrypt-1-specification.md	13. Envelope Test Vectors	13-envelope-test-vectors
+specs/publication/rem-encrypt-1-specification.md	13.1. REM-OBJECT-TV-E2	131-rem-object-tv-e2
+specs/publication/rem-encrypt-1-specification.md	13.2. REM-OBJECT-TV-D1 Encrypted Copy	132-rem-object-tv-d1-encrypted-copy
+specs/publication/rem-encrypt-1-specification.md	13.3. X-Wing and HPKE Component KATs	133-x-wing-and-hpke-component-kats
+specs/publication/rem-encrypt-1-specification.md	13.4. Negative Vectors	134-negative-vectors
+specs/publication/rem-encrypt-1-specification.md	15. Identifier Allocation Considerations	15-identifier-allocation-considerations
+specs/publication/rem-encrypt-1-specification.md	16. References	16-references
+specs/publication/rem-encrypt-1-specification.md	16.1. Normative References	161-normative-references
+specs/publication/rem-encrypt-1-specification.md	16.2. Informative References	162-informative-references
+specs/publication/rem-encrypt-1-specification.md	Appendix A. Worked Envelope Example (Informative)	appendix-a-worked-envelope-example-informative
+specs/publication/rem-encrypt-1-specification.md	Appendix B. Design Rationale (Informative)	appendix-b-design-rationale-informative
+specs/publication/rem-encrypt-1-specification.md	B.1. Encrypted Chunk Size Equals the Core Block	b1-encrypted-chunk-size-equals-the-core-block
+specs/publication/rem-encrypt-1-specification.md	B.2. Full Final Chunks Only	b2-full-final-chunks-only
+specs/publication/rem-encrypt-1-specification.md	B.3. The Manifest Remains Confidential	b3-the-manifest-remains-confidential
+specs/publication/rem-encrypt-1-specification.md	B.4. Stored Fill Is Part of the Envelope	b4-stored-fill-is-part-of-the-envelope
+specs/publication/rem-encrypt-1-specification.md	B.5. Two Metadata Layers Remain Separate	b5-two-metadata-layers-remain-separate
+specs/publication/rem-encrypt-1-specification.md	B.6. Empty AAD	b6-empty-aad
+specs/publication/rem-encrypt-1-specification.md	B.7. Derived Salts	b7-derived-salts
+specs/publication/rem-encrypt-1-specification.md	B.8. Fixed Metadata Is Bound into the Salt	b8-fixed-metadata-is-bound-into-the-salt
+specs/publication/rem-encrypt-1-specification.md	B.9. Encrypted Bootstrap Rows Omit Manifest Anchors	b9-encrypted-bootstrap-rows-omit-manifest-anchors
+specs/publication/rem-encrypt-1-specification.md	Appendix C. Revision History (Informative)	appendix-c-revision-history-informative
+specs/publication/rem-encrypt-1-specification.md	Appendix D. Open Items (Informative)	appendix-d-open-items-informative
+specs/publication/rem-encrypt-1-specification.md	Author's Address	authors-address
+specs/publication/rem-object-core-1-specification.md	REM-OBJECT Core Format 1.0	rem-object-core-format-10
+specs/publication/rem-object-core-1-specification.md	1. Introduction	1-introduction
+specs/publication/rem-object-core-1-specification.md	1.1. Identifiers and Versioning	11-identifiers-and-versioning
+specs/publication/rem-object-core-1-specification.md	1.2. Purpose and Design Goals	12-purpose-and-design-goals
+specs/publication/rem-object-core-1-specification.md	1.3. Two Representations of One Object	13-two-representations-of-one-object
+specs/publication/rem-object-core-1-specification.md	1.4. Relationship to Adjacent Components	14-relationship-to-adjacent-components
+specs/publication/rem-object-core-1-specification.md	1.5. Non-Goals	15-non-goals
+specs/publication/rem-object-core-1-specification.md	2. Conventions and Terminology	2-conventions-and-terminology
+specs/publication/rem-object-core-1-specification.md	2.1. Requirements Language	21-requirements-language
+specs/publication/rem-object-core-1-specification.md	2.2. Conformance Roles	22-conformance-roles
+specs/publication/rem-object-core-1-specification.md	2.3. Definitions	23-definitions
+specs/publication/rem-object-core-1-specification.md	2.4. Integer, Byte, and Text Conventions	24-integer-byte-and-text-conventions
+specs/publication/rem-object-core-1-specification.md	2.5. Constants	25-constants
+specs/publication/rem-object-core-1-specification.md	3. Object Model	3-object-model
+specs/publication/rem-object-core-1-specification.md	3.1. The Canonical Plaintext Object	31-the-canonical-plaintext-object
+specs/publication/rem-object-core-1-specification.md	3.2. Representations	32-representations
+specs/publication/rem-object-core-1-specification.md	3.3. Identities and Digests	33-identities-and-digests
+specs/publication/rem-object-core-1-specification.md	3.4. Representation Detection	34-representation-detection
+specs/publication/rem-object-core-1-specification.md	4. Plaintext Representation	4-plaintext-representation
+specs/publication/rem-object-core-1-specification.md	4.1. Frame Sequence	41-frame-sequence
+specs/publication/rem-object-core-1-specification.md	4.2. Body Blocks and `chunk_size`	42-body-blocks-and-chunk_size
+specs/publication/rem-object-core-1-specification.md	4.3. The ustar Record Subset	43-the-ustar-record-subset
+specs/publication/rem-object-core-1-specification.md	4.3.1. Header Layout	431-header-layout
+specs/publication/rem-object-core-1-specification.md	4.3.2. Reader-Ignored Fields; Names and Sizes	432-reader-ignored-fields-names-and-sizes
+specs/publication/rem-object-core-1-specification.md	4.3.3. Checksum	433-checksum
+specs/publication/rem-object-core-1-specification.md	4.3.4. Typeflags	434-typeflags
+specs/publication/rem-object-core-1-specification.md	4.4. Pax Extended Records	44-pax-extended-records
+specs/publication/rem-object-core-1-specification.md	4.4.1. Record Grammar	441-record-grammar
+specs/publication/rem-object-core-1-specification.md	4.4.2. Emission Order and Duplicates	442-emission-order-and-duplicates
+specs/publication/rem-object-core-1-specification.md	4.4.3. Unknown Keywords	443-unknown-keywords
+specs/publication/rem-object-core-1-specification.md	4.4.4. Standard Keywords Used	444-standard-keywords-used
+specs/publication/rem-object-core-1-specification.md	4.5. The Global Header	45-the-global-header
+specs/publication/rem-object-core-1-specification.md	4.5.1. Keywords	451-keywords
+specs/publication/rem-object-core-1-specification.md	4.5.2. Validation	452-validation
+specs/publication/rem-object-core-1-specification.md	4.6. File Entries and Block Alignment	46-file-entries-and-block-alignment
+specs/publication/rem-object-core-1-specification.md	4.6.1. Entry Frame	461-entry-frame
+specs/publication/rem-object-core-1-specification.md	4.6.2. Per-Entry Keywords	462-per-entry-keywords
+specs/publication/rem-object-core-1-specification.md	4.6.3. The Alignment Rule	463-the-alignment-rule
+specs/publication/rem-object-core-1-specification.md	4.6.4. Chunk Geometry	464-chunk-geometry
+specs/publication/rem-object-core-1-specification.md	4.6.5. Payload Hashing	465-payload-hashing
+specs/publication/rem-object-core-1-specification.md	4.6.6. Path and Identity Rules	466-path-and-identity-rules
+specs/publication/rem-object-core-1-specification.md	4.6.7. Entry Order	467-entry-order
+specs/publication/rem-object-core-1-specification.md	4.7. The Manifest	47-the-manifest
+specs/publication/rem-object-core-1-specification.md	4.7.1. Deterministic CBOR	471-deterministic-cbor
+specs/publication/rem-object-core-1-specification.md	4.7.2. Schema	472-schema
+specs/publication/rem-object-core-1-specification.md	4.7.3. Extended-Attribute Preservation	473-extended-attribute-preservation
+specs/publication/rem-object-core-1-specification.md	4.7.4. Within-Stream Chain of Trust	474-within-stream-chain-of-trust
+specs/publication/rem-object-core-1-specification.md	4.7.5. Extension Containers	475-extension-containers
+specs/publication/rem-object-core-1-specification.md	4.7.6. Object Metadata Inventory	476-object-metadata-inventory
+specs/publication/rem-object-core-1-specification.md	4.8. End of Archive	48-end-of-archive
+specs/publication/rem-object-core-1-specification.md	4.9. Writer, Planner, and Reader Obligations	49-writer-planner-and-reader-obligations
+specs/publication/rem-object-core-1-specification.md	4.10. Standard-Tool Extraction (Long-Term Fallback)	410-standard-tool-extraction-long-term-fallback
+specs/publication/rem-object-core-1-specification.md	6. Partial File Restore	6-partial-file-restore
+specs/publication/rem-object-core-1-specification.md	6.1. Range Validation	61-range-validation
+specs/publication/rem-object-core-1-specification.md	6.2. Inner Mapping (Both Representations)	62-inner-mapping-both-representations
+specs/publication/rem-object-core-1-specification.md	6.4. Stored-Block Mapping (Tape and Block-Addressed Backends)	64-stored-block-mapping-tape-and-block-addressed-backends
+specs/publication/rem-object-core-1-specification.md	7. Digests, Integrity, and the Verification Chain	7-digests-integrity-and-the-verification-chain
+specs/publication/rem-object-core-1-specification.md	7.1. The Chain of Trust	71-the-chain-of-trust
+specs/publication/rem-object-core-1-specification.md	7.2. Write-Path Verification (No Extra Reads)	72-write-path-verification-no-extra-reads
+specs/publication/rem-object-core-1-specification.md	7.3. Post-Write Re-Verification (Deployment Obligation)	73-post-write-re-verification-deployment-obligation
+specs/publication/rem-object-core-1-specification.md	7.4. Verifier Profile	74-verifier-profile
+specs/publication/rem-object-core-1-specification.md	7.5. Scrub	75-scrub
+specs/publication/rem-object-core-1-specification.md	8. Storage Bindings and Backend Independence	8-storage-bindings-and-backend-independence
+specs/publication/rem-object-core-1-specification.md	8.1. The Byte-Format Contract	81-the-byte-format-contract
+specs/publication/rem-object-core-1-specification.md	8.2. Tape Binding	82-tape-binding
+specs/publication/rem-object-core-1-specification.md	8.3. File Binding	83-file-binding
+specs/publication/rem-object-core-1-specification.md	8.4. Object-Store Binding	84-object-store-binding
+specs/publication/rem-object-core-1-specification.md	9. Relationship to the Parity Layer	9-relationship-to-the-parity-layer
+specs/publication/rem-object-core-1-specification.md	10. Versioning and Extensibility	10-versioning-and-extensibility
+specs/publication/rem-object-core-1-specification.md	11. Errors	11-errors
+specs/publication/rem-object-core-1-specification.md	11.1. Plaintext-Stream Errors	111-plaintext-stream-errors
+specs/publication/rem-object-core-1-specification.md	12. Security Considerations	12-security-considerations
+specs/publication/rem-object-core-1-specification.md	12.6. Plaintext Copies Are Not Self-Authenticating	126-plaintext-copies-are-not-self-authenticating
+specs/publication/rem-object-core-1-specification.md	12.9. Hostile-Input Posture	129-hostile-input-posture
+specs/publication/rem-object-core-1-specification.md	12.10. Path Traversal	1210-path-traversal
+specs/publication/rem-object-core-1-specification.md	12.12. Disclosure in Published Plaintext Objects	1212-disclosure-in-published-plaintext-objects
+specs/publication/rem-object-core-1-specification.md	13. Test Vectors	13-test-vectors
+specs/publication/rem-object-core-1-specification.md	13.1. Plaintext-Stream Positive Vectors	131-plaintext-stream-positive-vectors
+specs/publication/rem-object-core-1-specification.md	13.2. REM-OBJECT-TV-P1 — Plaintext Object	132-rem-object-tv-p1--plaintext-object
+specs/publication/rem-object-core-1-specification.md	13.3. Encrypted-Object Vectors	133-encrypted-object-vectors
+specs/publication/rem-object-core-1-specification.md	13.4. REM-OBJECT-TV-D1 — Default Chunk Size	134-rem-object-tv-d1--default-chunk-size
+specs/publication/rem-object-core-1-specification.md	13.5. Xattr Vectors	135-xattr-vectors
+specs/publication/rem-object-core-1-specification.md	13.6. Negative Vectors	136-negative-vectors
+specs/publication/rem-object-core-1-specification.md	14. Conformance	14-conformance
+specs/publication/rem-object-core-1-specification.md	15. IANA Considerations	15-iana-considerations
+specs/publication/rem-object-core-1-specification.md	16. References	16-references
+specs/publication/rem-object-core-1-specification.md	16.1. Normative References	161-normative-references
+specs/publication/rem-object-core-1-specification.md	16.2. Informative References	162-informative-references
+specs/publication/rem-object-core-1-specification.md	Appendix A. Worked Example (Informative)	appendix-a-worked-example-informative
+specs/publication/rem-object-core-1-specification.md	Appendix B. Design Rationale (Informative)	appendix-b-design-rationale-informative
+specs/publication/rem-object-core-1-specification.md	B.1. Encryption Is an Envelope, Never an In-Stream Flag	b1-encryption-is-an-envelope-never-an-in-stream-flag
+specs/publication/rem-object-core-1-specification.md	B.2. Two Identities: Logical and Physical	b2-two-identities-logical-and-physical
+specs/publication/rem-object-core-1-specification.md	B.3. `stored_digest` Is External	b3-stored_digest-is-external
+specs/publication/rem-object-core-1-specification.md	B.4. No Unencrypted Envelope	b4-no-unencrypted-envelope
+specs/publication/rem-object-core-1-specification.md	Appendix C. Revision History (Informative)	appendix-c-revision-history-informative
+specs/publication/rem-object-core-1-specification.md	Appendix D. Open Items (Informative)	appendix-d-open-items-informative
+specs/publication/rem-object-core-1-specification.md	Appendix E. Packing Many Small Files (Informative)	appendix-e-packing-many-small-files-informative
+specs/publication/rem-object-core-1-specification.md	E.1. What Alignment Costs	e1-what-alignment-costs
+specs/publication/rem-object-core-1-specification.md	E.2. When It Matters	e2-when-it-matters
+specs/publication/rem-object-core-1-specification.md	E.3. The Wrapper Convention	e3-the-wrapper-convention
+specs/publication/rem-object-core-1-specification.md	E.4. Recovering One Inner File	e4-recovering-one-inner-file
+specs/publication/rem-object-core-1-specification.md	E.5. What the Convention Gives Up	e5-what-the-convention-gives-up
+specs/publication/rem-object-core-1-specification.md	E.6. Whose Decision It Is	e6-whose-decision-it-is
+specs/publication/rem-object-core-1-specification.md	Author's Address	authors-address
+specs/publication/rem-parity-1-specification.md	Rem Tape Parity (REM-PARITY) Format	rem-tape-parity-rem-parity-format
+specs/publication/rem-parity-1-specification.md	Version 1.0 — Specification	version-10--specification
+specs/publication/rem-parity-1-specification.md	Status of This Document	status-of-this-document
+specs/publication/rem-parity-1-specification.md	Abstract	abstract
+specs/publication/rem-parity-1-specification.md	Table of Contents	table-of-contents
+specs/publication/rem-parity-1-specification.md	1. Introduction	1-introduction
+specs/publication/rem-parity-1-specification.md	1.1. Purpose and Design Goals	11-purpose-and-design-goals
+specs/publication/rem-parity-1-specification.md	1.2. One Tape, Many Objects	12-one-tape-many-objects
+specs/publication/rem-parity-1-specification.md	1.3. Relationship to Adjacent Components	13-relationship-to-adjacent-components
+specs/publication/rem-parity-1-specification.md	1.4. Non-Goals	14-non-goals
+specs/publication/rem-parity-1-specification.md	2. Conventions and Terminology	2-conventions-and-terminology
+specs/publication/rem-parity-1-specification.md	2.1. Requirements Language	21-requirements-language
+specs/publication/rem-parity-1-specification.md	2.2. Conformance Roles	22-conformance-roles
+specs/publication/rem-parity-1-specification.md	2.3. Definitions	23-definitions
+specs/publication/rem-parity-1-specification.md	2.4. Integer, Byte, and Text Conventions	24-integer-byte-and-text-conventions
+specs/publication/rem-parity-1-specification.md	2.5. Constants	25-constants
+specs/publication/rem-parity-1-specification.md	3. Tape Model and Address Spaces	3-tape-model-and-address-spaces
+specs/publication/rem-parity-1-specification.md	3.1. Tape Files	31-tape-files
+specs/publication/rem-parity-1-specification.md	3.2. Address Spaces	32-address-spaces
+specs/publication/rem-parity-1-specification.md	3.3. Ordinal-to-Stripe Mapping	33-ordinal-to-stripe-mapping
+specs/publication/rem-parity-1-specification.md	3.4. The Durable Boundary	34-the-durable-boundary
+specs/publication/rem-parity-1-specification.md	3.5. Requirements on the Tape I/O Layer	35-requirements-on-the-tape-io-layer
+specs/publication/rem-parity-1-specification.md	4. The Object Contract	4-the-object-contract
+specs/publication/rem-parity-1-specification.md	4.1. Objects Are Opaque Block Strings	41-objects-are-opaque-block-strings
+specs/publication/rem-parity-1-specification.md	4.2. What the Format Provides to Objects	42-what-the-format-provides-to-objects
+specs/publication/rem-parity-1-specification.md	4.3. What the Format Requires of Payload Formats	43-what-the-format-requires-of-payload-formats
+specs/publication/rem-parity-1-specification.md	4.4. Payload Format Bindings (Informative)	44-payload-format-bindings-informative
+specs/publication/rem-parity-1-specification.md	5. Common Primitives	5-common-primitives
+specs/publication/rem-parity-1-specification.md	5.1. CRC-64/XZ	51-crc-64xz
+specs/publication/rem-parity-1-specification.md	5.2. HMAC-Derived Magics	52-hmac-derived-magics
+specs/publication/rem-parity-1-specification.md	5.3. Deterministic CBOR	53-deterministic-cbor
+specs/publication/rem-parity-1-specification.md	6. The Erasure Scheme rs-cauchy-gf256-v1	6-the-erasure-scheme-rs-cauchy-gf256-v1
+specs/publication/rem-parity-1-specification.md	6.1. The Field GF(2⁸)	61-the-field-gf2
+specs/publication/rem-parity-1-specification.md	6.2. The Cauchy Generator	62-the-cauchy-generator
+specs/publication/rem-parity-1-specification.md	6.3. Encoding	63-encoding
+specs/publication/rem-parity-1-specification.md	6.4. Implicit Zeros	64-implicit-zeros
+specs/publication/rem-parity-1-specification.md	6.5. Reconstruction	65-reconstruction
+specs/publication/rem-parity-1-specification.md	6.6. Scheme Parameters and Profiles	66-scheme-parameters-and-profiles
+specs/publication/rem-parity-1-specification.md	6.7. Per-Shard CRCs	67-per-shard-crcs
+specs/publication/rem-parity-1-specification.md	6.8. Normative Vectors	68-normative-vectors
+specs/publication/rem-parity-1-specification.md	7. The Filemark Map and the Canonical Digest	7-the-filemark-map-and-the-canonical-digest
+specs/publication/rem-parity-1-specification.md	7.1. Entries	71-entries
+specs/publication/rem-parity-1-specification.md	7.2. Validity	72-validity
+specs/publication/rem-parity-1-specification.md	7.3. The Canonical Digest	73-the-canonical-digest
+specs/publication/rem-parity-1-specification.md	7.4. The Digest Record and Scope	74-the-digest-record-and-scope
+specs/publication/rem-parity-1-specification.md	8. The Bootstrap Block	8-the-bootstrap-block
+specs/publication/rem-parity-1-specification.md	8.1. Fixed Frame (one block, exactly)	81-fixed-frame-one-block-exactly
+specs/publication/rem-parity-1-specification.md	8.1.1. Schema Minor Registry	811-schema-minor-registry
+specs/publication/rem-parity-1-specification.md	8.2. CBOR Payload	82-cbor-payload
+specs/publication/rem-parity-1-specification.md	8.2.1. REM-OBJECT Object Rows	821-rem-object-object-rows
+specs/publication/rem-parity-1-specification.md	8.3. Placement (Writer)	83-placement-writer
+specs/publication/rem-parity-1-specification.md	8.4. Discovery (Reader)	84-discovery-reader
+specs/publication/rem-parity-1-specification.md	8.4.1. The Last-Resort Filemark Walk (Strategy 5)	841-the-last-resort-filemark-walk-strategy-5
+specs/publication/rem-parity-1-specification.md	8.5. Authoritative Selection	85-authoritative-selection
+specs/publication/rem-parity-1-specification.md	9. The Parity Sidecar Tape File	9-the-parity-sidecar-tape-file
+specs/publication/rem-parity-1-specification.md	9.1. Structure	91-structure
+specs/publication/rem-parity-1-specification.md	9.2. The Header Block (block 0 of each copy) — all little-endian	92-the-header-block-block-0-of-each-copy--all-little-endian
+specs/publication/rem-parity-1-specification.md	9.3. The Index Entry Stream	93-the-index-entry-stream
+specs/publication/rem-parity-1-specification.md	9.4. Index Layout Computation	94-index-layout-computation
+specs/publication/rem-parity-1-specification.md	9.5. The Canonical Metadata Hash	95-the-canonical-metadata-hash
+specs/publication/rem-parity-1-specification.md	9.6. The Footer Block (last block) — all little-endian	96-the-footer-block-last-block--all-little-endian
+specs/publication/rem-parity-1-specification.md	10. The parity_map Tape File and the Sidecar Epoch Directory	10-the-parity_map-tape-file-and-the-sidecar-epoch-directory
+specs/publication/rem-parity-1-specification.md	10.1. Purpose	101-purpose
+specs/publication/rem-parity-1-specification.md	10.2. Structure	102-structure
+specs/publication/rem-parity-1-specification.md	10.3. Header and Footer Blocks — all little-endian	103-header-and-footer-blocks--all-little-endian
+specs/publication/rem-parity-1-specification.md	10.4. Payload (CBOR)	104-payload-cbor
+specs/publication/rem-parity-1-specification.md	10.5. The SidecarEpochDirectory (CBOR)	105-the-sidecarepochdirectory-cbor
+specs/publication/rem-parity-1-specification.md	10.6. The ParityMapReference (bootstrap key 21)	106-the-paritymapreference-bootstrap-key-21
+specs/publication/rem-parity-1-specification.md	10.7. Inline versus External (Writer)	107-inline-versus-external-writer
+specs/publication/rem-parity-1-specification.md	11. Writer Obligations	11-writer-obligations
+specs/publication/rem-parity-1-specification.md	11.1. Commit Discipline (per tape file)	111-commit-discipline-per-tape-file
+specs/publication/rem-parity-1-specification.md	11.2. Epochs and Sidecars	112-epochs-and-sidecars
+specs/publication/rem-parity-1-specification.md	11.3. checkpoint() and finish()	113-checkpoint-and-finish
+specs/publication/rem-parity-1-specification.md	11.4. Session Preconditions	114-session-preconditions
+specs/publication/rem-parity-1-specification.md	12. Scanner Obligations	12-scanner-obligations
+specs/publication/rem-parity-1-specification.md	12.1. Inputs and Authority	121-inputs-and-authority
+specs/publication/rem-parity-1-specification.md	12.2. The Walk	122-the-walk
+specs/publication/rem-parity-1-specification.md	12.3. The Classification Ladder (in order)	123-the-classification-ladder-in-order
+specs/publication/rem-parity-1-specification.md	12.4. Overlay and Validation	124-overlay-and-validation
+specs/publication/rem-parity-1-specification.md	12.5. Epoch Isolation	125-epoch-isolation
+specs/publication/rem-parity-1-specification.md	12.6. The Tail Beyond the Attested Prefix	126-the-tail-beyond-the-attested-prefix
+specs/publication/rem-parity-1-specification.md	13. Recoverer Obligations	13-recoverer-obligations
+specs/publication/rem-parity-1-specification.md	13.1. Inputs	131-inputs
+specs/publication/rem-parity-1-specification.md	13.2. Fail Before I/O	132-fail-before-io
+specs/publication/rem-parity-1-specification.md	13.3. Acquiring the Sidecar Index	133-acquiring-the-sidecar-index
+specs/publication/rem-parity-1-specification.md	13.4. Erasure Taxonomy	134-erasure-taxonomy
+specs/publication/rem-parity-1-specification.md	13.5. Reconstruction and Release	135-reconstruction-and-release
+specs/publication/rem-parity-1-specification.md	13.6. Bulk Recovery (Informative)	136-bulk-recovery-informative
+specs/publication/rem-parity-1-specification.md	14. Resumer Obligations	14-resumer-obligations
+specs/publication/rem-parity-1-specification.md	15. Errors	15-errors
+specs/publication/rem-parity-1-specification.md	16. Security Considerations	16-security-considerations
+specs/publication/rem-parity-1-specification.md	16.1. No Authentication	161-no-authentication
+specs/publication/rem-parity-1-specification.md	16.2. Hostile-Input Posture	162-hostile-input-posture
+specs/publication/rem-parity-1-specification.md	16.3. Compression Interaction	163-compression-interaction
+specs/publication/rem-parity-1-specification.md	16.4. Structure Leakage and Confidential Payloads	164-structure-leakage-and-confidential-payloads
+specs/publication/rem-parity-1-specification.md	17. Test Vectors	17-test-vectors
+specs/publication/rem-parity-1-specification.md	18. Conformance and Freeze Criteria	18-conformance-and-freeze-criteria
+specs/publication/rem-parity-1-specification.md	19. IANA Considerations	19-iana-considerations
+specs/publication/rem-parity-1-specification.md	20. References	20-references
+specs/publication/rem-parity-1-specification.md	20.1. Normative References	201-normative-references
+specs/publication/rem-parity-1-specification.md	20.2. Informative References	202-informative-references
+specs/publication/rem-parity-1-specification.md	Appendix A. Worked Examples (Informative)	appendix-a-worked-examples-informative
+specs/publication/rem-parity-1-specification.md	A.1. The Default Geometry	a1-the-default-geometry
+specs/publication/rem-parity-1-specification.md	A.2. Sidecar Index Layout at the Default Geometry	a2-sidecar-index-layout-at-the-default-geometry
+specs/publication/rem-parity-1-specification.md	A.3. The Canonical Digest Vector	a3-the-canonical-digest-vector
+specs/publication/rem-parity-1-specification.md	A.4. A Minimal Tape, End to End	a4-a-minimal-tape-end-to-end
+specs/publication/rem-parity-1-specification.md	Appendix B. Design Rationale (Informative)	appendix-b-design-rationale-informative
+specs/publication/rem-parity-1-specification.md	B.1. Parity lives in separate tape files	b1-parity-lives-in-separate-tape-files
+specs/publication/rem-parity-1-specification.md	B.2. The interleave (data and parity)	b2-the-interleave-data-and-parity
+specs/publication/rem-parity-1-specification.md	B.3. Implicit zeros instead of padding blocks	b3-implicit-zeros-instead-of-padding-blocks
+specs/publication/rem-parity-1-specification.md	B.4. Derived magics	b4-derived-magics
+specs/publication/rem-parity-1-specification.md	B.5. The bootstrap endianness mix is frozen	b5-the-bootstrap-endianness-mix-is-frozen
+specs/publication/rem-parity-1-specification.md	B.6. The canonical digest excludes positions, hashes, and health	b6-the-canonical-digest-excludes-positions-hashes-and-health
+specs/publication/rem-parity-1-specification.md	B.7. parity_map integrity is payload SHA-256 plus a dual copy	b7-parity_map-integrity-is-payload-sha-256-plus-a-dual-copy
+specs/publication/rem-parity-1-specification.md	B.8. No per-file commit marker	b8-no-per-file-commit-marker
+specs/publication/rem-parity-1-specification.md	B.9. Content-blind classification	b9-content-blind-classification
+specs/publication/rem-parity-1-specification.md	B.10. At most one open epoch	b10-at-most-one-open-epoch
+specs/publication/rem-parity-1-specification.md	B.11. Sidecar metadata is replicated head and tail, with a locator	b11-sidecar-metadata-is-replicated-head-and-tail-with-a-locator
+specs/publication/rem-parity-1-specification.md	B.12. The reference off-tape journal is not a media format	b12-the-reference-off-tape-journal-is-not-a-media-format
+specs/publication/rem-parity-1-specification.md	Appendix C. Open Items Closed Before Publication (Informative)	appendix-c-open-items-closed-before-publication-informative
+specs/publication/rem-parity-1-specification.md	Appendix D. Revision History (Informative)	appendix-d-revision-history-informative
+specs/publication/rem-parity-1-specification.md	Appendix E. Open Items (Informative)	appendix-e-open-items-informative
+specs/publication/rem-parity-1-specification.md	Author's Address	authors-address
