@@ -79,7 +79,7 @@ def blocks(text: str) -> list[dict]:
             add("table-row", index, index)
         if re.search(r"`[^`]+`", line):
             add("identifier-line", index, index)
-        if re.search(r"\b(?:MUST|SHALL|SHOULD|MAY|REQUIRED|RECOMMENDED)\b", line):
+        if re.search(r"\b(?:MUST NOT|SHALL NOT|SHOULD NOT|NOT RECOMMENDED|MUST|SHALL|SHOULD|MAY|REQUIRED|RECOMMENDED|OPTIONAL)\b", line):
             add("normative-line", index, index)
         if re.search(r"(?:=|≤|≥|\\frac|ceil\(|floor\()", line) and not line.lstrip().startswith("|"):
             add("formula-line", index, index)
@@ -173,13 +173,13 @@ def check(baseline: str, candidate: str, dispositions: dict | None = None,
                     allowed = {"normative-keywords", "identifiers", "rfc-references", "fence-structure"}
                     if not isinstance(exceptions, list) or any(not isinstance(value, str) or value not in allowed for value in exceptions):
                         raise ValueError("invalid changed-item preservation exceptions")
-                    if edit_kind == "wording" and exceptions:
-                        errors.append(f"{key}: wording edits cannot waive content-preservation minimums")
-                    patterns = {"normative-keywords": r"\b(?:MUST|SHALL|SHOULD|MAY|REQUIRED|RECOMMENDED)\b",
+                    if exceptions and edit_kind != "substantive":
+                        errors.append(f"{key}: preservation exceptions require explicit substantive classification; wording edits cannot waive content-preservation minimums")
+                    patterns = {"normative-keywords": r"\b(?:MUST NOT|SHALL NOT|SHOULD NOT|NOT RECOMMENDED|MUST|SHALL|SHOULD|MAY|REQUIRED|RECOMMENDED|OPTIONAL)\b",
                                 "identifiers": r"`[^`\n]+`",
                                 "rfc-references": r"\bRFC[ -]+[0-9]+\b"}
                     for category, pattern in patterns.items():
-                        if Counter(re.findall(pattern, item["text"])) - Counter(re.findall(pattern, target)) and category not in exceptions:
+                        if Counter(re.findall(pattern, normalized(item["text"]))) - Counter(re.findall(pattern, normalized(target))) and category not in exceptions:
                             errors.append(f"{key}: changed span loses {category}; explicit reviewed exception required")
                     if item["kind"] == "fence":
                         lines = target.strip().splitlines()
