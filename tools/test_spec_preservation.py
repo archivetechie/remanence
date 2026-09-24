@@ -125,7 +125,7 @@ class DispositionTests(unittest.TestCase):
             old, '', status='changed', target=target,
             candidate_files={'spec/new.md': target}, exceptions=['identifiers'])
         self.assertEqual(p.check(old, '', dispositions, receipt,
-                                 candidate_files=candidate_files), [])
+                                 candidate_files=candidate_files, edit_kind="substantive"), [])
 
     def test_changed_replaced_schema_fence_preserves_original_tokens(self):
         old = '```yaml\n1: alpha\n2: beta\n```\n'
