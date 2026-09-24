@@ -8,42 +8,29 @@ on:
 permissions:
   contents: write
   actions: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   linux-artifacts:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
       - name: Verify signed tag, main ancestry, and successful CI
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = tag
-          test "$(git rev-parse "$GITHUB_REF_NAME^{}")" = "$GITHUB_SHA"
-          workspace_versions=$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]')
-          test "$GITHUB_REF_NAME" = "v$workspace_versions" || {
-            echo "release tag $GITHUB_REF_NAME does not match workspace version $workspace_versions" >&2
-            exit 1
-          }
-          git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-          tag_oid=$(git rev-parse "$GITHUB_REF_NAME^{tag}")
-          gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_oid" \
-            --jq 'if .verification.verified then true else error("tag signature is not GitHub-verified") end' \
-            >/dev/null
-          gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-            -f branch=main \
-            -f event=push \
-            -f head_sha="$GITHUB_SHA" \
-            -f status=success \
-            --jq 'if any(.workflow_runs[]; .conclusion == "success") then true else error("tagged commit has no successful main CI run") end' \
-            >/dev/null
+          workspace_versions=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | .[]')
+          test "$GITHUB_REF_NAME" = "v$workspace_versions"
+          python3 tools/release_evidence.py gate --output dist/eligibility.json
       - name: Install Rust and musl target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: "1.95.0"
           targets: x86_64-unknown-linux-musl
       - name: Install build dependencies
         run: |
@@ -71,8 +58,13 @@ jobs:
           install -m 0644 dist/THIRD-PARTY-LICENSES.html dist/rem-recover-x86_64-linux-musl/
           tar -C dist -czf dist/remanence-x86_64-linux.tar.gz remanence-x86_64-linux
           tar -C dist -czf dist/rem-recover-x86_64-linux-musl.tar.gz rem-recover-x86_64-linux-musl
-          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          python3 tools/release_evidence.py record --name remanence-linux --dist dist --lock Cargo.lock
+          python3 tools/release_evidence.py manifest --dist dist --lock Cargo.lock --require-build remanence-linux
+      - name: Attest release payload and manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
       - name: Create GitHub release and attach artifacts
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.json dist/THIRD-PARTY-LICENSES.html dist/SHA256SUMS --verify-tag --generate-notes
