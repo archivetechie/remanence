@@ -4,6 +4,8 @@
 import argparse
 import copy
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,10 +47,22 @@ class ReleaseEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.previous_cwd = Path.cwd()
+        os.chdir(self.root)
+        subprocess.run(["git", "init", "-q"], check=True)
+        for key, value in (
+            ("user.name", "Test"),
+            ("user.email", "test@example.invalid"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "/dev/null"),
+        ):
+            subprocess.run(["git", "config", key, value], check=True)
         self.dist = self.root / "dist"
         self.dist.mkdir()
-        self.lock = self.root / "Cargo.lock"
+        self.lock = Path("Cargo.lock")
         self.lock.write_text("pinned dependencies\n")
+        subprocess.run(["git", "add", "Cargo.lock"], check=True)
+        subprocess.run(["git", "commit", "-qm", "fixture"], check=True)
         self.artifact = self.dist / "binary.tar.gz"
         self.artifact.write_bytes(b"actual archive bytes")
         self.context = {
@@ -80,6 +94,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
 
     def tearDown(self):
         self.context_patch.stop()
+        os.chdir(self.previous_cwd)
         self.temporary.cleanup()
 
     def write_receipt(self):
@@ -132,11 +147,18 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 release.manifest(self.args)
             extra.unlink()
 
+    def test_checkout_line_endings_do_not_change_committed_lock_identity(self):
+        before = release.lockfiles([self.lock])
+        self.lock.write_bytes(b"pinned dependencies\r\n")
+        self.assertEqual(release.lockfiles([self.lock]), before)
+        release.manifest(self.args)
+
     def test_changed_lockfile_and_traversal_fail(self):
         self.lock.write_text("changed dependency\n")
-        with self.assertRaisesRegex(ValueError, "lockfiles mismatch"):
+        with self.assertRaisesRegex(ValueError, "lockfile"):
             release.manifest(self.args)
-        self.receipt["locks"] = {str(self.lock): release.digest(self.lock)}
+        self.lock.write_text("pinned dependencies\n")
+        self.receipt["locks"] = release.lockfiles([self.lock])
         self.receipt["artifacts"] = {"../outside": {"sha256": "untrusted", "size": 0}}
         self.write_receipt()
         with self.assertRaisesRegex(ValueError, "artifact missing or changed"):

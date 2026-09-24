@@ -9,6 +9,7 @@ Private dispositions and receipts need not be published with the generic tool.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import difflib
 import gzip
 import hashlib
@@ -125,7 +126,8 @@ def span_text(candidate: str, span: object) -> str:
 
 
 def check(baseline: str, candidate: str, dispositions: dict | None = None,
-          receipt: dict | None = None, design: dict | None = None, *, edit_kind: str | None = None) -> list[str]:
+          receipt: dict | None = None, design: dict | None = None, *, edit_kind: str | None = None,
+          candidate_files: dict[str, str] | None = None) -> list[str]:
     """Reject unaccounted loss and stale, incomplete, or false disposition claims."""
     expected = inventory(baseline, candidate)
     required = {item["id"]: item for item in expected["items"]}
@@ -157,10 +159,35 @@ def check(baseline: str, candidate: str, dispositions: dict | None = None,
             continue
         if status != "retired":
             try:
-                target = span_text(candidate, row.get("candidate_span"))
+                filename = row.get("candidate_file")
+                destination = candidate
+                if filename is not None:
+                    if not isinstance(filename, str) or Path(filename).is_absolute() or ".." in Path(filename).parts or not candidate_files or filename not in candidate_files:
+                        raise ValueError("candidate_file must name a supplied candidate document")
+                    destination = candidate_files[filename]
+                target = span_text(destination, row.get("candidate_span"))
                 if status in {"retained", "moved"} and sha(normalized(target)) != item["sha256"]:
                     errors.append(f"{key}: original content is absent from the claimed candidate span")
-            except ValueError as exc:
+                if status == "changed":
+                    exceptions = row.get("exceptions", [])
+                    allowed = {"normative-keywords", "identifiers", "rfc-references", "fence-structure"}
+                    if not isinstance(exceptions, list) or any(not isinstance(value, str) or value not in allowed for value in exceptions):
+                        raise ValueError("invalid changed-item preservation exceptions")
+                    if edit_kind == "wording" and exceptions:
+                        errors.append(f"{key}: wording edits cannot waive content-preservation minimums")
+                    patterns = {"normative-keywords": r"\b(?:MUST|SHALL|SHOULD|MAY|REQUIRED|RECOMMENDED)\b",
+                                "identifiers": r"`[^`\n]+`",
+                                "rfc-references": r"\bRFC[ -]+[0-9]+\b"}
+                    for category, pattern in patterns.items():
+                        if Counter(re.findall(pattern, item["text"])) - Counter(re.findall(pattern, target)) and category not in exceptions:
+                            errors.append(f"{key}: changed span loses {category}; explicit reviewed exception required")
+                    if item["kind"] == "fence":
+                        lines = target.strip().splitlines()
+                        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", lines[0]) if lines else None
+                        complete = bool(marker and len(lines) >= 2 and re.match(r"^ {0,3}" + re.escape(marker.group(1)[0]) + "{" + str(len(marker.group(1))) + r",}\s*$", lines[-1]))
+                        if not complete and "fence-structure" not in exceptions:
+                            errors.append(f"{key}: changed schema/fence must map to a complete fenced target")
+            except (ValueError, TypeError) as exc:
                 errors.append(f"{key}: {exc}")
         if status in {"changed", "retired"}:
             reviewed.add(key)
@@ -184,6 +211,8 @@ def check(baseline: str, candidate: str, dispositions: dict | None = None,
         else:
             identities = {"baseline_sha256": expected["baseline_sha256"], "candidate_sha256": expected["candidate_sha256"],
                           "inventory_sha256": canonical_hash(expected), "dispositions_sha256": canonical_hash(dispositions)}
+            if candidate_files is not None:
+                identities["candidate_files_sha256"] = canonical_hash({name: sha(text) for name, text in candidate_files.items()})
             if design:
                 identities["design_sha256"] = canonical_hash(design)
             if any(receipt.get(key) != value for key, value in identities.items()):
@@ -205,6 +234,7 @@ def main() -> int:
     parser.add_argument("--dispositions", type=Path)
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--design", type=Path)
+    parser.add_argument("--candidate-files", type=Path, help="JSON mapping of candidate file names to UTF-8 text")
     parser.add_argument("--edit-kind", choices=("substantive", "wording"))
     args = parser.parse_args()
     try:
@@ -219,7 +249,8 @@ def main() -> int:
         dispositions = json.loads(args.dispositions.read_text()) if args.dispositions else None
         receipt = json.loads(args.receipt.read_text()) if args.receipt else None
         design = json.loads(args.design.read_text()) if args.design else None
-        errors = check(baseline, candidate, dispositions, receipt, design, edit_kind=args.edit_kind)
+        candidate_files = json.loads(args.candidate_files.read_text()) if args.candidate_files else None
+        errors = check(baseline, candidate, dispositions, receipt, design, edit_kind=args.edit_kind, candidate_files=candidate_files)
         for error in errors:
             print(error)
         print(f"spec-preservation: {'FAIL' if errors else 'PASS'} ({len(errors)} finding(s))")
