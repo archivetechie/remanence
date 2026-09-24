@@ -187,6 +187,12 @@ def check(baseline: str, candidate: str, dispositions: dict | None = None,
                         complete = bool(marker and len(lines) >= 2 and re.match(r"^ {0,3}" + re.escape(marker.group(1)[0]) + "{" + str(len(marker.group(1))) + r",}\s*$", lines[-1]))
                         if not complete and "fence-structure" not in exceptions:
                             errors.append(f"{key}: changed schema/fence must map to a complete fenced target")
+                        def schema_tokens(text):
+                            body = "\n".join(line.split(";", 1)[0].split("//", 1)[0]
+                                             for line in text.strip().splitlines()[1:-1])
+                            return Counter(re.findall(r"[A-Za-z_][A-Za-z0-9_-]*|\b[0-9]+(?=\s*:)", body))
+                        if schema_tokens(item["text"]) - schema_tokens(target) and "fence-structure" not in exceptions:
+                            errors.append(f"{key}: changed schema loses field/type/key tokens; explicit reviewed fence-structure exception required")
             except (ValueError, TypeError) as exc:
                 errors.append(f"{key}: {exc}")
         if status in {"changed", "retired"}:

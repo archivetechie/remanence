@@ -21,7 +21,9 @@ canonical hash of the file-name-to-content-SHA256 map.
 Retained/moved spans must match the original content after whitespace normalization.
 Changed and retired rows need a substantive `rationale` and independent review.
 Changed spans preserve counts of normative keywords, backticked identifiers and
-RFC references, and schema items require a complete fenced destination. A
+RFC references, and schema items require a complete fenced destination that
+retains field/type names and integer map-key tokens. This is a conservative
+structural check, not a schema-equivalence proof. A
 substantive change may name an explicit `exceptions` entry (`normative-keywords`,
 `identifiers`, `rfc-references`, or `fence-structure`), bound into its independently
 reviewed disposition and rationale. Wording edits cannot waive these minimums.
