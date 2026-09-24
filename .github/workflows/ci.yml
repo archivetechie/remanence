@@ -33,6 +33,12 @@ jobs:
       - name: Install Python verifier dependencies
         run: python3 -m pip install -r tools/requirements-rem-object-independent.txt
 
+      - name: Check specification references and preservation regressions
+        run: |
+          python3 tools/check_spec_versioning.py
+          python3 -m unittest discover -s tools -p 'test_*spec*.py'
+          python3 -m unittest discover -s tools/oracle -p 'test_*.py'
+
       - name: Check formatting
         run: cargo fmt --all --check
 
