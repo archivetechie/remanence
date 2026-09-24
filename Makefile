@@ -11,7 +11,7 @@ REM_BIN ?= target/debug/rem
 SETCAP ?= setcap
 SUDO ?= sudo
 
-.PHONY: rem-dev rem-dev-setcap rem-dev-libraries proof-inventory \
+.PHONY: check-spec-versioning rem-dev rem-dev-setcap rem-dev-libraries proof-inventory \
 	in-progress-parity-test-vectors verify-in-progress-parity-test-vectors \
 	publication-test-vectors verify-publication-test-vectors \
 	benchmark-terminal-index-stream benchmark-terminal-index-journal-replay

@@ -1553,6 +1553,7 @@ map digest covers the deterministic structural projection. The edition digest
 binds the immutable snapshot facts shared by A/B/C; the layout digest binds
 only the planned A/gap/B/gap/C layout. Footer-local observed fields are not
 included in the shared layout digest.
+
 ## 11. Writer Obligations
 
 ### 11.1. Commit Discipline (per tape file)
@@ -1747,6 +1748,7 @@ If A, B, and C all fail, the Scanner returns an explicit
 BOT Object classifications are likewise streamed before their terminal
 summary. It MUST NOT convert missing terminal authority into an empty inventory
 or infer the existence of a planned future component from A or B.
+
 ### 12.5. Epoch Isolation
 
 Damage confined to one sidecar's metadata — any or all of its header
@@ -1771,6 +1773,7 @@ replica invokes the explicit BOT structural walk, whose result is recovery
 evidence rather than a fabricated terminal edition. A structural artifact after
 the exact terminal suffix is nonconformant and MUST NOT be admitted as an
 Object.
+
 ## 13. Recoverer Obligations
 
 ### 13.1. Inputs
@@ -2035,6 +2038,7 @@ truncation; map↔Object-row mismatch; header/footer disagreement; local
 observation mismatch; nonzero gap interior; missing filemark; A/B/C survivor
 conflict; all three replicas invalid with explicit BOT fallback; and arithmetic
 overflow in every size/location formula.
+
 ## 18. Conformance and Freeze Criteria
 
 These criteria gate the freeze of this specification. They are not all
@@ -2217,6 +2221,7 @@ recovery row. A Scanner starts from EOD, validates C and survivor agreement,
 then exposes that inventory. If C is damaged it tries B, then A. If all three
 are invalid it reports terminal authority unavailable and performs the explicit
 BOT structural walk; it never treats the tape as empty.
+
 ## Appendix B. Design Rationale (Informative)
 
 This appendix records the reasoning behind non-obvious decisions, so future
@@ -2445,6 +2450,7 @@ establish conformance to the generation-2 replacement. Replacement work is
 tracked in Appendix E; only
 items verified against the terminal triple may be closed in a later preparing
 revision.
+
 ## Appendix D. Revision History (Informative)
 
 Entries are newest first. Each carries: date · version · kind
@@ -2674,6 +2680,7 @@ replacement.
    campaign whose generator reaches terminal kinds at the legal 256 KiB,
    512 KiB, and 1 MiB record sizes. Criterion 18.3 remains open until those
    targets, committed corpus replay, and measured plateau reports exist.
+
 ## Author's Address
 
 The ArchiveTech Project
