@@ -127,6 +127,15 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(p.check(old, '', dispositions, receipt,
                                  candidate_files=candidate_files), [])
 
+    def test_changed_replaced_schema_fence_preserves_original_tokens(self):
+        old = '```yaml\n1: alpha\n2: beta\n```\n'
+        target = '```yaml\n1: gamma\n2: delta\n```\n'
+        dispositions, receipt, candidate_files = self.cross_file_evidence(
+            old, '', status='changed', target=target,
+            candidate_files={'spec/new.md': target})
+        errors = p.check(old, '', dispositions, receipt, candidate_files=candidate_files)
+        self.assertTrue(any('schema' in error for error in errors), errors)
+
     def test_review_receipt_binds_complete_candidate_file_set(self):
         old = 'Readers MUST preserve `field`.\n'
         dispositions, receipt, candidate_files = self.cross_file_evidence(
