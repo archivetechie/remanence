@@ -1,0 +1,10 @@
+{
+  "repository": "remanence",
+  "path": "specs/in-progress/rem-parity-1-specification.md",
+  "baseline_commit": "0ef3ed003087f8b135463c503e46c8f8bd2a88b5",
+  "candidate_commit": "6b1360cc4f866ce4fd4f789c82db513214a823ed",
+  "baseline_sha256": "2a2f242ff5641fa3d9f1109e5fb9128ee94e673208878f0e5aad9e98d0fcf702",
+  "candidate_sha256": "f577ef86f3f2b60010b140008109ea0f8d727b813bad7315c282b3dfdea26bac",
+  "baseline_lines": 2874,
+  "candidate_lines": 2538
+}
