@@ -14,8 +14,17 @@ The disposition object must bind `baseline_sha256` and `candidate_sha256` from
 the inventory and contain exactly one `items` row for each affected item ID.
 Each row has `id` and `status`: `retained`, `moved`, `changed`, or `retired`.
 All except retired rows identify an inclusive, one-based `candidate_span`.
+An optional `candidate_file` names another document in the JSON file-to-text
+map supplied with `--candidate-files`; cross-file folds are checked against that
+complete candidate set. Review receipts also bind `candidate_files_sha256`: the
+canonical hash of the file-name-to-content-SHA256 map.
 Retained/moved spans must match the original content after whitespace normalization.
 Changed and retired rows need a substantive `rationale` and independent review.
+Changed spans preserve counts of normative keywords, backticked identifiers and
+RFC references, and schema items require a complete fenced destination. A
+substantive change may name an explicit `exceptions` entry (`normative-keywords`,
+`identifiers`, `rfc-references`, or `fence-structure`), bound into its independently
+reviewed disposition and rationale. Wording edits cannot waive these minimums.
 
 Review receipts bind the baseline, candidate, canonical inventory, and canonical
 dispositions hashes. They identify distinct author/reviewer sessions, a passing

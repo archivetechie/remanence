@@ -23,6 +23,20 @@ def digest(path: Path) -> str:
         return result.hexdigest()
 
 
+def lockfiles(paths: list[Path]) -> dict[str, str]:
+    """Use portable Git paths and committed bytes, allowing checkout CRLF only."""
+    result = {}
+    for path in paths:
+        name = path.as_posix()
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("lockfile paths must be repository-relative")
+        content = subprocess.check_output(["git", "show", "HEAD:" + name])
+        if path.read_bytes().replace(b"\r\n", b"\n") != content.replace(b"\r\n", b"\n"):
+            raise ValueError("lockfile differs from committed input: " + name)
+        result[name] = hashlib.sha256(content).hexdigest()
+    return result
+
+
 def write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
@@ -159,7 +173,7 @@ def build_record(args) -> None:
                 k: os.environ.get(k)
                 for k in ("RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion")
             },
-            "locks": {str(p): digest(p) for p in args.lock},
+            "locks": lockfiles(args.lock),
             "artifacts": {
                 p.name: {"sha256": digest(p), "size": p.stat().st_size} for p in artifacts
             },
@@ -178,7 +192,7 @@ def manifest(args) -> None:
     if value["ref"].startswith("refs/tags/") and eligibility.get("eligible") is not True:
         raise ValueError("tagged release lacks eligibility proof")
     builds = []
-    locks = {str(p): digest(p) for p in args.lock}
+    locks = lockfiles(args.lock)
     covered = set()
     for name in args.require_build:
         receipt = json.loads((args.dist / ("build-" + name + ".json")).read_text())
