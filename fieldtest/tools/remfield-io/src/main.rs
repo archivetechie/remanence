@@ -88,6 +88,10 @@ impl From<tonic::transport::Error> for AppError {
     }
 }
 
+fn required<T>(value: Option<T>, field: &str) -> AppResult<T> {
+    value.ok_or_else(|| AppError::new(format!("missing required {field}")))
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "remfield-io")]
 #[command(about = "Field-test daemon write/read helper")]
@@ -545,9 +549,9 @@ async fn open_write_session(
                 mount_if_needed: true,
             },
         )),
-        body_format: "rem-object-v1".to_string(),
+        body_format: Some("rem-object-v1".to_string()),
         idempotency_key: None,
-        recover_session_id: Vec::new(),
+        recover_session_id: None,
     };
     match client.open_write_session(request()).await {
         Ok(response) => Ok(response.into_inner().session_id),
@@ -653,11 +657,9 @@ async fn append_object(
                     session_id: session_id_for_task.clone(),
                     caller_object_id: input.caller_object_id,
                     caller_metadata,
-                    declared_size_bytes: input.declared_size_bytes,
-                    body_format_manifest: Vec::new(),
-                    expected_content_sha256: start_digest
-                        .map(|digest| digest.to_vec())
-                        .unwrap_or_default(),
+                    declared_size_bytes: Some(input.declared_size_bytes),
+                    body_format_manifest: None,
+                    expected_content_sha256: start_digest.map(|digest| digest.to_vec()),
                     expected_content_digest: start_digest.map(|digest| pb::Digest {
                         algorithm: "sha256".to_string(),
                         value: digest.to_vec(),
@@ -705,7 +707,7 @@ async fn append_object(
             payload: Some(pb::append_object_message::Payload::Finish(
                 pb::AppendObjectFinish {
                     session_id: session_id_for_task,
-                    expected_content_sha256: finish_digest.clone(),
+                    expected_content_sha256: Some(finish_digest.clone()),
                     expected_content_digest: Some(pb::Digest {
                         algorithm: "sha256".to_string(),
                         value: finish_digest,
@@ -848,7 +850,7 @@ async fn abort_write_session(
         .abort_write_session(pb::AbortWriteSessionRequest {
             session_id: session_id.to_vec(),
             idempotency_key: None,
-            reason: "remfield-io append failed".to_string(),
+            reason: Some("remfield-io append failed".to_string()),
         })
         .await;
 }
@@ -869,6 +871,8 @@ async fn read_command(endpoint: &str, args: ReadArgs, no_wait: bool) -> AppResul
                 tape_uuid: target.tape_uuid.to_vec(),
                 mount_if_needed: true,
                 required_pool_id: target.required_pool_id.clone(),
+                // Servers currently reject the write-only unpooled acknowledgment as unimplemented.
+                allow_unpooled: false,
             },
         )),
         idempotency_key: None,
@@ -1005,10 +1009,10 @@ async fn list_command(endpoint: &str, args: ListArgs) -> AppResult<()> {
             *counts_by_tape.entry(tape_uuid.clone()).or_default() += 1;
             objects.push(json!({
                 "object_id": uuid_bytes_to_text(&object.object_id)?,
-                "caller_object_id": empty_string_as_null(&object.caller_object_id),
-                "content_sha256": bytes_to_hex(&object.content_sha256),
+                "caller_object_id": object.caller_object_id.as_deref(),
+                "content_sha256": object.content_sha256.as_deref().map(bytes_to_hex),
                 "logical_size_bytes": object.logical_size_bytes,
-                "body_format": object.body_format,
+                "body_format": object.body_format.as_deref(),
                 "tape_uuid": tape_uuid,
                 "tape_file_number": copy.tape_file_number,
                 "first_body_lba": copy.first_body_lba,
@@ -1024,9 +1028,9 @@ async fn list_command(endpoint: &str, args: ListArgs) -> AppResult<()> {
             let tape_uuid = bytes_to_hex(&tape.tape_uuid);
             json!({
                 "tape_uuid": tape_uuid,
-                "voltag": empty_string_as_null(&tape.voltag),
-                "pool_id": empty_string_as_null(&tape.pool_id),
-                "body_format": empty_string_as_null(&tape.body_format),
+                "voltag": tape.voltag.as_deref(),
+                "pool_id": tape.pool_id.as_deref(),
+                "body_format": tape.body_format.as_deref(),
                 "block_size_bytes": tape.block_size_bytes,
                 "last_committed_tape_file": tape.last_committed_tape_file,
                 "state": tape_state_name(tape.state),
@@ -1182,11 +1186,13 @@ fn read_range(
                 .ok_or_else(|| AppError::new("--offset + --length overflows u64"))?,
         )),
         (start, None) => {
-            let size = object
-                .map(|object| object.logical_size_bytes)
-                .ok_or_else(|| {
-                    AppError::new("--offset without --length requires catalog lookup")
-                })?;
+            let object = object.ok_or_else(|| {
+                AppError::new("--offset without --length requires catalog lookup")
+            })?;
+            let size = required(
+                object.logical_size_bytes,
+                "ObjectRecord.logical_size_bytes",
+            )?;
             if start > size {
                 return Err(AppError::new(format!(
                     "--offset {start} is beyond object size {size}"
@@ -1214,13 +1220,13 @@ fn write_result_json(
     let first_copy = record.copies.first();
     json!({
         "object_id": uuid_bytes_to_text(&record.object_id).unwrap_or_else(|_| bytes_to_hex(&record.object_id)),
-        "caller_object_id": empty_string_as_null(&record.caller_object_id),
+        "caller_object_id": record.caller_object_id.as_deref(),
         "tape_uuid": first_copy.map(|copy| bytes_to_hex(&copy.tape_uuid)),
         "tape_file_number": first_copy.map(|copy| copy.tape_file_number),
         "first_body_lba": first_copy.map(|copy| copy.first_body_lba),
-        "content_sha256": bytes_to_hex(&record.content_sha256),
+        "content_sha256": record.content_sha256.as_deref().map(bytes_to_hex),
         "pool_id": pool_id,
-        "body_format": record.body_format,
+        "body_format": record.body_format.as_deref(),
         "logical_size_bytes": record.logical_size_bytes,
         "bytes": bytes,
         "seconds": seconds,
@@ -1523,10 +1529,10 @@ mod tests {
     fn write_result_json_surfaces_append_commit_info() {
         let record = pb::ObjectRecord {
             object_id: Uuid::nil().as_bytes().to_vec(),
-            caller_object_id: "caller-object".to_string(),
-            content_sha256: vec![0x22; 32],
-            logical_size_bytes: 64,
-            body_format: "rem-object-v1".to_string(),
+            caller_object_id: Some("caller-object".to_string()),
+            content_sha256: Some(vec![0x22; 32]),
+            logical_size_bytes: Some(64),
+            body_format: Some("rem-object-v1".to_string()),
             caller_metadata: Default::default(),
             created_at: None,
             content_digest: Some(pb::Digest {
@@ -1546,6 +1552,8 @@ mod tests {
                     value: vec![0x22; 32],
                 }),
                 stored_digest: None,
+                global_start_block: None,
+                global_end_block: None,
             }],
             append_commit_info: Some(pb::AppendCommitInfo {
                 append_mode: pb::AppendMode::Append as i32,
@@ -1558,6 +1566,9 @@ mod tests {
                 journal_record_ordinal: None,
                 estimated_remaining_bytes: None,
                 sealed_after_write: None,
+                durability: pb::AppendDurability::Checkpointed as i32,
+                batch_id: Vec::new(),
+                provisional_ordinal: None,
             }),
         };
 
@@ -1615,10 +1626,10 @@ mod tests {
     fn write_many_object_json_carries_phase_timing_shape() {
         let record = pb::ObjectRecord {
             object_id: Uuid::nil().as_bytes().to_vec(),
-            caller_object_id: "batch-7".to_string(),
-            content_sha256: vec![0x33; 32],
-            logical_size_bytes: 1024 * 1024,
-            body_format: "rem-object-v1".to_string(),
+            caller_object_id: Some("batch-7".to_string()),
+            content_sha256: Some(vec![0x33; 32]),
+            logical_size_bytes: Some(1024 * 1024),
+            body_format: Some("rem-object-v1".to_string()),
             caller_metadata: Default::default(),
             created_at: None,
             content_digest: Some(pb::Digest {
@@ -1638,6 +1649,8 @@ mod tests {
                     value: vec![0x33; 32],
                 }),
                 stored_digest: None,
+                global_start_block: None,
+                global_end_block: None,
             }],
             append_commit_info: Some(pb::AppendCommitInfo {
                 append_mode: pb::AppendMode::Append as i32,
@@ -1650,6 +1663,9 @@ mod tests {
                 journal_record_ordinal: None,
                 estimated_remaining_bytes: None,
                 sealed_after_write: None,
+                durability: pb::AppendDurability::Checkpointed as i32,
+                batch_id: Vec::new(),
+                provisional_ordinal: None,
             }),
         };
 
