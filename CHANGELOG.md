@@ -52,6 +52,14 @@ per-release summaries.
   refuses responses where presence is now required (for example an accepted
   finalization without both digests). Run the CLI and the daemon from the
   same build.
+- The build no longer needs a system `protoc`. `remanence-api` compiles the
+  Layer 5 protos in-process with protox (0.9.1). The generated Rust code is
+  byte-identical to the `protoc` output. The descriptor set is identical
+  except that protox's built-in well-known types carry no source info, which
+  nothing reads. CI no longer installs `protoc`, and it sets `PROTOC` to a
+  path that does not exist, so a regression fails the build.
+  The README and quickstart now also state the one run-time requirement:
+  `bsdtar`, for `rem archive build` and `rem archive extract`.
 
 ## v0.1.0 — 2026-08-07
 
