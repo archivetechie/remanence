@@ -57,7 +57,7 @@ thiserror           = "2"
 time                = { version = "0.3", features = ["formatting", "parsing"] }
 tokio               = { version = "1",   features = ["full"] }
 tokio-stream        = "0.1"
-toml                = "0.8"
+toml                = "1.1"
 tower               = "0.5"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "json"] }
