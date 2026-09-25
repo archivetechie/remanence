@@ -61,6 +61,37 @@ jobs:
             fi
           done
 
+      # Read-only. Shows the write-cache mode the journal trust check will
+      # consult for the test temp directories, so a rejection can be told
+      # apart from a runner disk that is "write back" without FUA.
+      - name: Report journal-volume write cache
+        run: |
+          (
+            for dir in "${RUNNER_TEMP:-/tmp}" /tmp; do
+              echo "== $dir ($(findmnt -no SOURCE,FSTYPE -T "$dir"))"
+              dev=$(stat -c '%d' "$dir")
+              major=$(( ((dev >> 8) & 0xfff) | ((dev >> 32) & ~0xfff) ))
+              minor=$(( (dev & 0xff) | ((dev >> 12) & ~0xff) ))
+              echo "major:minor: $major:$minor"
+              node=$(readlink -e "/sys/dev/block/$major:$minor")
+              if [ -z "$node" ]; then
+                echo "sysfs: no /sys/dev/block/$major:$minor entry (anonymous device)"
+                continue
+              fi
+              echo "sysfs: $node"
+              if [ -f "$node/partition" ]; then
+                echo "partition: yes (number $(cat "$node/partition"))"
+                owner=$(dirname "$node")
+              else
+                echo "partition: no"
+                owner=$node
+              fi
+              echo "consulted: $owner"
+              echo "queue/write_cache: $(cat "$owner/queue/write_cache" 2>&1)"
+              echo "queue/fua: $(cat "$owner/queue/fua" 2>&1)"
+            done
+          ) || true
+
       - name: Run tests
         run: cargo test --workspace
 
