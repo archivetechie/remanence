@@ -10,11 +10,12 @@ Commands in the local sections were run as written against the current
 tree; hardware sections are marked, because they need a library (real or
 virtual) and host privileges.
 
-<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml @ 1dd451b2 -->
+<!-- code-anchor: Cargo.toml crates/remanence-cli/Cargo.toml crates/remanence-api/build.rs @ 1dd451b2 -->
 ## Build
 
 You need Rust 1.88 or newer. The workspace builds on stock Linux with no
-system dependencies:
+system packages; the protobuf definitions are compiled in-process, so
+`protoc` is not needed:
 
 ```sh
 git clone https://github.com/archivetechie/remanence
@@ -36,7 +37,13 @@ Foreign-format adapters are separate distributions rather than Cargo features
 of the core repository. See the
 [foreign-format adapter reference](reference-foreign-format-adapters.md).
 
-To run the test suite the way CI does:
+One program is needed at run time, and the first walkthrough below uses it.
+`rem archive build` and `rem archive extract` use `bsdtar` (the
+`libarchive-tools` package on Debian and Ubuntu, `bsdtar` on Fedora) to pack
+and unpack `.remwrap.tar` wrappers, and both require it even when no wrapper
+is involved. `rem archive extract --no-unwrap` does not.
+
+To run the test suite the way CI does (it also needs `bsdtar`):
 
 ```sh
 cargo fmt --all --check

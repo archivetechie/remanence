@@ -35,7 +35,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            protobuf-compiler musl-tools libarchive-tools attr
+            musl-tools libarchive-tools attr
           cargo install cargo-about --version 0.9.1 --locked --features cli
       - name: Run release gates
         run: |

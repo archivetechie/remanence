@@ -73,10 +73,11 @@ verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
 
-<!-- code-anchor: Cargo.toml @ 1dd451b2 -->
+<!-- code-anchor: Cargo.toml crates/remanence-api/build.rs @ 1dd451b2 -->
 ## Build
 
-Rust 1.88+, Linux. No system dependencies for the default build:
+Rust 1.88+, Linux. The default build needs no system packages; the protobuf
+definitions are compiled in-process by protox, so `protoc` is not required:
 
 ```sh
 cargo build --release
@@ -87,6 +88,12 @@ operator CLI and `rem-debug` the break-glass one that talks to hardware
 directly; `rem-recover` is a separate crate that depends on neither the daemon
 nor the catalog. One optional feature, `remanence-cli/linux-udev`, adds
 hot-plug watching and needs `pkg-config` and `libudev-dev`.
+
+One program is needed at run time. `rem archive build` and `rem archive
+extract` use `bsdtar` (the `libarchive-tools` package on Debian and Ubuntu,
+`bsdtar` on Fedora) to pack and unpack `.remwrap.tar` wrappers, and both
+require it even when no wrapper is involved. `rem archive extract --no-unwrap`
+does not. The test suite needs `bsdtar` as well.
 
 Tests and lints, as CI runs them:
 

@@ -20,7 +20,6 @@ tar xf remanence-src.tar.gz && cd remanence
 # 3. Point cargo at the vendored sources (offline)
 mkdir -p .cargo
 cp ../vendor-config.toml .cargo/config.toml   # [source.crates-io] replace-with vendored
-export PROTOC=$HOME/remfield/toolchain/protoc/bin/protoc
 
 # 4. Build
 cargo build --release --offline
