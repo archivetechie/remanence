@@ -16,7 +16,7 @@ thiserror      = { workspace = true }
 tokio          = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-udev   = { version = "0.9", optional = true }
+tokio-udev   = { version = "0.10", optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [features]
