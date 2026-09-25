@@ -1042,11 +1042,256 @@ fn all_invalid_terminal_inventory_projects_explicit_bot_recovery() {
         projected.outcome,
         pb::TapeInventoryOutcome::BotStructuralRecoveryRequired as i32
     );
-    assert_eq!(projected.selected_replica_ordinal, 0);
-    assert_eq!(projected.structural_entry_count, 0);
-    assert_eq!(projected.object_row_count, 0);
+    // No scan has run, so every summary field the outcome lacks is absent,
+    // never a zero that reads as an empty tape.
+    assert_eq!(projected.selected_replica_ordinal, None);
+    assert_eq!(projected.selected_attempt_id, None);
+    assert_eq!(projected.structural_entry_count, None);
+    assert_eq!(projected.object_row_count, None);
+    assert_eq!(projected.edition_digest, None);
+    assert_eq!(projected.layout_digest, None);
+    assert_eq!(projected.payload_digest, None);
+    assert_eq!(projected.canonical_map_digest, None);
+    assert_eq!(projected.recovered_object_count, None);
+    assert_eq!(projected.unknown_object_count, None);
+    assert_eq!(projected.incomplete_object_count, None);
+    assert_eq!(projected.damaged_region_count, None);
     assert_eq!(projected.replica_health.len(), 3);
     assert!(projected.detail.contains("structural recovery from BOT"));
+}
+
+/// Build the edition facts the converters read. The converters never validate
+/// an edition, so only the shape has to be real.
+fn converter_edition_plan(counts: TapeIndexReplicaCounts) -> TapeIndexEditionPlan {
+    const TERMINAL_BLOCK_SIZE: u32 = 256 * 1024;
+    let replica_layout =
+        checked_tape_index_replica_layout(TERMINAL_BLOCK_SIZE, counts).expect("replica layout");
+    let terminal_layout = TerminalTailLayout::new(
+        0,
+        TERMINAL_BLOCK_SIZE,
+        counts.structural_entry_count,
+        4,
+        replica_layout.replica_record_count,
+        3,
+    )
+    .expect("tail layout");
+    TapeIndexEditionPlan {
+        descriptor: TapeIndexEditionDescriptor {
+            tape_uuid: RANGE_TAPE_UUID,
+            edition_id: [0x81; 16],
+            edition_sequence: 1,
+            scope: TapeIndexReplicaScope {
+                covered_prefix_tape_file_count: counts.structural_entry_count,
+                total_data_ordinals: counts.object_row_count,
+                highest_protected_ordinal: 0,
+            },
+            counts,
+            block_size: TERMINAL_BLOCK_SIZE,
+            compression_enabled: false,
+            writer_version: "presence-converter-test".to_string(),
+            write_timestamp: "2026-09-25T00:00:00Z".to_string(),
+            terminal_layout,
+        },
+        replica_layout,
+        payload_sha256: [0x51; 32],
+        canonical_map_sha256: [0x52; 32],
+        edition_digest: [0x53; 32],
+        layout_digest: [0x54; 32],
+    }
+}
+
+fn converter_payload_summary(counts: TapeIndexReplicaCounts) -> TapeIndexReplicaPayloadSummary {
+    TapeIndexReplicaPayloadSummary {
+        structural_entry_count: counts.structural_entry_count,
+        object_row_count: counts.object_row_count,
+        payload_sha256: [0x51; 32],
+        canonical_map_sha256: [0x52; 32],
+        covered_prefix_end_lba: 3,
+    }
+}
+
+#[test]
+fn complete_inventory_with_no_objects_reports_a_present_zero_and_no_bot_counts() {
+    let counts = TapeIndexReplicaCounts {
+        structural_entry_count: 1,
+        object_row_count: 0,
+    };
+    let payload = converter_payload_summary(counts);
+    let projected = terminal_inventory_to_proto(
+        RANGE_TAPE_UUID,
+        TerminalInventoryOutcome::Inventory(Box::new(TerminalInventorySelection {
+            selected_attempt_id: 1,
+            selected_replica_ordinal: 3,
+            edition: converter_edition_plan(counts),
+            payload,
+            replicas: std::array::from_fn(|_| TerminalReplicaEvidence::Valid { summary: payload }),
+        })),
+    );
+
+    assert_eq!(projected.outcome, pb::TapeInventoryOutcome::Complete as i32);
+    // A tape with no Objects has a real Object count of zero.
+    assert_eq!(projected.object_row_count, Some(0));
+    assert_eq!(projected.structural_entry_count, Some(1));
+    assert_eq!(projected.selected_replica_ordinal, Some(3));
+    assert_eq!(projected.selected_attempt_id, Some(1));
+    assert_eq!(
+        projected.edition_digest.as_deref(),
+        Some([0x53; 32].as_slice())
+    );
+    assert_eq!(
+        projected.layout_digest.as_deref(),
+        Some([0x54; 32].as_slice())
+    );
+    assert_eq!(
+        projected.payload_digest.as_deref(),
+        Some([0x51; 32].as_slice())
+    );
+    assert_eq!(
+        projected.canonical_map_digest.as_deref(),
+        Some([0x52; 32].as_slice())
+    );
+    // The fast path runs no BOT classification, so those counts are absent.
+    assert_eq!(projected.recovered_object_count, None);
+    assert_eq!(projected.unknown_object_count, None);
+    assert_eq!(projected.incomplete_object_count, None);
+    assert_eq!(projected.damaged_region_count, None);
+}
+
+#[test]
+fn bot_recovered_summary_reports_present_zero_counts_and_no_terminal_selection() {
+    let projected = bot_structural_recovery_to_proto(
+        RANGE_TAPE_UUID,
+        BotStructuralRecoverySummary {
+            structural_entry_count: 3,
+            complete_object_count: 1,
+            recovered_object_count: 1,
+            unknown_object_count: 0,
+            incomplete_object_count: 0,
+            canonical_map_digest: [0x44; 32],
+            damaged_region_count: 0,
+        },
+    );
+
+    assert_eq!(
+        projected.outcome,
+        pb::TapeInventoryOutcome::BotStructuralRecovered as i32
+    );
+    // No torn file: a real zero, present on the wire.
+    assert_eq!(projected.incomplete_object_count, Some(0));
+    assert_eq!(projected.unknown_object_count, Some(0));
+    assert_eq!(projected.damaged_region_count, Some(0));
+    assert_eq!(projected.recovered_object_count, Some(1));
+    assert_eq!(projected.structural_entry_count, Some(3));
+    assert_eq!(projected.object_row_count, Some(1));
+    assert_eq!(
+        projected.canonical_map_digest.as_deref(),
+        Some([0x44; 32].as_slice())
+    );
+    // No terminal member was selected and there is no terminal edition.
+    assert_eq!(projected.selected_replica_ordinal, None);
+    assert_eq!(projected.selected_attempt_id, None);
+    assert_eq!(projected.edition_digest, None);
+    assert_eq!(projected.layout_digest, None);
+    assert_eq!(projected.payload_digest, None);
+}
+
+#[test]
+fn separation_health_keeps_a_two_record_zero_and_omits_an_invalid_count() {
+    let rows = terminal_separation_health(&[
+        TerminalSeparationEvidence::Valid {
+            interior_record_count: 0,
+        },
+        TerminalSeparationEvidence::Invalid {
+            detail: "footer missing".to_string(),
+        },
+    ]);
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].state,
+        pb::tape_index_separation_health::State::TapeIndexSeparationStateValid as i32
+    );
+    assert_eq!(rows[0].verified_interior_record_count, Some(0));
+    assert_eq!(
+        rows[1].state,
+        pb::tape_index_separation_health::State::TapeIndexSeparationStateInvalid as i32
+    );
+    assert_eq!(rows[1].verified_interior_record_count, None);
+}
+
+#[test]
+fn verified_index_reports_present_prefix_counts_and_digests() {
+    let counts = TapeIndexReplicaCounts {
+        structural_entry_count: 2,
+        object_row_count: 1,
+    };
+    let payload = converter_payload_summary(counts);
+    let projected = terminal_verification_to_proto(
+        RANGE_TAPE_UUID,
+        TerminalIndexVerificationOutcome::VerifiedComplete(Box::new(TerminalIndexVerification {
+            edition: converter_edition_plan(counts),
+            selected_payload: payload,
+            replicas: std::array::from_fn(|_| TerminalReplicaEvidence::Valid { summary: payload }),
+            separations: std::array::from_fn(|_| TerminalSeparationEvidence::Valid {
+                interior_record_count: 1,
+            }),
+            measured_eod: PhysicalPositionHint::new(40),
+            verified_prefix_tape_file_count: 2,
+            verified_prefix_record_count: 3,
+            measured_tape_file_count: 7,
+        })),
+    );
+
+    assert_eq!(
+        projected.state,
+        pb::TapeIndexVerificationState::VerifiedComplete as i32
+    );
+    assert_eq!(projected.verified_prefix_tape_file_count, Some(2));
+    assert_eq!(projected.verified_prefix_record_count, Some(3));
+    assert_eq!(
+        projected.edition_digest.as_deref(),
+        Some([0x53; 32].as_slice())
+    );
+    assert_eq!(
+        projected.layout_digest.as_deref(),
+        Some([0x54; 32].as_slice())
+    );
+    assert_eq!(
+        projected.payload_digest.as_deref(),
+        Some([0x51; 32].as_slice())
+    );
+    assert_eq!(
+        projected.canonical_map_digest.as_deref(),
+        Some([0x52; 32].as_slice())
+    );
+    assert!(projected
+        .separation_health
+        .iter()
+        .all(|row| row.verified_interior_record_count == Some(1)));
+}
+
+#[test]
+fn bot_object_stream_item_keeps_an_unmeasured_torn_count_absent() {
+    let block_count = |object: &BotRecoveredObject| match bot_recovered_object_to_proto(object).item
+    {
+        Some(pb::tape_inventory_stream_item::Item::BotObject(row)) => row.stored_block_count,
+        other => panic!("expected a BOT Object row, got {other:?}"),
+    };
+    let torn = BotRecoveredObject {
+        tape_file_number: 5,
+        stored_block_count: None,
+        object_id: None,
+        state: BotRecoveredObjectState::Incomplete,
+    };
+    let complete = BotRecoveredObject {
+        tape_file_number: 4,
+        stored_block_count: Some(9),
+        object_id: None,
+        state: BotRecoveredObjectState::Unknown,
+    };
+
+    assert_eq!(block_count(&torn), None);
+    assert_eq!(block_count(&complete), Some(9));
 }
 
 #[test]
@@ -1085,9 +1330,28 @@ fn recovery_required_verification_projects_measured_bot_evidence() {
     );
     assert_eq!(projected.measured_eod_lba, 123);
     assert_eq!(projected.measured_tape_file_count, 7);
+    // No canonical prefix authority: prefix counts and digests are absent.
+    assert_eq!(projected.verified_prefix_tape_file_count, None);
+    assert_eq!(projected.verified_prefix_record_count, None);
+    assert_eq!(projected.edition_digest, None);
+    assert_eq!(projected.layout_digest, None);
+    assert_eq!(projected.payload_digest, None);
+    assert_eq!(projected.canonical_map_digest, None);
+    assert_eq!(projected.separation_health.len(), 2);
+    assert!(projected.separation_health.iter().all(|row| {
+        row.state == pb::tape_index_separation_health::State::TapeIndexSeparationStateUnknown as i32
+            && row.verified_interior_record_count.is_none()
+    }));
     assert_eq!(
         projected.recovery_inventory.as_ref().map(|row| row.outcome),
         Some(pb::TapeInventoryOutcome::BotStructuralRecovered as i32)
+    );
+    assert_eq!(
+        projected
+            .recovery_inventory
+            .as_ref()
+            .and_then(|row| row.incomplete_object_count),
+        Some(1)
     );
 }
 

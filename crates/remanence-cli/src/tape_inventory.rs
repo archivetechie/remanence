@@ -252,7 +252,7 @@ fn consume_inventory_stream(
                     .map_err(DaemonClientError::client)?;
             }
             Item::Summary(inventory) => {
-                summary = Some(inventory);
+                summary = Some(*inventory);
             }
         }
     }
@@ -266,13 +266,14 @@ fn consume_inventory_stream(
                     "fast inventory carried BOT recovery stream events",
                 ));
             }
-            let selected = attempts
-                .get(&inventory.selected_attempt_id)
+            let selected = inventory
+                .selected_attempt_id
+                .and_then(|attempt_id| attempts.get(&attempt_id))
                 .ok_or_else(|| DaemonClientError::client("summary selected an unknown attempt"))?;
             if selected.rejected
-                || selected.replica_ordinal != inventory.selected_replica_ordinal
-                || selected.structural_entries != inventory.structural_entry_count
-                || selected.object_rows != inventory.object_row_count
+                || Some(selected.replica_ordinal) != inventory.selected_replica_ordinal
+                || Some(selected.structural_entries) != inventory.structural_entry_count
+                || Some(selected.object_rows) != inventory.object_row_count
             {
                 return Err(DaemonClientError::client(
                     "summary disagrees with the selected streamed row set",
@@ -283,15 +284,23 @@ fn consume_inventory_stream(
             let progress = bot_recovery.last_progress.ok_or_else(|| {
                 DaemonClientError::client("daemon completed BOT recovery without per-file progress")
             })?;
-            if progress.structural_candidate_count != inventory.structural_entry_count {
+            if Some(progress.structural_candidate_count) != inventory.structural_entry_count {
                 return Err(DaemonClientError::client(
                     "BOT summary disagrees with the final progress candidate count",
                 ));
             }
-            let expected = inventory
-                .recovered_object_count
-                .checked_add(inventory.unknown_object_count)
-                .and_then(|count| count.checked_add(inventory.incomplete_object_count))
+            let (Some(recovered), Some(unknown), Some(incomplete)) = (
+                inventory.recovered_object_count,
+                inventory.unknown_object_count,
+                inventory.incomplete_object_count,
+            ) else {
+                return Err(DaemonClientError::client(
+                    "BOT summary omitted its Object classification counts",
+                ));
+            };
+            let expected = recovered
+                .checked_add(unknown)
+                .and_then(|count| count.checked_add(incomplete))
                 .ok_or_else(|| DaemonClientError::client("BOT summary count overflows u64"))?;
             if bot_rows != expected {
                 return Err(DaemonClientError::client(
@@ -644,7 +653,7 @@ fn print_inventory_bot_object(
             "bot_object",
             json!({
                 "tape_file_number": object.tape_file_number.to_string(),
-                "stored_block_count": object.stored_block_count.to_string(),
+                "stored_block_count": object.stored_block_count.map(|count| count.to_string()),
                 "object_id_hex": object.object_id.as_ref().map(|id| bytes_to_hex(id)),
                 "state": state,
             }),
@@ -655,7 +664,7 @@ fn print_inventory_bot_object(
         out,
         "bot_object: tape_file={} blocks={} object_id_hex={} state={}",
         object.tape_file_number,
-        object.stored_block_count,
+        count_text(object.stored_block_count),
         object
             .object_id
             .as_ref()
@@ -778,8 +787,20 @@ fn validate_full_verification(
     let mut all_separations_valid = true;
     for gap in &verification.separation_health {
         match pb::tape_index_separation_health::State::try_from(gap.state) {
-            Ok(pb::tape_index_separation_health::State::TapeIndexSeparationStateValid) => {}
+            Ok(pb::tape_index_separation_health::State::TapeIndexSeparationStateValid) => {
+                if gap.verified_interior_record_count.is_none() {
+                    return Err(
+                        "valid separation evidence omitted its interior record count".to_string(),
+                    );
+                }
+            }
             Ok(pb::tape_index_separation_health::State::TapeIndexSeparationStateInvalid) => {
+                if gap.verified_interior_record_count.is_some() {
+                    return Err(
+                        "invalid separation evidence carried a verified interior record count"
+                            .to_string(),
+                    );
+                }
                 all_separations_valid = false;
             }
             Ok(pb::tape_index_separation_health::State::TapeIndexSeparationStateUnknown)
@@ -792,24 +813,31 @@ fn validate_full_verification(
     if require_complete && (!all_replicas_valid || !all_separations_valid) {
         return Err("verified-complete response carried degraded component evidence".to_string());
     }
-    let expected_file_count = verification
-        .verified_prefix_tape_file_count
+    let verified_prefix_tape_file_count = require_present(
+        verification.verified_prefix_tape_file_count,
+        "the verified prefix tape-file count",
+    )?;
+    let verified_prefix_record_count = require_present(
+        verification.verified_prefix_record_count,
+        "the verified prefix record count",
+    )?;
+    let expected_file_count = verified_prefix_tape_file_count
         .checked_add(5)
         .ok_or_else(|| "verified physical tape-file count overflows u64".to_string())?;
     if require_complete && verification.measured_tape_file_count != expected_file_count {
         return Err(format!(
             "measured tape-file count {}, expected prefix {} plus five terminal files",
-            verification.measured_tape_file_count, verification.verified_prefix_tape_file_count
+            verification.measured_tape_file_count, verified_prefix_tape_file_count
         ));
     }
     if !require_complete
-        && (verification.measured_tape_file_count < verification.verified_prefix_tape_file_count
+        && (verification.measured_tape_file_count < verified_prefix_tape_file_count
             || verification.measured_tape_file_count > expected_file_count)
     {
         return Err(format!(
             "degraded measured tape-file count {} lies outside verified prefix {} through planned total {}",
             verification.measured_tape_file_count,
-            verification.verified_prefix_tape_file_count,
+            verified_prefix_tape_file_count,
             expected_file_count
         ));
     }
@@ -821,15 +849,18 @@ fn validate_full_verification(
         return Err("verified-degraded response carried no degraded physical evidence".to_string());
     }
     if verification.measured_eod_lba == 0
-        || verification.verified_prefix_tape_file_count == 0
-        || verification.verified_prefix_record_count < verification.verified_prefix_tape_file_count
+        || verified_prefix_tape_file_count == 0
+        || verified_prefix_record_count < verified_prefix_tape_file_count
     {
         return Err("verified response carried impossible physical counts".to_string());
     }
-    require_digest("edition", &verification.edition_digest)?;
-    require_digest("layout", &verification.layout_digest)?;
-    require_digest("payload", &verification.payload_digest)?;
-    require_digest("canonical map", &verification.canonical_map_digest)?;
+    require_digest("edition", verification.edition_digest.as_deref())?;
+    require_digest("layout", verification.layout_digest.as_deref())?;
+    require_digest("payload", verification.payload_digest.as_deref())?;
+    require_digest(
+        "canonical map",
+        verification.canonical_map_digest.as_deref(),
+    )?;
     Ok(())
 }
 
@@ -840,12 +871,12 @@ fn validate_recovery_required_verification(
     if verification.fast_inventory.is_some()
         || verification.verification_basis != "bot_structural_recovery"
         || verification.measured_eod_lba == 0
-        || verification.verified_prefix_tape_file_count != 0
-        || verification.verified_prefix_record_count != 0
-        || !verification.edition_digest.is_empty()
-        || !verification.layout_digest.is_empty()
-        || !verification.payload_digest.is_empty()
-        || !verification.canonical_map_digest.is_empty()
+        || verification.verified_prefix_tape_file_count.is_some()
+        || verification.verified_prefix_record_count.is_some()
+        || verification.edition_digest.is_some()
+        || verification.layout_digest.is_some()
+        || verification.payload_digest.is_some()
+        || verification.canonical_map_digest.is_some()
     {
         return Err("recovery-required verification carried verified-prefix authority".to_string());
     }
@@ -860,6 +891,7 @@ fn validate_recovery_required_verification(
         || verification.separation_health.iter().any(|gap| {
             pb::tape_index_separation_health::State::try_from(gap.state)
                 != Ok(pb::tape_index_separation_health::State::TapeIndexSeparationStateUnknown)
+                || gap.verified_interior_record_count.is_some()
         })
     {
         return Err("recovery-required verification omitted unknown gap evidence".to_string());
@@ -874,7 +906,7 @@ fn validate_recovery_required_verification(
             "recovery-required verification attached the wrong inventory outcome".to_string(),
         );
     }
-    if verification.measured_tape_file_count != recovery.structural_entry_count {
+    if Some(verification.measured_tape_file_count) != recovery.structural_entry_count {
         return Err(
             "recovery-required verification disagreed with its BOT structural count".to_string(),
         );
@@ -931,33 +963,49 @@ fn validate_inventory(
         .count();
     match outcome {
         InventoryOutcome::Complete | InventoryOutcome::Degraded => {
-            if inventory.recovered_object_count != 0
-                || inventory.unknown_object_count != 0
-                || inventory.incomplete_object_count != 0
-                || inventory.damaged_region_count != 0
+            // The fast path runs no BOT classification, so those counts must be
+            // absent; a present zero would claim a classification that never ran.
+            if inventory.recovered_object_count.is_some()
+                || inventory.unknown_object_count.is_some()
+                || inventory.incomplete_object_count.is_some()
+                || inventory.damaged_region_count.is_some()
             {
                 return Err("fast terminal inventory carried BOT recovery evidence".to_string());
             }
-            if inventory.selected_attempt_id == 0 {
-                return Err("daemon omitted the selected inventory stream attempt".to_string());
+            let selected_attempt_id = require_present(
+                inventory.selected_attempt_id,
+                "the selected inventory stream attempt",
+            )?;
+            if selected_attempt_id == 0 {
+                return Err(
+                    "daemon returned invalid selected inventory stream attempt 0".to_string(),
+                );
             }
-            if !(1..=3).contains(&inventory.selected_replica_ordinal) {
+            let selected_replica_ordinal = require_present(
+                inventory.selected_replica_ordinal,
+                "the selected replica ordinal",
+            )?;
+            if !(1..=3).contains(&selected_replica_ordinal) {
                 return Err(format!(
-                    "daemon returned invalid selected replica ordinal {}",
-                    inventory.selected_replica_ordinal
+                    "daemon returned invalid selected replica ordinal {selected_replica_ordinal}"
                 ));
             }
-            if inventory.structural_entry_count == 0 {
+            if require_present(
+                inventory.structural_entry_count,
+                "the structural entry count",
+            )? == 0
+            {
                 return Err("daemon returned an empty successful structural inventory".to_string());
             }
-            require_digest("edition", &inventory.edition_digest)?;
-            require_digest("layout", &inventory.layout_digest)?;
-            require_digest("payload", &inventory.payload_digest)?;
-            require_digest("canonical map", &inventory.canonical_map_digest)?;
+            require_present(inventory.object_row_count, "the Object row count")?;
+            require_digest("edition", inventory.edition_digest.as_deref())?;
+            require_digest("layout", inventory.layout_digest.as_deref())?;
+            require_digest("payload", inventory.payload_digest.as_deref())?;
+            require_digest("canonical map", inventory.canonical_map_digest.as_deref())?;
             let selected = inventory
                 .replica_health
                 .iter()
-                .find(|row| row.replica_ordinal == inventory.selected_replica_ordinal)
+                .find(|row| row.replica_ordinal == selected_replica_ordinal)
                 .expect("validated A/B/C health rows contain the selected ordinal");
             if pb::tape_index_replica_health::State::try_from(selected.state)
                 != Ok(pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete)
@@ -978,7 +1026,7 @@ fn validate_inventory(
                         "successful inventory carried unresolved replica evidence".to_string()
                     );
                 }
-                if row.replica_ordinal != inventory.selected_replica_ordinal
+                if row.replica_ordinal != selected_replica_ordinal
                     && state == pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete
                 {
                     return Err(
@@ -986,7 +1034,7 @@ fn validate_inventory(
                             .to_string(),
                     );
                 }
-                if row.replica_ordinal > inventory.selected_replica_ordinal
+                if row.replica_ordinal > selected_replica_ordinal
                     && state != pb::tape_index_replica_health::State::TapeIndexReplicaStateInvalid
                 {
                     return Err(
@@ -1003,25 +1051,29 @@ fn validate_inventory(
             }
         }
         InventoryOutcome::BotStructuralRecovered => {
-            if inventory.selected_attempt_id != 0 {
+            if inventory.selected_attempt_id.is_some() {
                 return Err("BOT recovery selected a terminal stream attempt".to_string());
             }
             validate_bot_recovery(inventory, invalid_count)?;
         }
         InventoryOutcome::BotStructuralRecoveryRequired => {
-            if inventory.selected_replica_ordinal != 0 || inventory.selected_attempt_id != 0 {
+            if inventory.selected_replica_ordinal.is_some()
+                || inventory.selected_attempt_id.is_some()
+            {
                 return Err("BOT recovery outcome selected a terminal replica".to_string());
             }
-            if inventory.structural_entry_count != 0
-                || inventory.object_row_count != 0
-                || !inventory.edition_digest.is_empty()
-                || !inventory.layout_digest.is_empty()
-                || !inventory.payload_digest.is_empty()
-                || !inventory.canonical_map_digest.is_empty()
-                || inventory.recovered_object_count != 0
-                || inventory.unknown_object_count != 0
-                || inventory.incomplete_object_count != 0
-                || inventory.damaged_region_count != 0
+            // No scan has run: every count and digest is absent. A present
+            // zero here would read as an empty tape.
+            if inventory.structural_entry_count.is_some()
+                || inventory.object_row_count.is_some()
+                || inventory.edition_digest.is_some()
+                || inventory.layout_digest.is_some()
+                || inventory.payload_digest.is_some()
+                || inventory.canonical_map_digest.is_some()
+                || inventory.recovered_object_count.is_some()
+                || inventory.unknown_object_count.is_some()
+                || inventory.incomplete_object_count.is_some()
+                || inventory.damaged_region_count.is_some()
             {
                 return Err(
                     "BOT recovery outcome carried successful terminal inventory data".to_string(),
@@ -1041,32 +1093,48 @@ fn validate_bot_recovery(
     inventory: &pb::TapeInventory,
     invalid_replica_count: usize,
 ) -> Result<(), String> {
-    if inventory.selected_replica_ordinal != 0 || invalid_replica_count != 3 {
+    if inventory.selected_replica_ordinal.is_some() || invalid_replica_count != 3 {
         return Err("BOT recovery incorrectly selected a terminal replica".to_string());
     }
-    if inventory.structural_entry_count == 0 {
+    let structural_entry_count = require_present(
+        inventory.structural_entry_count,
+        "the BOT structural entry count",
+    )?;
+    if structural_entry_count == 0 {
         return Err("BOT recovery returned an empty structural scan".to_string());
     }
-    if !inventory.edition_digest.is_empty()
-        || !inventory.layout_digest.is_empty()
-        || !inventory.payload_digest.is_empty()
+    if inventory.edition_digest.is_some()
+        || inventory.layout_digest.is_some()
+        || inventory.payload_digest.is_some()
     {
         return Err("BOT recovery carried unsupported terminal-edition digests".to_string());
     }
-    require_digest("BOT canonical map", &inventory.canonical_map_digest)?;
-    let expected_complete = inventory
-        .recovered_object_count
-        .checked_add(inventory.unknown_object_count)
+    require_digest(
+        "BOT canonical map",
+        inventory.canonical_map_digest.as_deref(),
+    )?;
+    let recovered = require_present(
+        inventory.recovered_object_count,
+        "the recovered Object count",
+    )?;
+    let unknown = require_present(inventory.unknown_object_count, "the unknown Object count")?;
+    let incomplete = require_present(
+        inventory.incomplete_object_count,
+        "the incomplete Object count",
+    )?;
+    require_present(inventory.damaged_region_count, "the damaged region count")?;
+    let expected_complete = recovered
+        .checked_add(unknown)
         .ok_or_else(|| "BOT recovery complete Object count overflows u64".to_string())?;
-    if inventory.object_row_count != expected_complete {
+    if require_present(inventory.object_row_count, "the BOT Object row count")? != expected_complete
+    {
         return Err("BOT recovery Object counts are inconsistent".to_string());
     }
     let total_candidates = expected_complete
-        .checked_add(inventory.incomplete_object_count)
+        .checked_add(incomplete)
         .ok_or_else(|| "BOT recovery emitted Object count overflows u64".to_string())?;
-    let structural_plus_torn = inventory
-        .structural_entry_count
-        .checked_add(u64::from(inventory.incomplete_object_count != 0))
+    let structural_plus_torn = structural_entry_count
+        .checked_add(u64::from(incomplete != 0))
         .ok_or_else(|| "BOT structural-plus-torn count overflows u64".to_string())?;
     if total_candidates > structural_plus_torn {
         return Err("BOT recovery Object counts exceed measured structural evidence".to_string());
@@ -1086,15 +1154,36 @@ fn require_exact_tape_uuid(actual: &[u8], expected: [u8; 16]) -> Result<(), Stri
     }
 }
 
-fn require_digest(name: &str, digest: &[u8]) -> Result<(), String> {
-    if digest.len() == 32 {
-        Ok(())
-    } else {
-        Err(format!(
+fn require_digest(name: &str, digest: Option<&[u8]>) -> Result<(), String> {
+    match digest {
+        None => Err(format!("daemon omitted the {name} digest")),
+        Some(digest) if digest.len() == 32 => Ok(()),
+        Some(digest) => Err(format!(
             "daemon returned {name} digest with length {}, expected 32",
             digest.len()
-        ))
+        )),
     }
+}
+
+/// A field the outcome carries. Absence is a daemon contract violation, never
+/// a zero to fill in.
+fn require_present<T: Copy>(value: Option<T>, what: &str) -> Result<T, String> {
+    value.ok_or_else(|| format!("daemon omitted {what}"))
+}
+
+/// JSON for a u64 count: decimal text when present, `null` when absent.
+fn count_json(count: Option<u64>) -> Value {
+    count.map_or(Value::Null, |count| Value::String(count.to_string()))
+}
+
+/// Human text for a count: the number when present, "unknown" when absent.
+fn count_text(count: Option<u64>) -> String {
+    count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+}
+
+/// JSON for a digest: lowercase hex when present, `null` when absent.
+fn digest_json(digest: Option<&[u8]>) -> Value {
+    digest.map_or(Value::Null, |digest| Value::String(bytes_to_hex(digest)))
 }
 
 fn validate_replica_health(health: &[pb::TapeIndexReplicaHealth]) -> Result<(), String> {
@@ -1179,29 +1268,28 @@ fn inventory_json(
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let selected = (inventory.selected_replica_ordinal != 0).then(|| {
+    let selected = inventory.selected_replica_ordinal.map(|ordinal| {
         json!({
-            "replica": replica_letter(inventory.selected_replica_ordinal),
-            "replica_ordinal": inventory.selected_replica_ordinal,
+            "replica": replica_letter(ordinal),
+            "replica_ordinal": ordinal,
         })
     });
-    let digest = |bytes: &[u8]| (!bytes.is_empty()).then(|| bytes_to_hex(bytes));
     Ok(json!({
         "tape_uuid": bytes_to_uuid_text(&inventory.tape_uuid),
         "outcome": outcome.name(),
         "inventory_basis": inventory.inventory_basis,
         "selected_replica": selected,
-        "selected_attempt_id": (inventory.selected_attempt_id != 0).then(|| inventory.selected_attempt_id.to_string()),
-        "structural_entry_count": inventory.structural_entry_count.to_string(),
-        "object_row_count": inventory.object_row_count.to_string(),
-        "edition_digest": digest(&inventory.edition_digest),
-        "layout_digest": digest(&inventory.layout_digest),
-        "payload_digest": digest(&inventory.payload_digest),
-        "canonical_map_digest": digest(&inventory.canonical_map_digest),
-        "recovered_object_count": inventory.recovered_object_count.to_string(),
-        "unknown_object_count": inventory.unknown_object_count.to_string(),
-        "incomplete_object_count": inventory.incomplete_object_count.to_string(),
-        "damaged_region_count": inventory.damaged_region_count.to_string(),
+        "selected_attempt_id": count_json(inventory.selected_attempt_id),
+        "structural_entry_count": count_json(inventory.structural_entry_count),
+        "object_row_count": count_json(inventory.object_row_count),
+        "edition_digest": digest_json(inventory.edition_digest.as_deref()),
+        "layout_digest": digest_json(inventory.layout_digest.as_deref()),
+        "payload_digest": digest_json(inventory.payload_digest.as_deref()),
+        "canonical_map_digest": digest_json(inventory.canonical_map_digest.as_deref()),
+        "recovered_object_count": count_json(inventory.recovered_object_count),
+        "unknown_object_count": count_json(inventory.unknown_object_count),
+        "incomplete_object_count": count_json(inventory.incomplete_object_count),
+        "damaged_region_count": count_json(inventory.damaged_region_count),
         "replica_health": health,
         "operator_recovery_required": outcome.requires_operator_recovery(),
         "detail": inventory.detail,
@@ -1232,49 +1320,58 @@ fn print_inventory(
     writeln!(out, "outcome: {}", outcome.name()).map_err(|error| error.to_string())?;
     writeln!(out, "inventory_basis: {}", inventory.inventory_basis)
         .map_err(|error| error.to_string())?;
+    // No selection exists on the BOT outcomes, so both print "-".
     writeln!(
         out,
         "selected_replica: {}",
-        replica_letter(inventory.selected_replica_ordinal)
+        inventory
+            .selected_replica_ordinal
+            .map_or("-", replica_letter)
     )
     .map_err(|error| error.to_string())?;
     writeln!(
         out,
         "selected_attempt_id: {}",
-        inventory.selected_attempt_id
+        inventory
+            .selected_attempt_id
+            .map_or_else(|| "-".to_string(), |attempt_id| attempt_id.to_string())
     )
     .map_err(|error| error.to_string())?;
     writeln!(
         out,
         "structural_entry_count: {}",
-        inventory.structural_entry_count
+        count_text(inventory.structural_entry_count)
     )
     .map_err(|error| error.to_string())?;
-    writeln!(out, "object_row_count: {}", inventory.object_row_count)
-        .map_err(|error| error.to_string())?;
+    writeln!(
+        out,
+        "object_row_count: {}",
+        count_text(inventory.object_row_count)
+    )
+    .map_err(|error| error.to_string())?;
     if outcome == InventoryOutcome::BotStructuralRecovered {
         writeln!(
             out,
             "recovered_object_count: {}",
-            inventory.recovered_object_count
+            count_text(inventory.recovered_object_count)
         )
         .map_err(|error| error.to_string())?;
         writeln!(
             out,
             "unknown_object_count: {}",
-            inventory.unknown_object_count
+            count_text(inventory.unknown_object_count)
         )
         .map_err(|error| error.to_string())?;
         writeln!(
             out,
             "incomplete_object_count: {}",
-            inventory.incomplete_object_count
+            count_text(inventory.incomplete_object_count)
         )
         .map_err(|error| error.to_string())?;
         writeln!(
             out,
             "damaged_region_count: {}",
-            inventory.damaged_region_count
+            count_text(inventory.damaged_region_count)
         )
         .map_err(|error| error.to_string())?;
     }
@@ -1301,31 +1398,15 @@ fn print_inventory(
         )
         .map_err(|error| error.to_string())?;
     }
-    if !inventory.edition_digest.is_empty() {
-        writeln!(
-            out,
-            "edition_digest: {}",
-            bytes_to_hex(&inventory.edition_digest)
-        )
-        .map_err(|error| error.to_string())?;
-        writeln!(
-            out,
-            "layout_digest: {}",
-            bytes_to_hex(&inventory.layout_digest)
-        )
-        .map_err(|error| error.to_string())?;
-        writeln!(
-            out,
-            "payload_digest: {}",
-            bytes_to_hex(&inventory.payload_digest)
-        )
-        .map_err(|error| error.to_string())?;
-        writeln!(
-            out,
-            "canonical_map_digest: {}",
-            bytes_to_hex(&inventory.canonical_map_digest)
-        )
-        .map_err(|error| error.to_string())?;
+    for (name, digest) in [
+        ("edition_digest", &inventory.edition_digest),
+        ("layout_digest", &inventory.layout_digest),
+        ("payload_digest", &inventory.payload_digest),
+        ("canonical_map_digest", &inventory.canonical_map_digest),
+    ] {
+        if let Some(digest) = digest {
+            writeln!(out, "{name}: {}", bytes_to_hex(digest)).map_err(|error| error.to_string())?;
+        }
     }
     writeln!(out, "detail: {}", inventory.detail).map_err(|error| error.to_string())
 }
@@ -1391,7 +1472,7 @@ fn print_verification(
                 "separation": if gap.separation_ordinal == 1 { "AB" } else { "BC" },
                 "separation_ordinal": gap.separation_ordinal,
                 "state": separation_state_name(gap.state)?,
-                "verified_interior_record_count": gap.verified_interior_record_count.to_string(),
+                "verified_interior_record_count": count_json(gap.verified_interior_record_count),
                 "detail": gap.detail,
             }))
         })
@@ -1457,13 +1538,13 @@ fn print_verification(
                 "complete": complete,
                 "verification_basis": verification.verification_basis,
                 "measured_eod_lba": verification.measured_eod_lba.to_string(),
-                "verified_prefix_tape_file_count": verification.verified_prefix_tape_file_count.to_string(),
-                "verified_prefix_record_count": verification.verified_prefix_record_count.to_string(),
+                "verified_prefix_tape_file_count": count_json(verification.verified_prefix_tape_file_count),
+                "verified_prefix_record_count": count_json(verification.verified_prefix_record_count),
                 "measured_tape_file_count": verification.measured_tape_file_count.to_string(),
-                "edition_digest": bytes_to_hex(&verification.edition_digest),
-                "layout_digest": bytes_to_hex(&verification.layout_digest),
-                "payload_digest": bytes_to_hex(&verification.payload_digest),
-                "canonical_map_digest": bytes_to_hex(&verification.canonical_map_digest),
+                "edition_digest": digest_json(verification.edition_digest.as_deref()),
+                "layout_digest": digest_json(verification.layout_digest.as_deref()),
+                "payload_digest": digest_json(verification.payload_digest.as_deref()),
+                "canonical_map_digest": digest_json(verification.canonical_map_digest.as_deref()),
                 "replica_health": replica_json,
                 "separation_health": separation_json,
                 "detail": verification.detail,
@@ -1486,13 +1567,13 @@ fn print_verification(
     writeln!(
         out,
         "verified_prefix_tape_file_count: {}",
-        verification.verified_prefix_tape_file_count
+        count_text(verification.verified_prefix_tape_file_count)
     )
     .map_err(|error| error.to_string())?;
     writeln!(
         out,
         "verified_prefix_record_count: {}",
-        verification.verified_prefix_record_count
+        count_text(verification.verified_prefix_record_count)
     )
     .map_err(|error| error.to_string())?;
     writeln!(
@@ -1507,7 +1588,10 @@ fn print_verification(
         ("payload_digest", &verification.payload_digest),
         ("canonical_map_digest", &verification.canonical_map_digest),
     ] {
-        writeln!(out, "{name}: {}", bytes_to_hex(digest)).map_err(|error| error.to_string())?;
+        let digest = digest
+            .as_deref()
+            .map_or_else(|| "unknown".to_string(), bytes_to_hex);
+        writeln!(out, "{name}: {digest}").map_err(|error| error.to_string())?;
     }
     writeln!(out, "replica_health:").map_err(|error| error.to_string())?;
     for row in replicas {
@@ -1531,7 +1615,7 @@ fn print_verification(
                 "BC"
             },
             separation_state_name(gap.state)?,
-            gap.verified_interior_record_count,
+            count_text(gap.verified_interior_record_count),
             gap.detail
         )
         .map_err(|error| error.to_string())?;
@@ -1573,25 +1657,26 @@ mod tests {
         pb::TapeInventory {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
             outcome: outcome as i32,
-            selected_replica_ordinal: 3,
+            selected_replica_ordinal: Some(3),
             replica_health: match outcome {
                 pb::TapeInventoryOutcome::Complete => health(envelope, envelope, complete),
                 pb::TapeInventoryOutcome::Degraded => health(invalid, envelope, complete),
                 _ => unreachable!(),
             },
-            structural_entry_count: 9,
-            object_row_count: 8,
-            edition_digest: vec![1; 32],
-            layout_digest: vec![2; 32],
-            payload_digest: vec![3; 32],
-            canonical_map_digest: vec![4; 32],
+            structural_entry_count: Some(9),
+            object_row_count: Some(8),
+            edition_digest: Some(vec![1; 32]),
+            layout_digest: Some(vec![2; 32]),
+            payload_digest: Some(vec![3; 32]),
+            canonical_map_digest: Some(vec![4; 32]),
             inventory_basis: FAST_INVENTORY_BASIS.to_string(),
             detail: "selected newest valid replica C".to_string(),
-            recovered_object_count: 0,
-            unknown_object_count: 0,
-            incomplete_object_count: 0,
-            damaged_region_count: 0,
-            selected_attempt_id: 1,
+            // The fast path runs no BOT classification.
+            recovered_object_count: None,
+            unknown_object_count: None,
+            incomplete_object_count: None,
+            damaged_region_count: None,
+            selected_attempt_id: Some(1),
         }
     }
 
@@ -1600,22 +1685,23 @@ mod tests {
         pb::TapeInventory {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
             outcome: pb::TapeInventoryOutcome::BotStructuralRecoveryRequired as i32,
-            selected_replica_ordinal: 0,
+            selected_replica_ordinal: None,
             replica_health: health(invalid, invalid, invalid),
-            structural_entry_count: 0,
-            object_row_count: 0,
-            edition_digest: Vec::new(),
-            layout_digest: Vec::new(),
-            payload_digest: Vec::new(),
-            canonical_map_digest: Vec::new(),
+            // No scan has run: nothing is known, so nothing is present.
+            structural_entry_count: None,
+            object_row_count: None,
+            edition_digest: None,
+            layout_digest: None,
+            payload_digest: None,
+            canonical_map_digest: None,
             inventory_basis: FAST_INVENTORY_BASIS.to_string(),
             detail: "terminal replicas invalid; structural recovery from BOT is required"
                 .to_string(),
-            recovered_object_count: 0,
-            unknown_object_count: 0,
-            incomplete_object_count: 0,
-            damaged_region_count: 0,
-            selected_attempt_id: 0,
+            recovered_object_count: None,
+            unknown_object_count: None,
+            incomplete_object_count: None,
+            damaged_region_count: None,
+            selected_attempt_id: None,
         }
     }
 
@@ -1624,21 +1710,21 @@ mod tests {
         pb::TapeInventory {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
             outcome: pb::TapeInventoryOutcome::BotStructuralRecovered as i32,
-            selected_replica_ordinal: 0,
+            selected_replica_ordinal: None,
             replica_health: health(invalid, invalid, invalid),
-            structural_entry_count: 4,
-            object_row_count: 2,
-            edition_digest: Vec::new(),
-            layout_digest: Vec::new(),
-            payload_digest: Vec::new(),
-            canonical_map_digest: vec![4; 32],
+            structural_entry_count: Some(4),
+            object_row_count: Some(2),
+            edition_digest: None,
+            layout_digest: None,
+            payload_digest: None,
+            canonical_map_digest: Some(vec![4; 32]),
             inventory_basis: "bot_structural_recovery".to_string(),
             detail: "BOT recovery classified Object candidates".to_string(),
-            recovered_object_count: 1,
-            unknown_object_count: 1,
-            incomplete_object_count: 1,
-            damaged_region_count: 1,
-            selected_attempt_id: 0,
+            recovered_object_count: Some(1),
+            unknown_object_count: Some(1),
+            incomplete_object_count: Some(1),
+            damaged_region_count: Some(1),
+            selected_attempt_id: None,
         }
     }
 
@@ -1695,17 +1781,24 @@ mod tests {
     #[test]
     fn inventory_json_preserves_structural_u64_max_as_decimal_text() {
         let mut inventory = complete_inventory(pb::TapeInventoryOutcome::Complete);
-        inventory.structural_entry_count = u64::MAX;
-        inventory.object_row_count = u64::MAX;
-        inventory.recovered_object_count = u64::MAX;
-        inventory.unknown_object_count = u64::MAX;
-        inventory.incomplete_object_count = u64::MAX;
-        inventory.damaged_region_count = u64::MAX;
+        inventory.structural_entry_count = Some(u64::MAX);
+        inventory.object_row_count = Some(u64::MAX);
 
         let value = inventory_json(&inventory, InventoryOutcome::Complete).unwrap();
+        for field in ["structural_entry_count", "object_row_count"] {
+            assert_eq!(value[field], u64::MAX.to_string());
+        }
+
+        // The recovery counts exist only on a BOT-recovered summary, so their
+        // width is checked there rather than on a combination the wire forbids.
+        let mut inventory = bot_recovered_inventory();
+        inventory.recovered_object_count = Some(u64::MAX);
+        inventory.unknown_object_count = Some(u64::MAX);
+        inventory.incomplete_object_count = Some(u64::MAX);
+        inventory.damaged_region_count = Some(u64::MAX);
+
+        let value = inventory_json(&inventory, InventoryOutcome::BotStructuralRecovered).unwrap();
         for field in [
-            "structural_entry_count",
-            "object_row_count",
             "recovered_object_count",
             "unknown_object_count",
             "incomplete_object_count",
@@ -1725,6 +1818,10 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("outcome: bot_structural_recovery_required"));
         assert!(text.contains("operator_recovery_required: true"));
+        // No scan has run, so the counts are unknown, not zero.
+        assert!(text.contains("selected_attempt_id: -\n"));
+        assert!(text.contains("structural_entry_count: unknown\n"));
+        assert!(text.contains("object_row_count: unknown\n"));
 
         let mut false_success = inventory;
         false_success.outcome = pb::TapeInventoryOutcome::Complete as i32;
@@ -1859,25 +1956,25 @@ mod tests {
                     separation_ordinal: 1,
                     state: pb::tape_index_separation_health::State::TapeIndexSeparationStateValid
                         as i32,
-                    verified_interior_record_count: 4094,
+                    verified_interior_record_count: Some(4094),
                     detail: "valid".to_string(),
                 },
                 pb::TapeIndexSeparationHealth {
                     separation_ordinal: 2,
                     state: pb::tape_index_separation_health::State::TapeIndexSeparationStateValid
                         as i32,
-                    verified_interior_record_count: 4094,
+                    verified_interior_record_count: Some(4094),
                     detail: "valid".to_string(),
                 },
             ],
             measured_eod_lba: 12_300,
-            verified_prefix_tape_file_count: 4,
-            verified_prefix_record_count: 11,
+            verified_prefix_tape_file_count: Some(4),
+            verified_prefix_record_count: Some(11),
             measured_tape_file_count: 9,
-            edition_digest: vec![1; 32],
-            layout_digest: vec![2; 32],
-            payload_digest: vec![3; 32],
-            canonical_map_digest: vec![4; 32],
+            edition_digest: Some(vec![1; 32]),
+            layout_digest: Some(vec![2; 32]),
+            payload_digest: Some(vec![3; 32]),
+            canonical_map_digest: Some(vec![4; 32]),
             verification_basis: "measured_full_physical".to_string(),
             recovery_inventory: None,
         };
@@ -1929,18 +2026,18 @@ mod tests {
                 .map(|separation_ordinal| pb::TapeIndexSeparationHealth {
                     separation_ordinal,
                     state: valid_gap,
-                    verified_interior_record_count: 4094,
+                    verified_interior_record_count: Some(4094),
                     detail: "valid".to_string(),
                 })
                 .collect(),
             measured_eod_lba: 12_300,
-            verified_prefix_tape_file_count: 4,
-            verified_prefix_record_count: 11,
+            verified_prefix_tape_file_count: Some(4),
+            verified_prefix_record_count: Some(11),
             measured_tape_file_count: 9,
-            edition_digest: vec![1; 32],
-            layout_digest: vec![2; 32],
-            payload_digest: vec![3; 32],
-            canonical_map_digest: vec![4; 32],
+            edition_digest: Some(vec![1; 32]),
+            layout_digest: Some(vec![2; 32]),
+            payload_digest: Some(vec![3; 32]),
+            canonical_map_digest: Some(vec![4; 32]),
             verification_basis: "measured_full_physical".to_string(),
             ..Default::default()
         };
@@ -1971,12 +2068,14 @@ mod tests {
                 .map(|separation_ordinal| pb::TapeIndexSeparationHealth {
                     separation_ordinal,
                     state: unknown_gap,
-                    verified_interior_record_count: 0,
+                    verified_interior_record_count: None,
                     detail: "unknown".to_string(),
                 })
                 .collect(),
             measured_eod_lba: 12_300,
-            measured_tape_file_count: recovery.structural_entry_count,
+            measured_tape_file_count: recovery
+                .structural_entry_count
+                .expect("BOT recovery fixture counts its structure"),
             verification_basis: "bot_structural_recovery".to_string(),
             recovery_inventory: Some(recovery),
             ..Default::default()
@@ -1994,5 +2093,230 @@ mod tests {
             envelope["data"]["recovery_inventory"]["outcome"],
             "bot_structural_recovered"
         );
+        // Unknown gaps have no verified count: null, not "0".
+        for gap in 0..2 {
+            assert_eq!(
+                envelope["data"]["separation_health"][gap]["verified_interior_record_count"],
+                Value::Null
+            );
+        }
+    }
+
+    fn verified_degraded_with_invalid_bc() -> pb::TapeIndexVerification {
+        let complete = pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete as i32;
+        pb::TapeIndexVerification {
+            tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
+            state: pb::TapeIndexVerificationState::VerifiedDegraded as i32,
+            detail: "separation BC invalid".to_string(),
+            replica_health: health(complete, complete, complete),
+            separation_health: vec![
+                pb::TapeIndexSeparationHealth {
+                    separation_ordinal: 1,
+                    state: pb::tape_index_separation_health::State::TapeIndexSeparationStateValid
+                        as i32,
+                    // A two-record extent: zero interior records, a real count.
+                    verified_interior_record_count: Some(0),
+                    detail: "valid".to_string(),
+                },
+                pb::TapeIndexSeparationHealth {
+                    separation_ordinal: 2,
+                    state: pb::tape_index_separation_health::State::TapeIndexSeparationStateInvalid
+                        as i32,
+                    verified_interior_record_count: None,
+                    detail: "footer missing".to_string(),
+                },
+            ],
+            measured_eod_lba: 12_300,
+            verified_prefix_tape_file_count: Some(4),
+            verified_prefix_record_count: Some(11),
+            measured_tape_file_count: 9,
+            edition_digest: Some(vec![1; 32]),
+            layout_digest: Some(vec![2; 32]),
+            payload_digest: Some(vec![3; 32]),
+            canonical_map_digest: Some(vec![4; 32]),
+            verification_basis: "measured_full_physical".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bot_recovery_required_json_reports_unscanned_counts_as_null() {
+        let inventory = recovery_inventory();
+        let outcome = validate_inventory(&inventory, *Uuid::from_u128(1).as_bytes()).unwrap();
+        let value = inventory_json(&inventory, outcome).unwrap();
+        for field in [
+            "selected_replica",
+            "selected_attempt_id",
+            "structural_entry_count",
+            "object_row_count",
+            "edition_digest",
+            "layout_digest",
+            "payload_digest",
+            "canonical_map_digest",
+            "recovered_object_count",
+            "unknown_object_count",
+            "incomplete_object_count",
+            "damaged_region_count",
+        ] {
+            assert_eq!(value[field], Value::Null, "{field}");
+        }
+    }
+
+    #[test]
+    fn fast_inventory_json_reports_unperformed_bot_counts_as_null() {
+        let inventory = complete_inventory(pb::TapeInventoryOutcome::Complete);
+        let outcome = validate_inventory(&inventory, *Uuid::from_u128(1).as_bytes()).unwrap();
+        let value = inventory_json(&inventory, outcome).unwrap();
+        for field in [
+            "recovered_object_count",
+            "unknown_object_count",
+            "incomplete_object_count",
+            "damaged_region_count",
+        ] {
+            assert_eq!(value[field], Value::Null, "{field}");
+        }
+        assert_eq!(value["selected_attempt_id"], "1");
+    }
+
+    #[test]
+    fn complete_inventory_with_no_objects_renders_a_real_zero() {
+        let mut inventory = complete_inventory(pb::TapeInventoryOutcome::Complete);
+        inventory.object_row_count = Some(0);
+        let outcome = validate_inventory(&inventory, *Uuid::from_u128(1).as_bytes()).unwrap();
+        let value = inventory_json(&inventory, outcome).unwrap();
+        assert_eq!(value["object_row_count"], "0");
+
+        let mut out = Vec::new();
+        print_inventory(&inventory, outcome, false, &mut out).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("object_row_count: 0\n"));
+    }
+
+    #[test]
+    fn bot_recovered_with_no_torn_file_renders_a_real_zero() {
+        let mut inventory = bot_recovered_inventory();
+        inventory.incomplete_object_count = Some(0);
+        let outcome = validate_inventory(&inventory, *Uuid::from_u128(1).as_bytes()).unwrap();
+        let value = inventory_json(&inventory, outcome).unwrap();
+        assert_eq!(value["incomplete_object_count"], "0");
+    }
+
+    #[test]
+    fn torn_bot_object_reports_its_unmeasured_block_count_as_null() {
+        let torn = pb::TapeInventoryBotObject {
+            tape_file_number: 5,
+            stored_block_count: None,
+            object_id: None,
+            state: pb::TapeInventoryBotObjectState::Incomplete as i32,
+        };
+        let mut out = Vec::new();
+        print_inventory_bot_object(&torn, true, &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["schema"], INVENTORY_STREAM_JSON_SCHEMA);
+        assert_eq!(value["value"]["stored_block_count"], Value::Null);
+        assert_eq!(value["value"]["state"], "incomplete");
+
+        let mut out = Vec::new();
+        print_inventory_bot_object(&torn, false, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains(" blocks=unknown "));
+
+        let complete = pb::TapeInventoryBotObject {
+            stored_block_count: Some(7),
+            state: pb::TapeInventoryBotObjectState::Unknown as i32,
+            ..torn
+        };
+        let mut out = Vec::new();
+        print_inventory_bot_object(&complete, true, &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["value"]["stored_block_count"], "7");
+    }
+
+    #[test]
+    fn invalid_gap_reports_null_and_a_two_record_gap_reports_zero() {
+        let verification = verified_degraded_with_invalid_bc();
+        let fast = validate_verification(&verification, *Uuid::from_u128(1).as_bytes()).unwrap();
+        let mut out = Vec::new();
+        print_verification(&verification, fast, true, &mut out).unwrap();
+        let envelope: Value = serde_json::from_slice(&out).unwrap();
+        let gaps = &envelope["data"]["separation_health"];
+        assert_eq!(gaps[0]["state"], "valid");
+        assert_eq!(gaps[0]["verified_interior_record_count"], "0");
+        assert_eq!(gaps[1]["state"], "invalid");
+        assert_eq!(gaps[1]["verified_interior_record_count"], Value::Null);
+
+        let mut out = Vec::new();
+        print_verification(&verification, fast, false, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("  AB: valid (0 interior records; valid)\n"));
+        assert!(text.contains("  BC: invalid (unknown interior records; footer missing)\n"));
+    }
+
+    #[test]
+    fn presence_that_contradicts_the_outcome_is_rejected() {
+        let tape = *Uuid::from_u128(1).as_bytes();
+
+        // A present zero on a fast outcome claims a BOT classification that
+        // never ran.
+        let mut invalid = complete_inventory(pb::TapeInventoryOutcome::Complete);
+        invalid.incomplete_object_count = Some(0);
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("carried BOT recovery evidence"));
+
+        let mut invalid = complete_inventory(pb::TapeInventoryOutcome::Complete);
+        invalid.object_row_count = None;
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("omitted the Object row count"));
+
+        let mut invalid = complete_inventory(pb::TapeInventoryOutcome::Complete);
+        invalid.selected_attempt_id = None;
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("omitted the selected inventory stream attempt"));
+
+        let mut invalid = complete_inventory(pb::TapeInventoryOutcome::Complete);
+        invalid.edition_digest = Some(Vec::new());
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("edition digest with length 0"));
+
+        // A present zero count on BOT-recovery-required reads as an empty tape.
+        let mut invalid = recovery_inventory();
+        invalid.structural_entry_count = Some(0);
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("carried successful terminal inventory data"));
+
+        let mut invalid = recovery_inventory();
+        invalid.selected_replica_ordinal = Some(0);
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("selected a terminal replica"));
+
+        let mut invalid = bot_recovered_inventory();
+        invalid.damaged_region_count = None;
+        assert!(validate_inventory(&invalid, tape)
+            .unwrap_err()
+            .contains("omitted the damaged region count"));
+
+        let mut invalid = verified_degraded_with_invalid_bc();
+        invalid.separation_health[1].verified_interior_record_count = Some(0);
+        assert!(validate_verification(&invalid, tape)
+            .unwrap_err()
+            .contains("invalid separation evidence carried"));
+
+        let mut invalid = verified_degraded_with_invalid_bc();
+        invalid.separation_health[0].verified_interior_record_count = None;
+        assert!(validate_verification(&invalid, tape)
+            .unwrap_err()
+            .contains("valid separation evidence omitted"));
+
+        let mut invalid = verified_degraded_with_invalid_bc();
+        invalid.verified_prefix_record_count = None;
+        assert!(validate_verification(&invalid, tape)
+            .unwrap_err()
+            .contains("omitted the verified prefix record count"));
     }
 }

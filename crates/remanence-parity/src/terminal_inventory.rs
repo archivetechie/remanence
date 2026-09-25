@@ -3238,10 +3238,13 @@ mod tests {
             objects[0].object_id.as_deref(),
             Some(b"committed-object".as_slice())
         );
+        assert_eq!(objects[0].stored_block_count, Some(1));
         assert_eq!(objects[1].state, BotRecoveredObjectState::Unknown);
         assert!(objects[1].object_id.is_none());
+        assert_eq!(objects[1].stored_block_count, Some(1));
         assert_eq!(objects[2].state, BotRecoveredObjectState::Incomplete);
         assert!(objects[2].object_id.is_none());
+        assert_eq!(objects[2].stored_block_count, None);
     }
 
     #[test]
@@ -3264,7 +3267,10 @@ mod tests {
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].tape_file_number, 1);
         assert_eq!(objects[0].state, BotRecoveredObjectState::Incomplete);
-        assert_eq!(objects[0].stored_block_count, 0);
+        assert_eq!(
+            objects[0].stored_block_count, None,
+            "a torn Object's block count was never measured, so it is absent, not zero"
+        );
     }
 
     #[test]

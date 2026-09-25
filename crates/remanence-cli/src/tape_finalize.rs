@@ -23,6 +23,8 @@ use super::{
 
 const FINALIZATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FINALIZATION_JSON_SCHEMA: &str = "rem.tape.finalization.v2";
+/// The only trigger that carries an operator operation id.
+const OPERATOR_CLOSE_OUT_TRIGGER: &str = "operator_close_out";
 
 #[derive(Args, Clone, Debug)]
 pub(crate) struct TapeFinalizeArgs {
@@ -286,7 +288,13 @@ fn execute_with_transport<T: FinalizationTransport>(
     if !wait || terminal {
         return Ok(status);
     }
-    let operation_id = operation_id.expect("validated in-progress finalization has operation_id");
+    // Only an operator close-out carries an operation id, and FinalizeTape is
+    // always one; without it the poll could not prove it follows this request.
+    let operation_id = operation_id.ok_or_else(|| {
+        DaemonClientError::client(
+            "daemon accepted FinalizeTape without an operation_id; cannot poll the operation",
+        )
+    })?;
 
     loop {
         if !poll_interval.is_zero() {
@@ -340,12 +348,14 @@ fn validate_status(
                 "daemon returned BUSY while polling an accepted finalization operation",
             ));
         }
-        if !status.operation_id.is_empty()
+        // The daemon never read the tape, so every accepted-operation field
+        // must be absent, not merely zero or empty.
+        if status.operation_id.is_some()
             || status.progress != pb::TapeFinalizationProgress::Unspecified as i32
-            || status.completed_replicas != 0
+            || status.completed_replicas.is_some()
             || !status.replica_progress.is_empty()
-            || !status.edition_digest.is_empty()
-            || !status.layout_digest.is_empty()
+            || status.edition_digest.is_some()
+            || status.layout_digest.is_some()
         {
             return Err(DaemonClientError::client(
                 "daemon returned BUSY with accepted-operation fields",
@@ -371,33 +381,43 @@ fn validate_status(
     let expected_completed = completed_replicas_for_progress(progress).ok_or_else(|| {
         DaemonClientError::client("daemon returned unspecified tape finalization progress")
     })?;
-    let operation_id = if status.operation_id.is_empty() {
-        return Err(DaemonClientError::client(
-            "daemon returned finalization status without an operation_id",
-        ));
-    } else {
-        let operation_id = <[u8; 16]>::try_from(status.operation_id.as_slice()).map_err(|_| {
-            DaemonClientError::client(format!(
-                "daemon returned operation_id with {} bytes; expected 16",
-                status.operation_id.len()
-            ))
-        })?;
-        if operation_id == [0; 16] {
+    // Only an operator close-out has an operation; a finalization an automatic
+    // trigger started has none, and the catalog enforces exactly that pairing.
+    let operation_id = match status.operation_id.as_deref() {
+        None if status.trigger == OPERATOR_CLOSE_OUT_TRIGGER => {
             return Err(DaemonClientError::client(
-                "daemon returned the nil finalization operation_id",
+                "daemon returned finalization status without an operation_id",
             ));
         }
-        Some(operation_id)
+        None => None,
+        Some(bytes) => {
+            let operation_id = <[u8; 16]>::try_from(bytes).map_err(|_| {
+                DaemonClientError::client(format!(
+                    "daemon returned operation_id with {} bytes; expected 16",
+                    bytes.len()
+                ))
+            })?;
+            if operation_id == [0; 16] {
+                return Err(DaemonClientError::client(
+                    "daemon returned the nil finalization operation_id",
+                ));
+            }
+            Some(operation_id)
+        }
     };
     if expected_operation_id.is_some_and(|expected| operation_id.as_ref() != Some(expected)) {
         return Err(DaemonClientError::client(
             "daemon changed the finalization operation_id while polling",
         ));
     }
-    if status.completed_replicas != expected_completed {
+    let completed_replicas = status.completed_replicas.ok_or_else(|| {
+        DaemonClientError::client(
+            "daemon returned an accepted finalization without completed_replicas",
+        )
+    })?;
+    if completed_replicas != expected_completed {
         return Err(DaemonClientError::client(format!(
-            "daemon returned completed_replicas {} inconsistent with progress {} (expected {expected_completed})",
-            status.completed_replicas,
+            "daemon returned completed_replicas {completed_replicas} inconsistent with progress {} (expected {expected_completed})",
             progress_name(status.progress),
         )));
     }
@@ -468,15 +488,25 @@ fn validate_status(
             ordinals.len()
         )));
     }
+    // Once a finalization is recorded both digests are known, so an accepted
+    // status must carry them; present-but-empty is malformed, not absent.
     for (name, digest) in [
-        ("edition_digest", status.edition_digest.as_slice()),
-        ("layout_digest", status.layout_digest.as_slice()),
+        ("edition_digest", status.edition_digest.as_deref()),
+        ("layout_digest", status.layout_digest.as_deref()),
     ] {
-        if !digest.is_empty() && digest.len() != 32 {
-            return Err(DaemonClientError::client(format!(
-                "daemon returned {name} with {} bytes; expected 32 or absent",
-                digest.len()
-            )));
+        match digest {
+            None => {
+                return Err(DaemonClientError::client(format!(
+                    "daemon returned an accepted finalization without {name}"
+                )));
+            }
+            Some(digest) if digest.len() != 32 => {
+                return Err(DaemonClientError::client(format!(
+                    "daemon returned {name} with {} bytes; expected 32",
+                    digest.len()
+                )));
+            }
+            Some(_) => {}
         }
     }
     Ok(operation_id)
@@ -570,11 +600,10 @@ fn print_finalization(
         bytes_to_uuid_text(&finalization.tape_uuid)
     )
     .map_err(|error| format!("write finalization status: {error}"))?;
-    let operation_id = if finalization.operation_id.is_empty() {
-        "-".to_string()
-    } else {
-        bytes_to_uuid_text(&finalization.operation_id)
-    };
+    let operation_id = finalization
+        .operation_id
+        .as_deref()
+        .map_or_else(|| "-".to_string(), bytes_to_uuid_text);
     writeln!(out, "operation_id: {operation_id}")
         .map_err(|error| format!("write finalization status: {error}"))?;
     writeln!(out, "outcome: {}", outcome_name(finalization.outcome)?)
@@ -583,12 +612,12 @@ fn print_finalization(
         .map_err(|error| format!("write finalization status: {error}"))?;
     writeln!(out, "progress: {}", progress_name(finalization.progress))
         .map_err(|error| format!("write finalization status: {error}"))?;
-    writeln!(
-        out,
-        "completed_replicas: {}/3",
-        finalization.completed_replicas
-    )
-    .map_err(|error| format!("write finalization status: {error}"))?;
+    let completed_replicas = finalization.completed_replicas.map_or_else(
+        || "unknown".to_string(),
+        |completed| format!("{completed}/3"),
+    );
+    writeln!(out, "completed_replicas: {completed_replicas}")
+        .map_err(|error| format!("write finalization status: {error}"))?;
     writeln!(
         out,
         "operator_recovery_required: {}",
@@ -617,21 +646,13 @@ fn print_finalization(
             .map_err(|error| format!("write finalization status: {error}"))?;
         }
     }
-    if !finalization.edition_digest.is_empty() {
-        writeln!(
-            out,
-            "edition_digest: {}",
-            bytes_to_hex(&finalization.edition_digest)
-        )
-        .map_err(|error| format!("write finalization status: {error}"))?;
+    if let Some(digest) = finalization.edition_digest.as_deref() {
+        writeln!(out, "edition_digest: {}", bytes_to_hex(digest))
+            .map_err(|error| format!("write finalization status: {error}"))?;
     }
-    if !finalization.layout_digest.is_empty() {
-        writeln!(
-            out,
-            "layout_digest: {}",
-            bytes_to_hex(&finalization.layout_digest)
-        )
-        .map_err(|error| format!("write finalization status: {error}"))?;
+    if let Some(digest) = finalization.layout_digest.as_deref() {
+        writeln!(out, "layout_digest: {}", bytes_to_hex(digest))
+            .map_err(|error| format!("write finalization status: {error}"))?;
     }
     if !finalization.detail.is_empty() {
         writeln!(out, "detail: {}", finalization.detail)
@@ -654,19 +675,18 @@ fn finalization_json(finalization: &pb::TapeFinalization) -> Result<Value, Strin
         .collect::<Vec<_>>();
     Ok(json!({
         "tape_uuid": bytes_to_uuid_text(&finalization.tape_uuid),
-        "operation_id": if finalization.operation_id.is_empty() {
-            Value::Null
-        } else {
-            Value::String(bytes_to_uuid_text(&finalization.operation_id))
-        },
+        "operation_id": finalization
+            .operation_id
+            .as_deref()
+            .map_or(Value::Null, |operation_id| Value::String(bytes_to_uuid_text(operation_id))),
         "outcome": outcome_name(finalization.outcome)?,
         "trigger": finalization.trigger,
         "progress": progress_name(finalization.progress),
         "completed_replicas": finalization.completed_replicas,
         "replica_count": 3,
         "replica_progress": replica_progress,
-        "edition_digest": digest_json(&finalization.edition_digest),
-        "layout_digest": digest_json(&finalization.layout_digest),
+        "edition_digest": digest_json(finalization.edition_digest.as_deref()),
+        "layout_digest": digest_json(finalization.layout_digest.as_deref()),
         "terminal": terminal,
         "operator_recovery_required": matches!(
             pb::TapeFinalizationOutcome::try_from(finalization.outcome),
@@ -684,12 +704,8 @@ fn ordered_replica_progress(
     replicas
 }
 
-fn digest_json(bytes: &[u8]) -> Value {
-    if bytes.is_empty() {
-        Value::Null
-    } else {
-        Value::String(bytes_to_hex(bytes))
-    }
+fn digest_json(bytes: Option<&[u8]>) -> Value {
+    bytes.map_or(Value::Null, |bytes| Value::String(bytes_to_hex(bytes)))
 }
 
 fn progress_name(progress: i32) -> &'static str {
@@ -763,9 +779,9 @@ mod tests {
     fn status(outcome: pb::TapeFinalizationOutcome) -> pb::TapeFinalization {
         let mut status = pb::TapeFinalization {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
-            operation_id: Uuid::from_u128(3).as_bytes().to_vec(),
+            operation_id: Some(Uuid::from_u128(3).as_bytes().to_vec()),
             progress: pb::TapeFinalizationProgress::BeforeReplicaA as i32,
-            completed_replicas: 0,
+            completed_replicas: Some(0),
             replica_health: Vec::new(),
             replica_progress: (1..=3)
                 .map(|replica_ordinal| pb::TapeIndexReplicaProgress {
@@ -776,8 +792,10 @@ mod tests {
                     detail: String::new(),
                 })
                 .collect(),
-            edition_digest: Vec::new(),
-            layout_digest: Vec::new(),
+            // An accepted finalization always has both digests: the projection
+            // columns are required once progress exists.
+            edition_digest: Some(vec![0xed; 32]),
+            layout_digest: Some(vec![0x1a; 32]),
             outcome: outcome as i32,
             trigger: "operator_close_out".to_string(),
             detail: "accepted".to_string(),
@@ -791,14 +809,15 @@ mod tests {
         progress: pb::TapeFinalizationProgress,
     ) {
         status.progress = progress as i32;
-        status.completed_replicas =
+        let completed =
             completed_replicas_for_progress(progress).expect("test progress is specified");
+        status.completed_replicas = Some(completed);
         let outcome =
             pb::TapeFinalizationOutcome::try_from(status.outcome).expect("test outcome is known");
         for replica in &mut status.replica_progress {
             replica.state = expected_replica_progress_state(
                 replica.replica_ordinal,
-                status.completed_replicas,
+                completed,
                 progress,
                 outcome,
             ) as i32;
@@ -808,13 +827,13 @@ mod tests {
     fn busy_status() -> pb::TapeFinalization {
         pb::TapeFinalization {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
-            operation_id: Vec::new(),
+            operation_id: None,
             progress: pb::TapeFinalizationProgress::Unspecified as i32,
-            completed_replicas: 0,
+            completed_replicas: None,
             replica_health: Vec::new(),
             replica_progress: Vec::new(),
-            edition_digest: Vec::new(),
-            layout_digest: Vec::new(),
+            edition_digest: None,
+            layout_digest: None,
             outcome: pb::TapeFinalizationOutcome::Busy as i32,
             trigger: "operator_close_out".to_string(),
             detail: "tape has an in-flight owner; no state or media motion occurred".to_string(),
@@ -933,7 +952,7 @@ mod tests {
     #[test]
     fn finalize_response_requires_a_durable_operation_id_without_wait() {
         let mut response = status(pb::TapeFinalizationOutcome::Finalizing);
-        response.operation_id.clear();
+        response.operation_id = None;
         let mut transport = MockTransport {
             finalize_response: Some(response),
             ..MockTransport::default()
@@ -973,7 +992,10 @@ mod tests {
         assert_eq!(value["data"]["outcome"], "busy");
         assert_eq!(value["data"]["operation_id"], Value::Null);
         assert_eq!(value["data"]["progress"], "unspecified");
-        assert_eq!(value["data"]["completed_replicas"], 0);
+        // BUSY never read the tape: its progress is unknown, not zero.
+        assert_eq!(value["data"]["completed_replicas"], Value::Null);
+        assert_eq!(value["data"]["edition_digest"], Value::Null);
+        assert_eq!(value["data"]["layout_digest"], Value::Null);
         assert_eq!(value["data"]["replica_progress"], json!([]));
         assert_eq!(value["data"]["terminal"], true);
 
@@ -983,6 +1005,8 @@ mod tests {
         assert!(rendered.contains("operation_id: -\n"));
         assert!(rendered.contains("outcome: busy\n"));
         assert!(rendered.contains("progress: unspecified\n"));
+        assert!(rendered.contains("completed_replicas: unknown\n"));
+        assert!(!rendered.contains("0/3"));
         assert!(!rendered.contains("replica_progress:\n"));
     }
 
@@ -1044,11 +1068,28 @@ mod tests {
     fn busy_response_rejects_accepted_operation_fields() {
         let expected_tape = *Uuid::from_u128(1).as_bytes();
         let mut invalid = busy_status();
-        invalid.operation_id = Uuid::from_u128(3).as_bytes().to_vec();
+        invalid.operation_id = Some(Uuid::from_u128(3).as_bytes().to_vec());
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message
             .contains("BUSY with accepted-operation fields"));
+
+        // A present zero or a present empty value is still a value: BUSY must
+        // carry none of them.
+        for mutate in [
+            (|status: &mut pb::TapeFinalization| status.completed_replicas = Some(0))
+                as fn(&mut pb::TapeFinalization),
+            |status| status.operation_id = Some(Vec::new()),
+            |status| status.edition_digest = Some(vec![0xed; 32]),
+            |status| status.layout_digest = Some(Vec::new()),
+        ] {
+            let mut invalid = busy_status();
+            mutate(&mut invalid);
+            assert!(validate_status(&invalid, &expected_tape, None)
+                .unwrap_err()
+                .message
+                .contains("BUSY with accepted-operation fields"));
+        }
 
         let mut invalid = busy_status();
         invalid.replica_progress = status(pb::TapeFinalizationOutcome::Finalizing).replica_progress;
@@ -1100,7 +1141,7 @@ mod tests {
             &mut final_status,
             pb::TapeFinalizationProgress::AfterReplicaB,
         );
-        final_status.edition_digest = vec![0xab; 32];
+        final_status.edition_digest = Some(vec![0xab; 32]);
         final_status.replica_progress.reverse();
         let mut out = Vec::new();
         print_finalization(&final_status, true, &mut out).unwrap();
@@ -1114,7 +1155,11 @@ mod tests {
         assert_eq!(value["data"]["terminal"], true);
         assert_eq!(value["data"]["operator_recovery_required"], false);
         assert_eq!(value["data"]["edition_digest"], "ab".repeat(32));
-        assert_eq!(value["data"]["layout_digest"], Value::Null);
+        assert_eq!(value["data"]["layout_digest"], "1a".repeat(32));
+        assert_eq!(
+            value["data"]["operation_id"],
+            Uuid::from_u128(3).to_string()
+        );
         assert_eq!(value["data"]["replica_progress"][0]["replica_ordinal"], 1);
         assert_eq!(value["data"]["replica_progress"][1]["replica_ordinal"], 2);
         assert_eq!(value["data"]["replica_progress"][2]["replica_ordinal"], 3);
@@ -1144,15 +1189,141 @@ mod tests {
                 "  replica 1: barrier_proved (replica A barrier proved)\n",
                 "  replica 2: completion_unknown\n",
                 "  replica 3: pending\n",
+                "edition_digest: edededededededededededededededededededededededededededededededed\n",
+                "layout_digest: 1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a\n",
                 "detail: accepted\n",
             )
         );
     }
 
+    fn automatic_status() -> pb::TapeFinalization {
+        let mut status = status(pb::TapeFinalizationOutcome::Finalized);
+        set_status_progress(&mut status, pb::TapeFinalizationProgress::AfterReplicaC);
+        status.trigger = "reached_low_watermark".to_string();
+        status.operation_id = None;
+        status
+    }
+
+    #[test]
+    fn automatic_trigger_finalization_is_accepted_without_an_operation_id() {
+        let expected_tape = *Uuid::from_u128(1).as_bytes();
+        let automatic = automatic_status();
+        assert_eq!(
+            validate_status(&automatic, &expected_tape, None).expect("automatic finalization"),
+            None
+        );
+
+        let mut out = Vec::new();
+        print_finalization(&automatic, true, &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["schema"], FINALIZATION_JSON_SCHEMA);
+        assert_eq!(value["data"]["operation_id"], Value::Null);
+        assert_eq!(value["data"]["trigger"], "reached_low_watermark");
+        assert_eq!(value["data"]["completed_replicas"], 3);
+
+        let mut out = Vec::new();
+        print_finalization(&automatic, false, &mut out).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("operation_id: -\n"));
+    }
+
+    #[test]
+    fn operator_close_out_still_requires_its_operation_id() {
+        let expected_tape = *Uuid::from_u128(1).as_bytes();
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.operation_id = None;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("without an operation_id"));
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.operation_id = Some(Vec::new());
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("operation_id with 0 bytes"));
+    }
+
+    #[test]
+    fn waiting_on_a_finalization_without_an_operation_id_fails_instead_of_panicking() {
+        let mut response = automatic_status();
+        response.outcome = pb::TapeFinalizationOutcome::Finalizing as i32;
+        set_status_progress(&mut response, pb::TapeFinalizationProgress::AfterReplicaA);
+        let mut transport = MockTransport {
+            finalize_response: Some(response),
+            ..MockTransport::default()
+        };
+        let error = execute_with_transport(
+            &mut transport,
+            args().validate().unwrap(),
+            true,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("cannot poll the operation"));
+        assert!(transport.get_calls.is_empty());
+    }
+
+    #[test]
+    fn accepted_finalization_must_carry_replicas_and_both_digests() {
+        let expected_tape = *Uuid::from_u128(1).as_bytes();
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.completed_replicas = None;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("without completed_replicas"));
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.edition_digest = None;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("without edition_digest"));
+
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.layout_digest = None;
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("without layout_digest"));
+
+        // Present but empty is malformed, not a way of saying absent.
+        let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
+        invalid.edition_digest = Some(Vec::new());
+        assert!(validate_status(&invalid, &expected_tape, None)
+            .unwrap_err()
+            .message
+            .contains("edition_digest with 0 bytes"));
+    }
+
+    #[test]
+    fn accepted_before_replica_a_renders_a_real_zero() {
+        let expected_tape = *Uuid::from_u128(1).as_bytes();
+        let accepted = status(pb::TapeFinalizationOutcome::Finalizing);
+        assert_eq!(accepted.completed_replicas, Some(0));
+        validate_status(&accepted, &expected_tape, None).expect("accepted before replica A");
+
+        let mut out = Vec::new();
+        print_finalization(&accepted, true, &mut out).unwrap();
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["data"]["progress"], "before_replica_a");
+        assert_eq!(value["data"]["completed_replicas"], 0);
+
+        let mut out = Vec::new();
+        print_finalization(&accepted, false, &mut out).unwrap();
+        assert!(String::from_utf8(out)
+            .unwrap()
+            .contains("completed_replicas: 0/3\n"));
+    }
+
     #[test]
     fn polling_rejects_operation_identity_change() {
         let mut changed = status(pb::TapeFinalizationOutcome::Finalized);
-        changed.operation_id = Uuid::from_u128(4).as_bytes().to_vec();
+        changed.operation_id = Some(Uuid::from_u128(4).as_bytes().to_vec());
         let mut transport = MockTransport {
             finalize_response: Some(status(pb::TapeFinalizationOutcome::Finalizing)),
             polls: VecDeque::from([Ok(changed)]),
@@ -1184,7 +1355,7 @@ mod tests {
             .expect("replica C may be durable while host sealing remains in progress");
 
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalizing);
-        invalid.completed_replicas = 1;
+        invalid.completed_replicas = Some(1);
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message
@@ -1220,7 +1391,7 @@ mod tests {
             .contains("finalized outcome before replica C"));
 
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalized);
-        invalid.operation_id = Uuid::nil().as_bytes().to_vec();
+        invalid.operation_id = Some(Uuid::nil().as_bytes().to_vec());
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message
@@ -1228,7 +1399,7 @@ mod tests {
 
         let mut invalid = status(pb::TapeFinalizationOutcome::Finalized);
         set_status_progress(&mut invalid, pb::TapeFinalizationProgress::AfterReplicaC);
-        invalid.layout_digest = vec![0; 31];
+        invalid.layout_digest = Some(vec![0; 31]);
         assert!(validate_status(&invalid, &expected_tape, None)
             .unwrap_err()
             .message

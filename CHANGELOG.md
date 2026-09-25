@@ -22,6 +22,36 @@ per-release summaries.
 - Corrected the declared MSRV from Rust 1.85 to the dependency floor of 1.88.
 - Updated `h2` from 0.4.14 to 0.4.16 for RUSTSEC-2026-0258 and `anyhow`
   to 1.0.103 for RUSTSEC-2026-0190.
+- Layer 5 wire presence for the terminal inventory, verification and
+  finalization messages. 24 fields that some outcomes cannot know are now
+  proto3 `optional`, and the daemon leaves them absent instead of sending 0 or
+  an empty value: the `TapeInventory` selection, counts and digests;
+  the `TapeIndexVerification` verified-prefix counts and digests;
+  `TapeIndexSeparationHealth.verified_interior_record_count`; the
+  `TapeFinalization` `operation_id`, `completed_replicas` and digests; and
+  `TapeInventoryBotObject.stored_block_count`. A real zero, such as a tape with
+  no Objects, a finalization before replica A or a two-record separation
+  extent, is now sent as a present 0. The other 56 fields in these messages
+  stay plain, each with its reason in `tools/wire-presence-ledger.txt`. Field
+  numbers and types are unchanged.
+- `rem tape inventory`, `rem tape verify-index` and `rem tape finalize` render
+  an absent value as JSON `null`. In human output an absent count prints
+  `unknown`, and an absent selection or operation id prints `-` as before. Five
+  outputs that printed a fabricated `0` now print `null`: structural and
+  Object counts for BOT-recovery-required, BOT classification counts on fast
+  outcomes, `completed_replicas` for BUSY, `stored_block_count` for a torn BOT
+  Object, and `verified_interior_record_count` for INVALID and UNKNOWN
+  separations. The CLI accepts a finalization with no `operation_id` when an
+  automatic trigger started it, requires both digests on every accepted
+  finalization, and rejects a BUSY response that carries any of them. The CLI
+  JSON schema identifiers stay at `v1` (and `rem.tape.finalization.v2`); the
+  schemas already used `null` for absent values.
+- Version skew: an older CLI or client reading a newer daemon is unaffected.
+  A newer CLI reading an older daemon sees that daemon's real zeros as
+  absent, because an older daemon cannot encode a present zero, and it
+  refuses responses where presence is now required (for example an accepted
+  finalization without both digests). Run the CLI and the daemon from the
+  same build.
 
 ## v0.1.0 — 2026-08-07
 

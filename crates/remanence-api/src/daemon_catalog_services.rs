@@ -480,13 +480,13 @@ impl pb::catalog_server::Catalog for CatalogService {
         let response = match result {
             crate::write_owner::ManualFinalizeTapeResult::Busy => pb::TapeFinalization {
                 tape_uuid: tape_uuid.to_vec(),
-                operation_id: Vec::new(),
+                operation_id: None,
                 progress: pb::TapeFinalizationProgress::Unspecified as i32,
-                completed_replicas: 0,
+                completed_replicas: None,
                 replica_health: Vec::new(),
                 replica_progress: Vec::new(),
-                edition_digest: Vec::new(),
-                layout_digest: Vec::new(),
+                edition_digest: None,
+                layout_digest: None,
                 outcome: pb::TapeFinalizationOutcome::Busy as i32,
                 trigger: "operator_close_out".to_string(),
                 detail: "tape has an in-flight owner; no state or media motion occurred"
