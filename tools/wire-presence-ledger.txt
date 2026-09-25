@@ -96,3 +96,70 @@ AppendObjectStart.CallerMetadataEntry.value   an empty value is a value the call
 AppendObjectChunk.session_id                  refused by decode_uuid_bytes via ensure_same_session
 AppendObjectChunk.data                        a chunk carries the bytes it carries; zero bytes is an empty chunk, never an unknown one
 AppendObjectFinish.session_id                 refused by decode_uuid_bytes via ensure_same_session
+
+# ---------------------------------------------------------------------------
+# Tape terminal inventory, verification and finalization, decided 2026-09-25.
+# Derivation: the on-tape REM-PARITY §10.2 structural array and §10.3 Object
+# rows for row fields, the `tapes` finalization columns for TapeFinalization,
+# and the handler for requests. Summary fields that only some outcomes carry
+# (digests, selection, counts) are `optional` and do not appear here: the
+# writers zero-filled them on the other outcomes.
+# Every `detail` field below is diagnostic prose: empty means no commentary,
+# never an unknown value.
+# ---------------------------------------------------------------------------
+TapeInventoryRequest.tape_uuid                       refused by decode_uuid_bytes
+VerifyTapeIndexRequest.tape_uuid                     refused by decode_uuid_bytes
+GetTapeFinalizationRequest.tape_uuid                 refused by decode_uuid_bytes
+FinalizeTapeRequest.tape_uuid                        refused by decode_uuid_bytes
+FinalizeTapeRequest.reason                           required; the server refuses an empty or whitespace-only reason with INVALID_ARGUMENT
+AppendCanonicalPlaintextObjectStart.session_id       refused by decode_uuid_bytes
+AppendCanonicalPlaintextObjectStart.declared_size_bytes required; the server refuses zero before any tape I/O, since a canonical REM object is never empty (AppendObjectStart's is optional because there zero is an empty object)
+AppendCanonicalPlaintextObjectStart.expected_object_id refused by decode_uuid_bytes, and the nil UUID is refused after it
+AppendCanonicalPlaintextObjectStart.expected_caller_object_id required; the server refuses an empty or whitespace-only id with INVALID_ARGUMENT
+Tape.assignment_generation                           tapes.assignment_generation is NOT NULL DEFAULT 0; generation 0 is the row's first generation, a real counter value
+TapeFinalization.tape_uuid                           the tape the request named, already refused by decode_uuid_bytes unless 16 bytes
+TapeFinalization.trigger                             every finalization has a cause (finalization_trigger is required once the projection exists); on BUSY the value is the trigger of the refused request, which the caller supplied
+TapeFinalization.detail                              diagnostic prose; empty is no commentary, never an unknown
+TapeIndexReplicaHealth.replica_ordinal               one-based A/B/C ordinal; every health row is about a named member, and 0 is not an ordinal
+TapeIndexReplicaHealth.detail                        diagnostic prose written with every row
+TapeIndexReplicaProgress.replica_ordinal             one-based A/B/C ordinal; every progress row is about a named member
+TapeIndexReplicaProgress.detail                      diagnostic prose; the server writes none today, and empty is no commentary
+TapeIndexSeparationHealth.separation_ordinal         one-based AB/BC ordinal; every row is about a named gap
+TapeIndexSeparationHealth.detail                     diagnostic prose written with every row
+TapeIndexVerification.tape_uuid                      the tape the request named
+TapeIndexVerification.detail                         diagnostic prose written with every response
+TapeIndexVerification.measured_eod_lba               SPACE(EOD) is measured before any verdict, on every outcome
+TapeIndexVerification.measured_tape_file_count       the BOT walk counts files on every outcome, including recovery-required
+TapeIndexVerification.verification_basis             every response names its basis; no current server emits the only basis-less state (DEFERRED_FULL_PHYSICAL_VERIFY)
+TapeInventory.tape_uuid                              the tape the request named
+TapeInventory.inventory_basis                        every summary names its basis
+TapeInventory.detail                                 diagnostic prose written with every summary
+TapeInventoryReplicaAttemptStarted.attempt_id        minted from 1 upward for every attempt; an attempt cannot exist without one
+TapeInventoryReplicaAttemptStarted.replica_ordinal   one-based A/B/C ordinal of the member being attempted
+TapeInventoryReplicaAttemptRejected.attempt_id       as TapeInventoryReplicaAttemptStarted.attempt_id
+TapeInventoryReplicaAttemptRejected.replica_ordinal  as TapeInventoryReplicaAttemptStarted.replica_ordinal
+TapeInventoryReplicaAttemptRejected.failure_kind     a rejection always has a typed cause; one of nine stable names
+TapeInventoryReplicaAttemptRejected.detail           diagnostic prose carried by the typed failure
+TapeInventoryStructuralEntry.attempt_id              as TapeInventoryReplicaAttemptStarted.attempt_id
+TapeInventoryStructuralEntry.replica_ordinal         as TapeInventoryReplicaAttemptStarted.replica_ordinal
+TapeInventoryStructuralEntry.tape_file_number        REM-PARITY §10.2 structural row element 1 is a plain u64, never ?u64; file 0 is the Bootstrap
+TapeInventoryStructuralEntry.block_count             §10.2 element 3 is a plain u64, and a zero block count is refused while the payload streams
+TapeInventoryObjectRow.attempt_id                    as TapeInventoryReplicaAttemptStarted.attempt_id
+TapeInventoryObjectRow.replica_ordinal               as TapeInventoryReplicaAttemptStarted.replica_ordinal
+TapeInventoryObjectRow.tape_file_number              §10.3 row key 1 is REQUIRED
+TapeInventoryObjectRow.stored_block_count            §10.3 row key 3 is REQUIRED and MUST be positive
+TapeInventoryObjectRow.object_id                     §10.3 row key 4 is REQUIRED, 1-64 bytes
+TapeInventoryPlaintextRecovery.manifest_first_chunk_lba §10.3 key 10 is REQUIRED on every plaintext row, which the oneof arm identifies; body LBA 0 is a real position
+TapeInventoryPlaintextRecovery.manifest_size_bytes   §10.3 key 11, REQUIRED and positive on plaintext rows
+TapeInventoryPlaintextRecovery.manifest_chunk_count  §10.3 key 12, REQUIRED and positive on plaintext rows
+TapeInventoryPlaintextRecovery.manifest_sha256       §10.3 key 13, REQUIRED, exactly 32 bytes
+TapeInventoryEncryptedRecovery.metadata_frame_len    §10.3 key 21, REQUIRED on encrypted rows, bounded [17, 16 MiB]
+TapeInventoryEncryptedRecovery.key_frame_len         §10.3 key 23, REQUIRED on encrypted rows, bounded [1191, 16384]
+TapeInventoryBotObject.tape_file_number              the BOT walk numbers every file it crosses, torn ones included
+TapeInventoryBotRecoveryStarted.tape_uuid            the tape the request named
+TapeInventoryBotRecoveryStarted.block_size           the walk cannot start without the catalog block size (catalog_tape_block_size refuses a tape with none), so a start notice always carries it
+TapeInventoryBotRecoveryProgress.tape_file_number    emitted only at a boundary the walk has just crossed; every field is a measurement taken there
+TapeInventoryBotRecoveryProgress.partition           as tape_file_number; partition 0 is a real partition, the only one Remanence writes
+TapeInventoryBotRecoveryProgress.position_lba        as tape_file_number
+TapeInventoryBotRecoveryProgress.structural_candidate_count as tape_file_number; always tape_file_number + 1
+TapeInventoryBotRecoveryProgress.elapsed_millis      as tape_file_number; 0 ms is a real duration

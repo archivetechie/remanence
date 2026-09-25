@@ -3082,6 +3082,59 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn finalize_tape_busy_response_carries_no_fabricated_progress() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-finalize-busy-presence")
+            .tempdir()
+            .expect("tempdir");
+        let index = CatalogIndex::open(temp.path().join("state.sqlite")).expect("open catalog");
+        let mut state = ApiState::new(index);
+        let (drive_tx, _drive_rx) = tokio::sync::mpsc::channel(1);
+        let (changer_tx, _changer_rx) = tokio::sync::mpsc::channel(1);
+        let pool = crate::write_owner::DrivePool::new(
+            changer_tx,
+            std::collections::HashMap::from([(0x0101, drive_tx)]),
+            Arc::new(std::collections::HashMap::from([(
+                0x0101,
+                AtomicBool::new(false),
+            )])),
+        );
+        state.drive_pool = Some(pool.clone());
+        let tape_uuid = [0xB6; 16];
+        let _active_object_owner = pool.reserve_tape(tape_uuid).expect("reserve exact tape");
+
+        let response =
+            <crate::CatalogService as crate::pb::catalog_server::Catalog>::finalize_tape(
+                &state.catalog_service(),
+                tonic::Request::new(crate::pb::FinalizeTapeRequest {
+                    tape_uuid: tape_uuid.to_vec(),
+                    expected_pool_id: None,
+                    reason: "operator close-out while Object is active".to_string(),
+                    idempotency_key: Some(crate::pb::IdempotencyKey {
+                        value: Uuid::from_u128(0xB602).as_bytes().to_vec(),
+                    }),
+                }),
+            )
+            .await
+            .expect("busy is a typed response")
+            .into_inner();
+
+        assert_eq!(
+            response.outcome,
+            crate::pb::TapeFinalizationOutcome::Busy as i32
+        );
+        assert_eq!(response.tape_uuid, tape_uuid.to_vec());
+        // The daemon never read this tape: no operation, progress or digests.
+        assert_eq!(response.operation_id, None);
+        assert_eq!(response.completed_replicas, None);
+        assert_eq!(response.edition_digest, None);
+        assert_eq!(response.layout_digest, None);
+    }
+
     /// Build the smallest ordinary checkpoint authority that can be closed by
     /// the asynchronous manual-finalization admission path.
     fn manual_finalize_checkpoint(tape_uuid: TapeUuid, block_size: u32) -> CheckpointJournalRecord {
@@ -3771,9 +3824,16 @@ mod tests {
             .expect("poll accepted operation")
             .into_inner();
         assert_eq!(
-            polled.operation_id,
-            accepted.operation_id.as_bytes().as_slice()
+            polled.operation_id.as_deref(),
+            Some(accepted.operation_id.as_bytes().as_slice())
         );
+        assert_eq!(
+            polled.completed_replicas,
+            Some(0),
+            "an accepted operation before replica A reports a present zero"
+        );
+        assert_eq!(polled.edition_digest.as_ref().map(Vec::len), Some(32));
+        assert_eq!(polled.layout_digest.as_ref().map(Vec::len), Some(32));
         assert_eq!(
             polled.outcome,
             crate::pb::TapeFinalizationOutcome::Finalizing as i32

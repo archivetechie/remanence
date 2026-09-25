@@ -79,6 +79,96 @@ fn finalization_progress_uses_wire_tag_11_not_legacy_health_tag_5() {
 }
 
 #[test]
+fn optional_presence_survives_a_wire_round_trip_including_zero() {
+    use prost::Message as _;
+
+    let present = pb::TapeFinalization {
+        completed_replicas: Some(0),
+        edition_digest: Some(vec![0xE1; 32]),
+        ..Default::default()
+    };
+    let decoded = pb::TapeFinalization::decode(present.encode_to_vec().as_slice())
+        .expect("decode present zero");
+    assert_eq!(
+        decoded.completed_replicas,
+        Some(0),
+        "a present zero stays present"
+    );
+    assert_eq!(
+        decoded.edition_digest.as_deref(),
+        Some([0xE1; 32].as_slice())
+    );
+    assert_eq!(decoded.operation_id, None);
+    assert_eq!(decoded.layout_digest, None);
+
+    let absent =
+        pb::TapeFinalization::decode(pb::TapeFinalization::default().encode_to_vec().as_slice())
+            .expect("decode absent");
+    assert_eq!(
+        absent.completed_replicas, None,
+        "absent stays absent, not zero"
+    );
+
+    let inventory = pb::TapeInventory {
+        object_row_count: Some(0),
+        ..Default::default()
+    };
+    let decoded =
+        pb::TapeInventory::decode(inventory.encode_to_vec().as_slice()).expect("decode inventory");
+    assert_eq!(decoded.object_row_count, Some(0));
+    assert_eq!(decoded.structural_entry_count, None);
+}
+
+#[test]
+fn finalization_projection_carries_present_zero_and_absent_automatic_operation_id() {
+    use remanence_state::{
+        TerminalFinalizationOutcome, TerminalFinalizationProgress, TerminalFinalizationProjection,
+        TerminalFinalizationTrigger,
+    };
+
+    let projection = |trigger| TerminalFinalizationProjection {
+        trigger,
+        operation_id: None,
+        progress: TerminalFinalizationProgress::BeforeReplicaA,
+        edition_digest: [0xA1; 32],
+        layout_digest: [0xA2; 32],
+        completed_replicas: 0,
+        outcome: TerminalFinalizationOutcome::InProgress,
+    };
+
+    // An automatic trigger has no operator operation; the column is NULL.
+    let automatic = tape_finalization_to_proto(
+        TAPE_UUID,
+        None,
+        projection(TerminalFinalizationTrigger::ReachedLowWatermark),
+    );
+    assert_eq!(automatic.operation_id, None);
+    assert_eq!(automatic.trigger, "reached_low_watermark");
+    // BeforeReplicaA is a real zero, not an unknown.
+    assert_eq!(automatic.completed_replicas, Some(0));
+    assert_eq!(
+        automatic.edition_digest.as_deref(),
+        Some([0xA1; 32].as_slice())
+    );
+    assert_eq!(
+        automatic.layout_digest.as_deref(),
+        Some([0xA2; 32].as_slice())
+    );
+
+    let operation_id = Uuid::from_u128(0xF1);
+    let operator = tape_finalization_to_proto(
+        TAPE_UUID,
+        Some(operation_id),
+        projection(TerminalFinalizationTrigger::OperatorCloseOut),
+    );
+    assert_eq!(
+        operator.operation_id.as_deref(),
+        Some(operation_id.as_bytes().as_slice())
+    );
+    assert_eq!(operator.completed_replicas, Some(0));
+}
+
+#[test]
 fn recovery_progress_marks_only_the_replica_currently_in_flight_unknown() {
     use pb::tape_index_replica_progress::State as ReplicaState;
     use remanence_state::{

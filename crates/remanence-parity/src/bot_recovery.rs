@@ -79,8 +79,8 @@ pub enum BotRecoveredObjectState {
 pub struct BotRecoveredObject {
     /// Dense tape-file number measured from BOT.
     pub tape_file_number: u64,
-    /// Complete fixed-block count, or zero when a torn file could not be measured.
-    pub stored_block_count: u64,
+    /// Complete fixed-block count; `None` when a torn file could not be measured.
+    pub stored_block_count: Option<u64>,
     /// Recovered REM-OBJECT identifier when external authority survived.
     pub object_id: Option<Vec<u8>>,
     /// Typed recovery state.
@@ -406,7 +406,7 @@ where
         incomplete_object_count = 1;
         visit_object(&BotRecoveredObject {
             tape_file_number: truncation.tape_file_number,
-            stored_block_count: 0,
+            stored_block_count: None,
             object_id: None,
             state: BotRecoveredObjectState::Incomplete,
         })
@@ -665,7 +665,7 @@ where
     };
     visit_object(&BotRecoveredObject {
         tape_file_number: entry.tape_file_number,
-        stored_block_count: entry.block_count,
+        stored_block_count: Some(entry.block_count),
         object_id,
         state,
     })

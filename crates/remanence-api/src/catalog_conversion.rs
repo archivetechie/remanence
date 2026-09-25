@@ -357,15 +357,13 @@ pub(crate) fn tape_finalization_to_proto(
         .collect();
     pb::TapeFinalization {
         tape_uuid: tape_uuid.to_vec(),
-        operation_id: operation_id
-            .map(|operation_id| operation_id.as_bytes().to_vec())
-            .unwrap_or_default(),
+        operation_id: operation_id.map(|operation_id| operation_id.as_bytes().to_vec()),
         progress: progress as i32,
-        completed_replicas: u32::from(completed),
+        completed_replicas: Some(u32::from(completed)),
         replica_health: Vec::new(),
         replica_progress,
-        edition_digest: projection.edition_digest.to_vec(),
-        layout_digest: projection.layout_digest.to_vec(),
+        edition_digest: Some(projection.edition_digest.to_vec()),
+        layout_digest: Some(projection.layout_digest.to_vec()),
         outcome: outcome as i32,
         trigger: trigger.to_string(),
         detail: String::new(),

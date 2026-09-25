@@ -154,9 +154,9 @@ pub(crate) fn handle_drive_tape_inventory(
         send_inventory_stream_item(
             stream_tx,
             pb::TapeInventoryStreamItem {
-                item: Some(pb::tape_inventory_stream_item::Item::Summary(
+                item: Some(pb::tape_inventory_stream_item::Item::Summary(Box::new(
                     bot_structural_recovery_to_proto(tape_uuid, summary),
-                )),
+                ))),
             },
         )?;
         return Ok(());
@@ -164,9 +164,9 @@ pub(crate) fn handle_drive_tape_inventory(
     send_inventory_stream_item(
         stream_tx,
         pb::TapeInventoryStreamItem {
-            item: Some(pb::tape_inventory_stream_item::Item::Summary(
+            item: Some(pb::tape_inventory_stream_item::Item::Summary(Box::new(
                 terminal_inventory_to_proto(tape_uuid, outcome),
-            )),
+            ))),
         },
     )
 }
@@ -512,18 +512,18 @@ pub(crate) fn terminal_verification_to_proto(
                     separation_ordinal,
                     state: pb::tape_index_separation_health::State::TapeIndexSeparationStateUnknown
                         as i32,
-                    verified_interior_record_count: 0,
+                    verified_interior_record_count: None,
                     detail: "canonical prefix authority unavailable".to_string(),
                 })
                 .collect(),
             measured_eod_lba: recovery.measured_eod.lba,
-            verified_prefix_tape_file_count: 0,
-            verified_prefix_record_count: 0,
+            verified_prefix_tape_file_count: None,
+            verified_prefix_record_count: None,
             measured_tape_file_count: recovery.bot_recovery.structural_entry_count,
-            edition_digest: Vec::new(),
-            layout_digest: Vec::new(),
-            payload_digest: Vec::new(),
-            canonical_map_digest: Vec::new(),
+            edition_digest: None,
+            layout_digest: None,
+            payload_digest: None,
+            canonical_map_digest: None,
             verification_basis: "bot_structural_recovery".to_string(),
             recovery_inventory: Some(bot_structural_recovery_to_proto(
                 tape_uuid,
@@ -559,13 +559,13 @@ pub(crate) fn terminal_verified_to_proto(
             .collect(),
         separation_health: terminal_separation_health(&verified.separations),
         measured_eod_lba: verified.measured_eod.lba,
-        verified_prefix_tape_file_count: verified.verified_prefix_tape_file_count,
-        verified_prefix_record_count: verified.verified_prefix_record_count,
+        verified_prefix_tape_file_count: Some(verified.verified_prefix_tape_file_count),
+        verified_prefix_record_count: Some(verified.verified_prefix_record_count),
         measured_tape_file_count: verified.measured_tape_file_count,
-        edition_digest: verified.edition.edition_digest.to_vec(),
-        layout_digest: verified.edition.layout_digest.to_vec(),
-        payload_digest: verified.selected_payload.payload_sha256.to_vec(),
-        canonical_map_digest: verified.selected_payload.canonical_map_sha256.to_vec(),
+        edition_digest: Some(verified.edition.edition_digest.to_vec()),
+        layout_digest: Some(verified.edition.layout_digest.to_vec()),
+        payload_digest: Some(verified.selected_payload.payload_sha256.to_vec()),
+        canonical_map_digest: Some(verified.selected_payload.canonical_map_sha256.to_vec()),
         verification_basis: "measured_full_physical".to_string(),
         recovery_inventory: None,
     }
@@ -583,12 +583,12 @@ pub(crate) fn terminal_separation_health(
                     interior_record_count,
                 } => (
                     pb::tape_index_separation_health::State::TapeIndexSeparationStateValid,
-                    *interior_record_count,
+                    Some(*interior_record_count),
                     "header_footer_zero_fill_and_filemark_valid".to_string(),
                 ),
                 remanence_parity::TerminalSeparationEvidence::Invalid { detail } => (
                     pb::tape_index_separation_health::State::TapeIndexSeparationStateInvalid,
-                    0,
+                    None,
                     detail.clone(),
                 ),
             };
@@ -622,7 +622,7 @@ pub(crate) fn bot_structural_recovery_to_proto(
     pb::TapeInventory {
         tape_uuid: tape_uuid.to_vec(),
         outcome: pb::TapeInventoryOutcome::BotStructuralRecovered as i32,
-        selected_replica_ordinal: 0,
+        selected_replica_ordinal: None,
         replica_health: (1u32..=3)
             .map(|replica_ordinal| pb::TapeIndexReplicaHealth {
                 replica_ordinal,
@@ -630,12 +630,12 @@ pub(crate) fn bot_structural_recovery_to_proto(
                 detail: "terminal replica unavailable; BOT structural recovery used".to_string(),
             })
             .collect(),
-        structural_entry_count: summary.structural_entry_count,
-        object_row_count: summary.complete_object_count,
-        edition_digest: Vec::new(),
-        layout_digest: Vec::new(),
-        payload_digest: Vec::new(),
-        canonical_map_digest: summary.canonical_map_digest.to_vec(),
+        structural_entry_count: Some(summary.structural_entry_count),
+        object_row_count: Some(summary.complete_object_count),
+        edition_digest: None,
+        layout_digest: None,
+        payload_digest: None,
+        canonical_map_digest: Some(summary.canonical_map_digest.to_vec()),
         inventory_basis: "bot_structural_recovery".to_string(),
         detail: format!(
             "terminal index unavailable; BOT recovery classified {} recovered, {} unknown, and {} incomplete Object candidates",
@@ -643,11 +643,11 @@ pub(crate) fn bot_structural_recovery_to_proto(
             summary.unknown_object_count,
             summary.incomplete_object_count
         ),
-        recovered_object_count: summary.recovered_object_count,
-        unknown_object_count: summary.unknown_object_count,
-        incomplete_object_count: summary.incomplete_object_count,
-        damaged_region_count: summary.damaged_region_count,
-        selected_attempt_id: 0,
+        recovered_object_count: Some(summary.recovered_object_count),
+        unknown_object_count: Some(summary.unknown_object_count),
+        incomplete_object_count: Some(summary.incomplete_object_count),
+        damaged_region_count: Some(summary.damaged_region_count),
+        selected_attempt_id: None,
     }
 }
 
@@ -671,14 +671,14 @@ pub(crate) fn terminal_inventory_to_proto(
             pb::TapeInventory {
                 tape_uuid: tape_uuid.to_vec(),
                 outcome: outcome as i32,
-                selected_replica_ordinal: u32::from(selection.selected_replica_ordinal),
+                selected_replica_ordinal: Some(u32::from(selection.selected_replica_ordinal)),
                 replica_health,
-                structural_entry_count: selection.payload.structural_entry_count,
-                object_row_count: selection.payload.object_row_count,
-                edition_digest: selection.edition.edition_digest.to_vec(),
-                layout_digest: selection.edition.layout_digest.to_vec(),
-                payload_digest: selection.payload.payload_sha256.to_vec(),
-                canonical_map_digest: selection.payload.canonical_map_sha256.to_vec(),
+                structural_entry_count: Some(selection.payload.structural_entry_count),
+                object_row_count: Some(selection.payload.object_row_count),
+                edition_digest: Some(selection.edition.edition_digest.to_vec()),
+                layout_digest: Some(selection.edition.layout_digest.to_vec()),
+                payload_digest: Some(selection.payload.payload_sha256.to_vec()),
+                canonical_map_digest: Some(selection.payload.canonical_map_sha256.to_vec()),
                 inventory_basis: "terminal_index_fast".to_string(),
                 detail: if selection.is_degraded() {
                     format!(
@@ -688,11 +688,11 @@ pub(crate) fn terminal_inventory_to_proto(
                 } else {
                     "terminal inventory selected replica C; all replica envelopes agree".to_string()
                 },
-                recovered_object_count: 0,
-                unknown_object_count: 0,
-                incomplete_object_count: 0,
-                damaged_region_count: 0,
-                selected_attempt_id: selection.selected_attempt_id,
+                recovered_object_count: None,
+                unknown_object_count: None,
+                incomplete_object_count: None,
+                damaged_region_count: None,
+                selected_attempt_id: Some(selection.selected_attempt_id),
             }
         }
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
@@ -700,26 +700,26 @@ pub(crate) fn terminal_inventory_to_proto(
             pb::TapeInventory {
                 tape_uuid: tape_uuid.to_vec(),
                 outcome: pb::TapeInventoryOutcome::BotStructuralRecoveryRequired as i32,
-                selected_replica_ordinal: 0,
+                selected_replica_ordinal: None,
                 replica_health: recovery
                     .replicas
                     .iter()
                     .enumerate()
                     .map(|(index, evidence)| terminal_replica_health(index, evidence))
                     .collect(),
-                structural_entry_count: 0,
-                object_row_count: 0,
-                edition_digest: Vec::new(),
-                layout_digest: Vec::new(),
-                payload_digest: Vec::new(),
-                canonical_map_digest: Vec::new(),
+                structural_entry_count: None,
+                object_row_count: None,
+                edition_digest: None,
+                layout_digest: None,
+                payload_digest: None,
+                canonical_map_digest: None,
                 inventory_basis: "terminal_index_fast".to_string(),
                 detail: detail.to_string(),
-                recovered_object_count: 0,
-                unknown_object_count: 0,
-                incomplete_object_count: 0,
-                damaged_region_count: 0,
-                selected_attempt_id: 0,
+                recovered_object_count: None,
+                unknown_object_count: None,
+                incomplete_object_count: None,
+                damaged_region_count: None,
+                selected_attempt_id: None,
             }
         }
     }

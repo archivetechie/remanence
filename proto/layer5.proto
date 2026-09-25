@@ -958,7 +958,10 @@ enum TapeInventoryBotObjectState {
 
 message TapeInventoryBotObject {
   uint64 tape_file_number = 1;
-  uint64 stored_block_count = 2;
+  // Complete fixed-block count. Absent for an INCOMPLETE (torn) Object whose
+  // block count could not be measured; always present, and at least 1, for a
+  // structurally complete Object. Absent is never zero.
+  optional uint64 stored_block_count = 2;
   optional bytes object_id = 3;
   TapeInventoryBotObjectState state = 4;
 }
@@ -968,7 +971,8 @@ enum TapeInventoryOutcome {
   TAPE_INVENTORY_OUTCOME_COMPLETE = 1;
   TAPE_INVENTORY_OUTCOME_DEGRADED = 2;
   // No terminal member is authoritative. The caller must invoke structural
-  // recovery from BOT; zero counts in this outcome are never empty success.
+  // recovery from BOT. No scan has run, so the summary's selection, counts
+  // and digests are absent; absent counts are never empty success.
   TAPE_INVENTORY_OUTCOME_BOT_STRUCTURAL_RECOVERY_REQUIRED = 3;
   // No terminal member survived, but the daemon completed the explicit BOT
   // structural recovery and classified every physical Object candidate.
@@ -979,28 +983,39 @@ message TapeInventory {
   bytes tape_uuid = 1;
   TapeInventoryOutcome outcome = 2;
   // One-based member ordinal (A=1, B=2, C=3); selection prefers C, then B,
-  // then A. Zero only for BOT recovery required.
-  uint32 selected_replica_ordinal = 3;
+  // then A. Absent for both BOT outcomes (recovery required and recovered),
+  // where no terminal member was selected; never zero.
+  optional uint32 selected_replica_ordinal = 3;
   repeated TapeIndexReplicaHealth replica_health = 4;
-  uint64 structural_entry_count = 5;
-  uint64 object_row_count = 6;
-  bytes edition_digest = 7;
-  bytes layout_digest = 8;
-  bytes payload_digest = 9;
-  bytes canonical_map_digest = 10;
+  // Absent for BOT_STRUCTURAL_RECOVERY_REQUIRED, where no scan has run.
+  // Present on every other outcome; zero Object rows is a real count.
+  optional uint64 structural_entry_count = 5;
+  optional uint64 object_row_count = 6;
+  // Terminal-edition digests. Absent for both BOT outcomes, which have no
+  // terminal edition.
+  optional bytes edition_digest = 7;
+  optional bytes layout_digest = 8;
+  optional bytes payload_digest = 9;
+  // The selected terminal payload's canonical map digest, or for
+  // BOT_STRUCTURAL_RECOVERED the digest of the measured BOT map. Absent for
+  // BOT_STRUCTURAL_RECOVERY_REQUIRED.
+  optional bytes canonical_map_digest = 10;
   // Stable basis label: "terminal_index_fast" or
   // "bot_structural_recovery".
   string inventory_basis = 11;
   string detail = 12;
   // BOT recovery classifications are streamed internally; the unary summary
-  // stays bounded instead of materialising a whole-tape row set.
-  uint64 recovered_object_count = 13;
-  uint64 unknown_object_count = 14;
-  uint64 incomplete_object_count = 15;
-  uint64 damaged_region_count = 16;
-  // Attempt whose structural and Object rows are authoritative. Zero for BOT
-  // recovery outcomes, whose rows use TapeInventoryBotObject instead.
-  uint64 selected_attempt_id = 17;
+  // stays bounded instead of materialising a whole-tape row set. Present only
+  // for BOT_STRUCTURAL_RECOVERED, where zero is a real count; absent on every
+  // other outcome, where no BOT classification ran.
+  optional uint64 recovered_object_count = 13;
+  optional uint64 unknown_object_count = 14;
+  optional uint64 incomplete_object_count = 15;
+  optional uint64 damaged_region_count = 16;
+  // Attempt whose structural and Object rows are authoritative. Absent for BOT
+  // recovery outcomes, whose rows use TapeInventoryBotObject instead; never
+  // zero.
+  optional uint64 selected_attempt_id = 17;
 }
 
 message VerifyTapeIndexRequest {
@@ -1032,8 +1047,10 @@ message TapeIndexSeparationHealth {
     TAPE_INDEX_SEPARATION_STATE_UNKNOWN = 3;
   }
   State state = 2;
-  // Number of zero-filled interior records read and validated.
-  uint64 verified_interior_record_count = 3;
+  // Number of zero-filled interior records read and validated. Present only
+  // for VALID, where zero is a real count (a two-record extent); absent for
+  // INVALID and UNKNOWN, which have no verified count.
+  optional uint64 verified_interior_record_count = 3;
   string detail = 4;
 }
 
@@ -1048,13 +1065,16 @@ message TapeIndexVerification {
   repeated TapeIndexReplicaHealth replica_health = 5;
   repeated TapeIndexSeparationHealth separation_health = 6;
   uint64 measured_eod_lba = 7;
-  uint64 verified_prefix_tape_file_count = 8;
-  uint64 verified_prefix_record_count = 9;
+  // Verified canonical prefix. Absent for RECOVERY_REQUIRED, which has no
+  // canonical prefix authority; never zero for unknown.
+  optional uint64 verified_prefix_tape_file_count = 8;
+  optional uint64 verified_prefix_record_count = 9;
   uint64 measured_tape_file_count = 10;
-  bytes edition_digest = 11;
-  bytes layout_digest = 12;
-  bytes payload_digest = 13;
-  bytes canonical_map_digest = 14;
+  // Digests of the verified terminal edition. Absent for RECOVERY_REQUIRED.
+  optional bytes edition_digest = 11;
+  optional bytes layout_digest = 12;
+  optional bytes payload_digest = 13;
+  optional bytes canonical_map_digest = 14;
   // Stable basis label: "measured_full_physical" or
   // "bot_structural_recovery".
   string verification_basis = 15;
@@ -1065,15 +1085,22 @@ message TapeIndexVerification {
 
 message TapeFinalization {
   bytes tape_uuid = 1;
-  bytes operation_id = 2;
+  // Operator finalization operation. Absent for BUSY, and for a finalization
+  // an automatic trigger started, which has no operation id
+  // (tapes.finalization_operation_id is nullable).
+  optional bytes operation_id = 2;
   TapeFinalizationProgress progress = 3;
-  uint32 completed_replicas = 4;
+  // Absent for BUSY, where the tape's progress was never read. On an accepted
+  // or recorded finalization it is always present; zero is BEFORE_REPLICA_A.
+  optional uint32 completed_replicas = 4;
   // Deprecated draft field. Finalization no longer claims observation-backed
   // media health; servers leave this empty. Retaining tag 5 prevents older
   // clients from decoding progress states as health states.
   repeated TapeIndexReplicaHealth replica_health = 5 [deprecated = true];
-  bytes edition_digest = 6;
-  bytes layout_digest = 7;
+  // Absent for BUSY; always present, 32 bytes, on an accepted or recorded
+  // finalization.
+  optional bytes edition_digest = 6;
+  optional bytes layout_digest = 7;
   TapeFinalizationOutcome outcome = 8;
   string trigger = 9;
   string detail = 10;
