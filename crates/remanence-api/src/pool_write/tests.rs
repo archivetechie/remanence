@@ -895,6 +895,9 @@ struct StagedTestSink {
     diagnostic_publications: u64,
     ordered_events: Arc<Mutex<Vec<String>>>,
     position_overrides: VecDeque<TapePosition>,
+    /// Receives the running count of `position()` calls, so a test can act at
+    /// an exact point in the writer's sequence instead of racing it.
+    position_notify: Option<std_mpsc::Sender<usize>>,
 }
 
 impl StagedTestSink {
@@ -921,6 +924,7 @@ impl StagedTestSink {
             diagnostic_publications: 0,
             ordered_events: Arc::new(Mutex::new(Vec::new())),
             position_overrides: VecDeque::new(),
+            position_notify: None,
         }
     }
 
@@ -1115,6 +1119,14 @@ impl BlockSink for StagedTestSink {
 
     fn position(&mut self) -> Result<TapePosition, TapeIoError> {
         self.events.push("position".to_string());
+        if let Some(notify) = &self.position_notify {
+            let calls = self
+                .events
+                .iter()
+                .filter(|event| *event == "position")
+                .count();
+            let _ = notify.send(calls);
+        }
         if self.fail_position {
             return Err(TapeIoError::OperationFailed(
                 "injected READ POSITION failure".into(),
@@ -1508,6 +1520,8 @@ fn overlap_resume_refuses_position_drift_before_the_next_write() {
     };
     let mut sink = StagedTestSink::new(2);
     sink.position_overrides = [position(0), position(1), position(9)].into();
+    let (position_tx, position_rx) = std_mpsc::channel();
+    sink.position_notify = Some(position_tx);
     let mut gated = OverlapBlockSink {
         inner: &mut sink,
         control: Arc::clone(&control),
@@ -1522,6 +1536,15 @@ fn overlap_resume_refuses_position_drift_before_the_next_write() {
     consumer.read_exact(&mut drained).expect("drain to low");
 
     let refill = std::thread::spawn(move || {
+        // Refill only after the writer has read the low-water pause boundary
+        // (its second READ POSITION). Refilling earlier lets the writer see a
+        // full ring, skip the pause and write normally, and the resume proof
+        // under test never runs.
+        while position_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("writer reached the low-water pause boundary")
+            < 2
+        {}
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
