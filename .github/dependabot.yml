@@ -1,20 +1,89 @@
 version: 2
+
+# The fuzz crate and the field-test client resolve the workspace crates by
+# path, so a bump proposed for either of them also edits the workspace pins in
+# the root Cargo.toml. The same groups and holds therefore apply to all three
+# cargo entries.
+#
+# Held: the RustCrypto generation (digest 0.11 and its crates) moves only
+# together with hpke, whose Kem trait the REM-ENCRYPT key wrap implements.
+# That upgrade is a planned change, verified against the REM-ENCRYPT vectors,
+# and is not taken piecemeal. Remove these holds when it lands.
+
 updates:
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      tonic:
+        patterns: ["tonic", "tonic-*"]
+      rustcrypto:
+        patterns: ["sha2", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+    ignore:
+      - dependency-name: "sha2"
+        versions: [">= 0.11"]
+      - dependency-name: "hmac"
+        versions: [">= 0.13"]
+      - dependency-name: "hkdf"
+        versions: [">= 0.13"]
+      - dependency-name: "chacha20"
+        versions: [">= 0.10"]
+      - dependency-name: "chacha20poly1305"
+        versions: [">= 0.11"]
+      - dependency-name: "rand_core"
+        versions: [">= 0.10"]
+      - dependency-name: "hpke"
+        versions: [">= 0.14"]
   - package-ecosystem: cargo
     directory: /fieldtest/tools/remfield-io
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      tonic:
+        patterns: ["tonic", "tonic-*"]
+      rustcrypto:
+        patterns: ["sha2", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+    ignore:
+      - dependency-name: "sha2"
+        versions: [">= 0.11"]
+      - dependency-name: "hmac"
+        versions: [">= 0.13"]
+      - dependency-name: "hkdf"
+        versions: [">= 0.13"]
+      - dependency-name: "chacha20"
+        versions: [">= 0.10"]
+      - dependency-name: "chacha20poly1305"
+        versions: [">= 0.11"]
+      - dependency-name: "rand_core"
+        versions: [">= 0.10"]
+      - dependency-name: "hpke"
+        versions: [">= 0.14"]
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      rustcrypto:
+        patterns: ["sha2", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+    ignore:
+      - dependency-name: "sha2"
+        versions: [">= 0.11"]
+      - dependency-name: "hmac"
+        versions: [">= 0.13"]
+      - dependency-name: "hkdf"
+        versions: [">= 0.13"]
+      - dependency-name: "chacha20"
+        versions: [">= 0.10"]
+      - dependency-name: "chacha20poly1305"
+        versions: [">= 0.11"]
+      - dependency-name: "rand_core"
+        versions: [">= 0.10"]
+      - dependency-name: "hpke"
+        versions: [">= 0.14"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
