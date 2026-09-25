@@ -82,10 +82,10 @@ fn workspace_root() -> PathBuf {
 }
 
 fn read_manifest(path: &Path) -> Value {
-    fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-        .parse()
-        .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    let text =
+        fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    // toml 1.x: `str::parse::<Value>` reads a single value; a manifest is a document.
+    toml::from_str(&text).unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
 }
 
 fn manifest_dependencies(manifest: &Value) -> Vec<String> {

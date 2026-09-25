@@ -41,7 +41,8 @@ fn workspace_root() -> PathBuf {
 
 fn assert_internal_dependencies(manifest_path: &Path, allowed: BTreeSet<&str>) {
     let contents = fs::read_to_string(manifest_path).expect("read Cargo.toml");
-    let manifest: Value = contents.parse().expect("parse Cargo.toml");
+    // toml 1.x: `str::parse::<Value>` reads a single value; a manifest is a document.
+    let manifest: Value = toml::from_str(&contents).expect("parse Cargo.toml");
 
     let internal_dependencies = collect_internal_dependencies(&manifest);
     let violations = internal_dependencies
