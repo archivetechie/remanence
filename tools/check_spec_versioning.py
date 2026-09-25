@@ -346,8 +346,8 @@ def readme_state_findings(root: pathlib.Path, documents: dict[str, str]) -> list
     return errors
 
 
-KNOWN_REFERENCES = Counter({('in-progress/rem-parity-1-specification.md', 'local', '10.5', 'Excluded by construction: `copy_kind`, the reserved fields, `copy_generation`, the hash field itself, and all CRC fields. Both copies of one sidecar therefore carry the same hash, and the epoch directory (Section 10.5) can verify a surviving header copy independently of *which* copy survived. Readers MUST verify the hash on every index parse.'): 1})
-KNOWN_ANCHORS = Counter({('in-progress/rem-parity-1-specification.md', 'appendix-c-open-items-closed-before-publication-informative', '[Open Items Closed Before Publication (Informative)](#appendix-c-open-items-closed-before-publication-informative)'): 1})
+KNOWN_REFERENCES = Counter()
+KNOWN_ANCHORS = Counter()
 
 
 def structural_findings(root: pathlib.Path = ROOT) -> list[str]:

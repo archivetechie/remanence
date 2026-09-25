@@ -132,7 +132,7 @@ class StructuralRulesTests(unittest.TestCase):
             "publication/rem-object-core-1-specification.md": (21, 52, 120),
             "publication/rem-encrypt-1-specification.md": (0, 40, 37),
             "publication/formats-explained.md": (0, 7, 1),
-            "in-progress/rem-parity-1-specification.md": (26, 59, 94),
+            "in-progress/rem-parity-1-specification.md": (25, 59, 94),
             "publication/rem-parity-1-specification.md": (26, 61, 0),
         }
         docs = lint.discovered_documents()
@@ -146,7 +146,7 @@ class StructuralRulesTests(unittest.TestCase):
         name = "in-progress/rem-parity-1-specification.md"
         with tempfile.TemporaryDirectory() as temporary:
             scratch = pathlib.Path(temporary) / pathlib.Path(name).name
-            scratch.write_text(docs[name].replace("directory (Section 10.5)", "directory (Section 10.9)"))
+            scratch.write_text(docs[name].replace("directory (Section 10.1.5)", "directory (Section 10.9)"))
             mutated = {**docs, name: scratch.read_text()}
             defects = lint.deep_unresolved(name, mutated)
             self.assertTrue(any(key[2] == "10.9" for key in defects))

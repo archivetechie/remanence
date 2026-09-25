@@ -88,7 +88,7 @@ documents and published artifacts themselves.
   numbered fields (1 = tape file number, 4 = object identity, and so on).
   The sole BOT Bootstrap is Object-count independent and contains no rows.
   The set of assigned numbers is a vocabulary that can grow.
-- **Where.** REM-PARITY §8.2.1.
+- **Where.** REM-PARITY §10.3.
 - **Current values.** Row keys 1–4, 10–13 and 21–23 are assigned; key 4
   (`object_id`) is required. Bootstrap payload key 30 is prohibited by the
   replacement draft.
@@ -119,8 +119,8 @@ documents and published artifacts themselves.
 
 - **What it is.** The final pre-A ParityMap and every A/B/C replica or typed
   separation header/footer carry a `schema_version`.
-- **Where.** Offset 0x08 of each meaningful frame. Normative: REM-PARITY §§8–10
-  and the preparing terminal byte draft.
+- **Where.** Offset 0x08 of each meaningful frame. Normative: REM-PARITY
+  §10.1.3 (ParityMap), §10.4 (terminal replica), and §10.5 (separation extent).
 - **Current values.** 2 for the ParityMap header/footer; 1 for terminal replica
   and separation frames.
 - **Unknown value.** MUST be rejected; guessing a terminal authority layout
@@ -131,18 +131,22 @@ documents and published artifacts themselves.
 ### 7. The magic labels — version bytes inside "fixed" constants
 
 - **What it is.** Every structure announces itself with magic bytes, and
-each magic label ends in a version byte. The active labels cover the BOT
-  Bootstrap, sidecar header/footer, terminal replica header/footer, and
-  separation header/footer.
+  each magic label carries a version byte (`\x01`); the terminal replica and
+  separation labels follow it with a role letter (`H` or `F`). The active
+  labels cover the BOT Bootstrap, sidecar header/footer, ParityMap
+  header/footer, terminal replica header/footer, and separation
+  header/footer.
 - **Where.** REM-PARITY §2.5. Every magic except the BOT Bootstrap is further
   keyed to the individual tape by HMAC, so structures cannot migrate
   between tapes.
-- **Current values.** All end `\x01`.
+- **Current values.** Version byte `\x01` in every label. The Bootstrap,
+  sidecar and ParityMap labels end in it; the terminal replica and separation
+  labels end in `H` (header) or `F` (footer) after it.
 - **Unknown value.** A non-matching magic is simply "not this structure" —
   the structure is not recognised at all.
-- **How it changes.** A new magic (for example ending `\x02`) is one of
-  the defining moves of a new major version. The trailing byte exists so a
-  future generation can announce itself unambiguously.
+- **How it changes.** A new magic (for example with version byte `\x02`)
+  is one of the defining moves of a new major version. The version byte
+  exists so a future generation can announce itself unambiguously.
 
 ### 8. The erasure scheme — `rs-cauchy-gf256-v1`
 

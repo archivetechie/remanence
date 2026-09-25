@@ -6,9 +6,10 @@ the stable formats lives in the published specifications —
 [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md), and
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md). The
 terminal triple index described below is the experimental generation-2
-replacement in the current preparing copy; its candidate byte tables are in the
-[in-progress byte draft](../specs/in-progress/supporting/rem-parity-terminal-index-byte-draft.md).
-It is not part of the unchanged publication baseline.
+replacement in the current preparing copy,
+[REM-PARITY 1.0.0-draft.5](../specs/in-progress/rem-parity-1-specification.md),
+whose Sections 8.3 and 10 give its byte tables. It is not part of the
+unchanged publication baseline.
 
 The design goal behind all of it: a tape must be readable with no access
 to Remanence's host state. Everything the catalog knows is either written
