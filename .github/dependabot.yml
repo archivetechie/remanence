@@ -6,7 +6,7 @@ version: 2
 # cargo entries.
 #
 # Held: the RustCrypto generation (digest 0.11 and its crates, including the
-# sha3 used by the X-Wing combiner) moves only together with hpke, whose Kem
+# sha3 and x25519-dalek used by X-Wing) moves only together with hpke, whose Kem
 # trait the REM-ENCRYPT key wrap implements.
 # That upgrade is a planned change, verified against the REM-ENCRYPT vectors,
 # and is not taken piecemeal. Remove these holds when it lands.
@@ -21,7 +21,7 @@ updates:
       grpc:
         patterns: ["tonic", "tonic-*", "prost", "prost-*"]
       rustcrypto:
-        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke", "x25519-dalek"]
     ignore:
       - dependency-name: "sha2"
         versions: [">= 0.11"]
@@ -39,6 +39,8 @@ updates:
         versions: [">= 0.10"]
       - dependency-name: "hpke"
         versions: [">= 0.14"]
+      - dependency-name: "x25519-dalek"
+        versions: [">= 3"]
   - package-ecosystem: cargo
     directory: /fieldtest/tools/remfield-io
     schedule:
@@ -48,7 +50,7 @@ updates:
       grpc:
         patterns: ["tonic", "tonic-*", "prost", "prost-*"]
       rustcrypto:
-        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke", "x25519-dalek"]
     ignore:
       - dependency-name: "sha2"
         versions: [">= 0.11"]
@@ -66,6 +68,8 @@ updates:
         versions: [">= 0.10"]
       - dependency-name: "hpke"
         versions: [">= 0.14"]
+      - dependency-name: "x25519-dalek"
+        versions: [">= 3"]
   - package-ecosystem: cargo
     directory: /fuzz
     schedule:
@@ -73,7 +77,7 @@ updates:
     open-pull-requests-limit: 5
     groups:
       rustcrypto:
-        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke", "x25519-dalek"]
     ignore:
       - dependency-name: "sha2"
         versions: [">= 0.11"]
@@ -91,6 +95,8 @@ updates:
         versions: [">= 0.10"]
       - dependency-name: "hpke"
         versions: [">= 0.14"]
+      - dependency-name: "x25519-dalek"
+        versions: [">= 3"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
