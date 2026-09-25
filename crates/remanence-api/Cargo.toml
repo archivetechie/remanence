@@ -41,7 +41,7 @@ x509-parser.workspace = true
 
 [build-dependencies]
 prost.workspace = true
-prost-build = "=0.14.1"
+prost-build = "=0.14.4"
 protox.workspace = true
 tonic-build.workspace = true
 tonic-prost-build.workspace = true

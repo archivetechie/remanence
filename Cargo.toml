@@ -41,7 +41,7 @@ clap                = { version = "4",   features = ["derive"] }
 hkdf                = "0.12"
 hpke                = { version = "=0.13.0", default-features = false, features = ["std", "x25519"] }
 getrandom           = "=0.4.3"
-rand_core           = "=0.9.3"
+rand_core           = "=0.9.5"
 hmac                = "0.12"
 hyper-util          = "0.1"
 libc                = "0.2"
@@ -68,9 +68,9 @@ uuid                = { version = "1", features = ["serde", "v4"] }
 xattr               = "=1.6.1"
 x509-parser         = "0.18.1"
 zeroize             = "1"
-prost               = "=0.14.1"
-prost-derive        = "=0.14.1"
-prost-types         = "=0.14.1"
+prost               = "=0.14.4"
+prost-derive        = "=0.14.4"
+prost-types         = "=0.14.4"
 # Rust implementation of protoc: the build needs no system protobuf compiler.
 protox              = "=0.9.1"
 tonic               = "=0.14.6"
