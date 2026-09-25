@@ -95,6 +95,12 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      # The field-test client is outside the workspace, so the workspace build
+      # never compiles it; without this step it silently drifted behind the
+      # Layer 5 API until the next field window would have found it broken.
+      - name: Check the field-test client builds against the current API
+        run: cargo check --locked --manifest-path fieldtest/tools/remfield-io/Cargo.toml
+
       - name: Build warning-free API documentation
         env:
           RUSTDOCFLAGS: -D warnings
