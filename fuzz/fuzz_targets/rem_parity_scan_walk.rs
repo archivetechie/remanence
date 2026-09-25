@@ -47,6 +47,11 @@ impl RawTapeSource for FuzzRawTape {
         Ok(())
     }
 
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.cursor = self.records.len();
+        Ok(PhysicalPositionHint::new(self.cursor as u64))
+    }
+
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
         if count < 0 {
             return Err(ParityError::Invariant("fuzz tape spaces forward only"));
