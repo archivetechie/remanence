@@ -4,6 +4,63 @@ use std::collections::BTreeSet;
 
 use ciborium::value::Value as CborValue;
 
+/// Decode exactly one CBOR value from its declared payload extent.
+pub(crate) fn decode_canonical_cbor_value(
+    bytes: &[u8],
+    context: &str,
+) -> Result<CborValue, String> {
+    let mut reader = std::io::Cursor::new(bytes);
+    let value: CborValue = ciborium::from_reader(&mut reader)
+        .map_err(|error| format!("{context} CBOR decode failed: {error}"))?;
+    if reader.position() != bytes.len() as u64 {
+        return Err(format!(
+            "{context} CBOR consumed {} of {} encoded bytes",
+            reader.position(),
+            bytes.len()
+        ));
+    }
+
+    validate_canonical_cbor_shape(&value, context)?;
+
+    let mut canonical = Vec::new();
+    ciborium::into_writer(&value, &mut canonical)
+        .map_err(|error| format!("{context} CBOR re-encode failed: {error}"))?;
+    if canonical != bytes {
+        return Err(format!(
+            "{context} CBOR is not the deterministic canonical encoding"
+        ));
+    }
+    Ok(value)
+}
+
+/// Validate the permitted CBOR value types and every map's integer-key order.
+pub(crate) fn validate_canonical_cbor_shape(value: &CborValue, label: &str) -> Result<(), String> {
+    match value {
+        CborValue::Integer(_)
+        | CborValue::Bytes(_)
+        | CborValue::Text(_)
+        | CborValue::Bool(_)
+        | CborValue::Null => Ok(()),
+        CborValue::Array(values) => {
+            for value in values {
+                validate_canonical_cbor_shape(value, label)?;
+            }
+            Ok(())
+        }
+        CborValue::Map(entries) => {
+            let mut key_order = IntegerMapKeyTracker::default();
+            for (key, value) in entries {
+                key_order.next(key.clone(), label)?;
+                validate_canonical_cbor_shape(value, label)?;
+            }
+            Ok(())
+        }
+        CborValue::Float(_) => Err(format!("{label} contains a forbidden CBOR float")),
+        CborValue::Tag(_, _) => Err(format!("{label} contains a forbidden CBOR tag")),
+        _ => Err(format!("{label} contains an unsupported CBOR value")),
+    }
+}
+
 /// Tracks duplicate keys and RFC 8949 deterministic key order within one map.
 #[derive(Debug, Default)]
 pub(crate) struct IntegerMapKeyTracker {

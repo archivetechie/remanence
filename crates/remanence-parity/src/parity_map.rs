@@ -1240,8 +1240,8 @@ fn encode_parity_map_payload(payload: &ParityMapPayload) -> Result<Vec<u8>, Pari
 }
 
 fn decode_parity_map_payload(bytes: &[u8]) -> Result<ParityMapPayload, ParityError> {
-    let value: CborValue = ciborium::from_reader(bytes)
-        .map_err(|err| parity_map_parse(format!("parity-map payload CBOR decode failed: {err}")))?;
+    let value = crate::cbor::decode_canonical_cbor_value(bytes, "parity-map payload")
+        .map_err(parity_map_parse)?;
     let map = match value {
         CborValue::Map(map) => map,
         _ => return Err(parity_map_parse("parity-map payload root is not a map")),
@@ -2174,6 +2174,50 @@ mod tests {
     }
 
     #[test]
+    fn parity_map_payload_rejects_noncanonical_heads_and_trailing_bytes() {
+        let payload = sample_payload();
+        let canonical = encode_parity_map_payload(&payload).expect("payload encodes");
+        assert_eq!(
+            decode_parity_map_payload(&canonical).expect("canonical payload decodes"),
+            payload
+        );
+
+        assert_eq!(canonical[0], 0xa7);
+        assert_eq!(canonical[1], 0x01);
+        let mut overlong_key = canonical.clone();
+        overlong_key.splice(1..2, [0x18, 0x01]);
+        let error =
+            decode_parity_map_payload(&overlong_key).expect_err("overlong root key must reject");
+        assert!(
+            matches!(&error, ParityError::ParityMapParse(message) if message.contains("not the deterministic canonical encoding")),
+            "unexpected error: {error:?}"
+        );
+
+        let mut trailing = canonical.clone();
+        trailing.push(0x00);
+        let error = decode_parity_map_payload(&trailing)
+            .expect_err("bytes after root map inside payload must reject");
+        assert!(
+            matches!(&error, ParityError::ParityMapParse(message) if message.contains("CBOR consumed")),
+            "unexpected error: {error:?}"
+        );
+
+        // Key 3 is the sequence (7); key 4 follows it.
+        let sequence_head = canonical
+            .windows(3)
+            .position(|window| window == [0x03, 0x07, 0x04])
+            .expect("canonical sequence and next key");
+        let mut overlong_value = canonical.clone();
+        overlong_value.splice(sequence_head + 1..sequence_head + 2, [0x18, 0x07]);
+        let error = decode_parity_map_payload(&overlong_value)
+            .expect_err("overlong sequence integer must reject");
+        assert!(
+            matches!(&error, ParityError::ParityMapParse(message) if message.contains("not the deterministic canonical encoding")),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
     fn parity_map_writer_rejects_invalid_diagnostic_text() {
         for invalid_version in ["v".repeat(129), "writer\x1b[2J".to_string()] {
             let mut payload = sample_payload();
@@ -2364,5 +2408,54 @@ mod tests {
 
         directory.directory_scope_highest_protected_ordinal = 1;
         assert_directory_invalid(&directory);
+    }
+
+    #[test]
+    fn parity_map_payload_rejects_indefinite_root_and_forbidden_unknown_values() {
+        let canonical = encode_parity_map_payload(&sample_payload()).expect("payload encodes");
+        assert_eq!(canonical[0], 0xa7);
+
+        let mut indefinite = canonical.clone();
+        indefinite[0] = 0xbf;
+        indefinite.push(0xff);
+        let error = decode_parity_map_payload(&indefinite)
+            .expect_err("indefinite-length root map must reject");
+        assert!(
+            matches!(&error, ParityError::ParityMapParse(message)
+            if message.contains("not the deterministic canonical encoding")),
+            "unexpected error: {error:?}"
+        );
+
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("tag", &[0xc0, 0x61, b'x'], "forbidden CBOR tag"),
+            (
+                "double float",
+                &[0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a],
+                "forbidden CBOR float",
+            ),
+            (
+                "duplicate nested keys",
+                &[0xa2, 0x01, 0x00, 0x01, 0x00],
+                "duplicate CBOR map key",
+            ),
+            (
+                "out-of-order nested keys",
+                &[0xa2, 0x02, 0x00, 0x01, 0x00],
+                "not in deterministic order",
+            ),
+        ];
+        for &(case, value, expected) in cases {
+            let mut mutated = canonical.clone();
+            mutated[0] = 0xa8; // One additional root-map entry.
+            mutated.extend_from_slice(&[0x18, 0x63]); // Key 99, last in encoded-key order.
+            mutated.extend_from_slice(value);
+            let error = decode_parity_map_payload(&mutated)
+                .expect_err(&format!("{case} under unknown key must reject"));
+            assert!(
+                matches!(&error, ParityError::ParityMapParse(message)
+                if message.contains(expected)),
+                "{case}: unexpected error: {error:?}"
+            );
+        }
     }
 }
