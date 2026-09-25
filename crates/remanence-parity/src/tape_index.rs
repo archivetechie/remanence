@@ -720,36 +720,7 @@ fn validate_slot_reencoding(slot: &[u8], canonical: &[u8], label: &str) -> Resul
 }
 
 fn validate_canonical_cbor_shape(value: &CborValue, label: &str) -> Result<(), ParityError> {
-    match value {
-        CborValue::Integer(_)
-        | CborValue::Bytes(_)
-        | CborValue::Text(_)
-        | CborValue::Bool(_)
-        | CborValue::Null => Ok(()),
-        CborValue::Array(values) => {
-            for value in values {
-                validate_canonical_cbor_shape(value, label)?;
-            }
-            Ok(())
-        }
-        CborValue::Map(entries) => {
-            let mut key_order = IntegerMapKeyTracker::default();
-            for (key, value) in entries {
-                key_order.next(key.clone(), label).map_err(payload_error)?;
-                validate_canonical_cbor_shape(value, label)?;
-            }
-            Ok(())
-        }
-        CborValue::Float(_) => Err(payload_error(format!(
-            "{label} contains a forbidden CBOR float"
-        ))),
-        CborValue::Tag(_, _) => Err(payload_error(format!(
-            "{label} contains a forbidden CBOR tag"
-        ))),
-        _ => Err(payload_error(format!(
-            "{label} contains an unsupported CBOR value"
-        ))),
-    }
+    crate::cbor::validate_canonical_cbor_shape(value, label).map_err(payload_error)
 }
 
 fn cbor_u64(value: CborValue, field: &str) -> Result<u64, ParityError> {

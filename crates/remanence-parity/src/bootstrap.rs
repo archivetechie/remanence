@@ -649,8 +649,8 @@ fn decode_cbor_payload(
     bytes: &[u8],
     no_parity_flag: bool,
 ) -> Result<DecodedBootstrapCbor, ParityError> {
-    let value: CborValue = ciborium::from_reader(bytes)
-        .map_err(|e| ParityError::BootstrapParse(format!("CBOR decode failed: {e}")))?;
+    let value = crate::cbor::decode_canonical_cbor_value(bytes, "bootstrap payload")
+        .map_err(ParityError::BootstrapParse)?;
     let map = match value {
         CborValue::Map(m) => m,
         _ => {
@@ -1272,6 +1272,49 @@ mod tests {
 
         let extended = append_unknown_cbor_map_key(canonical);
         decode_bootstrap_payload_value(&extended).expect("ordered unknown payload key is ignored");
+    }
+
+    #[test]
+    fn bootstrap_payload_rejects_noncanonical_heads_and_trailing_bytes() {
+        let payload = sample_payload();
+        let canonical = encode_cbor_payload(&payload).expect("payload encodes");
+        let decoded = decode_cbor_payload(&canonical, false).expect("canonical payload decodes");
+        assert_eq!(decoded.written_by_version, payload.written_by_version);
+        assert!(decoded.scheme_record.is_some());
+
+        assert_eq!(canonical[0], 0xa5);
+        assert_eq!(canonical[1], 0x01);
+        let mut overlong_key = canonical.clone();
+        overlong_key.splice(1..2, [0x18, 0x01]);
+        let error =
+            decode_cbor_payload(&overlong_key, false).expect_err("overlong root key must reject");
+        assert!(
+            matches!(&error, ParityError::BootstrapParse(message) if message.contains("not the deterministic canonical encoding")),
+            "unexpected error: {error:?}"
+        );
+
+        let mut trailing = canonical.clone();
+        trailing.push(0x00);
+        let error = decode_cbor_payload(&trailing, false)
+            .expect_err("bytes after root map inside payload must reject");
+        assert!(
+            matches!(&error, ParityError::BootstrapParse(message) if message.contains("CBOR consumed")),
+            "unexpected error: {error:?}"
+        );
+
+        // Scheme key 2 is data_blocks_per_stripe (128); key 3 follows it.
+        let value_head = canonical
+            .windows(4)
+            .position(|window| window == [0x02, 0x18, 0x80, 0x03])
+            .expect("canonical scheme stripe count and next key");
+        let mut overlong_value = canonical.clone();
+        overlong_value.splice(value_head + 1..value_head + 3, [0x19, 0x00, 0x80]);
+        let error = decode_cbor_payload(&overlong_value, false)
+            .expect_err("overlong scheme integer must reject");
+        assert!(
+            matches!(&error, ParityError::BootstrapParse(message) if message.contains("not the deterministic canonical encoding")),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]
@@ -2174,5 +2217,54 @@ mod tests {
 
         let parsed = parse_bootstrap_block(&buf[..]).expect("future-field parse ok");
         assert_eq!(parsed, payload);
+    }
+
+    #[test]
+    fn bootstrap_payload_rejects_indefinite_root_and_forbidden_unknown_values() {
+        let canonical = encode_cbor_payload(&sample_payload()).expect("payload encodes");
+        assert_eq!(canonical[0], 0xa5);
+
+        let mut indefinite = canonical.clone();
+        indefinite[0] = 0xbf;
+        indefinite.push(0xff);
+        let error = decode_cbor_payload(&indefinite, false)
+            .expect_err("indefinite-length root map must reject");
+        assert!(
+            matches!(&error, ParityError::BootstrapParse(message)
+            if message.contains("not the deterministic canonical encoding")),
+            "unexpected error: {error:?}"
+        );
+
+        let cases: &[(&str, &[u8], &str)] = &[
+            ("tag", &[0xc0, 0x61, b'x'], "forbidden CBOR tag"),
+            (
+                "double float",
+                &[0xfb, 0x3f, 0xf1, 0x99, 0x99, 0x99, 0x99, 0x99, 0x9a],
+                "forbidden CBOR float",
+            ),
+            (
+                "duplicate nested keys",
+                &[0xa2, 0x01, 0x00, 0x01, 0x00],
+                "duplicate CBOR map key",
+            ),
+            (
+                "out-of-order nested keys",
+                &[0xa2, 0x02, 0x00, 0x01, 0x00],
+                "not in deterministic order",
+            ),
+        ];
+        for &(case, value, expected) in cases {
+            let mut mutated = canonical.clone();
+            mutated[0] = 0xa6; // One additional root-map entry.
+            mutated.extend_from_slice(&[0x18, 0x63]); // Key 99, last in encoded-key order.
+            mutated.extend_from_slice(value);
+            let error = decode_cbor_payload(&mutated, false)
+                .expect_err(&format!("{case} under unknown key must reject"));
+            assert!(
+                matches!(&error, ParityError::BootstrapParse(message)
+                if message.contains(expected)),
+                "{case}: unexpected error: {error:?}"
+            );
+        }
     }
 }
