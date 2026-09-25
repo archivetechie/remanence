@@ -32,7 +32,7 @@ readme = "README.md"
 # Shared dependency versions. Each crate opts in by referencing
 # `dep.workspace = true` in its own Cargo.toml.
 [workspace.dependencies]
-base64             = "0.22"
+base64             = "0.23"
 bytes               = "1"
 chacha20poly1305   = "0.10"
 chacha20           = { version = "0.9", features = ["zeroize"] }
@@ -57,7 +57,7 @@ thiserror           = "2"
 time                = { version = "0.3", features = ["formatting", "parsing"] }
 tokio               = { version = "1",   features = ["full"] }
 tokio-stream        = "0.1"
-toml                = "0.8"
+toml                = "1"
 tower               = "0.5"
 tracing             = "0.1"
 tracing-subscriber  = { version = "0.3", features = ["env-filter", "fmt", "json"] }
