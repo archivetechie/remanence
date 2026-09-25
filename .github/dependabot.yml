@@ -5,8 +5,9 @@ version: 2
 # the root Cargo.toml. The same groups and holds therefore apply to all three
 # cargo entries.
 #
-# Held: the RustCrypto generation (digest 0.11 and its crates) moves only
-# together with hpke, whose Kem trait the REM-ENCRYPT key wrap implements.
+# Held: the RustCrypto generation (digest 0.11 and its crates, including the
+# sha3 used by the X-Wing combiner) moves only together with hpke, whose Kem
+# trait the REM-ENCRYPT key wrap implements.
 # That upgrade is a planned change, verified against the REM-ENCRYPT vectors,
 # and is not taken piecemeal. Remove these holds when it lands.
 
@@ -17,12 +18,14 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      tonic:
-        patterns: ["tonic", "tonic-*"]
+      grpc:
+        patterns: ["tonic", "tonic-*", "prost", "prost-*"]
       rustcrypto:
-        patterns: ["sha2", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
     ignore:
       - dependency-name: "sha2"
+        versions: [">= 0.11"]
+      - dependency-name: "sha3"
         versions: [">= 0.11"]
       - dependency-name: "hmac"
         versions: [">= 0.13"]
@@ -42,12 +45,14 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
-      tonic:
-        patterns: ["tonic", "tonic-*"]
+      grpc:
+        patterns: ["tonic", "tonic-*", "prost", "prost-*"]
       rustcrypto:
-        patterns: ["sha2", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
     ignore:
       - dependency-name: "sha2"
+        versions: [">= 0.11"]
+      - dependency-name: "sha3"
         versions: [">= 0.11"]
       - dependency-name: "hmac"
         versions: [">= 0.13"]
@@ -68,9 +73,11 @@ updates:
     open-pull-requests-limit: 5
     groups:
       rustcrypto:
-        patterns: ["sha2", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
+        patterns: ["sha2", "sha3", "hmac", "hkdf", "chacha20", "chacha20poly1305", "rand_core", "hpke"]
     ignore:
       - dependency-name: "sha2"
+        versions: [">= 0.11"]
+      - dependency-name: "sha3"
         versions: [">= 0.11"]
       - dependency-name: "hmac"
         versions: [">= 0.13"]
