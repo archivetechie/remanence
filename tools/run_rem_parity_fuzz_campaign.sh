@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the REM-PARITY 1.0 coverage-guided fuzz campaign used for freeze
-# evidence (specification §18.3). Mirrors run_rem_object_fuzz_campaign.sh,
+# evidence (REM-PARITY freeze criterion 3). Mirrors run_rem_object_fuzz_campaign.sh,
 # and additionally records each target's end state into a dated report under
 # fuzz/reports/ so "corpus plateau" is a recorded observation, not a claim.
 

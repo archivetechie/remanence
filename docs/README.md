@@ -54,7 +54,8 @@ format specifications — and their plain-language companion — live in
   Implementation and Operations Guide: informative, tool-neutral practice for
   tools that read or write the REM formats (hostile media, restoring onto a
   host, staging and durability, catalogs, keys and secrets, verification,
-  ingest). The specifications point to it for everything outside
+  writing, finalizing and reading tapes, capacity admission, ingest, descriptive
+  fields). The specifications point to it for everything outside
   conformance.
 - [versioning-explained.md](versioning-explained.md) — the three-question
   change policy that governs every format revision, in plain language.

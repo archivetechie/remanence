@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Fuzz target for the REM-PARITY 1.0 sidecar parsers: header block, footer
-//! block, and the whole-tape-file parse the Scanner uses (freeze §18.3).
+//! block, and the whole-tape-file parse the Scanner uses (REM-PARITY freeze criterion 3).
 //! Robustness property only: no panic, no hang, no unbounded allocation.
 
 use libfuzzer_sys::fuzz_target;

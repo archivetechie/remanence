@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Structure-aware robustness target for the REM-PARITY 1.0 bootstrap block
-//! (freeze criterion §18.3).
+//! (REM-PARITY freeze criterion 3).
 //!
 //! Why this exists alongside `rem_parity_bootstrap_parse`. That target hands
 //! raw bytes to `parse_bootstrap_block`, which validates magic, then a

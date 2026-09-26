@@ -2,7 +2,7 @@
 
 //! Fuzz target for the REM-PARITY 1.0 parity_map parsers: header and footer
 //! blocks plus the whole-tape-file parse with its payload digest and §10.1.5
-//! directory-invariant checks (freeze §18.3). Robustness property only.
+//! directory-invariant checks (REM-PARITY freeze criterion 3). Robustness property only.
 
 use libfuzzer_sys::fuzz_target;
 use remanence_parity::{

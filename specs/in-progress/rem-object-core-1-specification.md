@@ -2062,10 +2062,9 @@ effect on conformance.
   No byte of the format changed, and no valid object or vector changed. This
   document no longer requires a conformant tool to protect the host it
   restores onto, to survive hostile input, or to stage its output durably;
-  the Guide recommends each. REM-ENCRYPT's rules of the same kind have since
-  left it too, as its own revision history records. REM-PARITY still carries
-  the rules that its Section 1.5 places outside it, until a later change in
-  this revision series moves them.
+  the Guide recommends each. REM-ENCRYPT's and REM-PARITY's rules of the same
+  kind have since left those documents too, as their own revision histories
+  record.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
   an informative description of the capacity cost the alignment rule imposes
   on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper

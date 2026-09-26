@@ -1,4 +1,4 @@
-//! Live and hermetic §18.4 freeze-drill orchestration.
+//! Live and hermetic REM-PARITY freeze criterion 4 freeze-drill orchestration.
 //!
 //! The drill writes deterministic REM-OBJECT payloads through the production
 //! parity sink, derives read-side medium-error LBAs from the committed tape
@@ -54,7 +54,7 @@ const DRILL_TIMESTAMP: &str = "2026-01-01T00:00:00Z";
 const OBJECT_COUNT: usize = 2;
 const DRILL_GAP_RECORDS: u64 = 3;
 
-/// Fixed block sizes admitted by the §18.4 steering vehicle.
+/// Fixed block sizes admitted by the REM-PARITY freeze criterion 4 steering vehicle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum FreezeDrillBlockSize {
     /// 256 KiB fixed records.

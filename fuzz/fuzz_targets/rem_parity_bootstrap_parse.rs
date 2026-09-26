@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Fuzz target for the REM-PARITY 1.0 bootstrap block parser — the entry the
-//! catalog-less Scanner feeds raw tape blocks into (freeze criterion §18.3).
+//! catalog-less Scanner feeds raw tape blocks into (REM-PARITY freeze criterion 3).
 //! Robustness property only: no panic, no hang, no unbounded allocation.
 
 use libfuzzer_sys::fuzz_target;

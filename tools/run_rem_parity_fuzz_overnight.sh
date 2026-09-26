@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Extended REM-PARITY 1.0 fuzz campaign (specification §18.3).
+# Extended REM-PARITY 1.0 fuzz campaign (REM-PARITY freeze criterion 3).
 #
 # The freeze campaign (run_rem_parity_fuzz_campaign.sh) runs each target
 # sequentially in a single process. That satisfies "no panics, hangs, or
