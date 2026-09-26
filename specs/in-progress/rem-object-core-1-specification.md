@@ -1,5 +1,50 @@
 # REM-OBJECT Core Format 1.0
 
+## Abstract
+
+This document specifies REM-OBJECT Core Format 1.0: a backend-independent byte
+format for large archival objects. A REM-OBJECT bundles named file payloads
+into one self-describing unit—a constrained POSIX pax tar stream carrying
+per-file SHA-256 identities, closed-form byte-range addressing, and a
+deterministic CBOR manifest. The canonical object may be stored directly as
+the **plaintext** representation or sealed inside the authenticated,
+confidential wrapper defined by REM-ENCRYPT.
+
+Both representations share the logical identity `plaintext_digest`; each
+stored copy has a representation-independent physical identity,
+`stored_digest`, that backends can scrub without interpreting the bytes. The
+format is designed for single-pass writing, byte-stable fanout to tape, disk,
+and object storage, parity protection over stored bytes, and long-term
+recovery from this document and its static test vectors. Canonical plaintext
+construction is deterministic.
+
+## Table of Contents
+
+- 1\. [Introduction](#1-introduction)
+- 2\. [Conventions and Terminology](#2-conventions-and-terminology)
+- 3\. [Object Model](#3-object-model)
+- 4\. [Plaintext Representation](#4-plaintext-representation)
+- 5\. [Encrypted Representation (in REM-ENCRYPT)](#5-encrypted-representation-in-rem-encrypt)
+- 6\. [Partial File Restore](#6-partial-file-restore)
+- 7\. [Digests, Integrity, and the Verification Chain](#7-digests-integrity-and-the-verification-chain)
+- 8\. [Storage Bindings and Backend Independence](#8-storage-bindings-and-backend-independence)
+- 9\. [Relationship to the Parity Layer](#9-relationship-to-the-parity-layer)
+- 10\. [Versioning and Extensibility](#10-versioning-and-extensibility)
+- 11\. [Errors](#11-errors)
+- 12\. [Security Considerations](#12-security-considerations)
+- 13\. [Test Vectors](#13-test-vectors)
+- 14\. [Conformance](#14-conformance)
+- 15\. [IANA Considerations](#15-iana-considerations)
+- 16\. [References](#16-references)
+- Appendix A. [Worked Example (Informative)](#appendix-a-worked-example-informative)
+- Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
+- Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
+- Appendix D. [Open Items (Informative)](#appendix-d-open-items-informative)
+- Appendix E. [Packing Many Small Files (Informative)](#appendix-e-packing-many-small-files-informative)
+- [Author's Address](#authors-address)
+
+---
+
 ## 1. Introduction
 
 ### 1.1. Identifiers and Versioning
@@ -7,8 +52,6 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
-| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719158](https://doi.org/10.5281/zenodo.21719158) | This publication |
-| Reference implementation DOI (informative) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | Software deposit, Apache-2.0 |
 | Stream format identifier | `rem-object-v1` | Frozen plaintext-stream wire constant |
 | Stream schema version | `1.0` without preserved xattrs; `1.1` with preserved xattrs | `REMANENCE.schema_version` |
 | Manifest schema version | `1` | Manifest CBOR field |
@@ -20,14 +63,19 @@ This document's version does not name any on-tape value. The
 indicator. REM-ENCRYPT independently defines the encrypted representation
 and its wire discriminators.
 
-REM-OBJECT Core and REM-ENCRYPT share one section skeleton, so the two can be
-read side by side: where a top-level number is absent from one document, the
-other owns it. This document omits Section 5 (the encrypted representation,
-owned by REM-ENCRYPT); REM-ENCRYPT omits Sections 4, 9, and 14 (the plaintext
-representation, the parity relationship, and conformance, owned here).
-Subsection numbers are shared as well: a gap below a common top-level section
-means the corresponding subsection is defined by the companion specification,
-not that text is missing from this document.
+REM-OBJECT and REM-ENCRYPT are numbered together, so the two can be read side
+by side. This document omits Section 5, the encrypted representation, which is
+in REM-ENCRYPT; REM-ENCRYPT omits Sections 4, 9 and 14, the plaintext
+representation, the relationship to the parity layer, and conformance, which
+are here. Each document marks a section it omits with a placeholder heading
+that names the document holding it. Sections 6, 7, 8, 11 and 12 number their
+subsections together in the same way: a number used in both documents names
+sections on the same subject, and a placeholder marks a subsection that only
+the other document contains. Sections 1, 3, 10 and 13 number their subsections
+separately, so the same number there can name unrelated sections; Sections 2
+and 16 match one for one. A reference into the other document therefore always
+names it, as in “REM-ENCRYPT §6.4”, while “Section 6.4” alone means this
+document's section.
 
 **Status of This Document**
 
@@ -131,57 +179,12 @@ re-pins an earlier one.
 The tape binding depends normatively on the REM-PARITY specification
 ([REMPARITY]), which is under review alongside this document. The
 tape-binding clauses of this document
-(the parity-layer references in Sections 4.9, 8.2, 9, 12.6) are stable
+(the parity-layer references in Sections 6.5, 8.2, 9, 12.6) are stable
 against every 1.x revision of REM-PARITY, because a REM-PARITY minor
 revision cannot invalidate a tape or leave an earlier reader unable to read
 one. A writer obligation added by a later REM-PARITY 1.x binds a Writer
 claiming that revision; it does not change this document's clauses. The
 file and object-store bindings do not depend on REM-PARITY.
-
-**Abstract**
-
-This document specifies REM-OBJECT Core Format 1.0: a backend-independent byte
-format for large archival objects. A REM-OBJECT bundles named file payloads
-into one self-describing unit—a constrained POSIX pax tar stream carrying
-per-file SHA-256 identities, closed-form byte-range addressing, and a
-deterministic CBOR manifest. The canonical object may be stored directly as
-the **plaintext** representation or sealed inside the authenticated,
-confidential wrapper defined by REM-ENCRYPT.
-
-Both representations share the logical identity `plaintext_digest`; each
-stored copy has a representation-independent physical identity,
-`stored_digest`, that backends can scrub without interpreting the bytes. The
-format is designed for single-pass writing, byte-stable fanout to tape, disk,
-and object storage, parity protection over stored bytes, and long-term
-recovery from this document and its static test vectors. Canonical plaintext
-construction is deterministic.
-
-**Table of Contents**
-
-- 1\. [Introduction](#1-introduction)
-- 2\. [Conventions and Terminology](#2-conventions-and-terminology)
-- 3\. [Object Model](#3-object-model)
-- 4\. [Plaintext Representation](#4-plaintext-representation)
-- 5\. *(Encrypted Representation — owned by REM-ENCRYPT; see Section 1.1)*
-- 6\. [Partial File Restore](#6-partial-file-restore)
-- 7\. [Digests, Integrity, and the Verification Chain](#7-digests-integrity-and-the-verification-chain)
-- 8\. [Storage Bindings and Backend Independence](#8-storage-bindings-and-backend-independence)
-- 9\. [Relationship to the Parity Layer](#9-relationship-to-the-parity-layer)
-- 10\. [Versioning and Extensibility](#10-versioning-and-extensibility)
-- 11\. [Errors](#11-errors)
-- 12\. [Security Considerations](#12-security-considerations)
-- 13\. [Test Vectors](#13-test-vectors)
-- 14\. [Conformance](#14-conformance)
-- 15\. [IANA Considerations](#15-iana-considerations)
-- 16\. [References](#16-references)
-- Appendix A. [Worked Example (Informative)](#appendix-a-worked-example-informative)
-- Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
-- Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
-- Appendix D. [Open Items (Informative)](#appendix-d-open-items-informative)
-- Appendix E. [Packing Many Small Files (Informative)](#appendix-e-packing-many-small-files-informative)
-- [Author's Address](#authors-address)
-
----
 
 ### 1.2. Purpose and Design Goals
 
@@ -1260,19 +1263,7 @@ A Reader processes the object as follows:
    have no payload hash of their own; they are verified through the
    manifest/object digest chain (and, for a hardlink, its referential
    integrity — Section 4.6).
-   Partial-range reads cannot verify a whole-file `file_sha256`. Their integrity
-   depends on representation and backend, and a range-read implementation MUST
-   report which of the three it provides rather than imply hash-verified content:
-   (a) a **parity-protected tape** plaintext copy is covered by the parity
-   layer's per-block CRCs ([REMPARITY]) — damage detection, not adversarial
-   authentication (CRC-64 confirms a guessed block); (b) an **encrypted** copy
-   follows the authenticated range-read rules of REM-ENCRYPT §6.3; (c) a
-   **plaintext copy on a byte-addressed backend without the
-   parity layer** (a file or object store) has **no per-range integrity by
-   construction** — a verifying range read there requires either the encrypted
-   representation or a whole-file `file_sha256`/`plaintext_digest` check, which
-   reads the whole file. Implementations MUST NOT present case (c) as
-   integrity-verified.
+   Section 6.5 states what integrity a partial-range read can claim.
 6. Capture the entry whose effective path is `_remanence/manifest.cbor` as the
    manifest bytes. An object whose EOF is reached with no manifest entry is
    nonconformant: Verifiers MUST reject it (Section 7.4), and a restore-mode
@@ -1308,6 +1299,8 @@ directory entries, and names; it loses only chunk addressing (irrelevant when sc
 verification (recoverable from the manifest if its blocks survive).
 Conformance requires demonstrated extraction equality by GNU tar, bsdtar, and
 Python `tarfile` (Section 14).
+
+## 5. Encrypted Representation (in REM-ENCRYPT)
 
 ## 6. Partial File Restore
 
@@ -1354,6 +1347,8 @@ bytes, with unrelated stream bytes after them (Section 4.6.4) — trim by `Z`,
 never by block boundaries. For a **plaintext copy** this is the whole
 computation: inner blocks are stored blocks; read them and trim.
 
+### 6.3. Ciphertext Mapping (in REM-ENCRYPT)
+
 ### 6.4. Stored-Block Mapping (Tape and Block-Addressed Backends)
 
 On a byte-addressed backend, a stored byte range is fetched directly. On a
@@ -1364,6 +1359,22 @@ stored byte range `[a, a + l)` maps to:
 first_stored_block = floor(a / C)
 last_stored_block  = floor((a + l − 1) / C)
 ```
+
+### 6.5. Integrity of a Range Read
+
+Partial-range reads cannot verify a whole-file `file_sha256`. Their integrity
+depends on representation and backend, and a range-read implementation MUST
+report which of the three it provides rather than imply hash-verified content:
+(a) a **parity-protected tape** plaintext copy is covered by the parity
+layer's per-block CRCs ([REMPARITY]) — damage detection, not adversarial
+authentication (CRC-64 confirms a guessed block); (b) an **encrypted** copy
+follows the authenticated range-read rules of REM-ENCRYPT §6.3; (c) a
+**plaintext copy on a byte-addressed backend without the
+parity layer** (a file or object store) has **no per-range integrity by
+construction** — a verifying range read there requires either the encrypted
+representation or a whole-file `file_sha256`/`plaintext_digest` check, which
+reads the whole file. Implementations MUST NOT present case (c) as
+integrity-verified.
 
 ## 7. Digests, Integrity, and the Verification Chain
 
@@ -1406,7 +1417,7 @@ complete.
 
 REM-ENCRYPT §7.2 specifies the additional encrypted write-path discharge.
 
-### 7.3. Post-Write Re-Verification (Deployment Obligation)
+### 7.3. Post-Write Re-Verification
 
 Recommended practice for re-verifying a copy after it is written is described
 in the REM Implementation and Operations Guide, under “Staging, commit and
@@ -1578,7 +1589,19 @@ SourceIo                  payload source read failure (not a format violation)
 TapeIo                    block sink/source failure (not a format violation)
 ```
 
+### 11.2. Envelope Errors (in REM-ENCRYPT)
+
 ## 12. Security Considerations
+
+### 12.1. Per-Object Key Uniqueness (in REM-ENCRYPT)
+
+### 12.2. Key Separation and Nonce Safety (in REM-ENCRYPT)
+
+### 12.3. Binding Without AAD (in REM-ENCRYPT)
+
+### 12.4. Fail-Closed (in REM-ENCRYPT)
+
+### 12.5. Confidentiality Boundary, Public Facts, and Catalog Trust (in REM-ENCRYPT)
 
 ### 12.6. Plaintext Copies Are Not Self-Authenticating
 
@@ -1595,6 +1618,10 @@ The off-tape catalog is a separate trust domain: it holds external anchors and
 may hold cleartext paths and per-file rows even when a stored copy is
 encrypted. REM-ENCRYPT §12.5 states the
 encrypted-copy public-facts and bootstrap-minimality consequences.
+
+### 12.7. Non-Committing AEAD (in REM-ENCRYPT)
+
+### 12.8. Key Rotation and Epoch Longevity (in REM-ENCRYPT)
 
 ### 12.9. Hostile-Input Posture
 
@@ -1661,6 +1688,8 @@ apply an attribute to be reported.
 
 Recommended practice for restoring onto a host is described in the REM
 Implementation and Operations Guide, under “Restoring onto a host”.
+
+### 12.11. Threat Model and Secret Handling (in REM-ENCRYPT)
 
 ### 12.12. Disclosure in Published Plaintext Objects
 

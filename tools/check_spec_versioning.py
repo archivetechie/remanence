@@ -32,6 +32,16 @@ Checked:
      it. Only whitespace is normalised. The published revisions that predate
      the subsection are excepted, listed by exact version; every other copy
      must carry it.
+ 10. A placeholder heading (a numbered heading, with or without the dot
+     after its number, whose title ends "(in REM-OBJECT)" or
+     "(in REM-ENCRYPT)") marks a section that the companion holds. It is not a
+     section of the document that carries it, and neither is any heading under
+     it: a reference that resolves only to a placeholder is reported, and can
+     never be listed as known. Each placeholder must repeat exactly, at the
+     same level, the heading the companion gives that number; must not share
+     its number with a section or another placeholder of its own document; and
+     has no body, a subordinate heading included. A heading that ends in the
+     suffix without being a numbered placeholder is reported.
 
 Exit 0 clean; exit 1 with findings on stderr.
 """
@@ -172,6 +182,7 @@ def unresolved_section_references(text: str) -> set[int]:
 # top-level reference semantics above remain intentionally unchanged.
 from collections import Counter
 import html
+from typing import NamedTuple
 import unicodedata
 
 DEEP_NUMBER = r"\d+(?:\.\d+)*"
@@ -181,6 +192,16 @@ COMPANIONS = {"Core": "rem-object-core-1-specification.md", "REM-OBJECT": "rem-o
               "[REMENCRYPT]": "rem-encrypt-1-specification.md", "REM-PARITY": "rem-parity-1-specification.md",
               "[REMPARITY]": "rem-parity-1-specification.md"}
 ATTRIBUTOR = r"(?:\[[^\]\r\n]+\]|RFC\s+\d+|Core|REM-OBJECT|REM-ENCRYPT|REM-PARITY)"
+# Rule 10. REM-OBJECT and REM-ENCRYPT number their sections together; a
+# section one of them holds appears in the other as a placeholder heading
+# that names the holder. The dot after the number is optional, as it is for
+# SECTION_HEADING, so a heading is never a section and a placeholder at once.
+SECTION_HEADING = r"(\d+(?:\.\d+)*)(?:\.|\s|$)"
+PLACEHOLDER_SUFFIX = re.compile(r"\s*\(in (?:REM-OBJECT|REM-ENCRYPT)\)$")
+PLACEHOLDER = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+(.+?)\s+\(in (REM-OBJECT|REM-ENCRYPT)\)$")
+PLACEHOLDER_OWNERS = {"REM-OBJECT": "rem-object-core-1-specification.md",
+                      "REM-ENCRYPT": "rem-encrypt-1-specification.md"}
+HEADING_LINE = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)(?:\s+#+)?\s*$", re.M)
 
 
 def document_views(text: str) -> tuple[str, str]:
@@ -224,9 +245,44 @@ def headings(text: str) -> list[str]:
     return re.findall(r"^ {0,3}#{1,6}\s+(.+?)(?:\s+#+)?\s*$", document_views(text)[1], re.M)
 
 
+def heading_entries(text: str) -> list[tuple[int, int, str]]:
+    """(line index, level, heading text) for every heading outside fences,
+    found exactly as headings() finds them."""
+    full = document_views(text)[1]
+    entries, line, last = [], 0, 0
+    for m in HEADING_LINE.finditer(full):
+        line += full.count("\n", last, m.start())
+        last = m.start()
+        entries.append((line, len(m.group(1)), m.group(2)))
+    return entries
+
+
 def section_numbers(text: str) -> set[str]:
-    return {m.group(1) for heading in headings(text)
-            if (m := re.match(r"(\d+(?:\.\d+)*)(?:\.|\s|$)", heading))}
+    """Numbers of the sections a document holds. A placeholder is not one, and
+    neither is a heading under a placeholder (which is a forbidden body)."""
+    numbers, under = set(), None
+    for _, level, heading in heading_entries(text):
+        if under is not None and level > under:
+            continue
+        under = level if PLACEHOLDER.match(heading) else None
+        if under is None and (m := re.match(SECTION_HEADING, heading)):
+            numbers.add(m.group(1))
+    return numbers
+
+
+class Placeholder(NamedTuple):
+    index: int      # line index of the heading
+    level: int      # number of '#'
+    number: str
+    heading: str    # heading text after the '#'s, suffix included
+    holder: str     # "REM-OBJECT" or "REM-ENCRYPT"
+
+
+def placeholder_headings(text: str) -> list[Placeholder]:
+    """Every placeholder heading, in document order, repeats included."""
+    return [Placeholder(index, level, m.group(1), heading, m.group(3))
+            for index, level, heading in heading_entries(text)
+            if (m := PLACEHOLDER.match(heading))]
 
 
 def expand_references(value: str) -> list[str]:
@@ -245,8 +301,9 @@ def expand_references(value: str) -> list[str]:
     return numbers
 
 
-def section_references(text: str) -> list[tuple[str, str, str]]:
-    """Lex references with attribution, preserving occurrence multiplicity."""
+def section_citations(text: str) -> list[tuple[str, str, str, str]]:
+    """Lex references with attribution, preserving occurrence multiplicity:
+    (attribution, number, containing paragraph, the citation as written)."""
     active, _ = document_views(text)
     occurrences = []
     for match in re.finditer(rf"(?:\bSections?\s+|§§?\s*)({DEEP_LIST})", active):
@@ -259,21 +316,114 @@ def section_references(text: str) -> list[tuple[str, str, str]]:
         start = start + 2 if start >= 0 else 0
         end = active.find("\n\n", match.end())
         context = re.sub(r"\s+", " ", active[max(0, start):end if end >= 0 else len(active)]).strip()
+        written = (match.group(0) + suffix.group(0) if suffix
+                   else active[prefix.start(1):match.end()] if prefix else match.group(0))
+        cited = re.sub(r"\s+", " ", written).strip()
         for number in expand_references(match.group(1)):
-            occurrences.append((attribution, number, context))
+            occurrences.append((attribution, number, context, cited))
     return occurrences
+
+
+def section_references(text: str) -> list[tuple[str, str, str]]:
+    """Lex references with attribution, preserving occurrence multiplicity."""
+    return [(attribution, number, context) for attribution, number, context, _ in section_citations(text)]
+
+
+def reference_target(name: str, attribution: str, documents: dict[str, str]) -> str | None:
+    """The document a reference resolves against: itself, or the companion's
+    preparing copy, else its published copy."""
+    if attribution == "local":
+        return name
+    return next((p for p in ("in-progress/" + attribution, "publication/" + attribution) if p in documents), None)
+
+
+def unresolved_citations(name: str, documents: dict[str, str]):
+    """Each local or companion citation whose number is not a section of the
+    document it resolves against: (attribution, number, context, cited, target)."""
+    for attribution, number, context, cited in section_citations(documents[name]):
+        if attribution == "external":
+            continue
+        target = reference_target(name, attribution, documents)
+        if target is None or number not in section_numbers(documents[target]):
+            yield attribution, number, context, cited, target
 
 
 def deep_unresolved(name: str, documents: dict[str, str]) -> Counter:
     """Resolve local and companion references at their full numbered depth."""
-    failures = Counter()
-    for attribution, number, context in section_references(documents[name]):
-        if attribution == "external":
+    return Counter((name, attribution, number, context)
+                   for attribution, number, context, _, _ in unresolved_citations(name, documents))
+
+
+def reference_findings(name: str, documents: dict[str, str]) -> tuple[Counter, list[str]]:
+    """Split unresolved references into those that meet only a placeholder,
+    which are always findings, and the rest, which are reconciled against
+    KNOWN_REFERENCES as before."""
+    ordinary, messages = Counter(), []
+    for attribution, number, context, cited, target in unresolved_citations(name, documents):
+        placeholder = next((p for p in placeholder_headings(documents[target]) if p.number == number),
+                           None) if target else None
+        if placeholder is None:
+            ordinary[(name, attribution, number, context)] += 1
             continue
-        target = name if attribution == "local" else next((p for p in ("in-progress/" + attribution, "publication/" + attribution) if p in documents), None)
-        if target is None or number not in section_numbers(documents[target]):
-            failures[(name, attribution, number, context)] += 1
-    return failures
+        if len(re.findall(DEEP_NUMBER, cited)) == 1:
+            subject = f"{cited} resolves only"
+        else:
+            subject = f"{cited} cites {number}, which resolves only"
+        if PLACEHOLDER_OWNERS[placeholder.holder] == pathlib.Path(name).name:
+            advice = f"the section is in this document, so cite it as Section {number}"
+        else:
+            advice = f"the section is in {placeholder.holder}, so the reference must name that document"
+        messages.append(f"{name}: {subject} to the placeholder {placeholder.heading!r} in {target}; "
+                        f"{advice} (in: {context[:80]!r})")
+    return ordinary, messages
+
+
+def placeholder_owner(name: str, holder: str, documents: dict[str, str]) -> str | None:
+    """The holder's copy in the placeholder's own folder, else in the other."""
+    folder = name.split("/", 1)[0] if "/" in name else ""
+    folders = [folder] + [f for f in ("in-progress", "publication") if f != folder]
+    return next((f"{f}/{PLACEHOLDER_OWNERS[holder]}" for f in folders
+                 if f"{f}/{PLACEHOLDER_OWNERS[holder]}" in documents), None)
+
+
+def placeholder_findings(name: str, documents: dict[str, str]) -> list[str]:
+    """Rule 10's checks on the placeholders a document carries."""
+    text = documents[name]
+    errors = []
+    lines = text.splitlines()
+    entries = heading_entries(text)
+    own = section_numbers(text)
+    first: dict[str, str] = {}
+    for p in placeholder_headings(text):
+        shown = "#" * p.level + " " + p.heading
+        if p.number in first:
+            errors.append(f"{name}: placeholder {shown!r} shares its number with the placeholder {first[p.number]!r}")
+        first.setdefault(p.number, shown)
+        if p.number in own:
+            errors.append(f"{name}: placeholder {shown!r} duplicates Section {p.number} of this document")
+        # The body runs to the next heading at the same or a higher level, so a
+        # subordinate heading is body too.
+        end = next((i for i, level, _ in entries if i > p.index and level <= p.level), len(lines))
+        if any(line.strip() for line in lines[p.index + 1:end]):
+            errors.append(f"{name}: placeholder {shown!r} has content before the next heading at its level "
+                          "or above; a placeholder has no body")
+        owner = placeholder_owner(name, p.holder, documents)
+        if owner is None:
+            errors.append(f"{name}: placeholder {shown!r} names {p.holder}, which is not present")
+            continue
+        wanted = [(level, heading) for _, level, heading in heading_entries(documents[owner])
+                  if not PLACEHOLDER.match(heading)
+                  and (m := re.match(SECTION_HEADING, heading)) and m.group(1) == p.number]
+        if not wanted:
+            errors.append(f"{name}: placeholder {shown!r} names {p.holder}, but {owner} has no Section {p.number}")
+        elif wanted[0] != (p.level, PLACEHOLDER_SUFFIX.sub("", p.heading)):
+            errors.append(f"{name}: placeholder {shown!r} does not match the heading "
+                          f"{'#' * wanted[0][0] + ' ' + wanted[0][1]!r} of {owner}")
+    for _, level, heading in entries:
+        if PLACEHOLDER_SUFFIX.search(heading) and not PLACEHOLDER.match(heading):
+            shown = "#" * level + " " + heading
+            errors.append(f"{name}: heading {shown!r} ends like a placeholder but is not a numbered placeholder heading")
+    return errors
 
 
 def heading_slugs(text: str) -> list[str]:
@@ -461,7 +611,10 @@ def structural_findings(root: pathlib.Path = ROOT) -> list[str]:
     refs, anchors, errors = Counter(), Counter(), []
     for name, text in documents.items():
         if name != "publication/rem-parity-1-specification.md":
-            refs.update(deep_unresolved(name, documents))
+            ordinary, placeholder_refs = reference_findings(name, documents)
+            refs.update(ordinary)
+            errors.extend(placeholder_refs)
+        errors.extend(placeholder_findings(name, documents))
         anchors.update(unresolved_anchors(name, text))
         errors.extend(f"{name}:{line}: heading needs preceding blank line" for line in heading_spacing(text))
         errors.extend(f"{name}: unresolved Appendix {ref}" for ref in sorted(unresolved_appendices(text)))

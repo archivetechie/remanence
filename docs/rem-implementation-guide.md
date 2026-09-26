@@ -434,7 +434,7 @@ deliberate extra read in the pipeline, and a conformant Verifier is the
 natural tool for it. REM-ENCRYPT §7.3 describes the corresponding check for
 an encrypted copy.
 
-Serves REM-OBJECT §7.3, Post-Write Re-Verification (Deployment Obligation).
+Serves REM-OBJECT §7.3, Post-Write Re-Verification.
 
 ### 4.4. Stage and publish a file-bound copy durably
 
@@ -995,7 +995,7 @@ for every file the barrier covers. The specification fixes when the batch counts
 barrier it says: "It MUST complete before the commit record of any file it
 covers takes effect." (REM-PARITY §11.1).
 
-Serves REM-PARITY §11.1, Commit Discipline (per tape file).
+Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
 
 ### 8.4. Treat staged records as uncommitted until their barrier
 
@@ -1009,7 +1009,7 @@ commit marker written after its barrier. Remanence, for example, keeps such
 records as orphan evidence and refuses to append to the tape until they have
 been reconciled with the tape's physical tail.
 
-Serves REM-PARITY §11.1, Commit Discipline (per tape file).
+Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
 
 ### 8.5. Stop the session when an outcome is unknown
 
@@ -1028,7 +1028,7 @@ parity sink after a barrier error, an end-of-medium report or a failed position
 check, and keeps it usable after a block write that failed without consuming a
 position.
 
-Serves REM-PARITY §11.1, Commit Discipline (per tape file).
+Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
 
 ### 8.6. Write with memory bounded by the geometry
 
@@ -1207,7 +1207,7 @@ do: "It MUST NOT write an Object or append a second terminal triple."
 that it finds on restart as torn terminal control, never as an Object.
 
 Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.3, The
-Classification Ladder (in order).
+Classification Ladder.
 
 ### 9.6. Accept reduced redundancy only as a separate, deliberate decision
 
@@ -1346,7 +1346,7 @@ role magic commits the tape file to its control type, so malformed control
 never falls through to Object" (REM-PARITY §10.6).
 
 Serves REM-PARITY §10.6, Replica Validity Conditions, and REM-PARITY §12.3, The
-Classification Ladder (in order).
+Classification Ladder.
 
 ### 10.6. Walk a tape from BOT with a notice, progress and a way to stop
 
@@ -1396,7 +1396,7 @@ themselves: "The Recoverer MUST reject, as typed refusals distinct from
 recovery failures" each of those cases (REM-PARITY §13.2). Two of the pinned
 recovery vectors describe their cases as refused before I/O.
 
-Serves REM-PARITY §13.2, Fail Before I/O.
+Serves REM-PARITY §13.2, Typed Refusals.
 
 ### 10.8. Plan bulk recovery by epoch, and read in tape order
 

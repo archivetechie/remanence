@@ -35,6 +35,7 @@ class SectionReferenceTests(unittest.TestCase):
 
 import collections
 import pathlib
+import re
 import tempfile
 import check_spec_versioning as lint
 
@@ -133,8 +134,8 @@ class StructuralRulesTests(unittest.TestCase):
             "publication/rem-encrypt-1-specification.md": (0, 40, 37),
             "publication/formats-explained.md": (0, 7, 1),
             "in-progress/rem-parity-1-specification.md": (25, 59, 94),
-            "in-progress/rem-object-core-1-specification.md": (21, 52, 120),
-            "in-progress/rem-encrypt-1-specification.md": (0, 40, 37),
+            "in-progress/rem-object-core-1-specification.md": (22, 52, 120),
+            "in-progress/rem-encrypt-1-specification.md": (21, 40, 37),
             "publication/rem-parity-1-specification.md": (26, 61, 0),
         }
         docs = lint.discovered_documents()
@@ -153,6 +154,271 @@ class StructuralRulesTests(unittest.TestCase):
             defects = lint.deep_unresolved(name, mutated)
             self.assertTrue(any(key[2] == "10.9" for key in defects))
             self.assertTrue(lint.reconcile_known(defects, lint.KNOWN_REFERENCES))
+        # A local citation of a section the companion holds meets only the placeholder.
+        name = "in-progress/rem-object-core-1-specification.md"
+        mutated = {**docs, name: docs[name].replace("REM-ENCRYPT §6.3 (ciphertext)", "Section 6.3 (ciphertext)")}
+        self.assertNotEqual(mutated[name], docs[name])
+        ordinary, messages = lint.reference_findings(name, mutated)
+        self.assertFalse(ordinary)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("placeholder '6.3. Ciphertext Mapping (in REM-ENCRYPT)'", messages[0])
+
+
+class PlaceholderTests(unittest.TestCase):
+    """Rule 10: placeholder headings in the paired REM-OBJECT/REM-ENCRYPT numbering."""
+    OBJ_NAME = "in-progress/rem-object-core-1-specification.md"
+    ENC_NAME = "in-progress/rem-encrypt-1-specification.md"
+    OBJ = ("## 4. Plaintext Representation\n\nText.\n\n"
+           "## 5. Encrypted Representation (in REM-ENCRYPT)\n\n"
+           "## 6. Partial File Restore\n\n"
+           "### 6.3. Ciphertext Mapping (in REM-ENCRYPT)\n\n"
+           "### 6.4. Stored-Block Mapping\n\nText.\n")
+    ENC = ("## 4. Plaintext Representation (in REM-OBJECT)\n\n"
+           "## 5. Encrypted Representation\n\nText.\n\n"
+           "## 6. Partial File Restore\n\nText.\n\n"
+           "### 6.3. Ciphertext Mapping\n\nText.\n\n"
+           "### 6.4. Stored-Block Mapping\n\nText.\n")
+
+    def docs(self, obj=None, enc=None, obj_extra="", enc_extra=""):
+        return {self.OBJ_NAME: (self.OBJ if obj is None else obj) + obj_extra,
+                self.ENC_NAME: (self.ENC if enc is None else enc) + enc_extra}
+
+    def test_placeholder_is_not_a_section_number(self):
+        self.assertEqual(lint.section_numbers(self.OBJ), {"4", "6", "6.4"})
+        self.assertEqual([p.number for p in lint.placeholder_headings(self.OBJ)], ["5", "6.3"])
+        # Only the exact suffix naming one of the paired documents makes a placeholder.
+        ordinary = "### 6.2. Inner Mapping (Both Representations)\n\n### 4.1. Frames (in REM-PARITY)\n"
+        self.assertEqual(lint.section_numbers(ordinary), {"6.2", "4.1"})
+        self.assertEqual(lint.placeholder_headings(ordinary), [])
+
+    def test_placeholder_without_the_dot_is_a_placeholder(self):
+        # section_numbers accepts "6.3 Title" as well as "6.3. Title"; so does PLACEHOLDER.
+        undotted = self.OBJ.replace("### 6.3. Ciphertext Mapping (in REM-ENCRYPT)",
+                                    "### 6.3 Ciphertext Mapping (in REM-ENCRYPT)")
+        self.assertNotIn("6.3", lint.section_numbers(undotted))
+        self.assertEqual([p.number for p in lint.placeholder_headings(undotted)], ["5", "6.3"])
+        ordinary, messages = lint.reference_findings(self.OBJ_NAME, self.docs(obj=undotted, obj_extra="\nSee Section 6.3.\n"))
+        self.assertFalse(ordinary)
+        self.assertEqual(len(messages), 1)
+        # Checked like any other: it must repeat the holder's heading exactly, dot included.
+        findings = lint.placeholder_findings(self.OBJ_NAME, self.docs(obj=undotted))
+        self.assertEqual(len(findings), 1)
+        self.assertIn("does not match the heading '### 6.3. Ciphertext Mapping'", findings[0])
+
+    def test_a_suffix_on_a_heading_that_is_not_a_placeholder_is_reported(self):
+        for heading in ("### Notes (in REM-ENCRYPT)", "### 6.3. (in REM-ENCRYPT)"):
+            with self.subTest(heading=heading):
+                findings = lint.placeholder_findings(self.OBJ_NAME, self.docs(obj_extra=f"\n{heading}\n"))
+                self.assertTrue(any(f"{heading!r} ends like a placeholder but is not a numbered placeholder heading" in f
+                                    for f in findings))
+
+    def test_rule_ten_reaches_the_linter_output(self):
+        """structural_findings, which main() runs, carries every Rule 10 finding."""
+        source = pathlib.Path(lint.__file__).resolve().parent.parent / "specs"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for folder in ("publication", "in-progress"):
+                (root / "specs" / folder).mkdir(parents=True)
+                for path in (source / folder).glob("*.md"):
+                    (root / "specs" / folder / path.name).write_text(path.read_text())
+            self.assertEqual(lint.structural_findings(root), [])
+            plants = {
+                self.OBJ_NAME: [
+                    ("REM-ENCRYPT §6.3 (ciphertext)", "Section 6.3 (ciphertext)"),
+                    ("### 12.4. Fail-Closed (in REM-ENCRYPT)", "### 12.4. Fail Closed (in REM-ENCRYPT)"),
+                    ("\n### 6.4. Stored-Block Mapping (Tape",
+                     "\n### 6.4. Stored-Block Mapping (in REM-ENCRYPT)\n\n### 6.4. Stored-Block Mapping (Tape"),
+                ],
+                self.ENC_NAME: [
+                    ("## 14. Conformance (in REM-OBJECT)\n", "## 14. Conformance (in REM-OBJECT)\n\nStray text.\n"),
+                    ("### 6.2. Inner Mapping (Both Representations) (in REM-OBJECT)\n",
+                     "### 6.2. Inner Mapping (Both Representations) (in REM-OBJECT)\n\n#### 6.2.1. Detail\n"),
+                    ("### 7.5. Scrub (in REM-OBJECT)\n", "### 7.5. Scrub (in REM-OBJECT)\n\n### 7.5. Scrub (in REM-OBJECT)\n"),
+                    ("\n## 13. Envelope Test Vectors\n",
+                     "\n### 12.13. Nothing (in REM-OBJECT)\n\n### Notes (in REM-OBJECT)\n\n## 13. Envelope Test Vectors\n"),
+                ],
+            }
+            for name, edits in plants.items():
+                path = root / "specs" / name
+                text = path.read_text()
+                for old, new in edits:
+                    self.assertEqual(text.count(old), 1, old)
+                    text = text.replace(old, new)
+                path.write_text(text)
+            findings = lint.structural_findings(root)
+            for fragment in ("Section 6.3 resolves only to the placeholder",
+                             "'### 12.4. Fail Closed (in REM-ENCRYPT)' does not match the heading",
+                             "duplicates Section 6.4 of this document",
+                             "'## 14. Conformance (in REM-OBJECT)' has content before the next heading",
+                             "'### 6.2. Inner Mapping (Both Representations) (in REM-OBJECT)' has content before",
+                             "'### 7.5. Scrub (in REM-OBJECT)' shares its number",
+                             "has no Section 12.13",
+                             "'### Notes (in REM-OBJECT)' ends like a placeholder"):
+                with self.subTest(fragment=fragment):
+                    self.assertTrue(any(fragment in finding for finding in findings), findings)
+
+    def test_fenced_lines_are_not_placeholders(self):
+        fenced = "\n```text\n### 6.7. Fenced (in REM-ENCRYPT)\n```\n\nSee Section 6.7.\n"
+        docs = self.docs(obj_extra=fenced)
+        self.assertEqual([p.number for p in lint.placeholder_headings(docs[self.OBJ_NAME])], ["5", "6.3"])
+        self.assertEqual(lint.placeholder_findings(self.OBJ_NAME, docs), [])
+        ordinary, messages = lint.reference_findings(self.OBJ_NAME, docs)
+        self.assertTrue(any(key[2] == "6.7" for key in ordinary))
+        self.assertEqual(messages, [])
+
+    def test_reference_to_a_placeholder_is_reported_in_both_directions(self):
+        reported = [
+            (self.OBJ_NAME, "See Section 6.3.", "Section 6.3 resolves only", "the section is in REM-ENCRYPT"),
+            (self.OBJ_NAME, "See REM-ENCRYPT §4.", "REM-ENCRYPT §4 resolves only", "cite it as Section 4"),
+            (self.ENC_NAME, "See Section 4.", "Section 4 resolves only", "the section is in REM-OBJECT"),
+            # The message quotes the citation as written, not the target's name.
+            (self.ENC_NAME, "See Core §6.3.", "Core §6.3 resolves only", "cite it as Section 6.3"),
+            (self.ENC_NAME, "See Section 6.3 of [REMOBJECT].", "Section 6.3 of [REMOBJECT] resolves only", "cite it as Section 6.3"),
+            (self.ENC_NAME, "See Core §§6.3 and 6.4.", "Core §§6.3 and 6.4 cites 6.3, which resolves only", "cite it as Section 6.3"),
+        ]
+        for name, text, cited, advice in reported:
+            with self.subTest(name=name, text=text):
+                extra = "\n" + text + "\n"
+                docs = self.docs(obj_extra=extra) if name == self.OBJ_NAME else self.docs(enc_extra=extra)
+                ordinary, messages = lint.reference_findings(name, docs)
+                # Never in the Counter reconciled against KNOWN_REFERENCES, so it cannot be waived.
+                self.assertFalse(ordinary)
+                self.assertEqual(len(messages), 1)
+                self.assertIn(cited + " to the placeholder", messages[0])
+                self.assertIn(advice, messages[0])
+        clean = [(self.OBJ_NAME, "See REM-ENCRYPT §6.3."), (self.OBJ_NAME, "See Section 4."),
+                 (self.ENC_NAME, "See Core §6.4."), (self.ENC_NAME, "See Section 6.3."),
+                 (self.ENC_NAME, "See Core §4.")]
+        for name, text in clean:
+            with self.subTest(name=name, text=text):
+                extra = "\n" + text + "\n"
+                docs = self.docs(obj_extra=extra) if name == self.OBJ_NAME else self.docs(enc_extra=extra)
+                self.assertEqual(lint.reference_findings(name, docs), (collections.Counter(), []))
+        # A number neither document has stays an ordinary unresolved reference.
+        ordinary, messages = lint.reference_findings(self.OBJ_NAME, self.docs(obj_extra="\nSee Section 6.9.\n"))
+        self.assertTrue(any(key[2] == "6.9" for key in ordinary))
+        self.assertEqual(messages, [])
+
+    def test_placeholder_heading_must_match_its_holder(self):
+        self.assertEqual(lint.placeholder_findings(self.OBJ_NAME, self.docs()), [])
+        self.assertEqual(lint.placeholder_findings(self.ENC_NAME, self.docs()), [])
+        placeholder = "### 6.3. Ciphertext Mapping (in REM-ENCRYPT)"
+        for bad, expected in (("### 6.3. Old Title (in REM-ENCRYPT)", "does not match the heading"),
+                              ("#### 6.3. Ciphertext Mapping (in REM-ENCRYPT)", "does not match the heading"),
+                              ("### 6.9. Ciphertext Mapping (in REM-ENCRYPT)", "has no Section 6.9")):
+            with self.subTest(bad=bad):
+                findings = lint.placeholder_findings(self.OBJ_NAME, self.docs(obj=self.OBJ.replace(placeholder, bad)))
+                self.assertEqual(len(findings), 1)
+                self.assertIn(expected, findings[0])
+        # A retitle in the holder leaves the placeholder stale.
+        retitled = self.ENC.replace("### 6.3. Ciphertext Mapping\n", "### 6.3. Ciphertext Ranges\n")
+        self.assertTrue(lint.placeholder_findings(self.OBJ_NAME, self.docs(enc=retitled)))
+        self.assertIn("not present", lint.placeholder_findings(self.OBJ_NAME, {self.OBJ_NAME: self.OBJ})[0])
+        # The holder is looked up in the placeholder's own folder first.
+        stale = self.ENC.replace("### 6.3. Ciphertext Mapping\n", "### 6.3. Old Title\n")
+        docs = {**self.docs(), "publication/rem-encrypt-1-specification.md": stale,
+                "publication/rem-object-core-1-specification.md": self.OBJ}
+        self.assertEqual(lint.placeholder_findings(self.OBJ_NAME, docs), [])
+        self.assertTrue(lint.placeholder_findings("publication/rem-object-core-1-specification.md", docs))
+
+    def test_placeholder_must_not_reuse_a_number_its_document_has(self):
+        findings = lint.placeholder_findings(self.OBJ_NAME, self.docs(obj_extra="\n### 6.3. Ciphertext Mapping\n\nText.\n"))
+        self.assertEqual(len(findings), 1)
+        self.assertIn("duplicates Section 6.3 of this document", findings[0])
+
+    def test_two_placeholders_with_one_number_are_each_checked(self):
+        second = "\n### 6.3. Stale Title (in REM-ENCRYPT)\n\nStray text.\n"
+        findings = lint.placeholder_findings(self.OBJ_NAME, self.docs(obj_extra=second))
+        self.assertEqual(len(findings), 3)
+        self.assertTrue(all("'### 6.3. Stale Title (in REM-ENCRYPT)'" in f for f in findings))
+        self.assertEqual(sum("shares its number with the placeholder '### 6.3. Ciphertext Mapping (in REM-ENCRYPT)'" in f for f in findings), 1)
+        self.assertEqual(sum("does not match the heading" in f for f in findings), 1)
+        self.assertEqual(sum("a placeholder has no body" in f for f in findings), 1)
+        self.assertEqual([p.number for p in lint.placeholder_headings(self.OBJ + second)], ["5", "6.3", "6.3"])
+
+    def test_placeholder_heading_has_no_body(self):
+        placeholder = "### 6.3. Ciphertext Mapping (in REM-ENCRYPT)\n"
+        for body in ("\nStray text.\n", "\n```text\nfenced\n```\n", "stray line\n"):
+            with self.subTest(body=body):
+                findings = lint.placeholder_findings(
+                    self.OBJ_NAME, self.docs(obj=self.OBJ.replace(placeholder, placeholder + body)))
+                self.assertEqual(len(findings), 1)
+                self.assertIn("a placeholder has no body", findings[0])
+        blank = self.OBJ.replace(placeholder, placeholder + "\n  \n")
+        self.assertEqual(lint.placeholder_findings(self.OBJ_NAME, self.docs(obj=blank)), [])
+
+    def test_a_subordinate_heading_is_part_of_the_placeholder_body(self):
+        placeholder = "### 6.3. Ciphertext Mapping (in REM-ENCRYPT)\n"
+        nested = self.OBJ.replace(placeholder, placeholder + "\n#### 6.3.1. Detail\n\n##### 6.3.1.1. Deeper\n\n")
+        findings = lint.placeholder_findings(self.OBJ_NAME, self.docs(obj=nested))
+        self.assertEqual(len(findings), 1)
+        self.assertIn("a placeholder has no body", findings[0])
+        # A heading under a placeholder is not a section of the document that carries it;
+        # the next heading at the placeholder's level ends the placeholder.
+        self.assertEqual(lint.section_numbers(nested), {"4", "6", "6.4"})
+        ordinary, messages = lint.reference_findings(self.OBJ_NAME, self.docs(obj=nested, obj_extra="\nSee Section 6.3.1.\n"))
+        self.assertTrue(any(key[2] == "6.3.1" for key in ordinary))
+
+    # The Section 1.1 numbering paragraphs, word for word (design v4, D5).
+    NUMBERING = {
+        OBJ_NAME: ("REM-OBJECT and REM-ENCRYPT are numbered together, so the two can be read side by side. "
+                   "This document omits Section 5, the encrypted representation, which is in REM-ENCRYPT; "
+                   "REM-ENCRYPT omits Sections 4, 9 and 14, the plaintext representation, the relationship "
+                   "to the parity layer, and conformance, which are here. Each document marks a section it "
+                   "omits with a placeholder heading that names the document holding it. Sections 6, 7, 8, "
+                   "11 and 12 number their subsections together in the same way: a number used in both "
+                   "documents names sections on the same subject, and a placeholder marks a subsection that "
+                   "only the other document contains. Sections 1, 3, 10 and 13 number their subsections "
+                   "separately, so the same number there can name unrelated sections; Sections 2 and 16 "
+                   "match one for one. A reference into the other document therefore always names it, as "
+                   "in “REM-ENCRYPT §6.4”, while “Section 6.4” alone means this document's section."),
+        ENC_NAME: ("REM-ENCRYPT and the REM-OBJECT Core Format ([REMOBJECT], called Core in this document) "
+                   "are numbered together, so the two can be read side by side. This document omits "
+                   "Sections 4, 9 and 14, the plaintext representation, the relationship to the parity "
+                   "layer, and conformance, which are in Core; Core omits Section 5, the encrypted "
+                   "representation, which is here. Each document marks a section it omits with a "
+                   "placeholder heading that names the document holding it. Sections 6, 7, 8, 11 and 12 "
+                   "number their subsections together in the same way: a number used in both documents "
+                   "names sections on the same subject, and a placeholder marks a subsection that only the "
+                   "other document contains. Sections 1, 3, 10 and 13 number their subsections separately, "
+                   "so the same number there can name unrelated sections; Sections 2 and 16 match one for "
+                   "one. A reference into Core therefore always names it, as in “Core §6.4”, while "
+                   "“Section 6.4” alone means this document's section."),
+    }
+
+    def skeleton(self, own, placeholders, holder, paragraph):
+        """Section 1 holds the paragraph; the other top-level numbers are real
+        headings or placeholders; Section 6 has a real 6.4."""
+        parts = [f"## 1. Introduction\n\n{paragraph}\n"]
+        for n in sorted((own | placeholders) - {1}):
+            suffix = f" (in {holder})" if n in placeholders else ""
+            parts.append(f"## {n}. Part {n}{suffix}\n")
+            if n == 6:
+                parts.append("### 6.4. Stored-Block Mapping\n")
+        return "\n".join(parts)
+
+    def test_numbering_paragraphs_pass(self):
+        real = lint.discovered_documents()
+        flat = lambda s: re.sub(r"\s+", " ", s).strip()
+        for name, paragraph in self.NUMBERING.items():
+            with self.subTest(name=name):
+                self.assertIn(paragraph, flat(real[name]))
+        shared = {1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 16}
+        def corpus(obj_paragraph, enc_paragraph):
+            return {self.OBJ_NAME: self.skeleton(shared | {4, 9, 14, 15}, {5}, "REM-ENCRYPT", obj_paragraph),
+                    self.ENC_NAME: self.skeleton(shared | {5, 15}, {4, 9, 14}, "REM-OBJECT", enc_paragraph)}
+        docs = corpus(self.NUMBERING[self.OBJ_NAME], self.NUMBERING[self.ENC_NAME])
+        for name in docs:
+            with self.subTest(name=name):
+                self.assertEqual(lint.reference_findings(name, docs), (collections.Counter(), []))
+                self.assertEqual(lint.placeholder_findings(name, docs), [])
+        # Negative controls: without the "omits" declarations the numbers meet placeholders.
+        docs = corpus(self.NUMBERING[self.OBJ_NAME].replace("This document omits Section 5",
+                                                            "This document leaves out Section 5"),
+                      self.NUMBERING[self.ENC_NAME].replace("This document omits Sections 4, 9 and 14",
+                                                            "This document leaves out Sections 4, 9 and 14"))
+        self.assertEqual(len(lint.reference_findings(self.OBJ_NAME, docs)[1]), 1)
+        self.assertEqual(len(lint.reference_findings(self.ENC_NAME, docs)[1]), 3)
 
 
 class ScopeStatementTests(unittest.TestCase):
