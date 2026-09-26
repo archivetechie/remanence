@@ -25,9 +25,9 @@ Layer 1   remanence-scsi
 ```
 
 Layers 3b and 3c are siblings, not stacked: both build on the
-`BlockSink`/`BlockSource` traits that Layer 2 defines. The format writes
-body blocks; the parity layer owns the physical tape layout around them
-(bootstraps, filemarks, sidecars).
+`BlockSink`/`BlockSource` traits that Layer 2 defines. The format writes an
+object's stored blocks; the parity layer owns the physical tape layout around
+them (bootstraps, filemarks, sidecars).
 
 One crate sits outside the stack by design: `crates/rem-recover` is a
 standalone disaster-recovery binary that links `remanence-aead`,

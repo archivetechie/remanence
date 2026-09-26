@@ -119,8 +119,9 @@ revision. Once a revision is deposited, its deposited text governs. Every other 
 repository, inside a Remanence source release, on a mirror, or printed — is a
 convenience copy. A copy carrying the same version string as a deposited
 revision is byte-identical to it or it is defective; where they differ, the
-deposit governs. A version string is never reused for different bytes, so
-naming a version names one exact text no matter which copy you hold. The
+deposit governs. The version string of a deposited revision is never reused
+for different bytes, so naming a deposited version names one exact text no
+matter which copy you hold. The
 reference implementation is informative: where it and this document disagree,
 this document is the fixed point, and the divergence
 is a defect in the implementation.
@@ -177,14 +178,14 @@ publishes its own archive and cites it by name, DOI and digest, and never
 re-pins an earlier one.
 
 The tape binding depends normatively on the REM-PARITY specification
-([REMPARITY]), which is under review alongside this document. The
-tape-binding clauses of this document
-(the parity-layer references in Sections 6.5, 8.2, 9, 12.6) are stable
-against every 1.x revision of REM-PARITY, because a REM-PARITY minor
-revision cannot invalidate a tape or leave an earlier reader unable to read
-one. A writer obligation added by a later REM-PARITY 1.x binds a Writer
-claiming that revision; it does not change this document's clauses. The
-file and object-store bindings do not depend on REM-PARITY.
+([REMPARITY]), which is under review alongside this document. The tape-binding
+clauses of this document (the parity-layer references in Sections 3.3, 4.2,
+4.5.1, 4.7, 6.5, 8.2, 9, 12.6) are stable against every 1.x revision of
+REM-PARITY, because a REM-PARITY minor revision cannot invalidate a tape or
+leave an earlier reader unable to read one. An obligation that a later
+REM-PARITY 1.x revision places on its Writer (REM-PARITY §2.2) binds a Writer
+claiming that revision; it does not change this document's clauses. The file
+and object-store bindings do not depend on REM-PARITY.
 
 ### 1.2. Purpose and Design Goals
 
@@ -256,18 +257,18 @@ components around it:
 
 ### 1.5. Non-Goals
 
-REM-OBJECT performs no compression: the payload workload is already-compressed media,
-and whole-stream compression destroys closed-form range addressing (a later
-member's offset would depend on decompressing earlier bytes). It defines no
-catalog format, no key registry, no network protocol, and no multi-object
+REM-OBJECT performs no compression: the payload workload is already-compressed
+media, and whole-stream compression destroys closed-form range addressing (a
+later member's offset would depend on decompressing earlier bytes). It defines
+no catalog format, no key registry, no network protocol, and no multi-object
 container: one object is one archive is one stored byte string. This format
 encodes a faithful tree of files — regular files, hardlinks, symbolic links,
 and (empty) directories. Device nodes, FIFOs, and sockets are excluded on
-principle: they carry no content (they are kernel/runtime handles) and
-materializing them on restore is a hazard, so a conformant reader rejects
-their typeflags (Section 4.3.4). Ownership is deliberately not preserved
-(Section 4.3.1); selected POSIX extended attributes are preserved as specified
-in Section 4.7.3. Encryption policy and key custody are outside this
+principle. They carry no content, being kernel or runtime handles, and
+materializing them on restore is a hazard. A conformant Reader therefore
+rejects their typeflags (Section 4.3.4). Ownership is deliberately not
+preserved (Section 4.3.1); selected POSIX extended attributes are preserved as
+specified in Section 4.7.3. Encryption policy and key custody are outside this
 document; see REM-ENCRYPT §1.
 
 ### 1.6. What this document specifies, and what it does not
@@ -309,12 +310,15 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174]
 when, and only when, they appear in all capitals, as shown here.
 
+A paragraph that opens with *Rationale.* is informative and states no
+requirement.
+
 ### 2.2. Conformance Roles
 
 A single implementation may fill several roles.
 
-- **Writer / Builder**: produces the canonical plaintext object (Section
-  4.9). REM-ENCRYPT defines the Sealer role for encrypted copies.
+- **Builder**: produces the canonical plaintext object (Section 4.9).
+  REM-ENCRYPT defines the Sealer role for encrypted copies.
 - **Planner**: computes a plaintext object's exact layout and block count
   without payload bytes (Section 4.9).
 - **Reader**: recovers entries from the canonical object (Section 4.9).
@@ -343,28 +347,38 @@ A single implementation may fill several roles.
   exactly this byte string.
 - **Representation**: one of `plaintext` or `encrypted` (Section 3.2). Two
   stored copies of one object may use different representations.
-- **Body block / chunk**: a fixed-size block of `chunk_size` bytes; the unit
-  of I/O, alignment, and addressing. "Chunk" is used for addressing and
-  "block" for I/O; they are synonyms.
-- **`chunk_size` (C)**: the per-object body-block size. A positive multiple
-  of 512; default 262144 (256 KiB). One value per object, shared by both
+- **Chunk**: one of the consecutive `chunk_size`-byte units that make up the
+  canonical plaintext object (Section 4.2); the unit of alignment and
+  addressing within the object.
+- **`chunk_size` (C)**: the size in bytes of one chunk. A positive multiple of
+  512; default 262144 (256 KiB). One value per object, shared by both
   representations of that object.
 - **Record**: a 512-byte tar record. All tar structures are sequences of
   records.
 - **Entry**: one pax extended header + one ustar header (typeflag `0`, `1`,
   `2`, or `5`) + record padding, describing one member; only a regular entry
   (`0`) has a payload (Section 4.6).
-- **Inner `BodyLba`**: zero-based index of a body block *within the canonical
+- **Inner `BodyLba`**: zero-based index of a chunk *within the canonical
   plaintext object*. This is the address space of the manifest and of all
   catalog per-file rows, and it is identical across both representations of
   one object.
-- **Stored `BodyLba`**: zero-based index of a `chunk_size` block within the
-  *stored* bytes of one copy. For a plaintext copy, stored `BodyLba` equals
-  inner `BodyLba`. REM-ENCRYPT §6.4 defines the encrypted mapping.
+- **Stored `BodyLba`**: zero-based index of a stored block within the *stored*
+  bytes of one copy. A stored block is a `chunk_size` unit of those bytes; on
+  a fixed-block backend it is one backend block. For a plaintext copy, stored
+  `BodyLba` equals inner `BodyLba`. REM-ENCRYPT §6.4 defines the encrypted
+  mapping.
 - **Stored bytes**: the exact bytes of one stored copy, from byte 0 through
   the final byte of its final block. `stored_digest` is defined over these.
 - **Deterministic CBOR**: the canonical CBOR encoding rules of Section 4.7.1,
   used by the manifest.
+
+An object's bytes are addressed in three units:
+
+| Unit | Size | Index | Where it applies |
+| --- | --- | --- | --- |
+| Chunk | `chunk_size` bytes | Inner `BodyLba` | The canonical plaintext object, in both representations |
+| Stored block | `chunk_size` bytes | Stored `BodyLba` | The stored bytes of one copy; for a plaintext copy, stored block `n` is chunk `n` |
+| Backend block | One stored block | The backend's block address; on tape, the block index within the object's tape file | A fixed-block backend, including tape (Sections 6.4 and 8.2) |
 
 ### 2.4. Integer, Byte, and Text Conventions
 
@@ -387,7 +401,7 @@ wrap silently (Section 11). PFR denotes partial file restore (Section 6).
 | Constant | Value | Meaning |
 | --- | --- | --- |
 | `TAR_RECORD_SIZE` | 512 | POSIX tar record size in bytes |
-| `DEFAULT_CHUNK_SIZE` | 262144 (256 KiB) | Default body-block size |
+| `DEFAULT_CHUNK_SIZE` | 262144 (256 KiB) | Default chunk size |
 | `STREAM_FORMAT_ID` | `rem-object-v1` | Value of the global `REMANENCE.format_id` keyword |
 | `STREAM_SCHEMA_VERSION` | `1.0` without preserved xattrs; `1.1` with any preserved xattrs | Value of the global `REMANENCE.schema_version` keyword |
 | `MANIFEST_PATH` | `_remanence/manifest.cbor` | Manifest entry path |
@@ -423,17 +437,19 @@ therefore identical across representations.
 
 There is no third representation: the plaintext representation is the bare
 container stream itself, preserving standard-`tar` extractability, and the
-encrypted representation is that same stream sealed. A writer producing both
-copies of one object MUST derive them from the same canonical plaintext byte
-string ("build once, fan out"), which is what makes the shared identities of
-Section 3.3 hold.
+encrypted representation is that same stream sealed. An implementation
+producing both copies of one object MUST derive them from the same canonical
+plaintext byte string.
+
+*Rationale.* This rule ("build once, fan out") is what makes the shared
+identities of Section 3.3 hold.
 
 ### 3.3. Identities and Digests
 
 | Digest | Computed over | Stored where | Verifiable without keys? |
 | --- | --- | --- | --- |
 | `file_sha256` | One regular member file's exact payload bytes | Entry pax header + manifest | Plaintext copies: yes. Encrypted copies: no |
-| `manifest_sha256` | The manifest entry's CBOR bytes | Manifest pax header; for plaintext copies also the parity-layer bootstrap and catalog (Section 8.2) | Plaintext copies: yes. Encrypted copies: no |
+| `manifest_sha256` | The manifest entry's CBOR bytes | Manifest pax header; for plaintext copies also the terminal replicas' Object recovery rows (REM-PARITY §10.3) and the catalog (Section 8.2) | Plaintext copies: yes. Encrypted copies: no |
 | `plaintext_digest` | The **complete canonical plaintext object** bytes | Encrypted copies: carried in the REM-ENCRYPT envelope. All copies: catalog | No (for encrypted copies) |
 | `stored_digest` | The **complete stored bytes** of one copy, byte 0 through the final fill byte | External only: catalog / master index (never in-band) | **Yes** — the keyless scrub anchor |
 
@@ -450,9 +466,9 @@ Consequences, all normative:
    with a new `object_id`, timestamp, or `chunk_size` produces a new object
    with a new `plaintext_digest`; per-file `file_sha256` values are what
    survive across rebuilds.
-4. Any stored copy MUST be scrubbable by `stored_digest` alone — no keys,
-   no plaintext access, and no format knowledge beyond "a byte string" are
-   required of the backend.
+4. Any stored copy MUST be scrubbable by `stored_digest` alone. The backend
+   needs no keys, no plaintext access, and no format knowledge beyond "a byte
+   string".
 
 Informative: the four digests map to preservation fixity roles —
 `file_sha256` is per-file content fixity (PREMIS bitstream fixity [PREMIS]),
@@ -474,7 +490,7 @@ and its global header must pass the
 `REMANENCE.format_id = rem-object-v1` gate (Section 4.5.2). A conformant
 plaintext object's first record is the global pax header.
 
-This rule is for self-identification and tooling convenience.
+*Rationale.* This rule is for self-identification and tooling convenience.
 
 ## 4. Plaintext Representation
 
@@ -482,7 +498,7 @@ The plaintext representation is a constrained subset of POSIX pax tar
 [POSIX-PAX], extended with vendor keywords in the `REMANENCE.` namespace and a
 generated CBOR manifest stored as the archive's final member. The single
 structural constraint beyond plain tar is that every file's payload begins on
-a body-block boundary (Section 4.6.3); the unconstrained tar stream remains
+a chunk boundary (Section 4.6.3); the unconstrained tar stream remains
 extractable by any pax-aware tool, which simply ignores the vendor keywords
 (Section 4.10).
 
@@ -513,38 +529,40 @@ The manifest entry MUST be the final entry before tar EOF. Member entries
 appear in caller-supplied order. An object with zero member entries is valid:
 it contains the global header, the manifest entry, and the EOF sequence.
 
-### 4.2. Body Blocks and `chunk_size`
+### 4.2. Chunks and `chunk_size`
 
-The object byte stream is written as consecutive fixed-size body blocks of
-exactly `chunk_size` bytes. `chunk_size` MUST be a positive multiple of 512.
-On tape `chunk_size` MUST equal the fixed tape block size of the containing
-tape file (Section 8.2); one body block is one tape block. The plaintext
+The object byte stream is written as consecutive chunks of exactly
+`chunk_size` bytes. `chunk_size` MUST be a positive multiple of 512. On tape
+`chunk_size` MUST equal the fixed tape block size of the containing tape file
+(Section 8.2); one stored block is one tape block. The plaintext
 representation defines no maximum. REM-ENCRYPT §5.2 defines the additional
 bound for an encrypted copy.
 
-The total object length is always an exact multiple of `chunk_size`
-(Section 4.8), and the object's block count is knowable before any payload
-byte is written (Section 4.8). A Reader is given the object's `chunk_size` and
-block count out of band (catalog, bootstrap, or filemark map) and MUST process
-exactly that many blocks; the format reserves no meaning for bytes outside the
-object's blocks and provides no in-band mechanism for locating object
+The total object length is always an exact multiple of `chunk_size` (Section
+4.8), and the object's block count is knowable before any payload byte is
+written (Section 4.8). A Reader is given the object's `chunk_size` and block
+count out of band and MUST process exactly that many blocks. The catalog can
+supply both. On tape, `chunk_size` is the block size that the bootstrap
+records (REM-PARITY §8.1), and the block count is recorded in the object's
+Object recovery row (REM-PARITY §10.3) and in its filemark-map entry
+(REM-PARITY §7.1). The format reserves no meaning for bytes outside the
+object's blocks. It provides no in-band mechanism for locating object
 boundaries (Section 4.1, Section 8.2).
 
 ### 4.3. The ustar Record Subset
 
 REM-OBJECT emits POSIX ustar headers [POSIX-PAX] restricted as specified here.
-Readers MUST validate the checksum of every non-zero header record
-(Section 4.3.3); the reader-ignored fields are governed by the rules of
-Section 4.3.2.
+Readers MUST validate the checksum of every non-zero header record (Section
+4.3.3). The rules of Section 4.3.2 govern the reader-ignored fields.
 
 #### 4.3.1. Header Layout
 
 Every header is one 512-byte record:
 
-| Offset | Length | Field | Writer-normative value |
+| Offset | Length | Field | Value a Builder writes |
 | ---: | ---: | --- | --- |
 | 0 | 100 | `name` | Entry-dependent (Section 4.3.2); NUL-padded |
-| 100 | 8 | `mode` | Regular entries: `0000644\0`, or `0000755\0` when `REMANENCE.executable` is `true`; hardlinks: `0000644\0`; symlinks: `0000777\0`; directories: `0000755\0`; pax header records (`g`, `x`): `0000644\0` |
+| 100 | 8 | `mode` | By entry type (table below) |
 | 108 | 8 | `uid` | `0000000\0` |
 | 116 | 8 | `gid` | `0000000\0` |
 | 124 | 12 | `size` | 11 octal digits + NUL (Section 4.3.2) |
@@ -558,34 +576,47 @@ Every header is one 512-byte record:
 | 297 | 32 | `gname` | `remanence`, NUL-padded |
 | 329 | 8 | `devmajor` | All NUL |
 | 337 | 8 | `devminor` | All NUL |
-| 345 | 155 | `prefix` | All NUL (writers never use `prefix`) |
+| 345 | 155 | `prefix` | All NUL (Builders never use `prefix`) |
 | 500 | 12 | — | All NUL |
+
+The `mode` values by entry type:
+
+| Entry | `mode` |
+| --- | --- |
+| Regular file | `0000644\0`, or `0000755\0` when `REMANENCE.executable` is `true` |
+| Hardlink | `0000644\0` |
+| Symbolic link | `0000777\0` |
+| Directory | `0000755\0` |
+| Pax header record (`g`, `x`) | `0000644\0` |
 
 Octal fields are zero-padded ASCII octal terminated by NUL. When parsing,
 Readers MUST stop a numeric field at the first NUL or space, MUST accept
 surrounding ASCII whitespace, and MUST treat an empty field as zero. The
 `uid`, `gid`, ustar `mtime`, `uname`, and `gname` fields carry the fixed
-values above regardless of metadata-preservation tier: this specification deliberately
-does not preserve ownership, so a root-run standard `tar` extraction cannot
-apply ownership the format never recorded. Readers MUST ignore these fields.
+values above regardless of metadata-preservation tier. Readers MUST ignore
+these fields.
+
+*Rationale.* This specification deliberately does not preserve ownership, so a
+root-run standard `tar` extraction cannot apply ownership the format never
+recorded.
 
 #### 4.3.2. Reader-Ignored Fields; Names and Sizes
 
 Readers MUST NOT base acceptance on `mode`, `uid`, `gid`, ustar `mtime`,
 `uname`, `gname`, `devmajor`, `devminor`, or `version`. Readers MUST honor
 `prefix` when forming a header path from a foreign ustar header
-(`prefix + "/" + name` when `prefix` is non-empty), even though conformant
-writers leave it empty.
+(`prefix + "/" + name` when `prefix` is non-empty). Conformant Builders leave
+`prefix` empty.
 
 The authoritative path and size of an entry are its pax `path` and `size`
 records (Section 4.4.4). The ustar header nevertheless remains well-formed:
 
 - **Name.** If the effective path is non-empty, at most 100 bytes, and
-  consists solely of non-control ASCII, the writer MUST store it in `name`
-  verbatim; otherwise the writer MUST store `PAX_PATH_PLACEHOLDER`
+  consists solely of non-control ASCII, the Builder MUST store it in `name`
+  verbatim; otherwise the Builder MUST store `PAX_PATH_PLACEHOLDER`
   (`remanence/pax-path`).
-- **Size.** If the payload length is ≤ `USTAR_SIZE_MAX`, the writer MUST store
-  it in `size`; otherwise the writer MUST store zero. The pax `size` record is
+- **Size.** If the payload length is ≤ `USTAR_SIZE_MAX`, the Builder MUST store
+  it in `size`; otherwise the Builder MUST store zero. The pax `size` record is
   always present and authoritative, so files ≥ 8 GiB are fully supported.
 - The ustar names of the pax header records themselves are the fixed
   constants `GLOBAL_HEADER_NAME`, `PAX_HEADER_NAME`, and
@@ -596,7 +627,7 @@ records (Section 4.4.4). The ustar header nevertheless remains well-formed:
 
 The `chksum` field holds the unsigned sum of all 512 header bytes with the
 eight checksum bytes treated as ASCII spaces (0x20), encoded as six ASCII
-octal digits, a NUL, and a space. Writers MUST emit exactly this encoding.
+octal digits, a NUL, and a space. Builders MUST emit exactly this encoding.
 Readers MUST verify the unsigned checksum and reject a mismatch with
 `UstarChecksumMismatch`.
 
@@ -610,14 +641,14 @@ Readers MUST verify the unsigned checksum and reject a mismatch with
 | `1` (0x31) | Hardlink (Section 4.6) |
 | `2` (0x32) | Symbolic link |
 | `5` (0x35) | Directory |
-| NUL (0x00) | Accepted by Readers as a regular file (pre-POSIX compatibility); writers MUST NOT emit it |
+| NUL (0x00) | Accepted by Readers as a regular file (pre-POSIX compatibility); Builders MUST NOT emit it |
 
-Readers MUST reject any other typeflag with `UnsupportedTarTypeflag`. This is
-deliberate: the Core entry set is regular files, hardlinks, symbolic
-links, and directories — a faithful tree of files — and excludes device,
-FIFO, socket, and other special entries (Section 1.5); accepting an
-unsupported typeflag silently would misrepresent an unsupported archive as
-fully restored.
+Readers MUST reject any other typeflag with `UnsupportedTarTypeflag`.
+
+*Rationale.* The Core entry set is a faithful tree of files — regular files,
+hardlinks, symbolic links, and directories — with no device, FIFO, socket, or
+other special entry (Section 1.5). Accepting an unsupported typeflag silently
+would misrepresent an unsupported archive as fully restored.
 
 ### 4.4. Pax Extended Records
 
@@ -631,19 +662,34 @@ A pax header's payload is a sequence of records, each:
 
 where `<len>` is the decimal byte length of the entire record including the
 length digits themselves, the single space, and the trailing newline. `<len>`
-is self-referential; writers MUST compute it by fixed-point iteration over its
-own digit count, starting from the digit count of the record length with zero
-length digits (`len ← base + digits(len)`, with `digits` initialized to
-`digits(base)`, iterated until stable). At certain base lengths (8, 97, 996,
-9995, …) two self-consistent values of `<len>` exist; the upward iteration
-converges to the smaller, and writers MUST emit that smaller value.
+is self-referential. A Builder MUST compute it by fixed-point iteration over
+its own digit count, starting from `base`, the record length with zero length
+digits:
 
-Constraints, enforced by both Writers and Readers:
+1. Initialize `digits` to `digits(base)`, the number of decimal digits in `base`.
+2. Set `len` to `base` plus `digits`.
+3. If `len` has exactly `digits` decimal digits, stop: `len` is the value.
+4. Otherwise set `digits` to the number of decimal digits in `len`.
+5. Continue at step 2.
+
+This is the iteration `len ← base + digits(len)`, run until stable. For a base
+of 20, `digits(base)` is 2 and `len` is 22, which has two digits, so `<len>`
+is 22. For a base of 8, `digits(base)` is 1 and `len` is 9, which has one
+digit, so `<len>` is 9.
+
+At certain base lengths (8, 97, 996, 9995, …) two self-consistent values of
+`<len>` exist: a base of 8 is also consistent with 10. These are the bases at
+which adding the digit count lands one short of a power of ten. The upward
+iteration converges to the smaller value, and a Builder MUST emit that smaller
+value. Section 13.2 gives the pad records that the rule produces for
+REM-OBJECT-TV-P1.
+
+Constraints, enforced by both Builders and Readers:
 
 - `<keyword>` MUST be non-empty ASCII and MUST NOT contain `=`, newline, or
   NUL.
-- `<value>` MUST be valid UTF-8 and MUST NOT contain any byte < 0x20 (a pax
-  value in this format is always single-line).
+- `<value>` MUST be valid UTF-8 and MUST NOT contain any byte < 0x20. A pax
+  value in this format is therefore always single-line.
 - `<len>` MUST be ≥ 1 and MUST NOT exceed the remaining header payload.
 - The record MUST end with exactly one newline at offset `<len> − 1`.
 
@@ -651,21 +697,21 @@ Readers MUST reject violations with `PaxRecordMalformed`.
 
 #### 4.4.2. Emission Order and Duplicates
 
-Writers MUST emit the records of one pax header sorted in ascending bytewise
+Builders MUST emit the records of one pax header sorted in ascending bytewise
 order of the keyword, and MUST NOT emit the same keyword twice in one header.
-(A consequence: all `REMANENCE.*` keywords sort before the lowercase standard
-keywords `mtime`, `path`, `size`.) Readers MUST apply POSIX last-wins
-semantics if duplicates are encountered in a foreign archive, and MUST NOT
-reject an archive solely for unsorted records. Determinism is a writer
-obligation, not a read-acceptance rule.
+As a consequence, all `REMANENCE.*` keywords sort before the lowercase
+standard keywords `mtime`, `path`, `size`. Readers MUST apply POSIX last-wins
+semantics if duplicates are encountered in a foreign archive. Readers MUST NOT
+reject an archive solely for unsorted records. Determinism is an obligation on
+the Builder, not a read-acceptance rule.
 
 #### 4.4.3. Unknown Keywords
 
-Readers MUST ignore unknown keywords, including unknown `REMANENCE.*` keywords
-(this is the format's extension mechanism — a future revision of this
-document may assign new keywords, Section 10), and SHOULD
-preserve them when re-emitting metadata. Unknown keywords MUST NOT alter
-payload framing or interpretation.
+Readers MUST ignore unknown keywords, including unknown `REMANENCE.*`
+keywords. Unknown keywords are the format's extension mechanism: a future
+revision of this document may assign new keywords (Section 10). Readers SHOULD
+preserve unknown keywords when re-emitting metadata. A Reader MUST NOT let an
+unknown keyword alter payload framing or interpretation.
 
 #### 4.4.4. Standard Keywords Used
 
@@ -674,10 +720,10 @@ payload framing or interpretation.
 | `path` | REQUIRED on every entry | Effective UTF-8 entry path; overrides the ustar `name` |
 | `size` | REQUIRED on every entry | Effective payload byte length (decimal); overrides the ustar `size` |
 | `linkpath` | Symlink/hardlink entries when needed | Effective symlink target (an opaque string), or hardlink target (an in-object path, Section 4.6); overrides the ustar `linkname` |
-| `mtime` | OPTIONAL | Modification time in POSIX pax decimal form: non-negative decimal seconds since the epoch, optionally followed by `.` and fractional digits. The value is a caller-supplied string; Writers MUST validate this shape and MUST emit the validated string verbatim, so the byte stream is a deterministic function of the caller's input |
+| `mtime` | OPTIONAL | Modification time in POSIX pax decimal form: non-negative decimal seconds since the epoch, optionally followed by `.` and fractional digits. The value is a caller-supplied string. Builders MUST validate this shape and MUST emit the validated string verbatim. The byte stream is then a deterministic function of the caller's input |
 
-Writers MUST always emit `path` and `size` even when the ustar header could
-carry them, so every entry is self-describing under pax rules alone. Readers
+Builders MUST always emit `path` and `size`, even when the ustar header could
+carry them. Every entry is then self-describing under pax rules alone. Readers
 MUST use the pax values when present and fall back to the ustar fields
 otherwise (foreign-archive tolerance). For symbolic links and hardlinks,
 Readers MUST use `linkpath` when present and fall back to the ustar `linkname`
@@ -705,7 +751,7 @@ keyword order (Section 4.4.2):
 | `REMANENCE.encryption` | MUST be `none` (Section 4.5.2, Section 10) |
 | `REMANENCE.format_id` | MUST be `rem-object-v1` |
 | `REMANENCE.metadata_preservation` | One of `minimal`, `archival`, `full` |
-| `REMANENCE.object_id` | Object identifier of 1–64 non-NUL UTF-8 bytes (a UUID string in practice; opaque to this format). The bound is intrinsic because the representation-independent REM-PARITY bootstrap ([REMPARITY] key 4) carries the identifier verbatim. |
+| `REMANENCE.object_id` | Object identifier of 1–64 non-NUL UTF-8 bytes (a UUID string in practice; opaque to this format). The bound is intrinsic because the representation-independent REM-PARITY Object recovery row (REM-PARITY §10.3, key 4) carries the identifier verbatim. |
 | `REMANENCE.schema_version` | `<major>.<minor>` decimal text; MUST have major version 1 (Section 10) |
 | `REMANENCE.write_timestamp` | [RFC3339] timestamp of object creation |
 
@@ -721,23 +767,27 @@ records:
    unsigned integer equal to 1 (`UnsupportedFeature` on mismatch, `Parse` on
    malformed).
 3. If `REMANENCE.encryption` is present, it equals `none`
-   (`UnsupportedFeature` otherwise). This is a refusal gate: a Reader that
-   ignored it could restore ciphertext as content under a future revision.
-   Confidentiality is provided exclusively by the REM-ENCRYPT envelope around
-   the stream, never flagged inside it.
+   (`UnsupportedFeature` otherwise).
+
+   *Rationale.* This is a refusal gate: a Reader that ignored it could restore
+   ciphertext as content under a future revision. Confidentiality is provided
+   exclusively by the REM-ENCRYPT envelope around the stream, never flagged
+   inside it.
 4. If `REMANENCE.chunk_size` is present, it equals the externally supplied
-   `chunk_size` (`ChunkSizeMismatch` otherwise). A mismatch means the object
-   is mis-cataloged or the tape was rewritten with different geometry;
-   restoring under the wrong geometry mis-addresses every chunk.
+   `chunk_size` (`ChunkSizeMismatch` otherwise).
+
+   *Rationale.* A mismatch means the object is mis-cataloged or the tape was
+   rewritten with different geometry, and restoring under the wrong geometry
+   mis-addresses every chunk.
 
 The remaining global keywords (`object_id`, `caller_object_id`,
 `metadata_preservation`, `write_timestamp`) are descriptive; Readers MUST NOT
 require them for acceptance. Consumers cross-check the identity keywords
-against the manifest (Section 4.7). A conformant writer emits exactly one
-global header, first. Readers MUST accept a foreign archive containing
-additional `g` headers later in the stream by merging their records with
-last-wins semantics and re-running these checks before the next entry is
-delivered.
+against the manifest (Section 4.7). A conformant Builder emits exactly one
+global header, first. Readers MUST accept a foreign archive that contains
+additional `g` headers later in the stream. They MUST merge those headers'
+records with last-wins semantics and re-run these checks before the next entry
+is delivered.
 
 ### 4.6. File Entries and Block Alignment
 
@@ -754,7 +804,7 @@ Each entry is, in order:
    payload.
 4. Zero padding to the next 512-byte boundary (none if `size mod 512 = 0`).
 
-For symbolic links, Writers MUST store the target in ustar `linkname` when it
+For symbolic links, Builders MUST store the target in ustar `linkname` when it
 fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and store
 `PAX_LINK_PLACEHOLDER` (`remanence/pax-linkpath`) in `linkname`. A symlink target is an opaque UTF-8 OS string, not
 a REM-OBJECT path: it MAY be absolute, contain `..`, or be dangling. Directory
@@ -762,16 +812,17 @@ paths MUST end in `/`.
 
 **Hardlinks.** A hardlink entry records that its path is a second name for the
 bytes of another entry — the **primary** — in the same object. Its target is
-stored exactly as a symlink target is (`linkname`, or pax `linkpath` with
-`PAX_LINK_PLACEHOLDER` in `linkname`), but unlike a symlink target it is **not** an
-arbitrary string: it MUST be a canonical relative path (Section 4.6.6) that
-resolves, within the same object, to a **regular-file primary entry appearing
-before** the hardlink entry. Of a set of names sharing one underlying file the
-**primary** is one regular entry that holds the bytes; each other name is a
-hardlink entry. Primary selection MUST be deterministic and is defined over the entries
-the object emits: the primary is the first, in archive order, of the set's
-names that the object emits as entries. If the object emits only one name of
-the set, that name is a plain regular entry (no hardlink entry).
+stored exactly as a symlink target is: in `linkname`, or in pax `linkpath`
+with `PAX_LINK_PLACEHOLDER` in `linkname`. Unlike a symlink target, it is
+**not** an arbitrary string. It MUST be a canonical relative path (Section
+4.6.6) that resolves, within the same object, to a **regular-file primary
+entry appearing before** the hardlink entry. Of a set of names sharing one
+underlying file the **primary** is one regular entry that holds the bytes;
+each other name is a hardlink entry. Primary selection MUST be deterministic
+and is defined over the entries the object emits: the primary is the first, in
+archive order, of the set's names that the object emits as entries. If the
+object emits only one name of the set, that name is a plain regular entry (no
+hardlink entry).
 
 #### 4.6.2. Per-Entry Keywords
 
@@ -817,30 +868,39 @@ not chunk-aligned with `ChunkAlignmentViolation`.
 For non-empty entries, alignment is achieved entirely inside the entry's own pax header by sizing the
 `REMANENCE.pad` record. Let `O` be the byte offset of the entry's pax ustar
 record (always a multiple of 512), `B` the pax payload length after including
-the pad record, and `R = roundup512(B)`. The writer MUST choose the pad length
+the pad record, and `R = roundup512(B)`. The Builder MUST choose the pad length
 such that
 
 ```text
 O + 512 + R + 512 ≡ 0   (mod chunk_size)
 ```
 
-(the two 512s are the pax ustar record and the file ustar record). Because the
-byte stream must be deterministic, the pad length is uniquely determined: let
-`Rmin` be `roundup512` of the pax payload including an empty-valued pad record;
-the target `R` is the smallest multiple of 512 that is ≥ `Rmin` and satisfies
-the congruence; the pad value is the largest number of spaces for which the
-pax payload length does not exceed `R` (solving each candidate record's
-self-referential length per Section 4.4.1). If that payload does not round up
-to exactly `R` (a decimal-digit-boundary corner), the writer advances `R` by
-`chunk_size` and retries; a writer MUST fail with `Layout` rather than emit a
-misaligned entry if no solution exists within `4 × chunk_size` above `Rmin`.
-The pad is never a standalone tar member — it is a legitimate pax record of
-the entry it aligns, invisible to standard tools.
+The two 512s are the pax ustar record and the file ustar record. Because the
+byte stream must be deterministic, the pad length is uniquely determined by
+these steps:
+
+1. Let `Rmin` be `roundup512` of the pax payload including an empty-valued pad
+   record.
+2. Let the target `R` be the smallest multiple of 512 that is ≥ `Rmin` and
+   satisfies the congruence.
+3. Let the pad value be the largest number of spaces for which the pax
+   payload length does not exceed `R`, solving each candidate record's
+   self-referential length per Section 4.4.1.
+4. If that payload rounds up to exactly `R`, the pad length is found.
+5. Otherwise, at a decimal-digit-boundary corner, advance `R` by `chunk_size`
+   and continue at step 3.
+
+A Builder MUST fail with `Layout` rather than emit a misaligned entry if no
+solution exists within `4 × chunk_size` above `Rmin`. Appendix A gives the
+resulting pad values for REM-OBJECT-TV-P1.
+
+*Rationale.* The pad is never a standalone tar member. It is a legitimate pax
+record of the entry it aligns, invisible to standard tools.
 
 There is no padding *after* payloads beyond tar's normal 512-byte record
-padding: a body block may contain one file's tail bytes followed immediately
-by the next entry's headers. Readers recover exact sizes from `size`, never
-from block boundaries.
+padding: a chunk may contain one file's tail bytes followed immediately by the
+next entry's headers. Readers recover exact sizes from `size`, never from
+chunk boundaries.
 
 #### 4.6.4. Chunk Geometry
 
@@ -854,7 +914,7 @@ first_chunk_lba = absent                  if Z = 0
 ```
 
 `first_chunk_lba` is an inner `BodyLba`. Byte range `[s, s+n)` of the file
-maps to body blocks
+maps to chunks
 `first_chunk_lba + floor(s / chunk_size) ..= first_chunk_lba + floor((s+n−1) / chunk_size)`
 with head/tail trimming; the final chunk holds
 `Z − (chunk_count−1) × chunk_size` payload bytes (plus whatever follows in the
@@ -864,18 +924,20 @@ before mapping (Section 6.1).
 #### 4.6.5. Payload Hashing
 
 For regular entries, `REMANENCE.file_sha256` is computed over the exact `Z`
-payload bytes — never over tar headers, padding, or block fill. When the
-writer receives payload bytes as a stream, it MUST recompute the SHA-256 of
-the bytes actually consumed and MUST fail the object (refusing to complete it)
-if the recomputed digest or byte count differs from the declared spec. This
-proves the writer archived the payload it was given, not the payload the
-metadata describes. Symlink, directory, and hardlink entries carry no payload
-and no payload hash of their own; a hardlinked name's content, hash, and PFR
+payload bytes — never over tar headers, padding, or the final zero fill. When
+the Builder receives payload bytes as a stream, it MUST recompute the SHA-256
+of the bytes actually consumed. If the recomputed digest or byte count differs
+from the declared spec, the Builder MUST fail the object and refuse to
+complete it. Symlink, directory, and hardlink entries carry no payload and no
+payload hash of their own. A hardlinked name's content, hash, and PFR
 coordinates are its primary's, reached through `link_target` (Section 4.7.2).
+
+*Rationale.* The recomputation proves that the Builder archived the payload it
+was given, not the payload the metadata describes.
 
 #### 4.6.6. Path and Identity Rules
 
-For every member entry, writers MUST enforce:
+For every member entry, Builders MUST enforce:
 
 1. `path` is non-empty UTF-8, contains no NUL and no byte < 0x20.
 2. `path` is a **canonical relative path**: it does not begin with `/`, does
@@ -889,13 +951,15 @@ For every member entry, writers MUST enforce:
    `file_id` MUST also be distinct from every payload `file_id`.
 
 Readers MUST reject an entry whose effective path violates rules 1–2
-(`InvalidPath`): a traversal-shaped or non-canonical path is nonconformant,
-and accepting it would push the hazard onto every downstream consumer
-(Section 12.10). Rules 3–5 are writer-side; Verifiers and Consumers catch
-duplicates via the manifest (Section 4.7). Within those rules, paths are byte
-sequences stored verbatim: the format performs no Unicode normalization (NFC
-and NFD spellings of the same name are distinct paths), no case folding, and
-no separator translation.
+(`InvalidPath`). A traversal-shaped or non-canonical path is nonconformant.
+Rules 3–5 bind the Builder; Verifiers and Consumers catch duplicates via the
+manifest (Section 4.7). Within those rules, paths are byte sequences stored
+verbatim: the format performs no Unicode normalization (NFC and NFD spellings
+of the same name are distinct paths), no case folding, and no separator
+translation.
+
+*Rationale.* Accepting a traversal-shaped or non-canonical path would push the
+hazard onto every downstream consumer (Section 12.10).
 
 Symlink targets are not entry paths and MUST NOT be validated with the
 canonical-relative-path rule. A target is a pax value: valid UTF-8, no NUL,
@@ -906,11 +970,12 @@ target; Section 12.10 describes the hazard this creates on restore.
 
 Payload entries appear in caller-supplied order; the format assigns no meaning
 to the order beyond determinism. The manifest MUST be the last entry. Readers
-identify the manifest by its exact path `_remanence/manifest.cbor` and MUST
-NOT rely on `REMANENCE.is_manifest` alone. Readers MUST reject any entry
-appearing after the manifest entry (`Parse`): such an entry cannot be listed
-in the manifest, so the object's self-description would be silently
-incomplete.
+identify the manifest by its exact path `_remanence/manifest.cbor` and
+MUST NOT rely on `REMANENCE.is_manifest` alone. Readers MUST reject any entry
+appearing after the manifest entry (`Parse`).
+
+*Rationale.* Such an entry cannot be listed in the manifest, so the object's
+self-description would be silently incomplete.
 
 ### 4.7. The Manifest
 
@@ -925,9 +990,10 @@ The manifest is a generated regular-file entry, last in the archive, with:
 
 The manifest **excludes itself**: its `file_entries` array lists every member
 entry — regular files, hardlinks, symlinks, and directories — except the
-manifest entry itself. Its own identity lives in its pax header and, externally, in the
-parity-layer bootstrap row (plaintext copies, Section 8.2), which enables
-direct LOCATE-to-manifest reading without scanning the archive.
+manifest entry itself. Its own identity lives in its pax header and,
+externally, in the Object recovery row (REM-PARITY §10.3; plaintext copies,
+Section 8.2), which enables direct LOCATE-to-manifest reading without scanning
+the archive.
 
 #### 4.7.1. Deterministic CBOR
 
@@ -945,7 +1011,7 @@ REM-OBJECT's deterministic CBOR. **Item repertoire** — each item MUST be one o
 
 Negative integers (major type 1), tags (major type 6), floats,
 indefinite-length items, `undefined`, and all other simple values MUST NOT
-appear; decoders MUST reject them with `Cbor`.
+appear. A decoder MUST reject them with `Cbor`.
 
 **Encoding requirements** (decoders MUST reject violations with `Cbor`):
 
@@ -959,15 +1025,17 @@ appear; decoders MUST reject them with `Cbor`.
 4. The item occupies the entire manifest payload exactly; no trailing bytes.
 
 Canonical form MUST be validated over the original encoded bytes, not by
-decode-and-re-encode. **Structural limits**: an object MUST NOT contain more
-than `MAX_FILE_ENTRIES` (10,000,000) member entries; manifest nesting depth
-MUST NOT exceed `MANIFEST_MAX_DEPTH` (8), counting the top-level map as
-depth 1. Decoders MUST enforce both limits.
+decode-and-re-encode.
+
+**Structural limits.** An object MUST NOT contain more than `MAX_FILE_ENTRIES`
+(10,000,000) member entries. Manifest nesting depth MUST NOT exceed
+`MANIFEST_MAX_DEPTH` (8), counting the top-level map as depth 1. Decoders MUST
+enforce both limits.
 
 #### 4.7.2. Schema
 
 The top-level item has the following seven required text keys (shown in
-encoded sort order). A 1.0 Writer emits exactly these seven top-level keys; a
+encoded sort order). A 1.0 Builder emits exactly these seven top-level keys; a
 Reader requires all seven and additionally tolerates unknown *bare* keys as
 reserved for future revisions under Consumer obligation 3 below.
 
@@ -979,19 +1047,21 @@ reserved for future revisions under Consumer obligation 3 below.
 | `schema_version` | unsigned | MUST be 1 (`MANIFEST_SCHEMA_VERSION`) |
 | `object_metadata` | map | Empty (`{}`), or the inventory of Section 4.7.6, optionally with an `ext` container (Section 4.7.5) |
 | `caller_object_id` | text | MUST equal the global `REMANENCE.caller_object_id` |
-| `external_references` | array | Reserved; MUST be empty (`[]`) in 1.0 writers |
+| `external_references` | array | Reserved; a 1.0 Builder MUST leave it empty (`[]`) |
 
 Each `file_entries` element is a map with the base keys below, plus the
-conditional non-regular keys. (Keys are shown grouped by function; on the
-wire they appear in the deterministic order of Section 4.7.1.) Regular entries MUST NOT carry `entry_type` or
-`link_target`, preserving the pre-expansion byte representation for
-regular-only objects.
+conditional non-regular keys. The table groups the keys by function; on the
+wire they appear in the deterministic order of Section 4.7.1. Regular entries
+MUST NOT carry `entry_type` or `link_target`.
+
+*Rationale.* Omitting the two keys preserves the pre-expansion byte
+representation for regular-only objects.
 
 | Key | Type | Constraint |
 | --- | --- | --- |
 | `path` | text | Effective entry path |
 | `file_id` | text | Entry `REMANENCE.file_id` |
-| `executable` | `true`/`false`/`null` | `null` when the writer was given no value |
+| `executable` | `true`/`false`/`null` | `null` when the Builder was given no value |
 | `size_bytes` | unsigned | Effective payload length (0 for hardlink/symlink/directory/empty entries) |
 | `chunk_count` | unsigned | Section 4.6.4 value (0 for zero-payload entries, hardlinks included) |
 | `entry_type` | text | OPTIONAL; absent means `regular`; otherwise `hardlink`, `symlink`, or `directory` |
@@ -1004,28 +1074,30 @@ Consumer obligations:
 
 1. A Consumer MUST NOT rely on a manifest field unless it has verified the
    manifest bytes against an anchor digest. A failure is
-   `ManifestDigestMismatch`. An anchor digest is the bootstrap or catalog
-   `manifest_sha256` when one is available. For self-consistency only, the
-   manifest entry's own pax `REMANENCE.file_sha256` is an anchor digest. An
-   unverified manifest is untrusted input from removable media.
-   For encrypted copies this obligation is discharged by the envelope's
-   authenticated whole-object digest as specified by REM-ENCRYPT §7.1;
-   external manifest anchors are required for plaintext copies only.
+   `ManifestDigestMismatch`. An anchor digest is the `manifest_sha256` of an
+   Object recovery row or of the catalog, when one is available. For
+   self-consistency only, the manifest entry's own pax
+   `REMANENCE.file_sha256` is an anchor digest. An unverified manifest is
+   untrusted input from removable media. For encrypted copies this
+   obligation is discharged by the envelope's authenticated whole-object
+   digest as specified by REM-ENCRYPT §7.1; external manifest anchors are
+   required for plaintext copies only.
 2. A Consumer MUST reject a manifest violating the type or value constraints
    above (`ManifestInvalid`), including the cross-checks: `object_id`,
    `caller_object_id`, and `chunk_size` MUST equal the corresponding global
    header values when both are in hand, and no two `file_entries` elements
    may share a `path` or a `file_id`.
-3. A Consumer MUST treat unknown bare keys (top-level or per-entry, including
-   unknown bare keys within `metadata_preservation_data` and
-   `object_metadata`) as **reserved for future revisions of this document** —
-   ignore them, and do not use them for third-party data (which lives only
-   under `ext`, Section 4.7.5). It MUST NOT reject a manifest merely because a
+3. A Consumer MUST treat unknown bare keys as **reserved for future revisions
+   of this document** and ignore them. This covers top-level and per-entry
+   keys, including unknown bare keys within `metadata_preservation_data` and
+   `object_metadata`. Third-party data lives only under `ext` (Section 4.7.5),
+   never in a bare key. A Consumer MUST NOT reject a manifest merely because a
    reserved map or array is non-empty.
-4. A Verifier MUST verify that the manifest and the archive entries correspond
-   exactly (Section 7.4). They correspond exactly when they have the same paths,
-   entry types, link targets, sizes, hashes where present, and chunk geometry,
-   with no extras on either side.
+
+**Verifier obligation.** A Verifier MUST verify that the manifest and the
+archive entries correspond exactly (Section 7.4). They correspond exactly when
+they have the same paths, entry types, link targets, sizes, hashes where
+present, and chunk geometry, with no extras on either side.
 
 #### 4.7.3. Extended-Attribute Preservation
 
@@ -1037,7 +1109,7 @@ An entry's `metadata_preservation_data` MAY contain the following map entry:
 
 `<name>` is a nonempty CBOR text string containing the attribute name. It MUST
 be valid UTF-8 [RFC3629] and MUST NOT contain an ASCII control byte below
-`0x20`; no escaping is defined. A Writer MUST reject a name violating these
+`0x20`. No escaping is defined. A Builder MUST reject a name violating these
 rules.
 The **namespace** of an attribute name is the substring preceding its first
 `.`; a name containing no `.` has no namespace. This document's validity rule
@@ -1045,35 +1117,36 @@ for names is unchanged (nonempty UTF-8, no ASCII control byte below `0x20`);
 the namespace derivation is a classification rule, not an acceptance rule, and
 does not shrink the set of valid names.
 
-The name is stored in **canonical wire form** as `namespace.name`. This is a
-Writer obligation: a Writer on a platform whose native attribute model differs
-(a separate namespace argument; a flat namespace; case-folding storage) MUST
-map its native namespace to the canonical prefix (for example, a `user.`
-namespace attribute is `user.name`) deterministically and MUST NOT remap one
-namespace onto another. A native attribute a Writer cannot represent with a
-derivable namespace — including a name with no `.`, or one a case-folding
-store cannot round-trip without altering case — is not captured. The canonical name
-bytes are identical across independent Writers for the same native attribute
-on the same platform; whole-manifest byte identity additionally requires
-identical object parameters (Section 1.2 goal 6).
+The name is stored in **canonical wire form** as `namespace.name`; producing
+that form is an obligation on the Builder. A platform's native attribute model
+can differ from it: the namespace can be a separate argument, the namespace
+can be flat, or the store can fold case. A Builder on such a platform MUST map
+its native namespace to the canonical prefix deterministically and MUST NOT
+remap one namespace onto another. For example, a `user.` namespace attribute
+is `user.name`. A native attribute that a Builder cannot represent with a
+derivable namespace is not captured; such attributes include a name with no
+`.` and a name that a case-folding store cannot round-trip without altering
+case. The canonical name bytes are identical across independent Builders for
+the same native attribute on the same platform. Whole-manifest byte identity
+additionally requires identical object parameters (Section 1.2 goal 6).
 
 `<value>` is a CBOR byte string containing the raw attribute value without a
 textual encoding. The `xattrs` map follows the deterministic encoding rules of
 Section 4.7.1, including encoded-key ordering and the prohibition on duplicate
-names. Readers MUST ignore unknown keys in `metadata_preservation_data`
-(reserved for future revisions; third-party data lives under `ext`,
-Section 4.7.5).
+names. Readers MUST ignore unknown keys in `metadata_preservation_data`. Those
+keys are reserved for future revisions; third-party data lives under `ext`
+(Section 4.7.5).
 
 An entry with no preserved xattrs MUST NOT carry an `xattrs` key. An entry
-with neither preserved xattrs nor an extension container (Section 4.7.5)
-MUST carry an empty `metadata_preservation_data` map. A hardlink entry MUST carry an empty map;
-the shared file's restored xattrs come from the regular-file primary named by
-`link_target`. Ownership, ACLs as a separate REM-OBJECT semantic, and mode bits beyond
-`executable` remain outside this format. `mtime` is already represented by the
-pax `mtime` keyword.
+with neither preserved xattrs nor an extension container (Section 4.7.5) MUST
+carry an empty `metadata_preservation_data` map. A hardlink entry MUST carry
+an empty map. The shared file's restored xattrs come from the regular-file
+primary named by `link_target`. Ownership, ACLs as a separate REM-OBJECT
+semantic, and mode bits beyond `executable` remain outside this format.
+`mtime` is already represented by the pax `mtime` keyword.
 
-A Writer that emits no preserved xattrs anywhere MUST set
-`REMANENCE.schema_version = 1.0`. A Writer that emits at least one preserved
+A Builder that emits no preserved xattrs anywhere MUST set
+`REMANENCE.schema_version = 1.0`. A Builder that emits at least one preserved
 xattr MUST set it to `1.1`. In both cases the manifest CBOR `schema_version`
 integer remains 1. This gate is independent of REM-ENCRYPT versioning
 (Section 10).
@@ -1091,8 +1164,8 @@ than silently declaring success.
 #### 4.7.4. Within-Stream Chain of Trust
 
 ```text
-bootstrap/catalog anchor (manifest location + manifest_sha256; plaintext copies — Section 8.2)
-        │  externally anchored, parity-protected on tape
+Object-recovery-row/catalog anchor (manifest location + manifest_sha256; plaintext copies — Section 8.2)
+        │  externally anchored
         ▼
 manifest.cbor  ── byte-verified by manifest_sha256
         │
@@ -1115,26 +1188,29 @@ encrypted copies is defined by REM-ENCRYPT §7.1.
 
 An entry's `metadata_preservation_data` map and the object-level
 `object_metadata` map (Section 4.7.2) MAY carry a single reserved indirection
-key, `ext`, whose value is a map; a hardlink entry's
+key, `ext`, whose value is a map. A hardlink entry's
 `metadata_preservation_data` MUST remain empty (Section 4.7.3) and MUST NOT
 carry `ext`. A non-map `ext` value makes the manifest nonconformant
 (`ManifestInvalid`). Every bare (non-`ext`) key in these two maps is reserved
-to this specification and its successors; third-party and platform-specific
-data MUST live only under `ext`. (Section 4.7.2 obligation 3 is amended
-accordingly: unknown bare keys are reserved-for-future-use — ignored, not an
-extension point.)
+to this specification and its successors. Third-party and platform-specific
+data MUST live only under `ext`.
 
-Each member of an `ext` map is one extension, keyed by an **extension name**:
-either a **reverse-DNS name** — lowercase, containing at least one `.`, in a
-domain the author controls (for example `org.example.thing`) — requiring no
-registration; or a **registered short name** — lowercase, hyphen-separated,
-containing no `.` — from the community list (Section 15). The presence of a
-`.` distinguishes the two. A malformed or uppercase extension name is treated
-as unrecognized: it is ignored and carry-only, not a reason to reject the
-object. An `ext` member value MUST use the manifest CBOR profile of
-Section 4.7.1 (definite-length items, the permitted major types only) and
-counts against the Section 4.7.1 depth limit; a non-conforming `ext` value
-makes the whole manifest nonconformant (`Cbor`).
+Each member of an `ext` map is one extension, keyed by an **extension name**.
+An extension name takes one of two forms, and the presence of a `.`
+distinguishes them:
+
+- A **reverse-DNS name** is lowercase, contains at least one `.`, and lies in
+  a domain the author controls, for example `org.example.thing`. It requires
+  no registration.
+- A **registered short name** is lowercase and hyphen-separated, contains no
+  `.`, and comes from the community list (Section 15).
+
+A malformed or uppercase extension name is treated as unrecognized: it is
+ignored and carry-only, not a reason to reject the object. An `ext` member
+value MUST use the manifest CBOR profile of Section 4.7.1, with
+definite-length items and the permitted major types only. It counts against
+the Section 4.7.1 depth limit. A non-conforming `ext` value makes the whole
+manifest nonconformant (`Cbor`).
 
 Extension processing is fail-safe, carry-only, and additive:
 
@@ -1143,10 +1219,10 @@ Extension processing is fail-safe, carry-only, and additive:
   disposition is not recognition.
 - A Consumer MUST ignore an `ext` member it does not recognize and MUST NOT
   reject an object for its presence.
-- A Repacker (Section 2.2) MUST reproduce the canonical CBOR encoding of every
-  `ext` member it does not recognize unchanged (equivalently: it preserves the
-  decoded value; under Section 4.7.1 the canonical re-encoding is identical).
-  Silently dropping an unrecognized extension is nonconformant.
+- A Repacker (Section 2.2) MUST reproduce unchanged the canonical CBOR
+  encoding of every `ext` member it does not recognize. Preserving the decoded
+  value is equivalent, because under Section 4.7.1 the canonical re-encoding
+  is identical. Silently dropping an unrecognized extension is nonconformant.
 - Extensions are **ancillary by definition**: an extension MUST NOT be
   required to interpret an object's content or structure correctly. A feature
   a conformant Consumer must understand to read an object is a new stream
@@ -1161,10 +1237,10 @@ solely to preserved xattrs.
 #### 4.7.6. Object Metadata Inventory
 
 When any entry, or the object itself, carries an attribute outside the `user.`
-namespace or any `ext` member, the object's `object_metadata` map MUST carry an
-inventory so a holder can determine what non-core metadata the object contains
-without decoding `file_entries`. The inventory is a map with exactly these
-keys:
+namespace or any `ext` member, the object's `object_metadata` map MUST carry
+an inventory. The inventory lets a holder determine what non-core metadata the
+object contains without decoding `file_entries`. It is a map with exactly
+these keys:
 
 | Key | Type | Value |
 | --- | --- | --- |
@@ -1174,64 +1250,65 @@ keys:
 Both arrays carry names only; attribute values and per-entry detail MUST NOT
 appear. An empty array is omitted (its key absent). For verification, an
 absent inventory key is treated as an empty array; a present empty array is
-accepted (writer determinism is not a read-acceptance rule, Section 4.4.2). An
-object carrying only the portable core and no `ext` MUST leave
+accepted (the Builder's determinism is not a read-acceptance rule, Section
+4.4.2). An object carrying only the portable core and no `ext` MUST leave
 `object_metadata` empty (`{}`). A Consumer MUST treat an unrecognized
 `object_metadata` key as reserved-for-future-use and ignore it (Section 4.7.2
 obligation 3).
 
-**Verifier obligation:** a Verifier (Section 7.4) MUST confirm the inventory
-is exact — `attribute_namespaces` equals the set of non-`user.` namespaces
-actually present, and `extensions` equals the set of `ext` names actually
-present across all entries and in `object_metadata` — and MUST reject a
-mismatch (`ManifestInvalid`). A holder MAY rely on the inventory as a
-disclosure-screening surface only for an object that has passed Verifier
-validation.
+**Verifier obligation.** A Verifier (Section 7.4) MUST confirm that the
+inventory is exact and MUST reject a mismatch (`ManifestInvalid`). The
+inventory is exact when `attribute_namespaces` equals the set of non-`user.`
+namespaces actually present, and `extensions` equals the set of `ext` names
+actually present across all entries and in `object_metadata`.
+
+A holder MAY rely on the inventory as a disclosure-screening surface only for
+an object that has passed Verifier validation.
 
 ### 4.8. End of Archive
 
-After the manifest entry's padding, writers MUST emit exactly two all-zero
+After the manifest entry's padding, Builders MUST emit exactly two all-zero
 512-byte records. Readers MUST treat an all-zero header record followed by a
-second all-zero record as end of archive, and MUST reject an all-zero record
-followed by a non-zero record with `Parse` (a single zero tar EOF record).
+second all-zero record as end of archive. Readers MUST reject an all-zero
+record followed by a non-zero record (a single zero tar EOF record) with
+`Parse`.
 
-After the EOF records, writers MUST fill the remainder of the final body block
-with zero bytes, so the object's total length is
+After the EOF records, Builders MUST fill the remainder of the final chunk
+with zero bytes. The object's total length is then:
 
 ```text
 total_size_bytes      = roundup(offset_after_EOF, chunk_size)
 projected_size_blocks = total_size_bytes / chunk_size
 ```
 
-This is the only block-level zero fill in the stream, and it is tar-safe: it
+This is the only chunk-level zero fill in the stream, and it is tar-safe: it
 lies beyond the archive EOF where standard tar already stops. Readers MUST NOT
 interpret bytes after the EOF records as archive members. A Reader MAY stop at
-the EOF records or MAY validate the remaining fill and reject a nonzero byte as
-a nonconformity. Verifiers (Section 7.4) MUST confirm the fill is all-zero and
-report a nonzero fill as a nonconformity. A writer
-whose emitted block count differs from its planned `projected_size_blocks`
-MUST fail the object rather than complete it.
+the EOF records or MAY validate the remaining fill and reject a nonzero byte
+as a nonconformity. Verifiers (Section 7.4) MUST confirm the fill is all-zero
+and report a nonzero fill as a nonconformity. A Builder whose emitted block
+count differs from its planned `projected_size_blocks` MUST fail the object
+rather than complete it.
 
-### 4.9. Writer, Planner, and Reader Obligations
+### 4.9. Builder, Planner, and Reader Obligations
 
-**Writer / Planner.** The Planner computes the entire layout — every offset,
-pad size, manifest byte, and the final block count — from the file *specs*
-alone (path, file_id, entry type, link target where present, size, hash,
-optional mtime/executable, and 1.x preservation metadata), without payload
-bytes; Planner and Writer MUST share the same sizing rules such that the
-planned layout is byte-exact. A failed object MUST NOT be reported as
-complete. A Writer MUST fail the object when a block write commits fewer
-bytes than the full block or reports hard end-of-medium. The failure is
-`IncompleteBlockWrite`. Recommended practice for a writer's pipeline is
-described in the REM Implementation and Operations Guide, under “Staging,
-commit and durability”.
+**Builder and Planner.** The Planner computes the entire layout from the file
+*specs* alone, without payload bytes. The specs are the path, file_id, entry
+type, link target where present, size, hash, optional mtime/executable, and
+1.x preservation metadata. The layout is every offset, pad size, manifest
+byte, and the final block count. The Planner and the Builder MUST share the
+sizing rules that make the planned layout byte-exact. A failed object MUST NOT
+be reported as complete. A Builder MUST fail the object when a block write
+commits fewer bytes than the full block or reports hard end-of-medium. The
+failure is `IncompleteBlockWrite`. Recommended practice for a Builder's
+pipeline is described in the REM Implementation and Operations Guide, under
+“Staging, commit and durability”.
 
 **Reader.** A Reader receives a block source positioned at the object's inner
 `BodyLba(0)`, the object's `chunk_size`, and its block count. A Reader
-operates in one of two modes: **restore**, which verifies integrity, or
-**salvage**, a mode for damaged media in which verification failures are
-reported but delivery continues. An implementation MUST NOT silently fall
-back to salvage.
+operates in one of two modes. **Restore** mode verifies integrity.
+**Salvage** mode, for damaged media, reports verification failures but
+continues delivery. A Reader MUST NOT silently fall back to salvage.
 A Reader processes the object as follows:
 
 1. Read 512-byte records. A short block read is a hard error.
@@ -1239,42 +1316,38 @@ A Reader processes the object as follows:
    Section 4.5.2 global checks (covers empty objects), and stop. Remaining
    blocks are ignored.
 3. Verify the header checksum (Section 4.3.3).
-4. Dispatch on typeflag: `g` → merge records into the global set (last-wins),
-   defer re-validation to the next entry; `x` → parse records, attach to the
-   next entry; `0`/NUL → a regular entry: run the global checks if not yet run
-   for the current global set, compute effective path and size, verify
-   `REMANENCE.compression`, verify chunk alignment if `size > 0`, deliver
-   exactly `size` payload bytes, then skip the record padding (EOF inside a
-   declared payload or its padding is `TruncatedPayload`); `1` → a hardlink:
-   require `size = 0`, compute the effective path and in-object target
-   (`linkpath` or `linkname`), verify the target resolves to a regular-file
-   primary already delivered (`InvalidHardlinkTarget` otherwise), and deliver a
-   hardlink entry with no payload (its content/PFR resolve through `link_target`
-   to that primary); `2` →
-   a symlink: require `size = 0`, compute effective path and target (`linkpath`
-   or `linkname`), and deliver a symlink entry with no payload; `5` → a
-   directory: require `size = 0` and deliver a directory entry with no
-   payload; anything else → `UnsupportedTarTypeflag`.
+4. Dispatch on typeflag:
+
+   | Typeflag | Reader action | Error |
+   | --- | --- | --- |
+   | `g` | Merge the records into the global set (last-wins), and defer re-validation to the next entry. | |
+   | `x` | Parse the records and attach them to the next entry. | |
+   | `0`/NUL | Treat the entry as a regular entry. Run the global checks if they have not yet run for the current global set. Compute the effective path and size, verify `REMANENCE.compression`, and verify chunk alignment if `size > 0`. Deliver exactly `size` payload bytes, then skip the record padding. | `TruncatedPayload` if EOF falls inside a declared payload or its padding |
+   | `1` | Treat the entry as a hardlink. Require `size = 0`, and compute the effective path and the in-object target (`linkpath` or `linkname`). Verify that the target resolves to a regular-file primary already delivered. Deliver a hardlink entry with no payload; its content and PFR resolve through `link_target` to that primary. | `InvalidHardlinkTarget` if the target is not a regular-file primary already delivered |
+   | `2` | Treat the entry as a symlink. Require `size = 0`, compute the effective path and target (`linkpath` or `linkname`), and deliver a symlink entry with no payload. | |
+   | `5` | Treat the entry as a directory. Require `size = 0`, and deliver a directory entry with no payload. | |
+   | Any other | Reject the typeflag (Section 4.3.4). | `UnsupportedTarTypeflag` |
+
 5. **Integrity (restore mode).** For every regular entry delivered in full,
    compute SHA-256 over the delivered payload bytes while streaming and
-   compare against `REMANENCE.file_sha256`; on mismatch, fail the entry with
-   `FileDigestMismatch` before reporting it restored (in salvage mode:
-   deliver, but report the mismatch). Hardlink, symlink, and directory entries
-   have no payload hash of their own; they are verified through the
-   manifest/object digest chain (and, for a hardlink, its referential
-   integrity — Section 4.6).
-   Section 6.5 states what integrity a partial-range read can claim.
+   compare it against `REMANENCE.file_sha256`. On a mismatch, fail the entry
+   with `FileDigestMismatch` before reporting it restored. In salvage mode,
+   deliver the entry but report the mismatch. Hardlink, symlink, and directory
+   entries have no payload hash of their own. They are verified through the
+   manifest and object digest chain, and a hardlink also through its
+   referential integrity (Section 4.6). Section 6.5 states what integrity a
+   range read can claim.
 6. Capture the entry whose effective path is `_remanence/manifest.cbor` as the
    manifest bytes. An object whose EOF is reached with no manifest entry is
-   nonconformant: Verifiers MUST reject it (Section 7.4), and a restore-mode
+   nonconformant. A Verifier MUST reject it (Section 7.4). A restore-mode
    Reader SHOULD report the absence to its caller.
 
-A conformant Reader accepts mildly foreign archives where safe
-(unsorted/duplicate pax records, NUL typeflag, `prefix`-formed names, missing
-pax `path`/`size` with ustar fallback, later `g` headers) and rejects the
-cases in which silent acceptance would misrepresent the object (unknown
-typeflags, unknown format/major, non-`none`
-compression, misaligned data, traversal-shaped paths, checksum mismatch).
+A conformant Reader accepts a mildly foreign archive where that is safe:
+unsorted or duplicate pax records, the NUL typeflag, `prefix`-formed names,
+missing pax `path` or `size` with ustar fallback, and later `g` headers. It
+rejects the cases in which silent acceptance would misrepresent the object:
+unknown typeflags, an unknown format or major version, non-`none` compression,
+misaligned data, traversal-shaped paths, and checksum mismatches.
 
 ### 4.10. Standard-Tool Extraction (Long-Term Fallback)
 
@@ -1312,11 +1385,12 @@ bytes. Stored offsets are reproducible from this section (plaintext) and
 REM-ENCRYPT §6.3 (ciphertext).
 
 **Hardlinks.** A hardlink entry has `size_bytes = 0` and `first_chunk_lba`
-`null` (Section 4.7.2); it stores none of its own content. PFR on a hardlinked
-name MUST first resolve its `link_target` to the primary entry and then use the
-**primary's** `first_chunk_lba` and `size_bytes` for all arithmetic below. A
-PFR implementation MUST NOT treat a hardlinked name as an empty or invalid
-range. (Symlinks and directories carry no payload and are not PFR targets.)
+`null` (Section 4.7.2); it stores none of its own content. For PFR on a
+hardlinked name, a Restorer MUST first resolve its `link_target` to the
+primary entry and then use the **primary's** `first_chunk_lba` and
+`size_bytes` for all arithmetic below. A Restorer MUST NOT treat a hardlinked
+name as an empty or invalid range. Symlinks and directories carry no payload
+and are not PFR targets.
 
 Recommended practice for catalogs and per-file indexes is described in the
 REM Implementation and Operations Guide, under “Catalogs and indexes”.
@@ -1327,7 +1401,7 @@ Given a file with size `Z` and a requested range `[s, s + n)`: if `n = 0`
 the result is the empty range set, provided `s` is itself within the file
 (`s ≤ Z`); a zero-length request at an out-of-range offset is rejected like
 any other out-of-range request. Otherwise the Restorer MUST validate
-`s + n ≤ Z` with checked arithmetic before applying any formula below; the
+`s + n ≤ Z` with checked arithmetic before applying any formula below. The
 formulas are defined only for validated, non-empty ranges.
 
 ### 6.2. Inner Mapping (Both Representations)
@@ -1339,13 +1413,13 @@ b_first = L + floor(s / C)
 b_last  = L + floor((s + n − 1) / C)
 ```
 
-File byte `x` lives in inner body block `L + floor(x / C)` at offset
-`x mod C` (file payloads start block-aligned, Section 4.6.3). The requested
-bytes are obtained from inner blocks `b_first ..= b_last` with head/tail
-trimming; the final block of a file holds `Z − (chunk_count − 1) × C` payload
-bytes, with unrelated stream bytes after them (Section 4.6.4) — trim by `Z`,
-never by block boundaries. For a **plaintext copy** this is the whole
-computation: inner blocks are stored blocks; read them and trim.
+File byte `x` lives in chunk `L + floor(x / C)` at offset `x mod C` (file
+payloads start chunk-aligned, Section 4.6.3). The requested bytes are obtained
+from chunks `b_first ..= b_last` with head/tail trimming. The final chunk of a
+file holds `Z − (chunk_count − 1) × C` payload bytes, with unrelated stream
+bytes after them (Section 4.6.4). Trim by `Z`, never by chunk boundaries. For
+a **plaintext copy** this is the whole computation: its chunks are its stored
+blocks, so read them and trim.
 
 ### 6.3. Ciphertext Mapping (in REM-ENCRYPT)
 
@@ -1362,26 +1436,32 @@ last_stored_block  = floor((a + l − 1) / C)
 
 ### 6.5. Integrity of a Range Read
 
-Partial-range reads cannot verify a whole-file `file_sha256`. Their integrity
-depends on representation and backend, and a range-read implementation MUST
-report which of the three it provides rather than imply hash-verified content:
-(a) a **parity-protected tape** plaintext copy is covered by the parity
-layer's per-block CRCs ([REMPARITY]) — damage detection, not adversarial
-authentication (CRC-64 confirms a guessed block); (b) an **encrypted** copy
-follows the authenticated range-read rules of REM-ENCRYPT §6.3; (c) a
-**plaintext copy on a byte-addressed backend without the
-parity layer** (a file or object store) has **no per-range integrity by
-construction** — a verifying range read there requires either the encrypted
-representation or a whole-file `file_sha256`/`plaintext_digest` check, which
-reads the whole file. Implementations MUST NOT present case (c) as
-integrity-verified.
+A range read that does not cover the whole file cannot verify a whole-file
+`file_sha256`. The integrity of such a read depends on the representation and
+the backend, in one of three cases:
+
+- (a) A **parity-protected tape** plaintext copy is covered by the parity
+  layer's per-block CRCs ([REMPARITY]). They detect damage but do not
+  authenticate: CRC-64 is unkeyed, so whoever substitutes a block can also
+  supply its matching CRC.
+- (b) An **encrypted** copy follows the authenticated range-read rules of
+  REM-ENCRYPT §6.3.
+- (c) A **plaintext copy on a byte-addressed backend without the parity
+  layer**, such as a file or object store, has **no per-range integrity by
+  construction**. A verifying range read there requires either the encrypted
+  representation or a whole-file `file_sha256`/`plaintext_digest` check, which
+  reads the whole file.
+
+A Restorer MUST report which of the three cases applies to such a read, so
+that the report does not imply hash-verified content. An implementation
+MUST NOT present a read of case (c) as integrity-verified.
 
 ## 7. Digests, Integrity, and the Verification Chain
 
 ### 7.1. The Chain of Trust
 
 ```text
-external catalog / plaintext bootstrap anchor
+external catalog / plaintext Object recovery row anchor
 (stored_digest, plaintext_digest, manifest location + manifest_sha256)
         │
         ▼
@@ -1406,14 +1486,15 @@ layer (REM-ENCRYPT §7.1).
 ### 7.2. Write-Path Verification (No Extra Reads)
 
 Every digest in the chain is computed over bytes already flowing through the
-writer — the chain costs hash arithmetic, never an additional read pass.
+Builder — the chain costs hash arithmetic, never an additional read pass.
 
-**Per-file, at build.** The Builder streams each payload file, hashing it,
-and MUST fail the object if the streamed SHA-256 or byte count differs from
-the caller-supplied expected `file_sha256`/size (Sections 4.6.5, 4.9). This
-proves the writer archived the payload it was given, not the payload the
-metadata describes. A failed object MUST NOT be completed or reported as
-complete.
+**Per-file, at build.** The Builder streams each payload file, hashing it, and
+MUST fail the object if the streamed SHA-256 or byte count differs from the
+caller-supplied expected `file_sha256`/size (Sections 4.6.5, 4.9). A failed
+object MUST NOT be completed or reported as complete.
+
+*Rationale.* This check proves that the Builder archived the payload it was
+given, not the payload the metadata describes.
 
 REM-ENCRYPT §7.2 specifies the additional encrypted write-path discharge.
 
@@ -1425,18 +1506,27 @@ durability”.
 
 ### 7.4. Verifier Profile
 
-A Core Verifier performs the full restore-mode read of Section 4.9 with every
-  regular entry's digest checked, manifest anchor-digest and schema validation
-  (Section 4.7.2), manifest-vs-archive correspondence (every member entry
-  appears in `file_entries` with matching `path` and `entry_type`; **regular
-  entries** match `size_bytes`, `file_sha256`, `first_chunk_lba`, and
-  `chunk_count`; **hardlink entries** match `link_target`, carry zero/`null`
-  content fields and no `file_sha256`, and resolve to a valid regular-file
-  primary (Section 4.6); **symlink/directory entries** carry zero/`null`
-  content fields; and `file_entries` lists nothing absent from the archive),
-  exact `object_metadata` inventory validation (Section 4.7.6), final-fill
-  zero check (Section 4.8), plus a `stored_digest`
-  comparison against the catalog value when available.
+A Core Verifier performs these checks:
+
+- the full restore-mode read of Section 4.9, with every regular entry's
+  digest checked;
+- manifest anchor-digest and schema validation (Section 4.7.2);
+- manifest-vs-archive correspondence, as defined below;
+- exact `object_metadata` inventory validation (Section 4.7.6);
+- the final-fill zero check (Section 4.8); and
+- a `stored_digest` comparison against the catalog value, when one is
+  available.
+
+The manifest and the archive correspond when every member entry appears in
+`file_entries` with matching `path` and `entry_type`, and `file_entries` lists
+nothing absent from the archive. In addition:
+
+- **regular entries** match `size_bytes`, `file_sha256`, `first_chunk_lba`,
+  and `chunk_count`;
+- **hardlink entries** match `link_target`, carry zero/`null` content fields
+  and no `file_sha256`, and resolve to a valid regular-file primary
+  (Section 4.6); and
+- **symlink/directory entries** carry zero/`null` content fields.
 
 REM-ENCRYPT §7.4 defines the keyed and keyless encrypted-copy profiles and
 requires the recovered inner stream to pass this Core profile.
@@ -1460,19 +1550,19 @@ scrub a copy.
 
 The stored bytes are written as one tape file of fixed-size tape blocks,
 terminated by a filemark written by the parity layer at object close. The tape
-block size MUST equal the object's `chunk_size`, for both representations —
-one stored block is one tape block, stored `BodyLba` is the tape file's block
-index, and parity geometry is uniform. Parity sidecars, the filemark map,
-block CRCs, and the BOT bootstrap are tape-binding artifacts owned by the
+block size MUST equal the object's `chunk_size`, for both representations. One
+stored block is therefore one tape block, stored `BodyLba` is the tape file's
+block index, and parity geometry is uniform. Parity sidecars, the filemark
+map, block CRCs, and the BOT bootstrap are tape-binding artifacts owned by the
 parity layer (Section 9); they exist **only** on tape and are not part of the
 object's stored bytes on any backend.
 
-Bootstrap rows differ by representation, deliberately. A **plaintext**
-object's row carries the manifest anchors (`manifest_first_chunk_lba` — an
-inner `BodyLba` — `manifest_size_bytes`, `manifest_chunk_count`,
-`manifest_sha256`). An **encrypted** object's row MUST NOT carry those
-manifest anchors. [REMPARITY] owns the exact row schema, and a Writer
-producing the tape binding MUST honor it.
+Object recovery rows (REM-PARITY §10.3) differ by representation,
+deliberately. A **plaintext** object's row carries the manifest anchors
+(`manifest_first_chunk_lba` — an inner `BodyLba` — `manifest_size_bytes`,
+`manifest_chunk_count`, `manifest_sha256`). An **encrypted** object's row
+MUST NOT carry those manifest anchors. [REMPARITY] owns the exact row schema,
+and a Writer (REM-PARITY §2.2) producing the tape binding MUST honor it.
 
 An encrypted object's catalogless recovery uses its own envelope header and
 key frame (REM-ENCRYPT §5.10). REM-ENCRYPT §12.5 owns the confidentiality
@@ -1480,15 +1570,16 @@ rationale. Plaintext objects remain fully recoverable keyless (Section 4.10).
 
 ### 8.3. File Binding
 
-The stored bytes as one regular file; default extension `.rem-object` for both
-representations (Section 3.4 disambiguates). Recommended practice for staging
-and publishing a file-bound copy is described in the REM Implementation and
-Operations Guide, under “Staging, commit and durability”.
+The stored bytes are stored as one regular file, with the default extension
+`.rem-object` for both representations (Section 3.4 disambiguates).
+Recommended practice for staging and publishing a file-bound copy is described
+in the REM Implementation and Operations Guide, under “Staging, commit and
+durability”.
 
 ### 8.4. Object-Store Binding
 
-The stored bytes as one object/blob. Ranged reads (Section 6.2 and
-REM-ENCRYPT §6.3) make PFR efficient without downloading whole objects.
+The stored bytes are stored as one object or blob. Range reads (Section 6.2
+and REM-ENCRYPT §6.3) make PFR efficient without downloading whole objects.
 Recommended practice for uploading a copy to an object store is described in
 the REM Implementation and Operations Guide, under “Ingest”.
 
@@ -1496,9 +1587,9 @@ the REM Implementation and Operations Guide, under “Ingest”.
 
 The parity layer [REMPARITY] protects tape-resident stored blocks with
 Reed-Solomon parity, block CRCs, parity-epoch sidecar tape files, a filemark
-map, and the replicated BOT bootstrap. **The parity construction and geometry
-are independent of this document**; what REM-OBJECT relies on, and what it adds to
-the bootstrap, is:
+map, and the bootstrap and the terminal replicas. **The parity construction
+and geometry are independent of this document**; what REM-OBJECT relies on,
+and what it adds to the terminal replicas' Object recovery rows, is:
 
 1. **Parity is computed over stored bytes** — the ciphertext, when the copy is
    encrypted. The order is: build → (seal) → parity. The parity layer protects
@@ -1512,16 +1603,24 @@ the bootstrap, is:
    operation completes ([REMPARITY]); neither representation defines an
    in-band commit marker. REM-ENCRYPT completion framing is not a commit
    barrier.
-4. **Informative:** [REMPARITY] defines the encrypted-object bootstrap schema,
-   while Section 8.2 states the Core Writer obligation. This relationship is
-   additive and does not change the parity construction.
+4. **Informative:** REM-PARITY §10.3 defines the encrypted-object Object
+   recovery row, while Section 8.2 states the obligation this document places
+   on the REM-PARITY Writer. This relationship is additive and does not change
+   the parity construction.
 
 ## 10. Versioning and Extensibility
 
-Document version 1.0, stream format identifier `rem-object-v1`, textual stream
-schema version, and manifest schema integer are independent axes and MUST NOT
-be used as proxies for one another. This document's version is not stored in
-an object.
+This document has four independent version axes:
+
+| Axis | Value | Where it is recorded |
+| --- | --- | --- |
+| Document version | 1.0 | This document only; it is not stored in an object |
+| Stream format identifier | `rem-object-v1` | The global `REMANENCE.format_id` keyword |
+| Stream schema version | `1.0` or `1.1` | The global `REMANENCE.schema_version` keyword |
+| Manifest schema version | `1` | The manifest's `schema_version` key |
+
+The four axes MUST NOT be used as proxies for one another. REM-ENCRYPT §10 and
+the REM-PARITY Status section state those documents' own axes.
 
 `REMANENCE.schema_version` is `1.0` when no xattr is preserved and `1.1`
 when any xattr is preserved. Both values are defined by document 1.0. The
@@ -1540,22 +1639,22 @@ encrypted-envelope versioning and registries.
 
 A Repacker (Section 2.2) MUST reproduce unknown manifest keys and unrecognized
 extension-container members unchanged under the Section 4.7.1 canonical
-encoding; ignore-on-read does not license drop-on-rewrite. For symmetry a
-Repacker MUST likewise re-emit all unknown pax keywords unchanged
-(strengthening the Section 4.4.3 SHOULD to a MUST for the preserving-rewrite
-case). A Repacker that recognizes the `xattrs` map and selectively strips
-attributes is performing a declared policy action, not a transparent rewrite,
-and thereby changes `plaintext_digest`. Because every extension is ancillary
-(Section 4.7.5), a minimal Consumer that ignores all extension data and
-recovers payload bytes and structure remains conformant for the roles it
-claims (Section 14).
+encoding. Ignoring a key on read does not license dropping it on rewrite. A
+Repacker MUST likewise re-emit all unknown pax keywords unchanged. For the
+preserving-rewrite case this strengthens the Section 4.4.3 SHOULD to a MUST. A
+Repacker that recognizes the `xattrs` map and selectively strips attributes is
+performing a declared policy action, not a transparent rewrite, and thereby
+changes `plaintext_digest`. Because every extension is ancillary (Section
+4.7.5), a minimal Consumer that ignores all extension data and recovers
+payload bytes and structure remains conformant for the roles it claims
+(Section 14).
 
 ## 11. Errors
 
-The error names below are normative for the test-vector manifests (Section 13); surface syntax
-is not. I/O failures MUST remain distinguishable from format violations so
-callers can tell storage problems from invalid objects. Section 12.9 describes
-the hazards of hostile input.
+The error names below are normative for the test-vector manifests (Section
+13); surface syntax is not. I/O failures MUST remain distinguishable from
+format violations. Callers can then tell storage problems from invalid
+objects. Section 12.9 describes the hazards of hostile input.
 
 ### 11.1. Plaintext-Stream Errors
 
@@ -1584,7 +1683,7 @@ MissingManifest           object EOF reached with no _remanence/manifest.cbor en
                           non-fatal warning in restore mode, rejection for a Verifier per 7.4)
 UnsupportedFeature        unknown format_id, schema major mismatch, non-none compression
                           or encryption
-IncompleteBlockWrite      Section 4.9 writer failure
+IncompleteBlockWrite      Section 4.9 Builder failure
 SourceIo                  payload source read failure (not a format violation)
 TapeIo                    block sink/source failure (not a format violation)
 ```
@@ -1609,15 +1708,16 @@ A plaintext REM-OBJECT object provides integrity plumbing, not authentication: a
 attacker who can rewrite the medium can rewrite payloads, pax hashes, and the
 manifest consistently. A lone plaintext object whose hashes verify internally
 proves only self-consistency. The trust anchor is external — the catalog's
-`stored_digest` and, on tape, the bootstrap's parity-protected
-`manifest_sha256` (plaintext rows, Section 8.2). Encrypted copies are
+`stored_digest` and, on tape, the Object recovery row's `manifest_sha256`
+(REM-PARITY §10.3; plaintext rows, Section 8.2). Encrypted copies are
 authenticated as specified by REM-ENCRYPT, subject to its
 non-committing-AEAD caveat (REM-ENCRYPT §12.7).
 
 The off-tape catalog is a separate trust domain: it holds external anchors and
 may hold cleartext paths and per-file rows even when a stored copy is
-encrypted. REM-ENCRYPT §12.5 states the
-encrypted-copy public-facts and bootstrap-minimality consequences.
+encrypted. REM-ENCRYPT §12.5 states the encrypted-copy public-facts
+consequences and the consequences of the minimal encrypted Object recovery
+row.
 
 ### 12.7. Non-Committing AEAD (in REM-ENCRYPT)
 
@@ -1632,8 +1732,9 @@ verify the checksum of every header record. Section 4.4.1 requires every pax
 record length to be checked against the header payload that remains.
 Section 4.2 limits a Reader to the declared number of blocks, and Section 4.9
 makes an end of object inside a declared payload the error `TruncatedPayload`.
-The `chunk_size` and block count arrive from the catalog or bootstrap
-(Section 4.2), so they are semi-trusted inputs. A reader that
+The `chunk_size` and block count arrive from the catalog or, on tape, from the
+bootstrap and the Object recovery row (Section 4.2), so they are semi-trusted
+inputs. A reader that
 panics, exhausts memory, or allocates by a size it has not yet checked can be
 brought down by a single hostile object, even though it reads every valid
 object correctly. Recommended practice for handling hostile media is described
@@ -1660,23 +1761,22 @@ to the already-restored primary.
 **Native path mapping.** Section 4.6.6 makes an entry path a clean
 `/`-separated relative path, but that grammar is validated against POSIX
 semantics only. On a non-POSIX target filesystem the same bytes can denote
-something else: on Windows a component such as `..\outside` embeds a separator
-the REM-OBJECT grammar never inspected, and a value like `C:\x` or `\\host\share\x` maps
-to a drive-relative or UNC absolute path; case-folding and Unicode normalization
-(e.g. NFC/NFD, or Windows case-insensitivity) can also collapse two
-REM-OBJECT-distinct entry paths onto one native target. An entry's native
-destination is the path it would occupy on the target filesystem after that
-filesystem's separator, case-folding and Unicode-normalization rules are
-applied. A Restoring Consumer
+something else. On Windows, a component such as `..\outside` embeds a
+separator the REM-OBJECT grammar never inspected. Windows also reads a value
+like `C:\x` or `\\host\share\x` as an absolute path, on a drive or on a UNC
+share. Case-folding, such as Windows case-insensitivity, and Unicode
+normalization, such as NFC and NFD, can also collapse two REM-OBJECT-distinct
+entry paths onto one native target. An entry's native destination is the path
+it would occupy on the target filesystem after that filesystem's separator,
+case-folding and Unicode-normalization rules are applied. A Restoring Consumer
 that maps entry paths onto a native filesystem MUST reject or report, never
 silently overwrite, any entry whose native destination collides with a
 destination that another entry in the same object has already produced.
-Framing-layer acceptance of a path is a necessary check, not a
-sufficient safety claim. An inner stream recovered through REM-ENCRYPT is
-parsed and restored under these same rules (REM-ENCRYPT §5.10). Stock tar
-extraction has its own
-security model; REM-OBJECT's standard-tool fallback is faithful, not inherently
-sandboxed.
+Framing-layer acceptance of a path is a necessary check, not a sufficient
+safety claim. An inner stream recovered through REM-ENCRYPT is parsed and
+restored under these same rules (REM-ENCRYPT §5.10). Stock tar extraction has
+its own security model. REM-OBJECT's standard-tool fallback is faithful, not
+inherently sandboxed.
 
 Preserved xattrs are equally untrusted. Attributes such as Linux
 `security.capability`, `security.*`, `trusted.*`, and POSIX ACL attributes can
@@ -1706,20 +1806,20 @@ representation seals the manifest inside the REM-ENCRYPT envelope and does
 not have this
 plaintext-disclosure exposure. The Verifier-validated inventory
 (Section 4.7.6) is the intended first-pass screening surface, but does not
-itself bound value-level disclosure. The
-standard-tool recovery path (Section 4.10) inherits the host tool's security
-model — it restores symlinks faithfully — and the format's protection there is
-limited to keeping privilege-changing metadata (ownership, setuid/setgid mode,
-extended attributes) in a form no standard `tar` applies to target files; it
+itself bound value-level disclosure. The standard-tool recovery path (Section
+4.10) inherits the host tool's security model, and it restores symlinks
+faithfully. The format's protection there is limited to keeping
+privilege-changing metadata, such as ownership, setuid/setgid mode and
+extended attributes, in a form no standard `tar` applies to target files. It
 is not a sandbox.
 
 ## 13. Test Vectors
 
 Static test vectors are distributed alongside this specification, each with a
 manifest entry recording inputs, the expected values pinned below, and — for
-negative vectors — the expected Section 11 error name. Vectors use small `chunk_size`
-values (e.g. 4096) so full object byte streams are practical to pin; at least
-one vector MUST use `DEFAULT_CHUNK_SIZE`.
+negative vectors — the expected Section 11 error name. Vectors use small
+`chunk_size` values (e.g. 4096) so full object byte streams are practical to
+pin. At least one vector MUST use `DEFAULT_CHUNK_SIZE`.
 
 The authoritative companion archive is `remanence-test-vectors.tar`, SHA-256
 `77be73e780e9ff2c265c8357b6ba684b4c69800213820ae1331850f742b1d83d`.
@@ -1737,33 +1837,39 @@ independently checkable with `sha256sum`.
 
 ### 13.1. Plaintext-Stream Positive Vectors
 
-The plaintext suite MUST include at least: an **empty object** (global header
-+ manifest + EOF only); an **empty file** (`chunk_count` 0, absent
-`first_chunk_lba`, `null` in the manifest); a **one-byte file**; a
-**block-boundary set** (payload sizes `chunk_size − 1`, `chunk_size`,
-`chunk_size + 1`, and one multi-chunk size); **pathological paths** (a
-non-ASCII path and a > 100-byte path, both exercising `PAX_PATH_PLACEHOLDER`,
-and a 100-byte portable path stored inline); **full metadata** (entries with
-`mtime`, `executable=true` at mode 0755, and `executable` unsupplied →
-`null`); a **multi-file object** ordering entries non-alphabetically (pinning
-caller-order preservation); **non-regular entries** (a symlink with its
-target, an empty directory, and a hardlink — primary + link — restoring to one
-shared inode); **long link targets** (a symlink and a hardlink whose targets
-exceed 100 bytes, exercising `PAX_LINK_PLACEHOLDER` and pax `linkpath`); and a **canonical-manifest byte-identity vector**
-pinning the exact manifest CBOR bytes and `manifest_sha256` for a fixed input
-set (the cross-implementation determinism gate, Section 4.7.1); a
-**portable-core-only object** (`user.` only, empty `object_metadata`, and
-`REMANENCE.schema_version` pinned); an **object with a non-`user.` attribute
-and a correct inventory**; an **object with an unknown
-reverse-DNS `ext` member**, for which a minimal Consumer recovers payloads and
-ignores the member and a Repacker reproduces it under canonical encoding; and
-a **combined non-`user.` attribute and `ext` member** with the two-array
-inventory pinned exactly. For each, the
-manifest pins the exact full object byte stream, or for large vectors
-`full_object_sha256` plus either the first object block bytes or
-`first_block_sha256`, `stored_size_blocks`, every entry's
+The plaintext suite MUST include at least the vectors in the following table.
+Each is named by its manifest's `vector_id`; the archive's `MANIFEST.tsv` lists
+the manifests.
+
+| Vector | What it pins |
+| --- | --- |
+| REM-OBJECT-TV-EMPTY | An empty object: the global header, the manifest and EOF only |
+| REM-OBJECT-TV-EMPTY-FILE | An empty file: `chunk_count` 0, absent `first_chunk_lba`, and `null` in the manifest |
+| REM-OBJECT-TV-ONE-BYTE | A one-byte file |
+| REM-OBJECT-TV-BOUNDARY | A chunk-boundary set: payload sizes `chunk_size − 1`, `chunk_size`, `chunk_size + 1`, and one multi-chunk size |
+| REM-OBJECT-TV-PATHS | Pathological paths: a non-ASCII path and a > 100-byte path, both exercising `PAX_PATH_PLACEHOLDER`, and a 100-byte portable path stored inline |
+| REM-OBJECT-TV-METADATA | Full metadata: entries with `mtime`, with `executable=true` at mode 0755, and with `executable` unsupplied, which the manifest records as `null` |
+| REM-OBJECT-TV-ORDER | A multi-file object whose entries are not in alphabetical order, pinning caller-order preservation |
+| REM-OBJECT-TV-NONREGULAR | Non-regular entries: a symlink with its target and an empty directory |
+| REM-OBJECT-TV-NONREGULAR | A long link target: a symlink whose target exceeds 100 bytes, exercising `PAX_LINK_PLACEHOLDER` and pax `linkpath` |
+| REM-OBJECT-TV-HARDLINKS | A hardlink, primary and link, restoring to one shared inode |
+| REM-OBJECT-TV-HARDLINKS | A long link target: a hardlink whose target exceeds 100 bytes, exercising `PAX_LINK_PLACEHOLDER` and pax `linkpath` |
+| REM-OBJECT-TV-MANIFEST | The exact manifest CBOR bytes and `manifest_sha256` for a fixed input set: the canonical-manifest byte-identity vector, the cross-implementation determinism gate of Section 4.7.1 |
+| REM-OBJECT-TV-PORTABLE-CORE-ONLY | A portable-core-only object: `user.` attributes only, an empty `object_metadata`, and `REMANENCE.schema_version` pinned |
+| REM-OBJECT-TV-NONUSER-ATTRIBUTE | An object with a non-`user.` attribute and a correct inventory |
+| REM-OBJECT-TV-EXT-MEMBER | An object with an unknown reverse-DNS `ext` member, for which a minimal Consumer recovers the payloads and ignores the member, and a Repacker reproduces it under canonical encoding |
+| REM-OBJECT-TV-ATTRIBUTE-EXT-COMBINED | A non-`user.` attribute and an `ext` member combined, with the two-array inventory pinned exactly |
+
+For each vector, the manifest pins the exact full object byte stream or, for a
+large vector, `full_object_sha256` and either the first object block bytes or
+`first_block_sha256`. It also pins `stored_size_blocks`, every entry's
 `(pax_header_offset, data_offset, first_chunk_lba, chunk_count, pad_spaces)`,
 the manifest CBOR bytes, and `manifest_sha256`.
+
+The suite also includes a manifest carrying an unknown top-level key in valid
+manifest-profile CBOR (`unknown-extra-key-accepted`, in
+`negative-manifest.json`). A Consumer MUST accept it (Section 4.7.2,
+obligation 3).
 
 Where a positive manifest carries an `expected.default_restore` object, its
 fields `skipped_xattrs`, `applied_privileged_xattrs`, `carried_extensions` and
@@ -1853,56 +1959,98 @@ and `user.remanence.color` with bytes `01 02 ff`; the global stream schema is
 
 The `plain.txt` entry carries an empty container. The companion manifest pins
 the exact deterministic CBOR, layout, `manifest_sha256`, and
-`stored_digest`. The no-xattr writer path remains schema `1.0` and emits empty
+`stored_digest`. The Builder's no-xattr path remains schema `1.0` and emits empty
 containers as required by Section 4.7.3.
 
 ### 13.6. Negative Vectors
 
 Each contains exactly one fault and asserts the mapped error.
 
-**Plaintext stream.** Writer-side (constructed via API): duplicate path;
-duplicate `file_id`; manifest `file_id` colliding with a payload `file_id`;
-reserved `_remanence/` path; control character in path; each non-canonical
-path shape (`/abs`, `a/../b`, `./a`, `a//b`, `a/`); malformed `mtime`;
-streamed payload with wrong hash; streamed payload with wrong size;
-non-multiple-of-512 `chunk_size`; symlink/directory with nonzero size;
-symlink missing target; directory path without trailing slash; a hardlink
-whose target is absent or not a regular-file primary (`InvalidHardlinkTarget`).
-Reader-side (byte vectors): wrong
-`REMANENCE.format_id`; schema major 2; missing `REMANENCE.compression`;
-`REMANENCE.compression=gzip`; `REMANENCE.encryption=aes-256-gcm`; declared
-`REMANENCE.chunk_size` disagreeing with the supplied geometry; corrupted
-header checksum; single zero EOF record; unknown typeflag; misaligned nonzero
-payload; traversal-shaped effective path; an entry after the manifest; one
-flipped payload bit (restore MUST fail `FileDigestMismatch`); truncated
-payload; truncated pax body; pax record length out of bounds; pax record
-missing `=`; pax record missing trailing newline; pax value with control
-character; non-UTF-8 pax value. Manifest: non-canonical key order;
-non-shortest integer encoding; indefinite-length item; float; tag; duplicate
-map key; `schema_version` 2; `file_sha256` of wrong length; nesting depth
-exceeding `MANIFEST_MAX_DEPTH`; manifest bytes disagreeing with the anchor;
-manifest `chunk_size` disagreeing with the global header; unknown extra key
-(MUST be accepted); two `file_entries` sharing a `path`; two `file_entries`
-sharing a `file_id`. Additive negative vectors cover an inventory that
-disagrees with the entries (a non-`user.` attribute is present but the
-inventory is empty or wrong), which MUST produce `ManifestInvalid`; a
-non-canonical `ext` value, which MUST produce `Cbor`; and a manifest tamper
-with constant payload (a repointed `path`, swapped `file_sha256`, or altered
-`first_chunk_lba`), which pins a distinct `plaintext_digest` and, with an
-anchor present, MUST produce `ManifestDigestMismatch`. Each additive negative
-vector pins the typed Section 11 error name and names the affected digest,
-`plaintext_digest`, which equals `stored_digest` for a plaintext copy. A
-restore-report vector reaches EOF without a manifest and asserts the typed
-`MissingManifest` report rather than silent absence.
+**Plaintext stream, Builder side.** These vectors are constructed through the
+Builder's input.
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| Duplicate path | `InvalidInput` |
+| Duplicate `file_id` | `InvalidInput` |
+| Manifest `file_id` colliding with a payload `file_id` | `InvalidInput` |
+| Reserved `_remanence/` path | `InvalidInput` |
+| Control character in path | `InvalidInput` |
+| Each non-canonical path shape (`/abs`, `a/../b`, `./a`, `a//b`, `a/`) | `InvalidInput` |
+| Malformed `mtime` | `InvalidInput` |
+| Streamed payload with wrong hash | `InvalidInput` |
+| Streamed payload with wrong size | `InvalidInput` |
+| Non-multiple-of-512 `chunk_size` | `InvalidInput` |
+| Symlink or directory with nonzero size | `InvalidInput` |
+| Symlink missing target | `InvalidInput` |
+| Directory path without trailing slash | `InvalidInput` |
+| A hardlink whose target is absent or not a regular-file primary | `InvalidHardlinkTarget` |
+
+**Plaintext stream, Reader side.** These are byte vectors.
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| Wrong `REMANENCE.format_id` | `UnsupportedFeature` |
+| Schema major 2 | `UnsupportedFeature` |
+| Missing `REMANENCE.compression` | `Parse` |
+| `REMANENCE.compression=gzip` | `UnsupportedFeature` |
+| `REMANENCE.encryption=aes-256-gcm` | `UnsupportedFeature` |
+| Declared `REMANENCE.chunk_size` disagreeing with the supplied geometry | `ChunkSizeMismatch` |
+| Corrupted header checksum | `UstarChecksumMismatch` |
+| Single zero EOF record | `Parse` |
+| Unknown typeflag | `UnsupportedTarTypeflag` |
+| Misaligned nonzero payload | `ChunkAlignmentViolation` |
+| Traversal-shaped effective path | `InvalidPath` |
+| An entry after the manifest | `Parse` |
+| One flipped payload bit, read in restore mode | `FileDigestMismatch` |
+| Truncated payload | `TruncatedPayload` |
+| Truncated pax body | `TruncatedPayload` |
+| Pax record length out of bounds | `PaxRecordMalformed` |
+| Pax record missing `=` | `PaxRecordMalformed` |
+| Pax record missing trailing newline | `PaxRecordMalformed` |
+| Pax value with control character | `PaxRecordMalformed` |
+| Non-UTF-8 pax value | `PaxRecordMalformed` |
+
+**Manifest.**
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| Non-canonical key order | `Cbor` |
+| Non-shortest integer encoding | `Cbor` |
+| Indefinite-length item | `Cbor` |
+| Float | `Cbor` |
+| Tag | `Cbor` |
+| Duplicate map key | `Cbor` |
+| `schema_version` 2 | `ManifestInvalid` |
+| `file_sha256` of wrong length | `ManifestInvalid` |
+| Nesting depth exceeding `MANIFEST_MAX_DEPTH` | `Cbor` |
+| Manifest bytes disagreeing with the anchor | `ManifestDigestMismatch` |
+| Manifest `chunk_size` disagreeing with the global header | `ManifestInvalid` |
+| Two `file_entries` sharing a `path` | `ManifestInvalid` |
+| Two `file_entries` sharing a `file_id` | `ManifestInvalid` |
+
+**Additive negative vectors.**
+
+| Fault | Expected Section 11 error |
+| --- | --- |
+| An inventory that disagrees with the entries: a non-`user.` attribute is present but the inventory is empty or wrong | `ManifestInvalid` |
+| A non-canonical `ext` value | `Cbor` |
+| A manifest tamper with constant payload, with an anchor present: a repointed `path`, swapped `file_sha256`, or altered `first_chunk_lba` | `ManifestDigestMismatch` |
+
+Each additive negative vector pins the typed Section 11 error name and names
+the affected digest, `plaintext_digest`, which equals `stored_digest` for a
+plaintext copy. Each manifest-tamper vector pins a distinct
+`plaintext_digest`. A restore-report vector reaches EOF without a manifest and
+asserts the typed `MissingManifest` report rather than silent absence.
 
 ## 14. Conformance
 
-An implementation conforms only for the roles it claims. A conforming Writer
+An implementation conforms only for the roles it claims. A conforming Builder
 implements the canonical stream and every feature it emits. A Reader MAY
-decline xattr restore, but it MUST preserve file-byte recovery, ignore the
-extension safely, and report that the attributes were not applied. An
-implementation claiming an encrypted role also conforms to REM-ENCRYPT and
-its Section 13 vectors.
+decline xattr restore. A Reader that declines it MUST still preserve file-byte
+recovery, ignore the `xattrs` maps, and report that the attributes were not
+applied. An implementation claiming an encrypted role also conforms to
+REM-ENCRYPT and its Section 13 vectors.
 
 Conformance evidence MUST include:
 
@@ -1915,8 +2063,12 @@ Conformance evidence MUST include:
 4. plaintext range recovery across a chunk boundary;
 5. failure without reporting a completed object on injected size, digest, and
    I/O failures; and
-6. the applicable portable-core, extension-container, object-inventory,
-   Repacker-preservation, and manifest-tamper vectors of Section 13.
+6. the applicable vectors of Section 13 for:
+   - the portable core;
+   - extension containers;
+   - the object inventory;
+   - Repacker preservation; and
+   - manifest tampering.
 
 The `expected.default_restore` fields that Section 13.1 describes as
 informative are not part of this evidence.
@@ -1938,10 +2090,10 @@ preservation key, the `ext` indirection key, and the `object_metadata` inventory
 governed by its versioning rules (Section 10).
 
 This document establishes no IANA registry. Extension names (Section 4.7.5)
-use permissionless reverse-DNS naming and require no central allocation; a
-community-maintained advisory list MAY record registered short names, but is
-not a precondition for conformance. Reverse-DNS extension names apply to manifest
-extension containers only and MUST NOT appear as pax keywords.
+use permissionless reverse-DNS naming and require no central allocation. A
+community-maintained advisory list MAY record registered short names. That
+list is not a precondition for conformance. Reverse-DNS extension names apply
+to manifest extension containers only and MUST NOT appear as pax keywords.
 
 ## 16. References
 
@@ -2070,7 +2222,7 @@ effect on conformance.
   revision this change writes. They concern protecting the host a restore
   writes onto, surviving hostile input, staging and durability, catalogs,
   keeping attribute values out of logs, optional verification, scrub and
-  repair, ingest, and which directory entries a writer emits. Statements about
+  repair, ingest, and which directory entries a Builder emits. Statements about
   the reference implementation's reader and its wrapper tooling went to that
   implementation's documentation; Appendix E keeps the wrapper convention and
   its field meanings. Sections 7.3 and 7.5 lost all of their text; each keeps its
@@ -2094,6 +2246,63 @@ effect on conformance.
   the Guide recommends each. REM-ENCRYPT's and REM-PARITY's rules of the same
   kind have since left those documents too, as their own revision histories
   record.
+
+  The readability pass then changed the text as follows. No byte of the format
+  changed, and no valid object or vector changed.
+
+  - The Abstract and Table of Contents now stand above Section 1, and the
+    Identifiers table no longer repeats the two DOIs that the Status table
+    carries.
+  - Section 1.1 now says which sections this document and REM-ENCRYPT number
+    together. A placeholder heading marks each section or subsection that
+    REM-ENCRYPT holds.
+  - Section 1.1's list of tape-binding clauses now names every section whose
+    parity-layer reference binds the tape: Sections 3.3, 4.2, 4.5.1, 4.7, 6.5,
+    8.2, 9 and 12.6.
+  - Section 4.2 is now “Chunks and `chunk_size`”, Section 4.9 is “Builder,
+    Planner, and Reader Obligations”, and Section 7.3 has lost “(Deployment
+    Obligation)”, which described text that had moved to the Guide.
+  - The statement of what integrity a range read can claim moved from Section
+    4.9 to a new Section 6.5. It now names the Restorer for the duty to report
+    which case applies, and keeps its case (c) prohibition on every
+    implementation.
+  - The producing role is the Builder throughout. “Writer” now means only the
+    REM-PARITY Writer, in the tape-binding clauses.
+  - “Chunk” replaces “body block” as the name of the unit inside the object.
+    Section 2.3 defines the two `BodyLba` indexes in terms of chunks and
+    stored blocks, and gains a table of the three units.
+  - Statements that the tape bootstrap carries an object's manifest anchors,
+    identifier or block count, or that it is replicated or parity-protected,
+    described the generation-1 tape layout. They now name the terminal
+    replicas' Object recovery rows (REM-PARITY §10.3), which carry those facts
+    in generation 2. Sections 4.2 and 12.9 name the bootstrap only for the
+    tape's block size, which equals `chunk_size`. The requirements they state
+    are unchanged.
+  - Section 1.1 now limits “never reused for different bytes” to the version
+    string of a deposited revision. A copy in preparation keeps its version
+    string while its text changes.
+  - Section 13.1 lists its vectors in a table by their archive `vector_id`,
+    and Section 13.6 lists its faults in tables, each with its expected
+    Section 11 error. The case of an unknown manifest key that a Consumer
+    accepts moved from Section 13.6 to Section 13.1. The four expected errors
+    that the prose of Section 13.6 also stated as requirements remain required
+    where their checks are defined (Sections 4.7.1, 4.7.2, 4.7.6 and 4.9).
+  - Section 4.4.1 states the pax length iteration as numbered steps with two
+    worked examples, and Section 4.6.3 states the pad-length search as
+    numbered steps. Section 4.9 gives its typeflag dispatch as a table,
+    Section 7.4 lists the Verifier's checks, Section 10 gives its version axes
+    as a table, and Section 14 lists its vector families one per line.
+  - An explanation of why a rule exists now stands in its own paragraph,
+    opening with *Rationale.*, which Section 2.1 declares informative.
+  - Sentences that stated more than one requirement, or a requirement and an
+    aside, were split. Where the role a requirement binds was only implied,
+    the sentence now names it.
+  - Errata: Sections 8.3 and 8.4 gain the verb they lacked; Section 4.7.5 no
+    longer claims to amend Section 4.7.2; Section 14 no longer says “safely”,
+    which lost its referent when the host-safety rules moved to the Guide;
+    Section 12.10 no longer calls a Windows path such as `C:\x`
+    drive-relative; and Appendix E cites REM-ENCRYPT §6 in the document's
+    usual form.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
   an informative description of the capacity cost the alignment rule imposes
   on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper
@@ -2110,9 +2319,25 @@ effect on conformance.
   review. Comments close 30 April 2027; the document freezes 31 July 2027.
 
   Text substantially the same as the copy distributed on 2026-07-25 (below),
-  with these changes: it introduces the Status section's change policy — which
-  the earlier copy did not carry in any form — records this document's concept
-  DOI, adds this revision history, and restates the dependency on REM-PARITY as stability against the 1.x line, reclassifies Section 14's vector-change rule from erratum to revision, de-couples the Section 4.4.3 and Section 10 wording from document minors, warns explicitly against confusing the stream-schema numeral with the document version, narrows the Section 4.7.3 empty-map requirement so it no longer forbids the extension container its own schema permits, rebuilds the Table of Contents so a renderer cannot silently renumber it around the deliberate Section 5 gap, and adds the worked classifications, the bytes-to-defining-revision lookup paragraph and the vectors-are-anchors rule.
+  with these changes:
+
+  - It introduces the Status section's change policy, which the earlier copy
+    did not carry in any form.
+  - It records this document's concept DOI.
+  - It adds this revision history.
+  - It restates the dependency on REM-PARITY as stability against the 1.x
+    line.
+  - It reclassifies Section 14's vector-change rule from erratum to revision.
+  - It de-couples the Section 4.4.3 and Section 10 wording from document
+    minors.
+  - It warns explicitly against confusing the stream-schema numeral with the
+    document version.
+  - It narrows the Section 4.7.3 empty-map requirement so it no longer forbids
+    the extension container its own schema permits.
+  - It rebuilds the Table of Contents so a renderer cannot silently renumber
+    it around the deliberate Section 5 gap.
+  - It adds the worked classifications, the bytes-to-defining-revision lookup
+    paragraph and the vectors-are-anchors rule.
 
   No object written against the earlier copy is affected, and no published
   vector changed. Where a correction touches a wire statement, the statement as
@@ -2193,12 +2418,12 @@ decommissioned workstation archived beside the masters. The second is a file
 that cannot be represented as a native entry at all: a path or symlink target
 that is not valid UTF-8 (Section 4.6.6), a file type the format does not
 carry (a device node, socket, or FIFO), or extended attributes outside the
-portable set the writer accepts. The convention described next serves
+portable set the caller accepts. The convention described next serves
 both.
 
 ### E.3. The Wrapper Convention
 
-The writer packs the subtree with an ordinary pax-format tar into a single
+The caller packs the subtree with an ordinary pax-format tar into a single
 regular entry, and writes a small index beside it as a second regular entry.
 For a subtree at canonical relative path `<path>`, the two entries are:
 
@@ -2231,7 +2456,7 @@ boundary, each carries its own `REMANENCE.file_sha256`, and each is listed in
 the manifest like any other file. The wrapper's inner files are not members:
 they have no entry of their own, no `REMANENCE.file_id`, and no manifest
 record. The index is a convenience of the convention rather than a
-requirement of it; a writer may omit it, in which case only whole-wrapper
+requirement of it; the caller may omit it, in which case only whole-wrapper
 restore is available.
 
 ### E.4. Recovering One Inner File
@@ -2250,7 +2475,7 @@ reading the wrapper in full:
 5. Verify the bytes read against the element's `sha256`.
 
 Under the encrypted representation the same steps apply, because
-range addressing is preserved through the envelope (REM-ENCRYPT Section 6);
+range addressing is preserved through the envelope (REM-ENCRYPT §6);
 the index and the wrapper range are fetched as ciphertext chunks and
 decrypted, and nothing else in the object is opened. A reader that
 implements the convention can offer this procedure for both
@@ -2275,7 +2500,7 @@ and a reader could compose the two offsets.
 ### E.6. Whose Decision It Is
 
 The choice of what to bundle into one object, and what to wrap inside it, is
-the writer's policy, and it belongs above this document. Recommended practice
+the caller's policy, and it belongs above this document. Recommended practice
 for deciding when to wrap is described in the REM Implementation and
 Operations Guide, under “Ingest”.
 
