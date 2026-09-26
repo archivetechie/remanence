@@ -290,7 +290,7 @@ recycle-skew issue when something outside Remanence rewrites a cartridge
 under an existing barcode (see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ 6ed03ef0 -->
 ## On disk: durable records and rebuildable state
 
 The host-side state, for completeness (paths are operator-configured; see

@@ -73,7 +73,7 @@ verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
 
-<!-- code-anchor: Cargo.toml crates/remanence-api/build.rs @ 7f39930d -->
+<!-- code-anchor: Cargo.toml crates/remanence-api/build.rs crates/remanence-cli/src/archive_ingest.rs @ 6ed03ef0 -->
 ## Build
 
 Rust 1.88+, Linux. The default build needs no system packages; the protobuf
@@ -108,7 +108,7 @@ cargo test --workspace
 Hardware-touching tests are ignored by default and opt in via
 environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Quickstart
 
 The native object format works against local files, no tape required:

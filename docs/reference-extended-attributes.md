@@ -1,4 +1,4 @@
-<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/tar.rs crates/remanence-format/src/writer.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-stream/src/lib.rs crates/rem-recover/src/main.rs @ 3c0f50b3 -->
+<!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/tar.rs crates/remanence-format/src/writer.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-stream/src/lib.rs crates/rem-recover/src/main.rs @ 6ed03ef0 -->
 # Extended attributes and file metadata
 
 This reference explains what file metadata Remanence preserves in a REM-OBJECT

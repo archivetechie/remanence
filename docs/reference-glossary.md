@@ -99,7 +99,7 @@ procedure are described in REM-OBJECT Core Format Appendix E (informative).
 separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
 
-<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 6ed03ef0 -->
 ## Catalog and daemon
 
 **catalog** — the queryable model of what is on which tape. The durable
