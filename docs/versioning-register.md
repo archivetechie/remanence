@@ -274,8 +274,8 @@ documents and published artifacts themselves.
   wrapped for each recipient — the post-quantum machinery.
 - **Where.** Scalar-header offset 0x38; registry §10.3.
 - **Current values.** 0x02 (current) = X-Wing hybrid KEM per
-  `draft-connolly-cfrg-xwing-kem-10`; 0x01 permanently forbidden (legacy
-  X25519-only, never shipped); 0x03 reserved for a future X-Wing
+  `draft-connolly-cfrg-xwing-kem-10`; 0x01 permanently forbidden (X25519-only;
+  assigned pre-production, never shipped); 0x03 reserved for a future X-Wing
   construction that differs on the wire.
 - **Unknown value.** Hard error, `InvalidWrapSuite`, by name.
 - **How it changes.** As `suite_id`: registry assignment through a
