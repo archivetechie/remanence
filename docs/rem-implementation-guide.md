@@ -675,8 +675,8 @@ We recommend obtaining the data key and the encapsulation randomness from the
 operating system's cryptographically secure generator, through an interface
 that reports failure, and failing the seal with `EntropyUnavailable` whenever
 that source cannot supply them. The specification requires the outcome:
-"Every seal MUST use a fresh uniformly random 32-byte DEK and fresh HPKE
-encapsulation randomness for every recipient, following [RFC9180] §9.2.3.
+"For every seal, a Sealer MUST use a fresh uniformly random 32-byte DEK and
+fresh HPKE encapsulation randomness for every recipient ([RFC9180] §9.2.3).
 Entropy failure is fatal." (REM-ENCRYPT §12.1).
 
 Serves REM-ENCRYPT §5.4, Key Inputs and Identification, and REM-ENCRYPT
@@ -772,7 +772,7 @@ A deployment that treats an object's existence, identifier or approximate
 size as sensitive should add its own policy above the format, which defines
 no padding. A deployment that needs provenance should keep an independently
 authenticated or signed external manifest, because "REM-ENCRYPT claims
-confidentiality and self-consistency, not writer identity or provenance."
+confidentiality and self-consistency, not Sealer identity or provenance."
 (REM-ENCRYPT §12.7).
 
 A tape adds public facts of its own. REM-PARITY's structures are plaintext on
@@ -896,9 +896,9 @@ The envelope fails closed: a copy with damaged blocks does not open.
 
 We recommend repairing the damaged stored blocks from parity first, and then
 retrying decryption on the recovered stored bytes. A repair that did not
-succeed produces no plaintext, because REM-ENCRYPT requires that "A failed
-metadata or chunk tag MUST stop processing without releasing that chunk's
-plaintext." (REM-ENCRYPT §12.4).
+succeed produces no plaintext, because REM-ENCRYPT requires that "When a
+metadata or chunk tag fails, the implementation that checks it MUST stop
+processing without releasing that chunk's plaintext." (REM-ENCRYPT §12.4).
 
 Serves REM-OBJECT §9, Relationship to the Parity Layer, and REM-ENCRYPT §12.4,
 Fail-Closed.

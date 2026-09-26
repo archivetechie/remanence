@@ -122,8 +122,9 @@ revision. Once a revision is deposited, its deposited text governs. Every other 
 repository, inside a Remanence source release, on a mirror, or printed — is a
 convenience copy. A copy carrying the same version string as a deposited
 revision is byte-identical to it or it is defective; where they differ, the
-deposit governs. A version string is never reused for different bytes, so
-naming a version names one exact text no matter which copy you hold. The
+deposit governs. The version string of a deposited revision is never reused
+for different bytes, so naming a deposited version names one exact text no
+matter which copy you hold. The
 reference implementation is informative: where it and this document disagree,
 this document is the fixed point, and the divergence
 is a defect in the implementation.
@@ -205,7 +206,7 @@ implementation that uses only plaintext objects does not need this one.
 
 ### 1.5. Non-Goals
 
-REM-ENCRYPT defines no key registry, custody protocol, writer identity,
+REM-ENCRYPT defines no key registry, custody protocol, Sealer identity,
 signature scheme, provenance mechanism, catalog format, or payload-padding
 policy. It does not support an unencrypted envelope or in-place key-frame
 rewriting. Resealing is a full read, open, and seal operation.
@@ -249,6 +250,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174]
 when, and only when, they appear in all capitals, as shown here.
 
+A paragraph that opens with *Rationale.* is informative and states no
+requirement.
+
 ### 2.2. Conformance Roles
 
 - **Sealer**: produces a REM-ENCRYPT envelope from a canonical plaintext
@@ -257,7 +261,7 @@ when, and only when, they appear in all capitals, as shown here.
   private key, then passes the recovered stream to a Core Reader.
 - **Keyless Verifier**: validates public envelope structure and computes
   `stored_digest` without claiming authenticity.
-- **Encrypted Restorer**: maps authenticated inner-block ranges to stored
+- **Encrypted Restorer**: maps authenticated inner-chunk ranges to stored
   ciphertext ranges.
 
 The Builder, Reader, Repacker, Verifier, Consumer, Restoring Consumer, and
@@ -266,6 +270,8 @@ an implementation conforms only for the roles it claims—applies here.
 
 ### 2.3. Definitions
 
+- **Core**: this document's short name for the REM-OBJECT Core Format
+  (Section 1.1).
 - **Canonical plaintext object / inner stream**: the complete byte string
   defined by Core §3.1 and Core §4.
 - **Envelope**: the encrypted representation: scalar header, key frame,
@@ -275,9 +281,10 @@ an implementation conforms only for the roles it claims—applies here.
 - **Recipient epoch**: one X-Wing key pair identified by a 16-byte
   `recipient_epoch_id` and an optional printable recovery label. Its public
   key is 1216 bytes; its secret custody form is the 32-byte X-Wing seed.
-- **Inner `BodyLba`**: a block index within the canonical plaintext object,
-  as defined by Core §2.3.
-- **Stored `BodyLba`**: a `chunk_size` block index within the stored envelope.
+- **Inner `BodyLba`**: a chunk index within the canonical plaintext object, as
+  defined by Core §2.3.
+- **Stored `BodyLba`**: the index of a `chunk_size` stored block within the
+  stored envelope, as defined by Core §2.3.
 - **Stored bytes**: the complete envelope byte string through the final fill
   byte.
 
@@ -372,10 +379,13 @@ complete canonical object of Core §4, manifest included. Total stored length
 MUST be a positive multiple of `chunk_size`.
 
 `format_version` is an on-tape field, not this document's version. A Reader
-MUST accept only value `2` and requires a matching recipient private key. It
-MUST NOT attempt another key mode after any parse, key-resolution, unwrap, or
-authentication failure. Value `1` is permanently reserved, as this registry
-records.
+MUST accept only value `2`. Value `1` is permanently reserved, as the
+Section 10.1 registry records.
+
+Opening an envelope requires a matching recipient private key. After any
+parse, key-resolution, unwrap or authentication failure, a Reader MUST report
+the failure and MUST NOT automatically retry with another recipient key.
+Opening again with a different key is a separate attempt.
 
 ### 5.2. Scalar Header
 
@@ -476,8 +486,9 @@ The exact 103-byte HPKE `info` value is:
 
 The byte at offset 101 is a frozen constant naming the generation of this
 transcript, matching the `v1` of the `rem-encrypt-wrap-v1` prefix. It is not
-the envelope `format_version` (which is 2, Section 10.1) and does not track
-it; a future transcript layout would take a new prefix and a new value here.
+the envelope `format_version`, which is 2 (Section 10.1), and it does not
+track that value. A future transcript layout would take a new prefix and a new
+value here.
 
 This binds the wrapped DEK to the object id, recipient epoch, slot, and wrap
 suite. A Reader selects the slot whose epoch id equals the
@@ -488,16 +499,10 @@ supplied private key's epoch id; absence is a hard mismatch.
 Suite `0x02` freezes the byte-level construction from
 `draft-connolly-cfrg-xwing-kem-10`; later revisions do not silently alter it.
 
-The standing of that document has changed since it was pinned, and the
-construction has not. The standalone draft expired on 3 September 2026
-without adoption by a working group. The identical construction is carried
-forward by the IRTF Crypto Forum Research Group as the `MLKEM768-X25519`
-instance of [CONCRETE-HYBRID-KEMS], which states that it is identical to
-X-Wing, and is registered for HPKE under KEM identifier `0x647a` in
-[HPKE-PQ], an IETF working-group document intended for the standards track.
-This document continues to pin draft-10 and its known-answer files, and the
-rule below stands: a successor that is wire-identical keeps `0x02`; one that
-differs on the wire takes a new `wrap_suite`.
+Open item RE-2 (Appendix D) and the revision history (Appendix C) record the
+standing of that document since it was pinned. A successor construction that
+is wire-identical keeps `0x02`; one that differs on the wire takes a new
+`wrap_suite`.
 
 For a 32-byte seed:
 
@@ -564,6 +569,10 @@ The one-byte `ctr` follows the label with no separator. A Sealer MUST derive
 the salt. A Reader MUST rederive it after metadata authentication and reject a
 mismatch.
 
+If no counter yields a nonzero output, no salt exists. A Sealer that finds no
+salt MUST fail with `InvalidSalt`. A Reader that finds no salt MUST reject the
+object with `InvalidSalt`.
+
 Define:
 
 ```text
@@ -579,13 +588,13 @@ payload_key   = HKDF(object_secret, empty,
 
 Every scalar-header and key-frame byte is therefore bound into the encrypted
 frames. In particular, `wrap_suite` is bound here and in the HPKE `info`
-transcript. Rewriting a key frame without resealing metadata and payload is
-impossible and MUST NOT be attempted.
+transcript. A key frame cannot be rewritten without resealing the metadata and
+payload. An implementation MUST NOT attempt such a rewrite.
 
 ### 5.6. Metadata Frame
 
-The metadata plaintext is one deterministic-CBOR [RFC8949] map with exactly
-four writer entries:
+The metadata plaintext is one deterministic-CBOR [RFC8949] map. A Sealer
+writes exactly these four entries:
 
 | Key | Value |
 | ---: | --- |
@@ -594,13 +603,17 @@ four writer entries:
 | 2 | text `sha256` |
 | 3 | 32-byte `plaintext_digest` |
 
-Keys use ascending deterministic order and shortest encodings. A Reader MAY
-skip unknown keys but MUST enforce canonical order, unique keys, valid UTF-8,
-maximum nesting depth 32, at most 65536 decoded items, required-field types
-and values, and no trailing bytes. The accepted CBOR repertoire is unsigned
-integers, definite byte/text strings, definite arrays/maps, and simple values
-false, true, and null. Negative integers, tags, floats, indefinite forms, and
-other simple values are invalid.
+Keys use ascending deterministic order and shortest encodings. A Reader
+MUST NOT reject a metadata map because it carries unsigned-integer keys this
+document does not define. A Reader MAY attach no meaning to the values of such
+keys. A Reader MUST enforce, over the whole map including those values, that
+every top-level key is an unsigned integer, canonical order, unique keys,
+valid UTF-8, maximum nesting depth 32, at most 65536 decoded items, the
+accepted CBOR repertoire, required-field types and values, and no trailing
+bytes. The accepted CBOR repertoire is unsigned integers, definite byte/text
+strings, definite arrays/maps, and simple values false, true, and null.
+Negative integers, tags, floats, indefinite forms, and other simple values are
+invalid.
 
 The frame is:
 
@@ -657,10 +670,16 @@ N = floor((stored_size - 128 - K - M - 16) / (C + 16))
 footer_offset = 128 + K + M + N * (C + 16)
 ```
 
-It MUST additionally require `N > 0`, `stored_size mod C = 0`,
-`roundup(footer_offset + 16, C) = stored_size`, the footer at the exact
-offset, and zero remaining bytes. These checks establish structural
-consistency and completion, not authenticity.
+The Keyless Verifier MUST additionally require:
+
+- `N > 0`;
+- `stored_size mod C = 0`;
+- `roundup(footer_offset + 16, C) = stored_size`;
+- the footer at the exact offset; and
+- zero remaining bytes.
+
+These checks establish structural consistency and completion, not
+authenticity.
 
 ### 5.9. Sealing
 
@@ -687,23 +706,30 @@ can observe the order in which a Sealer works.
    `P`.
 8. Emit footer and zero fill.
 
-A failed seal MUST NOT be represented as complete.
+A Sealer MUST NOT represent a failed seal as complete.
 
 ### 5.10. Opening, Recovery, and Keyless Inspection
 
-A Keyed Reader MUST parse the scalar header, enforce Section 10, read and
-canonically parse the key frame, select the matching epoch, and unwrap the
-DEK. It then derives the keys, authenticates and parses metadata, rederives
-the salt, decrypts exactly `N` chunks, verifies plaintext size and SHA-256,
-verifies footer and fill, and requires end of input. It MUST release no
-unauthenticated chunk.
+A Keyed Reader opens an envelope in the steps below. Items 3 and 5 describe
+the rest of the work of opening. Items 4 and 6 state the two orders that this
+section requires.
 
-A Keyed Reader MUST NOT publish restored members until it has compared the
-inner stream's `REMANENCE.object_id` and `REMANENCE.chunk_size` with the
-scalar header. A mismatch is `InnerObjectMismatch`. The restore rules of
-Core §12.10 apply to the restored members. Recommended practice for
-validating and staging recovered plaintext is described in the REM
-Implementation and Operations Guide, under “Verification, scrub and repair”.
+1. The Keyed Reader MUST parse the scalar header and enforce Section 10.
+2. It MUST read and canonically parse the key frame, select the matching
+   epoch, and unwrap the DEK.
+3. It derives the keys, authenticates and parses the metadata, and rederives
+   the salt.
+4. It decrypts exactly `N` chunks. It MUST release no unauthenticated chunk.
+5. It verifies the plaintext size and SHA-256, verifies the footer and fill,
+   and requires end of input.
+6. A Keyed Reader MUST NOT publish restored members until it has compared the
+   inner stream's `REMANENCE.object_id` and `REMANENCE.chunk_size` with the
+   scalar header. A mismatch is `InnerObjectMismatch`.
+
+The restore rules of Core §12.10 apply to the restored members. Recommended
+practice for validating and staging recovered plaintext is described in the
+REM Implementation and Operations Guide, under “Verification, scrub and
+repair”.
 
 Catalogless recovery is possible from an object and one matching recipient
 private key. A Keyless Verifier MAY parse the header and key frame, compute
@@ -712,9 +738,9 @@ public structural consistency, not authenticity or provenance.
 
 ## 6. Partial File Restore
 
-The range and inner-block validation rules are owned by Core §6.1 and
-Core §6.2. This section maps those validated inner blocks through the
-REM-ENCRYPT representation.
+The range and inner-chunk validation rules are owned by Core §6.1 and
+Core §6.2. This section maps those validated chunks through the REM-ENCRYPT
+representation.
 
 ### 6.1. Range Validation (in REM-OBJECT)
 
@@ -722,7 +748,7 @@ REM-ENCRYPT representation.
 
 ### 6.3. Ciphertext Mapping
 
-Inner body block `b` is encrypted chunk `b`. Let `K = key_frame_len` and
+Inner chunk `b` is encrypted chunk `b`. Let `K = key_frame_len` and
 `F = 128 + K + metadata_frame_len`:
 
 ```text
@@ -732,18 +758,18 @@ nonce counter    = b
 final_flag       = 0x01 if b == object_chunk_count - 1, else 0x00
 ```
 
-`object_chunk_count` is the envelope-wide count
-`plaintext_size / chunk_size`, not a file's Core `chunk_count`. The Restorer
-fetches `[cipher_offset(b), cipher_offset(b) + C + 16)` for every Core-mapped
-block, authenticates and decrypts each chunk, concatenates the plaintexts,
-and trims under Core §6.2. Consecutive chunks form one contiguous stored
-range.
+`object_chunk_count` is the envelope-wide count `plaintext_size / chunk_size`,
+not a file's Core `chunk_count`. The Encrypted Restorer fetches
+`[cipher_offset(b), cipher_offset(b) + C + 16)` for every Core-mapped chunk,
+authenticates and decrypts each chunk, concatenates the plaintexts, and trims
+under Core §6.2. Consecutive chunks form one contiguous stored range.
 
-Finality comes from authenticated `plaintext_size`, never probing. A Restorer
-MUST NOT release a chunk whose tag fails. It MAY release each authenticated
-chunk while streaming, but any later failure aborts the range and MUST be
-reported so that a released prefix is not mistaken for a successful complete
-range. Encrypted PFR requires a key and one metadata-frame read.
+Finality comes from authenticated `plaintext_size`, never probing. An
+Encrypted Restorer MUST NOT release a chunk whose tag fails. It MAY release
+each authenticated chunk while streaming. Any later failure aborts the range.
+The Encrypted Restorer MUST report that failure, so that a released prefix is
+not mistaken for a successful complete range. Encrypted PFR requires a key and
+one metadata-frame read.
 
 Without a catalog, a Reader opens sequentially through the inner manifest,
 then uses its Core index with this mapping.
@@ -758,9 +784,10 @@ first_stored_block = floor(a / C)
 last_stored_block  = floor((a + l - 1) / C)
 ```
 
-Because a stored chunk is `C + 16` bytes, one inner block's encrypted form
-spans at most three stored blocks. A run of `k` chunks occupies one
-contiguous range of at most:
+The 16-byte tag on each chunk causes a tag slip against the stored blocks. A
+stored chunk is `C + 16` bytes, so the encrypted form of one chunk spans at
+most three stored blocks. A run of `k` chunks occupies one contiguous range of
+at most:
 
 ```text
 k + ceil(16 * k / C) + 1
@@ -779,14 +806,14 @@ The complete chain is reproduced here so an envelope implementer can see the
 encrypted layer and the Core layer together:
 
 ```text
-off-tape catalog                      on-tape parity-layer bootstrap row
+off-tape catalog                      on-tape Object recovery row
 (stored_digest + plaintext_digest     (plaintext copies: manifest location +
- per copy — Core §12.6 trust           manifest_sha256; encrypted copies:
- domain)                               the Core §8.2 envelope fields only)
-        │  externally anchored; the bootstrap is parity-protected on tape
+ per copy — Core §12.6 trust           manifest_sha256; encrypted copies: the
+ domain)                               REM-PARITY §10.3 envelope fields only)
+        │  externally anchored; the row travels in the terminal replicas
         ▼
-[encrypted copies] envelope: header-bound derived keys → authenticated metadata frame
-        │            (plaintext_size, plaintext_digest) → per-chunk Poly1305 tags
+[encrypted] envelope: header-bound derived keys → authenticated metadata frame
+        │     (plaintext_size, plaintext_digest) → per-chunk Poly1305 tags
         ▼
 canonical plaintext object ── byte-verified by plaintext_digest
         │
@@ -794,8 +821,8 @@ canonical plaintext object ── byte-verified by plaintext_digest
 manifest.cbor ── byte-verified by manifest_sha256
         │
         ▼
-per-file  file_sha256, size_bytes, first_chunk_lba, chunk_count (regular entries;
-          a hardlink resolves via link_target to its primary's fields)
+per-file file_sha256, size_bytes, first_chunk_lba, chunk_count (regular entries;
+         a hardlink resolves via link_target to its primary's fields)
         │
         ▼
 payload bytes ── byte-verified by file_sha256
@@ -837,7 +864,7 @@ repair”.
 
 A successful keyed verification means that every payload byte and all object
 structure satisfy the Core verifier and every stored encrypted frame
-authenticates under the envelope keys. It does not establish writer identity;
+authenticates under the envelope keys. It does not establish Sealer identity;
 Section 12.7 applies.
 
 ### 7.5. Scrub (in REM-OBJECT)
@@ -849,18 +876,21 @@ Section 12.7 applies.
 Recommended practice for backend records is described in the REM
 Implementation and Operations Guide, under “Catalogs and indexes”.
 
-### 8.2. Tape Bootstrap and Catalogless Recovery
+### 8.2. Object Recovery Rows and Catalogless Recovery
 
-Core §8.2 owns the Writer obligation that an encrypted REM-PARITY bootstrap
-row omit plaintext manifest anchors. [REMPARITY] owns the row encoding.
+Core §8.2 states the obligation on the REM-PARITY Writer that an encrypted
+copy's Object recovery row (REM-PARITY §10.3) omit plaintext manifest anchors.
+[REMPARITY] owns the row encoding.
 
 Catalogless recovery begins at stored block 0. The scalar header supplies
 `object_id`, `format_version`, and `key_frame_len`; the adjacent key frame
 supplies recipient epoch ids. With a matching private key, the Reader opens
 sequentially until it reaches the inner manifest. The authenticated
-`plaintext_digest` anchors that manifest through Section 7.1. The absence of
-a direct manifest location is an accepted recovery-path cost on sequential
-media and avoids exposing confidential inner structure.
+`plaintext_digest` anchors that manifest through Section 7.1.
+
+*Rationale.* The absence of a direct manifest location is an accepted
+recovery-path cost on sequential media and avoids exposing confidential inner
+structure.
 
 ### 8.3. File Binding (in REM-OBJECT)
 
@@ -870,13 +900,24 @@ media and avoids exposing confidential inner structure.
 
 ## 10. Versioning and Registries
 
-Document version, Core stream schema, envelope `format_version`, `suite_id`,
-and `wrap_suite` are independent axes and MUST NOT be used as proxies for one
-another. Every value in the registries below was assigned by document 1.0;
-each future assignment names its defining revision here. An unassigned value
-met in the wild indicates an object written under a later revision of this
-document — retrieve the current revision via the concept DOI in the Status
-section, then obtain software implementing the named value.
+This document has four independent version axes:
+
+| Axis | Value | Where it is recorded |
+| --- | --- | --- |
+| Document version | 1.0 | This document only; it names no on-tape value (Section 1.1) |
+| Envelope `format_version` | `2` | Scalar-header offset `0x06` (Section 10.1) |
+| `suite_id` | `0x01` | Scalar-header offset `0x07` (Section 10.2) |
+| `wrap_suite` | `0x02` | Scalar-header offset `0x38` (Section 10.3) |
+
+These axes and the Core stream schema MUST NOT be used as proxies for one
+another. Core §10 and the REM-PARITY Status section state those documents' own
+axes.
+
+Every value in the registries below was assigned by document 1.0; each future
+assignment names its defining revision here. An unassigned value met in the
+wild indicates an object written under a later revision of this document —
+retrieve the current revision via the concept DOI in the Status section, then
+obtain software implementing the named value.
 
 ### 10.1. `format_version` Registry
 
@@ -909,7 +950,7 @@ produces `InvalidSuite`.
 | Value | Status | Defined by | KEM |
 | ---: | --- | --- | --- |
 | `0x00` | reserved / invalid | REM-ENCRYPT 1.0 | — |
-| `0x01` | **permanently forbidden** | REM-ENCRYPT 1.0 | Legacy X25519-only assignment; pre-production and never shipped |
+| `0x01` | **permanently forbidden** | REM-ENCRYPT 1.0 | X25519-only; assigned pre-production, never shipped |
 | `0x02` | **current** | REM-ENCRYPT 1.0 | X-Wing from `draft-connolly-cfrg-xwing-kem-10` |
 | `0x03` | reserved | REM-ENCRYPT 1.0 (consumable by a future revision) | A future X-Wing / MLKEM768-X25519 construction that differs on the wire from draft-10 |
 | all others | unassigned | a future revision | — |
@@ -921,14 +962,15 @@ construction changes wire bytes, such as the combiner or `kem_id`.
 ### 10.4. Assignment and Deprecation Policy
 
 Superseded suites remain valid for **opening**. Assignment of any new value
-requires a published REM-ENCRYPT revision. Reserved, forbidden, and unassigned values
-are hard errors—`InvalidWrapSuite`, `InvalidSuite`, or
-`UnsupportedFormatVersion`—and MUST NOT be negotiated or guessed.
+requires a published REM-ENCRYPT revision. Reserved, forbidden, and unassigned
+values are hard errors: `InvalidWrapSuite`, `InvalidSuite`, or
+`UnsupportedFormatVersion`. Such values MUST NOT be negotiated or guessed.
 
-An envelope change not expressible through a registered discriminator and
-ignorable metadata requires a new `format_version` or magic in a published
-REM-ENCRYPT revision. No envelope change requires a Core stream-format change
-unless it also changes the canonical plaintext object.
+Some envelope changes can be expressed neither through a registered
+discriminator nor through metadata keys that a Reader may ignore
+(Section 5.6). Such a change requires a new `format_version` or magic in a
+published REM-ENCRYPT revision. No envelope change requires a Core
+stream-format change unless it also changes the canonical plaintext object.
 
 ## 11. Errors
 
@@ -952,8 +994,9 @@ InvalidKeyFrameLength        key_frame_len violates bounds
 InvalidKeyFrame              malformed or non-canonical REMK frame
 RecipientEpochMismatch       no slot matches the supplied private-key epoch
 HpkeFailed                   HPKE key parsing, setup, wrap, or unwrap failed
-EntropyUnavailable           OS-backed randomness could not be obtained
-InvalidSalt                  all-zero hkdf_salt
+EntropyUnavailable           fresh random bytes could not be obtained
+InvalidSalt                  all-zero hkdf_salt, or no counter yields a
+                             nonzero salt
 SaltDerivationMismatch       hkdf_salt differs from Section 5.5
 InvalidObjectIdField         object_id field empty, malformed, or invalid UTF-8
 MetadataFrameLengthInvalid   metadata_frame_len outside [17, 16 MiB]
@@ -982,8 +1025,8 @@ Registry errors follow Section 10, including opening-valid deprecated suites.
 
 ### 12.1. Per-Object Key Uniqueness
 
-Every seal MUST use a fresh uniformly random 32-byte DEK and fresh HPKE
-encapsulation randomness for every recipient, following [RFC9180] §9.2.3.
+For every seal, a Sealer MUST use a fresh uniformly random 32-byte DEK and
+fresh HPKE encapsulation randomness for every recipient ([RFC9180] §9.2.3).
 Entropy failure is fatal. Independent seals of identical Core bytes therefore
 use independent keys and normally have different stored bytes.
 
@@ -1014,11 +1057,13 @@ registry rejection occurs before any attempt to interpret a forbidden value.
 
 ### 12.4. Fail-Closed
 
-A failed metadata or chunk tag MUST stop processing without releasing that
-chunk's plaintext. A failed seal MUST NOT produce a footer. Partial output is
-never reported as a successful complete open or range read. A whole-object
-open of a copy with damaged stored blocks therefore fails until the damage is
-repaired.
+When a metadata or chunk tag fails, the implementation that checks it MUST
+stop processing without releasing that chunk's plaintext. A Keyed Reader, an
+Encrypted Restorer and a Verifier applying the keyed profile of Section 7.4
+each check tags. A Sealer MUST NOT produce a footer for a failed seal. Partial
+output is never reported as a successful complete open or range read. A
+whole-object open of a copy with damaged stored blocks therefore fails until
+the damage is repaired.
 
 ### 12.5. Confidentiality Boundary, Public Facts, and Catalog Trust
 
@@ -1030,10 +1075,10 @@ sizes, member count, manifest content, or payload bytes.
 
 The off-tape catalog contains cleartext paths, per-file rows, and digests.
 Core §12.6 owns this catalog trust domain and its external-anchor obligation.
-The on-tape REM-PARITY bootstrap for an encrypted copy is deliberately
-minimal: it carries only public fields and, per Core §8.2, omits manifest
-anchors. This is the single confidentiality rationale for that structural
-rule.
+The Object recovery row that REM-PARITY writes for an encrypted copy is
+deliberately minimal: it carries only public fields and, per Core §8.2, omits
+manifest anchors. This is the single confidentiality rationale for that
+structural rule.
 
 REM-ENCRYPT defines no payload padding. Recommended practice for deployments
 that treat an object's existence, identifier or approximate size as sensitive
@@ -1047,7 +1092,7 @@ secrets”.
 ChaCha20-Poly1305 is not key-committing [AEAD-COMMIT] [PART-ORACLE].
 `stored_digest` does not prevent equivocation because one byte string can be
 constructed to open under multiple candidate keys. REM-ENCRYPT claims
-confidentiality and self-consistency, not writer identity or provenance.
+confidentiality and self-consistency, not Sealer identity or provenance.
 Possession of recipient public keys permits fabrication of a new internally
 valid object.
 
@@ -1068,9 +1113,11 @@ and `stored_digest`.
 
 ### 12.9. Envelope Hostile-Input Discharge
 
-Core §11 applies to every envelope parser, and the hazards Core §12.9
-describes apply to envelopes too. In addition, envelope
-parsers MUST enforce:
+Core §11 applies to every implementation that parses an envelope, and the
+hazards Core §12.9 describes apply to envelopes too. Such implementations
+include a Keyed Reader, a Keyless Verifier, an Encrypted Restorer and a
+Verifier applying a Section 7.4 profile. In addition, every implementation
+that parses an envelope MUST enforce the following in the parts it parses:
 
 - the fixed 128-byte scalar header before interpreting variable data;
 - `metadata_frame_len` in `[17, 16 MiB]`;
@@ -1104,12 +1151,11 @@ diagnostics, command lines, core dumps, and plaintext staged during recovery.
 Recommended practice for handling secrets is described in the REM
 Implementation and Operations Guide, under “Keys and secrets”.
 
-The X-Wing hybrid addresses harvest-now-decrypt-later exposure while retaining
-X25519 as a classical hedge. X-Wing's malicious-key and malicious-ciphertext
-binding properties matter because one DEK is independently wrapped to
-multiple recipient keys. A verified ML-KEM implementation does not by itself
-verify the HPKE transcript, combiner glue, serialization, entropy handling, or
-zeroization.
+Appendix B.10 explains why the key wrap is a hybrid. X-Wing's malicious-key
+and malicious-ciphertext binding properties matter because one DEK is
+independently wrapped to multiple recipient keys. A verified ML-KEM
+implementation does not by itself verify the HPKE transcript, combiner glue,
+serialization, entropy handling, or zeroization.
 
 Resealing under a future suite requires reading, opening, and writing the
 whole object, and on append-only media produces a new object copy. An object
@@ -1129,9 +1175,9 @@ without a source checkout. Exact byte strings and digests in the archive,
 not abbreviated prose, are authoritative.
 
 Core §13 owns plaintext vectors. This section owns encrypted positive objects,
-component KATs, encrypted range vectors, and envelope negative vectors. Core
-§14 owns the general conformance roles; a claimed REM-ENCRYPT role MUST pass
-the applicable vectors here.
+component KATs, encrypted range vectors, and envelope negative vectors.
+Core §14 owns the general conformance roles. An implementation that claims a
+REM-ENCRYPT role MUST pass the applicable vectors here.
 
 A negative vector records the error it expects in its `expected_error` field,
 as a Section 11.2 identifier. A result is matched to that field by identifier
@@ -1191,13 +1237,12 @@ Core D1 object.
 | `stored_digest` | `69fa820b0c1ab581ac5e04383865b3ac9d15952e0b1e144721377836a696f859` |
 
 The additive `encrypted-last-object-chunk` range vector uses
-REM-OBJECT-TV-D1's manifest range: `first_inner_chunk = 3`,
-`range_start = 0`, and `range_len = 358`. Since D1 has
-`object_chunk_count = 4`, this range covers the true final object chunk
-(`i = object_chunk_count - 1`) and MUST authenticate with `final_flag = 1`,
-reproducing the exact manifest CBOR, `manifest_sha256`, and
-`plaintext_digest`. The paired
-`encrypted-last-object-chunk-wrong-finality` negative applies
+REM-OBJECT-TV-D1's manifest range: `first_inner_chunk = 3`, `range_start = 0`,
+and `range_len = 358`. Since D1 has `object_chunk_count = 4`, this range
+covers the true final object chunk, `i = object_chunk_count - 1`. An Encrypted
+Restorer that reads this range MUST authenticate it with `final_flag = 1` and
+reproduce the exact manifest CBOR, `manifest_sha256`, and `plaintext_digest`.
+The paired `encrypted-last-object-chunk-wrong-finality` negative applies
 `final_flag = 0` to that same ciphertext and MUST produce
 `AeadAuthenticationFailed`.
 
@@ -1250,7 +1295,7 @@ the same input is advisory under Section 5.8).
 header, and inner `REMANENCE.encryption` other than `none`; each produces
 `InnerObjectMismatch`.
 
-**Writer inputs.** Sealing input whose size is not a multiple of
+**Sealer inputs.** Sealing input whose size is not a multiple of
 `chunk_size`; an `object_id` longer than 64 bytes; recipient counts zero or
 greater than eight; duplicate epoch ids; non-canonical slot order; and entropy
 failure.
@@ -1260,7 +1305,7 @@ explicit opt-in. The expected error is `InvalidInput`. The case tests the
 two-recipient default, which the REM Implementation and Operations Guide
 recommends under “Keys and secrets”. It is informative for conformance: a
 conformant Sealer need not refuse a seal to one recipient. Every other
-writer-input vector keeps its normative force.
+Sealer-input vector keeps its normative force.
 
 **Key-frame structure and key use.** Slot counts 0 and 9, duplicate or
 misordered slot indices, duplicate `recipient_epoch_id` values, internal slot
@@ -1375,11 +1420,12 @@ explains why distinct keys make this safe.
 
 ## Appendix B. Design Rationale (Informative)
 
-### B.1. Encrypted Chunk Size Equals the Core Block
+### B.1. One Encrypted Chunk per Core Chunk
 
-Using `C` plaintext bytes per encrypted chunk preserves a one-to-one inner
-block/chunk identity and keeps range mapping closed-form. The accepted cost is
-16 tag bytes per chunk and the stored-block slip quantified in Section 6.4.
+Using `C` plaintext bytes per encrypted chunk keeps a one-to-one identity
+between Core chunks and encrypted chunks, and keeps range mapping closed-form.
+The accepted cost is 16 tag bytes per chunk and the tag slip quantified in
+Section 6.4.
 
 ### B.2. Full Final Chunks Only
 
@@ -1424,11 +1470,16 @@ its hash contributes to salt derivation. This prevents a future optional
 metadata field from creating a readable nonce-reuse state under the same
 metadata key.
 
-### B.9. Encrypted Bootstrap Rows Omit Manifest Anchors
+### B.9. Encrypted Object Recovery Rows Omit Manifest Anchors
 
 Manifest geometry correlates with member count and is confidential. The
 authenticated whole-object digest already anchors the decrypted manifest.
 Catalogless recovery trades direct manifest positioning for sequential open.
+
+### B.10. A Hybrid Key Wrap
+
+The X-Wing hybrid addresses harvest-now-decrypt-later exposure while retaining
+X25519 as a classical hedge.
 
 ## Appendix C. Revision History (Informative)
 
@@ -1490,13 +1541,91 @@ effect on conformance.
   document no longer requires a conformant Sealer to seal to two recipients,
   to use the current suite, or to hold keys and handle secrets in any
   particular way; the Guide recommends each.
-- **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Records the current
-  standing of the pinned X-Wing draft: expired on 3 September 2026, its
-  construction carried forward identically as `MLKEM768-X25519` by the CFRG
-  and registered for HPKE as KEM `0x647a`; adds the three informative
-  references and retargets open item RE-2 at RFC publication. The pinned
-  construction, its known-answer files, `wrap_suite` `0x02`, and `kem_id`
-  `0x647a` are unchanged. No envelope obligation or vector changed.
+
+  The readability pass then changed the text as follows. No byte of the format
+  changed, and no valid object or vector changed.
+
+  - The document gains an Abstract and a Table of Contents above Section 1,
+    and the Identifiers table no longer repeats the two DOIs that the Status
+    table carries.
+  - Section 1.1 now says which sections this document and REM-OBJECT number
+    together, and names REM-OBJECT “Core” for short; Section 2.3 lists the
+    name. A placeholder heading marks each section or subsection that
+    REM-OBJECT holds.
+  - Erratum, Section 5.1. The sentence “It MUST NOT attempt another key mode
+    after any parse, key-resolution, unwrap, or authentication failure.” is
+    replaced, because “key mode” was not defined. After such a failure a
+    Reader now reports it and does not automatically retry with another
+    recipient key; opening again with a different key is a separate attempt.
+    The wrap suite stays with the Section 10.3 registry, and Sections 5.10,
+    7.3 and 7.4 already keep a keyless result from standing in for an open.
+  - Erratum, Section 5.5. The salt derivation stated no outcome when no
+    counter yields a nonzero output. A Sealer now fails with `InvalidSalt` in
+    that case, and a Reader rejects the object with it. The Section 11.2
+    description of `InvalidSalt`, “all-zero hkdf_salt”, now reads “all-zero
+    hkdf_salt, or no counter yields a nonzero salt”.
+  - Erratum, Section 5.6. The sentence “A Reader MAY skip unknown keys but
+    MUST enforce canonical order, unique keys, valid UTF-8, maximum nesting
+    depth 32, at most 65536 decoded items, required-field types and values,
+    and no trailing bytes.” is replaced by three sentences. The first says
+    that a Reader does not reject a metadata map for carrying unsigned-integer
+    keys this document does not define, a question the old text left open. The
+    list of checks now names the accepted CBOR repertoire and covers the
+    values of those keys, which restates the section's existing rule. It also
+    requires every top-level key to be an unsigned integer, which the pinned
+    vector `metadata-key-text` already requires, so no valid object or vector
+    changes.
+  - Errata: Section 5.1 names the registry it cites, Section 10.1; the
+    Section 7.1 diagram cites REM-PARITY §10.3, not Core §8.2, for the
+    envelope fields an encrypted copy's row carries; Section 10.3 no longer
+    calls `wrap_suite` value `0x01` legacy, which implied that shipped objects
+    carry it; and Section 11.2 no longer says that randomness comes from the
+    operating system, which Section 5.4 no longer requires.
+  - Statements that the tape bootstrap carries an encrypted copy's row, or
+    that the bootstrap is parity-protected, described the generation-1 tape
+    layout. They now name the Object recovery row (REM-PARITY §10.3), which
+    travels in the terminal replicas. Section 8.2 and Appendix B.9 are
+    retitled to match. The requirements they state are unchanged.
+  - The producing role is the Sealer: Section 13.4's “Writer inputs” are now
+    “Sealer inputs”, and “writer identity” is now Sealer identity. “Writer”
+    now means only the REM-PARITY Writer, in Section 8.2.
+  - “Chunk” is the unit inside the object, and “block” means a stored block,
+    as in REM-OBJECT. Section 2.3 defines the two `BodyLba` indexes in those
+    terms, Sections 2.2, 6, 6.3 and 6.4 use them, and Appendix B.1 is
+    retitled.
+  - Section 5.10 gives the Keyed Reader's opening as a numbered list. Two of
+    its items state the orders the section requires: no unauthenticated chunk
+    is released, and no restored member is published before the identities are
+    compared.
+  - Section 5.3.1 no longer recounts the standing of the pinned X-Wing draft,
+    which open item RE-2 and this history record, and keeps its rule for a
+    successor construction. The harvest-now-decrypt-later sentence of
+    Section 12.11 moved to Appendix B.10.
+  - Section 6.4 names the tag slip at the start of its paragraph, the
+    Section 7.1 diagram fits in 80 columns, and Section 10 gives its version
+    axes as a table.
+  - Section 1.2 now limits “never reused for different bytes” to the version
+    string of a deposited revision. A copy in preparation keeps its version
+    string while its text changes.
+  - An explanation of why a rule exists now stands in its own paragraph,
+    opening with *Rationale.*, which Section 2.1 declares informative.
+  - Sentences that stated more than one requirement, or a requirement and an
+    aside, were split, and each rewritten requirement on a role names that
+    role. The bounds of Section 12.9 and the tag rule of Section 12.4 bind
+    every implementation that parses an envelope or checks a tag, and name the
+    roles that do as examples.
+- **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** This revision makes
+  three changes.
+
+  - It records the current standing of the pinned X-Wing draft. The draft
+    expired on 3 September 2026, and its construction was carried forward
+    identically as `MLKEM768-X25519` by the CFRG and registered for HPKE as
+    KEM `0x647a`.
+  - It adds the three informative references.
+  - It retargets open item RE-2 at RFC publication.
+
+  The pinned construction, its known-answer files, `wrap_suite` `0x02`, and
+  `kem_id` `0x647a` are unchanged. No envelope obligation or vector changed.
 - **2026-09-06 — 1.0.0-draft.2 — review-draft errata.** Clarifies that shared
   numbering extends to subsections, removes a dead REM-PARITY Section 18
   cross-reference, and states the reserved-but-not-deposited publication
@@ -1506,9 +1635,19 @@ effect on conformance.
   review. Comments close 30 April 2027; the document freezes 31 July 2027.
 
   Text substantially the same as the copy distributed on 2026-07-25 (below),
-  with these changes: it introduces the Status section's change policy — which
-  the earlier copy did not carry in any form — records this document's concept
-  DOI, adds this revision history, and gives every Section 10 registry a Defined-by column and an unassigned-value retrieval note, fixes the Section 10.1 self-reference, adds the pinned-provenance and supersession note to the X-Wing citation, corrects the Section 13.2 range vector's `range_len` from 351 to 358, and adds the worked classifications and the vectors-are-anchors rule.
+  with these changes:
+
+  - It introduces the Status section's change policy, which the earlier copy
+    did not carry in any form.
+  - It records this document's concept DOI.
+  - It adds this revision history.
+  - It gives every Section 10 registry a Defined-by column and an
+    unassigned-value retrieval note.
+  - It fixes the Section 10.1 self-reference.
+  - It adds the pinned-provenance and supersession note to the X-Wing
+    citation.
+  - It corrects the Section 13.2 range vector's `range_len` from 351 to 358.
+  - It adds the worked classifications and the vectors-are-anchors rule.
 
   No object written against the earlier copy is affected, and no published
   vector changed. Where a correction touches a wire statement, the statement as
@@ -1547,10 +1686,10 @@ schedule, where a divergence produces objects nobody else can open.
 
 **RE-2 · The X-Wing draft dependency · open, monitored.** This document pins
 `draft-connolly-cfrg-xwing-kem-10`, an individual Internet-Draft that expired
-on 3 September 2026 without working-group adoption. Its construction has been
-adopted, identically, as the `MLKEM768-X25519` instance of
-[CONCRETE-HYBRID-KEMS] and registered for HPKE as KEM `0x647a` in [HPKE-PQ]
-(Section 5.3.1). The event monitored is the publication of either of those
+on 3 September 2026 without working-group adoption. Its construction
+(Section 5.3.1) has been adopted, identically, as the `MLKEM768-X25519`
+instance of [CONCRETE-HYBRID-KEMS] and registered for HPKE as KEM `0x647a` in
+[HPKE-PQ]. The event monitored is the publication of either of those
 documents as an RFC. At that point the known-answer files of Section 13.3 are
 re-run against the RFC text; if they match, the citation moves to the RFC by
 erratum and `wrap_suite` `0x02` is unchanged, as Section 10.3 already

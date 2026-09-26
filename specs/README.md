@@ -196,10 +196,10 @@ An encrypted vector can be reproduced only if every secret that goes into it
 is fixed. The vector REM-OBJECT-TV-E2 fixes its data-encryption key and its
 HPKE randomness (REM-ENCRYPT §13.1), and the X-Wing wrapping known-answer file
 fixes its encapsulation randomness (REM-ENCRYPT §13.3). An ordinary seal must
-not work that way. REM-ENCRYPT §12.1 requires that "Every seal MUST use a
-fresh uniformly random 32-byte DEK and fresh HPKE encapsulation randomness for
-every recipient". The means of fixing the secrets is therefore kept apart from
-sealing:
+not work that way. REM-ENCRYPT §12.1 requires that "For every seal, a Sealer
+MUST use a fresh uniformly random 32-byte DEK and fresh HPKE encapsulation
+randomness for every recipient ([RFC9180] §9.2.3)". The means of fixing the
+secrets is therefore kept apart from sealing:
 
 Deterministic vector-generation hooks inject fixed secrets solely for
 reproducible conformance artifacts and MUST NOT be exposed as production
