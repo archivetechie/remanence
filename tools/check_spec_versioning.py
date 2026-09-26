@@ -26,6 +26,11 @@ Checked:
      document in the same repository, which is precisely the drift hazard this
      linter was written for. It is held to the same structural rules as the
      published copy, and must strictly supersede it.
+  9. Each specification opens with one subsection headed "What this document
+     specifies, and what it does not", and that subsection reads the same,
+     word for word, in every document that carries it. Only whitespace is
+     normalised. The published revisions that predate the subsection are
+     listed by exact version; every other copy must carry it.
 
 Exit 0 clean; exit 1 with findings on stderr.
 """
@@ -63,6 +68,16 @@ CANONICAL_TITLES = [
 BANNED_TITLE_FORMS = [
     "REM-PARITY Tape Format Specification",   # variant found by the panel
 ]
+
+# Rule 9: the scope statement that opens every specification.
+SCOPE_HEADING = "What this document specifies, and what it does not"
+SCOPE_BLOCK_EXEMPT = {
+    # Published before the scope statement existed. A published copy at any
+    # other version must carry it.
+    ("publication/rem-object-core-1-specification.md", "1.0.0-draft.3"),
+    ("publication/rem-encrypt-1-specification.md", "1.0.0-draft.3"),
+    ("publication/rem-parity-1-specification.md", "1.0.0-draft.2"),
+}
 
 findings: list[str] = []
 
@@ -350,6 +365,96 @@ KNOWN_REFERENCES = Counter()
 KNOWN_ANCHORS = Counter()
 
 
+def scope_blocks(text: str) -> list[str]:
+    """Each scope subsection, from its heading title to the next heading of the
+    same or higher level, with runs of whitespace (including line breaks)
+    collapsed. The section number in the heading is not part of the result."""
+    # The statement is a subsection of Section 1, so its heading is level 3.
+    # Headings are found in the view with fenced lines blanked, so a heading-like
+    # line inside a code fence neither starts nor ends a block; the compared text
+    # comes from the original lines, fences included.
+    # It must be numbered as a subsection of Section 1; the number is not compared.
+    pattern = re.compile(r"^### 1\.\d+\.? " + re.escape(SCOPE_HEADING) + r"\s*$")
+    lines = text.splitlines()
+    unfenced = document_views(text)[1].splitlines()
+    blocks = []
+    for index, line in enumerate(unfenced):
+        if not pattern.match(line):
+            continue
+        body = [SCOPE_HEADING]
+        for offset, following in enumerate(unfenced[index + 1:], index + 1):
+            if re.match(r"^#{1,3} ", following):
+                break
+            body.append(lines[offset])
+        blocks.append(re.sub(r"\s+", " ", "\n".join(body)).strip())
+    return blocks
+
+
+def scope_block_findings(documents: dict[str, str]) -> list[str]:
+    """Rule 9 over every discovered specification copy."""
+    errors, found = [], {}
+    for name, text in sorted(documents.items()):
+        if pathlib.Path(name).name not in SPECS:
+            continue
+        blocks = scope_blocks(text)
+        if len(blocks) > 1:
+            errors.append(f"{name}: {len(blocks)} scope statements; exactly one is required")
+            continue
+        if blocks:
+            found[name] = blocks[0]
+            continue
+        version = re.search(r"^\| Version \| (\S+) \|", text, re.M)
+        if (name, version.group(1) if version else "") not in SCOPE_BLOCK_EXEMPT:
+            errors.append(f"{name}: scope statement {SCOPE_HEADING!r} missing")
+    if found:
+        reference = sorted(found)[0]
+        for name, block in sorted(found.items()):
+            if block != found[reference]:
+                errors.append(f"{name}: scope statement differs from {reference}")
+    return errors
+
+
+def archive_pin_findings(name: str, text: str, current: str) -> list[str]:
+    """Every digest in a sentence that names the archive must be the current pin.
+
+    The sentence runs from the archive's name to the next full stop that ends a
+    sentence (a stop followed by whitespace or the end of the text)."""
+    errors = []
+    for match in re.finditer(r"remanence-test-vectors\.tar", text):
+        rest = text[match.end():]
+        stop = re.search(r"\.(?:\s|$)", rest)
+        sentence = rest[:stop.start()] if stop else rest
+        for quoted in re.findall(r"\b([0-9a-f]{64})\b", sentence):
+            if quoted != current:
+                errors.append(f"{name}: quotes archive digest {quoted[:16]}… "
+                              f"with the archive name; the current pin is {current[:16]}…")
+    return errors
+
+
+def preparing_copy_rule_findings(name: str, text: str, current: str | None) -> list[str]:
+    """Rules 1, 3, 4 and 5, applied to a preparing copy in specs/in-progress/."""
+    errors = []
+    label = f"in-progress/{name}"
+    if name in SPECS:
+        dvs = re.findall(r"^\| Document version \| (\S+) \|", text, re.M)
+        if not dvs:
+            errors.append(f"{label}: no 'Document version' (line) row")
+        for dv in dvs:
+            if dv != SPECS[name]["line"]:
+                errors.append(f"{label}: Identifiers 'Document version' {dv} "
+                              f"!= line {SPECS[name]['line']}")
+        if current is not None:
+            if current not in set(re.findall(r"\b([0-9a-f]{64})\b", text)):
+                errors.append(f"{label}: does not quote the current archive SHA")
+            errors.extend(archive_pin_findings(label, text, current))
+    if re.search(r"^\| Version DOI \(this release\) \|", text, re.M):
+        errors.append(f"{label}: retired 'Version DOI (this release)' row present")
+    for bad in BANNED_TITLE_FORMS:
+        if bad in text:
+            errors.append(f"{label}: non-canonical citation form {bad!r}")
+    return errors
+
+
 def structural_findings(root: pathlib.Path = ROOT) -> list[str]:
     documents = discovered_documents(root)
     refs, anchors, errors = Counter(), Counter(), []
@@ -362,6 +467,7 @@ def structural_findings(root: pathlib.Path = ROOT) -> list[str]:
     errors.extend(reconcile_known(refs, KNOWN_REFERENCES))
     errors.extend(reconcile_known(anchors, KNOWN_ANCHORS))
     errors.extend(readme_state_findings(root, documents))
+    errors.extend(scope_block_findings(documents))
     for key, count in (refs & KNOWN_REFERENCES).items():
         print(f"known L1: {key!r} ({count})")
     for key, count in (anchors & KNOWN_ANCHORS).items():
@@ -423,6 +529,10 @@ def main() -> int:
         for rel, found in shas.items():
             if current[0] not in found and rel != "CHANGELOG.md":
                 fail(f"{rel}: does not quote the current archive SHA")
+        for rel in SHA_SITES:
+            if rel != "CHANGELOG.md":
+                for finding in archive_pin_findings(rel, (ROOT / rel).read_text(), current[0]):
+                    fail(finding)
 
     # 4. Retired DOI row.
     for n, t in texts.items():
@@ -533,6 +643,10 @@ def main() -> int:
                 if pm and version_key(wv) <= version_key(pm.group(1)):
                     fail(f"in-progress/{name}: Version {wv} does not supersede the "
                          f"published {pm.group(1)} — a copy here is the NEXT revision")
+            # Rules 1, 3, 4 and 5 apply to the preparing copy as well.
+            for finding in preparing_copy_rule_findings(
+                    name, wtext, current[0] if len(current) == 1 else None):
+                fail(finding)
             if name in SPECS:
                 wcore = policy_core(wtext, SPECS[name]["noun"])
                 if not wcore:

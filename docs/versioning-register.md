@@ -358,6 +358,8 @@ therefore runs `tools/check_spec_versioning.py` on every verification
 pass: it checks that the change policy reads identically across the three
 specifications, that every version number in a document agrees with
 itself, that the pinned archive digest matches at every place that quotes
-it, that revision histories stay in order, and that references resolve.
+it, that revision histories stay in order, and that references resolve. It
+also checks that each specification opens with exactly one statement of what
+it covers, in the same words in all three.
 When the specifications and their surrounding pages drift, the build says
 so before a reader has to.

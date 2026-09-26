@@ -286,6 +286,36 @@ wire consequences), does not define the commit-store, journal, audit, or
 catalog formats, and does not support multiple tape partitions (all positions
 are partition 0).
 
+### 1.5. What this document specifies, and what it does not
+
+This document defines a format: how its bytes are laid out, what they mean, and
+what may be concluded from them. Its definitions, registries, change policy and
+test vectors serve that purpose. It also contains rules about what an
+implementation does. Each of those rules is included only because ignoring it
+would do one of three things:
+
+1. It would produce bytes that another conformant reader cannot read, or would
+   misread.
+2. It would let two conformant readers reach different conclusions about what a
+   medium or an object contains.
+3. It would let a tool claim something that the bytes do not support.
+
+Conforming to this document is therefore necessary for interchange, but it is
+not enough for safe operation. This document does not say how a tool should hold
+keys, stage and publish what it writes, protect the computer it restores onto,
+organise its work after a crash, or report progress to its operator. It does say
+what the bytes a tool writes must be, and what a tool may claim about the bytes
+it reads.
+
+Recommended practice for those other matters is collected in the REM
+Implementation and Operations Guide
+(<https://github.com/archivetechie/remanence/blob/main/docs/rem-implementation-guide.md>).
+The Guide is informative and is revised independently of this document, which
+can be implemented without it. Descriptions of the reference implementation, and
+the record of how revisions of this document are prepared and frozen, are kept
+in the repository that holds the reference implementation and these
+specifications; this document does not depend on them.
+
 ## 2. Conventions and Terminology
 
 ### 2.1. Requirements Language
@@ -3055,6 +3085,21 @@ an errata revision of draft.1.
   conformance to the generation-2 replacement; that appendix is removed, and
   the revision history and the open items become Appendices C and D. No tape
   byte changed.
+
+  Section 1.5 is added. It states which rules belong in this document and
+  points to the REM Implementation and Operations Guide for the rest. A rule
+  about what an implementation does stays only if ignoring it would do one of
+  three things. It would produce bytes another conformant reader cannot read
+  or would misread. It would let two conformant readers reach different
+  conclusions about what a medium or an object contains. Or it would let a
+  tool claim something the bytes do not support. The same section, word for
+  word, opens REM-OBJECT, REM-ENCRYPT and REM-PARITY.
+
+  The rules that Section 1.5 places outside this document are still present in
+  this copy. Later changes in this revision move them out: most to the Guide,
+  which those changes also write, and some to the reference implementation's
+  documentation or to the record of how revisions are released. Until then,
+  Section 1.5 does not describe the whole text.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.

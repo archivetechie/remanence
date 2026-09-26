@@ -425,8 +425,9 @@ does not depend on care here. An automated check runs on every change to
 the documents: the change policy must read identically in all three,
 every version number in a document must agree with itself, revision
 histories must stay in order, and every appendix cross-reference must
-resolve. If any of that slips, the build fails before a reader ever sees
-the inconsistency.
+resolve. Each specification must also open with exactly one statement of
+what it covers, in the same words in all three. If any of that slips, the
+build fails before a reader ever sees the inconsistency.
 
 ## In plain terms
 
