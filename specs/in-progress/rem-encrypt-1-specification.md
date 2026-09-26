@@ -395,14 +395,13 @@ K = 5 + sum_over_slots(1186 + label_len)
 A Reader MUST reject truncation, trailing bytes, a non-increasing or duplicate
 slot index, a duplicate `recipient_epoch_id`, an invalid label, an invalid
 slot count, or a frame outside the header bounds. A Sealer MUST emit at least
-one slot, MUST give every slot a distinct `recipient_epoch_id`, and MUST fail
-the entire seal if any configured recipient cannot be wrapped.
+one slot. A Sealer MUST give every slot a distinct `recipient_epoch_id`. A
+Sealer MUST NOT report a seal as successful unless the key frame contains a
+slot for every recipient it was asked to seal to.
 
-A Sealer SHOULD ensure single-key-loss survivability by using two or more
-independent recipients or by independently protecting the sole recipient
-secret. Implementations SHOULD default to at least two recipients and require
-explicit opt-in for one. Readers accept any canonical frame with one through
-eight slots.
+Readers accept any canonical frame with one through eight slots. Recommended
+practice for choosing recipients is described in the REM Implementation and
+Operations Guide, under “Keys and secrets”.
 
 Every slot uses the header's object-global `wrap_suite`; there is no per-slot
 discriminator. Suite `0x02` is HPKE Base mode [RFC9180] with X-Wing
@@ -467,9 +466,6 @@ public key = pk_M || pk_X        # 1184 + 32 = 1216 bytes
 secret custody form = seed       # 32 bytes
 ```
 
-The expanded ML-KEM decapsulation key and `sk_X` are ephemeral and MUST NOT
-replace the seed as the secret-at-rest custody unit.
-
 For encapsulation, let `ss_M` and `ct_M` be the ML-KEM-768 outputs, and let
 `ss_X` and `ct_X` be the raw X25519 shared secret and ephemeral public key:
 
@@ -495,12 +491,10 @@ SHA-256
 ### 5.4. Key Inputs and Identification
 
 The Sealer generates a fresh uniformly random 32-byte DEK for every seal and
-wraps it independently to every recipient. It MUST obtain the DEK and
-encapsulation randomness from a fallible operating-system-backed CSPRNG and
-MUST fail closed if entropy is unavailable. Recipient public keys and
-fingerprints are custody inputs outside the format. A private-key file MUST
-contain the canonical 32-byte X-Wing seed, not an expanded decapsulation key.
-Any private key named in the frame can decrypt the object by itself.
+wraps it independently to every recipient. Any private key named in the frame
+can decrypt the object by itself. Recommended practice for holding keys and
+obtaining randomness is described in the REM Implementation and Operations
+Guide, under “Keys and secrets”.
 
 ### 5.5. Salt and Object-Key Derivation
 
@@ -517,8 +511,8 @@ hkdf_salt = HKDF(DEK, empty,
 ```
 
 The one-byte `ctr` follows the label with no separator. A Sealer MUST derive
-the salt and MUST NOT accept it from a caller. A Reader MUST rederive it after
-metadata authentication and reject a mismatch.
+the salt. A Reader MUST rederive it after metadata authentication and reject a
+mismatch.
 
 Define:
 
@@ -620,7 +614,15 @@ consistency and completion, not authenticity.
 
 ### 5.9. Sealing
 
-A Sealer MUST, using checked arithmetic:
+A Sealer MUST use checked arithmetic. A Sealer MUST reject a sealing input
+whose `C`, `P`, `object_id`, expected digest or recipient set does not meet
+the constraints of this document. A Sealer MUST reject a sealing input whose
+observed size or SHA-256 differs from the expected value, or that supplies
+source bytes beyond `P`. A Sealer MUST emit the envelope that Sections 5.1 to
+5.8 define.
+
+The following order meets these requirements. It is informative: no reader
+can observe the order in which a Sealer works.
 
 1. Validate `C`, `P`, `object_id`, expected digest, and recipient set.
 2. Construct the canonical metadata plaintext.
@@ -646,11 +648,12 @@ the salt, decrypts exactly `N` chunks, verifies plaintext size and SHA-256,
 verifies footer and fill, and requires end of input. It MUST release no
 unauthenticated chunk.
 
-After whole-object authentication, recovery SHOULD validate the inner stream
-under Core §7.4 and MUST compare its `REMANENCE.object_id` and
-`REMANENCE.chunk_size` with the scalar header before publishing restored
-members. The restore rules of Core §12.10 apply to the restored members.
-Recovery output SHOULD be staged and published only after complete success.
+A Keyed Reader MUST NOT publish restored members until it has compared the
+inner stream's `REMANENCE.object_id` and `REMANENCE.chunk_size` with the
+scalar header. A mismatch is `InnerObjectMismatch`. The restore rules of
+Core §12.10 apply to the restored members. Recommended practice for
+validating and staging recovered plaintext is described in the REM
+Implementation and Operations Guide, under “Verification, scrub and repair”.
 
 Catalogless recovery is possible from an object and one matching recipient
 private key. A Keyless Verifier MAY parse the header and key frame, compute
@@ -752,8 +755,7 @@ inner self-consistency check.
 
 Core §7.2 governs payload verification at build. At
 seal time, the Sealer recomputes the size and digest of the bytes actually
-sealed and fails, with no footer, on mismatch. It computes the encrypted
-copy's `stored_digest` over the emitted envelope bytes.
+sealed and fails, with no footer, on mismatch.
 
 ### 7.3. Post-Write Re-Verification
 
@@ -787,11 +789,7 @@ Section 12.7 applies.
 ### 8.1. Backend Records for Encrypted Copies
 
 Recommended practice for backend records is described in the REM
-Implementation and Operations Guide, under “Catalogs and indexes”. For an
-encrypted copy, a backend also records `format_version`,
-`metadata_frame_len`, `key_frame_len`, and the recipient epoch ids actually
-present. These fields are public envelope geometry and recovery selectors;
-they do not replace parsing the authoritative envelope header and key frame.
+Implementation and Operations Guide, under “Catalogs and indexes”.
 
 ### 8.2. Tape Bootstrap and Catalogless Recovery
 
@@ -858,9 +856,8 @@ construction changes wire bytes, such as the combiner or `kem_id`.
 
 ### 10.4. Assignment and Deprecation Policy
 
-Superseded suites remain valid for **opening**. Sealers MUST use the current
-`suite_id` and current `wrap_suite`. Assignment of any new value requires a
-published REM-ENCRYPT revision. Reserved, forbidden, and unassigned values
+Superseded suites remain valid for **opening**. Assignment of any new value
+requires a published REM-ENCRYPT revision. Reserved, forbidden, and unassigned values
 are hard errors—`InvalidWrapSuite`, `InvalidSuite`, or
 `UnsupportedFormatVersion`—and MUST NOT be negotiated or guessed.
 
@@ -929,9 +926,9 @@ also binds `object_id`, `plaintext_digest`, and the metadata hash. Reusing an
 `object_id` remains forbidden by Core, but independently random DEKs keep
 distinct seals independent.
 
-Deterministic vector-generation hooks inject fixed secrets solely for
-reproducible conformance artifacts and MUST NOT be exposed as production
-sealing modes.
+A sealing path that used fixed secrets, as the generation of test vectors
+does, would let anyone who knows those secrets open every object sealed
+through it.
 
 ### 12.2. Key Separation and Nonce Safety
 
@@ -952,9 +949,10 @@ registry rejection occurs before any attempt to interpret a forbidden value.
 ### 12.4. Fail-Closed
 
 A failed metadata or chunk tag MUST stop processing without releasing that
-chunk's plaintext. A failed seal MUST NOT produce a footer. Parity or CRC
-failure is repaired before another open attempt. Partial output is never
-reported as a successful complete open or range read.
+chunk's plaintext. A failed seal MUST NOT produce a footer. Partial output is
+never reported as a successful complete open or range read. A whole-object
+open of a copy with damaged stored blocks therefore fails until the damage is
+repaired.
 
 ### 12.5. Confidentiality Boundary, Public Facts, and Catalog Trust
 
@@ -971,9 +969,10 @@ minimal: it carries only public fields and, per Core §8.2, omits manifest
 anchors. This is the single confidentiality rationale for that structural
 rule.
 
-Deployments that treat object existence, identifier, or approximate size as
-sensitive must add policy above this format. REM-ENCRYPT defines no payload
-padding.
+REM-ENCRYPT defines no payload padding. Recommended practice for deployments
+that treat an object's existence, identifier or approximate size as sensitive
+is described in the REM Implementation and Operations Guide, under “Keys and
+secrets”.
 
 ### 12.7. Non-Committing AEAD
 
@@ -982,14 +981,17 @@ ChaCha20-Poly1305 is not key-committing [AEAD-COMMIT] [PART-ORACLE].
 constructed to open under multiple candidate keys. REM-ENCRYPT claims
 confidentiality and self-consistency, not writer identity or provenance.
 Possession of recipient public keys permits fabrication of a new internally
-valid object. Deployments needing provenance require an independently
-authenticated or signed external manifest.
+valid object.
 
 ### 12.8. Key Rotation and Epoch Longevity
 
 Recipient rotation affects new seals. Because the key frame contributes to
-`header_hash`, rewrapping without resealing is forbidden. A private epoch key
-MUST NOT be destroyed while any live object references it.
+`header_hash`, rewrapping without resealing is forbidden. An object can
+therefore be opened only while the private key of at least one of its
+recipient epochs survives. A lost or destroyed epoch key cannot be replaced
+for the objects already sealed to it. Recommended practice for keeping and
+retiring epoch keys is described in the REM Implementation and Operations
+Guide, under “Keys and secrets”.
 
 Resealing opens an envelope and seals the identical canonical bytes to a new
 recipient set. It preserves the Core `object_id`, `chunk_size`, canonical
@@ -1004,14 +1006,15 @@ parsers MUST enforce:
 
 - the fixed 128-byte scalar header before interpreting variable data;
 - `metadata_frame_len` in `[17, 16 MiB]`;
-- the Section 5.6 metadata CBOR depth and item limits incrementally;
-- key-frame length and slot-count bounds before allocation;
-- checked geometry before seeking or allocating; and
-- O(1) memory per payload chunk.
+- the Section 5.6 metadata CBOR depth and item limits;
+- key-frame length and slot-count bounds; and
+- checked geometry.
 
-The envelope fuzz-target list is: scalar-header parser, key-frame parser,
-metadata CBOR decoder, and whole-object open/verify for encrypted inputs. The
-fuzz targets for plaintext inputs remain separate.
+An envelope's header and key frame are parsed before anything has been
+authenticated, so a hostile envelope can declare lengths and counts chosen to
+exhaust a parser's memory. Recommended practice for surviving hostile envelope
+input is described in the REM Implementation and Operations Guide, under
+“Handling hostile media”.
 
 ### 12.11. Threat Model and Secret Handling
 
@@ -1022,27 +1025,26 @@ fuzz targets for plaintext inputs remain separate.
 | Holds one recipient private key | Every object wrapped to that epoch | Objects not wrapped to that epoch |
 | Holds only recipient public keys | Create new internally valid objects; observe public facts | Existing-object plaintext |
 
-Recipient public keys MUST be pinned independently if substitution is in
-scope. Multiple recipients reduce loss risk but are not a cryptographic
-threshold: any one matching private key opens the object.
+An attacker who can substitute a recipient's public key before a seal can read
+the object sealed to it. Multiple recipients reduce loss risk but are not a
+cryptographic threshold: any one matching private key opens the object.
 
-Implementations SHOULD minimize copies of DEKs, derived keys, private keys,
-HPKE ephemeral secrets, and RNG state, and MUST promptly zeroize mutable
-secret buffers. Secrets MUST NOT appear in logs, diagnostics, command lines,
-core dumps, or durable plaintext staging. Whole-object recovery SHOULD stage
-plaintext on protected storage and publish it only after full verification.
+A secret can leak from any place where a copy of it persists: memory, logs and
+diagnostics, command lines, core dumps, and plaintext staged during recovery.
+Recommended practice for handling secrets is described in the REM
+Implementation and Operations Guide, under “Keys and secrets”.
 
 The X-Wing hybrid addresses harvest-now-decrypt-later exposure while retaining
 X25519 as a classical hedge. X-Wing's malicious-key and malicious-ciphertext
 binding properties matter because one DEK is independently wrapped to
-multiple recipient keys. The static draft-10 KATs, independent verifier, and
-constant-time integration review are reference-release controls. A verified
-ML-KEM implementation does not by itself verify the HPKE transcript, combiner
-glue, serialization, entropy handling, or zeroization.
+multiple recipient keys. A verified ML-KEM implementation does not by itself
+verify the HPKE transcript, combiner glue, serialization, entropy handling, or
+zeroization.
 
 Resealing under a future suite requires reading, opening, and writing the
-whole object, and on append-only media produces a new object copy. Deployments
-SHOULD combine resealing with planned media migration.
+whole object, and on append-only media produces a new object copy. An object
+sealed under a superseded suite keeps that suite's protection until it is
+resealed.
 
 ## 13. Envelope Test Vectors
 
@@ -1058,6 +1060,12 @@ Core §13 owns plaintext vectors. This section owns encrypted positive objects,
 component KATs, encrypted range vectors, and envelope negative vectors. Core
 §14 owns the general conformance roles; a claimed REM-ENCRYPT role MUST pass
 the applicable vectors here.
+
+A negative vector records the error it expects in its `expected_error` field,
+as a Section 11.2 identifier. A result is matched to that field by identifier
+name; the surface syntax in which an implementation reports the error is not
+part of the match. A vector that this section describes as informative for
+conformance is not among the applicable vectors.
 
 ### 13.1. REM-OBJECT-TV-E2
 
@@ -1089,10 +1097,10 @@ wrapped-DEK ciphertexts, HPKE intermediate values, salt, all derived keys,
 header, key frame, metadata, payload digest, footer, fill, and both object
 digests. `plaintext_digest` MUST equal Core vector P1's `stored_digest`.
 
-The deterministic generation hook exists only for artifact reproduction.
-Production uses Section 5.4 randomness. The independent verifier implements
-OPEN from this document using generic primitives and verifies both slots, the
-canonical bytes, manifest, and per-file digests.
+The DEK and the HPKE randomness above are fixed inputs, chosen so that the
+vector can be reproduced. The independent verifier implements OPEN from this
+document using generic primitives and verifies both slots, the canonical
+bytes, manifest, and per-file digests.
 
 ### 13.2. REM-OBJECT-TV-D1 Encrypted Copy
 
@@ -1171,17 +1179,23 @@ header, and inner `REMANENCE.encryption` other than `none`; each produces
 `InnerObjectMismatch`.
 
 **Writer inputs.** Sealing input whose size is not a multiple of
-`chunk_size`; an `object_id` longer than 64 bytes; recipient counts zero, one
-without the explicit single-recipient opt-in, or greater than eight;
-duplicate epoch ids; non-canonical slot order; and entropy failure.
+`chunk_size`; an `object_id` longer than 64 bytes; recipient counts zero or
+greater than eight; duplicate epoch ids; non-canonical slot order; and entropy
+failure.
+
+In the case `writer-one-slot`, a Sealer is given one recipient with no
+explicit opt-in. The expected error is `InvalidInput`. The case tests the
+two-recipient default, which the REM Implementation and Operations Guide
+recommends under “Keys and secrets”. It is informative for conformance: a
+conformant Sealer need not refuse a seal to one recipient. Every other
+writer-input vector keeps its normative force.
 
 **Key-frame structure and key use.** Slot counts 0 and 9, duplicate or
 misordered slot indices, duplicate `recipient_epoch_id` values, internal slot
 truncation, trailing frame bytes, malformed `REMK` magic, malformed
 encapsulation, and a wrong recipient private key. A positive case opens a
-structurally valid one-slot object: a Sealer MAY emit one through eight slots
-subject to the Section 5.3 survivability guidance, and Readers accept one
-through eight.
+structurally valid one-slot object. A Sealer MAY emit one through eight slots.
+Readers accept one through eight.
 
 ## 15. Identifier Allocation Considerations
 
@@ -1371,11 +1385,37 @@ effect on conformance.
   Guide recommends each of these, and three of the updated references point
   to it.
 
-  The other rules that Section 1.6 places outside this document are still
-  present in this copy. A later change in this revision moves them out: most
-  to the Guide, and some to the reference implementation's documentation or
-  to the record of how revisions are released. Until then, Section 1.6 does
-  not describe the whole text. No valid object or vector changed.
+  The other rules that Section 1.6 places outside this document have now left
+  it as well. Most went to the Guide. Its chapter on keys and secrets, which
+  this change writes, now holds the recipient policy and the two-recipient
+  default, how private keys are held, public-key pinning and the source of
+  randomness. That chapter also holds the salt interface, current suites,
+  keeping epoch keys, handling secrets, resealing, and deployment policy for
+  public facts and provenance. Other chapters hold validating and staging
+  recovered plaintext, repair before a new open attempt, computing
+  `stored_digest` at write, backend records, and the allocation, memory and
+  fuzzing practice of Section 12.9. The bounds of Section 12.9 stay. The rule
+  that deterministic vector-generation hooks are not production sealing
+  modes, with the release controls that accompany it, went to the “How a
+  revision is frozen” section of `specs/README.md`. Section 8.1 keeps its
+  heading over one sentence that points to the Guide. Where a rule's handling
+  moved, Section 12 still describes the hazard.
+
+  Some rules stay in a changed form. Section 5.3 now says that a Sealer does
+  not report a seal as successful unless every recipient it was asked to seal
+  to has a slot, instead of prescribing that the seal fail. Section 5.10 now
+  says that a Keyed Reader does not publish restored members until it has
+  compared the inner identities with the header; the failure is still
+  `InnerObjectMismatch`. Section 5.9 keeps its outcomes as requirements and
+  gives its order of work as informative text. Section 13 now says that an
+  `expected_error` is matched by identifier name and that an informative
+  vector is not among the applicable vectors. Section 13.4 now says that the
+  vector `writer-one-slot` is informative for conformance.
+
+  No byte of the format changed, and no valid object or vector changed. This
+  document no longer requires a conformant Sealer to seal to two recipients,
+  to use the current suite, or to hold keys and handle secrets in any
+  particular way; the Guide recommends each.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Records the current
   standing of the pinned X-Wing draft: expired on 3 September 2026, its
   construction carried forward identically as `MLKEM768-X25519` by the CFRG

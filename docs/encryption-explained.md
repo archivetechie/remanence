@@ -300,7 +300,7 @@ a few named roles rather than a service.
 | Operations | Warm, on a token or encrypted volume | Authorised restores and drills |
 | Partner | Held by a second institution | Survives losing both the safe and the staff |
 
-The specification recommends at least two recipients.
+The REM Implementation and Operations Guide recommends at least two recipients.
 
 ### 6.4 The restore procedure
 

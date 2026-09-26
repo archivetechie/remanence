@@ -25,11 +25,12 @@ these formats. The reference implementation, Remanence, appears in examples,
 because it is the implementation we know best, but the recommendations do not
 depend on it. Where a recommendation describes what Remanence does, it says so.
 
-This first revision holds the practice that REM-OBJECT 1.0.0-draft.4 moved out
-of that specification. The practice that REM-ENCRYPT and REM-PARITY move out
-will be added in later revisions. Chapters are numbered in the order they will
-finally take, so the numbering has gaps until then: chapters 8 to 11 do not
-exist yet, and several chapters here will gain sections.
+This revision holds the practice that REM-OBJECT 1.0.0-draft.4 and
+REM-ENCRYPT 1.0.0-draft.4 moved out of those specifications. The practice that
+REM-PARITY moves out will be added in a later revision. Chapters are numbered
+in the order they will finally take, so the numbering has gaps until then:
+chapters 8 to 11 do not exist yet, and several chapters here will gain
+sections.
 
 ### How to read the recommendations
 
@@ -45,8 +46,8 @@ specifications, which are reserved for conformance requirements. Where a
 recommendation rests on a requirement of a specification, the guide quotes
 that requirement and cites it rather than restating it in its own words, so
 that nothing here can be mistaken for a new or changed requirement. A quoted
-requirement comes from REM-OBJECT 1.0.0-draft.4, the revision in preparation,
-or, where the citation says so, from REM-ENCRYPT 1.0.0-draft.4.
+requirement comes from the revision in preparation of the specification its
+citation names: REM-OBJECT 1.0.0-draft.4 or REM-ENCRYPT 1.0.0-draft.4.
 
 Each chapter ends with a short summary in plain terms.
 
@@ -81,7 +82,8 @@ reading. The acceptance checks that REM-OBJECT §12.9 lists, each required by
 the section it cites, are the minimum. The rest of this chapter is about
 performing them safely.
 
-Serves REM-OBJECT §12.9, Hostile-Input Posture.
+Serves REM-OBJECT §12.9, Hostile-Input Posture, and REM-ENCRYPT §12.9,
+Envelope Hostile-Input Discharge.
 
 ### 2.2. Check a size before it drives an allocation
 
@@ -102,27 +104,40 @@ structure. The limits themselves are a requirement of the specification:
 incrementally changes no result. It only keeps the decoder's memory bounded
 while it reaches that result.
 
-Serves REM-OBJECT §4.7.1, Deterministic CBOR, and REM-OBJECT §12.9,
-Hostile-Input Posture.
+An envelope parser meets the same risk in the key frame and the metadata
+frame. It should check the key-frame length and slot count before it
+allocates for the frame, and check the envelope's geometry before it seeks or
+allocates. It should enforce the metadata CBOR depth and item limits as it
+decodes. The bounds themselves are requirements, listed in REM-ENCRYPT §12.9;
+checking them early changes no result.
 
-### 2.3. Read in a stream; if you must hold an object whole, size the allocation so that a hostile declaration fails as an error
+Serves REM-OBJECT §4.7.1, Deterministic CBOR; REM-OBJECT §12.9, Hostile-Input
+Posture; and REM-ENCRYPT §12.9, Envelope Hostile-Input Discharge.
+
+### 2.3. Read in a stream
 
 An object can be hundreds of gigabytes long. A reader that loads a whole
 object before parsing it needs memory in proportion to the object, and a
-hostile object can declare a size chosen to exhaust it.
+hostile object can declare a size chosen to exhaust it. Some interfaces still
+need an object whole, and a reader that serves them has to hold one in memory.
 
 We recommend reading in a stream. A streaming reader needs memory in
 proportion to `chunk_size` plus one pax header, and allocates a constant
-amount per chunk, whatever the object's size. A reader that materializes the
-whole object, for example to serve an interface that needs it whole, should
-reserve its up-front allocation fallibly, so that an oversized declaration
-produces an error rather than an abort. It should also enforce a size ceiling
-set for the deployment. Both approaches accept and reject exactly the same
-objects; the difference lies only in the resources they use. Remanence, for
-example, restores through its streaming reader.
+amount per chunk, whatever the object's size. A streaming reader of an
+encrypted copy likewise needs a constant amount of memory per payload chunk.
+Remanence, for example, restores through its streaming reader.
 
-Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations, and
-REM-OBJECT §12.9, Hostile-Input Posture.
+A reader that materializes the whole object should reserve its up-front
+allocation fallibly, so that an oversized declaration produces an error rather
+than an abort. It should also enforce a size ceiling set for the deployment.
+That ceiling is deployment policy, not a check of format validity: it can
+refuse an object that is valid and that a streaming reader would read. The
+choice of approach does not change which objects are valid, and a refusal for
+size should be reported as a resource limit, not as a format violation.
+
+Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations; REM-OBJECT
+§12.9, Hostile-Input Posture; and REM-ENCRYPT §12.9, Envelope Hostile-Input
+Discharge.
 
 ### 2.4. Never panic on any byte sequence
 
@@ -151,10 +166,14 @@ written by hand covers only the inputs its authors imagined.
 We recommend validating the property of section 2.4 with coverage-guided
 fuzzing. For REM-OBJECT, fuzz at least three targets: the pax record loop, the
 manifest CBOR decoder, and whole-object open and verify for plaintext inputs.
-Each should run long enough for its coverage to stop growing. Remanence, for
-example, keeps these targets in the `fuzz/` directory of its repository.
+For REM-ENCRYPT, fuzz at least four targets, separately from the plaintext
+ones: the scalar-header parser, the key-frame parser, the metadata CBOR
+decoder, and whole-object open and verify for encrypted inputs. Each should
+run long enough for its coverage to stop growing. Remanence, for example,
+keeps these targets in the `fuzz/` directory of its repository.
 
-Serves REM-OBJECT §12.9, Hostile-Input Posture.
+Serves REM-OBJECT §12.9, Hostile-Input Posture, and REM-ENCRYPT §12.9,
+Envelope Hostile-Input Discharge.
 
 ### In plain terms
 
@@ -327,10 +346,13 @@ MUST NOT be reported as complete." (REM-OBJECT §4.9).
 Every digest in the chain can be computed over bytes that are already flowing
 through the writer. We recommend computing `plaintext_digest` over the
 emitted stream as it is written; for a plaintext copy the same value is its
-`stored_digest`. The digest then costs arithmetic and no extra read.
+`stored_digest`. The digest then costs arithmetic and no extra read. For an
+encrypted copy, we recommend computing its `stored_digest` in the same way,
+over the envelope bytes as the sealer emits them.
 
-Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations, and
-REM-OBJECT §7.2, Write-Path Verification (No Extra Reads).
+Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations; REM-OBJECT
+§7.2, Write-Path Verification (No Extra Reads); and REM-ENCRYPT §7.2,
+Write-Path Verification.
 
 ### 4.2. Write through a sink that reports every block
 
@@ -408,9 +430,17 @@ file's `first_chunk_lba`, the manifest's geometry, `manifest_sha256` and
 detection is a convenience. A reader should cross-check detection against the
 recorded representation rather than rely on detection alone.
 
+For an encrypted copy, we recommend recording also its `format_version`,
+`metadata_frame_len` and `key_frame_len`, and the recipient epoch ids present
+in its key frame. These are public envelope geometry. They let a tool choose a
+key and plan reads without opening the object, but they do not replace
+parsing the envelope's own header and key frame, which is where a reader
+takes them from.
+
 Serves REM-OBJECT §8.1, The Byte-Format Contract; REM-OBJECT §3.4,
 Representation Detection; REM-OBJECT §4.9, Writer, Planner, and Reader
-Obligations; and REM-OBJECT §7.2, Write-Path Verification (No Extra Reads).
+Obligations; REM-OBJECT §7.2, Write-Path Verification (No Extra Reads); and
+REM-ENCRYPT §8.1, Backend Records for Encrypted Copies.
 
 ### 5.2. Join copies by their shared identity
 
@@ -475,9 +505,13 @@ the catalog as carefully as the archive it describes.
 
 ## 6. Keys and secrets
 
-This revision of the chapter holds one recommendation, from REM-OBJECT. The
-key-custody practice that REM-ENCRYPT moves out of its specification will be
-added here in a later revision.
+An encrypted copy stays readable only while a key that opens it survives, and
+stays confidential only while the secrets that went into it stay secret.
+REM-ENCRYPT fixes how the envelope binds its keys, and defines no key registry
+or custody protocol (REM-ENCRYPT §1.5). This chapter recommends how a tool
+should choose recipients, hold private keys, obtain randomness and handle
+secrets while it works, and how long to keep keys. Its first section, on
+attribute values, comes from REM-OBJECT; the rest from REM-ENCRYPT.
 
 ### 6.1. Report attributes by name, never by value
 
@@ -491,9 +525,197 @@ should report their names only, and should never log their values.
 
 Serves REM-OBJECT §12.10, Path Traversal.
 
+### 6.2. Seal to at least two independent recipients
+
+Any one matching private key opens an encrypted object, and an object whose
+every recipient key is lost cannot be opened by anyone. An archive that seals
+to a single recipient loses everything sealed to it when that one key is
+lost.
+
+We recommend sealing to at least two independent recipients, held in
+separate custody, or else protecting the sole recipient's secret
+independently, for example by splitting its seed with Shamir's secret
+sharing. A tool should default to at least two recipients, and should seal to
+one only when its operator opts in explicitly. The pinned vector
+`writer-one-slot` records what a sealer that follows this default does: it
+refuses a one-recipient seal made without that opt-in. It is an informative
+vector, as REM-ENCRYPT §13.4 says, because a single-recipient envelope is
+valid and "Readers accept any canonical frame with one through eight slots."
+(REM-ENCRYPT §5.3). Remanence, for example, refuses a one-recipient seal
+unless its caller sets `allow_single_recipient`.
+
+Serves REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping, and REM-ENCRYPT
+§13.4, Negative Vectors.
+
+### 6.3. Fail the whole seal when a recipient cannot be wrapped
+
+A sealer asked to seal to three recipients that quietly seals to two leaves
+the third without access, and nobody learns of it until that key is the one
+that is needed.
+
+A sealer that cannot wrap the data key to one of the recipients it was asked
+to seal to should fail the whole seal, rather than emit an envelope without
+that recipient. The specification fixes what may be reported: "A Sealer MUST
+NOT report a seal as successful unless the key frame contains a slot for
+every recipient it was asked to seal to." (REM-ENCRYPT §5.3). Failing the
+seal is the simplest way to meet it.
+
+Serves REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping.
+
+### 6.4. Keep each private key as its 32-byte seed
+
+A private key is useful only if some tool can load it when it is needed,
+perhaps decades later and in another program. The specification defines one
+form for it: a recipient epoch's "secret custody form is the 32-byte X-Wing
+seed" (REM-ENCRYPT §2.3). The expanded ML-KEM decapsulation key and the
+X25519 secret `sk_X` are derived from the seed, and no REM specification
+defines how to store them.
+
+We recommend storing each private key as its seed, and deriving the expanded
+decapsulation key and `sk_X` in memory only, when the key is used. A key file
+should contain the seed, not an expanded key. Thirty-two bytes can also be
+written on paper, stamped into metal or split among custodians, which an
+expanded key does not allow as easily.
+
+Serves REM-ENCRYPT §5.3.1, Frozen X-Wing Construction, and REM-ENCRYPT §5.4,
+Key Inputs and Identification.
+
+### 6.5. Pin recipient public keys
+
+A sealer that takes a recipient's public key from an untrusted channel can be
+given an attacker's key instead. The object is then sealed to the attacker,
+who can read it, and nothing in the envelope shows it.
+
+Where public keys could be substituted, we recommend pinning each recipient
+public key, or its fingerprint, through a channel independent of the one that
+delivers it, and checking the pin before every seal. Public keys and their
+fingerprints are inputs to custody, which the format does not define.
+
+Serves REM-ENCRYPT §5.4, Key Inputs and Identification, and REM-ENCRYPT
+§12.11, Threat Model and Secret Handling.
+
+### 6.6. Take randomness from the operating system, and fail when it is missing
+
+The confidentiality of every object rests on its data-encryption key and its
+encapsulation randomness being fresh and unpredictable. A tool that falls
+back to a weak source when the operating system's generator is unavailable
+produces objects that look sound and are not.
+
+We recommend obtaining the data key and the encapsulation randomness from the
+operating system's cryptographically secure generator, through an interface
+that reports failure, and failing the seal with `EntropyUnavailable` whenever
+that source cannot supply them. The specification requires the outcome:
+"Every seal MUST use a fresh uniformly random 32-byte DEK and fresh HPKE
+encapsulation randomness for every recipient, following [RFC9180] §9.2.3.
+Entropy failure is fatal." (REM-ENCRYPT §12.1).
+
+Serves REM-ENCRYPT §5.4, Key Inputs and Identification, and REM-ENCRYPT
+§12.1, Per-Object Key Uniqueness.
+
+### 6.7. Derive the salt inside the sealer
+
+An interface that accepts a salt from its caller invites callers to supply
+one. An envelope sealed under any salt other than the one derived from its
+data key does not open: a reader rederives the salt and rejects a mismatch
+with `SaltDerivationMismatch`.
+
+A sealer's interface should derive the salt itself, as the specification
+requires ("A Sealer MUST derive the salt." REM-ENCRYPT §5.5), and should
+offer no way for a caller to supply one.
+
+Serves REM-ENCRYPT §5.5, Salt and Object-Key Derivation.
+
+### 6.8. Seal with the current suites
+
+A suite is superseded for a reason, usually because a better construction has
+replaced it. A new seal under a superseded suite extends that suite's life by
+the lifetime of the object.
+
+We recommend sealing new objects with the current `suite_id` and
+`wrap_suite` only. Objects already sealed under a superseded suite remain
+readable, because "Superseded suites remain valid for **opening**."
+(REM-ENCRYPT §10.4), and they keep that suite's protection until they are
+resealed (section 6.11). Today there is one current suite of each kind.
+
+Serves REM-ENCRYPT §10.4, Assignment and Deprecation Policy.
+
+### 6.9. Keep an epoch's private key while any object needs it
+
+A key frame cannot be rewritten without resealing the object, so a recipient
+cannot be added to an object once it is sealed. An object can be opened only
+while the private key of at least one of its recipient epochs survives, and a
+key destroyed too early cannot be replaced for the objects already sealed to
+it.
+
+We recommend never destroying a recipient epoch's private key while any live
+object references it. Retire a key only when the catalog shows that no live
+object depends on it, or once every object that did has been resealed to
+other recipients.
+
+Serves REM-ENCRYPT §12.8, Key Rotation and Epoch Longevity.
+
+### 6.10. Keep secrets few, short-lived and out of records
+
+A secret can leak from any place where a copy of it persists: memory that is
+swapped or dumped, logs and diagnostics, command lines that other users can
+see, core dumps, and plaintext staged during recovery. Section 6.1 applies the
+same reasoning to attribute values.
+
+We recommend keeping as few copies as possible of data keys, derived keys,
+private keys, HPKE ephemeral secrets and random-generator state, and zeroising
+the mutable buffers that hold them as soon as they are no longer needed. A
+tool should never write a secret to a log, a diagnostic, a command line or
+durable plaintext staging.
+
+A core dump needs more than care about what the tool writes, because it
+captures memory that the tool never chose to write out. We recommend
+disabling core dumps for processes that hold secrets, or excluding
+secret-bearing memory from dumps where the platform allows it, for example
+with `madvise` and `MADV_DONTDUMP` on Linux. Where neither can be assured, a
+dump file should be treated as secret-bearing.
+
+Serves REM-ENCRYPT §12.11, Threat Model and Secret Handling.
+
+### 6.11. Reseal alongside media migration
+
+Resealing an object, to new recipients or under a new suite, reads, opens and
+rewrites the whole object, and on append-only media produces a new copy.
+
+We recommend planning resealing together with media migration, which reads
+and rewrites the objects anyway. A resealed copy keeps the object's
+`object_id`, `chunk_size`, canonical bytes and `plaintext_digest`, and has new
+envelope bytes and a new `stored_digest` (REM-ENCRYPT §12.8), so a catalog
+should record it as a new copy of the same object.
+
+Serves REM-ENCRYPT §12.11, Threat Model and Secret Handling, and REM-ENCRYPT
+§12.8, Key Rotation and Epoch Longevity.
+
+### 6.12. Decide what an encrypted copy may reveal, and where provenance comes from
+
+Encryption hides an object's contents, not its existence. An encrypted copy
+reveals its identifier, its recipient epochs and their labels, and its size,
+among the public facts REM-ENCRYPT §12.5 lists. Because anyone who holds the
+recipient public keys can make a new, internally valid object, encryption
+also does not show who made an object.
+
+A deployment that treats an object's existence, identifier or approximate
+size as sensitive should add its own policy above the format, which defines
+no padding. A deployment that needs provenance should keep an independently
+authenticated or signed external manifest, because "REM-ENCRYPT claims
+confidentiality and self-consistency, not writer identity or provenance."
+(REM-ENCRYPT §12.7).
+
+Serves REM-ENCRYPT §12.5, Confidentiality Boundary, Public Facts, and Catalog
+Trust, and REM-ENCRYPT §12.7, Non-Committing AEAD.
+
 ### In plain terms
 
-Say which attributes you skipped or applied; never say what was in them.
+Seal every object so that losing one key does not lose the object, keep each
+private key as its 32-byte seed, trust a public key only when it has been
+checked independently, and take randomness only from the operating system.
+While a tool works, it should hold secrets briefly and never write them where
+others can read them, attribute values included. Keep every key for as long
+as an object needs it.
 
 ## 7. Verification, scrub and repair
 
@@ -538,7 +760,8 @@ at a time, and hides how damaged a copy is.
 A verifier should report every nonconformity it finds, in every
 representation, rather than only the first.
 
-Serves REM-OBJECT §7.4, Verifier Profile.
+Serves REM-OBJECT §7.4, Verifier Profile, and REM-ENCRYPT §7.4, Encrypted
+Verifier Profiles.
 
 ### 7.4. Make restore the default, and salvage a deliberate choice
 
@@ -591,14 +814,36 @@ succeed produces no plaintext, because REM-ENCRYPT requires that "A failed
 metadata or chunk tag MUST stop processing without releasing that chunk's
 plaintext." (REM-ENCRYPT §12.4).
 
-Serves REM-OBJECT §9, Relationship to the Parity Layer.
+Serves REM-OBJECT §9, Relationship to the Parity Layer, and REM-ENCRYPT §12.4,
+Fail-Closed.
+
+### 7.8. Validate and stage recovered plaintext before publishing it
+
+Authentication shows that an envelope is intact and was sealed under its
+keys. It does not show that the plaintext inside is a valid REM-OBJECT, or
+that it is the object the header names: a defective sealer can seal the wrong
+stream. Members published from such a recovery, or published before the
+recovery has finished, may be wrong or incomplete.
+
+After whole-object authentication, we recommend validating the recovered
+inner stream under the Verifier profile of REM-OBJECT §7.4, staging the
+recovered plaintext on protected storage, and publishing restored members only
+after the whole recovery has succeeded. The specification fixes the part that
+concerns what a tool may claim: "A Keyed Reader MUST NOT publish restored
+members until it has compared the inner stream's `REMANENCE.object_id` and
+`REMANENCE.chunk_size` with the scalar header." (REM-ENCRYPT §5.10). Section
+6.10 explains why the staging area should be protected.
+
+Serves REM-ENCRYPT §5.10, Opening, Recovery, and Keyless Inspection, and
+REM-ENCRYPT §12.11, Threat Model and Secret Handling.
 
 ### In plain terms
 
 Check the index before trusting it, look for the inexpensive signs of
 trouble, report everything you find, never pass off a rescue as a clean
 restore, and check every copy on a schedule. When a copy is damaged, mend its
-bytes first and open it afterwards.
+bytes first and open it afterwards. When you decrypt a copy, check what came
+out and keep it staged until the whole recovery has succeeded.
 
 ## 12. Ingest
 
@@ -721,6 +966,16 @@ leave out entries that would only repeat what the file paths already say.
 
 ## 14. Revision history
 
+- **26 September 2026.** Second revision. Chapter 6 now holds the practice on
+  keys and secrets that REM-ENCRYPT 1.0.0-draft.4 moved out of that
+  specification: recipients and the two-recipient default, keeping private
+  keys as seeds, pinning public keys, randomness, the salt interface, current
+  suites, keeping epoch keys, handling secrets, resealing, and what encryption
+  neither hides nor proves. Chapters 2, 4, 5 and 7 gain REM-ENCRYPT's practice
+  on envelope parsing and fuzzing, computing an encrypted copy's
+  `stored_digest` as it is written, recording envelope fields, and validating
+  and staging recovered plaintext. Chapter 1 says which revisions the guide
+  now holds.
 - **26 September 2026.** First revision. Chapters 1 to 7, 12 and 13 hold the
   practice that REM-OBJECT 1.0.0-draft.4 moved out of that specification:
   handling hostile media, restoring onto a host, staging and durability,
