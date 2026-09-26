@@ -269,13 +269,30 @@ A plaintext object that reaches tar EOF without its `_remanence/manifest.cbor`
 entry is nonconformant (REM-OBJECT §4.9). The REM-OBJECT reader in
 `remanence-format` does not fail a restore-mode read for that reason alone: it
 returns the member entries it recovered together with the non-fatal typed
-warning `MissingManifest`, so the absence stays visible to its caller. The JSON
-report of `rem archive extract` does not currently include this warning.
+warning `MissingManifest`, so the absence stays visible to its caller.
+`rem archive extract` passes such warnings on: every one of its JSON reports
+carries `warnings`, an array of warning names. A whole-object extract and a
+plaintext `--path`/`--range` extract read the object in restore mode, so their
+array holds `MissingManifest` for an object without its manifest. An encrypted
+`--range` extract and a `--blob-entry`/`--blob-member` extract read only the
+members they need and never the manifest, so their array is always empty.
 
 Blob wrappers (REM-OBJECT Appendix E). When `rem archive build` wraps a
 subtree, it creates the `.remwrap.tar` member by running the system tar program
 with `-c` and `--format pax --xattrs`, and records the program, its version and the
 exact create and extract argument lists in the index's `tar_engine` field.
+That program is bsdtar, and only wrappers need it. `rem archive build`, with or
+without `--scan-only`, looks for it once the plan holds a wrapper. A
+whole-object `rem archive extract` looks for it before writing anything when
+the object holds a `.remwrap.tar`, so a host without bsdtar fails the command
+before the destination changes. It then unwraps exactly the object's own
+wrappers and leaves any other `.remwrap.tar` already under `--dest` as it is.
+`--no-unwrap`, `--path`/`--range` and `--blob-entry`/`--blob-member` never run
+bsdtar. The `tar_engine` field of the build report's `ingest`, of the scan
+report, of the manifest `--manifest-out` writes, and of the extract report's
+`unwrap` is `null` when no wrapper was involved: always for a `--map` build,
+which never creates one, and always under `--no-unwrap`. An index always
+carries its `tar_engine`, since it exists only beside a wrapper.
 `rem archive extract` with `--blob-entry` and `--blob-member` recovers one
 inner file by the procedure of Appendix E.4, for both representations.
 `--blob-member` cannot be combined with `--path` or `--range`, so the reference

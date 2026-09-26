@@ -303,18 +303,8 @@ fn source_map_customer_manifest(
     archive_ingest::CustomerManifest {
         format: "remanence-customer-manifest-v1",
         ruleset: None,
-        tar_engine: archive_ingest::TarEngineReport {
-            program: "source-map".to_string(),
-            version: "1.0".to_string(),
-            create_invocation: vec![
-                "rem".to_string(),
-                "archive".to_string(),
-                "build".to_string(),
-                "--map".to_string(),
-                "<source-map.tsv>".to_string(),
-            ],
-            extract_invocation: Vec::new(),
-        },
+        // A map build never creates a wrapper, so no tar engine is involved.
+        tar_engine: None,
         entries: inputs
             .iter()
             .map(|input| archive_ingest::CustomerManifestEntry {
