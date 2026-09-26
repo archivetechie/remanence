@@ -73,7 +73,7 @@ verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
 
-<!-- code-anchor: Cargo.toml crates/remanence-api/build.rs @ 1dd451b2 -->
+<!-- code-anchor: Cargo.toml crates/remanence-api/build.rs @ 7f39930d -->
 ## Build
 
 Rust 1.88+, Linux. The default build needs no system packages; the protobuf
@@ -106,7 +106,7 @@ cargo test --workspace
 Hardware-touching tests are ignored by default and opt in via
 environment variables documented in their test modules.
 
-<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-cli/src/lib.rs @ 7f39930d -->
 ## Quickstart
 
 The native object format works against local files, no tape required:
@@ -157,7 +157,7 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   their pinned test-vector archive alongside.
 - [proto/layer5.proto](proto/layer5.proto) — the draft gRPC contract.
 
-<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ f643f8c2 -->
+<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs @ 7f39930d -->
 ## Migrating foreign tapes
 
 Core Remanence publishes a read-only adapter registry but includes no concrete
@@ -179,7 +179,7 @@ REM-OBJECT files follow the same discipline: they contain only the
 object's stored bytes — tape filemarks, bootstrap rows, and parity
 sidecars are tape-only framing.
 
-<!-- code-anchor: Cargo.toml @ 1dd451b2 -->
+<!-- code-anchor: Cargo.toml @ 7f39930d -->
 ## Repository layout
 
 ```text

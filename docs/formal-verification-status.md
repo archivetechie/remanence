@@ -1,4 +1,4 @@
-<!-- code-anchor: verif Makefile @ 3c0f50b3 -->
+<!-- code-anchor: verif Makefile @ 7f39930d -->
 # Formal verification status
 
 This document is the reviewer-facing inventory for Remanence formal proof work.
