@@ -267,6 +267,36 @@ their typeflags (Section 4.3.4). Ownership is deliberately not preserved
 in Section 4.7.3. Encryption policy and key custody are outside this
 document; see REM-ENCRYPT §1.
 
+### 1.6. What this document specifies, and what it does not
+
+This document defines a format: how its bytes are laid out, what they mean, and
+what may be concluded from them. Its definitions, registries, change policy and
+test vectors serve that purpose. It also contains rules about what an
+implementation does. Each of those rules is included only because ignoring it
+would do one of three things:
+
+1. It would produce bytes that another conformant reader cannot read, or would
+   misread.
+2. It would let two conformant readers reach different conclusions about what a
+   medium or an object contains.
+3. It would let a tool claim something that the bytes do not support.
+
+Conforming to this document is therefore necessary for interchange, but it is
+not enough for safe operation. This document does not say how a tool should hold
+keys, stage and publish what it writes, protect the computer it restores onto,
+organise its work after a crash, or report progress to its operator. It does say
+what the bytes a tool writes must be, and what a tool may claim about the bytes
+it reads.
+
+Recommended practice for those other matters is collected in the REM
+Implementation and Operations Guide
+(<https://github.com/archivetechie/remanence/blob/main/docs/rem-implementation-guide.md>).
+The Guide is informative and is revised independently of this document, which
+can be implemented without it. Descriptions of the reference implementation, and
+the record of how revisions of this document are prepared and frozen, are kept
+in the repository that holds the reference implementation and these
+specifications; this document does not depend on them.
+
 ## 2. Conventions and Terminology
 
 ### 2.1. Requirements Language
@@ -2072,8 +2102,22 @@ Entries are newest first: date · version · kind (erratum / minor / major) ·
 effect on conformance.
 
 - **2026-09-26 — 1.0.0-draft.4 — in preparation.** The preparing copy of the
-  next revision. It is identical to 1.0.0-draft.3 apart from its identifiers.
-  This entry is completed as the revision's changes are made.
+  next revision. This entry is completed as the revision's changes are made.
+  Section 1.6 is added. It states which rules belong in this document and
+  points to the REM Implementation and Operations Guide for the rest. A rule
+  about what an implementation does stays only if ignoring it would do one of
+  three things. It would produce bytes another conformant reader cannot read
+  or would misread. It would let two conformant readers reach different
+  conclusions about what a medium or an object contains. Or it would let a
+  tool claim something the bytes do not support. The same section, word for
+  word, opens REM-OBJECT, REM-ENCRYPT and REM-PARITY.
+
+  No requirement has changed yet. The rules that Section 1.6 places outside
+  this document are still present in this copy. Later changes in this
+  revision move them out: most to the Guide, which those changes also write,
+  and some to the reference implementation's documentation or to the record
+  of how revisions are released. Until then, Section 1.6 does not describe the
+  whole text. No valid object or vector changed.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
   an informative description of the capacity cost the alignment rule imposes
   on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper

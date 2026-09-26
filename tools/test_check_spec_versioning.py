@@ -155,5 +155,137 @@ class StructuralRulesTests(unittest.TestCase):
             self.assertTrue(lint.reconcile_known(defects, lint.KNOWN_REFERENCES))
 
 
+class ScopeStatementTests(unittest.TestCase):
+    BODY = ("This document defines a format.\n\n1. It would produce bytes that\n"
+            "   another reader cannot read.\n\nSee the Guide.\n")
+
+    def document(self, version, number="1.6", body=None, extra=""):
+        body = self.BODY if body is None else body
+        return (f"| Version | {version} |\n\n## 1. Introduction\n\n"
+                f"### {number}. {lint.SCOPE_HEADING}\n\n{body}\n{extra}"
+                "## 2. Conventions\n\nText.\n")
+
+    def corpus(self, **overrides):
+        docs = {}
+        for name in lint.SPECS:
+            docs["in-progress/" + name] = self.document("1.0.0-draft.9")
+        exempt = {path: version for path, version in lint.SCOPE_BLOCK_EXEMPT}
+        for path, version in exempt.items():
+            docs[path] = f"| Version | {version} |\n\n## 1. Introduction\n\nText.\n"
+        docs.update(overrides)
+        return docs
+
+    def test_identical_blocks_pass_across_numbers_and_wrapping(self):
+        rewrapped = self.BODY.replace("bytes that\n   another", "bytes that another")
+        docs = self.corpus(**{
+            "in-progress/rem-parity-1-specification.md":
+                self.document("1.0.0-draft.9", number="1.5", body=rewrapped)})
+        self.assertEqual(lint.scope_block_findings(docs), [])
+
+    def test_missing_block_in_a_preparing_copy_fails(self):
+        name = "in-progress/rem-object-core-1-specification.md"
+        docs = self.corpus(**{name: "| Version | 1.0.0-draft.9 |\n\n## 1. Introduction\n"})
+        self.assertTrue(any(name in f and "missing" in f
+                            for f in lint.scope_block_findings(docs)))
+
+    def test_two_blocks_in_one_document_fail(self):
+        name = "in-progress/rem-encrypt-1-specification.md"
+        twice = self.document("1.0.0-draft.9",
+                              extra=f"### 1.7. {lint.SCOPE_HEADING}\n\n{self.BODY}\n")
+        docs = self.corpus(**{name: twice})
+        self.assertTrue(any(name in f and "exactly one" in f
+                            for f in lint.scope_block_findings(docs)))
+
+    def test_one_character_difference_fails(self):
+        name = "in-progress/rem-parity-1-specification.md"
+        changed = self.document("1.0.0-draft.9", body=self.BODY.replace("format.", "format;"))
+        docs = self.corpus(**{name: changed})
+        self.assertTrue(any("differs" in f for f in lint.scope_block_findings(docs)))
+
+    def test_exempt_published_versions_pass_and_new_published_versions_fail(self):
+        self.assertEqual(lint.scope_block_findings(self.corpus()), [])
+        name = "publication/rem-object-core-1-specification.md"
+        docs = self.corpus(**{name: "| Version | 1.0.0-draft.4 |\n\n## 1. Introduction\n"})
+        self.assertTrue(any(name in f and "missing" in f
+                            for f in lint.scope_block_findings(docs)))
+
+    def test_block_ends_at_a_heading_of_the_same_or_higher_level(self):
+        text = self.document("1.0.0-draft.9", extra="#### A deeper heading\n\nKept.\n")
+        block = lint.scope_blocks(text)[0]
+        self.assertIn("A deeper heading", block)
+        self.assertNotIn("Conventions", block)
+
+    def test_fenced_heading_like_lines_neither_end_nor_hide_the_block(self):
+        fenced = self.BODY + "\n```text\n## 2. Looks like a heading\n```\n\nAfter the fence.\n"
+        changed = fenced.replace("After the fence.", "After the fence!")
+        docs = self.corpus(**{
+            "in-progress/rem-object-core-1-specification.md": self.document("1.0.0-draft.9", body=fenced),
+            "in-progress/rem-encrypt-1-specification.md": self.document("1.0.0-draft.9", body=fenced),
+            "in-progress/rem-parity-1-specification.md": self.document("1.0.0-draft.9", body=changed)})
+        self.assertTrue(any("differs" in f for f in lint.scope_block_findings(docs)))
+        self.assertIn("After the fence.", lint.scope_blocks(self.document("x", body=fenced))[0])
+
+    def test_the_statement_must_be_a_subsection_of_section_one(self):
+        name = "in-progress/rem-object-core-1-specification.md"
+        moved = self.document("1.0.0-draft.9", number="2.4")
+        docs = self.corpus(**{name: moved})
+        self.assertTrue(any(name in f and "missing" in f
+                            for f in lint.scope_block_findings(docs)))
+
+    def test_the_statement_must_be_a_level_three_subsection(self):
+        name = "in-progress/rem-parity-1-specification.md"
+        promoted = self.document("1.0.0-draft.9").replace(
+            f"### 1.6. {lint.SCOPE_HEADING}", f"## 1.6. {lint.SCOPE_HEADING}")
+        docs = self.corpus(**{name: promoted})
+        self.assertTrue(any(name in f and "missing" in f
+                            for f in lint.scope_block_findings(docs)))
+
+    def test_repository_documents_carry_one_identical_statement(self):
+        docs = lint.discovered_documents()
+        self.assertEqual(lint.scope_block_findings(docs), [])
+        blocks = {name: lint.scope_blocks(text) for name, text in docs.items()
+                  if name.startswith("in-progress/") and pathlib.Path(name).name in lint.SPECS}
+        self.assertEqual(len(blocks), 3)
+        self.assertTrue(all(len(found) == 1 for found in blocks.values()))
+
+
+class PreparingCopyRuleTests(unittest.TestCase):
+    CURRENT = "a" * 64
+    NAME = "rem-parity-1-specification.md"
+
+    def copy(self, **changes):
+        text = ("| Document version | 1.0 |\n| Version | 1.0.0-draft.9 |\n\n"
+                f"The archive `remanence-test-vectors.tar`, SHA-256\n`{self.CURRENT}`.\n")
+        for old, new in changes.items():
+            text = text.replace(old.replace("_", " "), new)
+        return text
+
+    def findings(self, text):
+        return lint.preparing_copy_rule_findings(self.NAME, text, self.CURRENT)
+
+    def test_a_conforming_copy_passes(self):
+        self.assertEqual(self.findings(self.copy()), [])
+
+    def test_document_version_row_missing_or_wrong(self):
+        self.assertTrue(self.findings(self.copy().replace("| Document version | 1.0 |\n", "")))
+        self.assertTrue(self.findings(self.copy().replace("| Document version | 1.0 |", "| Document version | 2.0 |")))
+
+    def test_current_pin_missing_or_contradicted(self):
+        stale = "b" * 64
+        self.assertTrue(self.findings(self.copy().replace(self.CURRENT, stale)))
+        both = self.copy() + f"\nAn older `remanence-test-vectors.tar`, SHA-256 `{stale}`.\n"
+        self.assertTrue(any("quotes archive digest" in f for f in self.findings(both)))
+        one_sentence = self.copy().replace(f"`{self.CURRENT}`.", f"`{self.CURRENT}`, formerly `{stale}`.")
+        self.assertTrue(any("quotes archive digest" in f for f in self.findings(one_sentence)))
+
+    def test_retired_doi_row_and_banned_title(self):
+        self.assertTrue(self.findings(self.copy() + "| Version DOI (this release) | x |\n"))
+        self.assertTrue(self.findings(self.copy() + lint.BANNED_TITLE_FORMS[0]))
+
+    def test_an_unrelated_document_digest_is_not_an_archive_pin(self):
+        text = self.copy() + "\nThe published revision (SHA-256 `" + "c" * 64 + "`) governs.\n"
+        self.assertEqual(self.findings(text), [])
+
+
 if __name__ == "__main__":
     unittest.main()
