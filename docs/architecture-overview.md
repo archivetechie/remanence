@@ -335,6 +335,18 @@ components may be repaired at proved positions; there is no path back to Open
 and no second terminal triple. SQLite is a replayable projection. On a
 finalized cartridge the three terminal replicas, selected C then B then A with
 agreement required between survivors, provide catalog-less tape authority.
+The finalization lifecycle, the companion intent and the recovery rules are
+described in the
+[on-tape layout reference](reference-tape-layout.md#finalization-and-catalog-less-recovery).
+
+When a finalization completes, Remanence makes sure the append-only audit log
+holds exactly one `TapeSealed` fact for the tape and, for an operator's
+close-out, exactly one `OperationFinished` fact bound to the operator's
+identity in the sealed checkpoint. Each is decided by reading before appending,
+under the audit append lock, so a repeat after an interruption neither loses
+nor duplicates it. Both completion facts are fsynced whatever the configured
+audit fsync setting. The daemon holds an exclusive lock on its state directory
+(`state.lock`) for the whole life of the process.
 
 <!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 1dd451b2 -->
 ## The read path

@@ -113,9 +113,10 @@ checkpoint watermarks for a parity-enabled tape.
 **checkpoint journal** — the append-file
 (`checkpoints/<hyphenated-uuid>.remcheckpoint`) recording synchronized
 checkpoint EOD positions and replayable catalog projections. On parity tapes,
-Layer 3c orphan tails are discarded and the remaining checkpointed history
-must agree with the tape-file journal before append resume; SQLite is not
-commit authority.
+Layer 3c bundles beyond the last checkpoint watermark are kept as orphan
+evidence, and the journal refuses appends until they are reconciled with the
+physical tail; the checkpointed histories must agree with the tape-file
+journal before append resume. SQLite is not commit authority.
 
 **audit log** — append-only daily `.remaudit` segments recording every
 state-changing operation and who asked for it.

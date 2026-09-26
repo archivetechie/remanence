@@ -1579,7 +1579,7 @@ enum TapeCommand {
     /// Emit a catalog-less terminal-index object recovery report.
     RecoveryReport(TapeRecoveryReportArgs),
 
-    /// Run one destructive §18.4 fault-injected scratch-tape round-trip.
+    /// Run one destructive REM-PARITY freeze criterion 4 fault-injected scratch-tape round-trip.
     FreezeDrill(TapeFreezeDrillArgs),
 
     /// Run one read-only terminal triple-index verification/fallback leg.

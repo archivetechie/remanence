@@ -1,7 +1,7 @@
 #![no_main]
 
 //! Structured fuzz target for the REM-PARITY 1.0 catalog-less scan walk and
-//! overlay/validation (§12; freeze criterion §18.3). The fuzz input is
+//! overlay/validation (§12; REM-PARITY freeze criterion 3). The fuzz input is
 //! decoded into a compact synthetic tape (kind/damage tuples rendered into an
 //! in-memory raw tape), then the production scan entry runs over it. The
 //! property is robustness only — no panic, no hang, no unbounded
