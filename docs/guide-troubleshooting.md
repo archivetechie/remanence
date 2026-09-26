@@ -5,7 +5,7 @@ recurring theme: when the stack cannot prove what state the hardware is in,
 it stops and says so rather than guessing. Most of what looks like an outage
 is a fence doing its job.
 
-<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 6ed03ef0 -->
 ## Discovery finds no libraries
 
 `rem libraries` reporting `no tape libraries reachable on this host` has
@@ -42,7 +42,7 @@ For the daemon under systemd, grant the capability in the unit instead:
 check that `/dev/sg*` nodes exist at all (no HBA, no VTL, or the module
 is not loaded).
 
-<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-library/src/handle/tape_io/readiness.rs crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Media-readiness fences and quarantine
 
 Remanence classifies TEST UNIT READY results into an explicit readiness

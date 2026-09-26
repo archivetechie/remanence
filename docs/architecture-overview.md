@@ -348,7 +348,7 @@ nor duplicates it. Both completion facts are fsynced whatever the configured
 audit fsync setting. The daemon holds an exclusive lock on its state directory
 (`state.lock`) for the whole life of the process.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 6ed03ef0 -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and

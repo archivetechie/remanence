@@ -1,4 +1,4 @@
-<!-- code-anchor: crates/remanence-aead specs/publication/rem-encrypt-1-specification.md @ 7f39930d -->
+<!-- code-anchor: crates/remanence-aead specs/publication/rem-encrypt-1-specification.md @ 6ed03ef0 -->
 # Encryption explained
 
 REM-ENCRYPT seals a REM-OBJECT before it reaches any storage medium. LTO drives
