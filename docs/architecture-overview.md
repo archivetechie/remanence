@@ -3,7 +3,7 @@
 How the pieces of Remanence fit together, grounded in the code as it is
 today. For byte formats see the [tape layout reference](reference-tape-layout.md).
 
-<!-- code-anchor: Cargo.toml @ 1dd451b2 -->
+<!-- code-anchor: Cargo.toml @ 7f39930d -->
 ## The layer model
 
 Remanence is organized as a strict stack. Each layer only knows about the
@@ -85,7 +85,7 @@ marks it uncalibrated before the first media-modifying command of a load —
 see [Read-order planning](#read-order-planning) below for what that epoch
 fences.
 
-<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-library/tests/platform_dependency_guard.rs .github/workflows/ci.yml @ 7f39930d -->
 ### The platform seam
 
 `remanence-scsi` and `remanence-library` are the reusable tape-platform
@@ -185,7 +185,7 @@ ordinary clean-break refusal.
 The recovery/import boundary and its deliberately identity-only authority are
 described in [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md).
 
-<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 1dd451b2 -->
+<!-- code-anchor: proto/layer5.proto crates/remanence-api/src/lib.rs crates/remanence-daemon/src/lib.rs @ 7f39930d -->
 ## Layer 5: daemon and API
 
 The gRPC contract (package `remanence.api.v1`, defined in
@@ -232,7 +232,7 @@ rules that keep new work out of the former monoliths are documented in
 
 *Fig. 2 — Layer 5 topology: clients reach `rem-daemon` over the unix socket or mTLS TCP, every RPC passes the default-deny role check, and one actor per mounted drive serializes hardware access; `rem-debug` keeps an allowlist-gated direct SCSI path for break-glass work.*
 
-<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-api/src/mount.rs crates/remanence-api/src/pool_write.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/index.rs @ 7f39930d -->
 ## The write path
 
 What happens when an orchestrator writes an object:
@@ -348,7 +348,7 @@ nor duplicates it. Both completion facts are fsynced whatever the configured
 audit fsync setting. The daemon holds an exclusive lock on its state directory
 (`state.lock`) for the whole life of the process.
 
-<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-api/src/read_core.rs crates/remanence-api/src/write_owner.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 7f39930d -->
 ## The read path
 
 `OpenReadSession` resolves the object to a tape, mounts it, and

@@ -15,7 +15,7 @@ documents and published artifacts themselves.
 
 ---
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-parity/src/sidecar.rs crates/remanence-parity/src/parity_map.rs crates/remanence-parity/src/index_separation.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/tape_index.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-parity/src/sidecar.rs crates/remanence-parity/src/parity_map.rs crates/remanence-parity/src/index_separation.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/tape_index.rs @ 7f39930d -->
 ## Tape layer (REM-PARITY)
 
 ### 1. The bootstrap block — `schema_major`

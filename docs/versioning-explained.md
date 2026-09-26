@@ -1,4 +1,4 @@
-<!-- code-anchor: specs/publication tools/check_spec_versioning.py @ 1dd451b2 -->
+<!-- code-anchor: specs/publication tools/check_spec_versioning.py @ 7f39930d -->
 # How These Formats Change — and What Never Does
 
 *A plain-language companion to the versioning and revision policy of the
