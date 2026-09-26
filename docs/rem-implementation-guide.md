@@ -73,8 +73,9 @@ collects the practice that keeps a reader running.
 Stored bytes come off removable media and networks, in both representations.
 An encrypted copy's header and key frame are parsed before anything has been
 authenticated, and a plaintext copy is never authenticated at all (REM-OBJECT
-§12.6). Even the values a catalog or bootstrap supplies, `chunk_size` and the
-block count, are only as trustworthy as that catalog.
+§12.6). Even `chunk_size` and the block count, which come from a catalog or,
+on tape, from the bootstrap and the Object recovery row (REM-OBJECT §4.2), are
+only as trustworthy as their source.
 
 We recommend that a reader treat every stored byte as untrusted input.
 `chunk_size` and the block count decide how the bytes are read, so a wrong
@@ -153,7 +154,7 @@ ordinal invariants of a replica's payload as its rows stream, so that reading
 or writing the inventory needs no allocation proportional to the whole tape.
 The invariants are the same either way.
 
-Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations; REM-OBJECT
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations; REM-OBJECT
 §12.9, Hostile-Input Posture; REM-ENCRYPT §12.9, Envelope Hostile-Input
 Discharge; and REM-PARITY §10.2, Structural Rows.
 
@@ -388,8 +389,8 @@ manifest entry, passing every payload byte through a running SHA-256 check.
 Emit tar EOF and the final zero fill, and confirm that the number of blocks
 written equals the plan. Only then report the layout, for the catalog
 (section 5.1). The specification requires the plan and the output to agree,
-and requires honesty about failure: "Planner and Writer MUST share the same
-sizing rules such that the planned layout is byte-exact." and "A failed object
+and requires honesty about failure: "The Planner and the Builder MUST share
+the sizing rules that make the planned layout byte-exact." and "A failed object
 MUST NOT be reported as complete." (REM-OBJECT §4.9).
 
 Every digest in the chain can be computed over bytes that are already flowing
@@ -399,7 +400,7 @@ emitted stream as it is written; for a plaintext copy the same value is its
 encrypted copy, we recommend computing its `stored_digest` in the same way,
 over the envelope bytes as the sealer emits them.
 
-Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations; REM-OBJECT
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations; REM-OBJECT
 §7.2, Write-Path Verification (No Extra Reads); and REM-ENCRYPT §7.2,
 Write-Path Verification.
 
@@ -413,11 +414,11 @@ We recommend writing through a block sink that reports the outcome of every
 block write, and treating a short write or a hard end of medium as the end of
 that object. How the writer then recovers, for example by starting the object
 again on another tape, is its own choice. The failure itself is a requirement
-of the specification: "A Writer MUST fail the object when a block write
+of the specification: "A Builder MUST fail the object when a block write
 commits fewer bytes than the full block or reports hard end-of-medium."
 (REM-OBJECT §4.9).
 
-Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations.
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations.
 
 ### 4.3. Re-read each copy before recording it durable
 
@@ -467,9 +468,9 @@ there and how to keep it.
 
 A reader needs `chunk_size` and the block count from outside the object; the
 specification requires that "A Reader is given the object's `chunk_size` and
-block count out of band (catalog, bootstrap, or filemark map) and MUST process
-exactly that many blocks" (REM-OBJECT §4.2). A scrubber needs `stored_digest`,
-which is never stored inside the copy.
+block count out of band and MUST process exactly that many blocks" (REM-OBJECT
+§4.2). A scrubber needs `stored_digest`, which is never stored inside the
+copy.
 
 We recommend recording, for each copy, its location, its representation, its
 `stored_digest`, its `stored_size_bytes` or block count, and its `chunk_size`.
@@ -487,7 +488,7 @@ parsing the envelope's own header and key frame, which is where a reader
 takes them from.
 
 Serves REM-OBJECT §8.1, The Byte-Format Contract; REM-OBJECT §3.4,
-Representation Detection; REM-OBJECT §4.9, Writer, Planner, and Reader
+Representation Detection; REM-OBJECT §4.9, Builder, Planner, and Reader
 Obligations; REM-OBJECT §7.2, Write-Path Verification (No Extra Reads); and
 REM-ENCRYPT §8.1, Backend Records for Encrypted Copies.
 
@@ -521,10 +522,10 @@ Serves REM-OBJECT §6, Partial File Restore.
 
 A hardlink entry holds none of its own content. Its size is 0 and its
 `first_chunk_lba` is `null`. A partial restore of a hardlinked name uses its
-primary's coordinates, as the specification requires: "PFR on a hardlinked
-name MUST first resolve its `link_target` to the primary entry and then use
-the **primary's** `first_chunk_lba` and `size_bytes` for all arithmetic
-below." (REM-OBJECT §6).
+primary's coordinates, as the specification requires: "For PFR on a
+hardlinked name, a Restorer MUST first resolve its `link_target` to the
+primary entry and then use the **primary's** `first_chunk_lba` and
+`size_bytes` for all arithmetic below." (REM-OBJECT §6).
 
 A per-file index that serves restores from catalog rows, rather than from the
 full manifest, should keep every hardlink resolvable. The hardlink's row
@@ -852,9 +853,9 @@ believes they were verified.
 We recommend making the integrity-verifying restore mode the default, and
 offering salvage only as a mode the operator selects deliberately and that is
 clearly labelled in every report. The specification forbids the silent case:
-"An implementation MUST NOT silently fall back to salvage." (REM-OBJECT §4.9).
+"A Reader MUST NOT silently fall back to salvage." (REM-OBJECT §4.9).
 
-Serves REM-OBJECT §4.9, Writer, Planner, and Reader Obligations.
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations.
 
 ### 7.5. Expose typed errors
 
@@ -863,8 +864,8 @@ from a failing drive, and cannot act on either.
 
 We recommend that a tool expose typed errors equivalent to the taxonomy of
 REM-OBJECT §11. The specification makes one distinction a requirement: "I/O
-failures MUST remain distinguishable from format violations so callers can
-tell storage problems from invalid objects." (REM-OBJECT §11).
+failures MUST remain distinguishable from format violations." (REM-OBJECT
+§11).
 
 A tape tool should likewise expose typed errors equivalent to the taxonomy of
 REM-PARITY §15. That specification makes the same distinction and one more:
@@ -1493,14 +1494,14 @@ without rewriting the object.
 
 ### 12.1. Choose a chunk size the drives can handle
 
-The format sets no upper bound on `chunk_size`, and on tape the body block is
-the tape block. A drive that cannot write or read blocks of that size cannot
+The format sets no upper bound on `chunk_size`, and on tape `chunk_size` is the
+tape block size. A drive that cannot write or read blocks of that size cannot
 handle the object.
 
 We recommend choosing `chunk_size` within the block-size limits of every
 drive that will write or read the tape, now and in the foreseeable future.
 
-Serves REM-OBJECT §4.2, Body Blocks and `chunk_size`.
+Serves REM-OBJECT §4.2, Chunks and `chunk_size`.
 
 ### 12.2. Report attributes that could not be captured
 
@@ -1523,7 +1524,7 @@ A writer that re-captures an object from a previously restored tree should
 carry forward, unchanged, every `ext` member of the source object's manifest
 that it does not recognise.
 
-Serves REM-OBJECT §4.7.5, Extension Containers, and REM-OBJECT §4.9, Writer,
+Serves REM-OBJECT §4.7.5, Extension Containers, and REM-OBJECT §4.9, Builder,
 Planner, and Reader Obligations.
 
 ### 12.4. Decide deliberately when to wrap small files
