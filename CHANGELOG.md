@@ -59,7 +59,30 @@ per-release summaries.
   nothing reads. CI no longer installs `protoc`, and it sets `PROTOC` to a
   path that does not exist, so a regression fails the build.
   The README and quickstart now also state the one run-time requirement:
-  `bsdtar`, for `rem archive build` and `rem archive extract`.
+  `bsdtar`, for `rem archive build` and `rem archive extract` when a
+  `.remwrap.tar` wrapper is involved.
+- `rem archive build` and `rem archive extract` look for `bsdtar` only when a
+  `.remwrap.tar` wrapper is involved. A build or scan looks once its plan holds
+  a wrapper. A whole-object extract looks before it writes anything when the
+  object holds one, so a host without `bsdtar` fails the command before the
+  destination changes; it previously restored the files and then exited 1.
+  Extract now unwraps only the object's own wrappers and leaves any other
+  `.remwrap.tar` already under `--dest` as it is. `--no-unwrap`, range and
+  blob-member extracts never need `bsdtar`.
+- `tar_engine` is now `null` when no wrapper was involved, in the build
+  report's `ingest`, the scan report, the `--manifest-out` manifest and the
+  extract report's `unwrap`. A `--map` manifest's `tar_engine` is always
+  `null`; it previously named a synthetic `source-map` engine. Under
+  `--no-unwrap` the `unwrap` report now carries `tar_engine: null`. A wrapper
+  index still always records its engine.
+- Every `rem archive extract` JSON report gains `warnings`, an array of reader
+  warning names. Whole-object and plaintext `--path`/`--range` extracts report
+  `MissingManifest` for an object that reaches tar EOF without its manifest
+  (REM-OBJECT §4.9). Encrypted range and blob-member extracts never read the
+  manifest, and their array is always empty.
+- The REM-ENCRYPT metadata decoder now rejects a negative integer anywhere in
+  the value of an unknown key with `InvalidCborEncoding`, as §5.6 requires. It
+  previously skipped one. The published vectors are unaffected.
 
 ## v0.1.0 — 2026-08-07
 

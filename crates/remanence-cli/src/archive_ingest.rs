@@ -6,6 +6,7 @@
 //! mainstream tar engine, deriving sibling `.remwrap.idx` entries for blobs,
 //! and applying one xattr capture policy to native and wrapped entries.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -68,7 +69,8 @@ pub(crate) struct MaterializedArchiveInputs {
 pub(crate) struct IngestReport {
     pub(crate) ruleset: Option<RulesetReport>,
     pub(crate) xattr_policy: XattrPolicyReport,
-    pub(crate) tar_engine: TarEngineReport,
+    /// `None` (JSON `null`) when the plan holds no wrapper, so bsdtar was not needed.
+    pub(crate) tar_engine: Option<TarEngineReport>,
     pub(crate) scan: ScanReport,
     pub(crate) lints: Vec<RulesetLint>,
 }
@@ -158,7 +160,8 @@ pub(crate) struct BlobSuggestion {
 pub(crate) struct CustomerManifest {
     pub(crate) format: &'static str,
     pub(crate) ruleset: Option<RulesetReport>,
-    pub(crate) tar_engine: TarEngineReport,
+    /// `None` (JSON `null`) when the build created no wrapper.
+    pub(crate) tar_engine: Option<TarEngineReport>,
     pub(crate) entries: Vec<CustomerManifestEntry>,
     pub(crate) exclusions: Vec<ScanCluster>,
 }
@@ -280,7 +283,7 @@ struct FileKey {
 struct ProcessContext<'a> {
     ruleset: Option<&'a Ruleset>,
     xattr_policy: &'a XattrPolicy,
-    tar_engine: &'a TarEngineReport,
+    tar_engine: &'a LazyTarEngine,
     tempdir: &'a Path,
     no_index: bool,
 }
@@ -288,6 +291,25 @@ struct ProcessContext<'a> {
 impl<'a> ProcessContext<'a> {
     fn with_no_index(self, no_index: bool) -> Self {
         Self { no_index, ..self }
+    }
+}
+
+/// The tar engine, detected when a wrapper is first needed, so a plan without
+/// one runs on a host that has no bsdtar.
+#[derive(Debug, Default)]
+struct LazyTarEngine(OnceCell<TarEngineReport>);
+
+impl LazyTarEngine {
+    fn get(&self) -> Result<&TarEngineReport, String> {
+        if let Some(engine) = self.0.get() {
+            return Ok(engine);
+        }
+        let engine = detect_tar_engine()?;
+        Ok(self.0.get_or_init(|| engine))
+    }
+
+    fn into_detected(self) -> Option<TarEngineReport> {
+        self.0.into_inner()
     }
 }
 
@@ -322,7 +344,7 @@ pub(crate) fn materialize_inputs(
     no_index: bool,
     tuning: ScanTuning,
 ) -> Result<MaterializedArchiveInputs, String> {
-    let tar_engine = detect_tar_engine()?;
+    let tar_engine = LazyTarEngine::default();
     let ruleset = match rules_path {
         Some(path) => Some(load_ruleset(path)?),
         None => None,
@@ -361,6 +383,7 @@ pub(crate) fn materialize_inputs(
         .filter(|cluster| cluster.reason == "exclude-rule")
         .cloned()
         .collect();
+    let tar_engine = tar_engine.into_detected();
     let manifest = CustomerManifest {
         format: "remanence-customer-manifest-v1",
         ruleset: ruleset_report.clone(),
@@ -390,7 +413,7 @@ pub(crate) fn scan_only_report(
     no_index: bool,
     tuning: ScanTuning,
 ) -> Result<IngestReport, String> {
-    let tar_engine = detect_tar_engine()?;
+    let tar_engine = LazyTarEngine::default();
     let ruleset = match rules_path {
         Some(path) => Some(load_ruleset(path)?),
         None => None,
@@ -407,6 +430,11 @@ pub(crate) fn scan_only_report(
     for input in input_paths {
         scan_input(input, context, &mut state)?;
     }
+    // A scan creates no wrapper, but the build it previews will need bsdtar
+    // once the plan holds one.
+    if state.totals.wrapped_entries != 0 || state.totals.blob_entries != 0 {
+        tar_engine.get()?;
+    }
     state.record_hardlink_splits();
     let lints = ruleset
         .as_ref()
@@ -416,7 +444,7 @@ pub(crate) fn scan_only_report(
     Ok(IngestReport {
         ruleset: ruleset_report,
         xattr_policy: xattr_policy.report(),
-        tar_engine,
+        tar_engine: tar_engine.into_detected(),
         scan: state.scan_report(tuning),
         lints,
     })
@@ -455,28 +483,67 @@ pub(crate) fn write_customer_manifest(
         .map_err(|error| format!("sync manifest {}: {error}", path.display()))
 }
 
-pub(crate) fn unwrap_remwraps(root: &Path, overwrite: bool) -> Result<UnwrapReport, String> {
-    let tar_engine = detect_tar_engine()?;
+/// The `.remwrap.tar` members a whole-object restore writes, each with the
+/// `.remwrap.idx` the object carries beside it, and the tar engine detected
+/// for them.
+#[derive(Debug)]
+pub(crate) struct UnwrapPlan {
+    tar_engine: TarEngineReport,
+    wrappers: Vec<(String, Option<String>)>,
+}
+
+/// Plan the unwrap of a restore that writes `restored_files` (archive paths).
+/// Extract calls this before it writes anything, so a host without bsdtar fails
+/// before the destination changes. `None` means the object holds no wrapper.
+pub(crate) fn plan_unwrap<'a>(
+    restored_files: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<UnwrapPlan>, String> {
+    let files = restored_files.into_iter().collect::<BTreeSet<_>>();
     let mut wrappers = Vec::new();
-    collect_remwrap_files(root, &mut wrappers)?;
-    wrappers.sort();
+    for wrapper in files.iter().filter(|path| path.ends_with(WRAP_TAR_SUFFIX)) {
+        let idx = remwrap_index_path(wrapper)?;
+        let idx = files.contains(idx.as_str()).then_some(idx);
+        wrappers.push((wrapper.to_string(), idx));
+    }
+    if wrappers.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(UnwrapPlan {
+        tar_engine: detect_tar_engine()?,
+        wrappers,
+    }))
+}
+
+/// Unwrap exactly the planned wrappers under `root`. Other `.remwrap.tar`
+/// files already in the destination are not this restore's and stay as they are.
+pub(crate) fn unwrap_remwraps(
+    root: &Path,
+    overwrite: bool,
+    plan: Option<UnwrapPlan>,
+) -> Result<UnwrapReport, String> {
     let mut report = UnwrapReport {
         wrappers_unwrapped: 0,
         literal_entries_removed: 0,
-        tar_engine,
+        tar_engine: None,
     };
-    for wrapper in wrappers {
-        extract_wrapper_tar(&report.tar_engine, root, &wrapper, overwrite)?;
+    let Some(plan) = plan else {
+        return Ok(report);
+    };
+    for (wrapper, idx) in &plan.wrappers {
+        let wrapper = root.join(wrapper);
+        extract_wrapper_tar(&plan.tar_engine, root, &wrapper, overwrite)?;
         fs::remove_file(&wrapper)
             .map_err(|error| format!("remove wrapper {}: {error}", wrapper.display()))?;
         report.literal_entries_removed += 1;
-        if let Some(idx) = remwrap_index_filesystem_path(&wrapper).filter(|idx| idx.exists()) {
+        if let Some(idx) = idx {
+            let idx = root.join(idx);
             fs::remove_file(&idx)
                 .map_err(|error| format!("remove wrapper index {}: {error}", idx.display()))?;
             report.literal_entries_removed += 1;
         }
         report.wrappers_unwrapped += 1;
     }
+    report.tar_engine = Some(plan.tar_engine);
     Ok(report)
 }
 
@@ -484,7 +551,8 @@ pub(crate) fn unwrap_remwraps(root: &Path, overwrite: bool) -> Result<UnwrapRepo
 pub(crate) struct UnwrapReport {
     pub(crate) wrappers_unwrapped: u64,
     pub(crate) literal_entries_removed: u64,
-    pub(crate) tar_engine: TarEngineReport,
+    /// `None` (JSON `null`) when there was no wrapper to unwrap.
+    pub(crate) tar_engine: Option<TarEngineReport>,
 }
 
 pub(crate) fn resolve_blob_member_from_index(
@@ -1023,7 +1091,7 @@ fn wrap_leaf(
     let tar_path = next_temp_path(context.tempdir, &mut state.wrapper_counter, "wrap.tar");
     let name = path.file_name().unwrap_or_else(|| OsStr::new("entry"));
     create_wrapper_tar(
-        context.tar_engine,
+        context.tar_engine.get()?,
         path.parent().unwrap_or_else(|| Path::new(".")),
         name,
         &tar_path,
@@ -1064,7 +1132,7 @@ fn materialize_blob(
     );
     let tar_path = next_temp_path(context.tempdir, &mut state.wrapper_counter, "blob.tar");
     create_wrapper_tar(
-        context.tar_engine,
+        context.tar_engine.get()?,
         root,
         relative.as_os_str(),
         &tar_path,
@@ -1098,7 +1166,7 @@ fn materialize_root_blob(
     let wrapper_archive_path = format!("{}{}", sanitized_component(name), WRAP_TAR_SUFFIX);
     let tar_path = next_temp_path(context.tempdir, &mut state.wrapper_counter, "blob.tar");
     create_wrapper_tar(
-        context.tar_engine,
+        context.tar_engine.get()?,
         dir.parent().unwrap_or_else(|| Path::new(".")),
         name,
         &tar_path,
@@ -1130,7 +1198,7 @@ fn add_blob_outputs(
     state: &mut PlannerState,
 ) -> Result<(), String> {
     let (tar_size, tar_hash) = hash_for_manifest(tar_path)?;
-    let index = build_wrap_index(tar_path, context.tar_engine)?;
+    let index = build_wrap_index(tar_path, context.tar_engine.get()?)?;
     state.record_blob(rel_text, tar_size, reason);
     state.files.push(read_archive_build_file(
         tar_path,
@@ -2603,27 +2671,6 @@ fn round_up_512(value: u64) -> Result<u64, String> {
         .ok_or_else(|| "tar size overflows while rounding to 512 bytes".to_string())
 }
 
-fn collect_remwrap_files(root: &Path, wrappers: &mut Vec<PathBuf>) -> Result<(), String> {
-    for entry in fs::read_dir(root).map_err(|error| format!("read {}: {error}", root.display()))? {
-        let entry = entry.map_err(|error| format!("read {}: {error}", root.display()))?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|error| format!("stat restore path {}: {error}", path.display()))?;
-        if metadata.is_dir() {
-            collect_remwrap_files(&path, wrappers)?;
-        } else if metadata.is_file()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.ends_with(WRAP_TAR_SUFFIX))
-                .unwrap_or(false)
-        {
-            wrappers.push(path);
-        }
-    }
-    Ok(())
-}
-
 impl PlannerState {
     fn record_native(&mut self, rel_text: &str, bytes: u64) {
         self.totals.native_entries = self.totals.native_entries.saturating_add(1);
@@ -3045,14 +3092,6 @@ pub(crate) fn remwrap_index_path(wrapper_path: &str) -> Result<String, String> {
         .strip_suffix(WRAP_TAR_SUFFIX)
         .map(|stem| format!("{stem}{WRAP_INDEX_SUFFIX}"))
         .ok_or_else(|| format!("wrapper path {wrapper_path:?} does not end in {WRAP_TAR_SUFFIX}"))
-}
-
-fn remwrap_index_filesystem_path(wrapper_path: &Path) -> Option<PathBuf> {
-    let file_name = wrapper_path.file_name()?.to_str()?;
-    let stem = file_name.strip_suffix(WRAP_TAR_SUFFIX)?;
-    let mut idx = wrapper_path.to_path_buf();
-    idx.set_file_name(format!("{stem}{WRAP_INDEX_SUFFIX}"));
-    Some(idx)
 }
 
 fn sha256_bytes_local(bytes: &[u8]) -> [u8; 32] {

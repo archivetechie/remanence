@@ -63,8 +63,8 @@ use remanence_format::{
     read_rem_tar_object, write_rem_tar_object_from_readers, ArchiveGapCause, ArchiveGapRange,
     ArchiveReader, BodyLba, DamageRange, DamageStatus, EntryKind, FormatError, ProbeConfidence,
     ProbeResult, RemTarEntryType, RemTarFileLayout, RemTarFileSpec, RemTarFileStream,
-    RemTarObjectLayout, RemTarObjectOptions, RemTarReadObject, SourceRequirement, FORMAT_ID,
-    MANIFEST_PATH,
+    RemTarObjectLayout, RemTarObjectOptions, RemTarReadObject, RemTarReadWarning,
+    SourceRequirement, FORMAT_ID, MANIFEST_PATH,
 };
 use remanence_format_driver::{ForeignFormatAdapter, ForeignFormatRegistry};
 #[cfg(target_os = "linux")]
@@ -12646,6 +12646,16 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
             range,
         );
     }
+    let unwrap_plan = if args.no_unwrap {
+        None
+    } else {
+        let scan = scan_plaintext_rem_object_entry_locators(path, chunk_size)?;
+        archive_ingest::plan_unwrap(restored_file_paths(
+            scan.entries
+                .iter()
+                .map(|entry| (entry.entry_type, entry.path.as_str())),
+        ))?
+    };
     let report = remanence_stream::restore_object_to_directory(
         &mut source,
         chunk_size,
@@ -12666,8 +12676,28 @@ fn extract_plaintext_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_digest,
     };
     let mut value = archive_extract_report_json(&context, &report);
-    attach_unwrap_report(&mut value, &args.dest, args.overwrite, args.no_unwrap)?;
+    attach_unwrap_report(
+        &mut value,
+        &args.dest,
+        args.overwrite,
+        args.no_unwrap,
+        unwrap_plan,
+    )?;
     Ok(value)
+}
+
+/// Paths a restore writes as files; only these can be a `.remwrap.tar` to unwrap
+/// or the `.remwrap.idx` beside one.
+fn restored_file_paths<'a>(
+    entries: impl Iterator<Item = (RemTarEntryType, &'a str)>,
+) -> impl Iterator<Item = &'a str> {
+    entries.filter_map(|(entry_type, path)| {
+        matches!(
+            entry_type,
+            RemTarEntryType::Regular | RemTarEntryType::Hardlink
+        )
+        .then_some(path)
+    })
 }
 
 fn encrypted_stream_key(
@@ -12748,6 +12778,16 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
     if inner_object_id != envelope.header.object_id {
         return Err("decrypted inner object_id does not match encrypted header".to_string());
     }
+    let unwrap_plan = if args.no_unwrap {
+        None
+    } else {
+        archive_ingest::plan_unwrap(restored_file_paths(
+            inner
+                .entries
+                .iter()
+                .map(|entry| (entry.entry_type, entry.path.as_str())),
+        ))?
+    };
     let mut restore_source = VecBlockSource::new(blocks);
     let report = remanence_stream::restore_object_to_directory(
         &mut restore_source,
@@ -12769,7 +12809,13 @@ fn extract_encrypted_archive_object_file(args: &ArchiveExtractArgs) -> Result<Va
         stored_digest: inspected.stored_digest,
     };
     let mut value = archive_extract_report_json(&context, &report);
-    attach_unwrap_report(&mut value, &args.dest, args.overwrite, args.no_unwrap)?;
+    attach_unwrap_report(
+        &mut value,
+        &args.dest,
+        args.overwrite,
+        args.no_unwrap,
+        unwrap_plan,
+    )?;
     Ok(value)
 }
 
@@ -12778,12 +12824,13 @@ fn attach_unwrap_report(
     dest: &Path,
     overwrite: bool,
     no_unwrap: bool,
+    unwrap_plan: Option<archive_ingest::UnwrapPlan>,
 ) -> Result<(), String> {
     if no_unwrap {
-        value["unwrap"] = json!({ "enabled": false });
+        value["unwrap"] = json!({ "enabled": false, "tar_engine": null });
         return Ok(());
     }
-    let report = archive_ingest::unwrap_remwraps(dest, overwrite)?;
+    let report = archive_ingest::unwrap_remwraps(dest, overwrite, unwrap_plan)?;
     value["unwrap"] = serde_json::to_value(report)
         .map_err(|error| format!("serialize unwrap report: {error}"))?;
     value["unwrap"]["enabled"] = json!(true);
@@ -12890,6 +12937,8 @@ fn blob_member_extract_report_json(context: &BlobMemberExtractReportContext<'_>)
         "blob_stored_range_start": context.blob_stored_range_start,
         "blob_stored_range_len": context.blob_stored_range_len,
         "bytes_written": context.bytes_written,
+        // The member is read through the entry locators; no restore-mode read runs.
+        "warnings": [],
     })
 }
 
@@ -13462,6 +13511,7 @@ fn extract_plaintext_archive_range_file(
         first_authenticated_chunk: None,
         stored_range_start: None,
         stored_range_len: None,
+        warnings: &object.warnings,
     };
     Ok(archive_range_extract_report_json(&context))
 }
@@ -13520,6 +13570,8 @@ fn extract_encrypted_archive_range_file(
         first_authenticated_chunk: range_result.envelope.first_chunk,
         stored_range_start: range_result.envelope.stored_range_start,
         stored_range_len: Some(range_result.envelope.stored_range_len),
+        // Only the covering chunks are decrypted; no restore-mode read runs.
+        warnings: &[],
     };
     Ok(archive_range_extract_report_json(&context))
 }
@@ -13686,7 +13738,18 @@ fn archive_extract_report_json(
         "bytes_written": report.bytes_written,
         "skipped_xattrs": &report.skipped_xattrs,
         "applied_privileged_xattrs": &report.applied_privileged_xattrs,
+        "warnings": read_warning_names(&report.stream.warnings),
     })
+}
+
+/// Report names of the non-fatal warnings a restore-mode read returned.
+fn read_warning_names(warnings: &[RemTarReadWarning]) -> Vec<&'static str> {
+    warnings
+        .iter()
+        .map(|warning| match warning {
+            RemTarReadWarning::MissingManifest => "MissingManifest",
+        })
+        .collect()
 }
 
 struct ArchiveRangeExtractReportContext<'a> {
@@ -13709,6 +13772,8 @@ struct ArchiveRangeExtractReportContext<'a> {
     first_authenticated_chunk: Option<u64>,
     stored_range_start: Option<u64>,
     stored_range_len: Option<u64>,
+    /// Warnings of the restore-mode read; empty when the mode runs none.
+    warnings: &'a [RemTarReadWarning],
 }
 
 fn archive_range_extract_report_json(context: &ArchiveRangeExtractReportContext<'_>) -> Value {
@@ -13734,6 +13799,7 @@ fn archive_range_extract_report_json(context: &ArchiveRangeExtractReportContext<
         "first_authenticated_chunk": context.first_authenticated_chunk,
         "stored_range_start": context.stored_range_start,
         "stored_range_len": context.stored_range_len,
+        "warnings": read_warning_names(context.warnings),
     })
 }
 
@@ -20665,7 +20731,9 @@ tape_catalog_dir = "{0}/cache/tapes"
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["format"], "remanence-customer-manifest-v1");
-        assert_eq!(manifest["tar_engine"]["program"], "source-map");
+        // A map build never creates a wrapper.
+        assert!(manifest.as_object().unwrap().contains_key("tar_engine"));
+        assert!(manifest["tar_engine"].is_null(), "{manifest}");
         let manifest_paths = manifest["entries"]
             .as_array()
             .unwrap()
@@ -21562,6 +21630,7 @@ blob Project/Render Files/
         assert_eq!(report["object_id"], "object-rules");
         assert_eq!(report["ingest"]["scan"]["totals"]["blob_entries"], 1);
         assert_eq!(report["ingest"]["scan"]["totals"]["excluded_entries"], 2);
+        assert_eq!(report["ingest"]["tar_engine"]["program"], "bsdtar");
         let files = report["files"].as_array().expect("files array");
         assert!(files
             .iter()
@@ -21575,6 +21644,7 @@ blob Project/Render Files/
         let manifest: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["format"], "remanence-customer-manifest-v1");
+        assert_eq!(manifest["tar_engine"]["program"], "bsdtar");
         assert!(manifest["entries"].as_array().unwrap().iter().any(|entry| {
             entry["path"] == "Project/Render Files/frame.dat"
                 && entry["sha256"] == bytes_to_hex(&sha256_bytes(b"render-frame"))
@@ -21588,6 +21658,7 @@ blob Project/Render Files/
         let idx = read.entry("Project/Render Files.remwrap.idx").unwrap();
         let index: serde_json::Value = serde_json::from_slice(&idx.data).unwrap();
         assert_eq!(index["format"], "remanence-remwrap-idx-v1");
+        assert_eq!(index["tar_engine"]["program"], "bsdtar");
         assert!(index["entries"].as_array().unwrap().iter().any(|entry| {
             entry["path"] == "Project/Render Files/frame.dat"
                 && entry["sha256"] == bytes_to_hex(&sha256_bytes(b"render-frame"))
@@ -21611,6 +21682,8 @@ blob Project/Render Files/
         let extract: serde_json::Value = serde_json::from_str(&stdout).expect("extract json");
         assert_eq!(extract["unwrap"]["enabled"], true);
         assert_eq!(extract["unwrap"]["wrappers_unwrapped"], 1);
+        assert_eq!(extract["unwrap"]["tar_engine"]["program"], "bsdtar");
+        assert_eq!(extract["warnings"], json!([]));
         assert_eq!(
             fs::read(restore_dir.join("keep.mov")).unwrap(),
             b"deliverable"
@@ -21643,6 +21716,11 @@ blob Project/Render Files/
         assert!(stderr.is_empty(), "{stderr}");
         let literal: serde_json::Value = serde_json::from_str(&stdout).expect("literal json");
         assert_eq!(literal["unwrap"]["enabled"], false);
+        assert!(literal["unwrap"]
+            .as_object()
+            .unwrap()
+            .contains_key("tar_engine"));
+        assert!(literal["unwrap"]["tar_engine"].is_null(), "{literal}");
         assert!(literal_dir
             .join("Project/Render Files.remwrap.tar")
             .exists());
@@ -21671,6 +21749,7 @@ blob Project/Render Files/
         assert!(stderr.is_empty(), "{stderr}");
         let member: serde_json::Value = serde_json::from_str(&stdout).expect("member json");
         assert_eq!(member["mode"], "blob-member");
+        assert_eq!(member["warnings"], json!([]));
         assert_eq!(member["range_method"], "rem-object-entry-range");
         assert_eq!(member["idx_entry"], "Project/Render Files.remwrap.idx");
         assert_eq!(member["blob_range_len"], 12);
@@ -21683,6 +21762,249 @@ blob Project/Render Files/
             fs::read(member_dir.join("Project/Render Files/frame.dat")).unwrap(),
             b"render-frame"
         );
+    }
+
+    #[test]
+    fn archive_build_and_extract_without_wrappers_report_null_tar_engine() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-rem-object-no-wrapper")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("Cache")).unwrap();
+        fs::write(input_dir.join("keep.mov"), b"deliverable").unwrap();
+        fs::write(input_dir.join("Cache/drop.tmp"), b"cache").unwrap();
+        let rules = temp.path().join("plain.rules");
+        fs::write(&rules, "exclude Cache/\n").unwrap();
+        let out_path = temp.path().join("plain.rem-object");
+        let manifest_path = temp.path().join("plain-manifest.json");
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--manifest-out",
+            manifest_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-plain",
+            "--caller-object-id",
+            "caller-plain",
+            "--manifest-file-id",
+            "manifest-plain",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("build json");
+        assert_eq!(report["ingest"]["scan"]["totals"]["wrapped_entries"], 0);
+        assert_eq!(report["ingest"]["scan"]["totals"]["blob_entries"], 0);
+        assert!(report["ingest"]
+            .as_object()
+            .unwrap()
+            .contains_key("tar_engine"));
+        assert!(report["ingest"]["tar_engine"].is_null(), "{report}");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(manifest.as_object().unwrap().contains_key("tar_engine"));
+        assert!(manifest["tar_engine"].is_null(), "{manifest}");
+
+        let restore_dir = temp.path().join("restore");
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let extract: serde_json::Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(extract["unwrap"]["enabled"], true);
+        assert_eq!(extract["unwrap"]["wrappers_unwrapped"], 0);
+        assert!(extract["unwrap"]
+            .as_object()
+            .unwrap()
+            .contains_key("tar_engine"));
+        assert!(extract["unwrap"]["tar_engine"].is_null(), "{extract}");
+        assert_eq!(extract["warnings"], json!([]));
+        assert_eq!(
+            fs::read(restore_dir.join("keep.mov")).unwrap(),
+            b"deliverable"
+        );
+    }
+
+    #[test]
+    fn archive_extract_unwraps_only_the_wrappers_it_restored() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-unwrap-own-wrappers")
+            .tempdir()
+            .unwrap();
+        let input_dir = temp.path().join("inputs");
+        fs::create_dir_all(input_dir.join("Cache")).unwrap();
+        fs::write(input_dir.join("Cache/blob.bin"), b"blob payload").unwrap();
+        let rules = temp.path().join("blob.rules");
+        fs::write(&rules, "blob Cache/\n").unwrap();
+        let out_path = temp.path().join("own.rem-object");
+        let (code, _stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "build",
+            "--inputs",
+            input_dir.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+            "--object-id",
+            "object-own",
+            "--caller-object-id",
+            "caller-own",
+            "--manifest-file-id",
+            "manifest-own",
+            "--timestamp",
+            "2026-01-01T00:00:00Z",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+
+        // The destination already holds a wrapper and index this object does
+        // not carry, such as ones an earlier `--no-unwrap` extract left.
+        let restore_dir = temp.path().join("restore");
+        fs::create_dir_all(&restore_dir).unwrap();
+        fs::write(restore_dir.join("Old.remwrap.tar"), b"not ours").unwrap();
+        fs::write(restore_dir.join("Old.remwrap.idx"), b"not ours either").unwrap();
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            out_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let extract: serde_json::Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(extract["unwrap"]["wrappers_unwrapped"], 1);
+        assert_eq!(extract["unwrap"]["literal_entries_removed"], 2);
+        assert_eq!(
+            fs::read(restore_dir.join("Cache/blob.bin")).unwrap(),
+            b"blob payload"
+        );
+        assert!(!restore_dir.join("Cache.remwrap.tar").exists());
+        assert!(!restore_dir.join("Cache.remwrap.idx").exists());
+        assert_eq!(
+            fs::read(restore_dir.join("Old.remwrap.tar")).unwrap(),
+            b"not ours"
+        );
+        assert_eq!(
+            fs::read(restore_dir.join("Old.remwrap.idx")).unwrap(),
+            b"not ours either"
+        );
+    }
+
+    #[test]
+    fn archive_extract_json_reports_missing_manifest_warning() {
+        let temp = tempfile::Builder::new()
+            .prefix("remanence-cli-missing-manifest")
+            .tempdir()
+            .unwrap();
+        let object_path = temp.path().join("no-manifest.rem-object");
+        let restore_dir = temp.path().join("restore");
+        let payload = b"payload without a manifest".to_vec();
+        let spec = RemTarFileSpec::new(
+            "a.txt",
+            "file-a",
+            payload.len() as u64,
+            sha256_bytes(&payload),
+        );
+        let mut reader = Cursor::new(payload.clone());
+        let mut streams = [RemTarFileStream::new(spec, &mut reader)];
+        let mut sink = remanence_library::VecBlockSink::new();
+        let mut options = RemTarObjectOptions::new(
+            "object-no-manifest",
+            "caller-no-manifest",
+            "2026-01-01T00:00:00Z",
+            "manifest-no-manifest",
+        );
+        options.chunk_size = 4096;
+        let layout = write_rem_tar_object_from_readers(&mut sink, &options, &mut streams).unwrap();
+        // Zero the manifest entry onward: the object now reaches tar EOF with
+        // no `_remanence/manifest.cbor` (REM-OBJECT §4.9).
+        let mut bytes = sink.blocks.iter().flatten().copied().collect::<Vec<_>>();
+        let intact_path = temp.path().join("intact.rem-object");
+        fs::write(&intact_path, &bytes).unwrap();
+        bytes[layout.manifest.pax_header_offset as usize..].fill(0);
+        fs::write(&object_path, bytes).unwrap();
+
+        // A ranged extract also reads the object in restore mode.
+        let range = format!("0:{}", payload.len());
+        for (object, expected) in [
+            (&object_path, json!(["MissingManifest"])),
+            (&intact_path, json!([])),
+        ] {
+            let range_dir = temp.path().join(format!(
+                "range-{}",
+                object.file_stem().unwrap().to_str().unwrap()
+            ));
+            let (code, stdout, stderr) = invoke_without_discovery(&[
+                "rem",
+                "archive",
+                "extract",
+                "--object",
+                object.to_str().unwrap(),
+                "--dest",
+                range_dir.to_str().unwrap(),
+                "--chunk-size",
+                "4KiB",
+                "--path",
+                "a.txt",
+                "--range",
+                range.as_str(),
+            ]);
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+            assert!(stderr.is_empty(), "{stderr}");
+            let report: Value = serde_json::from_str(&stdout).expect("range json");
+            assert_eq!(report["mode"], "range");
+            assert_eq!(report["warnings"], expected);
+            assert_eq!(fs::read(range_dir.join("a.txt")).unwrap(), payload);
+        }
+
+        let (code, stdout, stderr) = invoke_without_discovery(&[
+            "rem",
+            "archive",
+            "extract",
+            "--object",
+            object_path.to_str().unwrap(),
+            "--dest",
+            restore_dir.to_str().unwrap(),
+            "--chunk-size",
+            "4KiB",
+        ]);
+
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(stderr.is_empty(), "{stderr}");
+        let report: Value = serde_json::from_str(&stdout).expect("extract json");
+        assert_eq!(report["warnings"], json!(["MissingManifest"]));
+        assert_eq!(fs::read(restore_dir.join("a.txt")).unwrap(), payload);
     }
 
     #[test]
@@ -21715,6 +22037,7 @@ blob Project/Render Files/
         let report: serde_json::Value = serde_json::from_str(&stdout).expect("scan json");
         assert_eq!(report["ruleset"]["name"], "scan");
         assert_eq!(report["scan"]["totals"]["blob_entries"], 1);
+        assert_eq!(report["tar_engine"]["program"], "bsdtar");
         assert!(!temp.path().join("archive.rem-object").exists());
     }
 
@@ -21744,6 +22067,8 @@ blob Project/Render Files/
         assert_eq!(report["scan"]["totals"]["native_entries"], 1);
         assert_eq!(report["scan"]["totals"]["blob_entries"], 0);
         assert_eq!(report["scan"]["totals"]["wrapped_entries"], 0);
+        assert!(report.as_object().unwrap().contains_key("tar_engine"));
+        assert!(report["tar_engine"].is_null(), "{report}");
     }
 
     #[test]
@@ -22098,6 +22423,7 @@ blob Project/Render Files/
             json["applied_privileged_xattrs"]["tagged.txt"],
             json!(["security.ima"])
         );
+        assert_eq!(json["warnings"], json!([]));
         let serialized = serde_json::to_string(&json).unwrap();
         assert!(!serialized.contains("security-secret"));
         assert!(!serialized.contains("user-secret"));
@@ -22618,6 +22944,7 @@ blob Project/Render Files/
         let member: serde_json::Value =
             serde_json::from_str(&stdout).expect("encrypted member json");
         assert_eq!(member["mode"], "blob-member");
+        assert_eq!(member["warnings"], json!([]));
         assert_eq!(member["range_method"], "rem-object-entry-range");
         assert_eq!(member["representation"], "encrypted");
         assert_eq!(member["encryption"], "REMO");
@@ -22782,6 +23109,7 @@ blob Project/Render Files/
         let extract: serde_json::Value = serde_json::from_str(&stdout).expect("extract json");
         assert_eq!(extract["mode"], "range");
         assert_eq!(extract["representation"], "encrypted");
+        assert_eq!(extract["warnings"], json!([]));
         assert_eq!(extract["path"], "big.bin");
         assert_eq!(extract["range_start"], 400);
         assert_eq!(extract["range_len"], 500);

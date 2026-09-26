@@ -4336,6 +4336,9 @@ mod tests {
     /// NVMe namespace `nvme0n1` as the kernel places it under `/sys/devices`.
     #[cfg(target_os = "linux")]
     const MOCK_NVME0N1: &str = "pci0000:00/0000:00:03.1/0000:0a:00.0/nvme/nvme0/nvme0n1";
+    /// eMMC user area `mmcblk0` as the kernel places it under `/sys/devices`.
+    #[cfg(target_os = "linux")]
+    const MOCK_MMCBLK0: &str = "platform/fe310000.mmc/mmc_host/mmc0/mmc0:0001/block/mmcblk0";
 
     /// A fake sysfs laid out the way the kernel lays it out:
     /// `dev/block/<major>:<minor>` is a relative symlink into `devices/`, a
@@ -4561,6 +4564,37 @@ mod tests {
             message.contains("partition nvme0n1p2 of disk nvme0n1"),
             "{message}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_volume_policy_nested_device_with_own_queue_reads_its_own_queue() {
+        // An eMMC boot area such as mmcblk0boot0 sits inside its disk's
+        // directory like a partition, but it is a separate block device: it
+        // owns a queue and carries no `partition` file.
+        let sysfs = MockSysfs::new("sysfs-nested-device");
+        let disk = sysfs.disk("179:0", MOCK_MMCBLK0);
+        let boot = sysfs.disk("179:8", &format!("{MOCK_MMCBLK0}/mmcblk0boot0"));
+        assert!(
+            !boot.join("partition").exists(),
+            "a nested device is not a partition"
+        );
+
+        set_mock_queue(&disk, "write through", None);
+        set_mock_queue(&boot, "write back", Some("0"));
+        let message = untrusted_message(
+            sysfs.check(179, 8),
+            "the nested device's own write-back queue without FUA is rejected",
+        );
+        assert!(message.contains("mmcblk0boot0/queue/fua"), "{message}");
+        assert!(message.contains("device 179:8, mmcblk0boot0"), "{message}");
+        assert!(!message.contains("partition"), "{message}");
+
+        set_mock_queue(&disk, "write back", Some("0"));
+        set_mock_queue(&boot, "write through", None);
+        sysfs
+            .check(179, 8)
+            .expect("the nested device's own write-through queue is trusted");
     }
 
     #[cfg(target_os = "linux")]

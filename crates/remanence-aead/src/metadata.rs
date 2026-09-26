@@ -232,7 +232,8 @@ impl<'a> Decoder<'a> {
         self.bump_item()?;
         let (major, len, _encoding) = self.read_type_len()?;
         match major {
-            0 | 1 => Ok(()),
+            // Negative integers (major 1) are outside the profile even here.
+            0 => Ok(()),
             2 => {
                 self.take_len(len)?;
                 Ok(())
@@ -395,10 +396,36 @@ mod tests {
         bytes.extend_from_slice(b"sha256");
         bytes.extend_from_slice(&[0x03, 0x58, 0x20]);
         bytes.extend_from_slice(&[0x44; 32]);
-        bytes.extend_from_slice(&[0x04, 0x83, 0x20, 0xf5, 0xf6]);
+        bytes.extend_from_slice(&[0x04, 0x83, 0x00, 0xf5, 0xf6]);
         let parsed = RemObjectMetadata::from_cbor_bytes(&bytes, 512).unwrap();
         assert_eq!(parsed.plaintext_size, 512);
         assert_eq!(parsed.plaintext_digest, [0x44; 32]);
+    }
+
+    #[test]
+    fn metadata_rejects_negative_integer_in_unknown_value() {
+        // Negative integers are outside the profile anywhere in the map, so a
+        // Reader skipping an unknown key still rejects one inside its value.
+        for unknown in [
+            &[0x04, 0x20][..],
+            &[0x04, 0x83, 0x00, 0x20, 0xf6][..],
+            &[0x04, 0xa1, 0x20, 0x00][..],
+        ] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&[0xa5, 0x00, 0x01, 0x01, 0x19, 0x02, 0x00]);
+            bytes.extend_from_slice(&[0x02, 0x66]);
+            bytes.extend_from_slice(b"sha256");
+            bytes.extend_from_slice(&[0x03, 0x58, 0x20]);
+            bytes.extend_from_slice(&[0x44; 32]);
+            bytes.extend_from_slice(unknown);
+            assert!(
+                matches!(
+                    RemObjectMetadata::from_cbor_bytes(&bytes, 512),
+                    Err(RemObjectAeadError::InvalidCborEncoding)
+                ),
+                "{unknown:02x?}"
+            );
+        }
     }
 
     #[test]

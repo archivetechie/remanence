@@ -89,11 +89,13 @@ directly; `rem-recover` is a separate crate that depends on neither the daemon
 nor the catalog. One optional feature, `remanence-cli/linux-udev`, adds
 hot-plug watching and needs `pkg-config` and `libudev-dev`.
 
-One program is needed at run time. `rem archive build` and `rem archive
-extract` use `bsdtar` (the `libarchive-tools` package on Debian and Ubuntu,
-`bsdtar` on Fedora) to pack and unpack `.remwrap.tar` wrappers, and both
-require it even when no wrapper is involved. `rem archive extract --no-unwrap`
-does not. The test suite needs `bsdtar` as well.
+One program is needed at run time: `bsdtar` (the `libarchive-tools` package on
+Debian and Ubuntu, `bsdtar` on Fedora). `rem archive build` needs it only to
+build an archive that packs files into a `.remwrap.tar` wrapper, and `rem
+archive extract` only to extract a whole object that contains one, unless
+`--no-unwrap` is given. Extract checks for it before it writes anything.
+Range (`--path`/`--range`) and blob-member (`--blob-entry`/`--blob-member`)
+extracts never need it. The test suite needs `bsdtar` as well.
 
 Tests and lints, as CI runs them:
 

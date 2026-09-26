@@ -37,11 +37,13 @@ Foreign-format adapters are separate distributions rather than Cargo features
 of the core repository. See the
 [foreign-format adapter reference](reference-foreign-format-adapters.md).
 
-One program is needed at run time, and the first walkthrough below uses it.
-`rem archive build` and `rem archive extract` use `bsdtar` (the
-`libarchive-tools` package on Debian and Ubuntu, `bsdtar` on Fedora) to pack
-and unpack `.remwrap.tar` wrappers, and both require it even when no wrapper
-is involved. `rem archive extract --no-unwrap` does not.
+One program is needed at run time, and the first walkthrough below uses it:
+`bsdtar` (the `libarchive-tools` package on Debian and Ubuntu, `bsdtar` on
+Fedora). `rem archive build` needs it only to build an archive that packs
+files into a `.remwrap.tar` wrapper, and `rem archive extract` only to extract
+a whole object that contains one, unless `--no-unwrap` is given. Extract
+checks for it before it writes anything. Range (`--path`/`--range`) and
+blob-member (`--blob-entry`/`--blob-member`) extracts never need it.
 
 To run the test suite the way CI does (it also needs `bsdtar`):
 
