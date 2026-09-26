@@ -359,7 +359,8 @@ pass: it checks that the change policy reads identically across the three
 specifications, that every version number in a document agrees with
 itself, that the pinned archive digest matches at every place that quotes
 it, that revision histories stay in order, and that references resolve. It
-also checks that each specification opens with exactly one statement of what
-it covers, in the same words in all three.
+also checks that Section 1 of each specification contains exactly one
+statement of what it covers, in the same words in all three (the published
+revisions that predate it excepted).
 When the specifications and their surrounding pages drift, the build says
 so before a reader has to.

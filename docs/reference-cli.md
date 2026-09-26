@@ -265,6 +265,22 @@ foreign formats and fail closed with a “not registered in this distribution”
 error. An adapter distribution supplies the accepted IDs and parser code; see
 the [foreign-format adapter reference](reference-foreign-format-adapters.md).
 
+A plaintext object that reaches tar EOF without its `_remanence/manifest.cbor`
+entry is nonconformant (REM-OBJECT §4.9). The REM-OBJECT reader in
+`remanence-format` does not fail a restore-mode read for that reason alone: it
+returns the member entries it recovered together with the non-fatal typed
+warning `MissingManifest`, so the absence stays visible to its caller. The JSON
+report of `rem archive extract` does not currently include this warning.
+
+Blob wrappers (REM-OBJECT Appendix E). When `rem archive build` wraps a
+subtree, it creates the `.remwrap.tar` member by running the system tar program
+with `-c` and `--format pax --xattrs`, and records the program, its version and the
+exact create and extract argument lists in the index's `tar_engine` field.
+`rem archive extract` with `--blob-entry` and `--blob-member` recovers one
+inner file by the procedure of Appendix E.4, for both representations.
+`--blob-member` cannot be combined with `--path` or `--range`, so the reference
+tools offer no byte-range restore inside an inner file.
+
 ### Recipient key-file formats
 
 REMP and REMR are complete binary records, not raw key bytes. All offsets are

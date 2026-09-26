@@ -4,9 +4,11 @@
 This reference explains what file metadata Remanence preserves in a REM-OBJECT
 object, how that metadata is stored, and — importantly — how it behaves on
 restore, including the case where an archive is recovered decades later with
-nothing but a standard `tar`. The normative rules live in the REM-OBJECT Object
-Format specification (§4.3, §4.7.3, §4.10, §12.10); this document is the
-operator's companion to them.
+nothing but a standard `tar`. The format rules live in the REM-OBJECT
+specification (§4.3, §4.7.3, §4.10), and §12.10 describes the restore hazards
+and what a restore must reproduce; recommended restore practice is in the
+[REM Implementation and Operations Guide](rem-implementation-guide.md), under
+“Restoring onto a host”. This document is the operator's companion to both.
 
 ## What is preserved, and what is deliberately not
 

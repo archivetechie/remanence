@@ -50,6 +50,11 @@ format specifications — and their plain-language companion — live in
 - [encryption-explained.md](encryption-explained.md) — why REM-ENCRYPT
   seals objects in software instead of relying on LTO drive-level
   encryption, and what an operator still has to manage themselves.
+- [rem-implementation-guide.md](rem-implementation-guide.md) — the REM
+  Implementation and Operations Guide: informative, tool-neutral practice for
+  tools that read or write the REM formats (hostile media, restoring onto a
+  host, staging and durability, catalogs, verification, ingest). The
+  specifications point to it for everything outside conformance.
 - [versioning-explained.md](versioning-explained.md) — the three-question
   change policy that governs every format revision, in plain language.
 - [versioning-register.md](versioning-register.md) — every versioned
