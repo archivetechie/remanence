@@ -293,14 +293,14 @@ are handled under Core §3.4.
 
 ### 3.3. Shared Obligations
 
-Core owns these representation-independent obligations:
+Core owns these representation-independent rules and descriptions:
 
 - the manifest-anchor obligation and encrypted-copy carve-out (Core §4.7.2);
-- the report-all-nonconformities verifier rule (Core §7.4);
-- the distinction between I/O failures and format violations, plus the
-  no-panic rule (Core §11 and Core §12.9);
+- the Core Verifier profile (Core §7.4);
+- the distinction between I/O failures and format violations (Core §11);
 - the catalog trust domain (Core §12.6); and
-- path, link, attribute, and restore safety (Core §12.10).
+- the restore fidelity rules for links, colliding paths and attribute values
+  (Core §12.10).
 
 This document specifies how the envelope discharges the encrypted-copy
 obligations without restating the Core rules.
@@ -649,7 +649,7 @@ unauthenticated chunk.
 After whole-object authentication, recovery SHOULD validate the inner stream
 under Core §7.4 and MUST compare its `REMANENCE.object_id` and
 `REMANENCE.chunk_size` with the scalar header before publishing restored
-members. Core §12.10 governs path, link, attribute, and extension handling.
+members. The restore rules of Core §12.10 apply to the restored members.
 Recovery output SHOULD be staged and published only after complete success.
 
 Catalogless recovery is possible from an object and one matching recipient
@@ -750,22 +750,24 @@ inner self-consistency check.
 
 ### 7.2. Write-Path Verification
 
-Core §7.2 steps 1 and 2 govern payload and canonical-stream verification. At
+Core §7.2 governs payload verification at build. At
 seal time, the Sealer recomputes the size and digest of the bytes actually
 sealed and fails, with no footer, on mismatch. It computes the encrypted
 copy's `stored_digest` over the emitted envelope bytes.
 
 ### 7.3. Post-Write Re-Verification
 
-Core §7.3 owns the deployment obligation to re-read a copy before recording
-it durable. A full encrypted re-verification uses Section 7.4; a minimum
+Recommended practice for re-reading a copy before it is recorded durable is
+described in the REM Implementation and Operations Guide, under “Staging,
+commit and durability”. A full encrypted re-verification uses Section 7.4; a minimum
 keyless re-read compares `stored_digest` without making an authentication
 claim.
 
 ### 7.4. Encrypted Verifier Profiles
 
-Core §7.4 requires every Verifier, in every representation, to report all
-nonconformities rather than stop at the first reportable error.
+Recommended practice for reporting every nonconformity is described in the
+REM Implementation and Operations Guide, under “Verification, scrub and
+repair”.
 
 - **Keyed encrypted copy**: perform Section 5.10 in full—header and registry
   gates, metadata authentication, salt rederivation, every chunk tag,
@@ -784,7 +786,8 @@ Section 12.7 applies.
 
 ### 8.1. Backend Records for Encrypted Copies
 
-Core §8.1 defines the representation-independent backend record. For an
+Recommended practice for backend records is described in the REM
+Implementation and Operations Guide, under “Catalogs and indexes”. For an
 encrypted copy, a backend also records `format_version`,
 `metadata_frame_len`, `key_frame_len`, and the recipient epoch ids actually
 present. These fields are public envelope geometry and recovery selectors;
@@ -869,9 +872,7 @@ unless it also changes the canonical plaintext object.
 ## 11. Errors
 
 Core §11 owns the requirement that I/O failures remain distinguishable from
-format violations; Core §12.9 owns the requirement that byte-reachable code
-never panics, crashes, or allocates unboundedly. Both apply to all envelope
-parsing.
+format violations, and that requirement applies to all envelope parsing.
 
 ### 11.2. Envelope Errors
 
@@ -997,7 +998,8 @@ and `stored_digest`.
 
 ### 12.9. Envelope Hostile-Input Discharge
 
-Core §11 and Core §12.9 apply to every envelope parser. In addition, envelope
+Core §11 applies to every envelope parser, and the hazards Core §12.9
+describes apply to envelopes too. In addition, envelope
 parsers MUST enforce:
 
 - the fixed 128-byte scalar header before interpreting variable data;
@@ -1009,7 +1011,7 @@ parsers MUST enforce:
 
 The envelope fuzz-target list is: scalar-header parser, key-frame parser,
 metadata CBOR decoder, and whole-object open/verify for encrypted inputs. The
-Core §12.9 fuzz targets remain separate.
+fuzz targets for plaintext inputs remain separate.
 
 ### 12.11. Threat Model and Secret Handling
 
@@ -1353,15 +1355,27 @@ effect on conformance.
   three things. It would produce bytes another conformant reader cannot read
   or would misread. It would let two conformant readers reach different
   conclusions about what a medium or an object contains. Or it would let a
-  tool claim something the bytes do not support. The same section, word for
-  word, opens REM-OBJECT, REM-ENCRYPT and REM-PARITY.
+  tool claim something the bytes do not support. The same section appears,
+  word for word, as the last subsection of Section 1 of REM-OBJECT,
+  REM-ENCRYPT and REM-PARITY.
 
-  No requirement has changed yet. The rules that Section 1.6 places outside
-  this document are still present in this copy. Later changes in this
-  revision move them out: most to the Guide, which those changes also write,
-  and some to the reference implementation's documentation or to the record
-  of how revisions are released. Until then, Section 1.6 does not describe the
-  whole text. No valid object or vector changed.
+  REM-OBJECT's rules on tool behaviour have left that document, so this copy
+  no longer carries the four requirements it took from REM-OBJECT by
+  reference. A Verifier is no longer required to report every nonconformity
+  (Section 7.4). Envelope parsing is no longer required never to panic, crash
+  or allocate without bound (Sections 11 and 12.9). Restored members are no
+  longer subject to REM-OBJECT's rules for protecting the host on paths,
+  links, attributes and extensions; only the restore rules that REM-OBJECT
+  Section 12.10 keeps apply to them (Section 5.10). A copy is no longer
+  required to be re-read before it is recorded durable (Section 7.3). The
+  Guide recommends each of these, and three of the updated references point
+  to it.
+
+  The other rules that Section 1.6 places outside this document are still
+  present in this copy. A later change in this revision moves them out: most
+  to the Guide, and some to the reference implementation's documentation or
+  to the record of how revisions are released. Until then, Section 1.6 does
+  not describe the whole text. No valid object or vector changed.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Records the current
   standing of the pinned X-Wing draft: expired on 3 September 2026, its
   construction carried forward identically as `MLKEM768-X25519` by the CFRG

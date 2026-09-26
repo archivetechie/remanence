@@ -26,11 +26,12 @@ Checked:
      document in the same repository, which is precisely the drift hazard this
      linter was written for. It is held to the same structural rules as the
      published copy, and must strictly supersede it.
-  9. Each specification opens with one subsection headed "What this document
-     specifies, and what it does not", and that subsection reads the same,
-     word for word, in every document that carries it. Only whitespace is
-     normalised. The published revisions that predate the subsection are
-     listed by exact version; every other copy must carry it.
+  9. Section 1 of each specification contains exactly one subsection headed
+     "What this document specifies, and what it does not", and that
+     subsection reads the same, word for word, in every document that carries
+     it. Only whitespace is normalised. The published revisions that predate
+     the subsection are excepted, listed by exact version; every other copy
+     must carry it.
 
 Exit 0 clean; exit 1 with findings on stderr.
 """
@@ -69,7 +70,7 @@ BANNED_TITLE_FORMS = [
     "REM-PARITY Tape Format Specification",   # variant found by the panel
 ]
 
-# Rule 9: the scope statement that opens every specification.
+# Rule 9: the scope statement in Section 1 of every specification.
 SCOPE_HEADING = "What this document specifies, and what it does not"
 SCOPE_BLOCK_EXEMPT = {
     # Published before the scope statement existed. A published copy at any

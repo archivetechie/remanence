@@ -329,7 +329,7 @@ A single implementation may fill several roles.
   representation.
 - **Consumer**: interprets a decoded manifest (Section 4.7). A **Restoring
   Consumer** additionally materializes entries to a target filesystem; its
-  safety obligations are stated in Section 12.10.
+  obligations are stated in Sections 4.7.3 and 12.10.
 
 ### 2.3. Definitions
 
@@ -437,10 +437,9 @@ Section 3.3 hold.
 Consequences, all normative:
 
 1. For a plaintext copy, `stored_digest` = `plaintext_digest`. The two names
-   denote the same value; a catalog can store it once.
+   denote the same value.
 2. A plaintext copy and an encrypted copy of the same object share
-   `plaintext_digest` and differ in `stored_digest`. An external index joins
-   copies of one logical object by `plaintext_digest`.
+   `plaintext_digest` and differ in `stored_digest`.
 3. `plaintext_digest` is a function of the canonical bytes, which include the
    global header's `object_id` and `write_timestamp` keywords and the final
    zero fill. Copies share it if and only if they wrap the identical
@@ -472,9 +471,7 @@ and its global header must pass the
 `REMANENCE.format_id = rem-object-v1` gate (Section 4.5.2). A conformant
 plaintext object's first record is the global pax header.
 
-This rule is for self-identification and tooling convenience; a deployment's
-catalog records each copy's representation, and readers SHOULD cross-check
-against it rather than rely on detection.
+This rule is for self-identification and tooling convenience.
 
 ## 4. Plaintext Representation
 
@@ -520,8 +517,7 @@ exactly `chunk_size` bytes. `chunk_size` MUST be a positive multiple of 512.
 On tape `chunk_size` MUST equal the fixed tape block size of the containing
 tape file (Section 8.2); one body block is one tape block. The plaintext
 representation defines no maximum. REM-ENCRYPT §5.2 defines the additional
-bound for an encrypted copy. Operational bounds come from drive block-size
-limits.
+bound for an encrypted copy.
 
 The total object length is always an exact multiple of `chunk_size`
 (Section 4.8), and the object's block count is knowable before any payload
@@ -758,9 +754,8 @@ Each entry is, in order:
 For symbolic links, Writers MUST store the target in ustar `linkname` when it
 fits in 100 bytes; otherwise they MUST store it in pax `linkpath` and store
 `PAX_LINK_PLACEHOLDER` (`remanence/pax-linkpath`) in `linkname`. A symlink target is an opaque UTF-8 OS string, not
-a REM-OBJECT path: it MAY be absolute, contain `..`, or be dangling. For directories,
-Writers SHOULD emit entries only for directories that cannot be inferred from
-child paths, i.e. empty directories; directory paths MUST end in `/`.
+a REM-OBJECT path: it MAY be absolute, contain `..`, or be dangling. Directory
+paths MUST end in `/`.
 
 **Hardlinks.** A hardlink entry records that its path is a second name for the
 bytes of another entry — the **primary** — in the same object. Its target is
@@ -793,9 +788,7 @@ entry's pax header carries:
 Readers MUST verify `REMANENCE.compression` is present and equals `none` on
 every entry before delivering its payload (`UnsupportedFeature` otherwise;
 missing key is `Parse`). Readers MUST ignore the *content* of `REMANENCE.pad`.
-Readers SHOULD cross-check `REMANENCE.chunk_count` against the value
-recomputed from the effective size (Section 4.6.4) and surface a mismatch as
-an inconsistency. `REMANENCE.file_sha256` is not consulted during framing; its
+`REMANENCE.file_sha256` is not consulted during framing; its
 verification for regular entries is a delivery-time obligation (Section 4.9)
 and the core of the Verifier profile (Section 7.4). Non-regular entries omit
 `REMANENCE.file_sha256`; their metadata integrity is covered by the manifest,
@@ -904,7 +897,7 @@ no separator translation.
 Symlink targets are not entry paths and MUST NOT be validated with the
 canonical-relative-path rule. A target is a pax value: valid UTF-8, no NUL,
 and no byte < 0x20. It may be absolute, contain `..`, or point to a missing
-target; restore safety is a Consumer obligation (Section 12.10).
+target; Section 12.10 describes the hazard this creates on restore.
 
 #### 4.6.7. Entry Order
 
@@ -966,8 +959,7 @@ Canonical form MUST be validated over the original encoded bytes, not by
 decode-and-re-encode. **Structural limits**: an object MUST NOT contain more
 than `MAX_FILE_ENTRIES` (10,000,000) member entries; manifest nesting depth
 MUST NOT exceed `MANIFEST_MAX_DEPTH` (8), counting the top-level map as
-depth 1. Decoders MUST enforce both incrementally and MUST bound allocations
-by the manifest's declared size, never by counts read from the CBOR stream.
+depth 1. Decoders MUST enforce both limits.
 
 #### 4.7.2. Schema
 
@@ -1007,10 +999,11 @@ regular-only objects.
 
 Consumer obligations:
 
-1. Before interpreting any field, a Consumer MUST verify the manifest bytes
-   against an anchor digest: the bootstrap/catalog `manifest_sha256` when
-   available, or — self-consistency only — the manifest entry's own pax
-   `REMANENCE.file_sha256` (`ManifestDigestMismatch` on failure). An
+1. A Consumer MUST NOT rely on a manifest field unless it has verified the
+   manifest bytes against an anchor digest. A failure is
+   `ManifestDigestMismatch`. An anchor digest is the bootstrap or catalog
+   `manifest_sha256` when one is available. For self-consistency only, the
+   manifest entry's own pax `REMANENCE.file_sha256` is an anchor digest. An
    unverified manifest is untrusted input from removable media.
    For encrypted copies this obligation is discharged by the envelope's
    authenticated whole-object digest as specified by REM-ENCRYPT §7.1;
@@ -1026,10 +1019,10 @@ Consumer obligations:
    ignore them, and do not use them for third-party data (which lives only
    under `ext`, Section 4.7.5). It MUST NOT reject a manifest merely because a
    reserved map or array is non-empty.
-4. When both the manifest and the archive entries are available, a Consumer
-   SHOULD verify they correspond exactly — same paths, entry types, link
-   targets, sizes, hashes where present, and chunk geometry, with no extras on either side (Verifiers MUST;
-   Section 7.4).
+4. A Verifier MUST verify that the manifest and the archive entries correspond
+   exactly (Section 7.4). They correspond exactly when they have the same paths,
+   entry types, link targets, sizes, hashes where present, and chunk geometry,
+   with no extras on either side.
 
 #### 4.7.3. Extended-Attribute Preservation
 
@@ -1056,9 +1049,7 @@ map its native namespace to the canonical prefix (for example, a `user.`
 namespace attribute is `user.name`) deterministically and MUST NOT remap one
 namespace onto another. A native attribute a Writer cannot represent with a
 derivable namespace — including a name with no `.`, or one a case-folding
-store cannot round-trip without altering case — is not captured, and its
-omission is reported as ingest policy (Section 4.7 is silent on ingest
-selection; Section 12.10 governs restore, not capture). The canonical name
+store cannot round-trip without altering case — is not captured. The canonical name
 bytes are identical across independent Writers for the same native attribute
 on the same platform; whole-manifest byte identity additionally requires
 identical object parameters (Section 1.2 goal 6).
@@ -1085,19 +1076,14 @@ integer remains 1. This gate is independent of REM-ENCRYPT versioning
 (Section 10).
 
 Which xattrs an ingesting system selects is policy outside this byte format.
-This document defines a **portable core** and an **extension tier**,
-distinguished by what a Restoring Consumer applies by default, not by what is
-carried — both tiers are carried faithfully. The portable core is the `user.`
-attribute namespace, which a Restoring Consumer is permitted to apply by
-default (Section 12.10). Every attribute not in the `user.` namespace and every
-extension (Section 4.7.5) is the extension tier: carried, but on restore
-**carry-only** — applied only when explicit operator policy names it
-(Section 12.10). No registered disposition or external list can cause an
-extension-tier item to be applied by default in this specification.
+This document defines two tiers, and both are carried faithfully. The
+**portable core** is the `user.` attribute namespace. The **extension tier**
+is every attribute that is not in the `user.` namespace, including an
+attribute whose name has no namespace, and every extension (Section 4.7.5).
+An item that a Consumer carries but does not act on is **carry-only**.
 
-A Reader implementing xattr preservation MUST surface them to its caller. A
-Restoring Consumer MAY reapply attributes, subject to Section 12.10, and MUST
-surface any application failure rather than silently declaring success.
+A Restoring Consumer MUST surface any attribute application failure rather
+than silently declaring success.
 
 #### 4.7.4. Within-Stream Chain of Trust
 
@@ -1154,10 +1140,6 @@ Extension processing is fail-safe, carry-only, and additive:
   disposition is not recognition.
 - A Consumer MUST ignore an `ext` member it does not recognize and MUST NOT
   reject an object for its presence.
-- A Restoring Consumer MUST NOT apply any extension to system state unless
-  explicit operator policy names it (Section 12.10); in this specification no
-  extension is applied by default. An unrecognized extension is always
-  carry-only.
 - A Repacker (Section 2.2) MUST reproduce the canonical CBOR encoding of every
   `ext` member it does not recognize unchanged (equivalently: it preserves the
   decoded value; under Section 4.7.1 the canonical re-encoding is identical).
@@ -1234,36 +1216,20 @@ pad size, manifest byte, and the final block count — from the file *specs*
 alone (path, file_id, entry type, link target where present, size, hash,
 optional mtime/executable, and 1.x preservation metadata), without payload
 bytes; Planner and Writer MUST share the same sizing rules such that the
-planned layout is byte-exact. The writer's workflow: validate options
-(`chunk_size`; non-empty `object_id`, `caller_object_id`, `write_timestamp`,
-`manifest_file_id`); validate every member spec (Section 4.6.6); plan the
-layout (which serializes the manifest and computes `manifest_sha256`); emit
-the global header, each member entry, and the manifest entry, streaming
-payload bytes through the running SHA-256 check of Section 4.6.5; emit tar EOF
-and the final zero fill; verify the emitted block count equals the plan;
-report the layout (`projected_size_blocks`, per-file `first_chunk_lba`,
-manifest geometry, `manifest_sha256`) to the caller for cataloging. A failed
-object MUST NOT be reported as complete. The writer consumes a block sink that
-reports per-block outcomes; a block write that commits fewer bytes than the
-full block, or reports hard end-of-medium, MUST fail the object
-(`IncompleteBlockWrite`).
-
-A Writer that re-captures an object from a previously restored tree MUST carry
-forward, unchanged, every `ext` member present in the source object's manifest
-that it does not recognize.
+planned layout is byte-exact. A failed object MUST NOT be reported as
+complete. A Writer MUST fail the object when a block write commits fewer
+bytes than the full block or reports hard end-of-medium. The failure is
+`IncompleteBlockWrite`. Recommended practice for a writer's pipeline is
+described in the REM Implementation and Operations Guide, under “Staging,
+commit and durability”.
 
 **Reader.** A Reader receives a block source positioned at the object's inner
-`BodyLba(0)`, the object's `chunk_size`, and its block count. Two I/O
-profiles exist, with identical acceptance rules. The **streaming** profile is
-RECOMMENDED; it requires memory proportional to `chunk_size` plus one pax
-header. The **materializing** profile exists for compatibility; a
-materializing Reader MUST bound its up-front allocation with a fallible
-reservation. A Reader operates in
-one of two modes: **restore** (the default; integrity-verifying) or
-**salvage** (a deliberately-selected, explicitly-labeled mode for damaged
-media in which verification failures are reported but delivery continues; an
-implementation MUST NOT make salvage the default or silently fall back to it).
-Procedure:
+`BodyLba(0)`, the object's `chunk_size`, and its block count. A Reader
+operates in one of two modes: **restore**, which verifies integrity, or
+**salvage**, a mode for damaged media in which verification failures are
+reported but delivery continues. An implementation MUST NOT silently fall
+back to salvage.
+A Reader processes the object as follows:
 
 1. Read 512-byte records. A short block read is a hard error.
 2. On an all-zero record: require the second EOF record (Section 4.8), run the
@@ -1310,9 +1276,7 @@ Procedure:
 6. Capture the entry whose effective path is `_remanence/manifest.cbor` as the
    manifest bytes. An object whose EOF is reached with no manifest entry is
    nonconformant: Verifiers MUST reject it (Section 7.4), and a restore-mode
-   Reader SHOULD report the absence to its caller. The reference Reader reports
-   this non-fatally as the typed `MissingManifest` warning; the absence remains
-   visible even when member payloads can otherwise be restored.
+   Reader SHOULD report the absence to its caller.
 
 A conformant Reader accepts mildly foreign archives where safe
 (unsorted/duplicate pax records, NUL typeflag, `prefix`-formed names, missing
@@ -1351,11 +1315,8 @@ PFR maps a member-file byte range to stored byte ranges by closed-form
 arithmetic. The per-file index — `first_chunk_lba` (an inner `BodyLba`) and
 `size_bytes` per file, from the manifest or the catalog — is the **same for
 both representations** of an object, because both wrap the same canonical
-bytes. Catalog per-file rows therefore need to be stored once per object, not
-per copy. Restorers MUST treat plaintext offsets (inner `BodyLba`, file byte
-ranges) as the source of truth and MUST NOT make representation-specific
-stored offsets canonical; stored offsets are reproducible from this section
-(plaintext) and REM-ENCRYPT §6.3 (ciphertext).
+bytes. Stored offsets are reproducible from this section (plaintext) and
+REM-ENCRYPT §6.3 (ciphertext).
 
 **Hardlinks.** A hardlink entry has `size_bytes = 0` and `first_chunk_lba`
 `null` (Section 4.7.2); it stores none of its own content. PFR on a hardlinked
@@ -1364,12 +1325,8 @@ name MUST first resolve its `link_target` to the primary entry and then use the
 PFR implementation MUST NOT treat a hardlinked name as an empty or invalid
 range. (Symlinks and directories carry no payload and are not PFR targets.)
 
-A Restorer working from a per-file index (catalog rows rather than the full
-manifest) MUST preserve the ability to resolve a hardlink: the hardlink's row
-MUST carry `entry_type` + `link_target` (resolved at restore time), **or** a
-denormalized pointer to the primary's `first_chunk_lba`/`size_bytes`. An
-index that stores only the literal `first_chunk_lba`/`size_bytes` of a
-hardlink row (`null`/`0`) cannot support conformant restore of that name.
+Recommended practice for catalogs and per-file indexes is described in the
+REM Implementation and Operations Guide, under “Catalogs and indexes”.
 
 ### 6.1. Range Validation
 
@@ -1438,38 +1395,24 @@ layer (REM-ENCRYPT §7.1).
 ### 7.2. Write-Path Verification (No Extra Reads)
 
 Every digest in the chain is computed over bytes already flowing through the
-writer — the chain costs hash arithmetic, never an additional read pass:
+writer — the chain costs hash arithmetic, never an additional read pass.
 
-1. **Per-file, at build.** The Builder streams each payload file, hashing it,
-   and MUST fail the object if the streamed SHA-256 or byte count differs from
-   the caller-supplied expected `file_sha256`/size (Sections 4.6.5, 4.9). This
-   proves the writer archived the payload it was given, not the payload the
-   metadata describes. A failed object MUST NOT be completed or reported as
-   complete.
-2. **Canonical stream, at build.** The Builder computes `plaintext_digest`
-   (= the plaintext copy's `stored_digest`) over its own emitted byte stream,
-   and reports it with the layout for cataloging.
+**Per-file, at build.** The Builder streams each payload file, hashing it,
+and MUST fail the object if the streamed SHA-256 or byte count differs from
+the caller-supplied expected `file_sha256`/size (Sections 4.6.5, 4.9). This
+proves the writer archived the payload it was given, not the payload the
+metadata describes. A failed object MUST NOT be completed or reported as
+complete.
 
 REM-ENCRYPT §7.2 specifies the additional encrypted write-path discharge.
 
 ### 7.3. Post-Write Re-Verification (Deployment Obligation)
 
-After each copy is written, and before that copy is recorded durable, the
-deployment is expected to re-read the copy via the object read path and
-re-verify it —
-for a full verification, every **regular** member's `file_sha256` plus the
-Section 7.4 non-regular correspondence and hardlink referential checks; at
-minimum, the copy's `stored_digest`. REM-ENCRYPT §7.3 defines the corresponding
-encrypted-copy procedure. This is a media/transmission guard, deliberately distinct
-from the Section 7.2 build checks: it is the one intentional extra read in the
-pipeline, and it is a *deployment* (workflow) obligation rather than a property
-of the bytes — a conformant Verifier (Section 7.4) is the tool that discharges
-it.
+Recommended practice for re-verifying a copy after it is written is described
+in the REM Implementation and Operations Guide, under “Staging, commit and
+durability”.
 
 ### 7.4. Verifier Profile
-
-A Verifier reports all nonconformities, not first-error-only, in every
-representation.
 
 A Core Verifier performs the full restore-mode read of Section 4.9 with every
   regular entry's digest checked, manifest anchor-digest and schema validation
@@ -1489,10 +1432,8 @@ requires the recovered inner stream to pass this Core profile.
 
 ### 7.5. Scrub
 
-Backends scrub stored copies by `stored_digest` (whole-copy) without keys. On
-tape, the parity layer additionally CRCs every stored block and can verify and
-repair at block granularity without reading the whole object (Section 9). Both
-operate on stored bytes and are representation-agnostic.
+Recommended practice for scrub is described in the REM Implementation and
+Operations Guide, under “Verification, scrub and repair”.
 
 ## 8. Storage Bindings and Backend Independence
 
@@ -1502,9 +1443,7 @@ A REM-OBJECT in either representation is a byte string. Any conformant tool
 can produce it; any backend can store it; `stored_digest` is computed over the
 identical bytes everywhere ("byte-stable fanout"). A backend needs no keys, no
 plaintext access, and no format knowledge to store, replicate, compare, or
-scrub a copy. Backends SHOULD record per copy: location, representation,
-`stored_digest`, `stored_size_bytes`/block count, and `chunk_size`.
-REM-ENCRYPT §8.1 specifies additional records for encrypted copies.
+scrub a copy.
 
 ### 8.2. Tape Binding
 
@@ -1530,24 +1469,17 @@ rationale. Plaintext objects remain fully recoverable keyless (Section 4.10).
 
 ### 8.3. File Binding
 
-The stored bytes as one regular file; RECOMMENDED extension `.rem-object` for both
-representations (Section 3.4 disambiguates). Writers MUST follow a durable
-commitment protocol: write to an exclusively-created temporary path (e.g.
-`name.rem-object.partial`), flush and fsync the file before renaming to the final
-path, and fsync the containing directory before reporting success. A rename
-without prior synchronization can leave the final name referring to
-incompletely persisted data after a crash. Partial outputs SHOULD be deleted
-or quarantined and MUST NOT be referenced by any durable catalog.
+The stored bytes as one regular file; default extension `.rem-object` for both
+representations (Section 3.4 disambiguates). Recommended practice for staging
+and publishing a file-bound copy is described in the REM Implementation and
+Operations Guide, under “Staging, commit and durability”.
 
 ### 8.4. Object-Store Binding
 
-The stored bytes as one object/blob, `stored_digest` recorded as integrity
-metadata, uploaded with whatever integrity the store offers (e.g. checksum
-headers), and verified by digest after upload (Section 7.3). Ranged reads
-(Section 6.2 and REM-ENCRYPT §6.3) make PFR efficient without downloading
-whole objects. The
-encrypted representation is the intended cloud copy; storing plaintext copies
-on shared infrastructure is a deployment policy question, not a format one.
+The stored bytes as one object/blob. Ranged reads (Section 6.2 and
+REM-ENCRYPT §6.3) make PFR efficient without downloading whole objects.
+Recommended practice for uploading a copy to an object store is described in
+the REM Implementation and Operations Guide, under “Ingest”.
 
 ## 9. Relationship to the Parity Layer
 
@@ -1560,9 +1492,7 @@ the bootstrap, is:
 1. **Parity is computed over stored bytes** — the ciphertext, when the copy is
    encrypted. The order is: build → (seal) → parity. The parity layer protects
    bytes regardless of content and needs no keys, ever; recovery of damaged
-   blocks of an encrypted object proceeds keyless, after which decryption is
-   retried on the recovered stored bytes (REM-ENCRYPT §12.4 fail-closed
-   rule).
+   blocks of an encrypted object proceeds keyless.
 2. Within one object's tape file there are no parity or bootstrap blocks; the
    object's stored blocks are contiguous (stored `BodyLba` 0..N−1). Parity
    epochs span objects; sidecars land between tape files. None of this is
@@ -1611,11 +1541,10 @@ claims (Section 14).
 
 ## 11. Errors
 
-Implementations SHOULD expose typed errors equivalent to the taxonomy below.
-Names are normative for the test-vector manifests (Section 13); surface syntax
+The error names below are normative for the test-vector manifests (Section 13); surface syntax
 is not. I/O failures MUST remain distinguishable from format violations so
-callers can tell storage problems from invalid objects. Section 12.9 governs
-hostile-input behavior.
+callers can tell storage problems from invalid objects. Section 12.9 describes
+the hazards of hostile input.
 
 ### 11.1. Plaintext-Stream Errors
 
@@ -1664,28 +1593,25 @@ non-committing-AEAD caveat (REM-ENCRYPT §12.7).
 
 The off-tape catalog is a separate trust domain: it holds external anchors and
 may hold cleartext paths and per-file rows even when a stored copy is
-encrypted. Protecting catalog confidentiality, integrity, and provenance is a
-deployment obligation outside this byte format. REM-ENCRYPT §12.5 states the
+encrypted. REM-ENCRYPT §12.5 states the
 encrypted-copy public-facts and bootstrap-minimality consequences.
 
 ### 12.9. Hostile-Input Posture
 
-Stored bytes come off removable media and networks and MUST be treated as
-untrusted in both representations. In the plaintext stream, the ustar header
-record is checksummed, pax record lengths
-are validated against the remaining header payload, payload sizes are
-validated against the remaining declared blocks before allocation (streaming
-readers allocate O(1)), and `chunk_size`/block count arrive from the
-catalog/bootstrap as semi-trusted inputs — a materializing Reader MUST use
-fallible allocation and SHOULD enforce a deployment size ceiling, while
-streaming Readers are immune by construction and are the production path.
-Reader implementations MUST NOT panic, crash, or invoke undefined behavior on
-any byte sequence, SHOULD enforce this mechanically (no `unwrap`/unchecked
-indexing/unchecked arithmetic on reachable paths; forbid `unsafe` where
-practical), and SHOULD validate it with coverage-guided fuzzing. Core fuzz
-targets are the record loop, manifest CBOR decoder, and whole-object
-open/verify for plaintext inputs. REM-ENCRYPT §12.9 owns the envelope fuzz
-targets and envelope-specific bounds.
+Stored bytes come off removable media and networks, and in both
+representations they are untrusted. The plaintext stream's acceptance checks
+are required elsewhere in this document. Section 4.3.3 requires a Reader to
+verify the checksum of every header record. Section 4.4.1 requires every pax
+record length to be checked against the header payload that remains.
+Section 4.2 limits a Reader to the declared number of blocks, and Section 4.9
+makes an end of object inside a declared payload the error `TruncatedPayload`.
+The `chunk_size` and block count arrive from the catalog or bootstrap
+(Section 4.2), so they are semi-trusted inputs. A reader that
+panics, exhausts memory, or allocates by a size it has not yet checked can be
+brought down by a single hostile object, even though it reads every valid
+object correctly. Recommended practice for handling hostile media is described
+in the REM Implementation and Operations Guide, under “Handling hostile
+media”. REM-ENCRYPT §12.9 describes the envelope-specific bounds.
 
 ### 12.10. Path Traversal
 
@@ -1695,32 +1621,30 @@ violations (`InvalidPath`), so a conformant entry path is always a clean
 relative path. Symlink targets are different: they are opaque OS strings and
 may be absolute, contain `..`, or be dangling.
 
-A Restoring Consumer (Section 2.2) MUST therefore keep its own sanitization.
-It MUST NOT follow symlinks already present in the destination tree while
-materializing any entry; they SHOULD use `openat`/`O_NOFOLLOW` or equivalent
-component-by-component discipline and re-check each component. They MUST
-create symlink entries as symlinks, without dereferencing their targets, and
+A restore destination lies outside the object, and a hostile object can aim at
+it. In the classic archive attack, an earlier symlink entry creates
+`dir -> /outside` and a later regular entry writes through `dir/file`. A
+restoring tool that follows symlinks already present in the destination then
+writes outside its restore root. A Restoring Consumer MUST create symlink
+entries as symlinks, without dereferencing their targets. A Restoring Consumer
 MUST materialize a hardlink's primary before creating the hardlink (`link(2)`)
-to the already-restored primary. They MUST also prevent the classic archive
-attack where an earlier symlink entry creates `dir -> /outside` and a later
-regular entry writes through `dir/file`.
+to the already-restored primary.
 
-**Native path-mapping preflight.** Section 4.6.6 makes an entry path a clean
+**Native path mapping.** Section 4.6.6 makes an entry path a clean
 `/`-separated relative path, but that grammar is validated against POSIX
 semantics only. On a non-POSIX target filesystem the same bytes can denote
 something else: on Windows a component such as `..\outside` embeds a separator
 the REM-OBJECT grammar never inspected, and a value like `C:\x` or `\\host\share\x` maps
 to a drive-relative or UNC absolute path; case-folding and Unicode normalization
 (e.g. NFC/NFD, or Windows case-insensitivity) can also collapse two
-REM-OBJECT-distinct entry paths onto one native target. A Restoring Consumer that maps
-entry paths onto a native filesystem MUST therefore, before materializing any
-entry, resolve the entry's native-normalized destination (applying the target's
-separator, case-fold, and Unicode-normalization rules) and MUST reject or report
-— never silently overwrite — any entry whose native destination escapes the
-restore root, resolves to an absolute, drive-relative, or UNC path, or collides
-with a destination already produced by another entry in the same object. This
-preflight is in addition to, not a replacement for, the symlink and traversal
-discipline above. Framing-layer acceptance of a path is a necessary check, not a
+REM-OBJECT-distinct entry paths onto one native target. An entry's native
+destination is the path it would occupy on the target filesystem after that
+filesystem's separator, case-folding and Unicode-normalization rules are
+applied. A Restoring Consumer
+that maps entry paths onto a native filesystem MUST reject or report, never
+silently overwrite, any entry whose native destination collides with a
+destination that another entry in the same object has already produced.
+Framing-layer acceptance of a path is a necessary check, not a
 sufficient safety claim. An inner stream recovered through REM-ENCRYPT is
 parsed and restored under these same rules (REM-ENCRYPT §5.10). Stock tar
 extraction has its own
@@ -1730,23 +1654,13 @@ sandboxed.
 Preserved xattrs are equally untrusted. Attributes such as Linux
 `security.capability`, `security.*`, `trusted.*`, and POSIX ACL attributes can
 change privilege or access-control state — a restored `security.capability`
-is a privileged binary. A Restoring Consumer MUST restrict applied attributes
-to the `user.` namespace unless explicit operator policy names additional
-namespace prefixes; attributes outside the effective allow-list MUST be
-skipped and reported (names only — values MUST NOT be logged), never applied.
-It MUST treat values as opaque bytes. A Restoring Consumer MUST NOT write an
-attribute through an interface that follows a symbolic link at the final path
-component; for entries that are symbolic links it MUST use a link-targeting
-interface or skip and report the attribute. Skips are policy outcomes, not
-errors; genuine application failures MUST still surface per Section 4.7.3.
+is a privileged binary. An extension (Section 4.7.5) can carry platform
+metadata with the same effect when it is applied. A Restoring Consumer MUST
+treat attribute values as opaque bytes. Section 4.7.3 requires a failure to
+apply an attribute to be reported.
 
-The same disposition governs `ext` extensions (Section 4.7.5): a Restoring
-Consumer applies only the `user.` portable core by default; every non-`user.`
-namespace and every extension — recognized or not — is carried and, when
-reported, reported by name only, and is applied on restore only when explicit
-operator policy names it. No registered disposition applies an extension-tier
-item by default in this specification. A Restoring Consumer that reports skipped or
-applied names MUST NOT log their values.
+Recommended practice for restoring onto a host is described in the REM
+Implementation and Operations Guide, under “Restoring onto a host”.
 
 ### 12.12. Disclosure in Published Plaintext Objects
 
@@ -1761,10 +1675,9 @@ inventory itself, which names the non-`user.` namespaces and extensions
 present (revealing, for example, macOS or Windows origin). The encrypted
 representation seals the manifest inside the REM-ENCRYPT envelope and does
 not have this
-plaintext-disclosure exposure. Reviewing a plaintext object before publication
-is a deployment (workflow) obligation in the sense of Section 7.3; the
-Verifier-validated inventory (Section 4.7.6) is the intended first-pass
-screening surface, but does not itself bound value-level disclosure. The
+plaintext-disclosure exposure. The Verifier-validated inventory
+(Section 4.7.6) is the intended first-pass screening surface, but does not
+itself bound value-level disclosure. The
 standard-tool recovery path (Section 4.10) inherits the host tool's security
 model — it restores symlinks faithfully — and the format's protection there is
 limited to keeping privilege-changing metadata (ownership, setuid/setgid mode,
@@ -1812,8 +1725,7 @@ pinning the exact manifest CBOR bytes and `manifest_sha256` for a fixed input
 set (the cross-implementation determinism gate, Section 4.7.1); a
 **portable-core-only object** (`user.` only, empty `object_metadata`, and
 `REMANENCE.schema_version` pinned); an **object with a non-`user.` attribute
-and a correct inventory**, whose default restore reports it as not applied
-(carry-only) and omits its value from output; an **object with an unknown
+and a correct inventory**; an **object with an unknown
 reverse-DNS `ext` member**, for which a minimal Consumer recovers payloads and
 ignores the member and a Repacker reproduces it under canonical encoding; and
 a **combined non-`user.` attribute and `ext` member** with the two-array
@@ -1824,9 +1736,19 @@ manifest pins the exact full object byte stream, or for large vectors
 `(pax_header_offset, data_offset, first_chunk_lba, chunk_count, pad_spaces)`,
 the manifest CBOR bytes, and `manifest_sha256`.
 
+Where a positive manifest carries an `expected.default_restore` object, its
+fields `skipped_xattrs`, `applied_privileged_xattrs`, `carried_extensions` and
+`reported_values` record the behaviour of a restore that follows the
+recommended defaults described in the REM Implementation and Operations Guide,
+under “Restoring onto a host”. They are informative for conformance. A
+conformant Restoring Consumer need not reproduce them. In the vector with a
+non-`user.` attribute, for example, `skipped_xattrs` names that attribute and
+`reported_values` is `false`. The `file_layouts` field and every other expected
+field keep their normative force.
+
 ### 13.2. REM-OBJECT-TV-P1 — Plaintext Object
 
-Inputs (complete):
+Inputs (complete; `manifest_file_id` is the manifest entry's `file_id`):
 
 | Input | Value |
 | --- | --- |
@@ -1965,8 +1887,10 @@ Conformance evidence MUST include:
 5. failure without reporting a completed object on injected size, digest, and
    I/O failures; and
 6. the applicable portable-core, extension-container, object-inventory,
-   carry-only restore, Repacker-preservation, and manifest-tamper vectors of
-   Section 13.
+   Repacker-preservation, and manifest-tamper vectors of Section 13.
+
+The `expected.default_restore` fields that Section 13.1 describes as
+informative are not part of this evidence.
 
 The archive SHA-256 in Section 13 identifies one specific version of the
 frozen vector distribution. Changing an existing entry's byte encoding or
@@ -1987,8 +1911,7 @@ governed by its versioning rules (Section 10).
 This document establishes no IANA registry. Extension names (Section 4.7.5)
 use permissionless reverse-DNS naming and require no central allocation; a
 community-maintained advisory list MAY record registered short names, but is
-not a precondition for conformance and does not bear on the carry-only restore
-default (Section 12.10). Reverse-DNS extension names apply to manifest
+not a precondition for conformance. Reverse-DNS extension names apply to manifest
 extension containers only and MUST NOT appear as pax keywords.
 
 ## 16. References
@@ -2109,15 +2032,39 @@ effect on conformance.
   three things. It would produce bytes another conformant reader cannot read
   or would misread. It would let two conformant readers reach different
   conclusions about what a medium or an object contains. Or it would let a
-  tool claim something the bytes do not support. The same section, word for
-  word, opens REM-OBJECT, REM-ENCRYPT and REM-PARITY.
+  tool claim something the bytes do not support. The same section appears,
+  word for word, as the last subsection of Section 1 of REM-OBJECT,
+  REM-ENCRYPT and REM-PARITY.
 
-  No requirement has changed yet. The rules that Section 1.6 places outside
-  this document are still present in this copy. Later changes in this
-  revision move them out: most to the Guide, which those changes also write,
-  and some to the reference implementation's documentation or to the record
-  of how revisions are released. Until then, Section 1.6 does not describe the
-  whole text. No valid object or vector changed.
+  The rules that Section 1.6 places outside this document have now left it.
+  Most went to the REM Implementation and Operations Guide, whose first
+  revision this change writes. They concern protecting the host a restore
+  writes onto, surviving hostile input, staging and durability, catalogs,
+  keeping attribute values out of logs, optional verification, scrub and
+  repair, ingest, and which directory entries a writer emits. Statements about
+  the reference implementation's reader and its wrapper tooling went to that
+  implementation's documentation; Appendix E keeps the wrapper convention and
+  its field meanings. Sections 7.3 and 7.5 lost all of their text; each keeps its
+  heading over one sentence that points to the Guide.
+
+  Some rules stay in a changed form. Section 4.7.2 obligation 1 now says that
+  a Consumer does not rely on a manifest field it has not verified against an
+  anchor digest, instead of prescribing the order of work. Its failure is
+  still `ManifestDigestMismatch`. The portable core and the extension tier are
+  now defined by attribute namespace rather than by what a restore applies by
+  default, and Section 4.7.3 now defines carry-only. Section 12.10 keeps the
+  rules on reproducing symlinks, hardlinks and colliding paths, and describes
+  the hazards whose handling moved. The file extension `.rem-object` is now
+  named without a keyword. Sections 13.1 and 14 now say that the
+  `expected.default_restore` fields of the vector manifests are informative
+  for conformance.
+
+  No byte of the format changed, and no valid object or vector changed. This
+  document no longer requires a conformant tool to protect the host it
+  restores onto, to survive hostile input, or to stage its output durably;
+  the Guide recommends each. REM-ENCRYPT and REM-PARITY still carry the rules
+  that their own Section 1.5 or 1.6 places outside them, until later changes
+  in this revision series move them.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
   an informative description of the capacity cost the alignment rule imposes
   on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper
@@ -2217,8 +2164,8 @@ decommissioned workstation archived beside the masters. The second is a file
 that cannot be represented as a native entry at all: a path or symlink target
 that is not valid UTF-8 (Section 4.6.6), a file type the format does not
 carry (a device node, socket, or FIFO), or extended attributes outside the
-portable set the writer accepts. The reference implementation applies the
-same answer to both.
+portable set the writer accepts. The convention described next serves
+both.
 
 ### E.3. The Wrapper Convention
 
@@ -2228,7 +2175,7 @@ For a subtree at canonical relative path `<path>`, the two entries are:
 
 | Entry | Content |
 | --- | --- |
-| `<path>.remwrap.tar` | The subtree as one pax-format tar stream, produced by the system's tar program. The reference implementation invokes it with `--format pax --xattrs`. |
+| `<path>.remwrap.tar` | The subtree as one pax-format tar stream, produced by a tar program, with extended attributes carried in its pax records. |
 | `<path>.remwrap.idx` | A JSON document describing the wrapper, with the fields below. |
 
 The index document has three fields:
@@ -2276,9 +2223,9 @@ reading the wrapper in full:
 Under the encrypted representation the same steps apply, because
 range addressing is preserved through the envelope (REM-ENCRYPT Section 6);
 the index and the wrapper range are fetched as ciphertext chunks and
-decrypted, and nothing else in the object is opened. The reference
-implementation exposes the procedure as `rem archive extract` with
-`--blob-entry` and `--blob-member`, for both representations.
+decrypted, and nothing else in the object is opened. A reader that
+implements the convention can offer this procedure for both
+representations.
 
 Without any of this, standard tools still suffice: extract the object with
 `tar`, then extract `<path>.remwrap.tar` with `tar` again. The index remains a
@@ -2292,21 +2239,16 @@ and a Verifier that checks every member has checked the wrapper and the index
 as two files, not the inner files individually. Fixity for an inner file is
 the `sha256` in its index element, whose own integrity rests on the index
 entry's `REMANENCE.file_sha256` and, through it, on the manifest and the
-object digests of Section 7. Byte-range restore inside an inner file is not
-offered by the reference tools, although the wrapper entry itself is
-range-addressable and a reader could compose the two offsets.
+object digests of Section 7. The convention defines no byte-range restore
+inside an inner file, although the wrapper entry itself is range-addressable
+and a reader could compose the two offsets.
 
 ### E.6. Whose Decision It Is
 
-The reference implementation wraps a subtree in two situations only: when an
-ingest rule names the subtree, or when a file cannot be represented as a
-native entry for one of the reasons in Section E.2, in which case that file,
-or the directory holding it, is wrapped on its own. It never wraps by size.
-Its scan mode reports a directory as a candidate for wrapping when at least
-ninety per cent of at least one hundred files under it cannot be represented
-natively, but the report is a suggestion and changes nothing. The choice of
-what to bundle into one object, and what to wrap inside it, is the writer's
-policy, and it belongs above this document.
+The choice of what to bundle into one object, and what to wrap inside it, is
+the writer's policy, and it belongs above this document. Recommended practice
+for deciding when to wrap is described in the REM Implementation and
+Operations Guide, under “Ingest”.
 
 ## Author's Address
 
