@@ -184,7 +184,7 @@ damaged block is the first block of the very file that describes it.
 15. [Errors](#15-errors)
 16. [Security Considerations](#16-security-considerations)
 17. [Test Vectors](#17-test-vectors)
-18. [Conformance and Freeze Criteria](#18-conformance-and-freeze-criteria)
+18. [Freeze Criteria and Status](#18-freeze-criteria-and-status)
 19. [IANA Considerations](#19-iana-considerations)
 20. [References](#20-references)
 
@@ -953,7 +953,7 @@ checkpoint or final index through the Bootstrap payload. Final
 structural and Object rows live only in the streamed terminal replicas defined
 in Sections 8.3, 10.2, and 10.3.
 
-### 8.1. Fixed Frame (one block, exactly)
+### 8.1. Fixed Frame (One Block, Exactly)
 
 A bootstrap tape file is exactly one block:
 
@@ -1301,7 +1301,7 @@ readers MUST verify they agree and reject divergence. The minimum block
 size for sidecars is 0xE0 — block 0 must hold the 0xC8-byte header, at least
 one 16-byte parity index entry, and the trailing 8-byte CRC.
 
-### 9.2. The Header Block (block 0 of each copy) — all little-endian
+### 9.2. The Header Block (Block 0 of Each Copy) — All Little-Endian
 
 | Offset | Len | Field | Constraint |
 | --- | ---: | --- | --- |
@@ -1417,7 +1417,7 @@ therefore carry the same hash, and the epoch directory (Section 10.1.5) can
 verify a surviving header copy independently of *which* copy survived.
 Readers MUST verify the hash on every index parse.
 
-### 9.6. The Footer Block (last block) — all little-endian
+### 9.6. The Footer Block (Last Block) — All Little-Endian
 
 | Offset | Len | Field |
 | --- | ---: | --- |
@@ -1490,7 +1490,7 @@ ParityMap: payload integrity is the header's `payload_sha256`, and
 redundancy is the dual copy plus the footer locator. The minimum block size
 for ParityMap files is 0xC8.
 
-#### 10.1.3. Header and Footer Blocks — all little-endian
+#### 10.1.3. Header and Footer Blocks — All Little-Endian
 
 The primary header, tail header, and footer use this common little-endian fixed
 layout. Headers set `copy_kind` to 1 or 2; the footer reserves that field as
@@ -2039,7 +2039,7 @@ and MUST NOT report the terminal suffix as complete.
 
 ## 11. Writer Obligations
 
-### 11.1. Commit Discipline (per tape file)
+### 11.1. Commit Discipline (per Tape File)
 
 Every tape file — object, sidecar, Bootstrap, ParityMap, terminal replica, or separation
 extent — goes through one cycle:
@@ -2137,7 +2137,7 @@ spacing (space to the next filemark; the file's block count is the position
 delta minus one); a zero-block file or a missing trailing filemark is
 structural damage; EOD at a file start ends the walk.
 
-### 12.3. The Classification Ladder (in order)
+### 12.3. The Classification Ladder
 
 1. **Bootstrap**: the fixed magic matches, the full frame parses, the
    frame's `block_size_bytes` equals the read size, the payload's
@@ -2234,7 +2234,7 @@ A validated, scoped map (Section 12); the bootstrap's scheme record; and
 the failed addresses — `(tape_file_number, object_block_index)` pairs or
 ordinals.
 
-### 13.2. Fail Before I/O
+### 13.2. Typed Refusals
 
 The Recoverer MUST reject, as typed refusals distinct
 from recovery failures: ordinals outside the validated scope
@@ -2492,7 +2492,7 @@ How candidate vectors are handled until this document is frozen, and what the
 negative candidates must cover by then, are recorded in the release record,
 `specs/README.md`, with the freeze criteria (Section 18).
 
-## 18. Conformance and Freeze Criteria
+## 18. Freeze Criteria and Status
 
 The criteria that gate the freeze of this specification are kept, under their
 numbers 1 to 6, in the project's release record: the section “How a revision
@@ -2650,7 +2650,7 @@ BOT structural walk; it never treats the tape as empty.
 This appendix records the reasoning behind non-obvious decisions, so future
 revisions do not silently reverse them.
 
-### B.1. Parity lives in separate tape files
+### B.1. Parity Lives in Separate Tape Files
 
 No parity byte ever appears inside an object tape file. Objects stay
 contiguous and clean — a tar-based payload remains extractable with `mt` +
@@ -2658,7 +2658,7 @@ contiguous and clean — a tar-based payload remains extractable with `mt` +
 boundaries. The cost, sidecars consuming their own tape files and
 filemarks, is small at archival object sizes.
 
-### B.2. The interleave (data and parity)
+### B.2. The Interleave (Data and Parity)
 
 Tape damage is overwhelmingly contiguous (scratches, wraps, edge damage).
 Mapping consecutive *data* ordinals to consecutive *stripes* (Section 3.3) —
@@ -2711,7 +2711,7 @@ per-epoch stripe count in the locator instead of the constant `S` would be
 blocks and collapse tolerance to `≈ m` blocks. The constant-`S` locator is both
 correct and maximally robust.
 
-### B.3. Implicit zeros instead of padding blocks
+### B.3. Implicit Zeros Instead of Padding Blocks
 
 A short epoch is closed by *declaring* the missing logical positions
 all-zero rather than writing padding blocks. Tape capacity is never spent
@@ -2719,7 +2719,7 @@ on filler; the sidecar's `real_data_shard_count` tells readers which
 positions are implicit; and the parity arithmetic is unaffected because
 all-zero shards contribute nothing to any accumulator.
 
-### B.4. Derived magics
+### B.4. Derived Magics
 
 Sidecar and terminal-control magics are HMAC(tape_uuid, role label) so that a
 block can be attributed to *this tape* and *this role* without any further
@@ -2728,14 +2728,14 @@ a mixed pile, fail the magic check immediately. The bootstrap's magic must
 stay fixed: it is the entry point read before the UUID is known. Derived
 magics are identity, not security (Section 16.1).
 
-### B.5. The bootstrap endianness mix is frozen
+### B.5. The Bootstrap Endianness Mix Is Frozen
 
 The bootstrap header mixes big-endian integers with a little-endian length
 and CRCs (Section 8.1). It looks like an accident; it is recorded here
 precisely because "normalizing" it would break every existing tape. All
 other structures are uniformly little-endian.
 
-### B.6. The canonical digest excludes positions, hashes, and health
+### B.6. The Canonical Digest Excludes Positions, Hashes, and Health
 
 Three exclusion classes keep the digest non-circular and stable
 (Section 7.3): physical positions would change as control files are
@@ -2745,7 +2745,7 @@ would mutate the digest at *read* time, invalidating the map by the act of
 discovering damage. The digest covers structure only — which is exactly
 what recovery needs to be fenced by.
 
-### B.7. Three complete replicas are separated physically
+### B.7. Three Complete Replicas Are Separated Physically
 
 Each A/B/C member is independently usable: full header, streamed body, local
 footer, and trailing filemark. The two typed gaps are physical separation, not
@@ -2754,7 +2754,7 @@ end and one middle region without any geometric placement rule. Requiring
 surviving editions to agree prevents ordinal preference from hiding a split
 authority.
 
-### B.8. Checkpoint authority stays off tape
+### B.8. Checkpoint Authority Stays off Tape
 
 Open-tape commit state lives in durable off-tape commit records (Section 3.4).
 Ordinary checkpoint barriers close any pending parity epoch, prove the covered
@@ -2766,7 +2766,7 @@ survives, Section 8.4.1 offers structural recovery evidence without inventing
 commit authority. This keeps open-tape checkpoint frequency independent of the
 number or placement of on-tape index copies.
 
-### B.9. Content-blind classification
+### B.9. Content-Blind Classification
 
 The Scanner classifies object files by elimination, never by reading object
 bytes (Section 12.3). This is what payload independence means physically: a
@@ -2774,7 +2774,7 @@ tape of foreign objects is mappable by any conformant implementation, an
 unreadable object head block cannot derail the walk, and object formats
 need no registered magics with this layer.
 
-### B.10. At most one open epoch
+### B.10. At Most One Open Epoch
 
 The bounded-restart rule (Section 11.2) caps unprotected ordinals below
 `S × k` at every object boundary, so a Resumer rebuilds at most one open epoch
@@ -2782,7 +2782,7 @@ by re-reading at most `S × k − 1` blocks (16 GiB at the default geometry).
 Without it, resume cost would grow with the number of epochs left open —
 unbounded re-read of a tape that was supposedly fine.
 
-### B.11. Sidecar metadata is replicated head and tail, with a locator
+### B.11. Sidecar Metadata Is Replicated Head and Tail, With a Locator
 
 The header/index copy is written before the parity shards *and* after them,
 with a footer locator at the very end. Contiguous damage at either end of
@@ -2792,7 +2792,7 @@ directory makes it findable even with the footer gone (Section 13.3). The
 canonical metadata hash is copy-independent, so any surviving copy is
 verifiable against any directory entry.
 
-### B.12. The reference off-tape journals are not a media format
+### B.12. The Reference Off-Tape Journals Are Not a Media Format
 
 The reference implementation keeps its commit records in two append-only host
 journals per tape, which are not a media format: neither is recorded on tape,

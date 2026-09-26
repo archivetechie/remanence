@@ -1,5 +1,50 @@
 # REM-ENCRYPT 1.0
 
+## Abstract
+
+This document specifies REM-ENCRYPT 1.0: an authenticated, confidential
+envelope around the canonical plaintext object of the REM-OBJECT Core Format
+1.0. The envelope seals the object's exact bytes, manifest included, so an
+encrypted copy and a plaintext copy share one logical identity,
+`plaintext_digest`. It hides the object's member names, member sizes, member
+count, manifest content, and payload bytes.
+
+Each object is sealed under a fresh data-encryption key, which is wrapped for
+one to eight recipients with HPKE and X-Wing, a hybrid of the post-quantum
+ML-KEM-768 and the classical X25519. The payload is encrypted and
+authenticated chunk by chunk. A byte range of one member file can therefore
+still be located by arithmetic and read without decrypting the rest of the
+object. A copy can be stored, replicated, repaired from parity and scrubbed
+without a key, and recovered without a catalog from the object and one
+matching recipient private key. The cryptographic suites are registered
+values, so they can change without any change to the canonical object.
+
+## Table of Contents
+
+- 1\. [Introduction](#1-introduction)
+- 2\. [Conventions and Terminology](#2-conventions-and-terminology)
+- 3\. [Relationship to REM-OBJECT Core](#3-relationship-to-rem-object-core)
+- 4\. [Plaintext Representation (in REM-OBJECT)](#4-plaintext-representation-in-rem-object)
+- 5\. [Encrypted Representation](#5-encrypted-representation)
+- 6\. [Partial File Restore](#6-partial-file-restore)
+- 7\. [Envelope Verification Chain](#7-envelope-verification-chain)
+- 8\. [Storage Bindings](#8-storage-bindings)
+- 9\. [Relationship to the Parity Layer (in REM-OBJECT)](#9-relationship-to-the-parity-layer-in-rem-object)
+- 10\. [Versioning and Registries](#10-versioning-and-registries)
+- 11\. [Errors](#11-errors)
+- 12\. [Security Considerations](#12-security-considerations)
+- 13\. [Envelope Test Vectors](#13-envelope-test-vectors)
+- 14\. [Conformance (in REM-OBJECT)](#14-conformance-in-rem-object)
+- 15\. [Identifier Allocation Considerations](#15-identifier-allocation-considerations)
+- 16\. [References](#16-references)
+- Appendix A. [Worked Envelope Example (Informative)](#appendix-a-worked-envelope-example-informative)
+- Appendix B. [Design Rationale (Informative)](#appendix-b-design-rationale-informative)
+- Appendix C. [Revision History (Informative)](#appendix-c-revision-history-informative)
+- Appendix D. [Open Items (Informative)](#appendix-d-open-items-informative)
+- [Author's Address](#authors-address)
+
+---
+
 ## 1. Introduction
 
 ### 1.1. Identifiers and Versioning
@@ -7,8 +52,6 @@
 | Identifier | Value | Scope |
 | --- | --- | --- |
 | Document version | 1.0 | This publication only |
-| Concept DOI (all revisions of this document) | [10.5281/zenodo.21719161](https://doi.org/10.5281/zenodo.21719161) | This publication |
-| Reference implementation DOI (informative) | [10.5281/zenodo.21551570](https://doi.org/10.5281/zenodo.21551570) | Software deposit, Apache-2.0 |
 | Envelope magic | `REMO` | Frozen four-byte wire constant |
 | Key-frame magic | `REMK` | Frozen four-byte wire constant |
 | On-tape `format_version` | `2` | Encrypted-envelope wire discriminator |
@@ -23,14 +66,19 @@ document version 1.0 is independent of the frozen on-tape
 wire discriminators, and derivation labels in this document are wire
 constants, not document-version indicators.
 
-REM-ENCRYPT and REM-OBJECT Core share one section skeleton, so the two can be
-read side by side: where a top-level number is absent from one document, the
-other owns it. This document omits Sections 4, 9, and 14 (the plaintext
-representation, the parity relationship, and conformance, owned by Core); Core
-omits Section 5 (the encrypted representation, owned here).
-Subsection numbers are shared as well: a gap below a common top-level section
-means the corresponding subsection is defined by the companion specification,
-not that text is missing from this document.
+REM-ENCRYPT and the REM-OBJECT Core Format ([REMOBJECT], called Core in this
+document) are numbered together, so the two can be read side by side. This
+document omits Sections 4, 9 and 14, the plaintext representation, the
+relationship to the parity layer, and conformance, which are in Core; Core
+omits Section 5, the encrypted representation, which is here. Each document
+marks a section it omits with a placeholder heading that names the document
+holding it. Sections 6, 7, 8, 11 and 12 number their subsections together in
+the same way: a number used in both documents names sections on the same
+subject, and a placeholder marks a subsection that only the other document
+contains. Sections 1, 3, 10 and 13 number their subsections separately, so the
+same number there can name unrelated sections; Sections 2 and 16 match one for
+one. A reference into Core therefore always names it, as in “Core §6.4”, while
+“Section 6.4” alone means this document's section.
 
 ### 1.2. Status of This Document
 
@@ -304,6 +352,8 @@ Core owns these representation-independent rules and descriptions:
 
 This document specifies how the envelope discharges the encrypted-copy
 obligations without restating the Core rules.
+
+## 4. Plaintext Representation (in REM-OBJECT)
 
 ## 5. Encrypted Representation
 
@@ -666,6 +716,10 @@ The range and inner-block validation rules are owned by Core §6.1 and
 Core §6.2. This section maps those validated inner blocks through the
 REM-ENCRYPT representation.
 
+### 6.1. Range Validation (in REM-OBJECT)
+
+### 6.2. Inner Mapping (Both Representations) (in REM-OBJECT)
+
 ### 6.3. Ciphertext Mapping
 
 Inner body block `b` is encrypted chunk `b`. Let `K = key_frame_len` and
@@ -714,6 +768,8 @@ k + ceil(16 * k / C) + 1
 
 stored blocks, which is `k + 2` whenever `16 * k <= C`. This tag slip is why
 stored and inner `BodyLba` values differ for encrypted copies.
+
+### 6.5. Integrity of a Range Read (in REM-OBJECT)
 
 ## 7. Envelope Verification Chain
 
@@ -784,6 +840,8 @@ structure satisfy the Core verifier and every stored encrypted frame
 authenticates under the envelope keys. It does not establish writer identity;
 Section 12.7 applies.
 
+### 7.5. Scrub (in REM-OBJECT)
+
 ## 8. Storage Bindings
 
 ### 8.1. Backend Records for Encrypted Copies
@@ -803,6 +861,12 @@ sequentially until it reaches the inner manifest. The authenticated
 `plaintext_digest` anchors that manifest through Section 7.1. The absence of
 a direct manifest location is an accepted recovery-path cost on sequential
 media and avoids exposing confidential inner structure.
+
+### 8.3. File Binding (in REM-OBJECT)
+
+### 8.4. Object-Store Binding (in REM-OBJECT)
+
+## 9. Relationship to the Parity Layer (in REM-OBJECT)
 
 ## 10. Versioning and Registries
 
@@ -870,6 +934,8 @@ unless it also changes the canonical plaintext object.
 
 Core §11 owns the requirement that I/O failures remain distinguishable from
 format violations, and that requirement applies to all envelope parsing.
+
+### 11.1. Plaintext-Stream Errors (in REM-OBJECT)
 
 ### 11.2. Envelope Errors
 
@@ -974,6 +1040,8 @@ that treat an object's existence, identifier or approximate size as sensitive
 is described in the REM Implementation and Operations Guide, under “Keys and
 secrets”.
 
+### 12.6. Plaintext Copies Are Not Self-Authenticating (in REM-OBJECT)
+
 ### 12.7. Non-Committing AEAD
 
 ChaCha20-Poly1305 is not key-committing [AEAD-COMMIT] [PART-ORACLE].
@@ -1016,6 +1084,8 @@ exhaust a parser's memory. Recommended practice for surviving hostile envelope
 input is described in the REM Implementation and Operations Guide, under
 “Handling hostile media”.
 
+### 12.10. Path Traversal (in REM-OBJECT)
+
 ### 12.11. Threat Model and Secret Handling
 
 | Attacker capability | Can read or do | Cannot read, assuming sound primitives and custody |
@@ -1045,6 +1115,8 @@ Resealing under a future suite requires reading, opening, and writing the
 whole object, and on append-only media produces a new object copy. An object
 sealed under a superseded suite keeps that suite's protection until it is
 resealed.
+
+### 12.12. Disclosure in Published Plaintext Objects (in REM-OBJECT)
 
 ## 13. Envelope Test Vectors
 
@@ -1196,6 +1268,8 @@ truncation, trailing frame bytes, malformed `REMK` magic, malformed
 encapsulation, and a wrong recipient private key. A positive case opens a
 structurally valid one-slot object. A Sealer MAY emit one through eight slots.
 Readers accept one through eight.
+
+## 14. Conformance (in REM-OBJECT)
 
 ## 15. Identifier Allocation Considerations
 
