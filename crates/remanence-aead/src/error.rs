@@ -30,7 +30,7 @@ pub enum RemObjectAeadError {
     /// The wrapped-key frame is malformed or non-canonical.
     #[error("invalid REM-OBJECT wrapped-key frame")]
     InvalidKeyFrame,
-    /// The operating system could not provide cryptographic randomness.
+    /// Fresh random bytes could not be obtained (REM-ENCRYPT §11.2).
     #[error("operating-system CSPRNG failed")]
     EntropyUnavailable,
     /// HPKE key parsing, encapsulation, or authenticated opening failed.
@@ -48,7 +48,7 @@ pub enum RemObjectAeadError {
     /// HKDF could not expand one of the fixed-size output keys.
     #[error("REM-OBJECT HKDF expansion failed")]
     KdfExpansionFailed,
-    /// The header salt is invalid.
+    /// The hkdf_salt is all zero, or no counter yields a nonzero salt (REM-ENCRYPT §11.2).
     #[error("invalid REM-OBJECT HKDF salt")]
     InvalidSalt,
     /// The metadata frame length is outside REM-OBJECT bounds.

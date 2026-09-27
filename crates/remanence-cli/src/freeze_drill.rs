@@ -2,10 +2,11 @@
 //!
 //! The drill writes deterministic REM-OBJECT payloads through the production
 //! parity sink, derives read-side medium-error LBAs from the committed tape
-//! map, scans without a catalog through the §12.4 overlay funnel, and streams
-//! every recovered object through digest verification. Live Linux SG and the
-//! in-memory SSC model differ only in their `DrillTransportFactory`
-//! implementations; [`run_drill`] owns the complete workflow.
+//! map, and scans without a catalog by validating terminal replicas
+//! (REM-PARITY §12.4). It streams every recovered object through digest
+//! verification. Live Linux SG and the in-memory SSC model differ only in
+//! their `DrillTransportFactory` implementations; [`run_drill`] owns the
+//! complete workflow.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -90,7 +91,7 @@ pub(crate) enum DamagePlan {
     ObjectSpan,
     /// Make terminal replica C unreadable and require B/A fallback.
     TerminalReplicaC,
-    /// Combine the maximal §12.4-conforming set of damage classes.
+    /// Combine the maximal supported set of damage classes for the drill.
     Combined,
 }
 

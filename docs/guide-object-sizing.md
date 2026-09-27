@@ -22,8 +22,8 @@ replica_payload_records = ceil(replica_payload_bytes / B)
 replica_records         = 1 header + payload records + 1 footer
 replica_charge          = replica_records + replica filemark charge
 
-gap_records = ceil(1 GiB / B)  # includes the gap header and footer
-gap_charge  = gap_records + gap filemark charge
+gap_records = ceil(1 GiB / B)  # includes the separation extent header and footer
+gap_charge  = gap_records + separation extent filemark charge
 
 terminal_close = parity_closeout
                + 3*replica_charge
@@ -34,11 +34,11 @@ terminal_close = parity_closeout
 For parity-enabled tapes, `parity_closeout` includes any final partial sidecar
 and the one external final ParityMap required by a nonempty sidecar directory.
 That ParityMap is part of the structural prefix counted by `S`; it is not one of
-the five A/gap/B/gap/C components. The no-parity profile has zero parity-closeout
-charge but retains the complete terminal triple.
+the five components of the terminal suffix. The no-parity profile has zero
+parity-closeout charge but retains the complete terminal suffix.
 
-The supported block sizes are 256 KiB, 512 KiB, and 1 MiB. One default gap is
-therefore 4096, 2048, or 1024 records respectively, before its separate
+The supported block sizes are 256 KiB, 512 KiB, and 1 MiB. One default
+separation extent is therefore 4096, 2048, or 1024 records respectively, before its separate
 filemark charge. The three replicas have the same payload size; their local
 headers and footers differ by ordinal and location.
 
@@ -98,7 +98,7 @@ it to chase the removed bootstrap row budget.
 
 For planning, include the exact terminal report produced by the writer rather
 than a fixed percentage or an assumed final-bootstrap size. That report breaks
-out parity closeout, one replica, all three replicas, one gap, both gaps,
-safety allowance, required tape records, and spool bytes. The shipped
+out parity closeout, one replica, all three replicas, one separation extent,
+both separation extents, safety allowance, required tape records, and spool bytes. The shipped
 watermarks remain the policy defaults; the reserve is the safety proof beneath
 them.

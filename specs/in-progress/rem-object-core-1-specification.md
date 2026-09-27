@@ -180,7 +180,7 @@ re-pins an earlier one.
 The tape binding depends normatively on the REM-PARITY specification
 ([REMPARITY]), which is under review alongside this document. The tape-binding
 clauses of this document (the parity-layer references in Sections 3.3, 4.2,
-4.5.1, 4.7, 6.5, 8.2, 9, 12.6) are stable against every 1.x revision of
+4.5.1, 4.7, 6.5, 8.2, 9, 12.6, 12.9) are stable against every 1.x revision of
 REM-PARITY, because a REM-PARITY minor revision cannot invalidate a tape or
 leave an earlier reader unable to read one. An obligation that a later
 REM-PARITY 1.x revision places on its Writer (REM-PARITY §2.2) binds a Writer
@@ -1733,8 +1733,8 @@ record length to be checked against the header payload that remains.
 Section 4.2 limits a Reader to the declared number of blocks, and Section 4.9
 makes an end of object inside a declared payload the error `TruncatedPayload`.
 The `chunk_size` and block count arrive from the catalog or, on tape, from the
-bootstrap and the Object recovery row (Section 4.2), so they are semi-trusted
-inputs. A reader that
+bootstrap and the Object recovery row (REM-PARITY §8.1, REM-PARITY §10.3;
+Section 4.2), so they are semi-trusted inputs. A reader that
 panics, exhausts memory, or allocates by a size it has not yet checked can be
 brought down by a single hostile object, even though it reads every valid
 object correctly. Recommended practice for handling hostile media is described
@@ -2258,7 +2258,7 @@ effect on conformance.
     REM-ENCRYPT holds.
   - Section 1.1's list of tape-binding clauses now names every section whose
     parity-layer reference binds the tape: Sections 3.3, 4.2, 4.5.1, 4.7, 6.5,
-    8.2, 9 and 12.6.
+    8.2, 9, 12.6 and 12.9.
   - Section 4.2 is now “Chunks and `chunk_size`”, Section 4.9 is “Builder,
     Planner, and Reader Obligations”, and Section 7.3 has lost “(Deployment
     Obligation)”, which described text that had moved to the Guide.

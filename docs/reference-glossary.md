@@ -54,12 +54,12 @@ chunks (and their stored ciphertext byte offsets) that must be fetched
 and authenticated to serve it. What `rem archive covering-range` prints
 and `extract-stream`'s ranged mode consumes.
 
-**REM-PARITY** — the tape-layout-plus-parity format: the BOT Bootstrap,
+**REM-PARITY** — the tape-layout-plus-parity format: the BOT bootstrap,
 Object tape files, Reed-Solomon parity sidecars, final parity map, and the
-A/gap/B/gap/C terminal inventory.
+terminal inventory in replicas A, B and C, with separation extents AB and BC.
 Published as the REM-PARITY 1.0 specification.
 
-**Bootstrap** — the Object-count-independent self-description block at LBA 0:
+**bootstrap** — the Object-count-independent self-description block at LBA 0:
 tape UUID, block size, and parity scheme. It contains no Object recovery rows
 and is not repeated at checkpoints or finalization.
 
@@ -75,7 +75,7 @@ B, and C. A reader prefers C, then B, then A, while requiring valid survivors
 to agree.
 
 **filemark map** — the structural catalog of a tape: which tape file at
-which position is an Object, sidecar, BOT Bootstrap, or final parity map. The terminal replica
+which position is an Object, sidecar, BOT bootstrap, or final parity map. The terminal replica
 payload fixes the complete pre-tail map.
 
 **stripe / neighborhood** — parity geometry. A stripe is k data blocks
@@ -316,9 +316,9 @@ library's scanner. A label, not an identity.
 **volume label** — the identifying record traditional tape systems write
 first on a cartridge (the ANSI VOL1 record, the LTFS volume label).
 Remanence has no separate label structure; the sole BOT bootstrap carries
-that role. The recovery index is a separate structure — the terminal triple
-index (A/gap/B/gap/C) written at the tape's tail during finalization, not
-repeated bootstrap copies. See **bootstrap** and **terminal replica**.
+that role. The recovery index is a separate structure: three terminal replicas
+and two separation extents written at the tape's tail during finalization.
+These are not repeated bootstrap copies. See **bootstrap** and **terminal replica**.
 
 **BOT / EOM** — beginning of tape / end of media.
 

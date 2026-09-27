@@ -1,4 +1,4 @@
-//! Executes REM-OBJECT Section 13.5 negative vector manifests.
+//! Executes REM-OBJECT Section 13.6 negative vector manifests.
 
 use std::io::Cursor;
 
@@ -1195,7 +1195,7 @@ fn metadata_plaintext_case(id: &str, options: &SealOptions) -> Option<Vec<u8>> {
     })
 }
 
-/// Builds authenticated but intentionally nonconformant envelopes for Section 13.5.
+/// Builds authenticated but intentionally nonconformant envelopes for Section 13.6.
 fn defective_envelope(
     plaintext: &[u8],
     options: &SealOptions,

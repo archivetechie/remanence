@@ -207,11 +207,12 @@ pool, and Remanence picks the tape. Pool ids may use letters, digits, and
 Capacity admission subtracts the exact terminal reserve before admitting an
 Object. For block size `B`, fixed pre-A structural-row count `S`, Object-row
 count `R`, and configured separation extent record count `G`, the reserve is
-three replicas of `2 + ceil((64S + 256R)/B)` records plus two `G`-record gaps,
-five filemarks, pending parity closeout (including a final ParityMap when the
+three replicas of `2 + ceil((64S + 256R)/B)` records plus two `G`-record separation
+extents, five filemarks, pending parity closeout (including a final ParityMap when the
 sidecar directory is nonempty), and the implementation's safety
 allowance. The watermarks do not authorize consuming this reserve; increasing
-`block_size` changes replica rounding and the default 1 GiB gap record count.
+`block_size` changes replica rounding and the default 1 GiB separation-extent
+record count.
 
 The system TIX acceptance scenario has a private, process-local fault surface;
 it is not a daemon API or an operator feature. It is disabled unless both
@@ -381,8 +382,8 @@ barrier-proved progress state: `BeforeReplicaA`, `AfterReplicaA`,
 `AfterSeparationAb`, `AfterReplicaB`, `AfterSeparationBc`, or
 `AfterReplicaC`. Once finalization begins,
 Object admission is permanently disabled. A failure enters
-`RecoveryRequired`; only missing terminal control components may be written at
-their proved positions, never a new Object or a second terminal triple. SQLite
+`RecoveryRequired`; only missing terminal suffix components may be written at
+their proved positions, never a new Object or a second terminal suffix. SQLite
 and the per-tape catalog files remain rebuildable projections.
 
 `state.lock` is a kernel `flock`. Every `rem-daemon`, including a read-only
@@ -399,7 +400,7 @@ resolving the spool budget.
 The audit log and per-tape journals are append-only records; the SQLite
 file is a projection that `rem rebuild-catalog-from-journals` can
 regenerate from them. The tape itself stays the ultimate authority — its BOT
-bootstrap, parity structures, and finalized A/B/C index replicas support a
+bootstrap, parity structures, and finalized A/B/C terminal replicas support a
 catalog-less scan. TLS material
 is read from wherever `[daemon.tls]` points and is never written by the
 daemon.

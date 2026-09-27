@@ -78,7 +78,7 @@ pub fn open_plaintext_range_to_vec(
     )
 }
 
-/// Open an envelope range relative to an inner REM-OBJECT body block.
+/// Open an envelope range relative to an inner REM-OBJECT chunk (REM-ENCRYPT §6).
 pub fn open_inner_range_to_vec(
     input: &[u8],
     recipient: &crate::RecipientPrivateKey,

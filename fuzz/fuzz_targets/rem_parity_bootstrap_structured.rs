@@ -37,8 +37,9 @@ use remanence_parity::crc64_xz;
 const MAX_PAYLOAD: usize = 1 << 16;
 const PAYLOAD_CRC_LEN: usize = 8;
 
-/// Keys the bootstrap payload map actually defines (§8.1). Unknown keys are
-/// drawn from the gaps, to keep the "ignore unknown integer keys" path live.
+/// Keys the bootstrap payload map defines or reserves (REM-PARITY §8.2).
+/// Unknown keys are drawn from the gaps, to keep the "ignore unknown integer keys"
+/// path live.
 const PAYLOAD_KEYS: [u64; 7] = [1, 2, 3, 4, 5, 20, 21];
 const OBJECT_ROW_KEYS: [u64; 10] = [1, 2, 3, 4, 10, 11, 12, 13, 21, 22];
 

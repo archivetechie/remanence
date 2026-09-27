@@ -84,9 +84,10 @@ pub(crate) fn validate_manifest_profile(bytes: &[u8]) -> Result<(), FormatError>
 
 /// Validate only the REM-OBJECT manifest deterministic-CBOR profile.
 ///
-/// This is exposed solely for the in-tree coverage-guided fuzz harness named
-/// by REM-OBJECT 1.0 Section 14.8. Production readers validate both the profile and
-/// the manifest schema through `validate_manifest`.
+/// This is exposed solely for the in-tree coverage-guided fuzz harness recommended
+/// by the REM Implementation and Operations Guide, §2.5
+/// (docs/rem-implementation-guide.md). Production readers validate both the profile
+/// and the manifest schema through `validate_manifest`.
 #[cfg(feature = "fuzzing")]
 pub fn validate_manifest_cbor_for_fuzz(bytes: &[u8]) -> Result<(), FormatError> {
     validate_manifest_profile(bytes)

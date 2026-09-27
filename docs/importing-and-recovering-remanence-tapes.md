@@ -1,14 +1,14 @@
 # Importing and recovering Remanence tapes
 
 Remanence can reconstruct a local tape identity from a checksum-valid
-Remanence Bootstrap without rewriting the cartridge. This is useful after a
+Remanence bootstrap without rewriting the cartridge. This is useful after a
 catalog loss, when an offsite cartridge returns without its local SQLite row,
 or when a Remanence tape moves between sites.
 
 ## The short version
 
 Think of a Remanence tape as carrying its own identity card. The first record
-on the tape, called the **Bootstrap**, says which tape this is and how it was
+on the tape, called the **bootstrap**, says which tape this is and how it was
 written. A Remanence installation also keeps a local SQLite catalog, which is
 more like the site's card index: it says which tapes and Objects that site
 knows about.
@@ -23,7 +23,7 @@ Import and recovery then happen in three separate stages:
 
 | Stage | What Remanence learns | What it deliberately does not assume |
 |---|---|---|
-| **Probe** | Whether BOT contains a valid Remanence Bootstrap, plus its tape UUID and geometry | That the local catalog is correct or that the rest of the tape is healthy |
+| **Probe** | Whether BOT contains a valid Remanence bootstrap, plus its tape UUID and geometry | That the local catalog is correct or that the rest of the tape is healthy |
 | **Adopt** | The tape's identity, barcode, pool mapping, geometry, and a conservative lifecycle state | Which Objects are present or whether they were committed |
 | **Inventory/verify** | The contents and structural evidence that can be read from terminal indexes or a scan starting at BOT | That read-only inventory has rebuilt the site's writable catalog |
 
@@ -46,7 +46,7 @@ People use “foreign” for two quite different situations:
 |---|---:|---|
 | A Remanence tape written at another site | Partly | Probe and adopt its identity, then inventory/verify; ordinary catalog import additionally needs transferred host journals today |
 | A Remanence tape whose local SQLite row was lost | Yes | The same probe-and-adopt workflow |
-| A Remanence tape with a damaged or unreadable Bootstrap | No | Do not adopt; preserve the cartridge for a deeper recovery procedure |
+| A Remanence tape with a damaged or unreadable bootstrap | No | Do not adopt; preserve the cartridge for a deeper recovery procedure |
 | An LTFS, tar, Dwara, or other non-Remanence tape | No | Use a separately supplied, read-only foreign-format adapter |
 | A blank tape | No | Initialize it as new media instead of adopting it |
 
@@ -66,7 +66,7 @@ finalization history.
 
 For example, Site A can write a Remanence tape and send it to an offsite vault.
 If Site B later receives the cartridge without Site A's SQLite catalog, Site B
-can probe and adopt the Bootstrap identity, then inventory and verify the
+can probe and adopt the bootstrap identity, then inventory and verify the
 terminal indexes. If Site A also transferred its audit and per-tape journals,
 Site B can rebuild the ordinary catalog from those host records. With the
 cartridge alone, Site B can inspect but cannot yet import those inventory rows
@@ -77,7 +77,7 @@ unrecognized or unsupported rather than guessing.
 ## How Object names survive damaged terminal indexes
 
 A healthy finalized tape carries its complete Object inventory in each of the
-three terminal index replicas. If all three replicas are unusable, Remanence
+three terminal replicas. If all three replicas are unusable, Remanence
 has to scan every filemark-delimited tape file from the beginning. That scan
 can prove that an Object-shaped tape file is complete, but its position alone
 does not reveal the Object's name.
@@ -136,7 +136,7 @@ foreign format into a Remanence format, or make an already-written tape
 writable without recovering its real catalog authority.
 
 For a site-to-site transfer, the destination must understand the tape's draft
-Bootstrap and on-tape format version. Its configuration also needs a pool rule
+bootstrap and on-tape format version. Its configuration also needs a pool rule
 that maps the barcode to an existing pool. Adoption does not decrypt or restore
 Objects; encrypted Objects still need their recovery keys. A WORM cartridge is
 safe for this read-only identity step, but remains ineligible for ordinary
@@ -153,17 +153,17 @@ The workflow has two physical reads:
    reads BOT with exactly one `LOCATE(0)` and at most one `READ`.
 2. `adopt-bootstrap` does not trust the earlier probe as authority. It acquires
    the exclusive `StateHandle`, performs fresh discovery, revalidates the exact
-   barcode, library, home slot, and selected drive, and rereads the Bootstrap
+   barcode, library, home slot, and selected drive, and rereads the bootstrap
    and its immediate physical tail under the same drive handle.
 
 Both commands temporarily select fixed 1 MiB blocks with drive compression
 disabled. They verify that setting, restore and verify the prior drive mode,
 and park the cartridge in the exact expected home slot. A restore or park
 failure fails the command. Neither command writes tape data, filemarks, or a
-new Bootstrap.
+new bootstrap.
 
 The adoption read accepts only an RFC 4122 UUIDv4 and the canonical 1 MiB
-default-parity Bootstrap geometry with compression disabled. The expected UUID
+default-parity bootstrap geometry with compression disabled. The expected UUID
 argument is compared with the UUID from this authoritative fresh BOT read, not
 with discovery or catalog data.
 
@@ -186,7 +186,7 @@ rem-debug --allow LIBRARY_SERIAL \
   --json
 ```
 
-For a valid native Bootstrap, preserve the reported `tape_uuid` and confirm the
+For a valid native bootstrap, preserve the reported `tape_uuid` and confirm the
 reported library, barcode, source slot, drive, compression flags, and geometry.
 Then perform authoritative adoption. The command generates its own operation
 UUID, so the caller does not need to create or retain an operation receipt.
@@ -222,9 +222,9 @@ committed-prefix, session, fence, or finalization authority.
 The lifecycle state is deliberately conservative:
 
 - exactly `Bootstrap → one filemark → EOD` becomes `ready`; this is an
-  identity-only Bootstrap tape with no later physical content;
-- data after Bootstrap, a missing or extra filemark, or an unreadable tail after
-  a valid Bootstrap becomes `recovery_required`.
+  identity-only bootstrap tape with no later physical content;
+- data after bootstrap, a missing or extra filemark, or an unreadable tail after
+  a valid bootstrap becomes `recovery_required`.
 
 `recovery_required` is not a damaged-identity verdict. It means the valid
 identity was recovered but the tape has more, different, or uncertain physical
@@ -304,7 +304,7 @@ treated as committed authority.
 
 This mechanism depends on the host checkpoint journal for an open tape. A
 Remanence cartridge arriving from another installation does not acquire safe
-append authority merely because its Bootstrap can be adopted. Transfer the
+append authority merely because its bootstrap can be adopted. Transfer the
 matching host journals when they are available; otherwise keep the cartridge
 out of ordinary write service and use terminal inventory or bounded BOT
 recovery to establish what is present. Identity adoption alone never guesses a
@@ -376,7 +376,7 @@ re-adoption refuses rather than rolling state back.
 
 ## After adoption
 
-For an exact Bootstrap-only tape reported `ready`, the catalog has enough
+For an exact bootstrap-only tape reported `ready`, the catalog has enough
 identity to treat it as an empty native cartridge, but still has no invented
 Object history.
 
@@ -422,7 +422,7 @@ commit history, and local catalog agree.
 ## Refusals to expect
 
 The commands fail closed for an ambiguous barcode, wrong library or home slot,
-UUID mismatch, damaged or non-v4 Bootstrap identity, foreign or unrecognized
+UUID mismatch, damaged or non-v4 bootstrap identity, foreign or unrecognized
 format, noncanonical geometry, enabled compression, active media-readiness
 ownership, barcode/pool conflict, conflict with any tape kind, retired identity,
 or an existing row carrying file, Object, prefix, finalization, open-session,

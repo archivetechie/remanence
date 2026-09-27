@@ -46,12 +46,12 @@ is prepared. No revision has yet been deposited. Once one is, the **normative**
 text of that published revision is the copy deposited under the document's
 concept DOI, named in its Status section.
 
-The two can differ legitimately — that is how the next revision is written — but
-never under the same name: a version string is never reused for different bytes.
+The two can differ legitimately — that is how the next revision is written.
+Once a revision is deposited, its version string is never reused for different bytes.
 `DEPOSITED.sha256` records the digest published for each deposited revision, and
 `tools/check_spec_versioning.py` fails the build if a document's current version
 string appears there and its bytes have since changed. So if a copy anywhere
-claims version X, it is byte-identical to the deposit of version X or it is
+claims a deposited version X, it is byte-identical to that deposit or it is
 defective.
 
 A copy found inside a Remanence source release is a convenience copy under the

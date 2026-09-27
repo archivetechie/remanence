@@ -172,7 +172,7 @@ Pool writes fail closed on a set of preconditions. The common refusals:
   call rather than the whole session.
 - `terminal finalization requires recovery` — finalization crossed its first
   durable boundary and then failed. Object admission is permanently disabled;
-  recovery may write only the missing terminal control components from the
+  recovery may write only the missing terminal suffix components from the
   proved progress position. Do not open a new Object-writing session for that
   cartridge.
 - `staging ring accounting imbalance` — an internal invariant violation

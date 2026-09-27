@@ -32,13 +32,13 @@ specifications.
 ### How to read the recommendations
 
 Each recommendation starts with the risk it addresses, then gives the practice
-we recommend, and ends by naming the specification section it serves, by
+we recommend, and ends by naming the specification sections it serves, by
 number and title, for example "Serves REM-OBJECT §12.10, Path Traversal." The
-section is named by its title as well as its number so that the reference
-still makes sense if a later revision renumbers the section. A "Serves" line
-names the specification section the practice supports. Where the rule itself
-moved to this guide, that section may hold only the description of the hazard,
-not a rule.
+sections are named by their titles as well as their numbers so that the
+references still make sense if a later revision renumbers the sections. A
+"Serves" line names the specification sections whose requirements the practice
+supports or whose hazards it addresses. Where the rules themselves moved to
+this guide, those sections may hold only descriptions of the hazards, not rules.
 
 The guide's own advice is written with "should" and "we recommend", in lower
 case. It does not use the capitalised requirement keywords of the
@@ -207,7 +207,7 @@ Hostile-Input Discharge; and REM-PARITY §16.2, Hostile-Input Posture.
 
 ### 2.6. Escape text read from the medium before showing it
 
-Bootstrap keys 3 and 4, and ParityMap keys 6 and 7, hold text chosen by
+The bootstrap keys 3 and 4, and ParityMap keys 6 and 7, hold text chosen by
 whoever wrote the tape. They are the first human-readable text a diagnostic
 tool prints from an unknown cartridge, and the operator reading them is
 deciding whether the cartridge is damaged or hostile. Text that carries
@@ -1125,14 +1125,14 @@ chapter is about getting there across crashes and failures.
 
 ### 9.1. Make the decision to finalize durable before the first terminal write
 
-A tool that begins writing terminal components before it has durably recorded
-its decision to finalize can crash, restart without knowing that the decision
-was made, and append an Object after a partial suffix. The tape then carries
+A tool can crash after beginning terminal writes but before durably recording
+its decision to finalize. On restart, it has no record of that decision. It
+can then append an Object after a partial terminal suffix. The tape then carries
 control structures among its Objects.
 
 We recommend recording the transition to `Finalizing` durably before any
-terminal media motion, and refusing every Object from that moment. The
-specification fixes the effect: "The accepted transition to `Finalizing`
+terminal media motion. From that moment, the tool should refuse every Object.
+The specification fixes the effect: "The accepted transition to `Finalizing`
 permanently disables Object admission." (REM-PARITY §3.4).
 
 Serves REM-PARITY §3.4, The Durable Boundary.
@@ -1146,9 +1146,9 @@ records progress before a barrier completes, can skip a component or write one
 twice.
 
 We recommend recording durable progress at six points, before replica A and
-after each of the five components, and advancing only when a component's
-barrier has completed and the component agrees with the plan. A count of
-completed replicas is a convenient summary, but it is not enough to resume
+after each of the five components. Progress should advance only when a
+component's barrier has completed and the component agrees with the plan.
+A count of completed replicas is a convenient summary, but it is not enough to resume
 from: after a complete separation extent, only the six-point record says that
 the extent must not be written again.
 
@@ -1166,11 +1166,10 @@ media motion: no terminal component is repeated, and nothing is written after
 C. If a completed record and a stale intent to finalize both survive and
 agree, the completed record should take precedence. If they disagree, the tool
 should stop rather than choose. Remanence, for example, keeps a sealed
-checkpoint and a companion intent. On the uninterrupted path it retires the
-companion as soon as the sealed checkpoint has been fsynced, before its final
-catalog projection. When a crash leaves both behind, startup recovery projects
-the sealed checkpoint first and retires the companion only after that
-projection succeeds. The
+checkpoint and a companion intent. On the uninterrupted path it fsyncs the sealed
+checkpoint. It then retires the companion. The final catalog projection
+follows. When a crash leaves both behind, startup recovery projects the sealed
+checkpoint first. It retires the companion only after that projection succeeds. The
 [on-tape layout reference](reference-tape-layout.md#finalization-and-catalog-less-recovery)
 describes the sequence.
 
@@ -1183,29 +1182,30 @@ state that must be reconciled before finalization continues. A restart that
 forgets the failure proceeds as if the component were intact.
 
 We recommend storing the classification durably with the finalization's
-progress, keeping it across restarts at the same progress, and clearing it only
-when the next component succeeds or, after replica C, when a normal completed
-record has been made durable. The specification calls the state
+progress. The tool should keep it across restarts at the same progress. It
+should clear it only when the next component succeeds or, after replica C,
+when a normal completed record has been made durable. The specification calls
+the state
 `RecoveryRequired` (REM-PARITY §3.4).
 
 Serves REM-PARITY §3.4, The Durable Boundary.
 
 ### 9.5. Repair only what is missing, under the medium's rewrite policy
 
-A component whose header was written but whose payload was not is torn terminal
-control, and it sits at a planned position that later components depend on. On
+A component whose header was written but whose payload was not is a torn terminal
+component, and it sits at a planned position that later components depend on. On
 rewritable media it can be rewritten. On WORM media, or where the tool cannot
 prove where the component starts, a further write risks damaging what is
 already there.
 
-We recommend first reconciling the medium with the recorded progress; then
-rewriting a torn component only where its start is proved and the medium allows
-rewriting; and, on WORM media or at a start that cannot be proved, stopping with
-no further motion. A tool should never remove its own barrier against new
-Objects in order to recover. The specification fixes what a recovery may not
+We recommend first reconciling the medium with the recorded progress. A torn
+component should then be rewritten only where its start is proved and the
+medium allows rewriting. On WORM media or at a start that cannot be proved,
+the tool should stop with no further motion. A tool should never remove its
+own barrier against new Objects in order to recover. The specification fixes what a recovery may not
 do: "It MUST NOT write an Object or append a second terminal suffix."
 (REM-PARITY §3.4). Remanence, for example, classifies a header-only component
-that it finds on restart as torn terminal control, never as an Object.
+that it finds on restart as a torn terminal component, never as an Object.
 
 Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.3, The
 Classification Ladder.
@@ -1217,14 +1217,14 @@ those replicas are complete inventories, but the tape will never have three.
 Treating it as finished without saying so would hide, from later readers and
 operators, that one damaged region could now cost the whole index.
 
-We recommend that a tool remain in `RecoveryRequired` in that case, and that
-accepting the reduced set be a distinct operator decision, recorded in the
-tool's audit trail. The specification fixes what may be claimed in the
+We recommend that a tool remain in `RecoveryRequired` in that case. Accepting
+the reduced set should be a distinct operator decision, recorded in the tool's
+audit trail. The specification fixes what may be claimed in the
 meantime: "A Writer MUST NOT report a tape as `Finalized` while fewer than three
 complete replicas exist." (REM-PARITY §3.4). It allows the separate acceptance,
 as `FinalizedDegraded`, without defining it. Remanence does not yet offer that
-decision: its catalog can represent a `finalized_degraded` outcome, but nothing
-produces it, so such a tape stays in `RecoveryRequired`.
+decision. Its catalog can represent a `finalized_degraded` outcome, but nothing
+produces it. Such a tape stays in `RecoveryRequired`.
 
 Serves REM-PARITY §3.4, The Durable Boundary.
 
@@ -1254,9 +1254,9 @@ Serves REM-PARITY §10.3, Object Recovery Rows.
 ### In plain terms
 
 Finalizing a tape writes its index three times at its end. Decide durably
-before you start, record progress only after each piece is proved on the
-medium, and on restart finish what the tape already shows rather than writing
-it again. When something breaks, repair only what is missing, and do not call a
+before you start. Record progress only after each piece is proved on the
+medium. On restart, finish what the tape already shows rather than writing
+it again. When something breaks, repair only what is missing. Do not call a
 tape finished with fewer than three good copies of its index unless someone has
 decided, on the record, to accept that.
 
@@ -1274,7 +1274,7 @@ and a SCSI transport can report it in either of two formats, fixed and
 descriptor. A reader that understands only one of them misses boundaries, and
 builds a wrong map of the tape.
 
-We recommend handling both formats, and testing the tool against both. The
+We recommend handling both formats. The tool should be tested against both. The
 specification requires the outcome: "The tape I/O layer MUST distinguish the
 Filemark and EndOfData outcomes on every transport, and on a SCSI transport in
 both of its sense-data formats [LTO-SCSI]." (REM-PARITY §3.5).
@@ -1287,15 +1287,16 @@ A replica's body can run to gigabytes, and reading three bodies to compare them
 costs time and wear. But a replica that is valid on its own may still disagree
 with another, and accepting it without looking would hide the conflict.
 
-Every field that the replicas must share is in the envelope, the header and
-footer of each replica (REM-PARITY §8.5 and §10.4). We recommend reading all
-three envelopes; reading one body on the healthy path, where the envelopes
-agree; and replaying bodies only for envelopes that disagree, to find which
-editions have payload-valid survivors. The specification fixes the rule that
+Every field that the replicas must share is in the replica envelope, the
+header and footer of each replica (REM-PARITY §8.5 and §10.4). We recommend
+reading all three replica envelopes first. On the healthy path, where they
+agree, the reader should read one body. It should replay bodies only for
+replica envelopes that disagree, to find which editions have payload-valid
+survivors. The specification fixes the rule that
 the comparison serves: "A Scanner MUST NOT accept a replica while another fully
 valid replica differs from it in any edition-common field" (REM-PARITY §8.5).
-Remanence, for example, reads all three envelopes on every inventory and reads
-one body when they agree.
+Remanence, for example, reads all three replica envelopes on every
+inventory. It reads one body when they agree.
 
 Serves REM-PARITY §8.5, Authoritative Selection, and REM-PARITY §12.4, Terminal
 Replica Validation.
@@ -1305,7 +1306,8 @@ Replica Validation.
 Agreeing replicas give the same inventory whichever of them is read, so the
 choice is about cost.
 
-We recommend trying C first, then B, then A. Discovery starts from the end of
+We recommend trying C first. If that attempt fails, the reader should try B.
+If B fails too, it should try A. Discovery starts from the end of
 data (REM-PARITY §8.4), and C is the last component on the tape, so on a healthy
 tape the reader reads the body nearest to where the head already is. Remanence
 follows this order.
@@ -1318,17 +1320,18 @@ A consumer that stores inventory rows as they arrive, before the replica
 carrying them has been fully validated, can keep rows from a replica that later
 fails.
 
-We recommend giving each attempt at a replica its own identifier, marking its
-rows as provisional until the terminal summary names the selected attempt, and
-emitting an explicit rejection for a failed attempt before trying the next.
+We recommend giving each attempt at a replica its own identifier. Its rows
+should remain provisional until the terminal summary names the selected
+attempt. The reader should emit an explicit rejection for a failed attempt
+before trying the next.
 The stream can then be bounded and backpressured, with no buffer for the whole
-index and no second read of a body on the healthy path. When envelopes
-conflict, resolving them can need a bounded replay, and the selected attempt
-can then be replayed for its consumer. The specification fixes the consumer's
+index and no second read of a body on the healthy path. When replica envelopes
+conflict, resolving them can need a bounded replay. The selected attempt can
+then be replayed for its consumer. The specification fixes the consumer's
 side: "An Inventory Consumer MUST commit only the attempt named by the terminal
 summary and MUST discard rejected or unselected attempts." (REM-PARITY §12.4).
 Remanence, for example, gives each attempt an `attempt_id` in its inventory
-stream and names a rejected attempt before it falls back to the next.
+stream. It names a rejected attempt before it falls back to the next.
 
 Serves REM-PARITY §12.4, Terminal Replica Validation.
 
@@ -1339,9 +1342,10 @@ Object. A reader that parses fields before it checks the magic can mistake
 damaged control for an Object, or spend its resources on a structure it would
 have rejected.
 
-We recommend checking a tape file's role magic before anything else, then the
-frame's fixed fields, then every size formula before it drives an allocation or
-a seek (section 2.2), and only then the plan, the digests and the payload. The
+We recommend checking a tape file's role magic before anything else. The
+reader should then check the frame's fixed fields. Next, it should check every
+size formula before it drives an allocation or a seek (section 2.2). Only then
+should it check the plan, the digests and the payload. The
 specification fixes the conditions but not their order, except that "a matching
 role magic commits the tape file to its control type, so malformed control
 never falls through to Object" (REM-PARITY §10.6).
@@ -1364,22 +1368,22 @@ We recommend that a tool:
 - report progress at least once per tape file crossed: the tape-file ordinal,
   the position as a logical block address, the candidates found so far, and
   the elapsed time;
-- let the operator abort between tape files, and on abort report the last
-  tape-file ordinal crossed, the candidates found and the drive's position, or
-  say that the position is not known;
+- let the operator abort between tape files;
+- on abort, report the last tape-file ordinal crossed, the candidates found
+  and the drive's position, or say that the position is not known;
 - once it has decided to abort, not read the first record of the next tape
   file;
 - stop and report after a small number of consecutive positioning failures
-  between tape files, for example eight, rather than keep commanding motion,
-  and count read failures separately; and
+  between tape files, for example eight, rather than keep commanding motion;
+- count read failures separately; and
 - accept the hints it can use: the expected tape UUID and block size, which the
   specification requires when the bootstrap is unreadable, and an expected
   tape-file count and capacity, which are useful only for estimating progress.
 
 The specification fixes what a hint may not do: "Hints MUST NOT cause any tape
 file to be skipped." (REM-PARITY §8.4.1). Remanence, for example, emits one
-start notice and one progress event for every structurally complete tape file,
-and lets the operator abort between files. It has no positioning-failure
+start notice and one progress event for every structurally complete tape file.
+It lets the operator abort between files. It has no positioning-failure
 budget: its walk stops at the first positioning failure.
 
 Serves REM-PARITY §8.4.1, All-Replicas-Invalid BOT Walk.
@@ -1405,21 +1409,21 @@ Recovering a damaged region can need every peer of many stripes. Read without a
 plan, the same peer is read again for each stripe, and the head moves back and
 forth across the tape.
 
-We recommend planning per epoch, reading each needed peer at most once per
-planning window, and reading in physical tape order. Window and cache sizes are
-choices of the implementation, not rules of the format. Remanence, for example,
+We recommend planning per epoch. Within each planning window, the reader
+should read each needed peer at most once. It should read in physical tape
+order. Window and cache sizes are choices of the implementation, not rules of the format. Remanence, for example,
 bounds a planning window at 1024 stripes and its recovery cache at 8 GiB.
 
 Serves REM-PARITY §13.6, Bulk Recovery (Informative).
 
 ### In plain terms
 
-Read the cheap parts first and the expensive parts only when needed: compare
-the three index envelopes, read one body, and start from the end of the tape.
-Keep a consumer from trusting rows until the reader has chosen them. When the
-index is gone and the whole tape must be walked, tell the operator, show
-progress, and let them stop. Refuse what cannot be recovered before moving the
-tape, and recover in tape order.
+Start from the end of the tape. Compare the three replica envelopes before
+reading a body. Read further bodies only when needed. Keep a consumer from
+trusting rows until the reader has chosen them. When the index is gone and the
+whole tape must be walked, tell the operator before starting. Show progress
+during the walk. Let the operator stop between tape files. Refuse what cannot
+be recovered before moving the tape. Recover in tape order.
 
 ## 11. Capacity admission
 

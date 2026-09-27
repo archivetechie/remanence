@@ -77,7 +77,7 @@ Lean/Aeneas proofs over the parity and format cores in [`verif/`](../verif).
 ### The REM-PARITY generation boundary
 
 Current software writes and accepts only bootstrap `schema_major = 2`, whose
-terminal authority is three complete index replicas separated by typed extents.
+terminal authority is three complete terminal replicas separated by typed extents.
 The repository copy under `specs/publication/` and its frozen vectors define
 `schema_major = 1`. Consequently current software cannot read tapes written by
 the v0.1.0/v1.0.0 release, and an implementation of the generation-1 review

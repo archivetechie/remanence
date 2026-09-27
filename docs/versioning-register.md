@@ -52,15 +52,17 @@ documents and published artifacts themselves.
   a revision counter and **not** the document's version.
 - **Where.** Two bytes at offset 0x0A of every bootstrap block. Normative:
   REM-PARITY §8.1; its registry is §8.1.1.
-- **Current values.** The registry assigns: `0`–`1` — historic
-  pre-publication values, absent from the published vectors; `2` — object
-  rows carry no `object_id` requirement; `3` (current) — `object_id` is
-  required in every object row. Published test vectors legitimately carry both, because the
-  field advanced while they were generated; all are conformant.
-- **Unknown value.** Readers accept any value. This is safe because
-  unknown bootstrap payload keys are ignorable by rule (§5.3), so a
-  version-1 reader reads through tapes from any later 1.x — the
-  read-through path of the policy, not the refuse path.
+- **Current values.** This registry covers `schema_major` 2. Values `0`–`2`
+  were never assigned under that major. Value `3` is the current writer value;
+  it has no terminal-index semantics, and Object rows are carried by terminal
+  replicas. Values `4` and above are unassigned. The generation-1 registry is
+  retained in the published REM-PARITY 1.0.0-draft.2. The unchanged publication
+  archive contains major-1 images at minor values `2` and `3`; these are not
+  generation-2 vectors, and a major-2 reader rejects their bootstrap authority.
+- **Unknown value.** Readers accept any value in the fixed frame. Individual
+  future payload rules may be gated on it. Unknown bootstrap payload keys are
+  ignorable by rule (§5.3), so an unassigned minor value does not prevent a
+  reader from reading a newer bootstrap in the same major generation.
 - **How it changes.** A future minor revision of REM-PARITY that changes
   what can appear in the bootstrap assigns the next value and adds a
   registry row naming itself. Most document revisions assign nothing.
@@ -83,10 +85,10 @@ documents and published artifacts themselves.
 
 ### 4. Terminal Object rows — the integer-key vocabulary
 
-- **What it is.** Inside each of the three terminal index replica payloads,
+- **What it is.** Inside each of the three terminal replica payloads,
   each stored Object has one fixed 256-byte slot containing a small map of
   numbered fields (1 = tape file number, 4 = object identity, and so on).
-  The sole BOT Bootstrap is Object-count independent and contains no rows.
+  The sole BOT bootstrap is Object-count independent and contains no rows.
   The set of assigned numbers is a vocabulary that can grow.
 - **Where.** REM-PARITY §10.3.
 - **Current values.** Row keys 1–4, 10–13 and 21–23 are assigned; key 4
@@ -133,13 +135,13 @@ documents and published artifacts themselves.
 - **What it is.** Every structure announces itself with magic bytes, and
   each magic label carries a version byte (`\x01`); the terminal replica and
   separation labels follow it with a role letter (`H` or `F`). The active
-  labels cover the BOT Bootstrap, sidecar header/footer, ParityMap
+  labels cover the BOT bootstrap, sidecar header/footer, ParityMap
   header/footer, terminal replica header/footer, and separation
   header/footer.
-- **Where.** REM-PARITY §2.5. Every magic except the BOT Bootstrap is further
+- **Where.** REM-PARITY §2.5. Every magic except the BOT bootstrap is further
   keyed to the individual tape by HMAC, so structures cannot migrate
   between tapes.
-- **Current values.** Version byte `\x01` in every label. The Bootstrap,
+- **Current values.** Version byte `\x01` in every label. The bootstrap,
   sidecar and ParityMap labels end in it; the terminal replica and separation
   labels end in `H` (header) or `F` (footer) after it.
 - **Unknown value.** A non-matching magic is simply "not this structure" —

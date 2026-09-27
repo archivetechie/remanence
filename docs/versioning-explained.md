@@ -234,10 +234,11 @@ A revision still open for public comment carries a `-draft.N` suffix on that
 three-part core — it names the revision it anticipates and orders before it,
 without being that revision yet. All three specifications are there today,
 open for comment and each becoming 1.0.0 only once it is frozen; the `-draft.N`
-number climbs independently per document as review produces text changes
-(REM-OBJECT and REM-ENCRYPT are at 1.0.0-draft.3, REM-PARITY at 1.0.0-draft.2
-as of this writing — see [versioning-register.md](versioning-register.md#18-the-specification-documents)
-for current values).
+number climbs independently per document as review produces text changes.
+Those numbers name the published revisions; see
+[versioning-register.md](versioning-register.md#18-the-specification-documents)
+for current values and [specs/in-progress/README.md](../specs/in-progress/README.md)
+for revisions in preparation.
 
 The document's title and filename carry only the major line ("REM-PARITY
 Format", file `rem-parity-1-specification.md`), so filenames never churn
