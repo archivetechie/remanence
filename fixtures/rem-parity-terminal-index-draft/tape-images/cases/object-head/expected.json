@@ -1,0 +1,1 @@
+{"id": "object-head", "image": "a4-minimal", "fault": {"unreadable_lbas": [2]}, "failed_data_addresses": [[1, 0]], "expected": {"recovered": true, "object_sha256_matches": true}, "pinned": true, "sections": ["13"]}

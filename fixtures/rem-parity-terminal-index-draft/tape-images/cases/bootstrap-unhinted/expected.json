@@ -1,0 +1,1 @@
+{"id": "bootstrap-unhinted", "image": "a4-minimal", "fault": {"unreadable_lbas": [0]}, "expected": {"error": "NoBootstrapFound"}, "pinned": true, "sections": ["8.4.1", "15"]}

@@ -1,0 +1,12 @@
+{
+  "append_lba": 18,
+  "base": "a4-minimal",
+  "committed_file_blocks": [
+    1,
+    4,
+    7,
+    2
+  ],
+  "physical_eod": 21,
+  "stop": "after the 4-block Object with its sidecar, then a 2-block Object committed by finish_object with no barrier (W = 4, T = 6), then 3 torn records"
+}

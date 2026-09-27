@@ -1,0 +1,13 @@
+{
+  "failed_data_addresses": [],
+  "hints": null,
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 25,
+      "record_index": 2,
+      "tape_file": 5
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# Full-tape review candidates
+
+Review-only REM-PARITY generation-2 fixtures. These are not publication artifacts. Image bytes are pinned by size and SHA-256 per tape file and for the concatenation of all data records in MANIFEST.tsv. Filemarks and EOD are structural expectations, not bytes in those streams; an unterminated tail has no filemark. Image streams are regenerated, never checked in. REM-PARITY's companion archive will carry the bytes at freeze.
+
+Run `cargo run -p remanence-cli --example generate_tape_images` to regenerate metadata, or append `-- --check` to compare every digest and descriptor. Inputs record the complete byte-deciding recipe, including repeat-byte payloads, REM-OBJECT options, diagnostics, checkpoints and stop points. The second edition uses the same recipe except its explicit edition id and sequence, and replaces only replica B.
+
+expected-cases.json is the frozen specification-authored source. Per-case expected.json preserves its case verbatim, including pinned and sections. Never derive expectations from executor results. The executor runs as damage_vectors in the workspace suite; `cargo test -p remanence-cli --lib damage_vectors -- --nocapture` reports every outcome. Copy-health annotations and note/informative fields are informative. Unpinned cases execute but do not decide a pass. Disagreements remain failing pending specification review. Fault maps include physical and file-relative addresses; failed data addresses also produce real medium errors.

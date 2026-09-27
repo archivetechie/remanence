@@ -1,0 +1,1 @@
+{"id": "short-epoch-recoverable", "image": "short-epoch", "fault": {"unreadable_lbas": [3, 4, 5, 6, 7, 8, 9, 10]}, "failed_data_addresses": [[1, 1]], "expected": {"recovered": true, "object_sha256_matches": true}, "pinned": true, "sections": ["3.3", "9.1", "13.4", "13.5"]}

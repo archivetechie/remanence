@@ -1,0 +1,1 @@
+{"id": "replica-c", "image": "a4-minimal", "fault": {"unreadable_lbas": [35]}, "expected": {"inventory": "an agreeing valid replica", "degraded": true}, "pinned": true, "sections": ["8.5"]}

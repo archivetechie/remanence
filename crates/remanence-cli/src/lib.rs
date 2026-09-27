@@ -86,6 +86,8 @@ use zeroize::Zeroize;
 
 mod archive_ingest;
 mod archive_map;
+#[cfg(test)]
+mod damage_vectors;
 mod freeze_drill;
 mod get;
 mod pool_ops;
@@ -93,6 +95,9 @@ mod put;
 mod recovery_report;
 mod tape_finalize;
 pub mod tape_image;
+// Review-only fixture code used by the example and the executor.
+#[doc(hidden)]
+pub mod tape_image_vectors;
 mod tape_inventory;
 mod terminal_index_drill;
 #[cfg(feature = "tui")]

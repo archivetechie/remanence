@@ -1,0 +1,1 @@
+{"id": "editions-survivor", "image": "two-edition", "fault": {"unreadable_lbas": [27]}, "expected": {"inventory": "the agreeing survivors A and C", "degraded": true}, "pinned": true, "sections": ["8.5"]}

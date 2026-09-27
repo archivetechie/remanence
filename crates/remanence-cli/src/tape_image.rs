@@ -14,8 +14,8 @@ use remanence_parity::{
     assemble_terminal_plan, checked_tape_index_replica_layout, index_separation_records,
     write_terminal_tail, CommittedBundle, CommittedBundleKind, CommittedState, DriveHandleRawSink,
     FilemarkMap, JournalError, ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics,
-    ParityScheme, ParitySink, SidecarWriteSummary, TapeFileEntry, TapeFileJournal, TapeFileKind,
-    TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
+    ParityScheme, ParitySink, RawTapeSink, SidecarWriteSummary, TapeFileEntry, TapeFileJournal,
+    TapeFileKind, TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
     TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
     TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalPrefixPlan,
     TerminalPrefixReconcileEvidence, TerminalTailAuthority, TerminalTailComponentPlan,
@@ -55,6 +55,19 @@ pub struct TapeImageObject {
     pub files: Vec<TapeImageFile>,
 }
 
+/// Where the shared production write chain ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapeImageStop {
+    /// Write the final ParityMap and complete terminal triple.
+    Finalized,
+    /// Stop after the scheduled Object commits/checkpoints, then write raw
+    /// unterminated records. In particular this adds no checkpoint barrier.
+    CommittedPrefix {
+        torn_records: u64,
+        torn_record_fill: u8,
+    },
+}
+
 /// Every choice that can affect an image's bytes or checkpoint schedule.
 /// Payloads remain replayable in the returned inputs, so generators can record
 /// their bytes alongside the options without duplicating Object recovery rows.
@@ -86,9 +99,11 @@ pub struct TapeImageInputs {
     pub diagnostic_keys_present: bool,
     /// Capacity basis for the existing production reservation calculator.
     pub capacity_bytes: u64,
+    /// Explicit finalization or interrupted-write stop point.
+    pub stop: TapeImageStop,
 }
 
-/// Completed image plus original inputs and the actual captured diagnostics.
+/// Written image (finalized or stopped), original inputs and captured diagnostics.
 pub struct WrittenTapeImage {
     /// Original options and replayable byte sources, retained for recording.
     pub inputs: TapeImageInputs,
@@ -102,8 +117,8 @@ pub struct WrittenTapeImage {
     pub sidecars: Vec<SidecarWriteSummary>,
     /// Complete committed physical file map.
     pub map: FilemarkMap,
-    /// Shared assembly result used to write the terminal tail.
-    pub terminal_plan: TerminalTripleWritePlan,
+    /// Shared assembly result; absent when stopped before terminal finalization.
+    pub terminal_plan: Option<TerminalTripleWritePlan>,
 }
 
 /// Write bootstrap, Objects, scheduled checkpoints, final prefix and terminal
@@ -235,6 +250,37 @@ pub fn write_tape_image(
         .writer_identity
         .capture()
         .map_err(|error| error.to_string())?;
+    if let TapeImageStop::CommittedPrefix {
+        torn_records,
+        torn_record_fill,
+    } = inputs.stop
+    {
+        // Detach without closing the open epoch or issuing a barrier.
+        let _state = parity
+            .into_session_state()
+            .map_err(|error| error.to_string())?;
+        let entries = journal
+            .bundles
+            .iter()
+            .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
+            .flat_map(|bundle| bundle.entries.iter().map(TapeFileEntry::to_map_entry))
+            .collect();
+        let map = FilemarkMap::new(entries).map_err(|error| error.to_string())?;
+        let block = vec![torn_record_fill; inputs.block_size as usize];
+        for _ in 0..torn_records {
+            raw.write_fixed_block(&block)
+                .map_err(|error| error.to_string())?;
+        }
+        return Ok(WrittenTapeImage {
+            inputs,
+            bootstrap_diagnostics,
+            terminal_diagnostics,
+            object_rows,
+            sidecars,
+            map,
+            terminal_plan: None,
+        });
+    }
     let prefix_plan = parity
         .plan_terminal_index_close(terminal_diagnostics.clone())
         .map_err(|error| format!("plan terminal prefix: {error}"))?;
@@ -285,7 +331,7 @@ pub fn write_tape_image(
         object_rows,
         sidecars,
         map,
-        terminal_plan,
+        terminal_plan: Some(terminal_plan),
     })
 }
 
@@ -595,6 +641,7 @@ mod tests {
             },
             diagnostic_keys_present: diagnostics,
             capacity_bytes: 6_000_000_000_000,
+            stop: TapeImageStop::Finalized,
         }
     }
 
@@ -662,6 +709,8 @@ mod tests {
                 first_bytes.eod_record as u64,
                 first
                     .terminal_plan
+                    .as_ref()
+                    .unwrap()
                     .edition
                     .descriptor
                     .terminal_layout
@@ -669,7 +718,13 @@ mod tests {
             );
             assert_eq!(
                 first.inputs.edition_id,
-                first.terminal_plan.edition.descriptor.edition_id
+                first
+                    .terminal_plan
+                    .as_ref()
+                    .unwrap()
+                    .edition
+                    .descriptor
+                    .edition_id
             );
             assert_eq!(first.bootstrap_diagnostics, first.terminal_diagnostics);
             assert_eq!(
@@ -677,7 +732,13 @@ mod tests {
                 "1970-01-01T00:00:00Z"
             );
             assert_eq!(
-                first.terminal_plan.edition.descriptor.write_timestamp,
+                first
+                    .terminal_plan
+                    .as_ref()
+                    .unwrap()
+                    .edition
+                    .descriptor
+                    .write_timestamp,
                 "1970-01-01T00:00:00Z"
             );
             let bootstrap =
@@ -714,6 +775,48 @@ mod tests {
                     SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH
                 };
             assert_eq!(decoded.payload.directory.entries[0].flags, expected_flags);
+        }
+    }
+
+    /// Both stop forms preserve the committed prefix; stopping an open epoch
+    /// must not emit the partial sidecar that a checkpoint would write.
+    #[test]
+    fn committed_prefix_stop_preserves_open_epoch_and_optional_torn_records() {
+        for open in [false, true] {
+            for torn_records in [0, 3] {
+                let mut inputs = fixed_inputs(true, true, true);
+                if open {
+                    let mut second = fixed_inputs(false, false, true).objects.remove(0);
+                    second.options.object_id = "00000000-0000-4000-8000-000000000004".into();
+                    inputs.objects.push(second);
+                }
+                inputs.stop = TapeImageStop::CommittedPrefix {
+                    torn_records,
+                    torn_record_fill: 0xa5,
+                };
+                let (written, image) = write_model(inputs);
+                let append = if open { 18 } else { 15 };
+                assert!(written.terminal_plan.is_none());
+                assert_eq!(written.map.tape_file_count(), if open { 4 } else { 3 });
+                assert_eq!(written.sidecars.len(), 1);
+                assert_eq!(written.sidecars[0].protected_ordinal_end_exclusive, 4);
+                assert_eq!(written.map.total_data_ordinals(), if open { 6 } else { 4 });
+                assert_eq!(image.eod_record, append + torn_records as usize);
+                if torn_records != 0 {
+                    let tail = image.files.last().unwrap();
+                    assert_eq!(tail.start_record, append);
+                    assert_eq!(tail.filemark_record, None);
+                    assert_eq!(
+                        tail.bytes,
+                        vec![0xa5; torn_records as usize * BLOCK as usize]
+                    );
+                } else {
+                    assert_eq!(
+                        image.files.last().unwrap().filemark_record,
+                        Some(append - 1)
+                    );
+                }
+            }
         }
     }
 

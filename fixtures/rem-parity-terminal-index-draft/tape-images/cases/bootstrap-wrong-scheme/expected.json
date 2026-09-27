@@ -1,0 +1,1 @@
+{"id": "bootstrap-wrong-scheme", "image": "a4-minimal", "fault": {"unreadable_lbas": [0]}, "hints": {"tape_uuid": "the image's", "block_size": 262144, "scheme": {"k": 2, "m": 1, "S": 2}}, "failed_data_addresses": [[1, 0]], "expected": {"error": "SchemeMismatch"}, "pinned": true, "sections": ["13.3", "8.4.1"]}

@@ -1,0 +1,63 @@
+{
+  "block_size": 262144,
+  "capacity_bytes": 6000000000000,
+  "checkpoint_after_objects": [
+    0
+  ],
+  "compression": false,
+  "diagnostic_keys_present": true,
+  "directory_flags": 6,
+  "edition_id_hex": "54545454545454545454545454545454",
+  "edition_sequence": 7,
+  "nominal_extent_bytes": 786432,
+  "objects": [
+    {
+      "files": [
+        {
+          "entry_type": "regular",
+          "executable": null,
+          "extensions": {},
+          "file_id": "00000000-0000-4000-8000-000000000003",
+          "file_sha256": "f00fe5379e843e6346600bdfe186632d4126fcc4f47076b062651730a9920216",
+          "link_target": null,
+          "mtime": null,
+          "path": "payload.bin",
+          "payload": {
+            "byte": 53,
+            "count": 262144,
+            "encoding": "repeat-byte"
+          },
+          "size_bytes": 262144,
+          "xattrs": {}
+        }
+      ],
+      "options": {
+        "caller_object_id": "parity-image-object-0",
+        "chunk_size": 262144,
+        "encryption": "none",
+        "extensions": {},
+        "manifest_file_id": "00000000-0000-4000-8000-000000000002",
+        "metadata_preservation": "archival",
+        "object_id": "00000000-0000-4000-8000-000000000001",
+        "write_timestamp": "2026-08-09T00:00:00Z"
+      }
+    }
+  ],
+  "parity_map_sequence_start": 0,
+  "scheme": {
+    "data_blocks_per_stripe": 2,
+    "id": "rs-cauchy-gf256-v1",
+    "parity_blocks_per_stripe": 2,
+    "stripes_per_neighborhood": 2
+  },
+  "stop": {
+    "kind": "committed-prefix",
+    "torn_record_fill": 165,
+    "torn_records": 3
+  },
+  "tape_uuid": "12345678-1234-4234-8234-123456789abc",
+  "writer_identity": {
+    "write_timestamp": "2026-08-09T00:00:00Z",
+    "writer_version": "remanence-terminal-vector-generator/1"
+  }
+}

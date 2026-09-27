@@ -1,0 +1,1 @@
+{"id": "filemark-after-b", "image": "a4-minimal", "fault": {"removed_filemark_after_tape_file": 6}, "expected": {"inventory": "replica A accepted", "degraded": true}, "pinned": true, "sections": ["8.4 step 2", "8.5"]}

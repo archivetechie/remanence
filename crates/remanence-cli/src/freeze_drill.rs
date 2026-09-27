@@ -521,6 +521,7 @@ fn write_drill_tape(
                 | remanence_parity::SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
             diagnostic_keys_present: true,
             capacity_bytes: DRILL_CAPACITY_BYTES,
+            stop: crate::tape_image::TapeImageStop::Finalized,
         },
     )?;
     let expected_objects = image
@@ -546,9 +547,10 @@ fn write_drill_tape(
         tape_uuid,
         expected_objects,
         map: image.map,
-        terminal_replica_c_tape_file: image.terminal_plan.replicas[2]
-            .component
-            .planned_tape_file_number,
+        terminal_replica_c_tape_file: image.terminal_plan.expect("finalized drill image").replicas
+            [2]
+        .component
+        .planned_tape_file_number,
         first_sidecar_header_block_count: image
             .sidecars
             .first()

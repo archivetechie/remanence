@@ -95,8 +95,11 @@ jobs:
             done
           ) || true
 
+      - name: Check full-tape parity image digests and damage descriptors
+        run: cargo run -p remanence-cli --example generate_tape_images -- --check
+
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
 
       # The field-test client is outside the workspace, so the workspace build
       # never compiles it; without this step it silently drifted behind the
