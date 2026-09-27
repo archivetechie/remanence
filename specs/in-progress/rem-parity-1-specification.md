@@ -1537,6 +1537,16 @@ MUST NOT emit intermediate ParityMaps, checkpoint indexes, or a singular final
 index. The complete authoritative inventory is the fixed-slot payload repeated
 in full by replicas A, B, and C.
 
+For the final ParityMap, the Writer MUST set `canonical_map_digest` to the
+SHA-256 digest of the Section 7.3 canonical projection of tape files 0 through
+the ParityMap's own entry, inclusive. The Writer MUST set
+`directory_scope_tape_file_count` to the ParityMap's tape file number plus one.
+The Writer MUST set `directory_scope_total_data_ordinals` to that prefix's
+`T` at finalization (Section 7.2). The Writer MUST set
+`directory_scope_highest_protected_ordinal` to that prefix's `W` at
+finalization. These definitions apply to the header/footer fields and their
+matching payload values (Sections 10.1.4 and 10.1.5).
+
 #### 10.1.2. Copy Layout
 
 With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks
@@ -2258,6 +2268,20 @@ classify the file as an object candidate.
 *Rationale.* This is the no-circular-failure rule in action: the block needing
 recovery may be the very block that would have classified the file.
 
+After the walk, when the tape's final ParityMap validates and is marked
+`is_final_directory`, the Scanner MUST perform a second pass that identifies
+as a sidecar each Object candidate at a tape file a directory entry names
+whose measured length equals the entry's `sidecar_total_block_count`. The new
+entry holds the directory entry's `epoch_id` and protected range and the
+measured block count. Identification uses only the tape file number and
+measured length; it reads no sidecar block. The Section 13.1 digest and scope
+checks confirm all identifications together; otherwise the Scanner retains
+the unreconciled map. Each identification removes the file's blocks from the
+Object data-ordinal sequence, so later Objects'
+`first_parity_data_ordinal` values are recounted. Item 7's rule against reading
+Object content applies to the second pass. The tail copy's hash is checked
+before its metadata is used for rescue (Section 13.3 step 3).
+
 ### 12.4. Terminal Replica Validation
 
 The Scanner first performs bounded terminal discovery from EOD (Section 8.4).
@@ -2318,7 +2342,31 @@ A validated, scoped map (Section 12); the bootstrap's scheme record, or the
 scheme supplied out of band when the bootstrap is unreadable (Section
 8.4.1); and
 the failed addresses — `(tape_file_number, object_block_index)` pairs or
-ordinals.
+ordinals. A map produced by the Section 8.4.1 walk, after the second pass
+of Section 12.3, is validated against the tape's final ParityMap when that
+ParityMap validates and is marked `is_final_directory`, and the map's canonical
+projection (Section 7.3) through the ParityMap's own entry hashes to its
+`canonical_map_digest`.
+The validated scope and durable boundary are the first
+`directory_scope_tape_file_count` tape files, ending with that ParityMap's
+entry; `W` is `directory_scope_highest_protected_ordinal`. Validation checks
+that `directory_scope_tape_file_count` is the ParityMap's tape file number
+plus one, and recomputes `T` and `W` from that prefix and compares them with
+`directory_scope_total_data_ordinals` and
+`directory_scope_highest_protected_ordinal`, respectively, using the Writer
+definitions in Section 10.1.1. A walked map whose projection does not hash to a
+validated final ParityMap's `canonical_map_digest`, or whose prefix disagrees
+with those scope fields, is not validated and gives the Recoverer no map, with
+no fallback to the bootstrap's scope. Damage confined to one sidecar that
+leaves its metadata unreadable or checksum-invalid cannot cause this refusal
+or deny recovery of other epochs: identification does not depend on that
+metadata. If none of that sidecar's header/index copies validates, only its
+epoch is metadata-unavailable
+(Section 12.5).
+Without a validated final ParityMap, the walked map gives no validated scope
+beyond the bootstrap's. The sidecar epoch directory of the tape's final
+ParityMap is also an input whenever that ParityMap validates and is marked
+`is_final_directory`.
 
 ### 13.2. Typed Refusals
 
@@ -2346,6 +2394,18 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    epoch directory entry is available: locate the tail copy at block
    `sidecar_total_block_count − 1 − sidecar_header_block_count` using the
    entry's counts, and verify its `canonical_metadata_hash` against the entry.
+   An entry is available whenever the tape's final ParityMap validates and is
+   marked `is_final_directory`, reached through a validated replica's
+   structural rows or found by the Section 8.4.1 walk. A Recoverer MUST NOT
+   place a read from a directory entry unless the entry agrees with the
+   sidecar's map entry in tape file, epoch, protected range and block count.
+   This applies to every map entry the rescue uses, on either route.
+   On the walk route, the Scanner identifies each Object candidate at a tape
+   file the directory entry names as that sidecar when its measured length
+   equals the entry's `sidecar_total_block_count`, without reading its tail.
+   The Section 13.1 digest check confirms the whole projection, including these
+   identifications. The Recoverer checks the tail copy's `canonical_metadata_hash`
+   against the directory entry before using the tail copy's metadata for rescue.
    The directory carries exactly the counts and hash needed to find and verify
    the tail copy without the footer — the case it exists for (Section 10.1.1).
 4. Only when no header/index copy can be validated is the epoch
@@ -2441,7 +2501,8 @@ TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or
 TerminalIndexReplicaConflict    independently valid survivors disagree
 BotStructuralRecoveryRequired   no terminal replica validates; explicit BOT walk required
 SchemeMismatch                  sidecar geometry disagrees with the bootstrap or supplied scheme
-FilemarkMapDigestMismatch       replica structural projection digest disagrees
+FilemarkMapDigestMismatch       replica structural projection digest mismatch, or a walked map's
+                                projection or scope fields disagree with the final ParityMap
 FilemarkMapReconstruct          BOT recovery walk could not produce a valid map
 OutsideValidatedMapPrefix       refusal: address beyond the validated scope (Section 13.2)
 UnrecoverablePendingEpoch       refusal: ordinal ≥ W, parity not yet written
@@ -3097,6 +3158,30 @@ an errata revision of draft.1.
 
   Decisions on questions the review raised then changed the text as follows.
 
+  - Sections 13.1 and 13.3 now make the sidecar epoch directory available
+    whenever the tape's final ParityMap validates and is marked final, through
+    a validated replica's structural rows or the Section 8.4.1 walk. Section
+    10.1.1 defines the Writer's four authority fields: the canonical digest
+    covers tape files 0 through the ParityMap's own entry, the scope count is
+    its tape file number plus one, and the total-data and highest-protected
+    ordinal fields are that prefix's `T` and `W` at finalization. Section 13.1
+    validates the reconciled walked projection, scope count and recomputed `T`
+    and `W` against those fields, establishing its scope and durable boundary. A
+    mismatch with a validated final ParityMap gives no map, with no fallback
+    to the bootstrap's scope; only when no final ParityMap validates does the
+    bootstrap's scope remain. Sections 12.3 and 13.3 require walk identification
+    by directory tape file and measured length, confirmed by the Section 13.1
+    digest and scope checks. Identification reads no sidecar metadata, so
+    unreadable or checksum-invalid metadata cannot prevent identification of
+    other epochs. The tail hash is checked before the tail's metadata is used
+    for rescue, so unvalidated tail metadata cannot guide recovery.
+    Section 13.3's Recoverer prohibition covers every sidecar map entry the
+    rescue uses on both routes: agreement is checked before placing a
+    directory-assisted read. Section 15 widens `FilemarkMapDigestMismatch` to
+    cover a walked map whose projection or scope fields disagree with the final
+    ParityMap, retaining the replica structural projection case. The Recoverer
+    rule settles what Section 13.3 left undecided. The Writer definitions, the
+    Scanner's second pass and the Recoverer rule are a minor change of the draft.
   - Section 8.4 now points to Section 8.5 when footers propose different
     planned layouts. The pointer is informative and changes no requirement.
   - Section 8.4 now permits a Scanner to discover terminal replicas when the
@@ -3363,6 +3448,8 @@ This is the live preparing-copy snapshot for generation 2.
    properties they test are kept, and are covered by the reference
    implementation's tests rather than by candidate vectors. The sidecar
    negative cases are the largest group with no generation-2 coverage yet.
+   The walk route cannot find a ParityMap whose block 0 is unreadable; the
+   replica route survives that damage by locating it through structural rows.
 3. **TT-3 — media exercise of the default separation extents (VTL passed;
    physical open).** The exact one-GiB layout has passed clean VTL writes and
    independent full verification at all three legal block sizes. The 256 KiB

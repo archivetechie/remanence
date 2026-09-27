@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::ParityError;
-use crate::parity_map::SidecarEpochDirectory;
+use crate::parity_map::{DecodedParityMapTapeFile, SidecarEpochDirectory};
 use crate::raw::PhysicalPositionHint;
 
 /// Digest metadata for validating a filemark map or a covered prefix.
@@ -723,6 +723,42 @@ pub struct ScopedFilemarkMap {
 }
 
 impl ScopedFilemarkMap {
+    /// Validate a reconciled BOT walk through the final ParityMap's own entry.
+    /// The caller supplies a parsed, validated ParityMap from this tape. Its
+    /// directory bounds recovery even when the walk measured later tape files.
+    pub fn validate_against_final_parity_map(
+        map: FilemarkMap,
+        parity_map: &DecodedParityMapTapeFile,
+    ) -> Result<Self, ParityError> {
+        let directory = &parity_map.payload.directory;
+        directory.validate()?;
+        let entry = map
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == TapeFileKind::ParityMap);
+        if !directory.is_final_directory
+            || !entry.is_some_and(|entry| {
+                entry.tape_file_number.checked_add(1)
+                    == Some(directory.directory_scope_tape_file_count)
+                    && entry.block_count == parity_map.header.parity_map_total_block_count
+            })
+        {
+            return Err(ParityError::FilemarkMapDigestMismatch {
+                truncation_position: None,
+            });
+        }
+        let digest = FilemarkMapDigest {
+            map_sha256: parity_map.payload.canonical_map_digest,
+            tape_file_count: directory.directory_scope_tape_file_count,
+            map_total_data_ordinals: directory.directory_scope_total_data_ordinals,
+            highest_protected_ordinal: directory.directory_scope_highest_protected_ordinal,
+            covers_complete_map: false,
+        };
+        Ok(Self::validate_against_digest(map, &digest)?
+            .with_sidecar_directory(Some(directory.clone())))
+    }
+
     /// Construct a complete scoped map from the catalog and its protection
     /// watermark.
     pub fn from_catalog(map: FilemarkMap, highest_protected_ordinal: u64) -> Self {
