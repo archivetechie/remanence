@@ -1,0 +1,2 @@
+{"id": "resume-w-greater-than-t", "image": "unfinalized-closed", "prefix_mutation": "file 1 (the Object) records block_count 3, so T = 3, while the sidecar still protects [0, 4), so W = 4", "W": 4, "T": 3,
+     "expected": {"accepted": false, "error": "ResumeAppend", "before_any_read_or_write": true}, "pinned": true, "sections": ["14 step 2"]}

@@ -1,5 +1,6 @@
 //! Generate/check review-only full-tape digests and damage descriptors.
 //! Expected outcomes are copied from the frozen specification-authored source.
+use remanence_cli::resume_vectors as resume;
 use remanence_cli::tape_image_vectors::{fault_map, generate, hex, EXPECTATIONS, IMAGE_NAMES};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,7 +23,7 @@ fn artifact(
         if fs::read(&path).map_err(|error| format!("fixture {relative}: {error}"))? != bytes {
             return Err(format!("fixture differs: {relative}").into());
         }
-    } else {
+    } else if fs::read(&path).ok().as_deref() != Some(bytes) {
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(path, bytes)?;
     }
@@ -151,6 +152,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &mut emitted,
     )?;
     artifact(&root, "README.md", b"# Full-tape review candidates\n\nReview-only REM-PARITY generation-2 fixtures. These are not publication artifacts. Image bytes are pinned by size and SHA-256 per tape file and for the concatenation of all data records in MANIFEST.tsv. Filemarks and EOD are structural expectations, not bytes in those streams; an unterminated tail has no filemark. Image streams are regenerated, never checked in. REM-PARITY's companion archive will carry the bytes at freeze.\n\nRun `cargo run -p remanence-cli --example generate_tape_images` to regenerate metadata, or append `-- --check` to compare every digest and descriptor. Inputs record the complete byte-deciding recipe, including repeat-byte payloads, REM-OBJECT options, diagnostics, checkpoints and stop points. The second edition uses the same recipe except its explicit edition id and sequence, and replaces only replica B.\n\nexpected-cases.json is the frozen specification-authored source. Per-case expected.json preserves its case verbatim, including pinned and sections. Never derive expectations from executor results. The executor runs as damage_vectors in the workspace suite; `cargo test -p remanence-cli --lib damage_vectors -- --nocapture` reports every outcome. Copy-health annotations and note/informative fields are informative. Unpinned cases execute but do not decide a pass. Disagreements remain failing pending specification review. Fault maps include physical and file-relative addresses; failed data addresses also produce real medium errors.\n", check, &mut emitted)?;
+    artifact(
+        &root,
+        "resume/expected-cases.json",
+        resume::EXPECTATIONS.as_bytes(),
+        check,
+        &mut emitted,
+    )?;
+    let resume_source: Value = serde_json::from_str(resume::EXPECTATIONS)?;
+    let literals = resume::literal_cases();
+    assert_eq!(
+        literals.len(),
+        resume_source["cases"].as_array().unwrap().len()
+    );
+    let mut resume_manifest = String::from("image\ttape_file\tstart_record\tdata_records\tbytes\tsha256\tfilemark_record\teod_record\n");
+    for literal in literals {
+        let case: Value = serde_json::from_str(literal)?;
+        let id = case["id"].as_str().unwrap();
+        artifact(
+            &root,
+            &format!("resume/{id}/expected.json"),
+            literal.as_bytes(),
+            check,
+            &mut emitted,
+        )?;
+        if case["portable"] == false {
+            continue;
+        }
+        let vector = generate(case["image"].as_str().unwrap())?;
+        let input = resume::portable_input(id, &vector);
+        assert_eq!(input["image"], case["image"]);
+        assert_eq!(input["W"], case["W"]);
+        assert_eq!(input["T"], case["T"]);
+        artifact(
+            &root,
+            &format!("resume/{id}/inputs.json"),
+            &serde_json::to_vec_pretty(&input)?,
+            check,
+            &mut emitted,
+        )?;
+        if case["expected"]["accepted"] == true {
+            let result = resume::execute_positive(&input, &vector)?;
+            resume::assert_expected(id, &case["expected"], &result.actual);
+            append_manifest(&mut resume_manifest, id, &result.image);
+            if id == "resume-open" {
+                append_manifest(
+                    &mut resume_manifest,
+                    "resume-open-uninterrupted",
+                    &resume::uninterrupted()?,
+                );
+            }
+        }
+    }
+    artifact(
+        &root,
+        "resume/MANIFEST.tsv",
+        resume_manifest.as_bytes(),
+        check,
+        &mut emitted,
+    )?;
+    artifact(
+        &root,
+        "resume/README.md",
+        resume::README.as_bytes(),
+        check,
+        &mut emitted,
+    )?;
     if check {
         let mut actual = BTreeSet::new();
         files_under(&root, &root, &mut actual)?;
@@ -163,7 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "{}: all six image digests and 25 case descriptors",
+        "{}: all six image digests, 25 damage descriptors and nine resume cases",
         if check { "CHECK PASS" } else { "GENERATED" }
     );
     Ok(())
@@ -217,4 +284,36 @@ fn export_objects(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("EXPORTED: Object tape files for all six images");
     Ok(())
+}
+
+/// The resume manifest uses exactly the original image manifest's byte stream
+/// convention: structural filemarks and EOD, concatenated data bytes for ALL.
+fn append_manifest(
+    manifest: &mut String,
+    name: &str,
+    image: &remanence_chaos::model::ExportedTapeImage,
+) {
+    let mut whole = Sha256::new();
+    let mut size = 0;
+    let mut records = 0;
+    for (index, file) in image.files.iter().enumerate() {
+        whole.update(&file.bytes);
+        size += file.bytes.len();
+        records += file.record_offsets.len();
+        manifest.push_str(&format!(
+            "{name}\t{index}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            file.start_record,
+            file.record_offsets.len(),
+            file.bytes.len(),
+            hex(&Sha256::digest(&file.bytes)),
+            file.filemark_record
+                .map_or("none".into(), |n| n.to_string()),
+            image.eod_record
+        ));
+    }
+    manifest.push_str(&format!(
+        "{name}\tALL\t0\t{records}\t{size}\t{}\tstructural\t{}\n",
+        hex(&whole.finalize()),
+        image.eod_record
+    ));
 }

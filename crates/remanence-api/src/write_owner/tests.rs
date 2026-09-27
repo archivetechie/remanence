@@ -7909,3 +7909,265 @@ fn catalog_recovery_paths_refuse_checked_format_fields_and_short_bot() {
         }
     }
 }
+
+/// D5 closed resume goes through the private Layer-5 session opener, then the
+/// ordinary reserved Object write and checkpoint on its returned session state.
+#[test]
+fn resume_vectors_closed_layer5() {
+    resume_vectors_layer5_authorities(None);
+}
+
+#[test]
+fn resume_vectors_cross_record_conflict() {
+    resume_vectors_layer5_authorities(Some("conflict"));
+}
+
+#[test]
+fn resume_vectors_empty_checkpoint_authority() {
+    resume_vectors_layer5_authorities(Some("empty"));
+}
+
+/// Exercise shared pool-write and Layer-5 authority checks before tape motion.
+fn resume_vectors_layer5_authorities(refusal: Option<&str>) {
+    use crate::resume_vectors::{
+        adapt, append_object, assert_expected, model, recorded_input, EXPECTATIONS,
+    };
+    use remanence_parity::*;
+    use sha2::Digest;
+    let vector = crate::tape_image_vectors::generate("unfinalized-closed").unwrap();
+    let input = recorded_input("resume-closed");
+    let temp = tempfile::tempdir().unwrap();
+    let (mut drive, world, _) = model(&vector, &input);
+    let library = open_model_library(Arc::clone(&world));
+    let mut cfg = test_write_owner_config(
+        temp.path().join("catalog.sqlite"),
+        temp.path().join("audit"),
+        &library,
+        library_snapshot_cell(library.library().clone()),
+    );
+    cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+    let selected = SelectedTape {
+        pool_id: "resume-vectors".into(),
+        tape_uuid: vector.written.inputs.tape_uuid,
+        block_size: crate::tape_image_vectors::BLOCK,
+        parity_config: ParityConfig::Scheme(vector.written.inputs.scheme.clone()),
+    };
+    let journal = adapt(
+        &input,
+        &vector,
+        &super::checkpoint::parity_journal_path(&cfg, selected.tape_uuid).unwrap(),
+    )
+    .unwrap();
+    let committed = journal.load_committed().unwrap();
+    let append_lba = committed
+        .filemark_map()
+        .unwrap()
+        .append_position_after_prefix()
+        .unwrap()
+        .lba;
+    let source_object = &vector.written.inputs.objects[0];
+    let object_id = source_object.options.object_id.clone();
+    let mut entry = committed.entries[1].clone();
+    entry.object_id = Some(object_id.clone());
+    let row = &vector.written.object_rows[0];
+    let ObjectRecoveryRepresentation::Plaintext {
+        manifest_first_chunk_lba,
+        manifest_size_bytes,
+        manifest_chunk_count,
+        manifest_sha256,
+    } = &row.representation
+    else {
+        panic!("plaintext fixture required")
+    };
+    let recovery_row = remanence_state::CheckpointObjectRecoveryRow {
+        tape_file_number: row.tape_file_number,
+        stored_block_count: row.stored_block_count,
+        object_id: row.object_id.clone(),
+        representation: remanence_state::CheckpointObjectRecoveryRepresentation::Plaintext {
+            manifest_first_chunk_lba: *manifest_first_chunk_lba,
+            manifest_size_bytes: *manifest_size_bytes,
+            manifest_chunk_count: *manifest_chunk_count,
+            manifest_sha256: *manifest_sha256,
+        },
+    };
+    let digest = sha2::Sha256::digest(&vector.image.files[1].bytes).to_vec();
+    let mut checkpoint_record = remanence_state::CheckpointJournalRecord {
+        ordinal: 1,
+        committed_object_count: 1,
+        eod_partition: 0,
+        eod_lba: append_lba,
+        tape_uuid: selected.tape_uuid,
+        batch_id: [0x61; 16],
+        next_tape_file_number: committed.entries.len() as u64,
+        block_size: selected.block_size,
+        objects: vec![remanence_state::CheckpointObjectProjection {
+            object: NativeObjectProjectionInput {
+                object_id: object_id.clone(),
+                caller_object_id: Some(source_object.options.caller_object_id.clone()),
+                body_format: "rem-object-v1".into(),
+                logical_size_bytes: Some(
+                    source_object.files.iter().map(|f| f.spec.size_bytes).sum(),
+                ),
+                content_hash: Some(digest.clone()),
+                metadata_hash: Some(manifest_sha256.to_vec()),
+                created_at_utc: Some(source_object.options.write_timestamp.clone()),
+            },
+            files: vec![],
+            copy: NativeObjectCopyProjectionInput {
+                object_id,
+                tape_uuid: selected.tape_uuid,
+                tape_file_number: 1,
+                first_body_lba: 2,
+                first_parity_data_ordinal: Some(0),
+                protected_until_ordinal: Some(4),
+                status: "committed".into(),
+                representation: "plaintext".into(),
+                recipient_epoch_ids: None,
+                metadata_frame_len: None,
+                plaintext_digest: Some(digest.clone()),
+                stored_digest: Some(digest),
+            },
+            block_size: selected.block_size,
+            block_count: 4,
+            fresh_tape: true,
+            total_committed_ordinals: 4,
+            object_recovery_row: recovery_row,
+        }],
+        scheme: Some(vector.written.inputs.scheme.clone()),
+        object_tape_file_bundles: vec![CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries: vec![entry],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 4,
+        }],
+        barrier_bundle: Some(CommittedBundle {
+            kind: CommittedBundleKind::CheckpointSidecars,
+            entries: vec![committed.entries[2].clone()],
+            highest_protected_ordinal: 4,
+            total_committed_ordinals: 4,
+        }),
+        terminal_finalization: None,
+        sealed_after_write: false,
+    };
+    drop(journal);
+    let checkpoint = remanence_state::FileCheckpointJournal::open(
+        &cfg.checkpoint_journal_dir,
+        selected.tape_uuid,
+    )
+    .unwrap();
+    if refusal == Some("conflict") {
+        checkpoint_record.block_size *= 2;
+        for object in &mut checkpoint_record.objects {
+            object.block_size = checkpoint_record.block_size;
+        }
+    }
+    if refusal != Some("empty") {
+        checkpoint.append(&checkpoint_record).unwrap();
+    }
+    let mut lease = checkpoint.acquire_exclusive().unwrap();
+    let checkpoints = lease.replay().unwrap();
+    if let Some(kind) = refusal {
+        world.lock().unwrap().command_log.clear();
+        let journal = FileTapeFileJournal::open(
+            super::checkpoint::parity_journal_path(&cfg, selected.tape_uuid).unwrap(),
+            selected.tape_uuid,
+            selected.block_size,
+            vector.written.inputs.scheme.clone(),
+        )
+        .unwrap();
+        let error = crate::pool_write::validate_parity_resume_checkpoint_authority(
+            &lease,
+            &journal,
+            checkpoints.is_empty(),
+            committed.entries.len() as u64,
+        )
+        .unwrap_err();
+        let error = match error {
+            crate::pool_write::ResumeAuthorityRefusal::Records(error) => error,
+            other => panic!("expected a commit-record refusal, got {other:?}"),
+        };
+        let detail = match &error {
+            ParityError::ResumeAppend(detail) => detail,
+            other => panic!("expected ResumeAppend, got {other:?}"),
+        };
+        let expected_detail = if kind == "empty" {
+            "parity journal has a committed prefix but checkpoint authority is empty"
+        } else {
+            "does not match sink journal block size"
+        };
+        assert!(detail.contains(expected_detail), "{detail}");
+        let pool_status = super::restore::status_from_pool_write_error(error.into());
+        assert_eq!(pool_status.code(), tonic::Code::FailedPrecondition);
+        assert!(pool_status.message().contains(expected_detail));
+        drop(journal);
+        let status = match super::checkpoint::validate_parity_actor_authority(
+            &cfg,
+            &selected,
+            &lease,
+            &checkpoints,
+        ) {
+            Err(status) => status,
+            Ok(_) => panic!("invalid combined authority accepted"),
+        };
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(status.message(), pool_status.message());
+        // Neither function called here holds the drive, so this cannot fail on
+        // its own; the refusal precedes tape motion because both open paths call
+        // the helper before their first drive command (write_session.rs open
+        // before its locate, and direct.rs before `sink.locate(0)`).
+        assert!(world.lock().unwrap().command_log.is_empty());
+        println!("PASS resume-cross-records/{kind}: {}; FailedPrecondition; refused by the shared helper, which both open paths call before any drive command", status.message());
+        return;
+    }
+    let authority =
+        super::checkpoint::validate_parity_actor_authority(&cfg, &selected, &lease, &checkpoints)
+            .unwrap();
+    let mut index = CatalogIndex::open(&cfg.index_path).unwrap();
+    let mut session = super::checkpoint::open_parity_actor_session(
+        &mut index,
+        &mut drive,
+        &cfg,
+        &selected,
+        &checkpoints,
+        authority,
+    )
+    .unwrap();
+    let mut raw = DriveHandleRawSink::new(&mut drive);
+    raw.configure_parity_write_session(selected.block_size)
+        .unwrap();
+    let mut journal = session.journal.take().unwrap();
+    let mut sink =
+        ParitySink::from_session_state(&mut raw, &mut journal, session.sink_state.take().unwrap())
+            .unwrap();
+    let (row, _) = append_object(&mut sink, &world, &input, &vector).unwrap();
+    let _state = sink.into_session_state().unwrap();
+    let committed = journal.load_committed().unwrap();
+    let scan = scan_reconstruct_filemark_map_with_report(
+        &mut DriveHandleRawSource::new(&mut drive),
+        &selected.tape_uuid,
+        selected.block_size,
+    )
+    .unwrap();
+    assert_eq!(scan.map, committed.filemark_map().unwrap());
+    let image = world.lock().unwrap().tapes["RESUME001"].export_image();
+    let library_resume = crate::resume_vectors::execute_positive(&input, &vector).unwrap();
+    for (actual, generated) in image.files.iter().zip(&library_resume.image.files) {
+        assert_eq!(
+            actual.bytes, generated.bytes,
+            "Layer-5 and manifest bytes differ"
+        );
+    }
+    assert_eq!(image.files.len(), library_resume.image.files.len());
+    let appended = &image.files[row.tape_file_number as usize];
+    let actual = serde_json::json!({"accepted":true,"append_lba":append_lba,"appended_object_tape_file":row.tape_file_number,"appended_object_first_lba":appended.start_record,
+        "torn_records_superseded":appended.start_record as u64 == append_lba && appended.bytes.chunks_exact(selected.block_size as usize).all(|b|b != vec![0xa5;selected.block_size as usize]),
+        "open_epoch_ordinals":(committed.highest_protected_ordinal..committed.total_committed_ordinals).collect::<Vec<_>>()});
+    let source: serde_json::Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let case = source["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "resume-closed")
+        .unwrap();
+    assert_expected("resume-closed", &case["expected"], &actual);
+}

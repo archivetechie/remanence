@@ -1015,6 +1015,7 @@ pub(crate) fn status_from_format_error(err: &FormatError, message: String) -> St
 
 pub(crate) fn status_from_parity_error(err: &ParityError, message: String) -> Status {
     match err {
+        ParityError::ResumeAppend(_) => Status::failed_precondition(message),
         ParityError::CapacityReserveExceeded { .. }
         | ParityError::ObjectTooLargeForEmptyTape { .. }
         | ParityError::BootstrapPayloadTooLarge { .. } => Status::resource_exhausted(message),

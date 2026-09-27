@@ -1,0 +1,2 @@
+{"id": "resume-full-unprotected-epoch", "image": "unfinalized-closed", "prefix_mutation": "the prefix is files 0-1 only (the sidecar is not committed), so W = 0 and T = 4 = S x k", "W": 0, "T": 4,
+     "expected": {"accepted": false, "error": "ResumeAppend", "before_any_read_or_write": true}, "pinned": true, "sections": ["14 step 2", "11.1"]}

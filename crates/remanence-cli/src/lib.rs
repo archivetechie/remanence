@@ -97,6 +97,8 @@ mod tape_finalize;
 pub mod tape_image;
 // Review-only fixture code used by the example and the executor.
 #[doc(hidden)]
+pub mod resume_vectors;
+#[doc(hidden)]
 pub mod tape_image_vectors;
 mod tape_inventory;
 mod terminal_index_drill;

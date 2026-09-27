@@ -1,0 +1,4 @@
+{"id": "resume-boundary-read", "image": "unfinalized-open", "prefix_mutation": "file 3 records block_count 3, so T = 7 and the open epoch is [4, 7); on tape file 3 has 2 blocks, so re-reading ordinal 6 at LBA 17 meets the filemark", "W": 4, "T": 7,
+     "expected": {"accepted": false, "fatal": true, "no_write": true},
+     "informative": "§14 step 3 says a boundary read where data is expected is fatal but names no error; the reference's error is recorded, not pinned",
+     "pinned": true, "sections": ["14 step 3"]}

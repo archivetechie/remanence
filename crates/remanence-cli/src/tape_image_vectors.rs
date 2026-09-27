@@ -40,7 +40,7 @@ pub struct VectorImage {
     pub recipe: Value,
 }
 
-fn object(blocks: usize, index: usize) -> TapeImageObject {
+pub(crate) fn object(blocks: usize, index: usize) -> TapeImageObject {
     let mut options = RemTarObjectOptions::new(
         format!("00000000-0000-4000-8000-{:012}", 1 + index * 3),
         format!("parity-image-object-{index}"),
@@ -66,7 +66,7 @@ fn object(blocks: usize, index: usize) -> TapeImageObject {
     TapeImageObject { options, files }
 }
 
-fn inputs(name: &str) -> TapeImageInputs {
+pub(crate) fn inputs(name: &str) -> TapeImageInputs {
     assert!(IMAGE_NAMES.contains(&name), "unknown image {name}");
     let mut scheme = default_scheme_for_block_size(BLOCK);
     scheme.data_blocks_per_stripe = 2;
@@ -110,7 +110,7 @@ fn inputs(name: &str) -> TapeImageInputs {
     }
 }
 
-fn recipe(inputs: &TapeImageInputs) -> Value {
+pub(crate) fn recipe(inputs: &TapeImageInputs) -> Value {
     let identity = inputs
         .writer_identity
         .capture()
@@ -155,7 +155,9 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn write_model(inputs: TapeImageInputs) -> Result<(WrittenTapeImage, ExportedTapeImage), String> {
+pub(crate) fn write_model(
+    inputs: TapeImageInputs,
+) -> Result<(WrittenTapeImage, ExportedTapeImage), String> {
     let mut world = VirtualWorld::single_drive("IMAGE-LIB", 0x100, "IMAGE-DRV", 0x400, 1);
     world.put_tape_in_drive(
         0x100,

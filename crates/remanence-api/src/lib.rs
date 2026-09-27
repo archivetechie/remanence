@@ -159,3 +159,19 @@ pub use write_session_ingress::WriteSessionApi;
 
 #[cfg(test)]
 mod tests;
+
+// Compile CLI sources here to exercise private Layer-5 entry points with the same resume vectors.
+// Share the image builder and portable adapter with the fixture generator. This
+// is test-only: Layer-5 resume entry points remain private to write_owner.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../remanence-cli/src/resume_vectors.rs"]
+mod resume_vectors;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../remanence-cli/src/tape_image.rs"]
+mod tape_image;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../remanence-cli/src/tape_image_vectors.rs"]
+mod tape_image_vectors;

@@ -1,0 +1,25 @@
+{
+  "T": 4,
+  "W": 0,
+  "committed_prefix": [
+    {
+      "block_count": 1,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "Bootstrap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 0
+    },
+    {
+      "block_count": 4,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 0,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 1
+    }
+  ],
+  "image": "unfinalized-closed"
+}

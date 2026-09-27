@@ -1,0 +1,43 @@
+{
+  "T": 8,
+  "W": 8,
+  "committed_prefix": [
+    {
+      "block_count": 1,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "Bootstrap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 0
+    },
+    {
+      "block_count": 8,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 0,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 1
+    },
+    {
+      "block_count": 7,
+      "epoch_id": 0,
+      "first_parity_data_ordinal": null,
+      "kind": "ParitySidecar",
+      "protected_ordinal_end_exclusive": 4,
+      "protected_ordinal_start": 0,
+      "tape_file_number": 2
+    },
+    {
+      "block_count": 7,
+      "epoch_id": 2,
+      "first_parity_data_ordinal": null,
+      "kind": "ParitySidecar",
+      "protected_ordinal_end_exclusive": 8,
+      "protected_ordinal_start": 4,
+      "tape_file_number": 3
+    }
+  ],
+  "image": "two-epoch"
+}

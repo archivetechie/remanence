@@ -1,0 +1,47 @@
+{
+  "T": 4,
+  "W": 4,
+  "append_object": {
+    "files": [],
+    "options": {
+      "caller_object_id": "parity-image-object-1",
+      "chunk_size": 262144,
+      "encryption": "none",
+      "extensions": {},
+      "manifest_file_id": "00000000-0000-4000-8000-000000000005",
+      "metadata_preservation": "archival",
+      "object_id": "00000000-0000-4000-8000-000000000004",
+      "write_timestamp": "2026-08-09T00:00:00Z"
+    }
+  },
+  "committed_prefix": [
+    {
+      "block_count": 1,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "Bootstrap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 0
+    },
+    {
+      "block_count": 4,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 0,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 1
+    },
+    {
+      "block_count": 7,
+      "epoch_id": 0,
+      "first_parity_data_ordinal": null,
+      "kind": "ParitySidecar",
+      "protected_ordinal_end_exclusive": 4,
+      "protected_ordinal_start": 0,
+      "tape_file_number": 2
+    }
+  ],
+  "image": "unfinalized-closed"
+}

@@ -641,6 +641,16 @@ impl RecordingJournal {
 }
 
 impl TapeFileJournal for RecordingJournal {
+    // In-memory session journals have no durable resume authority to replay.
+    fn session_resume_snapshot(
+        &self,
+    ) -> Result<
+        Option<crate::journal::FileTapeFileJournalCommittedSnapshot>,
+        crate::journal::JournalError,
+    > {
+        Ok(None)
+    }
+
     fn tape_uuid(&self) -> [u8; 16] {
         self.tape_uuid
     }
@@ -895,6 +905,65 @@ fn unwritten_object_rollback_restores_detachable_session_state() {
         .write_block(&fixed_block(0x5A, block_size))
         .expect("retry reaches raw write");
     assert_eq!(resumed.active_object_blocks_written(), Some(1));
+}
+
+/// Snapshot refusal must be reported before any raw position or write call.
+#[test]
+fn parity_attach_reports_record_failure_before_position() {
+    struct BrokenJournal;
+    impl TapeFileJournal for BrokenJournal {
+        fn tape_uuid(&self) -> [u8; 16] {
+            sample_uuid()
+        }
+        fn commit_bundle(&mut self, _: &CommittedBundle) -> Result<(), crate::JournalError> {
+            panic!("resume refusal must not commit")
+        }
+        fn load_committed(&self) -> Result<crate::CommittedState, crate::JournalError> {
+            panic!("resume must use bounded authority")
+        }
+        fn committed_snapshot_bounded_authority(
+            &self,
+        ) -> Result<crate::FileTapeFileJournalCommittedSnapshot, crate::JournalError> {
+            Err(crate::JournalError::RecoveryRequired(
+                "torn resume record".into(),
+            ))
+        }
+    }
+    struct NoMotion;
+    impl RawTapeSink for NoMotion {
+        fn write_fixed_block(&mut self, _: &[u8]) -> Result<RawWriteOutcome, ParityError> {
+            panic!("unexpected write")
+        }
+        fn write_filemarks(&mut self, _: u32, _: bool) -> Result<RawWriteOutcome, ParityError> {
+            panic!("unexpected filemark")
+        }
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            panic!("unexpected position")
+        }
+    }
+    let mut raw = RecordingRawTapeSink::default();
+    let mut journal = RecordingJournal::new(sample_uuid());
+    let state = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        small_scheme(),
+        sample_uuid(),
+        4096,
+        crate::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
+    )
+    .unwrap()
+    .into_session_state()
+    .unwrap();
+    match ParitySink::try_from_session_state(&mut NoMotion, &mut BrokenJournal, state) {
+        Err((ParityError::ResumeAppend(detail), _)) => {
+            assert_eq!(detail, "journal recovery required: torn resume record")
+        }
+        Err((error, _)) => panic!("wrong refusal: {error}"),
+        Ok(_) => panic!("record failure was ignored"),
+    }
 }
 
 #[test]

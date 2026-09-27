@@ -1,0 +1,2 @@
+{"id": "resume-noncontiguous-sidecars", "image": "two-epoch", "prefix_mutation": "the prefix is files 0-3 (Bootstrap, the 8-block Object, both sidecars) with the second sidecar's range recorded as [5, 8) instead of [4, 8)", "W": 8, "T": 8,
+     "expected": {"accepted": false, "error": "ResumeAppend", "before_any_read_or_write": true}, "pinned": true, "sections": ["14 step 2"]}

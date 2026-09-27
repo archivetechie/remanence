@@ -1,0 +1,3 @@
+{"id": "resume-commit-records", "portable": false,
+     "statement": "When a record the Resumer relies on is missing, or the records' claims conflict, or their combination is incomplete or ambiguous, resume fails as ResumeAppend before positioning or writing. The commit record's format is implementation-defined (§3.4), so this is not a portable vector; the reference covers it at its journal-replay layer, which the vector set names.",
+     "expected": {"accepted": false, "error": "ResumeAppend"}, "pinned": true, "sections": ["3.4"]}

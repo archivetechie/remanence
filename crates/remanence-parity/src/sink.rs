@@ -52,8 +52,8 @@ use crate::raw::{
     RawTapeSink, RawTapeSource, RawWriteOutcome,
 };
 use crate::resume::{
-    checked_bounded_resume_summary, streamed_filemark_map_digest, BoundedResumeSummary,
-    ResumeAppendResult, ResumeLiveEpochState,
+    checked_bounded_resume_summary, resume_record_result, streamed_filemark_map_digest,
+    BoundedResumeSummary, ResumeAppendResult, ResumeLiveEpochState,
 };
 use crate::sidecar::{
     data_shard_crc64, encode_sidecar_tape_file, parse_sidecar_tape_file, SidecarDescriptor,
@@ -844,6 +844,9 @@ pub struct ParitySinkSessionState {
     last_data_lba: u64,
     filemark_map: FilemarkMapBuilder,
     committed_prefix_snapshot: Option<FileTapeFileJournalCommittedSnapshot>,
+    /// Live actor handoffs retain writes beyond the last checkpoint in memory;
+    /// only checkpoint-boundary handoffs replay off-tape resume authority.
+    has_uncheckpointed_bundles: bool,
     sidecar_directory_entries: Vec<SidecarEpochDirectoryEntry>,
     committed_object_count: u64,
     durable_boundary: DurableBoundaryState,
@@ -1015,6 +1018,9 @@ pub struct ParitySink<'a> {
     /// Structural map of tape files emitted by this sink.
     filemark_map: FilemarkMapBuilder,
     committed_prefix_snapshot: Option<FileTapeFileJournalCommittedSnapshot>,
+    /// Live actor handoffs retain writes beyond the last checkpoint in memory;
+    /// only checkpoint-boundary handoffs replay off-tape resume authority.
+    has_uncheckpointed_bundles: bool,
 
     /// Sidecar-directory rows available for bootstrap/parity_map root of
     /// trust emission. The canonical filemark-map digest does not include
@@ -1152,6 +1158,7 @@ impl<'a> ParitySink<'a> {
             last_data_lba: self.last_data_lba,
             filemark_map: self.filemark_map,
             committed_prefix_snapshot: self.committed_prefix_snapshot,
+            has_uncheckpointed_bundles: self.has_uncheckpointed_bundles,
             sidecar_directory_entries: self.sidecar_directory_entries,
             committed_object_count: self.committed_object_count,
             durable_boundary: self.durable_boundary,
@@ -1191,20 +1198,26 @@ impl<'a> ParitySink<'a> {
                 Box::new(state),
             ));
         }
-        let observed = match inner.position() {
-            Ok(observed) => observed,
-            Err(error) => return Err((error, Box::new(state))),
+        // A live handoff carries its own uncheckpointed state. Do not ask a
+        // crash-resume snapshot to authorize that suffix as committed records.
+        let snapshot = if state.has_uncheckpointed_bundles {
+            None
+        } else {
+            match resume_record_result(journal.session_resume_snapshot()) {
+                Ok(Some(snapshot)) => Some(snapshot),
+                Ok(None) if state.committed_prefix_snapshot.is_none() => None,
+                Ok(None) => {
+                    return Err((
+                        ParityError::ResumeAppend(
+                            "bounded resume session has no journal snapshot authority".into(),
+                        ),
+                        Box::new(state),
+                    ));
+                }
+                Err(error) => return Err((error, Box::new(state))),
+            }
         };
-        if observed.partition != 0 || observed.lba != state.last_physical_lba {
-            return Err((
-                ParityError::SessionOpen(format!(
-                    "parity session transport is at partition {} lba {}, expected partition 0 lba {}",
-                    observed.partition, observed.lba, state.last_physical_lba
-                )),
-                Box::new(state),
-            ));
-        }
-        if let Ok(snapshot) = journal.committed_snapshot_bounded_authority() {
+        if let Some(snapshot) = snapshot {
             let summary = match checked_bounded_resume_summary(&snapshot) {
                 Ok(summary) => summary,
                 Err(error) => return Err((error, Box::new(state))),
@@ -1219,7 +1232,7 @@ impl<'a> ParitySink<'a> {
                 || summary.sidecar_directory_entries != state.sidecar_directory_entries
             {
                 return Err((
-                    ParityError::SessionOpen(
+                    ParityError::ResumeAppend(
                         "bounded journal checkpoint disagrees with detached parity state".into(),
                     ),
                     Box::new(state),
@@ -1231,6 +1244,19 @@ impl<'a> ParitySink<'a> {
             );
             state.committed_prefix_snapshot = Some(snapshot);
             state.committed_object_count = summary.committed_object_count;
+        }
+        let observed = match inner.position() {
+            Ok(observed) => observed,
+            Err(error) => return Err((error, Box::new(state))),
+        };
+        if observed.partition != 0 || observed.lba != state.last_physical_lba {
+            return Err((
+                ParityError::SessionOpen(format!(
+                    "parity session transport is at partition {} lba {}, expected partition 0 lba {}",
+                    observed.partition, observed.lba, state.last_physical_lba
+                )),
+                Box::new(state),
+            ));
         }
         Ok(Self {
             backend: ParitySinkBackend(inner),
@@ -1253,6 +1279,7 @@ impl<'a> ParitySink<'a> {
             active_object: None,
             filemark_map: state.filemark_map,
             committed_prefix_snapshot: state.committed_prefix_snapshot,
+            has_uncheckpointed_bundles: state.has_uncheckpointed_bundles,
             sidecar_directory_entries: state.sidecar_directory_entries,
             committed_object_count: state.committed_object_count,
             durable_boundary: state.durable_boundary,
@@ -1480,6 +1507,7 @@ impl<'a> ParitySink<'a> {
             active_object: None,
             filemark_map: FilemarkMapBuilder::new(),
             committed_prefix_snapshot: None,
+            has_uncheckpointed_bundles: false,
             sidecar_directory_entries: Vec::new(),
             committed_object_count: 0,
             durable_boundary: DurableBoundaryState::new(),
@@ -2829,9 +2857,15 @@ impl<'a> ParitySink<'a> {
         })
     }
 
+    // Every sink-journal bundle commit must go through this helper to keep
+    // has_uncheckpointed_bundles accurate. The terminal-prefix transition is
+    // exempt: close_for_terminal_index consumes the sink, so no later handoff
+    // can observe its flag.
     fn commit_journal_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), ParityError> {
         if let Some(journal) = self.journal.as_mut() {
             journal.commit_bundle(bundle)?;
+            self.has_uncheckpointed_bundles =
+                bundle.kind != CommittedBundleKind::CheckpointedThrough;
         }
         Ok(())
     }

@@ -1,0 +1,4 @@
+{"id": "resume-closed", "image": "unfinalized-closed", "prefix": "the image's committed prefix: files 0-2, blocks [1, 4, 7]", "W": 4, "T": 4,
+     "append": "one further Object of 2 blocks, committed by finish_object, then a barrier",
+     "expected": {"accepted": true, "append_lba": 15, "appended_object_tape_file": 3, "appended_object_first_lba": 15, "torn_records_superseded": true, "open_epoch_ordinals": []},
+     "route": "Layer 5 (write_owner)", "pinned": true, "sections": ["3.4", "7.2", "14 steps 1-4"]}

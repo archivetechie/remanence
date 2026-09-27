@@ -16,7 +16,8 @@ use crate::error::ParityError;
 use crate::filemark_map::{FilemarkMap, TapeFileKind, TapeFileMapEntry};
 use crate::journal::{
     validate_committed_bundle_shape, BoundedJournalReplayMetrics, CommittedBundle,
-    CommittedBundleKind, FileTapeFileJournalCommittedSnapshot, TapeFileEntry, TapeFileJournal,
+    CommittedBundleKind, FileTapeFileJournalCommittedSnapshot, JournalError, TapeFileEntry,
+    TapeFileJournal,
 };
 use crate::model::ParityScheme;
 use crate::parity_map::{
@@ -32,6 +33,33 @@ use crate::sidecar::{
     EncodedSidecarTapeFile, SidecarDescriptor,
 };
 use crate::sink::{SidecarTapeFile, TerminalPrefixPlan, TerminalPrefixReconcileEvidence};
+
+/// Interpret off-tape record validation at the Resumer boundary (§3.4/§14).
+///
+/// Keep the complete journal diagnostic for content refusals. Operational
+/// failures retain their original error; ordinary journal append, commit and
+/// reconciliation must not use this mapping. Unexpected EOF is an incomplete
+/// record (including a torn header), rather than an operational I/O failure.
+pub fn resume_record_result<T>(result: Result<T, JournalError>) -> Result<T, ParityError> {
+    result.map_err(|error| {
+        let content = match &error {
+            JournalError::Io(error) => matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+            ),
+            JournalError::HeaderMismatch
+            | JournalError::Codec(_)
+            | JournalError::InvalidBundleShape(_)
+            | JournalError::RecoveryRequired(_) => true,
+            JournalError::UntrustedVolume(_) => false,
+        };
+        if content {
+            ParityError::ResumeAppend(error.to_string())
+        } else {
+            ParityError::Journal(error)
+        }
+    })
+}
 
 /// One full parity epoch that resume must rebuild and emit as an ordinary
 /// sidecar tape file before accepting new object data.
@@ -381,7 +409,7 @@ pub fn checked_bounded_resume_summary(
         )));
     }
 
-    let mut replay = snapshot.replay()?;
+    let mut replay = resume_record_result(snapshot.replay())?;
     let mut expected_file = 0u64;
     let mut append_lba = 0u64;
     let mut total_data_ordinals = 0u64;
@@ -394,7 +422,7 @@ pub fn checked_bounded_resume_summary(
     let mut open_epoch_object_extents = Vec::new();
     let mut tail = None;
 
-    while let Some(entry) = replay.next_entry()? {
+    while let Some(entry) = resume_record_result(replay.next_entry())? {
         if entry.tape_file_number != expected_file {
             return Err(resume_error(format!(
                 "resume structural map is not dense at {expected_file}: found {}",
@@ -2284,6 +2312,77 @@ fn resume_error(message: impl Into<String>) -> ParityError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every content class keeps its complete journal diagnostic at resume.
+    #[test]
+    fn resume_record_mapping_content_classes() {
+        let invalid_shape = validate_committed_bundle_shape(&CommittedBundle {
+            kind: CommittedBundleKind::Object,
+            entries: Vec::new(),
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 0,
+        })
+        .expect_err("empty Object bundle is invalid");
+        for error in [
+            JournalError::HeaderMismatch,
+            JournalError::Codec("committed bundle W=4 exceeds T=3".into()),
+            JournalError::InvalidBundleShape(invalid_shape),
+            JournalError::RecoveryRequired("torn checkpoint record".into()),
+            JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing record",
+            )),
+            JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "torn header",
+            )),
+        ] {
+            let expected = error.to_string();
+            let actual = resume_record_result::<()>(Err(error)).unwrap_err();
+            assert!(
+                matches!(actual, ParityError::ResumeAppend(ref detail) if detail == &expected),
+                "{actual:?}"
+            );
+        }
+    }
+
+    /// Operational errors keep their type, diagnostic and OS error code.
+    #[test]
+    fn resume_record_mapping_operational_classes() {
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = JournalError::Io(std::io::Error::new(kind, "operational failure"));
+            let expected = error.to_string();
+            let actual = resume_record_result::<()>(Err(error)).unwrap_err();
+            assert_eq!(
+                actual.to_string(),
+                format!("tape-file journal error: {expected}")
+            );
+            assert!(
+                matches!(actual, ParityError::Journal(JournalError::Io(ref error)) if error.kind() == kind)
+            );
+        }
+        let actual = resume_record_result::<()>(Err(JournalError::Io(
+            std::io::Error::from_raw_os_error(13),
+        )))
+        .unwrap_err();
+        assert!(
+            matches!(actual, ParityError::Journal(JournalError::Io(error)) if error.raw_os_error() == Some(13))
+        );
+        let actual = resume_record_result::<()>(Err(JournalError::UntrustedVolume(
+            "remote filesystem".into(),
+        )))
+        .unwrap_err();
+        assert!(
+            matches!(actual, ParityError::Journal(JournalError::UntrustedVolume(detail)) if detail == "remote filesystem")
+        );
+        assert_eq!(resume_record_result(Ok(42)).unwrap(), 42);
+    }
+
     use crate::filemark_map::TapeFileMapEntry;
     use crate::journal::{CommittedBundle, TapeFileEntry};
     use crate::model::SchemeId;
