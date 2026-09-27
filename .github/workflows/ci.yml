@@ -104,6 +104,16 @@ jobs:
       - name: Verify terminal-index candidates
         run: python3 tools/verify_terminal_index_vectors.py fixtures/rem-parity-terminal-index-draft
 
+      - name: Second implementation of REM-PARITY generation 2
+        run: |
+          python3 tools/rem_parity_second_implementation.py build --out "$RUNNER_TEMP/second-build-report.json"
+          python3 tools/rem_parity_second_implementation.py decide \
+            fixtures/rem-parity-terminal-index-draft/tape-images/cases/*/fault-map.json \
+            --out "$RUNNER_TEMP/second-decisions.json"
+          cmp "$RUNNER_TEMP/second-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/decisions-real-ids.json
+          python3 -m unittest tools/test_rem_parity_second_implementation.py
+
       - name: Run tests
         run: cargo test --workspace --no-fail-fast
 
