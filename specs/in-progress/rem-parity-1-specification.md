@@ -24,11 +24,14 @@ not readable by generation-2 Readers.
 
 **This is a review draft.** It is published for public review and is not yet
 frozen. Generation 2 is implemented in the reference tree. Its review-only
-candidate vectors are pinned and independently re-derived, and its proof and
-nonphysical lifecycle/VTL gates have passed. Dedicated coverage-guided
-terminal-replica/separation/parser-walk fuzz plateaus and the supervised
-physical-media gate remain open. Candidate vectors are not publication
-artifacts until the freeze gates close.
+candidate vectors for the terminal suffix are pinned and independently
+re-derived, and its proof and nonphysical lifecycle/VTL gates have passed.
+Dedicated coverage-guided terminal-replica/separation/parser-walk fuzz
+plateaus and the supervised physical-media gate remain open. So does freeze
+criterion 2: there is not yet a byte-pinned tape image of Appendix A.4's
+minimal tape, nor pinned damage-matrix vectors, and the independent verifier
+does not yet re-derive the bytes before the terminal suffix. Candidate
+vectors are not publication artifacts until the freeze gates close.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
 one year after publication. On that date the finality promise below takes
@@ -2551,9 +2554,18 @@ independent verifier `tools/verify_terminal_index_vectors.py` re-derives HMAC
 role magics, CRC-64/XZ, full-file SHA-256, header hashes, local observations,
 record formulas, component ordering, dense file numbers, logical positions,
 the zero interiors of the separation extents, and terminal EOD without calling
-the Rust codec. Candidate bytes remain mutable until the specification
+the Rust codec. It does not yet re-derive bootstrap, sidecar or ParityMap bytes,
+or Reed–Solomon parity. Candidate bytes remain mutable until the specification
 freezes; the recorded independent derivation and incremental implementation
 review are pre-freeze evidence rather than publication.
+
+The candidate set does not yet meet REM-PARITY freeze criterion 2, which the
+release record, `specs/README.md`, states. The `minimal-*` profiles above are
+terminal suffixes of a tape that holds only the bootstrap. There is not yet a
+byte-pinned tape image of Appendix A.4's minimal tape, which also holds an
+Object, a sidecar and the ParityMap, and there are no pinned damage-matrix
+vectors. The independent verifier does not yet re-derive the bytes before the
+terminal suffix. Appendix D item TT-2 records how far the set has got.
 
 How candidate vectors are handled until this document is frozen, and what the
 negative candidates must cover by then, are recorded in the release record,
@@ -2691,22 +2703,25 @@ SHA-256 of these 25 bytes is
 ### A.4. A Minimal Tape, End to End
 
 A smallest-useful finalized generation-2 tape has the bootstrap followed by
-its Object/ParitySidecar prefix and the exact terminal suffix:
+its Object/ParitySidecar prefix, the one final ParityMap that a nonempty
+sidecar epoch directory requires (Section 10.1.1), and the exact terminal
+suffix:
 
 ```text
 file 0   Bootstrap
 file 1   Object
 file 2   ParitySidecar
-file 3   TapeIndexReplica A
-file 4   IndexSeparationExtent AB
-file 5   TapeIndexReplica B
-file 6   IndexSeparationExtent BC
-file 7   TapeIndexReplica C
+file 3   ParityMap
+file 4   TapeIndexReplica A
+file 5   IndexSeparationExtent AB
+file 6   TapeIndexReplica B
+file 7   IndexSeparationExtent BC
+file 8   TapeIndexReplica C
 EOD
 ```
 
-Each replica carries the identical three-row fixed prefix and one Object
-recovery row. A Scanner reads the replicas from EOD and exposes the inventory
+Each replica carries the same four structural rows, one for each of files 0
+to 3 (Sections 10.2 and 10.6), and one Object recovery row. A Scanner reads the replicas from EOD and exposes the inventory
 of one that validates and agrees with every other valid replica (Section 8.5).
 If all three are invalid it reports terminal authority unavailable and
 performs the explicit BOT structural walk; it never treats the tape as empty.
@@ -3045,6 +3060,19 @@ an errata revision of draft.1.
     aside, were split, among them Section 3.3's statement of where parity
     shards live and Section 16.2's bounds on diagnostic text. Where a split or
     rewritten requirement binds a role, it now names that role.
+
+  The vector step then changed the text as follows. No byte of the format,
+  valid tape or vector changed.
+
+  - Erratum, Appendix A.4. The minimal tape now includes, as tape file 3, the
+    one final ParityMap that Sections 10.1.1 and 10.6 require when final
+    parity closeout has a nonempty sidecar epoch directory, and its replicas
+    carry four structural rows. The appendix is informative; no rule changed.
+  - The Status section, Section 17 and Appendix D item TT-2 now say that the
+    candidate set does not yet meet freeze criterion 2, and what the
+    independent verifier does not yet re-derive. TT-2 also says that no
+    vector yet covers append resume, and how the pinned archive's
+    generation-1 cases are covered.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -3274,11 +3302,21 @@ This is the live preparing-copy snapshot for generation 2.
    their 30 component streams without calling the Rust codec. Incremental
    reviews bind later changes to the last recorded clean baseline; an untouched
    byte-contract region does not lose its accepted review status.
-2. **TT-2 — negative and interruption vectors (candidate evidence passed).**
+2. **TT-2 — negative and interruption vectors (candidate evidence passed;
+   freeze criterion 2 open).**
    The review-only set currently verifies 50 hostile mutations, 14 survivor
    selections, 68 interruption cuts, seven Object-row extension cases, and the
    million-Object streaming profile. Publication promotion remains gated by
-   TT-5 and the other freeze criteria.
+   TT-5 and the other freeze criteria. Freeze criterion 2 is not yet met.
+   There is not yet a byte-pinned tape image of Appendix A.4's minimal tape.
+   There are no pinned damage-matrix vectors. The independent verifier does
+   not yet re-derive bootstrap, sidecar or ParityMap bytes, or Reed–Solomon
+   parity. No vector yet covers append resume (Section 14); the 68
+   interruption cuts are cuts in finalization. The generation-1 REM-PARITY
+   cases of the pinned archive were read against generation 2. Most of the
+   properties they test are kept, and are covered by the reference
+   implementation's tests rather than by candidate vectors. The sidecar
+   negative cases are the largest group with no generation-2 coverage yet.
 3. **TT-3 — media exercise of the default separation extents (VTL passed;
    physical open).** The exact one-GiB layout has passed clean VTL writes and
    independent full verification at all three legal block sizes. The 256 KiB
