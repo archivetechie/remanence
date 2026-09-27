@@ -1,0 +1,116 @@
+{
+  "block_size": 1048576,
+  "compression_enabled": false,
+  "counts": {
+    "object_row_count": 2,
+    "structural_entry_count": 6
+  },
+  "description": "Records every input to this profile's terminal replicas and separation extents.",
+  "diagnostics": {
+    "write_timestamp": "2026-08-09T00:00:00Z",
+    "writer_version": "remanence-terminal-vector-generator/1"
+  },
+  "edition_id": "22222222222222222222222222222222",
+  "edition_sequence": 2,
+  "object_rows": [
+    {
+      "object_id": "6d696e696d616c2d706c61696e746578742d6f626a656374",
+      "representation": {
+        "kind": "Plaintext",
+        "manifest_chunk_count": 1,
+        "manifest_first_chunk_lba": 0,
+        "manifest_sha256": "3131313131313131313131313131313131313131313131313131313131313131",
+        "manifest_size_bytes": 32
+      },
+      "stored_block_count": 2,
+      "tape_file_number": 1
+    },
+    {
+      "object_id": "6d696e696d616c2d656e637279707465642d6f626a656374",
+      "representation": {
+        "key_frame_len": 1191,
+        "kind": "Encrypted",
+        "metadata_frame_len": 4096,
+        "recipient_epoch_ids": [
+          "41414141414141414141414141414141",
+          "42424242424242424242424242424242"
+        ]
+      },
+      "stored_block_count": 3,
+      "tape_file_number": 3
+    }
+  ],
+  "scope": {
+    "covered_prefix_tape_file_count": 6,
+    "highest_protected_ordinal": 5,
+    "total_data_ordinals": 5
+  },
+  "separation_extent": {
+    "nominal_extent_bytes": 3145728,
+    "total_records": 3
+  },
+  "structural_entries": [
+    {
+      "block_count": 1,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "Bootstrap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 0
+    },
+    {
+      "block_count": 2,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 0,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 1
+    },
+    {
+      "block_count": 5,
+      "epoch_id": 0,
+      "first_parity_data_ordinal": null,
+      "kind": "ParitySidecar",
+      "protected_ordinal_end_exclusive": 2,
+      "protected_ordinal_start": 0,
+      "tape_file_number": 2
+    },
+    {
+      "block_count": 3,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 2,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 3
+    },
+    {
+      "block_count": 5,
+      "epoch_id": 1,
+      "first_parity_data_ordinal": null,
+      "kind": "ParitySidecar",
+      "protected_ordinal_end_exclusive": 5,
+      "protected_ordinal_start": 2,
+      "tape_file_number": 4
+    },
+    {
+      "block_count": 3,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "ParityMap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 5
+    }
+  ],
+  "tape_uuid": "11111111111111111111111111111111",
+  "terminal_layout": {
+    "partition": 0,
+    "prefix_end_lba": 25,
+    "replica_record_count": 3,
+    "separation_records": 3,
+    "start_tape_file": 6
+  }
+}

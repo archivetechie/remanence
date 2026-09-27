@@ -1,0 +1,90 @@
+{
+  "block_size": 262144,
+  "compression_enabled": false,
+  "counts": {
+    "object_row_count": 1000000,
+    "structural_entry_count": 1000001
+  },
+  "description": "Records the million-row stream's plan and zero-based row templates without materializing the stream.",
+  "diagnostics": {
+    "write_timestamp": "2026-08-09T00:00:00Z",
+    "writer_version": "synthetic-constant-storage-source/1"
+  },
+  "edition_id": "62626262626262626262626262626262",
+  "edition_sequence": 1,
+  "object_rows": {
+    "i_dependent_fields": {
+      "tape_file_number": {
+        "i_plus": 1
+      }
+    },
+    "i_end_exclusive": 1000000,
+    "i_start": 0,
+    "template": {
+      "object_id": "78",
+      "representation": {
+        "kind": "Plaintext",
+        "manifest_chunk_count": 1,
+        "manifest_first_chunk_lba": 0,
+        "manifest_sha256": "5151515151515151515151515151515151515151515151515151515151515151",
+        "manifest_size_bytes": 1
+      },
+      "stored_block_count": 1,
+      "tape_file_number": 0
+    }
+  },
+  "parameters": {
+    "object_rows": 1000000
+  },
+  "scope": {
+    "covered_prefix_tape_file_count": 1000001,
+    "highest_protected_ordinal": 0,
+    "total_data_ordinals": 1000000
+  },
+  "separation_extent": {
+    "nominal_extent_bytes": 786432,
+    "total_records": 3
+  },
+  "structural_entries": {
+    "initial": [
+      {
+        "block_count": 1,
+        "epoch_id": null,
+        "first_parity_data_ordinal": null,
+        "kind": "Bootstrap",
+        "protected_ordinal_end_exclusive": null,
+        "protected_ordinal_start": null,
+        "tape_file_number": 0
+      }
+    ],
+    "repeat": {
+      "i_dependent_fields": {
+        "first_parity_data_ordinal": {
+          "i_plus": 0
+        },
+        "tape_file_number": {
+          "i_plus": 1
+        }
+      },
+      "i_end_exclusive": 1000000,
+      "i_start": 0,
+      "template": {
+        "block_count": 1,
+        "epoch_id": null,
+        "first_parity_data_ordinal": 0,
+        "kind": "Object",
+        "protected_ordinal_end_exclusive": null,
+        "protected_ordinal_start": null,
+        "tape_file_number": 0
+      }
+    }
+  },
+  "tape_uuid": "61616161616161616161616161616161",
+  "terminal_layout": {
+    "partition": 0,
+    "prefix_end_lba": 2000002,
+    "replica_record_count": 1223,
+    "separation_records": 3,
+    "start_tape_file": 1000001
+  }
+}
