@@ -1455,10 +1455,10 @@ fn assert_envelope_case(case: &Value) {
 }
 
 fn run_envelope_case(case: &Value, id: &str, operation: &str) -> Result<(), RemObjectAeadError> {
-    if id == SUPPLEMENT_CASES[0] {
+    if let Some(fault) = SealerFault::from_case_id(id) {
         assert_eq!(operation, "seal");
         let inputs = &case["inputs"];
-        assert_eq!(*inputs, supplement_inputs(true));
+        assert_eq!(*inputs, supplement_inputs(Some(fault)));
         let plaintext = rem_object_p1::build_p1_plaintext();
         let recipients = inputs["recipients"]
             .as_array()
@@ -1483,15 +1483,14 @@ fn run_envelope_case(case: &Value, id: &str, operation: &str) -> Result<(), RemO
         );
         let err = result
             .as_ref()
-            .expect_err("duplicate recipient epochs must fail");
+            .expect_err("invalid recipient set must fail");
         assert!(
-            err.to_string()
-                .contains("recipient epochs must be distinct"),
+            err.to_string().contains(fault.expected_message()),
             "{id}: unexpected rejection reason: {err}"
         );
         return result.map(|_| ());
     }
-    if SUPPLEMENT_CASES[1..].contains(&id) {
+    if SUPPLEMENT_CASES[3..].contains(&id) {
         assert_eq!(operation, "open");
         let directory = supplement_root().join(str_field(case, "archive_path"));
         let inputs = fixture(&std::fs::read_to_string(directory.join("input.json")).unwrap());
@@ -2249,8 +2248,10 @@ fn key_frame_negative_vectors_match_manifest_errors() {
 }
 
 /// Review-only supplement inputs and bytes share the archive harness builders.
-const SUPPLEMENT_CASES: [&str; 3] = [
+const SUPPLEMENT_CASES: [&str; 5] = [
     "seal-duplicate-epoch-id",
+    "seal-slot-order",
+    "seal-zero-epoch-id",
     "metadata-negative-integer-under-unknown-key",
     "metadata-unknown-key-control",
 ];
@@ -2282,18 +2283,61 @@ fn supplement_options(plaintext: &[u8]) -> SealOptions {
     }
 }
 
-fn supplement_inputs(duplicate: bool) -> Value {
+/// Each Sealer candidate changes exactly one recipient-set constraint.
+#[derive(Clone, Copy)]
+enum SealerFault {
+    DuplicateEpochId,
+    SlotOrder,
+    ZeroEpochId,
+}
+
+impl SealerFault {
+    fn from_case_id(id: &str) -> Option<Self> {
+        match id {
+            "seal-duplicate-epoch-id" => Some(Self::DuplicateEpochId),
+            "seal-slot-order" => Some(Self::SlotOrder),
+            "seal-zero-epoch-id" => Some(Self::ZeroEpochId),
+            _ => None,
+        }
+    }
+
+    fn expected_message(self) -> &'static str {
+        match self {
+            Self::DuplicateEpochId => "recipient epochs must be distinct",
+            Self::SlotOrder => {
+                "recipient slot indices must be strictly increasing in the order given"
+            }
+            Self::ZeroEpochId => "recipient epoch ids must be nonzero",
+        }
+    }
+}
+
+fn supplement_inputs(fault: Option<SealerFault>) -> Value {
     let (_, recipients) = recipient_pair();
-    let recipients: Vec<Value> = recipients.iter().enumerate().map(|(i, r)| {
-        serde_json::json!({
-            "slot_index": r.slot_index,
-            "recipient_epoch_id": hex(if duplicate { &recipients[0].recipient_epoch_id } else { &r.recipient_epoch_id }),
-            "epoch_label": r.epoch_label,
-            "private_key": hex(&[0x41 + i as u8; 32]),
-            "private_key_role": "xwing-seed-32",
-            "public_key": hex(&r.public_key),
+    let mut recipients: Vec<Value> = recipients
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            serde_json::json!({
+                "slot_index": r.slot_index,
+                "recipient_epoch_id": hex(&r.recipient_epoch_id),
+                "epoch_label": r.epoch_label,
+                "private_key": hex(&[0x41 + i as u8; 32]),
+                "private_key_role": "xwing-seed-32",
+                "public_key": hex(&r.public_key),
+            })
         })
-    }).collect();
+        .collect();
+    match fault {
+        Some(SealerFault::DuplicateEpochId) => {
+            recipients[1]["recipient_epoch_id"] = recipients[0]["recipient_epoch_id"].clone();
+        }
+        Some(SealerFault::SlotOrder) => recipients.swap(0, 1),
+        Some(SealerFault::ZeroEpochId) => {
+            recipients[0]["recipient_epoch_id"] = serde_json::json!(hex(&[0; 16]));
+        }
+        None => {}
+    }
     let p1 = rem_object_p1::p1_options();
     serde_json::json!({
         "plaintext_vector": "REM-OBJECT-TV-P1", "chunk_size": p1.chunk_size,
@@ -2331,20 +2375,26 @@ fn supplement_files() -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut files = std::collections::BTreeMap::new();
     let plaintext = rem_object_p1::build_p1_plaintext();
     let options = supplement_options(&plaintext);
-    let mut sealer_case = json!({
-        "id": SUPPLEMENT_CASES[0], "operation": "seal", "expected_error": "InvalidInput",
-        "rule_section": "REM-ENCRYPT 5.3, 5.9, 11.2",
-    });
-    sealer_case["inputs"] = supplement_inputs(true);
+    let sealer_cases: Vec<Value> = SUPPLEMENT_CASES[..3]
+        .iter()
+        .map(|id| {
+            let fault = SealerFault::from_case_id(id).unwrap();
+            json!({
+                "id": id, "operation": "seal", "expected_error": "InvalidInput",
+                "rule_section": "REM-ENCRYPT 5.3, 5.9, 11.2",
+                "inputs": supplement_inputs(Some(fault)),
+            })
+        })
+        .collect();
     files.insert(
         "manifests/negative-sealer.json".into(),
         json_bytes(&json!({
             "vector_set": "REM-OBJECT-SUPPLEMENT-1-CANDIDATE", "status": "review-only-candidate",
-            "spec_section": "REM-ENCRYPT 13.4", "cases": [sealer_case],
+            "spec_section": "REM-ENCRYPT 13.4", "cases": sealer_cases,
         })),
     );
     let mut envelope_cases = Vec::new();
-    for (id, value) in [(SUPPLEMENT_CASES[1], 0x20), (SUPPLEMENT_CASES[2], 0x00)] {
+    for (id, value) in [(SUPPLEMENT_CASES[3], 0x20), (SUPPLEMENT_CASES[4], 0x00)] {
         let metadata = metadata_cbor_with_extra(&options, &[value]);
         let object = envelope_from_metadata_plaintext(
             &plaintext,
@@ -2355,7 +2405,7 @@ fn supplement_files() -> std::collections::BTreeMap<String, Vec<u8>> {
             true,
         )
         .unwrap();
-        let mut inputs = supplement_inputs(false);
+        let mut inputs = supplement_inputs(None);
         inputs["metadata_plaintext_hex"] = json!(hex(&metadata));
         let mut expected = json!({"stored_digest": hex(&sha256_array(&object))});
         if value == 0x20 {
@@ -2382,26 +2432,17 @@ fn supplement_files() -> std::collections::BTreeMap<String, Vec<u8>> {
         })),
     );
     let mut vectors = Vec::new();
-    for (id, path, category, section) in [
-        (
-            SUPPLEMENT_CASES[0],
-            "manifests/negative-sealer.json".to_string(),
-            "negative/sealer",
-            "REM-ENCRYPT 13.4",
-        ),
-        (
-            SUPPLEMENT_CASES[1],
-            format!("cases/{}", SUPPLEMENT_CASES[1]),
-            "negative/envelope",
-            "REM-ENCRYPT 13.4",
-        ),
-        (
-            SUPPLEMENT_CASES[2],
-            format!("cases/{}", SUPPLEMENT_CASES[2]),
-            "positive/envelope",
-            "REM-ENCRYPT 13.4",
-        ),
-    ] {
+    for (index, id) in SUPPLEMENT_CASES.iter().enumerate() {
+        let (path, category) = match index {
+            0..=2 => (
+                "manifests/negative-sealer.json".to_string(),
+                "negative/sealer",
+            ),
+            3 => (format!("cases/{id}"), "negative/envelope"),
+            4 => (format!("cases/{id}"), "positive/envelope"),
+            _ => unreachable!(),
+        };
+        let section = "REM-ENCRYPT 13.4";
         let mut records = Vec::new();
         let mut artifacts = Vec::new();
         for (name, bytes) in &files {

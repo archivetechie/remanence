@@ -1,6 +1,6 @@
 # REM-OBJECT supplement 1 candidate vectors
 
-This set adds two negative cases and one Reader control to the REM-OBJECT and
+This set adds four negative cases and one Reader control to the REM-OBJECT and
 REM-ENCRYPT vectors. Its status is review-only. These cases “become conformance
 vectors only when the revision is frozen and publishes its own archive” and
 “MUST NOT be copied into or substituted for publication artifacts before
@@ -13,9 +13,10 @@ identity is `MANIFEST.tsv` plus the commit that holds it. No file records a dige
 of the whole set. The manifest lists each other file by path, byte count and
 SHA-256, using tab-separated records as in the REM-PARITY candidate set.
 
-The Sealer case supplies distinct slots with one shared recipient epoch id and
-expects `InvalidInput`. The metadata pair has all four required entries and an
-unknown unsigned key 4. Its value is -1 in the negative case and 0 in the control.
+The three Sealer cases each contain one fault: a shared recipient epoch id,
+slot indices given in order 1 then 0, or one all-zero recipient epoch id. Each
+expects `InvalidInput`; every other recipient-set constraint is satisfied.
+The metadata pair has all four required entries and an unknown unsigned key 4. Its value is -1 in the negative case and 0 in the control.
 Every other construction input is identical. Authenticated bytes derived from
 that value, including the salt, necessarily differ. The negative case expects
 `InvalidCborEncoding`; the control must recover the recorded plaintext digest.
@@ -26,10 +27,10 @@ All secrets here are public deterministic test inputs. Each `input.json` records
 P1 as the plaintext source, framing inputs, the DEK, HPKE RNG seed, both complete
 recipients and the metadata plaintext. The HPKE seed keys a ChaCha20 stream with
 an all-zero 12-byte nonce and initial counter zero; each slot consumes 64 bytes
-for X-Wing encapsulation in slot order. The Sealer rejection records these inputs
+for X-Wing encapsulation in slot order. Each Sealer rejection records these inputs
 too, although rejection precedes their use by encryption. Entropy failure has no
 portable input and is exercised by each implementation's own tests, not by a
-vector. Slot-order behaviour remains outside this supplement.
+vector. The slot-order case checks refusal of the order given.
 
 Run both executors from the repository root:
 
@@ -41,8 +42,9 @@ python3 tools/verify_rem_object_vectors_independent.py --supplement fixtures/rem
 The independent executor requires the dependencies in
 `tools/requirements-rem-object-independent.txt`. It checks the complete manifest,
 re-derives both objects without Rust, opens them with each recipient, and checks
-the duplicate-epoch inputs. The Rust executor calls the public Sealer for that
-rejection, and compares regenerated artifacts with every checked-in file.
+all three Sealer cases for a single fault. The Rust executor calls the public
+Sealer for each rejection, and compares regenerated artifacts with every
+checked-in file.
 To export a review copy, set `REM_OBJECT_SUPPLEMENT_EXPORT_DIR` to an empty
 scratch directory and run the same Rust test. Export never updates publication
 artifacts. The generator uses this README's source template in

@@ -6,6 +6,10 @@ per-release summaries.
 
 ## Unreleased
 
+- A Sealer now refuses recipients given out of slot order and a recipient whose
+  epoch id is all zero, both with `InvalidInput`, before it draws any key
+  material, on the production and the deterministic sealing paths alike.
+  Readers are unchanged. The candidate supplement gains the two cases.
 - Added a review-only candidate supplement for REM-OBJECT and REM-ENCRYPT
   (`fixtures/rem-object-supplement-draft/`): a Sealer refusing two recipients
   that share an epoch id, an envelope whose metadata hides a negative integer
