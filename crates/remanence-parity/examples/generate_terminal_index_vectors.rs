@@ -14,14 +14,13 @@ use std::path::{Path, PathBuf};
 
 use ciborium::value::Value as CborValue;
 use remanence_parity::{
-    encode_tape_index_bootstrap_footer, encode_tape_index_replica_header, index_separation_records,
-    plan_index_separation, plan_tape_index_edition, plan_tape_index_replica,
-    write_index_separation, write_tape_index_replica, IndexSeparationDescriptor,
-    IndexSeparationObservation, ObjectRecoveryRepresentation, ParityError,
-    TapeIndexEditionDescriptor, TapeIndexEditionPlan, TapeIndexReplicaCounts,
-    TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
-    TapeIndexReplicaObservation, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
-    TerminalTailLayout, TERMINAL_INDEX_BLOCK_SIZES,
+    assemble_terminal_plan, encode_tape_index_bootstrap_footer, encode_tape_index_replica_header,
+    index_separation_records, write_index_separation, write_tape_index_replica,
+    IndexSeparationObservation, ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics,
+    TapeIndexEditionPlan, TapeIndexReplicaCounts, TapeIndexReplicaFileKind,
+    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaObservation,
+    TapeIndexReplicaRecordSource, TapeIndexReplicaScope, TerminalTailLayout,
+    TerminalTripleWritePlan, TERMINAL_INDEX_BLOCK_SIZES,
 };
 use sha2::{Digest, Sha256};
 
@@ -143,18 +142,18 @@ fn emit_profile(
     records: Records,
     manifest: &mut String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let edition = plan_records_edition(
+    let assembled = plan_records_edition(
         name,
         block_size,
         records.clone(),
         "remanence-terminal-vector-generator/1",
         VECTOR_TIMESTAMP,
     )?;
+    let edition = &assembled.edition;
     let directory = root.join(format!("{name}-{}k", block_size / 1024));
     fs::create_dir_all(&directory)?;
 
-    for ordinal in 1..=3 {
-        let plan = plan_tape_index_replica(edition.clone(), ordinal)?;
+    for (index, plan) in assembled.replicas.iter().enumerate() {
         let observation = TapeIndexReplicaObservation {
             tape_file_number: plan.component.planned_tape_file_number,
             start_lba: plan.component.planned_start_lba,
@@ -162,45 +161,35 @@ fn emit_profile(
         };
         let mut source = records.clone();
         let mut bytes = Vec::new();
-        write_tape_index_replica(&plan, observation, &mut source, |block| {
+        write_tape_index_replica(plan, observation, &mut source, |block| {
             bytes.extend_from_slice(block);
             Ok(())
         })?;
-        let component = match ordinal {
-            1 => "replica-a.bin",
-            2 => "replica-b.bin",
+        let component = match index {
+            0 => "replica-a.bin",
+            1 => "replica-b.bin",
             _ => "replica-c.bin",
         };
-        write_component(&directory, component, &bytes, name, &edition, manifest)?;
+        write_component(&directory, component, &bytes, name, edition, manifest)?;
     }
 
-    for ordinal in 1..=2 {
-        let plan = plan_index_separation(IndexSeparationDescriptor {
-            tape_uuid: edition.descriptor.tape_uuid,
-            edition_id: edition.descriptor.edition_id,
-            gap_ordinal: ordinal,
-            block_size,
-            nominal_extent_bytes: COMPACT_GAP_RECORDS * u64::from(block_size),
-            total_records: COMPACT_GAP_RECORDS,
-            compression_enabled: false,
-            terminal_layout: edition.descriptor.terminal_layout,
-        })?;
+    for (index, plan) in assembled.separations.iter().enumerate() {
         let observation = IndexSeparationObservation {
             tape_file_number: plan.component.planned_tape_file_number,
             start_lba: plan.component.planned_start_lba,
             record_count: plan.component.record_count,
         };
         let mut bytes = Vec::new();
-        write_index_separation(&plan, observation, |block| {
+        write_index_separation(plan, observation, |block| {
             bytes.extend_from_slice(block);
             Ok(())
         })?;
-        let component = if ordinal == 1 {
+        let component = if index == 0 {
             "gap-ab.bin"
         } else {
             "gap-bc.bin"
         };
-        write_component(&directory, component, &bytes, name, &edition, manifest)?;
+        write_component(&directory, component, &bytes, name, edition, manifest)?;
     }
     Ok(())
 }
@@ -211,7 +200,7 @@ fn plan_records_edition(
     records: Records,
     writer_version: &str,
     write_timestamp: &str,
-) -> Result<TapeIndexEditionPlan, Box<dyn std::error::Error>> {
+) -> Result<TerminalTripleWritePlan, Box<dyn std::error::Error>> {
     let counts = TapeIndexReplicaCounts {
         structural_entry_count: records.entries.len() as u64,
         object_row_count: records.rows.len() as u64,
@@ -235,27 +224,30 @@ fn plan_records_edition(
         replica_layout.replica_record_count,
         gap_records,
     )?;
-    let descriptor = TapeIndexEditionDescriptor {
-        tape_uuid: [0x11; 16],
-        edition_id: match name {
-            "minimal" => [0x21; 16],
-            "multi" => [0x22; 16],
-            _ => [0x23; 16],
-        },
-        edition_sequence: match name {
+    Ok(assemble_terminal_plan(
+        [0x11; 16],
+        block_size,
+        false,
+        match name {
             "minimal" => 1,
             "multi" => 2,
             _ => 3,
         },
         scope,
         counts,
-        block_size,
-        compression_enabled: false,
-        writer_version: writer_version.into(),
-        write_timestamp: write_timestamp.into(),
+        &mut records.clone(),
         terminal_layout,
-    };
-    Ok(plan_tape_index_edition(descriptor, &mut records.clone())?)
+        ParityMapDiagnostics {
+            writer_version: writer_version.into(),
+            write_timestamp: write_timestamp.into(),
+        },
+        match name {
+            "minimal" => [0x21; 16],
+            "multi" => [0x22; 16],
+            _ => [0x23; 16],
+        },
+        COMPACT_GAP_RECORDS * u64::from(block_size),
+    )?)
 }
 
 fn write_component(
@@ -300,17 +292,17 @@ fn emit_maximum_vectors(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let encrypted = maximum_encrypted_slot()?;
     let block_size = TERMINAL_INDEX_BLOCK_SIZES[0];
     let records = minimal_records();
-    let edition = plan_records_edition(
+    let assembled = plan_records_edition(
         "maximum-footer",
         block_size,
         records,
         &"V".repeat(128),
         MAX_TIMESTAMP,
     )?;
-    let plan = plan_tape_index_replica(edition, 1)?;
-    let header = encode_tape_index_replica_header(&plan)?;
+    let plan = &assembled.replicas[0];
+    let header = encode_tape_index_replica_header(plan)?;
     let footer = encode_tape_index_bootstrap_footer(
-        &plan,
+        plan,
         Sha256::digest(&header).into(),
         TapeIndexReplicaObservation {
             tape_file_number: plan.component.planned_tape_file_number,
@@ -445,28 +437,32 @@ fn emit_high_count_evidence(root: &Path) -> Result<(), Box<dyn std::error::Error
         replica_layout.replica_record_count,
         COMPACT_GAP_RECORDS,
     )?;
-    let descriptor = TapeIndexEditionDescriptor {
-        tape_uuid: [0x61; 16],
-        edition_id: [0x62; 16],
-        edition_sequence: 1,
-        scope: TapeIndexReplicaScope {
-            covered_prefix_tape_file_count: structural_rows,
-            total_data_ordinals: HIGH_COUNT_OBJECT_ROWS,
-            highest_protected_ordinal: 0,
-        },
-        counts,
-        block_size,
-        compression_enabled: false,
-        writer_version: "synthetic-constant-storage-source/1".into(),
-        write_timestamp: VECTOR_TIMESTAMP.into(),
-        terminal_layout,
-    };
     let mut source = SyntheticRecords {
         object_rows: HIGH_COUNT_OBJECT_ROWS,
         structural_passes: 0,
         object_passes: 0,
     };
-    let edition = plan_tape_index_edition(descriptor, &mut source)?;
+    let edition = assemble_terminal_plan(
+        [0x61; 16],
+        block_size,
+        false,
+        1,
+        TapeIndexReplicaScope {
+            covered_prefix_tape_file_count: structural_rows,
+            total_data_ordinals: HIGH_COUNT_OBJECT_ROWS,
+            highest_protected_ordinal: 0,
+        },
+        counts,
+        &mut source,
+        terminal_layout,
+        ParityMapDiagnostics {
+            writer_version: "synthetic-constant-storage-source/1".into(),
+            write_timestamp: VECTOR_TIMESTAMP.into(),
+        },
+        [0x62; 16],
+        COMPACT_GAP_RECORDS * u64::from(block_size),
+    )?
+    .edition;
     fs::write(
         root.join("STREAMING.tsv"),
         format!(

@@ -455,22 +455,20 @@ pub(super) fn build_new_terminal_plan(
             .capture()
             .map_err(|error| status_from_parity_error(&error, error.to_string()))?,
     };
-    let writer_version = diagnostics.writer_version;
-    let write_timestamp = diagnostics.write_timestamp;
-    let edition = remanence_parity::plan_tape_index_edition(
-        remanence_parity::TapeIndexEditionDescriptor {
-            tape_uuid: spec.tape_uuid,
-            edition_id: *edition_id.as_bytes(),
-            edition_sequence,
-            scope: summary.scope,
-            counts: summary.counts,
-            block_size: spec.block_size,
-            compression_enabled: false,
-            writer_version: writer_version.clone(),
-            write_timestamp: write_timestamp.clone(),
-            terminal_layout: layout,
-        },
+    let writer_version = diagnostics.writer_version.clone();
+    let write_timestamp = diagnostics.write_timestamp.clone();
+    let plan = remanence_parity::assemble_terminal_plan(
+        spec.tape_uuid,
+        spec.block_size,
+        false,
+        edition_sequence,
+        summary.scope,
+        summary.counts,
         source,
+        layout,
+        diagnostics,
+        *edition_id.as_bytes(),
+        remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
     )
     .map_err(|error| Status::failed_precondition(format!("plan terminal edition: {error}")))?;
     let intent = remanence_state::TerminalFinalizationIntent {
@@ -481,16 +479,13 @@ pub(super) fn build_new_terminal_plan(
         recovery_required: false,
         edition_id: *edition_id.as_bytes(),
         edition_sequence,
-        edition_digest: edition.edition_digest,
+        edition_digest: plan.edition.edition_digest,
         writer_version,
         write_timestamp,
         terminal_prefix: terminal_prefix.map(remanence_state::TerminalFinalizationPrefixPlan::from),
         layout: remanence_state::TerminalFinalizationLayout::try_from(layout)
             .map_err(crate::status_from_state_error)?,
     };
-    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-        Status::failed_precondition(format!("plan terminal triple writer: {error}"))
-    })?;
     Ok((intent, plan))
 }
 
@@ -751,8 +746,8 @@ pub(crate) fn preflight_manual_finalize_tape(
                     }
                     let mut source = remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&checkpoint)
                         .map_err(crate::status_from_state_error)?;
-                    let edition = source
-                        .reconstruct_final_edition(&intent)
+                    let plan = source
+                        .reconstruct_final_plan(&intent)
                         .map_err(crate::status_from_state_error)?;
                     authorize_terminal_intent_capacity(
                         index,
@@ -761,9 +756,6 @@ pub(crate) fn preflight_manual_finalize_tape(
                         &intent,
                         source.summary().counts,
                     )?;
-                    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-                        Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
-                    })?;
                     (intent, plan)
                 }
                 remanence_parity::ParityConfig::Scheme(scheme) => {
@@ -823,12 +815,9 @@ pub(crate) fn preflight_manual_finalize_tape(
                         )
                     }
                     .map_err(crate::status_from_state_error)?;
-                    let edition = source
-                        .reconstruct_final_edition(&intent)
+                    let plan = source
+                        .reconstruct_final_plan(&intent)
                         .map_err(crate::status_from_state_error)?;
-                    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-                        Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
-                    })?;
                     drop(source);
                     let intent = reconcile_and_authorize_parity_resume(
                         index,
@@ -1078,8 +1067,8 @@ pub(crate) fn preflight_automatic_terminal_completion(
                     &checkpoint,
                 )
                 .map_err(crate::status_from_state_error)?;
-            let edition = source
-                .reconstruct_final_edition(&intent)
+            let plan = source
+                .reconstruct_final_plan(&intent)
                 .map_err(crate::status_from_state_error)?;
             authorize_terminal_intent_capacity(
                 index,
@@ -1088,9 +1077,6 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 &intent,
                 source.summary().counts,
             )?;
-            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
-            })?;
             (intent, plan)
         }
         remanence_parity::ParityConfig::Scheme(scheme) => {
@@ -1141,12 +1127,9 @@ pub(crate) fn preflight_automatic_terminal_completion(
                 )
             }
             .map_err(crate::status_from_state_error)?;
-            let edition = source
-                .reconstruct_final_edition(&intent)
+            let plan = source
+                .reconstruct_final_plan(&intent)
                 .map_err(crate::status_from_state_error)?;
-            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
-            })?;
             drop(source);
             let intent = reconcile_and_authorize_parity_resume(
                 index,
@@ -1233,8 +1216,8 @@ pub(super) fn finalize_terminal_no_parity(
                     "parity-off finalization intent unexpectedly has a parity prefix",
                 ));
             }
-            let edition = source
-                .reconstruct_final_edition(&intent)
+            let plan = source
+                .reconstruct_final_plan(&intent)
                 .map_err(crate::status_from_state_error)?;
             authorize_terminal_intent_capacity(
                 index,
@@ -1243,9 +1226,6 @@ pub(super) fn finalize_terminal_no_parity(
                 &intent,
                 source.summary().counts,
             )?;
-            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
-            })?;
             (intent, plan)
         }
         None => {
@@ -1405,12 +1385,9 @@ pub(super) fn finalize_terminal_with_parity_journal(
                 )
             }
             .map_err(crate::status_from_state_error)?;
-            let edition = source
-                .reconstruct_final_edition(&intent)
+            let plan = source
+                .reconstruct_final_plan(&intent)
                 .map_err(crate::status_from_state_error)?;
-            let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-                Status::failed_precondition(format!("reconstruct terminal writer: {error}"))
-            })?;
             let (prefix_snapshot, journal) = if prefix_is_durable {
                 (None, journal)
             } else {

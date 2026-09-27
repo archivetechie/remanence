@@ -30,6 +30,41 @@ use crate::terminal_tail::{
     TerminalTailProgress, TERMINAL_TAIL_COMPONENT_COUNT,
 };
 
+/// Assemble the common terminal edition and all five tail components from explicit
+/// authority. This is the shared, I/O-free funnel for new writes and replay;
+/// callers own row acquisition, identity selection, authorization and persistence.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_terminal_plan<S: TapeIndexReplicaRecordSource + ?Sized>(
+    tape_uuid: [u8; 16],
+    block_size: u32,
+    compression_enabled: bool,
+    edition_sequence: u64,
+    scope: crate::TapeIndexReplicaScope,
+    counts: crate::TapeIndexReplicaCounts,
+    source: &mut S,
+    terminal_layout: crate::TerminalTailLayout,
+    diagnostics: crate::ParityMapDiagnostics,
+    edition_id: [u8; 16],
+    nominal_extent_bytes: u64,
+) -> Result<TerminalTripleWritePlan, TerminalTailWriteError> {
+    let edition = crate::plan_tape_index_edition(
+        crate::TapeIndexEditionDescriptor {
+            tape_uuid,
+            edition_id,
+            edition_sequence,
+            scope,
+            counts,
+            block_size,
+            compression_enabled,
+            writer_version: diagnostics.writer_version,
+            write_timestamp: diagnostics.write_timestamp,
+            terminal_layout,
+        },
+        source,
+    )?;
+    TerminalTripleWritePlan::with_extent(edition, nominal_extent_bytes)
+}
+
 /// Complete immutable codec plan for A/gap-AB/B/gap-BC/C.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalTripleWritePlan {
@@ -44,6 +79,14 @@ pub struct TerminalTripleWritePlan {
 impl TerminalTripleWritePlan {
     /// Bind the three replicas and two default one-GiB separation extents.
     pub fn new(edition: TapeIndexEditionPlan) -> Result<Self, TerminalTailWriteError> {
+        Self::with_extent(edition, DEFAULT_INDEX_SEPARATION_BYTES)
+    }
+
+    /// Bind all five components using the supplied separation extent size.
+    fn with_extent(
+        edition: TapeIndexEditionPlan,
+        nominal_extent_bytes: u64,
+    ) -> Result<Self, TerminalTailWriteError> {
         let replicas = [
             plan_tape_index_replica(edition.clone(), 1)?,
             plan_tape_index_replica(edition.clone(), 2)?,
@@ -55,7 +98,7 @@ impl TerminalTripleWritePlan {
                 edition_id: edition.descriptor.edition_id,
                 gap_ordinal,
                 block_size: edition.descriptor.block_size,
-                nominal_extent_bytes: DEFAULT_INDEX_SEPARATION_BYTES,
+                nominal_extent_bytes,
                 total_records: edition
                     .descriptor
                     .terminal_layout
@@ -1031,6 +1074,49 @@ mod tests {
         };
         let separations = [gap(1), gap(2)];
         TerminalTripleWritePlan::from_parts(edition, replicas, separations).unwrap()
+    }
+
+    #[test]
+    fn shared_assembly_preserves_compact_and_default_plans() {
+        let compact = test_plan();
+        for extent_bytes in [3 * u64::from(BLOCK_SIZE), DEFAULT_INDEX_SEPARATION_BYTES] {
+            let mut descriptor = compact.edition.descriptor.clone();
+            descriptor.terminal_layout = TerminalTailLayout::new(
+                0,
+                BLOCK_SIZE,
+                1,
+                2,
+                compact.edition.replica_layout.replica_record_count,
+                crate::index_separation_records(BLOCK_SIZE, extent_bytes).unwrap(),
+            )
+            .unwrap();
+            let expected = if extent_bytes == DEFAULT_INDEX_SEPARATION_BYTES {
+                TerminalTripleWritePlan::new(
+                    plan_tape_index_edition(descriptor.clone(), &mut MinimalSource).unwrap(),
+                )
+                .unwrap()
+            } else {
+                compact.clone()
+            };
+            let assembled = assemble_terminal_plan(
+                descriptor.tape_uuid,
+                BLOCK_SIZE,
+                false,
+                descriptor.edition_sequence,
+                descriptor.scope,
+                descriptor.counts,
+                &mut MinimalSource,
+                descriptor.terminal_layout,
+                crate::ParityMapDiagnostics {
+                    writer_version: descriptor.writer_version,
+                    write_timestamp: descriptor.write_timestamp,
+                },
+                descriptor.edition_id,
+                extent_bytes,
+            )
+            .unwrap();
+            assert_eq!(assembled, expected);
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

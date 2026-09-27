@@ -92,6 +92,7 @@ mod pool_ops;
 mod put;
 mod recovery_report;
 mod tape_finalize;
+pub mod tape_image;
 mod tape_inventory;
 mod terminal_index_drill;
 #[cfg(feature = "tui")]
