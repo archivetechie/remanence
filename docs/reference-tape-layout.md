@@ -147,8 +147,8 @@ with `UnsupportedFormatVersion`; there is no compatibility reader or writer.
   and sealers reject it. Bytes `0x39..0x3c` are reserved-zero, and
   `0x3c..0x40` holds the key-frame length.
 - A plaintext **key frame** follows immediately (wire tag `REMK`). Readers
-  accept 1-8 slots; production sealers require 2-8 distinct recipient
-  epochs in ascending slot order. Each slot is
+  accept 1-8 slots; production sealers require 2-8 distinct, nonzero
+  recipient epochs in ascending slot order. Each slot is
   `[slot_index][recipient_epoch_id:16][label][enc:1120][ciphertext:48]`
   and carries one X-Wing-encapsulated copy of the object's freshly
   generated 32-byte data-encryption key (DEK); the 1120-byte `enc` field

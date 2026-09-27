@@ -114,7 +114,7 @@ representation: every
 object gets a fresh data-encryption key, wrapped separately to each
 recipient with HPKE (RFC 9180 Base mode, HKDF-SHA256, ChaCha20-Poly1305)
 running the X-Wing post-quantum/classical hybrid KEM (ML-KEM-768
-combined with X25519). Writers require 2-8 distinct recipient epochs in
+combined with X25519). Writers require 2-8 distinct, nonzero recipient epochs in
 ascending slot order.
 
 Remanence consumes canonical REMR public-key files and REMP private-key

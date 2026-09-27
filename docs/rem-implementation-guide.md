@@ -1376,9 +1376,10 @@ We recommend that a tool:
 - stop and report after a small number of consecutive positioning failures
   between tape files, for example eight, rather than keep commanding motion;
 - count read failures separately; and
-- accept the hints it can use: the expected tape UUID and block size, which the
-  specification requires when the bootstrap is unreadable, and an expected
-  tape-file count and capacity, which are useful only for estimating progress.
+- accept the hints it can use: the expected tape UUID, block size and parity
+  scheme (or no parity), which the specification requires when the bootstrap
+  is unreadable, and an expected tape-file count and capacity, which are
+  useful only for estimating progress.
 
 The specification fixes what a hint may not do: "Hints MUST NOT cause any tape
 file to be skipped." (REM-PARITY §8.4.1). Remanence, for example, emits one
@@ -1676,6 +1677,10 @@ on the tape which software wrote it, and when, and choose each edition's
 identity at random.
 
 ## 14. Revision history
+
+- **27 September 2026.** Fifth revision. Section 9's recommendation on walk
+  hints names the parity scheme (or no parity) as the third hint REM-PARITY
+  §8.4.1 now requires when the bootstrap is unreadable.
 
 - **27 September 2026.** Fourth revision. Sections 13.2 and 13.3 qualify the
   diagnostic recommendations for implementations that plan a ParityMap's bytes

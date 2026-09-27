@@ -456,6 +456,11 @@ A Reader MUST reject truncation, trailing bytes, a non-increasing or duplicate
 slot index, a duplicate `recipient_epoch_id`, an invalid label, an invalid
 slot count, or a frame outside the header bounds. A Sealer MUST emit at least
 one slot. A Sealer MUST give every slot a distinct `recipient_epoch_id`. A
+Sealer MUST refuse recipients given in an order whose slot indices are not
+strictly increasing, with `InvalidInput`. A Sealer MUST refuse a recipient
+whose `recipient_epoch_id` is all zero (sixteen zero bytes), with
+`InvalidInput`. Each recipient given to a Sealer carries the slot index its
+slot will have. A
 Sealer MUST NOT report a seal as successful unless the key frame contains a
 slot for every recipient it was asked to seal to.
 
@@ -1306,8 +1311,9 @@ header, and inner `REMANENCE.encryption` other than `none`; each produces
 
 **Sealer inputs.** Sealing input whose size is not a multiple of
 `chunk_size`; an `object_id` longer than 64 bytes; recipient counts zero or
-greater than eight; duplicate epoch ids; and non-canonical slot order.
-The duplicate epoch-id case is in the candidate supplement that Core §13
+greater than eight; an all-zero epoch id; duplicate epoch ids; and
+non-canonical slot order. The duplicate epoch-id, non-canonical slot-order
+and all-zero epoch-id cases are in the candidate supplement that Core §13
 describes. Entropy failure has no portable input, so no vector covers it.
 Its handling is left to each implementation's own tests.
 
@@ -1643,6 +1649,16 @@ effect on conformance.
     supplement Core §13 describes from the applicable vectors until the
     revision that adds them is frozen. Core §14 also excludes them from
     conformance evidence until that freeze. The pinned conformance target is
+    unchanged.
+
+  Decisions on questions the review raised then changed the text as follows.
+
+  - Section 5.3's slot-order rule settles what Section 5.9 left undecided: a
+    Sealer does not sort the recipients it is given.
+  - Section 5.3's all-zero epoch-id rule is a new Sealer requirement.
+  - Section 13.4's Sealer-input list names both cases, and places them, with
+    the duplicate epoch-id case, in the candidate supplement.
+  - These are minor changes of the revision in preparation. Readers are
     unchanged.
 
   No byte of the format changed, and no valid object or vector changed.
