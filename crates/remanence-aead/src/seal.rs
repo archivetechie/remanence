@@ -10,7 +10,9 @@ use crate::metadata::RemObjectMetadata;
 use crate::stream::{
     encrypt_chunk, encrypt_metadata, finalize_sha256, stored_size_from_parts, PlaintextStats,
 };
-use crate::wrap::{wrap_dek, DataEncryptionKey, EphemeralRng, RecipientPublicKey};
+use crate::wrap::{
+    wrap_dek, DataEncryptionKey, EntropySource, EphemeralRng, OsEntropy, RecipientPublicKey,
+};
 
 /// Inputs to the REM-OBJECT sealer.
 #[derive(Debug, Clone)]
@@ -63,8 +65,18 @@ pub fn seal<R: Read, W: Write>(
     output: W,
     options: &EnvelopeSealOptions,
 ) -> Result<SealReport> {
-    let dek = DataEncryptionKey::generate()?;
-    let mut rng = EphemeralRng::from_os()?;
+    seal_with_entropy(plaintext, output, options, &mut OsEntropy)
+}
+
+/// Obtain both secrets before sealing can write any output; private for failure injection.
+fn seal_with_entropy<R: Read, W: Write>(
+    plaintext: R,
+    output: W,
+    options: &EnvelopeSealOptions,
+    entropy: &mut impl EntropySource,
+) -> Result<SealReport> {
+    let dek = DataEncryptionKey::generate_with_entropy(entropy)?;
+    let mut rng = EphemeralRng::from_entropy(entropy)?;
     seal_with_material(plaintext, output, options, &dek, &mut rng)
 }
 
@@ -358,6 +370,49 @@ mod tests {
                 recovery.public_key(1).unwrap(),
             ],
         }
+    }
+
+    /// Fail a selected entropy draw, including after partially filling its buffer.
+    struct FailOnDraw {
+        fail_on: usize,
+        draws: usize,
+    }
+
+    impl EntropySource for FailOnDraw {
+        fn fill(&mut self, destination: &mut [u8]) -> Result<()> {
+            self.draws += 1;
+            assert_eq!(destination.len(), 32);
+            destination[..16].fill(0x5a);
+            if self.draws == self.fail_on {
+                return Err(RemObjectAeadError::EntropyUnavailable);
+            }
+            destination[16..].fill(0xa5);
+            Ok(())
+        }
+    }
+
+    fn assert_entropy_failure_writes_nothing(fail_on: usize) {
+        let plaintext = vec![0x5a; 512];
+        let options = envelope_options(options(&plaintext));
+        let mut output = Vec::new();
+        let mut entropy = FailOnDraw { fail_on, draws: 0 };
+
+        let error =
+            seal_with_entropy(&plaintext[..], &mut output, &options, &mut entropy).unwrap_err();
+
+        assert!(matches!(error, RemObjectAeadError::EntropyUnavailable));
+        assert_eq!(entropy.draws, fail_on);
+        assert!(output.is_empty(), "entropy failure wrote output bytes");
+    }
+
+    #[test]
+    fn seal_dek_entropy_failure_writes_nothing() {
+        assert_entropy_failure_writes_nothing(1);
+    }
+
+    #[test]
+    fn seal_hpke_entropy_failure_writes_nothing() {
+        assert_entropy_failure_writes_nothing(2);
     }
 
     struct FailAfterWriter {

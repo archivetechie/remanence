@@ -194,17 +194,37 @@ impl hpke::Kem for XWingHpkeKem {
     }
 }
 
+/// Fallible entropy source shared by DEK generation and HPKE seeding.
+pub(crate) trait EntropySource {
+    fn fill(&mut self, destination: &mut [u8]) -> Result<()>;
+}
+
+/// Production entropy source; never substitutes bytes when the OS draw fails.
+pub(crate) struct OsEntropy;
+
+impl EntropySource for OsEntropy {
+    fn fill(&mut self, destination: &mut [u8]) -> Result<()> {
+        getrandom::fill(destination).map_err(|_| RemObjectAeadError::EntropyUnavailable)
+    }
+}
+
 /// OS-seeded, zeroize-on-drop CSPRNG for arbitrary-length HPKE entropy draws.
 pub(crate) struct EphemeralRng {
     inner: ChaCha20,
 }
 
 impl EphemeralRng {
+    #[cfg(test)]
     pub(crate) fn from_os() -> Result<Self> {
+        Self::from_entropy(&mut OsEntropy)
+    }
+
+    /// Seed the ephemeral generator through the shared fallible entropy source.
+    pub(crate) fn from_entropy(entropy: &mut impl EntropySource) -> Result<Self> {
         let mut seed = [0u8; 32];
-        if getrandom::fill(&mut seed).is_err() {
+        if let Err(error) = entropy.fill(&mut seed) {
             seed.zeroize();
-            return Err(RemObjectAeadError::EntropyUnavailable);
+            return Err(error);
         }
         let inner = Self::from_seed(&seed);
         seed.zeroize();
@@ -253,9 +273,14 @@ pub struct DataEncryptionKey([u8; 32]);
 impl DataEncryptionKey {
     /// Generate a DEK directly from the fallible operating-system CSPRNG.
     pub fn generate() -> Result<Self> {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).map_err(|_| RemObjectAeadError::EntropyUnavailable)?;
-        Ok(Self(bytes))
+        Self::generate_with_entropy(&mut OsEntropy)
+    }
+
+    /// Draw the DEK through the shared source, wiping even a partial failed draw.
+    pub(crate) fn generate_with_entropy(entropy: &mut impl EntropySource) -> Result<Self> {
+        let mut dek = Self([0u8; 32]);
+        entropy.fill(&mut dek.0)?;
+        Ok(dek)
     }
 
     /// Construct key material for deterministic conformance tests and opening.

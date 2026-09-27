@@ -1054,6 +1054,22 @@ fn metadata_cbor_with_extra(options: &SealOptions, extra_value: &[u8]) -> Vec<u8
     out
 }
 
+/// Keep all required metadata fields so only the extra key's type is invalid.
+fn metadata_cbor_with_text_key(options: &SealOptions) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_cbor_type_len(&mut out, 5, 5);
+    push_cbor_metadata_fields(
+        &mut out,
+        options.plaintext_size,
+        options.plaintext_digest,
+        1,
+    );
+    // The text key sorts after the four single-byte unsigned integer keys.
+    push_cbor_text(&mut out, "x");
+    push_cbor_uint(&mut out, 0);
+    out
+}
+
 fn metadata_cbor_missing_plaintext_size(options: &SealOptions) -> Vec<u8> {
     let mut out = Vec::new();
     push_cbor_type_len(&mut out, 5, 3);
@@ -1153,13 +1169,7 @@ fn metadata_plaintext_case(id: &str, options: &SealOptions) -> Option<Vec<u8>> {
             push_cbor_type_len(&mut out, 4, 0);
             out
         }
-        "metadata-key-text" => {
-            let mut out = Vec::new();
-            push_cbor_type_len(&mut out, 5, 1);
-            push_cbor_text(&mut out, "x");
-            push_cbor_uint(&mut out, 0);
-            out
-        }
+        "metadata-key-text" => metadata_cbor_with_text_key(options),
         "metadata-float" => metadata_cbor_with_extra(options, &[0xf9, 0x3c, 0x00]),
         "metadata-tag" => metadata_cbor_with_extra(options, &[0xc0, 0x00]),
         "metadata-indefinite-length" => metadata_cbor_with_extra(options, &[0x5f, 0xff]),
