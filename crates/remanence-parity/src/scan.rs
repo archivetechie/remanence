@@ -84,6 +84,204 @@ pub struct UnattestedTapeFile {
     pub position: PhysicalPositionHint,
 }
 
+/// Complete out-of-band authority for an unreadable BOT Bootstrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanRecoveryHints {
+    /// Supplied tape identity, also used to derive role magics.
+    pub tape_uuid: [u8; 16],
+    /// Supplied fixed-block geometry.
+    pub block_size: u32,
+    /// Explicit parity geometry or an explicit no-parity declaration.
+    pub scheme: crate::ParityConfig,
+}
+
+/// Recovery classification after binding all trustworthy BOT evidence to hints.
+#[derive(Clone, Debug)]
+pub enum RecoveryBootstrap {
+    /// The complete bootstrap validates and agrees with the supplied authority.
+    Validated(BootstrapPayload),
+    /// BOT damage or nonconformance supplies no conflicting validated evidence.
+    Unreadable(String),
+}
+
+impl ScanRecoveryHints {
+    /// Classify a recovery BOT block, refusing validated disagreements before
+    /// parsing its payload. Physical read failures are handled by the caller.
+    pub fn classify_bootstrap(&self, block: &[u8]) -> Result<RecoveryBootstrap, ParityError> {
+        let header_error = if block.len() < crate::bootstrap::BOOTSTRAP_HEADER_LEN {
+            Some("bootstrap header buffer too short")
+        } else if block[..8] != crate::bootstrap::BOOTSTRAP_MAGIC {
+            Some("bootstrap magic mismatch")
+        } else if crate::crc64_xz(&block[..48])
+            != u64::from_le_bytes(block[48..56].try_into().expect("header CRC bytes"))
+        {
+            Some("bootstrap header CRC mismatch")
+        } else {
+            None
+        };
+        if let Some(reason) = header_error {
+            return Ok(RecoveryBootstrap::Unreadable(reason.into()));
+        }
+        let major = u16::from_be_bytes(block[8..10].try_into().expect("header schema bytes"));
+        if major != crate::bootstrap::BOOTSTRAP_SCHEMA_MAJOR {
+            return Err(filemark_scan_error(format!(
+                "unsupported bootstrap schema major version: got {major}, accept {}",
+                crate::bootstrap::BOOTSTRAP_SCHEMA_MAJOR
+            )));
+        }
+        if block[16..32] != self.tape_uuid {
+            return Err(ParityError::TapeIdentityMismatch(
+                "tape identity mismatch: readable bootstrap header differs from supplied hints"
+                    .into(),
+            ));
+        }
+        if u32::from_be_bytes(block[32..36].try_into().expect("header block size bytes"))
+            != self.block_size
+        {
+            return Err(filemark_scan_error(
+                "readable bootstrap block size differs from supplied hints",
+            ));
+        }
+        let sequence = u64::from_be_bytes(block[36..44].try_into().expect("header sequence bytes"));
+        if sequence != 0 {
+            return Err(filemark_scan_error(format!(
+                "schema-major 2 permits only the sequence-0 BOT Bootstrap: got sequence {sequence}"
+            )));
+        }
+        let flags = u32::from_be_bytes(block[12..16].try_into().expect("header flags bytes"));
+        if (flags & crate::bootstrap::FLAG_NO_PARITY != 0)
+            != matches!(self.scheme, crate::ParityConfig::None)
+        {
+            return Err(filemark_scan_error(
+                "readable bootstrap parity scheme differs from supplied hints: no-parity flag contradicts scheme",
+            ));
+        }
+        if block.len() != self.block_size as usize {
+            return Err(filemark_scan_error(format!(
+                "readable bootstrap block size differs from supplied hints: got {} bytes, expected {}",
+                block.len(),
+                self.block_size
+            )));
+        }
+        match parse_bootstrap_block(block) {
+            Ok(payload) => {
+                self.validate_bootstrap(&payload)?;
+                Ok(RecoveryBootstrap::Validated(payload))
+            }
+            Err(error @ ParityError::BootstrapParse(_)) => {
+                // Bounds are covered by the header CRC. An impossible length is
+                // nonconformance, but cannot supply authenticated payload fields.
+                let payload_len = u32::from_le_bytes(block[44..48].try_into().unwrap());
+                let payload_end = usize::try_from(payload_len)
+                    .ok()
+                    .and_then(|len| crate::bootstrap::BOOTSTRAP_HEADER_LEN.checked_add(len));
+                let framed_end = payload_end.and_then(|end| end.checked_add(8));
+                let Some((end, crc_end)) = payload_end
+                    .zip(framed_end)
+                    .filter(|(_, crc_end)| *crc_end <= block.len())
+                else {
+                    return Ok(RecoveryBootstrap::Unreadable(format!(
+                        "bootstrap payload is readable but nonconformant: {error}"
+                    )));
+                };
+                let bytes = &block[crate::bootstrap::BOOTSTRAP_HEADER_LEN..end];
+                let stored_crc = u64::from_le_bytes(block[end..crc_end].try_into().unwrap());
+                if crate::crc64_xz(bytes) != stored_crc {
+                    return Ok(RecoveryBootstrap::Unreadable(error.to_string()));
+                }
+                // Decode without canonical/order/digest/legacy-key validation:
+                // these rules must not hide independently readable conflicts.
+                use ciborium::value::Value;
+                if let Ok(Value::Map(entries)) = ciborium::from_reader::<Value, _>(bytes) {
+                    for (key, value) in entries {
+                        if key == Value::Integer(5.into()) && value == Value::Bool(true) {
+                            return Err(ParityError::DriveCompressionEnabled);
+                        }
+                        if key != Value::Integer(1.into()) {
+                            continue;
+                        }
+                        let Value::Map(fields) = value else { continue };
+                        let field = |key: u8| {
+                            fields
+                                .iter()
+                                .find(|(k, _)| *k == Value::Integer(key.into()))
+                                .map(|(_, v)| v)
+                        };
+                        let decoded = (|| {
+                            let id = field(1)?.as_text()?;
+                            let k = u16::try_from(i128::from(field(2)?.as_integer()?)).ok()?;
+                            let m = u16::try_from(i128::from(field(3)?.as_integer()?)).ok()?;
+                            let s = u32::try_from(i128::from(field(4)?.as_integer()?)).ok()?;
+                            Some((id, k, m, s))
+                        })();
+                        if let Some((id, k, m, s)) = decoded {
+                            let agrees = match &self.scheme {
+                                crate::ParityConfig::None => false,
+                                crate::ParityConfig::Scheme(expected) => {
+                                    expected.id.as_str() == id
+                                        && expected.data_blocks_per_stripe == k
+                                        && expected.parity_blocks_per_stripe == m
+                                        && expected.stripes_per_neighborhood == s
+                                }
+                            };
+                            if !agrees {
+                                return Err(filemark_scan_error(
+                                    "readable bootstrap parity scheme differs from supplied hints",
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(RecoveryBootstrap::Unreadable(format!(
+                    "bootstrap payload is readable but nonconformant: {error}"
+                )))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Refuse any disagreement with a readable, valid bootstrap.
+    fn validate_bootstrap(&self, bootstrap: &BootstrapPayload) -> Result<(), ParityError> {
+        if self.tape_uuid != bootstrap.tape_uuid {
+            return Err(ParityError::TapeIdentityMismatch(
+                "tape identity mismatch: readable bootstrap differs from supplied hints".into(),
+            ));
+        }
+        if self.block_size != bootstrap.block_size_bytes {
+            return Err(filemark_scan_error(
+                "readable bootstrap block size differs from supplied hints",
+            ));
+        }
+        let matches = match (&self.scheme, &bootstrap.scheme) {
+            (crate::ParityConfig::None, _) => bootstrap.no_parity_flag,
+            (crate::ParityConfig::Scheme(expected), Some(actual)) => {
+                !bootstrap.no_parity_flag
+                    && expected.id.as_str() == actual.id
+                    && expected.data_blocks_per_stripe == actual.data_blocks_per_stripe
+                    && expected.parity_blocks_per_stripe == actual.parity_blocks_per_stripe
+                    && expected.stripes_per_neighborhood == actual.stripes_per_neighborhood
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(filemark_scan_error(
+                "readable bootstrap parity scheme differs from supplied hints",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Scoped recovery opt-in; ordinary callers preserve the original scanner rules.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum ScanMode<'a> {
+    /// Require the existing structural bootstrap validation.
+    #[default]
+    Standard,
+    /// Treat an invalid or physically unreadable file-0 bootstrap as unreadable.
+    Recovery(&'a ScanRecoveryHints),
+}
+
 /// Tail-aware result of the single physical filemark-map walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanWalkResult {
@@ -98,8 +296,11 @@ pub struct ScanWalkResult {
     /// Valid bootstrap copies encountered and structurally classified by the
     /// walk, in physical tape-file order.
     pub bootstrap_candidates: Vec<ScanBootstrapCandidate>,
-    /// Physical damage encountered by the scanner itself.
+    /// Physical damage or bootstrap validation failure encountered by the scanner.
     pub damaged_regions: Vec<ScanDamagedRegion>,
+    /// Present only when file 0 was treated as unreadable and these supplied
+    /// values provided the tape identity and geometry instead of a bootstrap.
+    pub bootstrap_recovery_hints: Option<ScanRecoveryHints>,
     unreadable_one_block_objects: Vec<u64>,
 }
 
@@ -167,10 +368,11 @@ pub struct ScanBootstrapCandidate {
     pub payload: BootstrapPayload,
 }
 
-/// Scanner-observed physical damage category.
+/// Scanner-observed physical damage or bootstrap validation failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanDamageKind {
-    /// The first block of a measured tape file was unreadable.
+    /// The first block was physically unreadable, or file 0 failed bootstrap
+    /// validation under the explicit recovery mode.
     UnreadableTapeFileHead,
     /// A tape file carried a recognisable structural header whose recorded
     /// block count disagreed with the measured length of the file, so the
@@ -477,10 +679,28 @@ pub fn scan_reconstruct_filemark_map_with_report(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<ScanWalkResult, ParityError> {
-    let outcome =
-        scan_reconstruct_filemark_map_with_control(source, tape_uuid, block_size, |_| {
-            ScanWalkControl::Continue
-        })?;
+    scan_reconstruct_filemark_map_with_report_mode(
+        source,
+        tape_uuid,
+        block_size,
+        ScanMode::Standard,
+    )
+}
+
+/// Reporting scan with an explicit, fully supplied bootstrap recovery mode.
+pub fn scan_reconstruct_filemark_map_with_report_mode(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+) -> Result<ScanWalkResult, ParityError> {
+    let outcome = scan_reconstruct_filemark_map_with_control_mode(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        |_| ScanWalkControl::Continue,
+    )?;
     let ControlledScanWalkOutcome::Complete(walked) = outcome else {
         unreachable!("an unconditional scan controller cannot abort")
     };
@@ -495,6 +715,26 @@ pub fn scan_reconstruct_filemark_map_with_control<F>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
+    control: F,
+) -> Result<ControlledScanWalkOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
+    scan_reconstruct_filemark_map_with_control_mode(
+        source,
+        tape_uuid,
+        block_size,
+        ScanMode::Standard,
+        control,
+    )
+}
+
+/// Controlled scan using the same walk with scoped bootstrap recovery.
+pub fn scan_reconstruct_filemark_map_with_control_mode<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
     mut control: F,
 ) -> Result<ControlledScanWalkOutcome, ParityError>
 where
@@ -504,10 +744,12 @@ where
         source,
         tape_uuid,
         block_size,
+        mode,
         &mut control,
     )? {
         ScanReconstructionOutcome::Complete(reconstructed) => {
             Ok(ControlledScanWalkOutcome::Complete(ScanWalkResult {
+                bootstrap_recovery_hints: reconstructed.bootstrap_recovery_hints,
                 map: reconstructed.map,
                 truncation: reconstructed.truncation,
                 truncation_candidate_kind: reconstructed.truncation_candidate_kind,
@@ -524,6 +766,7 @@ where
 
 #[derive(Debug)]
 struct ScanReconstruction {
+    bootstrap_recovery_hints: Option<ScanRecoveryHints>,
     map: FilemarkMap,
     unreadable_one_block_objects: Vec<u64>,
     truncation: Option<ScanTailTruncation>,
@@ -541,6 +784,7 @@ fn scan_reconstruct_filemark_map_with_provenance<F>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
+    mode: ScanMode<'_>,
     control: &mut F,
 ) -> Result<ScanReconstructionOutcome, ParityError>
 where
@@ -550,6 +794,17 @@ where
         return Err(ParityError::Invariant("scan block size is zero"));
     }
 
+    if let ScanMode::Recovery(hints) = mode {
+        if hints.tape_uuid != *tape_uuid || hints.block_size != block_size {
+            return Err(filemark_scan_error(
+                "scan arguments disagree with recovery hints",
+            ));
+        }
+        if let crate::ParityConfig::Scheme(scheme) = &hints.scheme {
+            scheme.validate()?;
+        }
+    }
+    let mut bootstrap_recovery_hints = None;
     let block_size_usize = usize::try_from(block_size)
         .map_err(|_| ParityError::Invariant("scan block size does not fit usize"))?;
     source.configure_fixed_block_size(block_size)?;
@@ -585,6 +840,23 @@ where
             }
             Ok(RawReadOutcome::Block { .. }) => {
                 let first_block = buf.clone();
+                let mut invalid_bootstrap = false;
+                if builder.next_tape_file_number()? == 0 && file_start.lba == 0 {
+                    if let ScanMode::Recovery(hints) = mode {
+                        match hints.classify_bootstrap(&first_block)? {
+                            RecoveryBootstrap::Validated(_) => {}
+                            RecoveryBootstrap::Unreadable(_) => {
+                                invalid_bootstrap = true;
+                                bootstrap_recovery_hints = Some(hints.clone());
+                                damaged_regions.push(ScanDamagedRegion {
+                                    start: file_start,
+                                    block_count: 1,
+                                    kind: ScanDamageKind::UnreadableTapeFileHead,
+                                });
+                            }
+                        }
+                    }
+                }
                 let measured = match measure_current_file(source, file_start)? {
                     MeasureCurrentFileOutcome::Complete(measured) => measured,
                     MeasureCurrentFileOutcome::Truncated(kind) => {
@@ -602,7 +874,17 @@ where
                         break;
                     }
                 };
-                if let Some(candidate) = append_classified_entry(
+                if invalid_bootstrap {
+                    append_entry_with_unreadable_head(
+                        source,
+                        &mut builder,
+                        tape_uuid,
+                        block_size,
+                        file_start,
+                        measured.block_count,
+                        &mut damaged_regions,
+                    )?;
+                } else if let Some(candidate) = append_classified_entry(
                     source,
                     &mut builder,
                     &first_block,
@@ -628,6 +910,11 @@ where
                     block_count: 1,
                     kind: ScanDamageKind::UnreadableTapeFileHead,
                 });
+                if builder.next_tape_file_number()? == 0 && file_start.lba == 0 {
+                    if let ScanMode::Recovery(hints) = mode {
+                        bootstrap_recovery_hints = Some(hints.clone());
+                    }
+                }
                 source.locate_physical(file_start)?;
                 let measured = match measure_current_file(source, file_start)? {
                     MeasureCurrentFileOutcome::Complete(measured) => measured,
@@ -670,6 +957,7 @@ where
     }
 
     Ok(ScanReconstructionOutcome::Complete(ScanReconstruction {
+        bootstrap_recovery_hints,
         map: builder.build()?,
         unreadable_one_block_objects,
         truncation,
@@ -2316,5 +2604,470 @@ mod tests {
         assert_eq!(walked.map.tape_file_count(), 1);
         assert_eq!(walked.truncation_candidate_kind, Some(TapeFileKind::Object));
         assert_eq!(walked.bootstrap_candidates.len(), 1);
+    }
+    /// Opt-in recovery preserves the sole structural BOT without authenticating it.
+    #[test]
+    fn scanner_recovery_requires_hints_and_records_bootstrap_provenance() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("BOT-only map");
+        let valid = bootstrap_block(map.digest(false).expect("digest"), 0);
+        let mut malformed = valid.clone();
+        malformed[80] ^= 1;
+        for scheme in [
+            crate::ParityConfig::None,
+            crate::ParityConfig::Scheme(crate::default_scheme_for_block_size(BLOCK_SIZE)),
+        ] {
+            let hints = ScanRecoveryHints {
+                tape_uuid: TAPE_UUID,
+                block_size: BLOCK_SIZE,
+                scheme,
+            };
+            // Payload damage is recoverable only when the checked header agrees.
+            let flags = u32::from(matches!(hints.scheme, crate::ParityConfig::None));
+            malformed[12..16].copy_from_slice(&flags.to_be_bytes());
+            let crc = crate::crc64_xz(&malformed[..48]);
+            malformed[48..56].copy_from_slice(&crc.to_le_bytes());
+            for head in [
+                Record::Block(malformed.clone()),
+                Record::Block(block(0)),
+                Record::ReadFault(TestReadFault::Medium),
+            ] {
+                let records = vec![
+                    head,
+                    Record::Filemark,
+                    Record::Block(block(0x33)),
+                    Record::Filemark,
+                ];
+                let mut source = RecordingRawSource::new(records.clone());
+                let report = scan_reconstruct_filemark_map_with_report_mode(
+                    &mut source,
+                    &TAPE_UUID,
+                    BLOCK_SIZE,
+                    ScanMode::Recovery(&hints),
+                )
+                .expect("scoped recovery");
+                assert_eq!(report.bootstrap_recovery_hints, Some(hints.clone()));
+                assert!(report.authoritative_bootstrap().is_none());
+                assert_eq!(report.map.entries()[0].kind, TapeFileKind::Bootstrap);
+                assert_eq!(report.map.entries()[1].kind, TapeFileKind::Object);
+                assert_eq!(report.damaged_regions.len(), 1);
+                if matches!(records[0], Record::Block(_)) {
+                    let error = scan_reconstruct_filemark_map_with_report(
+                        &mut RecordingRawSource::new(records),
+                        &TAPE_UUID,
+                        BLOCK_SIZE,
+                    )
+                    .expect_err("without hints a malformed file 0 must refuse");
+                    assert!(
+                        error.to_string().contains("sole tape-file-0 BOT Bootstrap"),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scoped recovery cannot replace a valid bootstrap or conceal transport failures.
+    #[test]
+    fn scanner_recovery_refuses_valid_bootstrap_conflicts_and_transport_errors() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("BOT map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let record = payload.scheme.as_ref().expect("parity bootstrap");
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::Scheme(ParityScheme {
+                id: SchemeId::new_owned(record.id.clone()),
+                data_blocks_per_stripe: record.data_blocks_per_stripe,
+                parity_blocks_per_stripe: record.parity_blocks_per_stripe,
+                stripes_per_neighborhood: record.stripes_per_neighborhood,
+            }),
+        };
+        let records = vec![
+            Record::Block(bootstrap_block_for_payload(&payload)),
+            Record::Filemark,
+        ];
+        let report = scan_reconstruct_filemark_map_with_report_mode(
+            &mut RecordingRawSource::new(records.clone()),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            ScanMode::Recovery(&hints),
+        )
+        .expect("matching hints leave bootstrap authoritative");
+        assert_eq!(
+            report
+                .authoritative_bootstrap()
+                .expect("valid bootstrap")
+                .payload,
+            payload
+        );
+        assert!(report.bootstrap_recovery_hints.is_none());
+        for mismatch in ["identity", "block size", "parity scheme"] {
+            let mut conflicting = hints.clone();
+            match mismatch {
+                "identity" => conflicting.tape_uuid = [0x99; 16],
+                "block size" => conflicting.block_size *= 2,
+                _ => conflicting.scheme = crate::ParityConfig::None,
+            }
+            // Validate geometry before scanning: fixed-size I/O can itself reject wrong sizes.
+            assert!(conflicting
+                .validate_bootstrap(&payload)
+                .expect_err("conflict")
+                .to_string()
+                .contains(mismatch));
+            let mut conflict_records = records.clone();
+            if let Record::Block(block) = &mut conflict_records[0] {
+                block.resize(conflicting.block_size as usize, 0);
+            }
+            let error = scan_reconstruct_filemark_map_with_report_mode(
+                &mut RecordingRawSource::new(conflict_records),
+                &conflicting.tape_uuid,
+                conflicting.block_size,
+                ScanMode::Recovery(&conflicting),
+            )
+            .expect_err("readable bootstrap conflict");
+            assert!(error.to_string().contains(mismatch), "{error}");
+        }
+        for fault in [
+            TestReadFault::Transport,
+            TestReadFault::Hardware,
+            TestReadFault::DeferredFixedMedium,
+            TestReadFault::DeferredDescriptorMedium,
+        ] {
+            let error = scan_reconstruct_filemark_map_with_report_mode(
+                &mut RecordingRawSource::new(vec![Record::ReadFault(fault), Record::Filemark]),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                ScanMode::Recovery(&hints),
+            )
+            .expect_err("only current medium damage permits physical fallback");
+            assert!(matches!(error, ParityError::TapeIo(_)));
+        }
+    }
+    /// Recovery must distinguish validated refusals and header evidence from damaged payloads.
+    #[test]
+    fn scanner_recovery_preserves_compression_and_header_refusals() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let scheme = payload.scheme.as_ref().expect("parity");
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::Scheme(ParityScheme {
+                id: SchemeId::new_owned(scheme.id.clone()),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            }),
+        };
+        let scan = |block, hints: &ScanRecoveryHints| {
+            scan_reconstruct_filemark_map_with_report_mode(
+                &mut RecordingRawSource::new(vec![Record::Block(block), Record::Filemark]),
+                &hints.tape_uuid,
+                hints.block_size,
+                ScanMode::Recovery(hints),
+            )
+        };
+        let mut compressed = bootstrap_block_for_payload(&payload);
+        let end = 56 + u32::from_le_bytes(compressed[44..48].try_into().unwrap()) as usize;
+        assert_eq!(&compressed[end - 2..end], &[5, 0xf4]);
+        compressed[end - 1] = 0xf5;
+        let crc = crate::crc64_xz(&compressed[56..end]);
+        compressed[end..end + 8].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            scan(compressed, &hints),
+            Err(ParityError::DriveCompressionEnabled)
+        ));
+        for field in ["identity", "block size"] {
+            for failure in ["payload", "schema"] {
+                let mut block = bootstrap_block_for_payload(&payload);
+                if field == "identity" {
+                    block[16] ^= 1;
+                } else {
+                    block[32..36].copy_from_slice(&(BLOCK_SIZE / 2).to_be_bytes());
+                }
+                if failure == "payload" {
+                    block[80] ^= 1;
+                } else {
+                    block[8..10].copy_from_slice(&99u16.to_be_bytes());
+                }
+                let crc = crate::crc64_xz(&block[..48]);
+                block[48..56].copy_from_slice(&crc.to_le_bytes());
+                let error = scan(block.clone(), &hints).expect_err("checksummed header binds");
+                let reason = if failure == "schema" {
+                    "got 99, accept 2"
+                } else {
+                    field
+                };
+                assert!(error.to_string().contains(reason), "{error}");
+                block[48] ^= 1;
+                assert!(scan(block, &hints)
+                    .expect("bad header has no identity evidence")
+                    .bootstrap_recovery_hints
+                    .is_some());
+            }
+        }
+        for field in ["k", "m", "S"] {
+            let mut conflicting = hints.clone();
+            let crate::ParityConfig::Scheme(scheme) = &mut conflicting.scheme else {
+                panic!("scheme")
+            };
+            match field {
+                "k" => scheme.data_blocks_per_stripe -= 1,
+                "m" => scheme.parity_blocks_per_stripe += 1,
+                _ => scheme.stripes_per_neighborhood += 1,
+            }
+            let error = scan(bootstrap_block_for_payload(&payload), &conflicting)
+                .expect_err("distinct parity geometry refuses");
+            assert!(error.to_string().contains("parity scheme"), "{error}");
+        }
+    }
+
+    /// Nonconformance cannot conceal authenticated scheme or compression conflicts.
+    #[test]
+    fn recovery_nonconformant_payload_preserves_readable_conflicts() {
+        use ciborium::value::Value;
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let scheme = payload.scheme.as_ref().expect("scheme");
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::Scheme(ParityScheme {
+                id: SchemeId::new_owned(scheme.id.clone()),
+                data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+                parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+                stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            }),
+        };
+        for defect in ["key20", "key21", "key30", "digest", "noncanonical"] {
+            for conflict in ["agree", "scheme", "none", "compression"] {
+                let mut block = bootstrap_block_for_payload(&payload);
+                let end = 56 + u32::from_le_bytes(block[44..48].try_into().unwrap()) as usize;
+                let Value::Map(mut entries) =
+                    ciborium::from_reader::<Value, _>(&block[56..end]).expect("decode payload")
+                else {
+                    panic!("map")
+                };
+                if conflict == "compression" {
+                    entries
+                        .iter_mut()
+                        .find(|(k, _)| *k == Value::Integer(5.into()))
+                        .expect("compression key")
+                        .1 = Value::Bool(true);
+                }
+                match defect {
+                    "key20" | "key21" | "key30" => {
+                        let key: u8 = defect[3..].parse().expect("key");
+                        entries.push((Value::Integer(key.into()), Value::Null));
+                    }
+                    "digest" => {
+                        entries
+                            .iter_mut()
+                            .find(|(k, _)| *k == Value::Integer(2.into()))
+                            .expect("digest key")
+                            .1 = Value::Null;
+                    }
+                    _ => entries.swap(0, 1),
+                }
+                let mut bytes = Vec::new();
+                ciborium::into_writer(&Value::Map(entries), &mut bytes).expect("encode payload");
+                let end = 56 + bytes.len();
+                block[44..48].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+                block[56..end].copy_from_slice(&bytes);
+                block[end..end + 8].copy_from_slice(&crate::crc64_xz(&bytes).to_le_bytes());
+                let mut supplied = hints.clone();
+                if conflict == "scheme" {
+                    let crate::ParityConfig::Scheme(scheme) = &mut supplied.scheme else {
+                        panic!("scheme")
+                    };
+                    scheme.data_blocks_per_stripe -= 1;
+                } else if conflict == "none" {
+                    supplied.scheme = crate::ParityConfig::None;
+                    block[12..16].copy_from_slice(&crate::bootstrap::FLAG_NO_PARITY.to_be_bytes());
+                }
+                let crc = crate::crc64_xz(&block[..48]);
+                block[48..56].copy_from_slice(&crc.to_le_bytes());
+                assert!(matches!(
+                    parse_bootstrap_block(&block),
+                    Err(ParityError::BootstrapParse(_))
+                ));
+                let result = supplied.classify_bootstrap(&block);
+                match conflict {
+                    "agree" => {
+                        let RecoveryBootstrap::Unreadable(reason) =
+                            result.expect("lenient recovery")
+                        else {
+                            panic!("nonconformant payload must remain unreadable")
+                        };
+                        assert!(reason.contains("readable but nonconformant"), "{reason}");
+                    }
+                    "compression" => {
+                        assert!(matches!(result, Err(ParityError::DriveCompressionEnabled)))
+                    }
+                    _ => assert!(result
+                        .expect_err("scheme conflict")
+                        .to_string()
+                        .contains("parity scheme")),
+                }
+                // Without the payload CRC, no decoded conflict is trustworthy.
+                block[end] ^= 1;
+                assert!(matches!(
+                    supplied.classify_bootstrap(&block),
+                    Ok(RecoveryBootstrap::Unreadable(_))
+                ));
+            }
+        }
+        let mut block = bootstrap_block_for_payload(&payload);
+        block[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc = crate::crc64_xz(&block[..48]);
+        block[48..56].copy_from_slice(&crc.to_le_bytes());
+        let RecoveryBootstrap::Unreadable(reason) =
+            hints.classify_bootstrap(&block).expect("lenient bounds")
+        else {
+            panic!("payload past block cannot validate")
+        };
+        assert!(reason.contains("readable but nonconformant"), "{reason}");
+    }
+
+    /// Checksummed format and scheme refusals survive even a damaged payload.
+    #[test]
+    fn scanner_recovery_refuses_checked_format_fields() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let mut payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        payload.no_parity_flag = true;
+        payload.scheme = None;
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::None,
+        };
+        for (offset, bytes, reason) in [
+            (8, 1u16.to_be_bytes().to_vec(), "got 1, accept 2"),
+            (8, 3u16.to_be_bytes().to_vec(), "got 3, accept 2"),
+            (36, 7u64.to_be_bytes().to_vec(), "got sequence 7"),
+            (12, 0u32.to_be_bytes().to_vec(), "no-parity flag"),
+        ] {
+            for damaged_payload in [false, true] {
+                let mut block = bootstrap_block_for_payload(&payload);
+                block[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                if damaged_payload {
+                    block[80] ^= 1;
+                }
+                let crc = crate::crc64_xz(&block[..48]);
+                block[48..56].copy_from_slice(&crc.to_le_bytes());
+                let error = scan_reconstruct_filemark_map_with_report_mode(
+                    &mut RecordingRawSource::new(vec![
+                        Record::Block(block.clone()),
+                        Record::Filemark,
+                    ]),
+                    &TAPE_UUID,
+                    BLOCK_SIZE,
+                    ScanMode::Recovery(&hints),
+                )
+                .expect_err("checked header refusal");
+                assert!(error.to_string().contains(reason), "{error}");
+                block[48] ^= 1;
+                assert!(matches!(
+                    hints.classify_bootstrap(&block),
+                    Ok(RecoveryBootstrap::Unreadable(_))
+                ));
+            }
+        }
+        let block = bootstrap_block_for_payload(&payload);
+        for len in [block.len() - 1, block.len() + 1] {
+            let mut resized = block.clone();
+            resized.resize(len, 0);
+            let error = hints
+                .classify_bootstrap(&resized)
+                .expect_err("block size refusal");
+            assert!(error.to_string().contains("block size"), "{error}");
+        }
+        // Check the other direction of the flag disagreement as well.
+        let parity_hints = ScanRecoveryHints {
+            scheme: crate::ParityConfig::Scheme(crate::default_scheme_for_block_size(BLOCK_SIZE)),
+            ..hints
+        };
+        assert!(parity_hints
+            .classify_bootstrap(&block)
+            .expect_err("no-parity conflicts with parity hints")
+            .to_string()
+            .contains("no-parity flag"));
+    }
+
+    /// Direct BOT recovery preserves the typed identity refusal in both modes.
+    #[test]
+    fn bot_recovery_preserves_typed_foreign_identity_refusal() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let mut payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        payload.tape_uuid = [0x99; 16];
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::None,
+        };
+        for mode in [ScanMode::Standard, ScanMode::Recovery(&hints)] {
+            let error = crate::bot_recovery::recover_terminal_inventory_from_bot_controlled_mode(
+                &mut RecordingRawSource::new(vec![
+                    Record::Block(bootstrap_block_for_payload(&payload)),
+                    Record::Filemark,
+                ]),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                mode,
+                |_| ScanWalkControl::Continue,
+                |_| Ok(()),
+            )
+            .expect_err("foreign BOT");
+            assert!(
+                matches!(
+                    error,
+                    crate::BotStructuralRecoveryError::TapeIdentityMismatch
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    /// Recovery retains the one-block BOT rule and validates even a torn valid BOT.
+    #[test]
+    fn scanner_recovery_preserves_bot_shape_and_torn_head_identity() {
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::None,
+        };
+        let error = scan_reconstruct_filemark_map_with_report_mode(
+            &mut RecordingRawSource::new(vec![
+                Record::Block(block(0)),
+                Record::Block(block(0)),
+                Record::Filemark,
+            ]),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            ScanMode::Recovery(&hints),
+        )
+        .expect_err("recovery cannot invent a one-block BOT out of two blocks");
+        assert!(error.to_string().contains("requires one Bootstrap block"));
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("BOT map");
+        let mut payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        payload.tape_uuid = [0x99; 16];
+        let error = scan_reconstruct_filemark_map_with_report_mode(
+            &mut RecordingRawSource::new(vec![Record::Block(bootstrap_block_for_payload(
+                &payload,
+            ))]),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            ScanMode::Recovery(&hints),
+        )
+        .expect_err("a missing trailing filemark cannot hide a readable UUID conflict");
+        assert!(error.to_string().contains("identity mismatch"));
+        let error = scan_reconstruct_filemark_map_with_report_mode(
+            &mut RecordingRawSource::new(vec![Record::Block(block(0))]),
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            ScanMode::Recovery(&hints),
+        )
+        .expect_err("recovery still requires a complete structural BOT file");
+        assert!(error.to_string().contains("sole tape-file-0 BOT Bootstrap"));
     }
 }

@@ -4,14 +4,15 @@ use std::collections::{BTreeMap, HashMap};
 
 use ciborium::value::Value as CborValue;
 use remanence_parity::{
-    scan_reconstruct_filemark_map, DriveHandleRawSource, FilemarkMap, TapeFileEntry, TapeFileKind,
+    scan_reconstruct_filemark_map_with_report_mode, DriveHandleRawSource, FilemarkMap,
+    TapeFileEntry, TapeFileKind,
 };
 use remanence_state::{AuditActor, AuditEvent, CatalogIndex};
 use tonic::Status;
 use uuid::Uuid;
 
 use super::actor_runtime::WriteOwnerConfig;
-use super::restore::verify_loaded_tape_identity;
+use super::terminal_inventory::prepare_catalog_recovery_read;
 use crate::audit_projection::{append_operation_audit, OperationAuditInput};
 use crate::{load_tape_by_uuid, pb};
 
@@ -88,66 +89,46 @@ pub(crate) fn handle_reconcile(
             return;
         }
     };
-    if let Err(status) = verify_loaded_tape_identity(&mut drive, &tape_uuid) {
-        fail_operation(
-            index,
-            cfg,
-            &handle,
-            &tape_uuid,
-            &format!("tape identity: {}", status.message()),
-            &[("phase", "mount")],
-        );
-        return;
-    }
+    reconcile_loaded_tape(index, cfg, &mut drive, tape_uuid, handle);
+}
+
+/// Reconcile an already mounted tape through the same catalog recovery gate as inventory.
+pub(crate) fn reconcile_loaded_tape(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut remanence_library::DriveHandle,
+    tape_uuid: [u8; 16],
+    handle: crate::operations::OperationHandle,
+) {
     if handle.is_cancelled() {
         cancel_operation(index, cfg, &handle, &tape_uuid, "cancelled after mount");
         return;
     }
-
-    let tape = match index.get_tape(&tape_uuid) {
-        Ok(Some(tape)) => tape,
-        Ok(None) => {
+    let prepared = match prepare_catalog_recovery_read(index, drive, &tape_uuid) {
+        Ok(prepared) => prepared,
+        Err(status) => {
             fail_operation(
                 index,
                 cfg,
                 &handle,
                 &tape_uuid,
-                "tape not found in catalog",
-                &[("phase", "scan")],
+                status.message(),
+                &[("phase", "mount")],
             );
             return;
         }
-        Err(err) => {
-            fail_operation(
-                index,
-                cfg,
-                &handle,
-                &tape_uuid,
-                &format!("catalog lookup: {err}"),
-                &[("phase", "scan")],
-            );
-            return;
-        }
-    };
-    let Some(block_size) = tape
-        .block_size
-        .and_then(|block_size| u32::try_from(block_size).ok())
-    else {
-        fail_operation(
-            index,
-            cfg,
-            &handle,
-            &tape_uuid,
-            "tape block size is unknown or outside u32 range",
-            &[("phase", "scan")],
-        );
-        return;
     };
 
+    let hints = &prepared.hints;
     publish_running(&handle, &[("phase", "scan")]);
     let scan = {
-        let mut source = DriveHandleRawSource::new(&mut drive);
-        scan_reconstruct_filemark_map(&mut source, &tape_uuid, block_size)
+        let mut source = DriveHandleRawSource::new(drive);
+        scan_reconstruct_filemark_map_with_report_mode(
+            &mut source,
+            &tape_uuid,
+            hints.block_size,
+            remanence_parity::ScanMode::Recovery(hints),
+        )
     };
     let scan = match scan {
         Ok(scan) => scan,
@@ -168,10 +149,22 @@ pub(crate) fn handle_reconcile(
         return;
     }
 
-    match reconcile_tape_files(index, &tape_uuid, &scan, &handle) {
+    match reconcile_tape_files(index, &tape_uuid, &scan.map, &handle) {
         Ok(report) => {
             let rebuilt = report.tape_files_rebuilt.to_string();
             let mut detail = BTreeMap::new();
+            if prepared.bootstrap_unreadable_reason.is_some()
+                || scan.bootstrap_recovery_hints.is_some()
+            {
+                detail.insert(
+                    "bootstrap_treated_as_unreadable".to_string(),
+                    CborValue::Bool(true),
+                );
+                detail.insert(
+                    "identity_and_geometry_source".to_string(),
+                    CborValue::Text("catalog_hints".to_string()),
+                );
+            }
             detail.insert("tape_files".to_string(), CborValue::Text(rebuilt.clone()));
             if let Err(err) = record_reconcile_event(
                 index,

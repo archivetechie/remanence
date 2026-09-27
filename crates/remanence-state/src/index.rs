@@ -2263,7 +2263,9 @@ impl CatalogIndex {
                 tape.state
             )));
         }
-        let geometry = catalog_reset_geometry(&tape)?;
+        let geometry = catalog_reset_geometry(&tape)?
+            .map(|(block_size, parity)| ProvisionTapeGeometry::from_parity(block_size, &parity))
+            .transpose()?;
         if tape.kind == "data" && geometry.is_none() {
             return Err(StateError::IndexCorrupt(format!(
                 "data tape {source_voltag} has no block geometry"
@@ -5979,7 +5981,12 @@ impl ProvisionTapeGeometry {
     }
 }
 
-fn catalog_reset_geometry(tape: &TapeRecord) -> Result<Option<ProvisionTapeGeometry>, StateError> {
+/// Validate catalog geometry for reset and recovery readers.
+/// A known block size with all four scheme columns absent means explicit no-parity;
+/// a row without any geometry supplies no recovery authority.
+pub fn catalog_reset_geometry(
+    tape: &TapeRecord,
+) -> Result<Option<(u32, ParityConfig)>, StateError> {
     let geometry_present = tape.block_size.is_some()
         || tape.scheme_id.is_some()
         || tape.data_blocks_per_stripe.is_some()
@@ -6074,7 +6081,7 @@ fn catalog_reset_geometry(tape: &TapeRecord) -> Result<Option<ProvisionTapeGeome
             ParityConfig::Scheme(scheme)
         }
     };
-    ProvisionTapeGeometry::from_parity(block_size, &parity).map(Some)
+    Ok(Some((block_size, parity)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

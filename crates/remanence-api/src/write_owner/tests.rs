@@ -1162,6 +1162,7 @@ fn bot_recovered_summary_reports_present_zero_counts_and_no_terminal_selection()
     let projected = bot_structural_recovery_to_proto(
         RANGE_TAPE_UUID,
         BotStructuralRecoverySummary {
+            bootstrap_recovery_hints: None,
             structural_entry_count: 3,
             complete_object_count: 1,
             recovered_object_count: 1,
@@ -1310,6 +1311,7 @@ fn recovery_required_verification_projects_measured_bot_evidence() {
             remanence_parity::TerminalIndexRecoveryRequired {
                 measured_eod: remanence_parity::PhysicalPositionHint::new(123),
                 bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+                    bootstrap_recovery_hints: None,
                     structural_entry_count: 7,
                     complete_object_count: 4,
                     recovered_object_count: 2,
@@ -7152,4 +7154,758 @@ fn bot_recovery_control_events_preserve_start_and_boundary_evidence() {
     );
     assert_eq!(status.code(), tonic::Code::Cancelled);
     assert!(status.message().contains("tape file Some(7)"));
+}
+
+/// Extend the write-owner model harness with a cataloged tape and caller-chosen BOT bytes.
+fn with_catalog_recovery_tape(
+    parity: ParityConfig,
+    bootstrap: Option<BootstrapPayload>,
+    test: impl FnOnce(&mut CatalogIndex, &WriteOwnerConfig, &mut DriveHandle),
+) {
+    with_catalog_recovery_tape_options(parity, bootstrap, |_| {}, false, false, test);
+}
+
+/// Customize only fresh in-memory tapes; published fixtures are never modified.
+fn with_catalog_recovery_tape_options(
+    parity: ParityConfig,
+    bootstrap: Option<BootstrapPayload>,
+    edit_tape: impl FnOnce(&mut VirtualTape),
+    medium_error: bool,
+    short_reads: bool,
+    test: impl FnOnce(&mut CatalogIndex, &WriteOwnerConfig, &mut DriveHandle),
+) {
+    const BLOCK_SIZE: u32 = 512 * 1024;
+    let temp = tempfile::tempdir().expect("recovery test directory");
+    let index_path = temp.path().join("catalog.sqlite");
+    let mut index = CatalogIndex::open(&index_path).expect("open recovery catalog");
+    index
+        .provision_tape(ProvisionTapeInput {
+            tape_uuid: RANGE_TAPE_UUID,
+            voltag: "RECOVERY001".to_string(),
+            block_size: BLOCK_SIZE,
+            parity,
+            force: false,
+        })
+        .expect("catalog recovery authority");
+    let mut bot = vec![0; BLOCK_SIZE as usize];
+    if let Some(bootstrap) = bootstrap {
+        write_bootstrap_block(&bootstrap, &mut bot).expect("encode bootstrap");
+    }
+    let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK_SIZE);
+    tape.records = vec![
+        Record::Block(bot),
+        Record::Filemark,
+        Record::ZeroBlock(BLOCK_SIZE),
+        Record::Filemark,
+    ];
+    tape.written_bytes = 2 * u64::from(BLOCK_SIZE);
+    // Start in another mode to prove the recovery path takes geometry from the catalog.
+    tape.block_size = 4096;
+    edit_tape(&mut tape);
+    let mut world = VirtualWorld::single_drive("LIB-RECOVERY", 0x0100, "DRV-RECOVERY", 0x0400, 1);
+    world.put_tape_in_drive(0x0100, "RECOVERY001", Some(0x0400), tape);
+    let world = Arc::new(Mutex::new(world));
+    let model = world.lock().expect("world").library_snapshot();
+    let policy = remanence_library::StaticAllowlist::new([model.serial.as_str()]);
+    let mut library = model
+        .open_with(&policy, move |path| {
+            let role = world
+                .lock()
+                .expect("world")
+                .role_for_path(path)
+                .expect("model path");
+            Ok(Box::new(RecoveryReadFaultTransport {
+                inner: ModelTransport::new(Arc::clone(&world), role),
+                medium_error,
+                short_reads,
+            }))
+        })
+        .expect("model library");
+    let snapshot = library_snapshot_cell(library.library().clone());
+    let audit_dir = temp.path().join("audit");
+    std::fs::create_dir_all(&audit_dir).expect("recovery audit directory");
+    let mut cfg = test_write_owner_config(index_path, audit_dir, &library, snapshot);
+    cfg.checkpoint_journal_dir = temp.path().join("checkpoints");
+    let mut drive = library
+        .open_drive(0x0100, &cfg.policy)
+        .expect("open recovery drive");
+    test(&mut index, &cfg, &mut drive);
+}
+
+/// Inventory reaches terminal discovery and BOT fallback with either catalog scheme.
+#[test]
+fn terminal_inventory_unreadable_bootstrap_uses_catalog_hints() {
+    for parity in [
+        ParityConfig::None,
+        ParityConfig::Scheme(default_scheme_for_block_size(512 * 1024)),
+    ] {
+        with_catalog_recovery_tape(parity, None, |index, cfg, drive| {
+            let (tx, mut rx) = mpsc::channel(64);
+            handle_drive_tape_inventory(
+                0x0100,
+                index,
+                cfg,
+                drive,
+                RANGE_TAPE_UUID,
+                false,
+                "LIB-RECOVERY",
+                Some("RECOVERY001"),
+                None,
+                Some("DRV-RECOVERY"),
+                &tx,
+            )
+            .expect("inventory proceeds with unreadable BOT");
+            let mut summary = None;
+            while let Ok(item) = rx.try_recv() {
+                if let Some(pb::tape_inventory_stream_item::Item::Summary(value)) =
+                    item.expect("inventory item").item
+                {
+                    summary = Some(value);
+                }
+            }
+            let summary = summary.expect("terminal discovery emits a recovery summary");
+            assert_eq!(summary.tape_uuid, RANGE_TAPE_UUID);
+            assert_eq!(summary.structural_entry_count, Some(2));
+            assert_eq!(summary.unknown_object_count, Some(1));
+            assert!(summary.detail.contains("bootstrap treated as unreadable"));
+            assert_eq!(
+                drive.read_config().expect("read mode").block_size,
+                remanence_library::BlockSize::Fixed {
+                    size_bytes: 512 * 1024
+                }
+            );
+        });
+    }
+}
+
+/// Full verification reports missing terminal authority after discovery, not a BOT refusal.
+#[test]
+fn verify_index_unreadable_bootstrap_uses_catalog_hints() {
+    for parity in [
+        ParityConfig::None,
+        ParityConfig::Scheme(default_scheme_for_block_size(512 * 1024)),
+    ] {
+        with_catalog_recovery_tape(parity, None, |index, cfg, drive| {
+            let report = handle_drive_verify_tape_index(
+                0x0100,
+                index,
+                cfg,
+                drive,
+                RANGE_TAPE_UUID,
+                false,
+                "LIB-RECOVERY",
+                Some("RECOVERY001"),
+                None,
+                Some("DRV-RECOVERY"),
+            )
+            .expect("verify-index proceeds with unreadable BOT");
+            assert_eq!(report.tape_uuid, RANGE_TAPE_UUID);
+            assert_eq!(
+                report.state,
+                pb::TapeIndexVerificationState::RecoveryRequired as i32
+            );
+            assert_eq!(report.measured_eod_lba, 4);
+            let recovery = report.recovery_inventory.expect("BOT recovery evidence");
+            assert_eq!(recovery.structural_entry_count, Some(2));
+            assert_eq!(recovery.unknown_object_count, Some(1));
+            assert!(recovery.detail.contains("bootstrap treated as unreadable"));
+        });
+    }
+}
+
+/// The mounted reconcile path scans and projects using the catalog despite unreadable BOT.
+#[test]
+fn reconcile_unreadable_bootstrap_uses_catalog_hints() {
+    for parity in [
+        ParityConfig::None,
+        ParityConfig::Scheme(default_scheme_for_block_size(512 * 1024)),
+    ] {
+        with_catalog_recovery_tape(parity, None, |index, cfg, drive| {
+            let registry = crate::operations::OperationRegistry::default();
+            let operation = registry.register(Uuid::new_v4(), "reconcile_tape");
+            super::reconcile::reconcile_loaded_tape(index, cfg, drive, RANGE_TAPE_UUID, operation);
+            let audit = FileAuditLog::replay(&cfg.audit_dir).expect("reconcile audit");
+            assert!(
+                audit
+                    .iter()
+                    .any(|record| record.event == AuditEvent::OperationFinished),
+                "{audit:?}"
+            );
+            assert!(!audit
+                .iter()
+                .any(|record| record.event == AuditEvent::OperationFailed));
+            let finish = audit
+                .iter()
+                .find(|record| record.event == AuditEvent::OperationFinished)
+                .expect("finish audit");
+            assert_eq!(
+                finish.detail.get("bootstrap_treated_as_unreadable"),
+                Some(&CborValue::Bool(true))
+            );
+            assert_eq!(
+                finish.detail.get("identity_and_geometry_source"),
+                Some(&CborValue::Text("catalog_hints".to_string()))
+            );
+            let entries = index
+                .list_tape_files(&RANGE_TAPE_UUID)
+                .expect("reconciled tape files");
+            assert_eq!(entries.len(), 2);
+            assert!(entries.iter().all(|entry| entry.block_count == 1));
+        });
+    }
+}
+
+/// Every recovery entry point must preserve readable identity and geometry conflicts.
+#[test]
+fn catalog_recovery_paths_refuse_readable_bootstrap_disagreement() {
+    let bootstrap = BootstrapPayload {
+        scheme: None,
+        no_parity_flag: true,
+        filemark_map_digest: None,
+        tape_uuid: RANGE_TAPE_UUID,
+        written_by_version: "recovery-test".to_string(),
+        written_at: "2026-09-27T00:00:00Z".to_string(),
+        sequence: 0,
+        block_size_bytes: 512 * 1024,
+        drive_compression: false,
+    };
+    for mismatch in ["identity", "block size", "parity scheme"] {
+        let mut bootstrap = bootstrap.clone();
+        let parity = match mismatch {
+            "identity" => {
+                bootstrap.tape_uuid = [0xCD; 16];
+                ParityConfig::None
+            }
+            "block size" => {
+                bootstrap.block_size_bytes = 256 * 1024;
+                ParityConfig::None
+            }
+            _ => ParityConfig::Scheme(default_scheme_for_block_size(512 * 1024)),
+        };
+        with_catalog_recovery_tape(parity, Some(bootstrap), |index, cfg, drive| {
+            let (tx, _rx) = mpsc::channel(64);
+            let error = handle_drive_tape_inventory(
+                0x0100,
+                index,
+                cfg,
+                drive,
+                RANGE_TAPE_UUID,
+                false,
+                "LIB-RECOVERY",
+                Some("RECOVERY001"),
+                None,
+                Some("DRV-RECOVERY"),
+                &tx,
+            )
+            .expect_err("inventory rejects disagreement");
+            assert!(error.message().contains(mismatch), "{error}");
+            let error = handle_drive_verify_tape_index(
+                0x0100,
+                index,
+                cfg,
+                drive,
+                RANGE_TAPE_UUID,
+                false,
+                "LIB-RECOVERY",
+                Some("RECOVERY001"),
+                None,
+                Some("DRV-RECOVERY"),
+            )
+            .expect_err("verify-index rejects disagreement");
+            assert!(error.message().contains(mismatch), "{error}");
+            let registry = crate::operations::OperationRegistry::default();
+            let operation = registry.register(Uuid::new_v4(), "reconcile_tape");
+            super::reconcile::reconcile_loaded_tape(index, cfg, drive, RANGE_TAPE_UUID, operation);
+            let audit = FileAuditLog::replay(&cfg.audit_dir).expect("reconcile audit");
+            assert!(audit
+                .iter()
+                .any(|record| record.event == AuditEvent::OperationFailed));
+            assert!(!audit
+                .iter()
+                .any(|record| record.event == AuditEvent::OperationFinished));
+            assert!(index
+                .list_tape_files(&RANGE_TAPE_UUID)
+                .expect("no projection")
+                .is_empty());
+        });
+    }
+}
+
+/// Inject exactly one physical READ failure to exercise the daemon gate itself.
+struct RecoveryReadFaultTransport {
+    inner: ModelTransport,
+    medium_error: bool,
+    short_reads: bool,
+}
+
+impl SgTransport for RecoveryReadFaultTransport {
+    fn execute_in(
+        &mut self,
+        cdb: &[u8],
+        buf: &mut [u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        if self.medium_error && cdb.first() == Some(&0x08) {
+            self.medium_error = false;
+            return Err(remanence_library::ScsiError::CheckCondition {
+                sense: readiness_fixed_sense(0x03, 0x11, 0),
+                bytes_transferred: 0,
+            });
+        }
+        let mut outcome = self.inner.execute_in(cdb, buf)?;
+        if self.short_reads && cdb.first() == Some(&0x08) {
+            assert!(
+                outcome.bytes_transferred > 1,
+                "short-read injection needs a block"
+            );
+            outcome.bytes_transferred -= 1;
+        }
+        Ok(outcome)
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+        self.inner.execute_none(cdb)
+    }
+    fn execute_out(
+        &mut self,
+        cdb: &[u8],
+        buf: &[u8],
+    ) -> Result<remanence_library::transport::TransferOutcome, remanence_library::ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: remanence_library::TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
+/// All daemon entry points refuse incomplete catalog authority before rebuilding anything.
+#[test]
+fn catalog_recovery_paths_refuse_missing_or_incomplete_geometry() {
+    for sql in [
+        "DELETE FROM tapes",
+        "UPDATE tapes SET block_size = NULL",
+        "UPDATE tapes SET scheme_id = 'rs-cauchy-gf256-v1'",
+        "UPDATE tapes SET data_blocks_per_stripe = 128",
+        "UPDATE tapes SET scheme_id = 'rs-cauchy-gf256-v1', data_blocks_per_stripe = 128, parity_blocks_per_stripe = 4",
+    ] {
+        with_catalog_recovery_tape(ParityConfig::None, None, |index, cfg, drive| {
+            rusqlite::Connection::open(&cfg.index_path).expect("catalog")
+                .execute(sql, []).expect("remove catalog authority");
+            assert_catalog_recovery_refusal(index, cfg, drive, "catalog");
+        });
+    }
+}
+
+/// Assert refusal through inventory, verify-index and reconcile, including the audit.
+fn assert_catalog_recovery_refusal(
+    index: &mut CatalogIndex,
+    cfg: &WriteOwnerConfig,
+    drive: &mut DriveHandle,
+    reason: &str,
+) {
+    let (tx, _rx) = mpsc::channel(64);
+    let error = handle_drive_tape_inventory(
+        0x0100,
+        index,
+        cfg,
+        drive,
+        RANGE_TAPE_UUID,
+        false,
+        "LIB-RECOVERY",
+        Some("RECOVERY001"),
+        None,
+        Some("DRV-RECOVERY"),
+        &tx,
+    )
+    .expect_err("inventory refusal");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains(reason), "{error}");
+    let error = handle_drive_verify_tape_index(
+        0x0100,
+        index,
+        cfg,
+        drive,
+        RANGE_TAPE_UUID,
+        false,
+        "LIB-RECOVERY",
+        Some("RECOVERY001"),
+        None,
+        Some("DRV-RECOVERY"),
+    )
+    .expect_err("verify refusal");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(error.message().contains(reason), "{error}");
+    let registry = crate::operations::OperationRegistry::default();
+    let operation_id = Uuid::new_v4();
+    super::reconcile::reconcile_loaded_tape(
+        index,
+        cfg,
+        drive,
+        RANGE_TAPE_UUID,
+        registry.register(operation_id, "reconcile_tape"),
+    );
+    let audit = FileAuditLog::replay(&cfg.audit_dir).expect("audit");
+    let failed = audit
+        .iter()
+        .find(|record| record.event == AuditEvent::OperationFailed)
+        .expect("failure audit");
+    assert!(
+        format!("{:?}", failed.detail).contains(reason),
+        "{failed:?}"
+    );
+    tokio::runtime::Runtime::new()
+        .expect("operation runtime")
+        .block_on(async {
+            use tokio_stream::StreamExt;
+            let status = registry
+                .watch(&operation_id)
+                .expect("operation watch")
+                .next()
+                .await
+                .expect("failure status")
+                .expect("status");
+            assert_eq!(status.state, pb::OperationState::Failed as i32);
+            assert_eq!(
+                status.progress.get("phase").map(String::as_str),
+                Some("mount")
+            );
+        });
+    assert!(!audit
+        .iter()
+        .any(|record| record.event == AuditEvent::OperationFinished));
+}
+
+/// Recovery never overrides compression refusal, including when catalog geometry agrees.
+#[test]
+fn catalog_recovery_paths_refuse_compressed_bootstrap() {
+    let scheme = default_scheme_for_block_size(512 * 1024);
+    let bootstrap = BootstrapPayload {
+        scheme: Some(ParitySchemeRecord {
+            id: scheme.id.as_str().to_string(),
+            data_blocks_per_stripe: scheme.data_blocks_per_stripe,
+            parity_blocks_per_stripe: scheme.parity_blocks_per_stripe,
+            stripes_per_neighborhood: scheme.stripes_per_neighborhood,
+            no_parity_flag: false,
+        }),
+        no_parity_flag: false,
+        filemark_map_digest: Some(
+            FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+                .expect("map")
+                .digest(false)
+                .expect("digest"),
+        ),
+        tape_uuid: RANGE_TAPE_UUID,
+        written_by_version: "recovery-test".to_string(),
+        written_at: "2026-09-27T00:00:00Z".to_string(),
+        sequence: 0,
+        block_size_bytes: 512 * 1024,
+        drive_compression: false,
+    };
+    with_catalog_recovery_tape_options(
+        ParityConfig::Scheme(scheme),
+        Some(bootstrap),
+        |tape| {
+            let Record::Block(block) = &mut tape.records[0] else {
+                panic!("BOT block")
+            };
+            let end = 56 + u32::from_le_bytes(block[44..48].try_into().unwrap()) as usize;
+            assert_eq!(&block[end - 2..end], &[5, 0xf4]);
+            block[end - 1] = 0xf5;
+            let crc = crc64_xz(&block[56..end]);
+            block[end..end + 8].copy_from_slice(&crc.to_le_bytes());
+        },
+        false,
+        false,
+        |index, cfg, drive| {
+            assert_catalog_recovery_refusal(
+                index,
+                cfg,
+                drive,
+                &ParityError::DriveCompressionEnabled.to_string(),
+            );
+        },
+    );
+}
+
+/// An intact terminal tail must retain malformed or physically unreadable BOT provenance.
+#[test]
+fn catalog_recovery_terminal_tail_retains_bootstrap_provenance() {
+    for medium_error in [false, true] {
+        with_catalog_recovery_tape_options(
+            ParityConfig::None,
+            None,
+            append_recovery_terminal_tail,
+            medium_error,
+            false,
+            |index, cfg, drive| {
+                let (tx, mut rx) = mpsc::channel(64);
+                handle_drive_tape_inventory(
+                    0x0100,
+                    index,
+                    cfg,
+                    drive,
+                    RANGE_TAPE_UUID,
+                    false,
+                    "LIB-RECOVERY",
+                    Some("RECOVERY001"),
+                    None,
+                    Some("DRV-RECOVERY"),
+                    &tx,
+                )
+                .expect("terminal inventory survives BOT damage");
+                let mut summary = None;
+                while let Ok(item) = rx.try_recv() {
+                    if let Some(pb::tape_inventory_stream_item::Item::Summary(value)) =
+                        item.expect("inventory item").item
+                    {
+                        summary = Some(value);
+                    }
+                }
+                let summary = summary.expect("summary");
+                assert_eq!(summary.inventory_basis, "terminal_index_fast");
+                assert!(
+                    summary.detail.contains("bootstrap treated as unreadable"),
+                    "{}",
+                    summary.detail
+                );
+                assert!(summary.detail.contains("catalog hints"));
+                if medium_error {
+                    assert!(summary.detail.contains("read BOT:"), "{}", summary.detail);
+                } else {
+                    assert!(
+                        summary.detail.contains("magic mismatch"),
+                        "{}",
+                        summary.detail
+                    );
+                }
+                let verification = handle_drive_verify_tape_index(
+                    0x0100,
+                    index,
+                    cfg,
+                    drive,
+                    RANGE_TAPE_UUID,
+                    false,
+                    "LIB-RECOVERY",
+                    Some("RECOVERY001"),
+                    None,
+                    Some("DRV-RECOVERY"),
+                )
+                .expect("verification reports damaged BOT with surviving replicas");
+                assert!(
+                    verification
+                        .detail
+                        .contains("bootstrap treated as unreadable"),
+                    "{}",
+                    verification.detail
+                );
+                assert!(verification.detail.contains("catalog hints"));
+                assert_eq!(
+                    verification.state,
+                    pb::TapeIndexVerificationState::RecoveryRequired as i32
+                );
+            },
+        );
+    }
+}
+
+/// Generate a terminal edition over a bootstrap-only prefix in fresh model memory.
+fn append_recovery_terminal_tail(tape: &mut VirtualTape) {
+    const BLOCK_SIZE: u32 = 512 * 1024;
+    struct BootstrapRows;
+    impl TapeIndexReplicaRecordSource for BootstrapRows {
+        fn visit_structural_entries(
+            &mut self,
+            visitor: &mut dyn FnMut(&TapeIndexReplicaMapEntry) -> Result<(), ParityError>,
+        ) -> Result<(), ParityError> {
+            visitor(&TapeIndexReplicaMapEntry {
+                tape_file_number: 0,
+                kind: TapeIndexReplicaFileKind::Bootstrap,
+                block_count: 1,
+                first_parity_data_ordinal: None,
+                protected_ordinal_start: None,
+                protected_ordinal_end_exclusive: None,
+                epoch_id: None,
+            })
+        }
+        fn visit_object_rows(
+            &mut self,
+            _visitor: &mut dyn FnMut(&TapeIndexReplicaObjectRow) -> Result<(), ParityError>,
+        ) -> Result<(), ParityError> {
+            Ok(())
+        }
+    }
+    tape.records.truncate(2);
+    let counts = TapeIndexReplicaCounts {
+        structural_entry_count: 1,
+        object_row_count: 0,
+    };
+    let replica_records = checked_tape_index_replica_layout(BLOCK_SIZE, counts)
+        .expect("replica layout")
+        .replica_record_count;
+    let layout =
+        TerminalTailLayout::new(0, BLOCK_SIZE, 1, 2, replica_records, 3).expect("tail layout");
+    let edition = plan_tape_index_edition(
+        TapeIndexEditionDescriptor {
+            tape_uuid: RANGE_TAPE_UUID,
+            edition_id: [0x62; 16],
+            edition_sequence: 1,
+            scope: TapeIndexReplicaScope {
+                covered_prefix_tape_file_count: 1,
+                total_data_ordinals: 0,
+                highest_protected_ordinal: 0,
+            },
+            counts,
+            block_size: BLOCK_SIZE,
+            compression_enabled: false,
+            writer_version: "recovery-test".to_string(),
+            write_timestamp: "2026-09-27T00:00:00Z".to_string(),
+            terminal_layout: layout,
+        },
+        &mut BootstrapRows,
+    )
+    .expect("edition");
+    for ordinal in 1..=3 {
+        let plan = plan_tape_index_replica(edition.clone(), ordinal).expect("replica plan");
+        write_tape_index_replica(
+            &plan,
+            TapeIndexReplicaObservation {
+                tape_file_number: plan.component.planned_tape_file_number,
+                start_lba: plan.component.planned_start_lba,
+                record_count: plan.component.record_count,
+            },
+            &mut BootstrapRows,
+            |block| {
+                tape.records.push(Record::Block(block.to_vec()));
+                Ok(())
+            },
+        )
+        .expect("replica");
+        tape.records.push(Record::Filemark);
+        if ordinal != 3 {
+            let plan = plan_index_separation(IndexSeparationDescriptor {
+                tape_uuid: RANGE_TAPE_UUID,
+                edition_id: edition.descriptor.edition_id,
+                gap_ordinal: ordinal,
+                block_size: BLOCK_SIZE,
+                nominal_extent_bytes: 3 * u64::from(BLOCK_SIZE),
+                total_records: 3,
+                compression_enabled: false,
+                terminal_layout: layout,
+            })
+            .expect("separation plan");
+            write_index_separation(
+                &plan,
+                IndexSeparationObservation {
+                    tape_file_number: plan.component.planned_tape_file_number,
+                    start_lba: plan.component.planned_start_lba,
+                    record_count: plan.component.record_count,
+                },
+                |block| {
+                    tape.records.push(Record::Block(block.to_vec()));
+                    Ok(())
+                },
+            )
+            .expect("separation");
+            tape.records.push(Record::Filemark);
+        }
+    }
+    tape.written_bytes = tape
+        .records
+        .iter()
+        .filter(|record| !matches!(record, Record::Filemark))
+        .count() as u64
+        * u64::from(BLOCK_SIZE);
+}
+
+/// Catalog recovery must reject checksummed foreign headers despite payload or schema damage.
+#[test]
+fn catalog_recovery_paths_refuse_checksummed_header_conflicts() {
+    for field in ["identity", "block size"] {
+        for failure in ["payload", "schema"] {
+            let bootstrap = BootstrapPayload {
+                scheme: None,
+                no_parity_flag: true,
+                filemark_map_digest: None,
+                tape_uuid: RANGE_TAPE_UUID,
+                written_by_version: "recovery-test".to_string(),
+                written_at: "2026-09-27T00:00:00Z".to_string(),
+                sequence: 0,
+                block_size_bytes: 512 * 1024,
+                drive_compression: false,
+            };
+            with_catalog_recovery_tape_options(
+                ParityConfig::None,
+                Some(bootstrap),
+                |tape| {
+                    let Record::Block(block) = &mut tape.records[0] else {
+                        panic!("BOT")
+                    };
+                    if field == "identity" {
+                        block[16] ^= 1;
+                    } else {
+                        block[32..36].copy_from_slice(&(256 * 1024u32).to_be_bytes());
+                    }
+                    if failure == "payload" {
+                        block[80] ^= 1;
+                    } else {
+                        block[8..10].copy_from_slice(&99u16.to_be_bytes());
+                    }
+                    let crc = crc64_xz(&block[..48]);
+                    block[48..56].copy_from_slice(&crc.to_le_bytes());
+                },
+                false,
+                false,
+                |index, cfg, drive| {
+                    let reason = if failure == "schema" {
+                        "got 99, accept 2"
+                    } else {
+                        field
+                    };
+                    assert_catalog_recovery_refusal(index, cfg, drive, reason);
+                },
+            );
+        }
+    }
+}
+
+/// Every daemon recovery entry point binds checked format fields before payload parsing.
+#[test]
+fn catalog_recovery_paths_refuse_checked_format_fields_and_short_bot() {
+    for (offset, bytes, reason) in [
+        (8, 1u16.to_be_bytes().to_vec(), "got 1, accept 2"),
+        (8, 3u16.to_be_bytes().to_vec(), "got 3, accept 2"),
+        (36, 7u64.to_be_bytes().to_vec(), "got sequence 7"),
+        (12, 0u32.to_be_bytes().to_vec(), "no-parity flag"),
+        (0, Vec::new(), "short fixed-block bootstrap read"),
+    ] {
+        for damaged_payload in [false, true] {
+            let bootstrap = BootstrapPayload {
+                scheme: None,
+                no_parity_flag: true,
+                filemark_map_digest: None,
+                tape_uuid: RANGE_TAPE_UUID,
+                written_by_version: "recovery-test".to_string(),
+                written_at: "2026-09-27T00:00:00Z".to_string(),
+                sequence: 0,
+                block_size_bytes: 512 * 1024,
+                drive_compression: false,
+            };
+            with_catalog_recovery_tape_options(
+                ParityConfig::None,
+                Some(bootstrap),
+                |tape| {
+                    let Record::Block(block) = &mut tape.records[0] else {
+                        panic!("BOT")
+                    };
+                    block[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                    if damaged_payload {
+                        block[80] ^= 1;
+                    }
+                    let crc = crc64_xz(&block[..48]);
+                    block[48..56].copy_from_slice(&crc.to_le_bytes());
+                },
+                false,
+                bytes.is_empty(),
+                |index, cfg, drive| assert_catalog_recovery_refusal(index, cfg, drive, reason),
+            );
+        }
+    }
 }

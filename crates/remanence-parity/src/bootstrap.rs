@@ -428,7 +428,7 @@ pub fn discover_bootstrap_with_block_size(
     block_size: u32,
 ) -> Result<BootstrapPayload, ParityError> {
     source.configure_fixed_block_size(block_size)?;
-    match try_read_bootstrap_at(source, 0, block_size) {
+    match try_read_bootstrap_at(source, 0, block_size, None) {
         Ok(payload) => Ok(payload),
         Err(err) if bootstrap_probe_can_continue(&err) => {
             if matches!(err, ParityError::BootstrapParse(_)) {
@@ -450,9 +450,19 @@ pub fn discover_bootstrap_with_candidate_block_sizes(
     _tape_total_blocks_hint: Option<u64>,
     candidate_block_sizes: &[u32],
 ) -> Result<BootstrapPayload, ParityError> {
+    discover_bootstrap_with_recovery_hints(source, candidate_block_sizes, None)
+}
+
+/// Probe BOT while preserving checksummed header identity against recovery hints.
+/// Parse damage can permit another probe; validated identity conflicts cannot.
+pub fn discover_bootstrap_with_recovery_hints(
+    source: &mut dyn RawTapeSource,
+    candidate_block_sizes: &[u32],
+    hints: Option<&crate::ScanRecoveryHints>,
+) -> Result<BootstrapPayload, ParityError> {
     for block_size in candidate_block_sizes {
         source.configure_fixed_block_size(*block_size)?;
-        match try_read_bootstrap_at(source, 0, *block_size) {
+        match try_read_bootstrap_at(source, 0, *block_size, hints) {
             Ok(payload) => return Ok(payload),
             Err(err) if bootstrap_probe_can_continue(&err) => continue,
             Err(err) => return Err(err),
@@ -477,6 +487,7 @@ fn try_read_bootstrap_at(
     source: &mut dyn RawTapeSource,
     target_lba: u64,
     block_size: u32,
+    hints: Option<&crate::ScanRecoveryHints>,
 ) -> Result<BootstrapPayload, ParityError> {
     if block_size == 0 {
         return Err(ParityError::Invariant("bootstrap block size is zero"));
@@ -494,6 +505,14 @@ fn try_read_bootstrap_at(
                 )));
             }
             Ok(RawReadOutcome::Block { .. }) => {
+                if let Some(hints) = hints {
+                    return match hints.classify_bootstrap(&buf)? {
+                        crate::scan::RecoveryBootstrap::Validated(payload) => Ok(payload),
+                        crate::scan::RecoveryBootstrap::Unreadable(_) => {
+                            Err(ParityError::NoBootstrapAtPosition(target_lba))
+                        }
+                    };
+                }
                 if has_bootstrap_magic(&buf) {
                     // Magic hit — try to parse. If the parse
                     // succeeds, return immediately. If it fails

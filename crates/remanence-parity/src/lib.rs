@@ -70,8 +70,10 @@ pub use bootstrap::{
 };
 pub use bot_recovery::{
     recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_controlled,
+    recover_terminal_inventory_from_bot_controlled_mode,
     recover_terminal_inventory_from_bot_with_authority,
-    recover_terminal_inventory_from_bot_with_authority_controlled, BotObjectRecoveryAuthority,
+    recover_terminal_inventory_from_bot_with_authority_controlled,
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode, BotObjectRecoveryAuthority,
     BotObjectRecoveryAuthorityRow, BotObjectRecoveryAuthorityScope, BotRecoveredObject,
     BotRecoveredObjectState, BotStructuralRecoveryError, BotStructuralRecoveryEvent,
     BotStructuralRecoverySummary,
@@ -142,12 +144,13 @@ pub use resume::{
 };
 pub use scan::{
     acquire_filemark_map, acquire_filemark_map_with_report, scan_reconstruct_filemark_map,
-    scan_reconstruct_filemark_map_with_control, scan_reconstruct_filemark_map_with_report,
+    scan_reconstruct_filemark_map_with_control, scan_reconstruct_filemark_map_with_control_mode,
+    scan_reconstruct_filemark_map_with_report, scan_reconstruct_filemark_map_with_report_mode,
     validate_scan_reconstruction_with_report, CatalogFilemarkMapInput, ControlledScanWalkOutcome,
-    FilemarkMapScanResult, ParityMapContentConflict, ParityMapSelectionKey, ScanBootstrapCandidate,
-    ScanDamageKind, ScanDamagedRegion, ScanOverlaySource, ScanTailTruncation,
-    ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl, ScanWalkProgress, ScanWalkResult,
-    UnattestedTapeFile,
+    FilemarkMapScanResult, ParityMapContentConflict, ParityMapSelectionKey, RecoveryBootstrap,
+    ScanBootstrapCandidate, ScanDamageKind, ScanDamagedRegion, ScanMode, ScanOverlaySource,
+    ScanRecoveryHints, ScanTailTruncation, ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl,
+    ScanWalkProgress, ScanWalkResult, UnattestedTapeFile,
 };
 pub use sidecar::{
     checked_sidecar_index_capacity_layout, classify_sidecar_header_block, crc64_xz,
@@ -188,12 +191,12 @@ pub use tape_index_replica::{
 pub use terminal_inventory::{
     read_terminal_index_inventory, read_terminal_index_inventory_streamed,
     read_terminal_index_inventory_summary, verify_terminal_index_full,
-    verify_terminal_index_full_with_authority, BotStructuralRecoveryReason,
-    BotStructuralRecoveryRequired, TerminalIndexRecoveryRequired, TerminalIndexVerification,
-    TerminalIndexVerificationError, TerminalIndexVerificationOutcome, TerminalInventoryOutcome,
-    TerminalInventoryReadError, TerminalInventorySelection, TerminalInventoryStreamEvent,
-    TerminalReplicaEvidence, TerminalReplicaFailure, TerminalReplicaFailureKind,
-    TerminalSeparationEvidence,
+    verify_terminal_index_full_with_authority, verify_terminal_index_full_with_scan_mode,
+    BotStructuralRecoveryReason, BotStructuralRecoveryRequired, TerminalIndexRecoveryRequired,
+    TerminalIndexVerification, TerminalIndexVerificationError, TerminalIndexVerificationOutcome,
+    TerminalInventoryOutcome, TerminalInventoryReadError, TerminalInventorySelection,
+    TerminalInventoryStreamEvent, TerminalReplicaEvidence, TerminalReplicaFailure,
+    TerminalReplicaFailureKind, TerminalSeparationEvidence,
 };
 pub use terminal_tail::{
     validate_terminal_index_block_size, TerminalTailComponentKind, TerminalTailComponentPlan,

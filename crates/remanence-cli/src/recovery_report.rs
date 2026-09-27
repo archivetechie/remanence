@@ -12,22 +12,54 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use remanence_aead::{KeyFrame, RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 use remanence_parity::{
-    discover_bootstrap_with_candidate_block_sizes, read_terminal_index_inventory,
-    scan_reconstruct_filemark_map_with_report, FilemarkMap, ImageDirectoryRawSource,
-    ObjectRecoveryRepresentation, RawReadOutcome, RawTapeSource, ScanDamageKind, ScanDamagedRegion,
-    ScanTailTruncation, ScanTailTruncationKind, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
-    TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
-    TerminalInventoryOutcome,
+    bootstrap::discover_bootstrap_with_recovery_hints, read_terminal_index_inventory,
+    scan_reconstruct_filemark_map_with_report_mode, FilemarkMap, ImageDirectoryRawSource,
+    ObjectRecoveryRepresentation, ParityError, RawReadOutcome, RawTapeSource, ScanDamageKind,
+    ScanDamagedRegion, ScanMode, ScanRecoveryHints, ScanTailTruncation, ScanTailTruncationKind,
+    TapeFileKind, TapeFileMapEntry, TapeFilePosition, TapeIndexReplicaFileKind,
+    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TerminalInventoryOutcome,
 };
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+/// Out-of-band authority, kept separate from bootstrap evidence in the report.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct RecoveryHints {
+    pub tape_uuid: String,
+    pub block_size_bytes: u32,
+    pub scheme: String,
+}
+
+/// Validate a supplied UUID while preserving its spelling for the report.
+pub(crate) fn parse_tape_uuid(value: &str) -> Result<String, String> {
+    uuid::Uuid::parse_str(value).map_err(|error| error.to_string())?;
+    Ok(value.to_string())
+}
+
+/// Accept only explicit parity geometry or an explicit absence of parity.
+pub(crate) fn parse_scheme(value: &str) -> Result<String, String> {
+    let argument = if value == "none" {
+        value.to_string()
+    } else {
+        format!("custom:{value}")
+    };
+    remanence_parity::parse_parity_arg(&argument).map_err(|error| error.to_string())?;
+    Ok(value.to_string())
+}
+
+/// Apply the existing tape block-size limits to recovery hints.
+pub(crate) fn parse_block_size(value: &str) -> Result<u32, String> {
+    u32::try_from(crate::parse_tape_block_size(value)?)
+        .map_err(|_| "block size does not fit u32".to_string())
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct CatalogLessRecoveryReport {
     report_version: u32,
-    tape_uuid: String,
-    block_size_bytes: u32,
+    tape_uuid: Option<String>,
+    block_size_bytes: Option<u32>,
+    supplied: Option<RecoveryHints>,
     scan: RecoveryScanSummary,
     objects: Vec<RecoveryObjectReport>,
     totals: RecoveryTotals,
@@ -42,8 +74,10 @@ impl CatalogLessRecoveryReport {
 
 #[derive(Clone, Debug, Serialize)]
 struct RecoveryScanSummary {
-    #[serde(serialize_with = "serialize_decimal_u64")]
-    bootstrap_generation_used: u64,
+    #[serde(serialize_with = "serialize_optional_decimal_u64")]
+    bootstrap_generation_used: Option<u64>,
+    bootstrap_treated_as_unreadable: bool,
+    identity_and_geometry_from_hints: bool,
     #[serde(serialize_with = "serialize_optional_decimal_u64")]
     bootstrap_tape_file_number: Option<u64>,
     overlay_source: &'static str,
@@ -157,7 +191,7 @@ struct RecoveredMap {
     map: FilemarkMap,
     object_rows: Vec<TapeIndexReplicaObjectRow>,
     scope_tape_file_count: u64,
-    bootstrap_generation_used: u64,
+    bootstrap_generation_used: Option<u64>,
     overlay_source: &'static str,
     terminal_authority: bool,
     damaged_regions: Vec<ScanDamagedRegion>,
@@ -167,6 +201,7 @@ struct RecoveredMap {
 /// Run a report against a published-layout image directory.
 pub(crate) fn run_image_recovery_report(
     image_directory: &Path,
+    hints: Option<RecoveryHints>,
     json_output: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -179,18 +214,26 @@ pub(crate) fn run_image_recovery_report(
         }
     };
     let candidate_block_sizes = source.candidate_block_sizes().to_vec();
-    run_raw_recovery_report(&mut source, &candidate_block_sizes, json_output, out, err)
+    run_raw_recovery_report(
+        &mut source,
+        &candidate_block_sizes,
+        hints,
+        json_output,
+        out,
+        err,
+    )
 }
 
 /// Run a report against any production Layer 3c raw source.
 pub(crate) fn run_raw_recovery_report(
     source: &mut dyn RawTapeSource,
     candidate_block_sizes: &[u32],
+    hints: Option<RecoveryHints>,
     json_output: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let report = match build_recovery_report(source, candidate_block_sizes) {
+    let report = match build_recovery_report(source, candidate_block_sizes, hints) {
         Ok(report) => report,
         Err(error) => {
             let _ = writeln!(err, "error: catalog-less recovery report: {error}");
@@ -220,25 +263,79 @@ pub(crate) fn run_raw_recovery_report(
 fn build_recovery_report(
     source: &mut dyn RawTapeSource,
     candidate_block_sizes: &[u32],
+    hints: Option<RecoveryHints>,
 ) -> Result<CatalogLessRecoveryReport, String> {
-    if candidate_block_sizes.is_empty() {
+    let mut candidates = candidate_block_sizes.to_vec();
+    let supplied_uuid = hints
+        .as_ref()
+        .map(|hints| {
+            parse_scheme(&hints.scheme)?;
+            parse_block_size(&hints.block_size_bytes.to_string())?;
+            candidates.push(hints.block_size_bytes);
+            uuid::Uuid::parse_str(&hints.tape_uuid)
+                .map(|uuid| *uuid.as_bytes())
+                .map_err(|error| format!("supplied tape UUID: {error}"))
+        })
+        .transpose()?;
+    if candidates.is_empty() {
         return Err("no candidate fixed-block sizes were supplied".to_string());
     }
-    let first_bootstrap =
-        discover_bootstrap_with_candidate_block_sizes(source, None, candidate_block_sizes)
-            .map_err(|error| format!("discover bootstrap: {error}"))?;
-    let scan = scan_reconstruct_filemark_map_with_report(
+    let scan_hints = hints
+        .as_ref()
+        .map(|hints| {
+            let scheme_arg = if hints.scheme == "none" {
+                "none".to_string()
+            } else {
+                format!("custom:{}", hints.scheme)
+            };
+            Ok::<_, String>(ScanRecoveryHints {
+                tape_uuid: supplied_uuid.expect("validated supplied UUID"),
+                block_size: hints.block_size_bytes,
+                scheme: remanence_parity::parse_parity_arg(&scheme_arg)
+                    .map_err(|error| error.to_string())?,
+            })
+        })
+        .transpose()?;
+    let first_bootstrap = match discover_bootstrap_with_recovery_hints(
         source,
-        &first_bootstrap.tape_uuid,
-        first_bootstrap.block_size_bytes,
-    )
-    .map_err(|error| format!("scan filemark map: {error}"))?;
+        &candidates,
+        scan_hints.as_ref(),
+    ) {
+        Ok(bootstrap) => Some(bootstrap),
+        Err(ParityError::NoBootstrapFound | ParityError::BootstrapParse(_)) if hints.is_some() => {
+            None
+        }
+        Err(error @ (ParityError::NoBootstrapFound | ParityError::BootstrapParse(_))) => {
+            return Err(format!("discover bootstrap: {error}; unreadable bootstrap requires --tape-uuid, --block-size and --scheme"));
+        }
+        Err(error) => return Err(format!("discover bootstrap: {error}")),
+    };
+    let (tape_uuid, block_size) = match (&first_bootstrap, &hints) {
+        (Some(bootstrap), _) => (bootstrap.tape_uuid, bootstrap.block_size_bytes),
+        (None, Some(hints)) => (
+            supplied_uuid.expect("validated supplied UUID"),
+            hints.block_size_bytes,
+        ),
+        (None, None) => unreachable!("bootstrap discovery requires hints to fall back"),
+    };
+    let mode = scan_hints
+        .as_ref()
+        .map_or(ScanMode::Standard, ScanMode::Recovery);
+    let scan = scan_reconstruct_filemark_map_with_report_mode(source, &tape_uuid, block_size, mode)
+        .map_err(|error| format!("scan filemark map: {error}"))?;
+    let bootstrap_treated_as_unreadable = scan.bootstrap_recovery_hints.is_some();
+    // A retry in the structural walk can recover a bootstrap that discovery
+    // could not read. Preserve that validated evidence in the report as well.
+    let first_bootstrap = first_bootstrap.or_else(|| {
+        scan.authoritative_bootstrap()
+            .map(|candidate| candidate.payload.clone())
+    });
     let mut terminal_entries = Vec::new();
     let mut terminal_rows = Vec::new();
     let inventory = read_terminal_index_inventory(
         source,
-        &first_bootstrap.tape_uuid,
-        first_bootstrap.block_size_bytes,
+        &tape_uuid,
+        block_size,
         |entry| {
             terminal_entries.push(entry.clone());
             Ok(())
@@ -262,7 +359,9 @@ fn build_recovery_report(
                 scope_tape_file_count: map.tape_file_count(),
                 map,
                 object_rows: terminal_rows,
-                bootstrap_generation_used: first_bootstrap.sequence,
+                bootstrap_generation_used: first_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.sequence),
                 overlay_source: selected_terminal_replica_name(selection.selected_replica_ordinal),
                 terminal_authority: true,
                 damaged_regions: scan.damaged_regions,
@@ -273,7 +372,7 @@ fn build_recovery_report(
             scope_tape_file_count: scan.map.tape_file_count(),
             map: scan.map,
             object_rows: Vec::new(),
-            bootstrap_generation_used: first_bootstrap.sequence,
+            bootstrap_generation_used: first_bootstrap.as_ref().map(|bootstrap| bootstrap.sequence),
             overlay_source: "structural_walk_no_terminal_authority",
             terminal_authority: false,
             damaged_regions: scan.damaged_regions,
@@ -303,7 +402,7 @@ fn build_recovery_report(
             source,
             &recovered.map,
             recovered.scope_tape_file_count,
-            first_bootstrap.block_size_bytes,
+            block_size,
             row,
         );
         match object.map_status {
@@ -344,11 +443,18 @@ fn build_recovery_report(
 
     Ok(CatalogLessRecoveryReport {
         report_version: 1,
-        tape_uuid: hex(&first_bootstrap.tape_uuid),
-        block_size_bytes: first_bootstrap.block_size_bytes,
+        tape_uuid: first_bootstrap
+            .as_ref()
+            .map(|bootstrap| hex(&bootstrap.tape_uuid)),
+        block_size_bytes: first_bootstrap
+            .as_ref()
+            .map(|bootstrap| bootstrap.block_size_bytes),
+        supplied: hints,
         scan: RecoveryScanSummary {
+            bootstrap_treated_as_unreadable,
+            identity_and_geometry_from_hints: first_bootstrap.is_none(),
             bootstrap_generation_used: recovered.bootstrap_generation_used,
-            bootstrap_tape_file_number: Some(0),
+            bootstrap_tape_file_number: first_bootstrap.as_ref().map(|_| 0),
             overlay_source: recovered.overlay_source,
             recovered_scope_tape_file_count: recovered.scope_tape_file_count,
             damaged_regions: recovered
@@ -1001,12 +1107,43 @@ fn print_human_report(
     out: &mut dyn Write,
 ) -> std::io::Result<()> {
     writeln!(out, "catalog-less recovery report")?;
-    writeln!(out, "tape uuid: {}", report.tape_uuid)?;
-    writeln!(out, "block size: {} bytes", report.block_size_bytes)?;
+    writeln!(
+        out,
+        "tape uuid: {}",
+        report.tape_uuid.as_deref().unwrap_or("unknown")
+    )?;
+    writeln!(
+        out,
+        "block size: {}",
+        report
+            .block_size_bytes
+            .map_or_else(|| "unknown".to_string(), |size| format!("{size} bytes"))
+    )?;
+    if let Some(hints) = &report.supplied {
+        writeln!(
+            out,
+            "supplied: tape uuid {} block size {} bytes scheme {}",
+            hints.tape_uuid, hints.block_size_bytes, hints.scheme
+        )?;
+    }
+    if report.scan.bootstrap_treated_as_unreadable {
+        writeln!(
+            out,
+            "bootstrap treated as unreadable during scan; identity and geometry supplied by {}",
+            if report.scan.identity_and_geometry_from_hints {
+                "hints"
+            } else {
+                "validated bootstrap"
+            }
+        )?;
+    }
     writeln!(
         out,
         "scan: bootstrap generation {} tape-file {} overlay {} damaged-regions {} scope-files {}",
-        report.scan.bootstrap_generation_used,
+        report.scan.bootstrap_generation_used.map_or_else(
+            || "unknown".to_string(),
+            |generation| generation.to_string()
+        ),
         report
             .scan
             .bootstrap_tape_file_number
@@ -1129,6 +1266,423 @@ mod tests {
             }
             other => panic!("unexpected parsed command: {other:?}"),
         }
+    }
+
+    /// Exercise the public CLI over freshly generated images, including provenance.
+    #[test]
+    fn recovery_report_unreadable_bootstrap_requires_all_hints() {
+        for parity in [false, true] {
+            for absent in [false, true] {
+                let mut files = plaintext_image(parity);
+                if absent {
+                    files[0].fill(0);
+                } else {
+                    // Keep the magic but invalidate the bootstrap checksum.
+                    files[0][80] ^= 1;
+                }
+                let temp = write_image_directory(&files);
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                assert_eq!(
+                    run_image_recovery_report(temp.path(), None, true, &mut out, &mut err),
+                    ExitCode::from(1)
+                );
+                assert!(String::from_utf8_lossy(&err).contains("requires --tape-uuid"));
+                assert!(out.is_empty());
+
+                let scheme = if parity {
+                    let scheme = parity_scheme_record();
+                    format!(
+                        "{},{},{}",
+                        scheme.data_blocks_per_stripe,
+                        scheme.parity_blocks_per_stripe,
+                        scheme.stripes_per_neighborhood
+                    )
+                } else {
+                    "none".to_string()
+                };
+                let uuid = uuid::Uuid::from_bytes(TAPE_UUID).to_string();
+                let cli = crate::DebugCli::try_parse_from([
+                    "rem-debug",
+                    "tape",
+                    "recovery-report",
+                    temp.path().to_str().expect("image path"),
+                    "--json",
+                    "--tape-uuid",
+                    &uuid,
+                    "--block-size",
+                    "262144",
+                    "--scheme",
+                    &scheme,
+                ])
+                .expect("complete hints parse");
+                let crate::Command::Tape {
+                    command: crate::TapeCommand::RecoveryReport(args),
+                } = cli.command
+                else {
+                    panic!("expected recovery report command");
+                };
+                err.clear();
+                assert_eq!(
+                    run_image_recovery_report(
+                        &args.source,
+                        args.hints(),
+                        args.json,
+                        &mut out,
+                        &mut err
+                    ),
+                    ExitCode::SUCCESS,
+                    "{}",
+                    String::from_utf8_lossy(&err)
+                );
+                let report: Value = serde_json::from_slice(&out).expect("JSON report");
+                assert!(report["tape_uuid"].is_null());
+                assert!(report["block_size_bytes"].is_null());
+                assert!(report["scan"]["bootstrap_generation_used"].is_null());
+                assert_eq!(report["scan"]["bootstrap_treated_as_unreadable"], true);
+                assert_eq!(report["scan"]["identity_and_geometry_from_hints"], true);
+                assert!(report["scan"]["bootstrap_tape_file_number"].is_null());
+                assert_eq!(
+                    report["supplied"],
+                    json!({"tape_uuid": uuid, "block_size_bytes": BLOCK_SIZE, "scheme": scheme})
+                );
+                assert_eq!(report["totals"]["verified"], "1");
+                assert_eq!(report["scan"]["overlay_source"], "terminal_index_replica_c");
+            }
+        }
+    }
+
+    /// Physical BOT read damage also uses supplied authority without inventing bootstrap evidence.
+    #[test]
+    fn recovery_report_medium_error_at_bootstrap_uses_hints() {
+        let temp = write_image_directory(&plaintext_image(false));
+        let mut source = ImageDirectoryRawSource::open(temp.path()).expect("open image");
+        source.mark_unreadable(0, 0).expect("BOT block exists");
+        let candidates = source.candidate_block_sizes().to_vec();
+        assert!(build_recovery_report(&mut source, &candidates, None).is_err());
+        let report = build_recovery_report(
+            &mut source,
+            &candidates,
+            Some(RecoveryHints {
+                tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                block_size_bytes: BLOCK_SIZE,
+                scheme: "none".to_string(),
+            }),
+        )
+        .expect("terminal discovery survives BOT medium error");
+        assert!(report.success);
+        assert_eq!(report.totals.verified, 1);
+        assert!(report.tape_uuid.is_none());
+        assert!(report.scan.bootstrap_generation_used.is_none());
+        assert_eq!(report.scan.damaged_regions.len(), 1);
+        let mut human = Vec::new();
+        print_human_report(&report, &mut human).expect("human report");
+        let human = String::from_utf8(human).expect("UTF-8 report");
+        assert!(human.contains("tape uuid: unknown"));
+        assert!(human.lines().any(|line| line == "block size: unknown"));
+        assert!(human.contains("supplied: tape uuid 42424242-4242-4242-4242-424242424242 block size 262144 bytes scheme none"));
+    }
+
+    /// A valid bootstrap remains authoritative and refuses every hint conflict.
+    #[test]
+    fn recovery_report_readable_bootstrap_rejects_conflicting_hints() {
+        let temp = write_image_directory(&plaintext_image(false));
+        let mut hints = RecoveryHints {
+            tape_uuid: uuid::Uuid::from_bytes([0x99; 16]).to_string(),
+            block_size_bytes: 524288,
+            scheme: "128,4,1".to_string(),
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            run_image_recovery_report(temp.path(), Some(hints.clone()), true, &mut out, &mut err),
+            ExitCode::from(1)
+        );
+        assert!(String::from_utf8_lossy(&err).contains("tape identity mismatch"));
+        assert!(out.is_empty());
+        hints.tape_uuid = uuid::Uuid::from_bytes(TAPE_UUID).to_string();
+        for mismatch in ["block size", "parity scheme"] {
+            err.clear();
+            assert_eq!(
+                run_image_recovery_report(
+                    temp.path(),
+                    Some(hints.clone()),
+                    true,
+                    &mut out,
+                    &mut err
+                ),
+                ExitCode::from(1)
+            );
+            assert!(
+                String::from_utf8_lossy(&err).contains(mismatch),
+                "{}",
+                String::from_utf8_lossy(&err)
+            );
+            assert!(out.is_empty());
+            hints.block_size_bytes = BLOCK_SIZE;
+        }
+        hints.scheme = "none".to_string();
+        err.clear();
+        assert_eq!(
+            run_image_recovery_report(temp.path(), Some(hints), true, &mut out, &mut err),
+            ExitCode::SUCCESS,
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        let report: Value = serde_json::from_slice(&out).expect("JSON report");
+        assert_eq!(report["block_size_bytes"], BLOCK_SIZE);
+        assert_eq!(report["scan"]["bootstrap_generation_used"], "0");
+        assert_eq!(report["scan"]["bootstrap_treated_as_unreadable"], false);
+        assert_eq!(report["scan"]["identity_and_geometry_from_hints"], false);
+    }
+
+    /// A readable bootstrap found on the walk takes precedence after failed probes.
+    #[test]
+    fn recovery_report_keeps_bootstrap_evidence_recovered_during_scan() {
+        struct FailedProbes {
+            inner: ImageDirectoryRawSource,
+            probes_left: usize,
+            fail_after_discovery: bool,
+        }
+        impl RawTapeSource for FailedProbes {
+            fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+                self.inner.configure_fixed_block_size(size)
+            }
+            fn locate_physical(
+                &mut self,
+                hint: remanence_parity::PhysicalPositionHint,
+            ) -> Result<(), ParityError> {
+                self.inner.locate_physical(hint)
+            }
+            fn locate_end_of_data(
+                &mut self,
+            ) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+                self.inner.locate_end_of_data()
+            }
+            fn space_filemarks(
+                &mut self,
+                count: i64,
+            ) -> Result<remanence_parity::SpaceFilemarksOutcome, ParityError> {
+                self.inner.space_filemarks(count)
+            }
+            fn position(&mut self) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+                self.inner.position()
+            }
+            fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+                if self.fail_after_discovery && self.probes_left == 0 {
+                    self.inner.mark_unreadable(0, 0).expect("BOT exists");
+                }
+                let outcome = self.inner.read_record(buf)?;
+                if self.probes_left > 0 {
+                    self.probes_left -= 1;
+                    if !self.fail_after_discovery {
+                        buf.fill(0);
+                    }
+                }
+                Ok(outcome)
+            }
+        }
+        for fail_after_discovery in [false, true] {
+            let temp = write_image_directory(&plaintext_image(false));
+            let mut source = FailedProbes {
+                inner: ImageDirectoryRawSource::open(temp.path()).expect("image"),
+                probes_left: if fail_after_discovery { 1 } else { 2 },
+                fail_after_discovery,
+            };
+            let report = build_recovery_report(
+                &mut source,
+                &[BLOCK_SIZE],
+                Some(RecoveryHints {
+                    tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                    block_size_bytes: BLOCK_SIZE,
+                    scheme: "none".to_string(),
+                }),
+            )
+            .expect("the structural scan reads a valid bootstrap");
+            assert!(report.success);
+            assert_eq!(source.probes_left, 0);
+            assert_eq!(report.tape_uuid.as_deref(), Some(hex(&TAPE_UUID).as_str()));
+            assert_eq!(report.block_size_bytes, Some(BLOCK_SIZE));
+            assert_eq!(report.scan.bootstrap_generation_used, Some(0));
+            assert_eq!(
+                report.scan.bootstrap_treated_as_unreadable,
+                fail_after_discovery
+            );
+            assert!(!report.scan.identity_and_geometry_from_hints);
+            let mut human = Vec::new();
+            print_human_report(&report, &mut human).expect("human report");
+            if fail_after_discovery {
+                assert!(String::from_utf8_lossy(&human)
+                    .contains("identity and geometry supplied by validated bootstrap"));
+            }
+        }
+    }
+
+    /// Complete recovery hints cannot override a validated compression refusal.
+    #[test]
+    fn recovery_report_refuses_compressed_bootstrap() {
+        let mut files = plaintext_image(true);
+        let block = &mut files[0];
+        let end = 56 + u32::from_le_bytes(block[44..48].try_into().unwrap()) as usize;
+        assert_eq!(&block[end - 2..end], &[5, 0xf4]);
+        block[end - 1] = 0xf5;
+        let crc = remanence_parity::crc64_xz(&block[56..end]);
+        block[end..end + 8].copy_from_slice(&crc.to_le_bytes());
+        let temp = write_image_directory(&files);
+        let mut source = ImageDirectoryRawSource::open(temp.path()).expect("image");
+        let error = build_recovery_report(
+            &mut source,
+            &[BLOCK_SIZE],
+            Some(RecoveryHints {
+                tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                block_size_bytes: BLOCK_SIZE,
+                scheme: "128,4,64".to_string(),
+            }),
+        )
+        .expect_err("compression refusal");
+        assert!(
+            error.contains(&ParityError::DriveCompressionEnabled.to_string()),
+            "{error}"
+        );
+    }
+
+    /// Header evidence remains binding when a later payload or schema check fails.
+    #[test]
+    fn recovery_report_refuses_checksummed_header_conflicts() {
+        for field in ["identity", "block size"] {
+            for failure in ["payload", "schema"] {
+                let mut files = plaintext_image(false);
+                let block = &mut files[0];
+                if field == "identity" {
+                    block[16] ^= 1;
+                } else {
+                    block[32..36].copy_from_slice(&(BLOCK_SIZE / 2).to_be_bytes());
+                }
+                if failure == "payload" {
+                    block[80] ^= 1;
+                } else {
+                    block[8..10].copy_from_slice(&99u16.to_be_bytes());
+                }
+                let crc = remanence_parity::crc64_xz(&block[..48]);
+                block[48..56].copy_from_slice(&crc.to_le_bytes());
+                let temp = write_image_directory(&files);
+                let mut source = ImageDirectoryRawSource::open(temp.path()).expect("image");
+                let error = build_recovery_report(
+                    &mut source,
+                    &[BLOCK_SIZE],
+                    Some(RecoveryHints {
+                        tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                        block_size_bytes: BLOCK_SIZE,
+                        scheme: "none".to_string(),
+                    }),
+                )
+                .expect_err("checksummed header conflict");
+                let reason = if failure == "schema" {
+                    "got 99, accept 2"
+                } else {
+                    field
+                };
+                assert!(error.contains(reason), "{error}");
+                assert!(
+                    error.starts_with("discover bootstrap:"),
+                    "refuse during discovery: {error}"
+                );
+            }
+        }
+    }
+
+    /// Discovery refuses valid header disagreements before inspecting damaged payloads.
+    #[test]
+    fn recovery_report_refuses_checked_format_fields() {
+        for (offset, bytes, reason) in [
+            (8, 1u16.to_be_bytes().to_vec(), "got 1, accept 2"),
+            (8, 3u16.to_be_bytes().to_vec(), "got 3, accept 2"),
+            (36, 7u64.to_be_bytes().to_vec(), "got sequence 7"),
+            (12, 0u32.to_be_bytes().to_vec(), "no-parity flag"),
+        ] {
+            for damaged_payload in [false, true] {
+                let mut files = plaintext_image(false);
+                let block = &mut files[0];
+                block[offset..offset + bytes.len()].copy_from_slice(&bytes);
+                if damaged_payload {
+                    block[80] ^= 1;
+                }
+                let crc = remanence_parity::crc64_xz(&block[..48]);
+                block[48..56].copy_from_slice(&crc.to_le_bytes());
+                let temp = write_image_directory(&files);
+                let mut source = ImageDirectoryRawSource::open(temp.path()).expect("image");
+                let error = build_recovery_report(
+                    &mut source,
+                    &[BLOCK_SIZE],
+                    Some(RecoveryHints {
+                        tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                        block_size_bytes: BLOCK_SIZE,
+                        scheme: "none".to_string(),
+                    }),
+                )
+                .expect_err("checked header refusal");
+                assert!(error.contains(reason), "{error}");
+                assert!(error.starts_with("discover bootstrap:"), "{error}");
+            }
+        }
+    }
+
+    /// A successful candidate read cannot hide a disagreement with hinted geometry.
+    #[test]
+    fn recovery_report_refuses_header_geometry_from_another_candidate_size() {
+        let files = plaintext_image(false);
+        let temp = write_image_directory(&files);
+        let mut source = ImageDirectoryRawSource::open(temp.path()).expect("image");
+        let error = build_recovery_report(
+            &mut source,
+            &[BLOCK_SIZE],
+            Some(RecoveryHints {
+                tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                block_size_bytes: BLOCK_SIZE * 2,
+                scheme: "none".to_string(),
+            }),
+        )
+        .expect_err("candidate header disagrees with hints");
+        assert!(
+            error.contains("readable bootstrap block size differs from supplied hints"),
+            "{error}"
+        );
+        assert!(error.starts_with("discover bootstrap:"), "{error}");
+    }
+
+    /// Partial authority and invalid geometry must fail before touching the source.
+    #[test]
+    fn recovery_report_cli_rejects_partial_or_invalid_hints() {
+        let flags = [
+            ["--tape-uuid", "42424242-4242-4242-4242-424242424242"],
+            ["--block-size", "262144"],
+            ["--scheme", "none"],
+        ];
+        for mask in 1..7 {
+            let mut args = vec!["rem-debug", "tape", "recovery-report", "image"];
+            for (bit, flag) in flags.iter().enumerate() {
+                if mask & (1 << bit) != 0 {
+                    args.extend(flag);
+                }
+            }
+            assert!(
+                crate::DebugCli::try_parse_from(args).is_err(),
+                "partial mask {mask}"
+            );
+        }
+        for scheme in [
+            "default",
+            "custom:128,4,1",
+            "0,4,1",
+            "128,0,1",
+            "128,4,0",
+            "128,4",
+            "none,1,1",
+        ] {
+            assert!(parse_scheme(scheme).is_err(), "invalid scheme {scheme}");
+        }
+        assert!(parse_tape_uuid("invalid").is_err());
+        assert!(parse_block_size("0").is_err());
     }
 
     fn parity_scheme_record() -> ParitySchemeRecord {
@@ -1415,7 +1969,7 @@ mod tests {
         let mut source =
             ImageDirectoryRawSource::open(path).expect("hermetic image directory opens");
         let candidates = source.candidate_block_sizes().to_vec();
-        build_recovery_report(&mut source, &candidates).expect("hermetic image report builds")
+        build_recovery_report(&mut source, &candidates, None).expect("hermetic image report builds")
     }
 
     #[test]
@@ -1463,10 +2017,13 @@ mod tests {
     fn recovery_report_json_preserves_structural_u64_values_as_decimal_strings() {
         let report = CatalogLessRecoveryReport {
             report_version: 1,
-            tape_uuid: "42424242424242424242424242424242".to_string(),
-            block_size_bytes: BLOCK_SIZE,
+            tape_uuid: Some("42424242424242424242424242424242".to_string()),
+            block_size_bytes: Some(BLOCK_SIZE),
+            supplied: None,
             scan: RecoveryScanSummary {
-                bootstrap_generation_used: u64::MAX,
+                bootstrap_treated_as_unreadable: false,
+                identity_and_geometry_from_hints: false,
+                bootstrap_generation_used: Some(u64::MAX),
                 bootstrap_tape_file_number: Some(u64::MAX),
                 overlay_source: "structural_walk",
                 recovered_scope_tape_file_count: u64::MAX,
@@ -1550,7 +2107,7 @@ mod tests {
         let temp = write_image_directory(&image);
         let report = image_report(temp.path());
         assert!(report.success);
-        assert_eq!(report.scan.bootstrap_generation_used, 0);
+        assert_eq!(report.scan.bootstrap_generation_used, Some(0));
         assert_eq!(report.scan.bootstrap_tape_file_number, Some(0));
         assert_eq!(report.scan.overlay_source, "terminal_index_replica_c");
         assert_eq!(report.scan.recovered_scope_tape_file_count, 2);
@@ -1633,8 +2190,8 @@ mod tests {
             .mark_unreadable(1, 1)
             .expect("hermetic manifest block exists");
         let candidates = source.candidate_block_sizes().to_vec();
-        let report =
-            build_recovery_report(&mut source, &candidates).expect("damage remains reportable");
+        let report = build_recovery_report(&mut source, &candidates, None)
+            .expect("damage remains reportable");
         assert!(!report.success);
         assert_eq!(report.totals.failed, 1);
         assert_eq!(
@@ -1653,8 +2210,14 @@ mod tests {
             .expect("hermetic manifest block exists");
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit =
-            run_raw_recovery_report(&mut source, &candidates, true, &mut stdout, &mut stderr);
+        let exit = run_raw_recovery_report(
+            &mut source,
+            &candidates,
+            None,
+            true,
+            &mut stdout,
+            &mut stderr,
+        );
         assert_eq!(exit, ExitCode::from(2));
         assert!(stderr.is_empty());
     }
@@ -1670,7 +2233,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let exit = run_image_recovery_report(temp.path(), true, &mut stdout, &mut stderr);
+        let exit = run_image_recovery_report(temp.path(), None, true, &mut stdout, &mut stderr);
         assert_eq!(exit, ExitCode::from(2));
         assert!(stderr.is_empty());
         let report: Value = serde_json::from_slice(&stdout).expect("JSON failure report parses");
@@ -1782,8 +2345,14 @@ mod tests {
         let candidates = source.candidate_block_sizes().to_vec();
         let mut stdout = FailingWriter;
         let mut stderr = Vec::new();
-        let exit =
-            run_raw_recovery_report(&mut source, &candidates, false, &mut stdout, &mut stderr);
+        let exit = run_raw_recovery_report(
+            &mut source,
+            &candidates,
+            None,
+            false,
+            &mut stdout,
+            &mut stderr,
+        );
         assert_eq!(exit, ExitCode::from(1));
         assert!(String::from_utf8(stderr)
             .expect("error is UTF-8")

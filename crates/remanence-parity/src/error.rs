@@ -67,6 +67,10 @@ pub enum ParityError {
     #[error("bootstrap parse error: {0}")]
     BootstrapParse(String),
 
+    /// A checksummed recovery bootstrap contradicts the required tape identity.
+    #[error("filemark map could not be reconstructed: {0}")]
+    TapeIdentityMismatch(String),
+
     /// A bootstrap payload serialized successfully but does not fit in one
     /// fixed-size bootstrap tape block.
     #[error(
