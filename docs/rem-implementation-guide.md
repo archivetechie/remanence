@@ -1203,7 +1203,7 @@ rewriting a torn component only where its start is proved and the medium allows
 rewriting; and, on WORM media or at a start that cannot be proved, stopping with
 no further motion. A tool should never remove its own barrier against new
 Objects in order to recover. The specification fixes what a recovery may not
-do: "It MUST NOT write an Object or append a second terminal triple."
+do: "It MUST NOT write an Object or append a second terminal suffix."
 (REM-PARITY §3.4). Remanence, for example, classifies a header-only component
 that it finds on restart as torn terminal control, never as an Object.
 
@@ -1275,9 +1275,9 @@ descriptor. A reader that understands only one of them misses boundaries, and
 builds a wrong map of the tape.
 
 We recommend handling both formats, and testing the tool against both. The
-specification requires the outcome: "Boundary classification MUST distinguish
-the Filemark and EndOfData outcomes on every transport, and on a SCSI transport
-in both of its sense-data formats [LTO-SCSI]." (REM-PARITY §3.5).
+specification requires the outcome: "The tape I/O layer MUST distinguish the
+Filemark and EndOfData outcomes on every transport, and on a SCSI transport in
+both of its sense-data formats [LTO-SCSI]." (REM-PARITY §3.5).
 
 Serves REM-PARITY §3.5, Requirements on the Tape I/O Layer.
 
@@ -1325,10 +1325,10 @@ The stream can then be bounded and backpressured, with no buffer for the whole
 index and no second read of a body on the healthy path. When envelopes
 conflict, resolving them can need a bounded replay, and the selected attempt
 can then be replayed for its consumer. The specification fixes the consumer's
-side: "A Consumer MUST commit only the attempt named by the terminal summary and
-MUST discard rejected or unselected attempts." (REM-PARITY §12.4). Remanence,
-for example, gives each attempt an `attempt_id` in its inventory stream and
-names a rejected attempt before it falls back to the next.
+side: "An Inventory Consumer MUST commit only the attempt named by the terminal
+summary and MUST discard rejected or unselected attempts." (REM-PARITY §12.4).
+Remanence, for example, gives each attempt an `attempt_id` in its inventory
+stream and names a rejected attempt before it falls back to the next.
 
 Serves REM-PARITY §12.4, Terminal Replica Validation.
 
@@ -1479,7 +1479,7 @@ written with another size is read correctly (REM-PARITY §10.5).
 We recommend the default unless a medium's damage profile argues for another
 size. Remanence uses the default.
 
-Serves REM-PARITY §10.5, Index Separation Extents.
+Serves REM-PARITY §10.5, Separation Extents.
 
 ### In plain terms
 

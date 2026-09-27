@@ -20,14 +20,14 @@ This revision defines the generation-2 layout (`schema_major` 2). Tapes of
 generation 1 are governed by the published revision 1.0.0-draft.2
 (2026-09-06, SHA-256
 `1e4ad796bd77291f731d8d2611231984ba778f3650c1597f80eebdc7ba359fd2`) and are
-not readable by generation-2 readers.
+not readable by generation-2 Readers.
 
 **This is a review draft.** It is published for public review and is not yet
-frozen. The current generation-2 replacement is implemented in the reference
-tree. Its review-only candidate vectors are pinned and independently re-derived,
-and its proof and nonphysical lifecycle/VTL gates have passed. Dedicated
-coverage-guided terminal-replica/separation/parser-walk fuzz plateaus and the
-supervised physical-media gate remain open. Candidate vectors are not publication
+frozen. Generation 2 is implemented in the reference tree. Its review-only
+candidate vectors are pinned and independently re-derived, and its proof and
+nonphysical lifecycle/VTL gates have passed. Dedicated coverage-guided
+terminal-replica/separation/parser-walk fuzz plateaus and the supervised
+physical-media gate remain open. Candidate vectors are not publication
 artifacts until the freeze gates close.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
@@ -40,7 +40,7 @@ Before reporting, check the live list of known items at
 appendix of this document is only a snapshot taken when this revision was fixed.
 
 On freezing, the format this document defines becomes final: no tape it
-validates will ever be invalidated, no reader guarantee will be withdrawn, and
+validates will ever be invalidated, no Reader guarantee will be withdrawn, and
 the discovery guarantee of Section 8.4 will stand for the life of
 `schema_major` 2. The document itself may still be revised even then, in
 exactly the three ways set out below.
@@ -51,12 +51,20 @@ implementation, so the finality above is our own undertaking and not anyone
 else's approval. That is worth saying plainly, because such words usually
 imply a committee somewhere, and in this case there is none.
 
-The document's version, the bootstrap's `schema_major` and `schema_minor`
-(Section 8.1), REM-OBJECT's `REMANENCE.schema_version` (a text feature gate)
-and manifest `schema_version` (an integer), and REM-ENCRYPT's registries are
-independent axes. None is a proxy for another, and no arithmetic relates
-them. In particular, `schema_minor` is not this document's version number;
-Section 8.1.1 is its registry.
+This document has three independent version axes:
+
+| Axis | Value | Where it is recorded |
+| --- | --- | --- |
+| Document version | 1.0 | This document only; it names no on-tape value |
+| `schema_major` | `2` | Bootstrap fixed frame, offset `0x08` (Section 8.1) |
+| `schema_minor` | `3` (the current Writer value) | Bootstrap fixed frame, offset `0x0A`; registry in Section 8.1.1 |
+
+None is a proxy for another, and no arithmetic relates them. In particular,
+`schema_minor` is not this document's version number; Section 8.1.1 is its
+registry. REM-OBJECT §10 and REM-ENCRYPT §10 state those documents' own axes,
+among them REM-OBJECT's `REMANENCE.schema_version` (a text feature gate) and
+manifest `schema_version` (an integer), and REM-ENCRYPT's registries; none of
+them is a proxy for an axis of this document either.
 
 **Which copy governs.** The concept DOI above is reserved, but no revision of
 this document has yet been deposited. Until the first deposit is published,
@@ -65,8 +73,9 @@ Once a revision is deposited, its deposited text governs. Every other copy — i
 repository, inside a Remanence source release, on a mirror, or printed — is a
 convenience copy. A copy carrying the same version string as a deposited
 revision is byte-identical to it or it is defective; where they differ, the
-deposit governs. A version string is never reused for different bytes, so
-naming a version names one exact text no matter which copy you hold. The
+deposit governs. The version string of a deposited revision is never reused
+for different bytes, so naming a deposited version names one exact text no
+matter which copy you hold. The
 reference implementation is informative: where it and this document disagree,
 this document is the fixed point, and the divergence is a defect in the
 implementation.
@@ -116,7 +125,7 @@ line, and its `Version` row is the full revision.
 For orientation, the classifications of the changes most likely to be
 proposed (informative): a new optional bootstrap key — minor; a new damage
 plan in the drill tooling — erratum or minor, by whether an obligation
-moves; a new writer-legal block size — major, by question 2; a new
+moves; a new Writer-legal block size — major, by question 2; a new
 `schema_major` or magic — major, by definition.
 
 The image-level vectors of Section 17 are conformance anchors of the
@@ -126,10 +135,10 @@ revision that needs new vectors publishes its own archive alongside this
 one and cites it separately.
 
 A tape written against this specification will therefore still be read
-correctly by an implementation built from any later revision of it. A reader
+correctly by an implementation built from any later revision of it. A Reader
 does not need to know which revision wrote a tape in order to read it; the
 Revision History appendix exists so that anyone can recover what a given
-revision's text said, not to identify writers.
+revision's text said, not to identify Writers.
 
 Errata are raised as issues on the project repository. Every published
 revision of this document is archived with its own DOI and recorded in the
@@ -137,31 +146,30 @@ Revision History appendix.
 
 This document remains the normative fixed point for the format: an
 implementation is validated against it, not the reverse. The arithmetic test
-vectors here (CRC, Reed–Solomon,
-canonical digest) are normative and can be re-derived from this text alone;
-the image-level vectors of Section 17 are *pinned-at-generation*, and the
-archive holding them is published with a checksum so you can confirm you
-have the same bytes we do.
+vectors here (CRC, Reed–Solomon, canonical digest) are normative and can be
+re-derived from this text alone; the image-level vectors of Section 17 are
+*pinned-at-generation*, and the archive holding them is published with a
+checksum so you can confirm you have the same bytes we do.
 
 ## Abstract
 
 This document specifies the Rem Tape Parity (REM-PARITY) format, version 1.0:
 a self-describing, parity-protected method of writing multiple archival
-objects to linear tape. Objects are opaque byte strings — this format never
+Objects to linear tape. Objects are opaque byte strings — this format never
 interprets their content — written one per filemark-delimited tape file and
-protected collectively: a fixed **BOT bootstrap** identifies the tape and its
-geometry;
-**parity sidecar tape files** carry Reed–Solomon parity and per-block CRCs
-for each parity epoch; an external final **ParityMap** carries the sidecar
-directory when nonempty; and exactly three complete **terminal tape-index
-replicas**, separated by two typed one-GiB extents, carry the final structural
-map and Object recovery rows. Parity is computed over GF(2⁸)
-with a Cauchy generator (`rs-cauchy-gf256-v1`), incrementally accumulated as
-data streams, and written strictly in separate tape files, so every object
-remains a clean, contiguous run of blocks readable with standard positioning
-tools. The format is designed for catalog-less recovery: a reader holding
-only this document, a damaged tape, and a generic SHA-256/HMAC/CBOR toolkit
-can reconstruct the tape's structure, verify it cryptographically, and
+protected collectively: a fixed **bootstrap** at the beginning of the tape
+identifies the tape and its geometry; **parity sidecar tape files** carry
+Reed–Solomon parity and per-block CRCs for each parity epoch; a **ParityMap**
+tape file, written before the terminal suffix, carries the sidecar epoch
+directory when that directory is nonempty; and exactly three complete
+**terminal replicas**, separated by two one-GiB **separation extents**, carry
+the final structural map and the Object recovery rows. Parity is computed over
+GF(2⁸) with a Cauchy generator (`rs-cauchy-gf256-v1`), incrementally
+accumulated as data streams, and written strictly in separate tape files, so
+every Object remains a clean, contiguous run of blocks readable with standard
+positioning tools. The format is designed for catalog-less recovery: a reader
+holding only this document, a damaged tape, and a generic SHA-256/HMAC/CBOR
+toolkit can reconstruct the tape's structure, verify it cryptographically, and
 recover up to *m* damaged blocks per stripe — including the case where the
 damaged block is the first block of the very file that describes it.
 
@@ -200,7 +208,7 @@ Appendix D. [Open Items (Informative)](#appendix-d-open-items-informative)
 
 ### 1.1. Purpose and Design Goals
 
-REM-PARITY defines how a sequence of archival objects is laid out on one
+REM-PARITY defines how a sequence of archival Objects is laid out on one
 linear tape and how that layout survives media damage. Its design goals, in
 priority order:
 
@@ -209,17 +217,17 @@ priority order:
    recovery but is never required for it.
 2. **Payload independence.** Objects are opaque byte strings. The format
    never reads object content to classify, map, verify, or repair a tape;
-   any archiving tool whose objects meet the Section 4 contract can write
+   any archiving tool whose Objects meet the Section 4 contract can write
    and recover conformant tapes.
 3. **Clean coexistence with standard tooling.** Parity and self-description
-   live in separate, filemark-delimited tape files. An object occupies its
+   live in separate, filemark-delimited tape files. An Object occupies its
    own tape file as a contiguous run of fixed blocks, navigable with
    standard positioning tools (`mt fsf` + read); no parity byte ever appears
-   inside an object.
+   inside an Object.
 4. **Bounded damage tolerance with bounded memory.** The default geometry
    tolerates a contiguous burst of up to `S × m` blocks (~512 MiB) per epoch —
    **including bursts that straddle the data→sidecar boundary** (Section 9.1,
-   Appendix B.2) — while the writer holds only `S × m` parity accumulators
+   Appendix B.2) — while the Writer holds only `S × m` parity accumulators
    (~512 MiB at the default geometry), regardless of object sizes. A short final
    or checkpoint epoch that closes fewer than `S` real data blocks (< 128 MiB at
    the default geometry) has a reduced boundary tolerance of `≈ (m − 1) × S`
@@ -238,27 +246,29 @@ priority order:
 
 ### 1.2. One Tape, Many Objects
 
-A REM-PARITY tape is a sequence of filemark-delimited tape files. While open it
-contains the BOT Bootstrap, Objects, and sidecars. Final parity closeout may
-append one ParityMap immediately before the normal
-finalization appends one exact five-file suffix:
+A REM-PARITY tape is a sequence of filemark-delimited tape files. While open
+it contains the bootstrap, Objects, and sidecars. Final parity closeout may
+append one ParityMap immediately before the normal finalization appends the
+terminal suffix. The labels in the diagram abbreviate terms defined in
+Section 2.3.
 
 ```text
 | bootstrap(0) | object | sidecar | ... |
 | index A | gap AB | index B | gap BC | index C | EOD
 ```
 
-A Writer appends objects one per tape file. As object blocks stream to tape,
+A Writer appends Objects one per tape file. As object blocks stream to tape,
 the Writer accumulates Reed–Solomon parity over them in fixed-size **stripes**
 grouped into **epochs**; each completed epoch's parity and per-block CRCs are
 written as a **parity sidecar** tape file at the next object boundary. Epochs
-span objects: the parity geometry is independent of object sizes, and an
-object needs no minimum size to be protected. The BOT bootstrap records tape
+span Objects: the parity geometry is independent of object sizes, and an
+Object needs no minimum size to be protected. The bootstrap records tape
 identity, fixed block size, and parity scheme. There are no intermediate tape
 indexes and no singular final bootstrap. Each terminal replica contains the
 complete canonical structural map plus exactly one recovery row per Object. A
-healthy bare-tape inventory reads BOT identity, positions from EOD to replica C,
-and falls back through B then A without an Object walk. If all replicas are
+healthy bare-tape inventory reads BOT identity, then reads the terminal
+replicas from EOD and accepts one that validates and agrees with every other
+valid replica (Section 8.5), without an Object walk. If all replicas are
 invalid, recovery scans structurally from BOT; missing terminal authority is
 never an empty inventory.
 
@@ -276,6 +286,10 @@ never an empty inventory.
 - Drive hardware compression is required to be off for parity-protected
   tapes (Section 11.4): block bytes must map 1:1 to media so damage
   geometry and parity coverage correspond.
+
+This document cites its own sections as “Section 8.2” and a section of a
+companion specification by the companion's name, as in “REM-OBJECT §4.5.1” or
+“REM-ENCRYPT §5.2”.
 
 ### 1.4. Non-Goals
 
@@ -325,6 +339,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174]
 when, and only when, they appear in all capitals, as shown here.
 
+A paragraph that opens with *Rationale.* is informative and states no
+requirement.
+
+Where a numbered list sets out steps, they are taken in the order given unless
+the text says otherwise.
+
 ### 2.2. Conformance Roles
 
 A single implementation may fill several roles.
@@ -336,17 +356,25 @@ A single implementation may fill several roles.
 - **Verifier**: validates a tape's structures and digests end to end without
   recovering payload — the Scanner's checks plus the Recoverer's index and
   CRC validation.
+- **Reader**: any role that reads a tape: the Scanner, the Recoverer, the
+  Resumer and the Verifier, and the Writer when it reads back what it has
+  written. A requirement on a Reader binds each of them. This is not the
+  REM-OBJECT Reader, which reads an object.
+- **Inventory Consumer**: the role that receives a Scanner's inventory
+  (Section 12.4). It is distinct from the REM-OBJECT Consumer.
 
 ### 2.3. Definitions
 
 - **Block / block size**: the tape's fixed block size; one value per tape,
-  recorded in the BOT bootstrap. All structures in this document are sized in
+  recorded in the bootstrap. All structures in this document are sized in
   blocks of this one size. All tape I/O is in whole blocks.
 - **Tape file**: a run of one or more fixed blocks delimited by exactly one
   trailing filemark. Kinds: **object**, **parity sidecar**, **bootstrap**,
-  **parity map**, **tape-index replica**, **index-separation extent**.
+  **ParityMap**, **terminal replica**, **separation extent**.
 - **Object**: one opaque archival byte string occupying exactly one object
-  tape file (Section 4).
+  tape file (Section 4). The capitalised word “Object” names this term;
+  attributive uses, such as “object tape file”, “object bytes” and
+  “object block index”, are lower case.
 - **Stripe**: one Reed–Solomon codeword: `k` data shards plus `m` parity
   shards, each shard one full block.
 - **Epoch**: one parity protection unit covering a non-empty explicit,
@@ -364,8 +392,21 @@ A single implementation may fill several roles.
   session is on medium (Section 3.5).
 - **Final prefix**: the complete committed structural prefix before terminal
   replica A; this is the identical payload scope of A, B, and C.
+- **Terminal suffix**: the five tape files that follow the final prefix:
+  terminal replica A, separation extent AB, terminal replica B, separation
+  extent BC and terminal replica C, in that order (Section 8.3).
+- **Terminal replica**: one of the three tape files A, B and C of the terminal
+  suffix, each carrying the complete terminal inventory (Sections 10.2 to
+  10.4).
+- **Replica envelope**: the header and footer records of a terminal replica
+  (Section 10.4).
+- **Separation extent**: one of the two tape files, AB and BC, that keep the
+  terminal replicas physically apart; each is a header record, zero-filled
+  interior records and a footer record (Section 10.5).
 - **Filemark map**: the tape's structural table of contents — one entry per
   tape file (Section 7).
+- **Sidecar epoch directory**: the per-epoch repair root that the final
+  ParityMap carries (Section 10.1.1).
 - **Terminal inventory**: the immutable dense structural map and matching
   Object recovery rows repeated in full by A, B, and C (Sections 10.2 and
   10.3).
@@ -379,7 +420,7 @@ A single implementation may fill several roles.
 ### 2.4. Integer, Byte, and Text Conventions
 
 All multi-byte integers in sidecar and terminal structures are
-**little-endian**, except the BOT bootstrap fields explicitly marked
+**little-endian**, except the bootstrap fields explicitly marked
 big-endian. The bootstrap header mixes endianness per field — its
 table (Section 8.1) is authoritative, and the mix is deliberate and frozen
 (Appendix B.5). All offsets are zero-based. `KiB` = 2^10 bytes; `MiB` = 2^20
@@ -397,8 +438,8 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | Constant | Value |
 | --- | --- |
 | `BOOTSTRAP_MAGIC` | `52 45 4D 00 42 4F 4F 01` (`"REM\0BOO\x01"`, fixed bytes) |
-| `BOOTSTRAP_SCHEMA_MAJOR` | 2 — replacement draft; readers MUST reject any other value (Section 8.1) |
-| `BOOTSTRAP_SCHEMA_MINOR` | 3 — the reference writer's current value, not a conformance bound; see the Section 8.1.1 registry |
+| `BOOTSTRAP_SCHEMA_MAJOR` | 2 — generation 2; Readers MUST reject any other value (Section 8.1) |
+| `BOOTSTRAP_SCHEMA_MINOR` | 3 — the reference Writer's current value, not a conformance bound; see the Section 8.1.1 registry |
 | `BOOTSTRAP_HEADER_LEN` | 0x38 |
 | `FLAG_NO_PARITY` | bit 0 of the bootstrap flags |
 | `MAX_BOOTSTRAP_SCAN_BLOCKS` | 1024 |
@@ -425,7 +466,7 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 | `TERMINAL_INDEX_REPLICA_COUNT` / `TERMINAL_INDEX_SEPARATION_COUNT` | 3 / 2 |
 | `DEFAULT_INDEX_SEPARATION_BYTES` | 1,073,741,824 (1 GiB), including header and footer |
 | Tape-file kind codes | Object = 0, ParitySidecar = 1, Bootstrap = 2, ParityMap = 3, TapeIndexReplica = 4, IndexSeparationExtent = 5 |
-| Minimum frame sizes | bootstrap 0x40; parity map 0xC8; sidecar 0xE0; replica 0x400; separation 0x200 |
+| Minimum frame sizes | bootstrap 0x40; ParityMap 0xC8; sidecar 0xE0; replica 0x400; separation 0x200 |
 
 ## 3. Tape Model and Address Spaces
 
@@ -433,18 +474,18 @@ read from tape MUST be checked; overflow is rejection, never wraparound
 
 A REM-PARITY tape is a sequence of tape files numbered densely from 0 at the
 beginning of tape (BOT), each terminated by exactly one filemark, followed by
-end of data (EOD):
+end of data (EOD). The labels in the diagram abbreviate terms defined in
+Section 2.3.
 
 ```text
 | bootstrap(0) | object | sidecar | ... |
 | index A | gap AB | index B | gap BC | index C | EOD
 ```
 
-Tape file 0 MUST be a bootstrap. This format owns every filemark on the
-tape: an object's bytes MUST NOT depend on filemarks for internal structure,
-and a Writer MUST NOT emit filemarks except as tape-file terminators. A tape
-file MUST contain at least one block — an immediate filemark is structural
-damage.
+Tape file 0 MUST be a bootstrap. This format owns every filemark on the tape.
+An Object's bytes MUST NOT depend on filemarks for internal structure. A
+Writer MUST NOT emit filemarks except as tape-file terminators. A tape file
+MUST contain at least one block. An immediate filemark is structural damage.
 
 The **committed prefix** is the uninterrupted initial sequence of committed
 tape files starting at file 0. It is empty if file 0 has not been committed;
@@ -471,7 +512,7 @@ some last committed file `F`. Bytes and filemarks physically present after
   shards have no ordinals. First-ordinals are dense and contiguous: in tape
   order, each object file's first ordinal equals the previous running total
   of object blocks, starting at 0.
-- **Object block index**: the zero-based block index within one object's
+- **Object block index**: the zero-based block index within one Object's
   tape file — the address an object format uses internally.
   `(tape_file_number, object_block_index)` resolves to an ordinal through
   the filemark map (Section 7).
@@ -479,8 +520,8 @@ some last committed file `F`. Bytes and filemarks physically present after
 ### 3.3. Ordinal-to-Stripe Mapping
 
 For scheme `(k, m, S)` (Section 6.6), locate the unique sidecar descriptor
-whose explicit range `[start, end)` contains ordinal `o`. Let `E = S × k`
-and `d = o − start`; then:
+whose explicit range `[start, end)`, of at most `S × k` data ordinals,
+contains ordinal `o`. Let `d = o − start`; then:
 
 ```text
 epoch       = descriptor.epoch_id
@@ -491,34 +532,34 @@ data_index  = d / S                    (0 ≤ data_index < k)
 inverse:  o = start + data_index·S + stripe
 ```
 
-The interleave is essential: `N ≤ S` physically consecutive data blocks
-land in `N` distinct stripes, so contiguous damage of up to `S × m` blocks
-stays within the per-stripe tolerance `m` (Appendix B.2). Parity shards are
-addressed `(epoch, stripe, parity_index)` with `0 ≤ parity_index < m`; they
-live in sidecar tape files (Section 9), never among the data blocks, and are
-stored **parity-index-major** (Section 9.1) so the same interleave extends into
-the parity region: consecutive parity blocks belong to consecutive stripes. A
-contiguous burst that straddles the data→sidecar boundary therefore spreads
-across stripes on both sides, and the guarantee holds across the boundary, not
-only within object data (Appendix B.2).
+The interleave is essential: `N ≤ S` physically consecutive data blocks land
+in `N` distinct stripes, so contiguous damage of up to `S × m` blocks stays
+within the per-stripe tolerance `m` (Appendix B.2). Parity shards are
+addressed `(epoch, stripe, parity_index)` with `0 ≤ parity_index < m`. They
+live in sidecar tape files (Section 9), never among the data blocks. A sidecar
+stores them **parity-index-major** (Section 9.1), so consecutive parity blocks
+belong to consecutive stripes and the same interleave extends into the parity
+region. A contiguous burst that straddles the data→sidecar boundary therefore
+spreads across stripes on both sides, and the guarantee holds across the
+boundary, not only within object data (Appendix B.2).
 
 ### 3.4. The Durable Boundary
 
-A tape file is **committed** only when all of the following hold, in
-order: its blocks and its trailing filemark are written; blocks and filemark
-are **synchronized to medium** — by a synchronous filemark, or by a later
-synchronizing barrier (Section 11.1) completing before the commit record;
-and a durable off-tape **commit record** exists. The commit record's format is implementation-defined (a
-journal, a database row, a replicated log entry). There is no on-tape commit
-marker and no on-tape
-"unclean" marker: an interrupted tail simply lies beyond the last committed
-file and is physically superseded on resume (Section 14). Tape files are
-written and numbered strictly sequentially (next = last committed + 1,
-first = 0, at most one in flight). Readers seeded from a *prefix*-scoped map
-(Section 7.4) MUST treat rows beyond the validated prefix as forensic only —
-never recovery inputs.
+A tape file is **committed** only when all of the following hold, in order:
+its blocks and its trailing filemark are written; blocks and filemark are
+**synchronized to medium** — by a synchronous filemark, or by a later
+synchronizing barrier (Section 11.1) completing before the commit record; and
+a durable off-tape **commit record** exists. The commit record's format is
+implementation-defined (a journal, a database row, a replicated log entry).
+There is no on-tape commit marker and no on-tape "unclean" marker: an
+interrupted tail simply lies beyond the last committed file and is physically
+superseded on resume (Section 14). Tape files are written and numbered
+strictly sequentially (next = last committed + 1, first = 0, at most one in
+flight). A Recoverer seeded from a *prefix*-scoped map (Section 7.4) MUST
+treat rows beyond the validated prefix as forensic only, never as recovery
+inputs.
 
-An implementation MAY store the required contents of this logical commit
+An implementation MAY store the contents of this logical commit
 record in more than one durable off-tape record. Before a Resumer positions to
 an append point or writes, the validated combination of the records it relies
 on MUST determine exactly one committed prefix and its append point. If a
@@ -545,15 +586,15 @@ Finalization is not a pause: no failure, restart, recovery action, or degraded
 acceptance may transition the tape back to `Open`.
 
 A component failure or completion-unknown result enters or retains
-`RecoveryRequired`. From there a Writer may repair only missing terminal
-control components at proved locations. It MUST NOT write an Object or append a
-second terminal triple. A Writer MUST NOT report a tape as `Finalized` while
-fewer than three complete replicas exist. A distinct audited operator action
-MAY accept a proved set of one or two complete replicas as `FinalizedDegraded`.
-This document does not define that action. Zero complete replicas, an unproved
-position, or completion-unknown cannot be accepted; three complete replicas use
-ordinary `Finalized`. A finalized-degraded tape cannot resume finalization or
-return to `Open`.
+`RecoveryRequired`. From there a Writer may repair only missing tape files of
+the terminal suffix, at proved locations. It MUST NOT write an Object or
+append a second terminal suffix. A Writer MUST NOT report a tape as
+`Finalized` while fewer than three complete replicas exist. A distinct audited
+operator action MAY accept a proved set of one or two complete replicas as
+`FinalizedDegraded`. This document does not define that action. Zero complete
+replicas, an unproved position, or completion-unknown cannot be accepted;
+three complete replicas use ordinary `Finalized`. A finalized-degraded tape
+cannot resume finalization or return to `Open`.
 
 Recommended practice for finalization is described in the REM Implementation and
 Operations Guide, under “Finalizing a tape and recovering from a crash”.
@@ -562,30 +603,30 @@ Operations Guide, under “Finalizing a tape and recovering from a crash”.
 
 Fixed-block reads and writes only; a read returning other than exactly one
 block is an error, with two classified boundary outcomes: **Filemark** and
-**EndOfData**. Boundary classification MUST distinguish the Filemark and
-EndOfData outcomes on every transport, and on a SCSI transport in both of its
-sense-data formats [LTO-SCSI].
+**EndOfData**. The tape I/O layer MUST distinguish the Filemark and EndOfData
+outcomes on every transport, and on a SCSI transport in both of its sense-data
+formats [LTO-SCSI].
 
 The tape I/O layer MUST persist blocks and filemarks to medium strictly in
-submission order, and MUST provide a **synchronizing barrier**: an
-operation (e.g. a zero-count synchronous SCSI WRITE FILEMARKS) whose
-successful completion proves that every block and filemark issued before it
-is on medium. A completion-unknown outcome at a barrier MUST be treated as
-barrier failure. On a transport that cannot guarantee ordered persistence,
-the attestation conclusions of Sections 3.4 and 12.6 are void.
+submission order. The tape I/O layer MUST provide a **synchronizing barrier**:
+an operation whose successful completion proves that every block and filemark
+issued before it is on medium. A zero-count synchronous SCSI WRITE FILEMARKS
+is one such operation. A completion-unknown outcome at a barrier MUST be
+treated as barrier failure. On a transport that cannot guarantee ordered
+persistence, the attestation conclusions of Sections 3.4 and 12.6 are void.
 
 ## 4. The Object Contract
 
 ### 4.1. Objects Are Opaque Block Strings
 
-An **object** is a byte string whose length is a positive exact multiple of
+An **Object** is a byte string whose length is a positive exact multiple of
 the tape block size. It is written as exactly one object tape file of
 `block_count = length / block_size` contiguous blocks followed by one
 filemark. This format places no constraint on the bytes themselves: any
 block content is valid, and nothing in this format ever parses object bytes.
-A Writer MUST refuse an object whose length is not a positive multiple of
-the block size; padding an object up to a block multiple is the payload
-format's (or the caller's) responsibility and becomes part of the object's
+A Writer MUST refuse an Object whose length is not a positive multiple of the
+block size. Padding an Object up to a block multiple is the responsibility of
+the payload format or the caller. The padding becomes part of the Object's
 bytes, indistinguishable from content to this format.
 
 ### 4.2. What the Format Provides to Objects
@@ -597,8 +638,8 @@ protects the block with Reed–Solomon parity (Section 6) at the epoch's
 geometry. Between sidecar emissions, fewer than one epoch's worth of
 committed data is pending (`W ≤ ordinal < T`, Section 11.2): durable, but
 not yet repairable, and recovery refuses it as such (Section 13.2).
-`finish()` (Section 11.3) closes the final epoch, so on a finished tape every object
-block is protected. The format provides:
+Finalization (Section 11.3) closes the final epoch, so on a finalized tape
+every object block is protected. The format provides:
 
 1. **Structural addressing.** `(tape_file_number, object_block_index)`
    resolves through the filemark map to a `ParityDataOrdinal` and back, so
@@ -608,12 +649,12 @@ block is protected. The format provides:
    detected without any payload-format knowledge.
 3. **Bounded repair.** Up to `m` damaged blocks per stripe are
    reconstructed from any `k` surviving shards (Section 13), keyless and
-   content-blind — an encrypted object is repaired without its keys.
-4. **Commit semantics.** An object is durable exactly when its tape file is
+   content-blind — an encrypted Object is repaired without its keys.
+4. **Commit semantics.** An Object is durable exactly when its tape file is
    committed (Section 3.4); the Writer reports completion only then.
 5. **Catalog-less rediscovery.** A Scanner classifies object tape files by
    elimination — never by reading object content (Section 12.3) — so a tape
-   of foreign objects is mappable by any conformant implementation.
+   of foreign Objects is mappable by any conformant implementation.
 
 This format provides integrity and recovery at **block** granularity only.
 End-to-end content integrity (per-file digests, manifests) and
@@ -621,12 +662,12 @@ confidentiality are the payload format's job (Section 16.4).
 
 ### 4.3. What the Format Requires of Payload Formats
 
-A payload format carried as REM-PARITY objects:
+A payload format carried as REM-PARITY Objects:
 
-1. MUST produce objects whose stored length is a positive exact multiple of
+1. MUST produce Objects whose stored length is a positive exact multiple of
    the tape block size (Section 4.1).
 2. MUST NOT require filemarks, tape positioning side effects, or any medium
-   feature inside an object: an object round-trips as a plain byte string
+   feature inside an Object: an Object round-trips as a plain byte string
    through any storage that preserves bytes.
 3. MUST tolerate that a reader is handed whole blocks.
 
@@ -639,19 +680,19 @@ carries its own end-of-content structure, so its content length can be
 recovered from its own bytes. It is easier to trust when it is self-describing
 and carries its own content-level integrity, such as per-file digests, because
 this format verifies blocks, not meaning. When catalog-less payload recovery
-matters, it helps if a payload format makes its objects identifiable from their
+matters, it helps if a payload format makes its Objects identifiable from their
 own bytes, with a magic or a header, because this format's generic structures
 identify *which tape files are objects* but do not parse object bytes.
 
 ### 4.4. Payload Format Bindings (Informative)
 
-**REM-OBJECT [REMOBJECT].** A REM-OBJECT meets the contract by
-construction: its stored bytes are an exact positive multiple of the
-object's `chunk_size` in both representations (plaintext and encrypted);
-with the tape block size equal to `chunk_size`, one REM-OBJECT body block is one
-tape block. Parity is computed over stored bytes — ciphertext when
-the object is encrypted — so damaged encrypted objects are repaired keyless
-and opening under [REMENCRYPT] is retried on the recovered bytes.
+**REM-OBJECT [REMOBJECT].** A REM-OBJECT meets the contract by construction:
+its stored bytes are an exact positive multiple of its `chunk_size` in both
+representations (plaintext and encrypted); with the tape block size equal to
+`chunk_size`, one REM-OBJECT stored block is one tape block. Parity is
+computed over stored bytes — ciphertext when the Object is encrypted — so
+damaged encrypted Objects are repaired keyless and opening under [REMENCRYPT]
+is retried on the recovered bytes.
 
 **Plain tar.** A POSIX tar archive zero-padded to a block multiple meets the
 contract: it is self-framing (tar end-of-archive records), self-describing,
@@ -690,15 +731,14 @@ where HMAC is [RFC2104] with SHA-256 [FIPS180-4], `tape_uuid` is the 16-byte
 tape identity from the bootstrap, `LABEL` is the role's ASCII label from
 Section 2.5 (label bytes exactly as listed, including the embedded NUL, the
 0x01 version byte, and, for the terminal replica and separation labels, the
-role letter that follows it; no terminator added), and `[0..8]` takes the first 8 bytes of
-the 32-byte MAC. The label bytes never appear on tape. Each block role has a
-distinct label except the established ParityMap header/footer label shared by
-that retained codec; its role interpretation is defined in Sections 10.1.2
-and 10.1.3. The
-Bootstrap magic alone is a fixed byte string, because the reader does not
-yet know the tape UUID when it searches for a bootstrap (Section 8.1).
-Derived magics are an *identity* mechanism — these blocks belong to this
-tape and role — not authentication (Section 16.1).
+role letter that follows it; no terminator added), and `[0..8]` takes the
+first 8 bytes of the 32-byte MAC. The label bytes never appear on tape. Each
+block role has a distinct label, except that the ParityMap header and footer
+share one label; Sections 10.1.2 and 10.1.3 define how the two are told apart.
+The bootstrap magic alone is a fixed byte string, because a Reader does not
+yet know the tape UUID when it searches for the bootstrap (Section 8.1).
+Derived magics are an *identity* mechanism — these blocks belong to this tape
+and role — not authentication (Section 16.1).
 
 ### 5.3. Deterministic CBOR
 
@@ -712,17 +752,20 @@ frame payload or a map: it applies these canonical-encoding rules to its
 specified array-of-arrays structure. A terminal replica's structural slot
 (Section 10.2) is likewise an array, not a map: it carries one Section 7.3
 per-entry array under the same rules. Each payload map MUST occupy its entire
-declared payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1);
-bytes after the map's definite-length encoding, within the declared payload,
-are a nonconformity. Decoders MUST reject duplicate keys and
-non-canonical encoding, and MUST ignore unknown integer keys at every map
-level — that is the format's extension mechanism: a future revision of this
-document may assign new keys; it never changes the meaning of existing ones
-(a change that would, requires a new schema version or magic). An assigned
-key MUST NOT alter an existing field's meaning, the recovery outcome of any
-tape written without it, or any other rule this document enforces; an
-extension that would is a new major version, because an earlier reader
-ignoring the key would recover different results with no wire signal.
+declared payload extent (for the bootstrap, `cbor_payload_len`, Section 8.1).
+Bytes after the map's definite-length encoding, within the declared payload,
+are a nonconformity. When a Reader decodes any CBOR item of this format, it
+MUST reject duplicate keys and non-canonical encoding, and MUST ignore unknown
+integer keys at every map level. Ignoring unknown keys is the format's
+extension mechanism. A future revision of this document may assign new keys;
+it never changes the meaning of existing ones, and a change that would do so
+requires a new schema version or magic. An assigned key MUST NOT alter an
+existing field's meaning, the recovery outcome of any tape written without it,
+or any other rule this document enforces. An extension that would do so is a
+new major version.
+
+*Rationale.* A Reader built from an earlier revision ignores the key, so it
+would recover different results with no wire signal.
 
 ## 6. The Erasure Scheme rs-cauchy-gf256-v1
 
@@ -774,19 +817,21 @@ parity_j = XOR over i in 0..k of  G[j][i] ⊗ data_i
 where `⊗` is GF(2⁸) scalar-by-block multiplication (each byte of the block
 multiplied by the scalar) and `data_i` is the full data shard at stripe
 position `i`. Encoding MUST be expressible as order-independent incremental
-accumulation — `accumulate(i, shard)` XORs `G[j][i] ⊗ shard` into each of
-`m` zero-initialized accumulators — and incremental and batch encodings MUST
-be byte-identical. This is what lets a Writer stream object data without
-buffering an epoch (Section 11.2).
+accumulation: `accumulate(i, shard)` XORs `G[j][i] ⊗ shard` into each of `m`
+zero-initialized accumulators. Incremental and batch encodings MUST be
+byte-identical.
+
+*Rationale.* This is what lets a Writer stream object data without buffering
+an epoch (Section 11.2).
 
 ### 6.4. Implicit Zeros
 
 In a short epoch, logical data positions beyond the real data are all-zero
 shards that are *never written to tape* and never accumulated (an all-zero
 shard contributes nothing to any parity accumulator). The sidecar's
-`real_data_shard_count` versus `logical_shard_count = S × k` tells readers
-which positions are implicit (Section 9.2). Implicit-zero positions are
-never erasures: a reader supplies an all-zero block for them during
+`real_data_shard_count` versus `logical_shard_count = S × k` tells a Reader
+which positions are implicit (Section 9.2). Implicit-zero positions are never
+erasures: the Recoverer supplies an all-zero block for them during
 reconstruction (Section 13.4).
 
 ### 6.5. Reconstruction
@@ -806,9 +851,9 @@ A scheme is the triple `(k, m, S)` plus the scheme identifier. Validity:
 k ≥ 2      1 ≤ m ≤ k      S ≥ 1      k + m ≤ 255      S × (k + m) ≤ 2³² − 1
 ```
 
-The scheme triple is recorded in the bootstrap and in every sidecar; readers
+The scheme triple is recorded in the bootstrap and in every sidecar; Readers
 MUST use the recorded values, never defaults. The profiles below are
-informative writer defaults, with `S` chosen as
+informative Writer defaults, with `S` chosen as
 `max(1, ceil(target / (block_size × m)))` for a contiguous-damage target:
 
 | Profile | k | m | Damage target | At 256 KiB blocks | Parity overhead |
@@ -862,8 +907,8 @@ Tape file numbers are dense from 0. Object first-ordinals are dense and
 contiguous from 0 in tape order (Section 3.2). Kind-specific fields are
 exclusive to their kinds; an entry carrying a field outside its kind is
 invalid. A terminal-replica payload describes only the prefix before A, so
-kinds 4 and 5 inside that payload are invalid even though scanners recognize
-those kinds in the measured physical tail. Derived scalars:
+kinds 4 and 5 inside that payload are invalid, even though a Scanner
+recognizes those kinds in the terminal suffix it measures. Derived scalars:
 
 ```text
 T = max(first_parity_data_ordinal + block_count) over object entries    (0 if none)
@@ -889,10 +934,10 @@ Fields that do not apply to the entry's kind are CBOR `null` (0xF6).
 
 **Exclusions — the non-circularity rule.** The canonical map digest covers no
 physical position hints, no content hashes, no control-file payload bytes, and
-no replica-health state. Terminal replica envelopes separately bind the
-complete planned five-file layout while their canonical payload remains the
-prefix before A. Discovering damage therefore changes health evidence, not the
-canonical inventory.
+no replica-health state. The replica envelopes separately bind the complete
+planned layout of the terminal suffix, while the replicas' canonical payload
+remains the prefix before A. Discovering damage therefore changes health
+evidence, not the canonical inventory.
 
 **Normative vector.** The map
 `[bootstrap(#0, 1 blk), object(#1, 3 blk, first ordinal 0), sidecar(#2,
@@ -917,8 +962,7 @@ epoch 7 could not protect ordinal range [0, 3).)
 
 ### 7.4. The Digest Record and Scope
 
-In each terminal replica envelope, the digest travels
-with its scope:
+In each replica envelope, the digest travels with its scope:
 
 | Field | Meaning |
 | --- | --- |
@@ -928,30 +972,30 @@ with its scope:
 | `highest_protected_ordinal` | `W` over that prefix |
 | `is_final_map` | true for a terminal final-prefix inventory |
 
-Validation MUST recompute the digest over exactly the leading
-`tape_file_count` entries and cross-check all three scalars. A terminal digest
-yields a **Complete final-prefix** map. The five terminal files are checked
-against the separate planned layout and observed placement; they are not
-recursively embedded in the payload map. Recovery MUST be fenced to the
-validated scope (Section 13.2).
+When a Reader validates a terminal digest, it MUST recompute the digest over
+exactly the leading `tape_file_count` entries and cross-check all three
+scalars. A terminal digest yields a **Complete final-prefix** map. The tape
+files of the terminal suffix are checked against the separate planned layout
+and observed placement; they are not recursively embedded in the payload map.
+Recovery MUST be fenced to the validated scope (Section 13.2).
 
 ## 8. BOT Bootstrap and Terminal Index
 
-The BOT bootstrap is the tape's UUID-independent entry point: a single block at
+The bootstrap is the tape's UUID-independent entry point: a single block at
 tape file 0, findable by magic, that records the tape's identity, block size,
-and parity scheme. It is the only
-structure in this format with a fixed (non-derived) magic, because the
-reader does not yet know the tape UUID when searching for it.
+and parity scheme. It is the only structure in this format with a fixed
+(non-derived) magic, because a Reader does not yet know the tape UUID when
+searching for it.
 
-The replacement profile writes no later Bootstrap copy. Every generation-2
-Bootstrap is Object-count independent: its payload contains no Object recovery
+A generation-2 tape carries no later copy of the bootstrap. Every generation-2
+bootstrap is Object-count independent: its payload contains no Object recovery
 rows, including on a no-parity tape. Host checkpoint operations do not emit a
-Bootstrap. Payload key 2 carries only the BOT-only digest record of
+bootstrap. Payload key 2 carries only the BOT-only digest record of
 Section 8.2 and is not terminal inventory authority. Keys 20, 21, and 30 are
 reserved and MUST be absent (Section 8.2). A Writer MUST NOT publish a
-checkpoint or final index through the Bootstrap payload. Final
-structural and Object rows live only in the streamed terminal replicas defined
-in Sections 8.3, 10.2, and 10.3.
+checkpoint or final index through the bootstrap payload. Final structural and
+Object rows live only in the streamed terminal replicas defined in
+Sections 8.3, 10.2, and 10.3.
 
 ### 8.1. Fixed Frame (One Block, Exactly)
 
@@ -960,30 +1004,31 @@ A bootstrap tape file is exactly one block:
 | Offset | Len | Field | Type | Constraint |
 | --- | ---: | --- | --- | --- |
 | 0x00 | 8 | magic | fixed bytes | `BOOTSTRAP_MAGIC` |
-| 0x08 | 2 | schema_major | **u16 BE** | MUST be 2; readers reject ≠ 2 |
-| 0x0A | 2 | schema_minor | **u16 BE** | registry in Section 8.1.1; readers accept any value; payload rules MAY gate on it |
-| 0x0C | 4 | flags | **u32 BE** | bit 0 = no-parity; writers MUST zero all other bits; readers MUST ignore bits they do not recognise. A future flag may therefore carry only semantics an earlier reader can safely ignore; anything stronger requires a new `schema_major` |
+| 0x08 | 2 | schema_major | **u16 BE** | MUST be 2; Readers reject ≠ 2 |
+| 0x0A | 2 | schema_minor | **u16 BE** | registry in Section 8.1.1; Readers accept any value; payload rules MAY gate on it |
+| 0x0C | 4 | flags | **u32 BE** | bit 0 = no-parity. Writers MUST zero all other bits. Readers MUST ignore bits they do not recognise. A future flag may therefore carry only semantics an earlier Reader can safely ignore; anything stronger requires a new `schema_major` |
 | 0x10 | 16 | tape_uuid | raw bytes | the tape's identity (16 opaque bytes; RECOMMENDED a version-4 UUID [RFC9562], unique per tape); the HMAC key of Section 5.2 |
 | 0x20 | 4 | block_size_bytes | **u32 BE** | MUST equal the size of the block it was read with |
-| 0x24 | 8 | sequence | **u64 BE** | exactly 0 for the sole BOT bootstrap |
+| 0x24 | 8 | sequence | **u64 BE** | exactly 0 for the sole bootstrap |
 | 0x2C | 4 | cbor_payload_len | **u32 LE** | payload byte length |
 | 0x30 | 8 | crc64_header | **u64 LE** | CRC-64/XZ over bytes 0x00..0x30 |
 | 0x38 | var | CBOR payload | Section 8.2 | |
 | +len | 8 | crc64_payload | **u64 LE** | CRC-64/XZ over the payload bytes |
 | … | | zero fill to block end | | MUST be written zero; not an acceptance rule (see below) |
 
-The endianness mix — big-endian header integers, little-endian length and
-CRCs — is fixed by this replacement draft; implementations MUST NOT
-"normalize" it (Appendix B.5). The minimum viable block size is 0x40 (header
-plus the payload CRC of an empty payload). Parse order: block length ≥ 0x40 → magic →
-header CRC → schema_major → payload bounds (checked against the block) →
-payload CRC → CBOR.
+The endianness mix — big-endian header integers, little-endian length and CRCs
+— is fixed. An implementation MUST NOT "normalize" it (Appendix B.5). The
+minimum viable block size is 0x40 (header plus the payload CRC of an empty
+payload). Parse order: block length ≥ 0x40 → magic → header CRC → schema_major
+→ payload bounds (checked against the block) → payload CRC → CBOR.
 
 Writers MUST zero the trailing fill. Verifiers MUST verify it and report a
-nonzero fill as a nonconformity, but bootstrap *acceptance* — during
-discovery (Section 8.4) and classification (Section 12.3) — MUST NOT depend
-on the fill, so a damaged fill byte cannot cost the tape its entry point.
-This is the one deliberate exception to the Section 16.2 verify-zero rule.
+nonzero fill as a nonconformity. A Reader MUST NOT let the fill decide whether
+it accepts a bootstrap, in discovery (Section 8.4) or in classification
+(Section 12.3). This is the one deliberate exception to the Section 16.2
+verify-zero rule.
+
+*Rationale.* A damaged fill byte then cannot cost the tape its entry point.
 
 #### 8.1.1. Schema Minor Registry
 
@@ -999,29 +1044,30 @@ that of the published revision 1.0.0-draft.2 (2026-09-06, SHA-256
 
 | `schema_minor` | Status | Defined by | Wire meaning |
 | ---: | --- | --- | --- |
-| 0–2 | not assigned under `schema_major` 2 | — | none; these values carry meaning only under `schema_major` 1 |
-| 3 | **current writer value** | REM-PARITY draft.4 | no terminal-index semantics; Object rows are carried by terminal replicas |
+| 0–2 | never assigned under `schema_major` 2 | — | none; these values carry meaning only under `schema_major` 1 |
+| 3 | **current Writer value** | REM-PARITY 1.0 | no terminal-index semantics; Object rows are carried by terminal replicas |
 | ≥ 4 | unassigned | a future revision of this document | a value here indicates a tape written under a later revision; retrieve the current revision via this document's concept DOI |
 
-Readers accept any value in the fixed frame — that is deliberate, and unlike
-`format_version` in REM-ENCRYPT, whose unassigned values are hard errors.
-Individual future payload rules MAY be gated on the value. A replacement Writer
-SHOULD emit the current value. The unchanged publication archive contains
-major-1 images at minor values 2 and 3; those bytes are not replacement-draft
-vectors and major-2 readers reject their narrow bootstrap authority.
-An unassigned value is not an error here: Section 5.3's ignore-unknown rule
-means a reader reads through newer bootstrap revisions, satisfying the
-change policy's second condition outright. The refuse-with-typed-error
-condition governs formats that gate reading on a registry, which the
-bootstrap does not.
+A Reader accepts any value in the fixed frame. Individual future payload rules
+MAY be gated on the value. A Writer SHOULD emit the current value. The
+unchanged publication archive contains major-1 images at minor values 2 and 3;
+those bytes are not generation-2 vectors, and a major-2 Reader rejects their
+narrow bootstrap authority.
+
+*Rationale.* Accepting any value is deliberate. It differs from REM-ENCRYPT's
+`format_version`, whose unassigned values are hard errors. An unassigned value
+is not an error here: Section 5.3's ignore-unknown rule means a Reader reads
+through newer bootstrap revisions, satisfying the change policy's second
+condition outright. The refuse-with-typed-error condition governs formats that
+gate reading on a registry, which the bootstrap does not.
 
 To identify what defines a tape in hand: read `schema_major` and
-`schema_minor` from any bootstrap (Section 8.1) — each assigned value's
-defining revision is named in this registry; read the terminal Object rows for the
-identities and geometry of what is stored (Section 10.3). Every revision of
-this document is retrievable through its concept DOI. Which revision *wrote*
-the tape is not recorded on the wire and is not needed for reading; treat
-`schema_minor` as provenance only where this registry gives it a wire
+`schema_minor` from the bootstrap (Section 8.1) — each assigned value's
+defining revision is named in this registry; read the Object recovery rows for
+the identities and geometry of what is stored (Section 10.3). Every revision
+of this document is retrievable through its concept DOI. Which revision
+*wrote* the tape is not recorded on the wire and is not needed for reading;
+treat `schema_minor` as provenance only where this registry gives it a wire
 meaning.
 
 ### 8.2. CBOR Payload
@@ -1032,21 +1078,21 @@ A single integer-keyed map (Section 5.3):
 | ---: | --- | --- | --- |
 | 1 | map | REQUIRED unless no-parity | scheme record: `{1: tstr scheme_id, 2: uint k, 3: uint m, 4: uint S}` |
 | 2 | map | REQUIRED unless no-parity | BOT-only digest record: `{1: bytes .size 32 sha256, 2: uint tape_file_count=1, 3: uint map_total_data_ordinals=0, 4: uint highest_protected_ordinal=0, 5: bool is_final_map=false}` |
-| 3 | tstr, ≤ 128 bytes | OPTIONAL; readers MUST tolerate absence | writing-implementation identity; printable US-ASCII only |
+| 3 | tstr, ≤ 128 bytes | OPTIONAL | writing-implementation identity; printable US-ASCII only |
 | 4 | tstr, ≤ 64 bytes | OPTIONAL | [RFC3339] write timestamp |
-| 5 | bool | REQUIRED (a Writer MUST write it); readers MUST treat absence as false | `drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4) |
+| 5 | bool | REQUIRED. A Writer MUST write it. A Reader MUST treat its absence as false | `drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4) |
 | 20 | — | reserved; MUST be absent | reserved |
 | 21 | — | reserved; MUST be absent | reserved |
 | 30 | — | reserved; MUST be absent | reserved |
 
-Any of keys 20, 21, or 30 in a replacement BOT bootstrap is a parse error.
-Those keys carried generation-1 structures (an inline sidecar epoch
-directory, a ParityMap reference, and REM-OBJECT object rows), whose keys are
-defined in Section 8.2 of the published revision 1.0.0-draft.2 (2026-09-06). A
+Any of keys 20, 21, or 30 in a generation-2 bootstrap is a parse error. Those
+keys carried generation-1 structures (an inline sidecar epoch directory, a
+ParityMap reference, and REM-OBJECT object rows), whose keys are defined in
+Section 8.2 of the published revision 1.0.0-draft.2 (2026-09-06). A
 **no-parity bootstrap** (flag bit 0 set) marks a tape written without parity
-protection; it MAY omit the scheme record (key 1) and the digest record
-(key 2), and readers MUST NOT require those records on it. For a parity bootstrap the
-scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)`
+protection. It MAY omit the scheme record (key 1) and the digest record
+(key 2). A Reader MUST NOT require those records on it. For a parity bootstrap
+the scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)`
 MUST satisfy Section 6.6 validity. Unknown keys are ignored at every level
 (Section 5.3).
 
@@ -1080,16 +1126,15 @@ TapeIndexReplica C       + filemark + barrier
 EOD
 ```
 
-The payload of A, B, and C describes the complete prefix before A and
-excludes all five terminal files. The three payloads are identical; the
-headers and footers of the three replicas differ only in their replica-local
-fields (Section 10.4). Each replica uses one full header record, one or more
-payload records, and one full local footer record (Section 10.4). Each default
-gap includes its header and footer within `ceil(1 GiB/block_size)` records
-(Section 10.5). The shared planned layout is computed before A; local
-observations in
-a footer MUST equal that plan, but planned future components never prove their
-existence.
+The payload of A, B, and C describes the complete prefix before A and excludes
+the terminal suffix. The three payloads are identical; the headers and footers
+of the three replicas differ only in their replica-local fields
+(Section 10.4). Each replica uses one full header record, one or more payload
+records, and one full local footer record (Section 10.4). Each default
+separation extent includes its header and footer within
+`ceil(1 GiB/block_size)` records (Section 10.5). The shared planned layout is
+computed before A. Local observations in a footer MUST equal that plan.
+Planned future components never prove their existence.
 
 Unless a field is explicitly inside deterministic CBOR, every fixed-width
 integer in the terminal structures is unsigned little-endian, including the
@@ -1148,16 +1193,16 @@ capacity charge is not an on-media location and is deliberately excluded.
 
 ### 8.4. Discovery (Reader)
 
-A Scanner with no off-tape state first reads the sole Bootstrap at BOT to
-establish tape identity, block size, and parity geometry. It then positions to
-EOD and discovers the terminal index replicas:
+A Scanner with no off-tape state first reads the bootstrap at BOT to establish
+tape identity, block size, and parity geometry. It then positions to EOD and
+discovers the terminal replicas:
 
 1. locate, from EOD, the local footer of a terminal replica, and from it the
    planned terminal layout (Section 8.3);
 2. validate the header, footer and trailing filemark of every replica that
-   layout plans; a replica's payload need be validated only for the replica
-   to be accepted, or when the envelopes of two replicas differ in an
-   edition-common field (every such field is in the envelope);
+   layout plans; a replica's payload need be validated only for the replica to
+   be accepted, or when two replica envelopes differ in an edition-common
+   field;
 3. before accepting any replica, consider every replica that validates for
    conflict under Section 8.5;
 4. if no replica validates, perform the BOT structural recovery walk in
@@ -1169,76 +1214,79 @@ later component does not prove that the component was written. Filemarks and
 EOD are structural evidence and are not represented as payload bytes.
 
 All layout locations are committed plans calculated before terminal tape
-motion. Each footer records the writer's local file, start, and record-count
-observation and the header hash. A reader locates the frame from the immutable
+motion. Each footer records the Writer's local file, start, and record-count
+observation and the header hash. A Reader locates the frame from the immutable
 planned tuple, checks device-reported post-read positions for the addressed
 records and trailing filemark, and cross-checks the footer observation against
-that tuple. The footer's tape-file, start, and count fields are writer
+that tuple. The footer's tape-file, start, and count fields are Writer
 observations, not an independent device tape-file counter. A valid footer
 still does not prove its trailing filemark or any host-side commit record.
 
-When the block size is unknown, the discovery candidates (256 KiB, 512 KiB,
-1 MiB) MUST each be applied as a real drive reconfiguration before reading;
-a parsed bootstrap is accepted only if its `block_size_bytes` equals the
+When the block size is unknown, a Scanner MUST apply each discovery candidate
+(256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading. It
+accepts a parsed bootstrap only if its `block_size_bytes` equals the
 configured read size.
 
-A conformant Writer for production media MUST use one of the discovery-candidate
-block sizes. This closes the writer-legal set over the discovery set: every
-conformant tape is discoverable from the media alone, with no out-of-band
-hint. A
-Scanner MUST accept an operator-supplied block-size hint and apply it as a
-configured read size. The hint path serves damaged-media recovery and
-nonconformant tapes, not Writer freedom.
+A conformant Writer for production media MUST use one of the
+discovery-candidate block sizes. This closes the Writer-legal set over the
+discovery set: every conformant tape is discoverable from the media alone,
+with no out-of-band hint. A Scanner MUST accept an operator-supplied
+block-size hint and apply it as a configured read size. The hint path serves
+damaged-media recovery and nonconformant tapes, not Writer freedom.
 
-Replacement-draft terminal vectors use the same 256 KiB, 512 KiB, and 1 MiB
+The generation-2 terminal vectors use the same 256 KiB, 512 KiB, and 1 MiB
 record sizes as conformant media. The frozen publication archive contains
 historical 4096-byte major-1 images; those bytes are verified by the isolated
-publication tools and are not terminal-tail vectors. An operator may still
+publication tools and are not terminal-suffix vectors. An operator may still
 supply another size to the separate BOT structural walk for damaged or
-nonconformant media, but that hint cannot make a terminal replica or separation
-extent at that size eligible.
+nonconformant media, but that hint cannot make a terminal replica or
+separation extent at that size eligible.
 
-Section 10.6 defines the exact local eligibility conditions. A magic or
-CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport
-error aborts discovery. `drive_compression = true` on the BOT Bootstrap still
-rejects the tape (Sections 11.4, 16.3).
+Section 10.6 defines the exact local eligibility conditions. A magic or CRC
+miss invalidates that candidate. A medium error invalidates the affected
+candidate, while a non-medium transport error aborts discovery.
+`drive_compression = true` on the bootstrap still rejects the tape
+(Sections 11.4, 16.3).
 
 #### 8.4.1. All-Replicas-Invalid BOT Walk
 
 When A, B, and C are all absent or invalid, the Scanner MUST offer a full
-structural walk from BOT. The BOT Bootstrap supplies tape identity and geometry
-when readable. If it is unreadable, an operator-supplied block-size hint and
-expected tape-identity UUID are required. The identity hint is required because
-terminal, ParitySidecar, and ParityMap frame magics are derived from the tape
-UUID; geometry alone cannot derive, validate, or safely classify those frames.
+structural walk from BOT. The bootstrap supplies tape identity and geometry
+when it is readable. If it is unreadable, an operator-supplied block-size hint
+and expected tape-identity UUID are required.
+
+*Rationale.* The identity hint is required because terminal, ParitySidecar,
+and ParityMap frame magics are derived from the tape UUID; geometry alone
+cannot derive, validate, or safely classify those frames.
+
 The walk reconstructs tape-file boundaries, validates recognisable
 ParitySidecar and control structure, and measures complete Object candidates
 by elimination. It reports each candidate's identity as unknown unless a
 separate exact Object-recovery authority succeeds. Such authority MAY be a
 surviving fsynced host checkpoint journal or a representation-aware REM-OBJECT
-recovery pass; a rebuildable catalog projection alone is insufficient. It does
-not invent a terminal replica and it MUST report that terminal authority was
-not recovered.
+recovery pass. A rebuildable catalog projection alone is insufficient. The
+walk does not invent a terminal replica. The Scanner MUST report that terminal
+authority was not recovered.
 
 - **Optional Object authority.** Before emitting a recovered identifier, the
   Scanner MUST bind the authority to the expected tape UUID and block size,
   prove a committed structural-prefix boundary, and prove a bijection between
   its strictly ordered Object rows and every measured complete Object below
   that boundary. Each row MUST match the measured tape-file number and stored
-  block count and carry a 1–64-byte non-NUL Object identifier. Complete Objects at or
-  beyond the authority boundary remain unknown. A torn Object is incomplete
-  and MUST NOT inherit an authority row. Missing authority is not an error;
-  conflicting, corrupt, or non-repeatable authority MUST fail closed rather
-  than emit a guessed identity.
+  block count and carry a 1–64-byte non-NUL Object identifier. Complete
+  Objects at or beyond the authority boundary remain unknown. A torn Object is
+  incomplete and MUST NOT inherit an authority row. Missing authority is not
+  an error. The Scanner MUST fail closed on conflicting, corrupt, or
+  non-repeatable authority rather than emit a guessed identity.
 
 - **Identity and geometry hints.** A Scanner MUST accept an expected tape UUID
   and a block size supplied out of band. Expected tape UUID and block size are
-  mandatory when the BOT Bootstrap is unreadable. A block-size hint makes the
+  mandatory when the bootstrap is unreadable. A block-size hint makes the
   size known and is applied as a configured read size under the Section 8.4
   hint path, suppressing candidate rotation. Hints MUST NOT cause any tape
   file to be skipped.
-- **Termination.** The walk ends at EOD. Encountering EOM first is reported
-  as truncation and feeds the Section 12.6 tail taxonomy unchanged.
+- **Termination.** The walk ends at EOD. Encountering EOM first is reported as
+  truncation and feeds the completeness outcomes of Section 12.6 unchanged.
 
 Recommended practice for announcing the walk, reporting its progress and
 stopping it is described in the REM Implementation and Operations Guide, under
@@ -1248,14 +1296,15 @@ stopping it is described in the REM Implementation and Operations Guide, under
 
 A terminal replica is *fully valid* when it is locally eligible under
 Section 10.6. A Scanner MUST NOT accept a replica while another fully valid
-replica differs from it in any edition-common field: any row of kind
-*common* in the replica frame of Section 10.4, which together are the
-replicas' *edition* (Section 2.3). A disagreement in any edition-common field
-is `TerminalIndexReplicaConflict` and is never resolved by ordinal preference;
-a Scanner MUST NOT choose one side of a conflict merely because it is newer in
-the suffix. A missing or invalid replica is degraded evidence, not a conflict,
-and does not invalidate an agreeing survivor. If no replica validates,
-selection yields the explicit BOT structural recovery path of Section 8.4.1.
+replica differs from it in any edition-common field: any row of kind *common*
+in the replica frame of Section 10.4, which together are the replicas'
+*edition* (Section 2.3). A disagreement in any edition-common field is
+`TerminalIndexReplicaConflict` and is never resolved by ordinal preference; a
+Scanner MUST NOT choose one side of a conflict merely because it is newer in
+the terminal suffix. A missing or invalid replica is degraded evidence, not a
+conflict, and does not invalidate an agreeing survivor. If no replica
+validates, selection yields the explicit BOT structural recovery path of
+Section 8.4.1.
 
 ## 9. The Parity Sidecar Tape File
 
@@ -1294,12 +1343,12 @@ determined solely by the locator above from a shard's explicit `(stripe_index,
 parity_index)` fields; it is **independent of the order of that shard's entry in
 the Section 9.3 index stream** (which remains stripe-major). A Reader MUST locate
 a parity shard by computing `block(stripe, parity_index)` from its explicit
-fields, never by the position of its index entry. The tail copy MUST
-carry metadata and index content identical to the primary — only
-`copy_kind` and the recomputed CRCs differ — and when both copies parse,
-readers MUST verify they agree and reject divergence. The minimum block
-size for sidecars is 0xE0 — block 0 must hold the 0xC8-byte header, at least
-one 16-byte parity index entry, and the trailing 8-byte CRC.
+fields, never by the position of its index entry. The tail copy MUST carry
+metadata and index content identical to the primary; only `copy_kind` and the
+recomputed CRCs differ. When both copies parse, a Reader MUST verify that they
+agree and reject divergence. The minimum block size for sidecars is 0xE0 —
+block 0 must hold the 0xC8-byte header, at least one 16-byte parity index
+entry, and the trailing 8-byte CRC.
 
 ### 9.2. The Header Block (Block 0 of Each Copy) — All Little-Endian
 
@@ -1336,14 +1385,14 @@ one 16-byte parity index entry, and the trailing 8-byte CRC.
 | bs−8 | 8 | block0_crc64 | CRC-64/XZ over bytes 0..block_size−8 |
 
 An epoch protects the half-open ordinal range
-`[protected_ordinal_start, protected_ordinal_end_exclusive)`. The first
-epoch starts at ordinal 0; subsequent epoch ranges MUST be contiguous, with
-each start equal to the preceding end. Epoch ids MUST increase by one but
-carry no range arithmetic. `real_data_shard_count` MUST equal
-`protected_ordinal_end_exclusive − protected_ordinal_start`, MUST be in
-`1..=S × k`, and a value below `S × k` marks a short epoch whose missing
-logical positions are implicit zeros (Section 6.4). Short epochs are legal
-at any checkpoint boundary, including mid-tape.
+`[protected_ordinal_start, protected_ordinal_end_exclusive)`. The first epoch
+starts at ordinal 0; subsequent epoch ranges MUST be contiguous, with each
+start equal to the preceding end. Epoch ids MUST increase by one but carry no
+range arithmetic. `real_data_shard_count` MUST equal
+`protected_ordinal_end_exclusive − protected_ordinal_start` and MUST be in
+`1..=S × k`. A value below `S × k` marks a short epoch whose missing logical
+positions are implicit zeros (Section 6.4). Short epochs are legal at any
+checkpoint boundary, including mid-tape.
 
 ### 9.3. The Index Entry Stream
 
@@ -1413,9 +1462,9 @@ Appendix A.2.
 
 Excluded by construction: `copy_kind`, the reserved fields, `copy_generation`,
 the hash field itself, and all CRC fields. Both copies of one sidecar
-therefore carry the same hash, and the epoch directory (Section 10.1.5) can
-verify a surviving header copy independently of *which* copy survived.
-Readers MUST verify the hash on every index parse.
+therefore carry the same hash, and the sidecar epoch
+directory (Section 10.1.5) can verify a surviving header copy independently of
+*which* copy survived. Readers MUST verify the hash on every index parse.
 
 ### 9.6. The Footer Block (Last Block) — All Little-Endian
 
@@ -1439,7 +1488,7 @@ Readers MUST verify the hash on every index parse.
 The footer is a *locator*: it holds everything needed to find and check
 either header copy without reading the other, and it sits at the end of the
 tape file where it is found by reading the file's last block (Section 12.3
-item 4, Section 13.3).
+item 6, Section 13.3).
 
 ## 10. Final ParityMap, Terminal Replicas, and Separation Extents
 
@@ -1447,9 +1496,9 @@ This section defines the control tape files that finalization writes and the
 payload that every terminal replica carries: the final ParityMap and its
 sidecar epoch directory (Section 10.1); the structural rows (Section 10.2) and
 Object recovery rows (Section 10.3) of the fixed-slot payload; the replica
-frame and its digests (Section 10.4); the index separation extents
-(Section 10.5); and the conditions under which a replica is valid
-(Section 10.6). Section 8.3 places these files on the tape.
+frame and its digests (Section 10.4); the separation extents (Section 10.5);
+and the conditions under which a replica is valid (Section 10.6). Section 8.3
+places these files on the tape.
 
 ### 10.1. The Final ParityMap
 
@@ -1461,9 +1510,9 @@ and its `canonical_metadata_hash` — enough to locate and verify a surviving
 header copy even when scan-time classification of that sidecar failed
 (Section 13.3 step 3).
 
-When final parity closeout has a nonempty sidecar directory, the Writer emits
-exactly one `rem-parity-map-v1` ParityMap before replica A, and that ParityMap
-carries the directory.
+When final parity closeout has a nonempty sidecar epoch directory, the Writer
+emits exactly one `rem-parity-map-v1` ParityMap before replica A, and that
+ParityMap carries the directory.
 
 The ParityMap is parity-closeout metadata and one structural row in the fixed
 pre-A prefix; it is not terminal inventory authority. A generation-2 Writer
@@ -1598,11 +1647,11 @@ because finalization closes the partial epoch before it writes the ParityMap
 epoch closed by the finalization sequence (Section 11.3), and MUST leave it
 clear on a short epoch closed by a checkpoint barrier.
 
-**Decoder rules.** A decoder MUST validate all of the following invariants on
-every decode; a violation is `DirectoryInvalid` (Section 15). These restate at
-decode time what Section 9.2 requires of the on-tape sidecar-header sequence,
-because a directory MAY be trusted without reading those headers
-(Section 10.1.1):
+**Reader rules.** Whenever a Reader decodes a sidecar epoch directory, it MUST
+validate all of the following invariants; a violation is `DirectoryInvalid`
+(Section 15). A Reader MAY trust a directory without reading the sidecar
+headers (Section 10.1.1). The invariants below therefore restate at decode
+time what Section 9.2 requires of the on-tape sidecar-header sequence:
 
 - entries strictly ascending by `tape_file_number`, each `< scope_tape_file_count`;
 - non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and
@@ -1653,13 +1702,12 @@ Section 7.3, in that order, with an absent optional field encoded as `null`
  epoch_id:?u64]
 ```
 
-Kinds 0, 1, 2, and 3 mean Object, ParitySidecar, the sole BOT Bootstrap, and
-the optional final ParityMap. Structural row 0 MUST be the kind-2 BOT
-Bootstrap that Section 3.1 requires at tape file 0, so a final edition always
-has at least one structural row.
-Kinds 4 and 5 identify terminal replicas and gaps but MUST NOT occur in this
-payload because its scope ends immediately before A. Every structural and
-ordinal-range invariant is validated.
+Kinds 0, 1, 2, and 3 mean Object, ParitySidecar, Bootstrap, and the optional
+final ParityMap. Structural row 0 MUST be the kind-2 bootstrap that
+Section 3.1 requires at tape file 0. A final edition therefore always has at
+least one structural row. Kinds 4 and 5, which identify terminal replicas and
+separation extents, MUST NOT occur in this payload. Its scope ends immediately
+before A. Every structural and ordinal-range invariant is validated.
 
 ### 10.3. Object Recovery Rows
 
@@ -1675,7 +1723,7 @@ integer-keyed map:
 | 1 | uint | REQUIRED | filemark-delimited object `tape_file_number` |
 | 2 | tstr | REQUIRED | representation marker: `"plaintext"` or `"encrypted"` |
 | 3 | uint | REQUIRED | stored block count for the object tape file |
-| 4 | bytes, 1–64 | REQUIRED | REM-OBJECT `object_id` — the identity the archive answers "where is object X" with — carried verbatim as its 1–64 non-NUL bytes (any REM-ENCRYPT envelope NUL padding from [REMENCRYPT] §5.2 stripped). This matches [REMOBJECT] §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. |
+| 4 | bytes, 1–64 | REQUIRED | REM-OBJECT `object_id`, the identity the archive answers "where is object X" with, carried verbatim as its 1–64 non-NUL bytes. Any REM-ENCRYPT envelope NUL padding (REM-ENCRYPT §5.2) is stripped. The value matches REM-OBJECT §4.5.1 exactly: opaque UTF-8, 1–64 bytes, with no conversion. |
 | 10 | uint | plaintext only | `manifest_first_chunk_lba` |
 | 11 | uint | plaintext only | `manifest_size_bytes` |
 | 12 | uint | plaintext only | `manifest_chunk_count` |
@@ -1690,18 +1738,20 @@ They are grouped — 1–4 identity, 10–13 plaintext-only, 21–23 encrypted-o
 revision can place a new field beside its relatives (Section 5.3 governs
 assignment; unknown keys are ignored).
 
-Key 10 (`manifest_first_chunk_lba`) is the zero-based block index, *within
-the object's tape file*, of the first block of the manifest entry's payload —
-a REM-OBJECT inner `BodyLba`, not a Section 3.2 Logical LBA; one REM-OBJECT body block is
-one tape block (Section 4.4). Key 11 is the manifest's payload byte length,
-key 12 its block count, and key 13 the SHA-256 of its CBOR bytes. Key 21 is the
-REM-ENCRYPT header's `metadata_frame_len`; key 22 records the
-recipient epoch ids present in its key frame; key 23 is the header's
-`key_frame_len`. The semantics of these three keys, and the key 21 and key 23
-bounds, are defined by [REMENCRYPT], which is a normative reference for
-implementations of terminal Object recovery rows; the requirement that key 22's `recipient_epoch_id`
-values be distinct and nonzero is imposed by this document, for the benefit of
-a catalog-less scan that must tell recipient slots apart.
+Key 10 (`manifest_first_chunk_lba`) is the zero-based index, *within the
+Object's tape file*, of the first chunk of the manifest entry's payload: a
+REM-OBJECT inner `BodyLba`, not a Section 3.2 Logical LBA. In a plaintext copy
+one REM-OBJECT chunk is one tape block (Section 4.4). Key 11 is the manifest's
+payload byte length, key 12 its chunk count, and key 13 the SHA-256 of its
+CBOR bytes. Key 21 is the REM-ENCRYPT header's `metadata_frame_len`; key 22
+records the recipient epoch ids present in its key frame; key 23 is the
+header's `key_frame_len`. The semantics of these three keys, and the key 21
+and key 23 bounds, are defined by [REMENCRYPT], which is a normative reference
+for implementations of terminal Object recovery rows. The requirement that
+key 22's `recipient_epoch_id` values be distinct and nonzero is imposed by
+this document.
+
+*Rationale.* A catalog-less scan must tell recipient slots apart.
 
 Plaintext rows MUST carry keys 10–13 and MUST NOT carry keys 21–23.
 Encrypted rows MUST carry keys 21–23 and MUST NOT carry keys 10–13. For
@@ -1751,8 +1801,8 @@ one trailing filemark
 ```
 
 The header never shares a record with payload bytes. The replica footer is a
-record of the kind-4 tape file; it is not a kind-2 Bootstrap, and there is no
-Bootstrap after C. The payload is all 64-byte structural slots in tape-file
+record of the kind-4 tape file; it is not a kind-2 bootstrap, and there is no
+bootstrap after C. The payload is all 64-byte structural slots in tape-file
 order (Section 10.2) followed by all 256-byte Object recovery-row slots in
 matching Object order (Section 10.3). It runs contiguously across the payload
 records, and the `payload_padding_bytes` that follow it in the last payload
@@ -1825,9 +1875,9 @@ comes from, not by whether it differs between replicas.
 | local | Replica-local: belongs to one replica | Compared with that replica's plan, its measured observation, or its recomputed digest |
 | fixed | A format constant, a reserved zero, or a value set by the frame's role | Equal to the value the row states |
 
-A replica-local value may coincide across a healthy triple: the observed
-record count (`0x2E8`) and the backward start delta (`0x2F8`) are equal in A,
-B, and C by construction.
+A replica-local value may coincide in all three terminal replicas of a healthy
+tape: the observed record count (`0x2E8`) and the backward start delta
+(`0x2F8`) are equal in A, B, and C by construction.
 
 In a footer, the backward start delta (`0x2F8`) MUST equal the observed record
 count (`0x2E8`) minus one, and the observed footer LBA (`0x2F0`) MUST equal the
@@ -1840,10 +1890,11 @@ fields are zero.
 The edition ID (`0x020`) is 16 bytes chosen by the Writer when it finalizes
 the tape; it MUST NOT be all zero. The edition sequence (`0x030`) is a u64
 chosen by the Writer; it MUST NOT be zero. A Reader rejects a zero value of
-either. No Reader decision defined by this document depends on their values beyond
-the zero check and equality: both are edition-common fields, so they are equal in A, B and C
-(Section 8.5), and the edition ID is also equal in both separation extents
-(Section 10.6), whose frame carries no edition sequence.
+either. No Reader decision defined by this document depends on their values
+beyond the zero check and equality: both are edition-common fields, so they
+are equal in A, B and C (Section 8.5), and the edition ID is also equal in
+both separation extents (Section 10.6), whose frame carries no edition
+sequence.
 
 Each magic is derived as in Section 5.2 from the tape UUID and the role's
 label. The labels are exactly:
@@ -1897,7 +1948,7 @@ The header and footer repeat the same descriptor digest. A footer therefore
 cannot bind another ordinal or location. The fields that replicas must share
 are stated once, in Section 8.5.
 
-### 10.5. Index Separation Extents
+### 10.5. Separation Extents
 
 **Record geometry.** The nominal extent includes its header and footer. For
 nominal extent bytes `E` and block size `B`:
@@ -1995,8 +2046,8 @@ never falls through to Object (Section 12.3).
   of the terminal record sizes of Section 8.3.
 - Every size formula of Section 10.4 evaluates without overflow, and the
   recorded geometry fields equal its results.
-- The five-component plan validates against Section 8.3, and its layout
-  digest recomputes to the recorded value.
+- The planned layout of the terminal suffix validates against Section 8.3, and
+  its layout digest recomputes to the recorded value.
 - The edition digest and the local descriptor digest recompute to the
   recorded values.
 - The footer's backward delta names the same header start as the discovered
@@ -2020,7 +2071,7 @@ additional relationships hold:
 - `covered_prefix_tape_file_count`, `structural_row_count`, and replica A's
   planned tape-file number are equal.
 
-An index separation extent is valid when its header and footer satisfy the
+A separation extent is valid when its header and footer satisfy the
 conditions in the first list above, read against the fields of Section 10.5
 in place of those of Section 10.4, with two exceptions: the payload condition
 does not apply, because an extent has no payload, and in the digest condition
@@ -2033,7 +2084,7 @@ The validity of a separation extent does not affect whether a replica is
 accepted for an inventory. A Scanner that reads only the replicas to return an
 inventory need not read the separation extents. A Verifier performing full
 verification MUST check that every interior byte of both separation extents is
-zero; an extent whose interior is not entirely zero is invalid for full
+zero. An extent whose interior is not entirely zero is invalid for full
 verification. A Verifier that finds a separation extent invalid MUST report it
 and MUST NOT report the terminal suffix as complete.
 
@@ -2041,8 +2092,8 @@ and MUST NOT report the terminal suffix as complete.
 
 ### 11.1. Commit Discipline (per Tape File)
 
-Every tape file — object, sidecar, Bootstrap, ParityMap, terminal replica, or separation
-extent — goes through one cycle:
+Every tape file — object, sidecar, bootstrap, ParityMap, terminal replica, or
+separation extent — goes through one cycle:
 
 ```text
 begin                      (at the durable boundary; dense numbering; one in flight)
@@ -2083,52 +2134,52 @@ and Operations Guide, under “Writing tapes: sessions, commit and resume”.
 
 ### 11.2. Epochs and Sidecars
 
-Parity accumulates incrementally per data block (Section 6.3). At `S × k`
-data blocks the epoch closes into a **pending** sidecar; no tape I/O
-occurs mid-object. Pending sidecars are emitted as tape files when the
-current object closes. A barrier may close a non-empty short epoch and emit
-its sidecar without `FINAL_PARTIAL_EPOCH`. Finalization performs the same
-funnel with a terminal reason: its short epoch, if any, carries
-`FINAL_PARTIAL_EPOCH`, after which the Writer emits the final ParityMap when
-required and then the exact terminal triple.
-Implicit-zero positions never cause padding blocks to be written (Section 6.4).
+Parity accumulates incrementally per data block (Section 6.3). At `S × k` data
+blocks the epoch closes into a **pending** sidecar; no tape I/O occurs
+mid-object. Pending sidecars are emitted as tape files when the current object
+closes. A barrier may close a non-empty short epoch and emit its sidecar
+without `FINAL_PARTIAL_EPOCH`. Finalization performs the same funnel with a
+terminal reason: its short epoch, if any, carries `FINAL_PARTIAL_EPOCH`, after
+which the Writer emits the final ParityMap when required and then the terminal
+suffix. Implicit-zero positions never cause padding blocks to be written
+(Section 6.4).
 
-After each object's close-and-emit bundle, unprotected ordinals MUST number
-fewer than `S × k` — the version-1 bounded-restart rule: at most one open
-epoch ever needs rebuilding (Section 14 step 2).
+After each Object's close-and-emit bundle, unprotected ordinals MUST number
+fewer than `S × k`. This is the version-1 bounded-restart rule: at most one
+open epoch ever needs rebuilding (Section 14 step 2).
 
 ### 11.3. Finalization
 
 Finalization is permitted only between objects; a mid-object request MUST be
 refused. It closes the partial epoch, emits all remaining sidecars, writes one
-final ParityMap when the resulting sidecar directory is nonempty, fixes one
-immutable snapshot including that structural row, and writes exactly replica A,
-separation AB, replica B,
-separation BC, and replica C, each followed by a filemark and persistence
-barrier. A finalized tape accepts no further appends.
+final ParityMap when the resulting sidecar epoch directory is nonempty, fixes
+one immutable snapshot including that structural row, and writes exactly
+replica A, separation extent AB, replica B, separation extent BC, and replica
+C, each followed by a filemark and persistence barrier. A finalized tape
+accepts no further appends.
 
-The first finalization transition permanently disables Object
-admission. Failure enters `RecoveryRequired`; recovery may emit only missing
-terminal control components at proved positions.
-It cannot reopen the tape or write a second terminal triple (Section 3.4).
+The first finalization transition permanently disables Object admission.
+Failure enters `RecoveryRequired`; recovery may emit only missing tape files
+of the terminal suffix, at proved positions. It cannot reopen the tape or
+write a second terminal suffix (Section 3.4).
 
 ### 11.4. Session Preconditions
 
 Drive hardware compression MUST be verified off before any parity write. The
 effective value is recorded as bootstrap key 5. A parity bootstrap recording
-`true` MUST be rejected by readers and writers alike (Section 16.3). A
-writer MUST treat hard end-of-medium mid-file as a commit failure (Section
-11.1), never as a signal to truncate an object.
+`true` MUST be rejected by Readers and Writers alike (Section 16.3). A Writer
+MUST treat hard end-of-medium mid-file as a commit failure (Section 11.1),
+never as a signal to truncate an object.
 
 ## 12. Scanner Obligations
 
 ### 12.1. Inputs and Authority
 
-An off-tape catalog is a cache. The mounted tape's BOT Bootstrap establishes
+An off-tape catalog is a cache. The mounted tape's bootstrap establishes
 identity, and a finalized tape's selected terminal replica supplies the
-authoritative inventory. If terminal selection yields no
-valid replica, the Scanner returns the explicit BOT structural-recovery outcome
-and walks from LBA 0.
+authoritative inventory. If terminal selection yields no valid replica, the
+Scanner returns the explicit BOT structural-recovery outcome and walks from
+LBA 0.
 
 ### 12.2. The Walk
 
@@ -2139,31 +2190,38 @@ structural damage; EOD at a file start ends the walk.
 
 ### 12.3. The Classification Ladder
 
-1. **Bootstrap**: the fixed magic matches, the full frame parses, the
-   frame's `block_size_bytes` equals the read size, the payload's
-   `tape_uuid` equals the tape identity of Section 12.1, and the file measures
-   exactly 1 block.
+The bootstrap at tape file 0 establishes the tape identity against which every
+later classification is checked. When the bootstrap cannot be read, the
+identity is the expected tape UUID supplied out of band (Section 8.4.1). The
+items below are numbered for reference, not as an order of trial: items 1 to 6
+recognise kinds that their magics keep disjoint, and item 7 applies to a tape
+file that none of them recognises.
+
+1. **Bootstrap**: the fixed magic matches, the full frame parses, the frame's
+   `block_size_bytes` equals the read size, the frame's `tape_uuid` equals the
+   tape identity of Section 12.1, and the file measures exactly 1 block.
 2. **TapeIndexReplica**: matching terminal-replica header magic commits the
    tape file to this control type. The header and measured block count are
    checked against the encoded component plan. A malformed frame or count
-   mismatch is reported as damaged terminal control; it MUST NOT fall through
+   mismatch is reported as a damaged terminal replica; it MUST NOT fall through
    to Object. When the head is unreadable, a matching, fully parsed terminal
    footer may establish the same type after its measured count is checked.
 3. **IndexSeparationExtent**: matching separation-header magic commits the
    tape file to this control type under the same malformed-control and measured
    count rules. A matching, fully parsed footer may establish the type when the
    head is unreadable.
-4. **ParityMap**: a complete copy/header and payload validate, and the measured
-   block count agrees with its locator footer. It is classified as pre-tail
-   parity-closeout metadata, not selected as terminal inventory authority.
-5. **Sidecar (primary)**: the primary header parses; the measured block
-   count MUST equal the header's `sidecar_total_block_count` (mismatch is a
-   hard error).
-6. **Sidecar (footer/tail probe)**: read the file's last block; if it
-   parses as a sidecar footer, the footer's total MUST equal the measured
-   block count; then verify the tail header copy against the footer,
-   field for field. Classification MAY fall back to footer fields alone if
-   the tail copy is unreadable.
+4. **ParityMap**: a complete copy/header and payload validate, and the
+   measured block count agrees with its locator footer. It is classified as
+   parity-closeout metadata written before the terminal suffix, not selected
+   as terminal inventory authority.
+5. **Sidecar (primary)**: the primary header parses, and the measured block
+   count MUST equal the header's `sidecar_total_block_count`. A mismatch is a
+   hard error.
+6. **Sidecar (footer/tail probe)**: the Scanner reads the file's last block.
+   If it parses as a sidecar footer, the footer's total MUST equal the
+   measured block count, and the Scanner verifies the tail header copy against
+   the footer, field for field. The Scanner MAY classify from the footer
+   fields alone if the tail copy is unreadable.
 7. **Object, by elimination** — never by reading object content.
 
 In items 2 through 6, a count-mismatch “hard error” is scoped to that rung and
@@ -2173,9 +2231,10 @@ abort the whole walk for that mismatch.
 
 **Unreadable head block:** the Scanner MUST NOT abort. It MUST measure the
 file by filemark spacing, run the footer/tail sidecar probe, and otherwise
-classify the file as an object candidate. This is the no-circular-failure
-rule in action: the block needing recovery may be the very block that would
-have classified the file.
+classify the file as an object candidate.
+
+*Rationale.* This is the no-circular-failure rule in action: the block needing
+recovery may be the very block that would have classified the file.
 
 ### 12.4. Terminal Replica Validation
 
@@ -2189,12 +2248,13 @@ Section 8.5.
 
 Map and Object rows that a Scanner emits before its terminal summary are
 provisional: each belongs to one attempt at one replica, and only the attempt
-the terminal summary selects is the inventory.
-A Consumer MUST commit only the attempt named by the terminal summary and MUST
-discard rejected or unselected attempts.
+the terminal summary selects is the inventory. An Inventory Consumer MUST
+commit only the attempt named by the terminal summary and MUST discard
+rejected or unselected attempts.
 
-Recommended practice for streaming an inventory to a consumer is described in
-the REM Implementation and Operations Guide, under “Reading tapes”.
+Recommended practice for streaming an inventory to an Inventory Consumer is
+described in the REM Implementation and Operations Guide, under
+“Reading tapes”.
 
 If A, B, and C all fail, the Scanner returns an explicit
 `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk;
@@ -2204,27 +2264,29 @@ or infer the existence of a planned future component from A or B.
 
 ### 12.5. Epoch Isolation
 
-Damage confined to one sidecar's metadata — any or all of its header
-copies, its footer, its directory entry's health flags — MUST NOT degrade
-classification, mapping, digest validation, or recovery of any other epoch.
-At worst the damaged epoch becomes "metadata unavailable"
-(`SidecarMetadataUnavailable`, scoped to that epoch by definition). Copy
-health is deliberately excluded from the canonical digest so that
-*discovering* damage never invalidates the map (Section 7.3).
+Damage confined to one sidecar's metadata — any or all of its header copies,
+its footer, its directory entry's health flags — MUST NOT degrade
+classification, mapping, digest validation, or recovery of any other epoch. At
+worst the damaged epoch becomes "metadata unavailable"
+(`SidecarMetadataUnavailable`, scoped to that epoch by definition).
+
+*Rationale.* Copy health is deliberately excluded from the canonical digest so
+that *discovering* damage never invalidates the map (Section 7.3).
 
 ### 12.6. Terminal Completeness
 
-A normal finalized tape has the exact suffix in Section 8.3 and EOD immediately
-after C's trailing filemark. Planned future tuples in an earlier component never
-attest that the later component, its filemark, or its barrier exists.
+A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD
+immediately after C's trailing filemark. Planned future tuples in an earlier
+component never attest that the later component, its filemark, or its barrier
+exists.
 
-On a tape presented without host state, a validating C/B/A survivor attests the
-complete fixed pre-tail snapshot carried in that replica. Missing or invalid
+On a tape presented without host state, a validating C/B/A survivor attests
+the complete terminal inventory carried in that replica. Missing or invalid
 siblings make the result degraded; disagreement makes it a conflict. No valid
 replica invokes the explicit BOT structural walk, whose result is recovery
-evidence rather than a fabricated terminal edition. A structural artifact after
-the exact terminal suffix is nonconformant and MUST NOT be admitted as an
-Object.
+evidence rather than a fabricated terminal edition. A structural artifact
+after the exact terminal suffix is nonconformant and MUST NOT be admitted as
+an Object.
 
 ## 13. Recoverer Obligations
 
@@ -2256,13 +2318,12 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    the map is treated as an invalid footer, not as a hard stop — fall back to
    the primary header at block 0 (copy-kind and map-entry block-count
    cross-checks apply).
-3. **Directory-assisted tail rescue.** If the primary also fails and an
-   epoch-directory entry is available: locate the tail copy at block
+3. **Directory-assisted tail rescue.** If the primary also fails and a sidecar
+   epoch directory entry is available: locate the tail copy at block
    `sidecar_total_block_count − 1 − sidecar_header_block_count` using the
-   entry's counts, and verify its `canonical_metadata_hash` against the
-   entry. The directory carries exactly the counts and hash needed to find
-   and verify the tail copy without the footer — the case it exists for
-   (Section 10.1.1).
+   entry's counts, and verify its `canonical_metadata_hash` against the entry.
+   The directory carries exactly the counts and hash needed to find and verify
+   the tail copy without the footer — the case it exists for (Section 10.1.1).
 4. Only when no header/index copy can be validated is the epoch
    **metadata-unavailable** — and only that epoch (Section 12.5).
 
@@ -2294,12 +2355,13 @@ Reconstruct per Section 6.5 from the first `k` trusted or implicit shards
 a stripe is unrecoverable — a typed result carrying the stripe and the
 counts (`Unrecoverable{stripe, lost_count, limit}`).
 
-Every reconstructed data block MUST be verified against its sidecar data
-CRC before release. A mismatch is an unrecoverable result — typed
-distinguishably from parse failures and refusals, e.g. as `Unrecoverable`
-with the stripe and counts — even though the
-matrix algebra succeeded: it means some trusted input was wrong, and
-releasing the output would convert detected damage into silent corruption.
+Every reconstructed data block MUST be verified against its sidecar data CRC
+before release. A mismatch is an unrecoverable result, even though the matrix
+algebra succeeded. It is typed distinguishably from parse failures and
+refusals, for example as `Unrecoverable` with the stripe and counts.
+
+*Rationale.* A mismatch means that some trusted input was wrong, and releasing
+the output would convert detected damage into silent corruption.
 
 ### 13.6. Bulk Recovery (Informative)
 
@@ -2341,15 +2403,15 @@ The error names below are normative for the test-vector manifests
 (Section 17); surface syntax is not.
 
 ```text
-NoBootstrapFound                BOT identity Bootstrap is absent or invalid
+NoBootstrapFound                bootstrap is absent or invalid
 BootstrapParse                  bootstrap frame or payload violates Section 8
 BootstrapPayloadTooLarge        framed BOT payload cannot fit the block
 SidecarParse                    sidecar structure violates Section 9
 SidecarMetadataUnavailable{epoch_id}   no header/index copy validated (Section 13.3)
-ParityMapParse                  final pre-tail ParityMap violates Section 10.1
+ParityMapParse                  final ParityMap violates Section 10.1
 DirectoryInvalid                well-formed sidecar epoch directory breaks an invariant of Section 10.1.5
 TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6
-TerminalIndexSeparationParse    typed separation extent violates Section 8.3, 10.5, or 10.6
+TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6
 TerminalIndexReplicaConflict    independently valid survivors disagree
 BotStructuralRecoveryRequired   no terminal replica validates; explicit BOT walk required
 SchemeMismatch                  sidecar geometry disagrees with the bootstrap scheme
@@ -2373,7 +2435,7 @@ Journal                         commit-store failure (not a format violation)
 Framing, CBOR, and type errors in a ParityMap, its directory included, are
 `ParityMapParse`; a well-formed directory that breaks an invariant of
 Section 10.1.5 is `DirectoryInvalid`. The name is normative as a category:
-this document does not specify which of the two a parser reports once it has
+this document does not specify which of the two a Reader reports once it has
 failed both ParityMap copies.
 
 Refusals (Section 13.2), parse failures, and reconstruction failures MUST
@@ -2400,21 +2462,23 @@ is a secret-key authenticity claim.
 All tape bytes are untrusted. The bounds below are normative. Every declared
 count or length is validated against the measured physical extent. All
 arithmetic on tape-derived values is checked. Reserved fields and declared
-zero-fill MUST be verified zero. Misuse of reserved space is nonconformance, and
-silent acceptance would foreclose 1.x extensions. The sole exception is the
-bootstrap's trailing fill, which is excluded from acceptance decisions (Section
-8.1). CBOR decoding enforces the Section 5.3 subset. Writer-supplied diagnostic
-text (bootstrap keys 3 and 4, and ParityMap keys 6 and 7) is bounded in length
-and charset. A value violating either bound is treated as absent (Sections 8.2
-and 10.1.4). The reason for bounding that text, and for escaping it wherever it
-is shown, is that those fields are the first human-readable text a diagnostic
-tool prints from an unknown cartridge. The operator reading them is deciding
-whether the cartridge is damaged or hostile, and the text is chosen by whoever
-wrote the tape.
+zero-fill MUST be verified zero. Misuse of reserved space is nonconformance,
+and silent acceptance would foreclose 1.x extensions. The sole exception is
+the bootstrap's trailing fill, which is excluded from acceptance decisions
+(Section 8.1). CBOR decoding enforces the Section 5.3 subset. Writer-supplied
+diagnostic text (bootstrap keys 3 and 4, and ParityMap keys 6 and 7) is
+bounded in length. The same text is bounded in charset. A value violating
+either bound is treated as absent (Sections 8.2 and 10.1.4).
+
+*Rationale.* That text is bounded, and escaped wherever it is shown, because
+those fields are the first human-readable text a diagnostic tool prints from
+an unknown cartridge. The operator reading them is deciding whether the
+cartridge is damaged or hostile, and the text is chosen by whoever wrote the
+tape.
 
 A hostile or damaged cartridge can also declare counts and lengths chosen to
-exhaust a reader's memory, or carry bytes chosen to crash a parser. Neither
-changes what a conformant reader concludes from a valid tape, but either can
+exhaust a Reader's memory, or carry bytes chosen to crash a parser. Neither
+changes what a conformant Reader concludes from a valid tape, but either can
 stop a tool before it reaches a conclusion. Coverage-guided fuzzing of the
 parsers and of the scan walk is REM-PARITY freeze criterion 3, recorded in
 `specs/README.md`. Recommended practice for handling such media is described
@@ -2423,37 +2487,38 @@ media”.
 
 ### 16.3. Compression Interaction
 
-Parity correctness assumes block-to-media identity: the damage geometry
-model (Section 3.3) is meaningful only if the Nth logical block occupies
-the Nth physical block's worth of media. Hardware compression silently
-breaks that correspondence while appearing to work. Hence the dual defense:
-the writer verifies compression off before writing (Section 11.4), and the
-recorded `drive_compression` flag (bootstrap key 5) makes a tape written
-with compression enabled identify itself as nonconformant — readers MUST
-reject it.
+Parity correctness assumes block-to-media identity: the damage geometry model
+(Section 3.3) is meaningful only if the Nth logical block occupies the Nth
+physical block's worth of media. Hardware compression silently breaks that
+correspondence while appearing to work. Hence the dual defense. The Writer
+verifies compression off before writing (Section 11.4). The recorded
+`drive_compression` flag (bootstrap key 5) makes a tape written with
+compression enabled identify itself as nonconformant. A Reader MUST reject
+such a tape.
 
 ### 16.4. Structure Leakage and Confidential Payloads
 
 This format's structures are plaintext on the tape and content-blind at the
-block layer, but they still reveal *shape*: the number of objects, each
-object's block count, the write timeline (bootstrap timestamps and
-sequences), and per-block CRC-64 values of stored bytes. An unkeyed CRC of
-a stored block can confirm a guessed block's content. Storing objects in an
-encrypted representation (for example, [REMENCRYPT] envelopes) prevents this,
-because it makes every stored block — and therefore every CRC and parity
-computation — a function of ciphertext.
+block layer, but they still reveal *shape*: the number of Objects, each
+Object's block count, the write timeline (the timestamps and sequence numbers
+that the bootstrap, the ParityMap and the terminal replicas record), and
+per-block CRC-64 values of stored bytes. An unkeyed CRC of a stored block can
+confirm a guessed block's content. Storing Objects in an encrypted
+representation (for example, [REMENCRYPT] envelopes) prevents this, because it
+makes every stored block — and therefore every CRC and parity computation — a
+function of ciphertext.
 
 Each terminal replica's fixed 256-byte Object-row slot is the designated
-bounded surface for payload-binding recovery metadata. A plaintext REM-OBJECT row exposes manifest location,
-manifest size, manifest chunk count, and manifest digest; this is acceptable
-because plaintext REM-OBJECT objects are not confidential against a tape reader.
-An encrypted REM-OBJECT row exposes only recipient epoch ids, `metadata_frame_len`,
-and `key_frame_len`, all already plaintext in the REM-ENCRYPT envelope
-stored in the same tape file. The encrypted row MUST NOT carry plaintext
-manifest anchors
-(`manifest_first_chunk_lba`, `manifest_size_bytes`, `manifest_chunk_count`,
-or `manifest_sha256`), because those values describe confidential inner
-content and would add leakage beyond the REM-ENCRYPT envelope.
+bounded surface for payload-binding recovery metadata. A plaintext REM-OBJECT
+row exposes manifest location, manifest size, manifest chunk count, and
+manifest digest; this is acceptable because plaintext REM-OBJECT objects are
+not confidential against a tape reader. An encrypted REM-OBJECT row exposes
+only recipient epoch ids, `metadata_frame_len`, and `key_frame_len`, all
+already plaintext in the REM-ENCRYPT envelope stored in the same tape file.
+The encrypted row MUST NOT carry plaintext manifest anchors
+(`manifest_first_chunk_lba`, `manifest_size_bytes`, `manifest_chunk_count`, or
+`manifest_sha256`). Those values describe confidential inner content and would
+add leakage beyond the REM-ENCRYPT envelope.
 
 ## 17. Test Vectors
 
@@ -2466,27 +2531,27 @@ candidate vectors under
 
 The candidate set contains minimal and multi-object inventories at each legal
 record size: 256 KiB, 512 KiB, and 1 MiB. Every profile contains five byte
-streams in the exact A/gap-AB/B/gap-BC/C order. Filemarks and EOD are recorded
-as structural expectations in `MANIFEST.tsv`, not encoded into those files.
-Compact gaps use a test profile with nominal gap bytes `E = 3*B`
-(Section 10.5): one header, one zero interior record, and one footer. The
-compact profile changes only the recorded nominal extent and derived count; it
-does not change framing or validation rules. The default one-GiB gaps are
-exercised by the VTL matrix and remain part of the supervised physical-media
-obligation. The multi-object candidate prefix includes the one final pre-A
-ParityMap row produced by nonempty sidecar closeout; that ParityMap is not
-part of the five-component terminal layout or a substitute for A/B/C
-authority.
+streams in the order of the terminal suffix: A, AB, B, BC, C. Filemarks and
+EOD are recorded as structural expectations in `MANIFEST.tsv`, not encoded
+into those files. Compact separation extents use a test profile with nominal
+extent bytes `E = 3*B` (Section 10.5): one header, one zero interior record,
+and one footer. The compact profile changes only the recorded nominal extent
+and derived count; it does not change framing or validation rules. The default
+one-GiB separation extents are exercised by the VTL matrix and remain part of
+the supervised physical-media obligation. The multi-object candidate prefix
+includes the one final pre-A ParityMap row produced by nonempty sidecar
+closeout; that ParityMap is not part of the terminal suffix or a substitute
+for A/B/C authority.
 
 The generator is
 `crates/remanence-parity/examples/generate_terminal_index_vectors.rs`. The
-independent verifier `tools/verify_terminal_index_vectors.py` re-derives
-HMAC role magics, CRC-64/XZ, full-file SHA-256, header hashes, local
-observations, record formulas, component ordering, dense file numbers, logical
-positions, zero gap interiors, and terminal EOD without calling the Rust
-codec. Candidate bytes remain mutable until the specification freezes; the
-recorded independent derivation and incremental implementation review are
-pre-freeze evidence rather than publication.
+independent verifier `tools/verify_terminal_index_vectors.py` re-derives HMAC
+role magics, CRC-64/XZ, full-file SHA-256, header hashes, local observations,
+record formulas, component ordering, dense file numbers, logical positions,
+the zero interiors of the separation extents, and terminal EOD without calling
+the Rust codec. Candidate bytes remain mutable until the specification
+freezes; the recorded independent derivation and incremental implementation
+review are pre-freeze evidence rather than publication.
 
 How candidate vectors are handled until this document is frozen, and what the
 negative candidates must cover by then, are recorded in the release record,
@@ -2503,7 +2568,7 @@ that remain open.
 After freeze, revisions are governed by the change policy in the Status of This
 Document section: errata and conforming minor revisions are permitted, and
 anything that would invalidate an existing tape, change the meaning of
-anything already written, or leave an earlier reader unable to identify and
+anything already written, or leave an earlier Reader unable to identify and
 cleanly refuse a newer one is a new major version.
 
 ## 19. IANA Considerations
@@ -2564,8 +2629,7 @@ required to implement it.
 
 At the default scheme (k = 128, m = 4, S = 512) with 256 KiB blocks:
 
-- One epoch protects `E = S × k = 65,536` data ordinals = 16 GiB of object
-  data.
+- One epoch protects `S × k = 65,536` data ordinals = 16 GiB of object data.
 - Its sidecar carries `P = S × m = 2,048` parity shards = 512 MiB, a 3.125%
   overhead.
 - Contiguous damage tolerance: `S × m = 2,048` blocks = 512 MiB — any run
@@ -2624,8 +2688,8 @@ SHA-256 of these 25 bytes is
 
 ### A.4. A Minimal Tape, End to End
 
-A smallest-useful finalized generation-2 tape has the sole BOT Bootstrap
-followed by its Object/ParitySidecar prefix and the exact terminal suffix:
+A smallest-useful finalized generation-2 tape has the bootstrap followed by
+its Object/ParitySidecar prefix and the exact terminal suffix:
 
 ```text
 file 0   Bootstrap
@@ -2640,10 +2704,10 @@ EOD
 ```
 
 Each replica carries the identical three-row fixed prefix and one Object
-recovery row. A Scanner starts from EOD, validates C and survivor agreement,
-then exposes that inventory. If C is damaged it tries B, then A. If all three
-are invalid it reports terminal authority unavailable and performs the explicit
-BOT structural walk; it never treats the tape as empty.
+recovery row. A Scanner reads the replicas from EOD and exposes the inventory
+of one that validates and agrees with every other valid replica (Section 8.5).
+If all three are invalid it reports terminal authority unavailable and
+performs the explicit BOT structural walk; it never treats the tape as empty.
 
 ## Appendix B. Design Rationale (Informative)
 
@@ -2675,10 +2739,10 @@ most one parity shard per stripe per `S` blocks traversed. This is what makes
 the guarantee hold across the **data→sidecar boundary**, not only within object
 data. Worst case, one full-epoch object at default geometry (`k=128, m=4, S=512`,
 `H=3`): a stripe's last data shard sits at LBA `(k−1)·S + s`; its parity shards
-at LBA `E + 1 + H + j·S + s` (the `+1` is the terminating filemark), spaced `S`
-apart and phase-shifted from the data lattice by `1 + H`. Destroying a stripe
-requires erasing `m + 1` of its shards; the shortest contiguous span covering
-its data shard and `m` parity shards is
+at LBA `S × k + 1 + H + j·S + s` (the `+1` is the terminating filemark),
+spaced `S` apart and phase-shifted from the data lattice by `1 + H`.
+Destroying a stripe requires erasing `m + 1` of its shards; the shortest
+contiguous span covering its data shard and `m` parity shards is
 
 ```text
 span = (m − 1)·S + (S + 1 + H) + 1 = m·S + H + 2 = 2053 blocks ≈ 513 MiB.
@@ -2715,18 +2779,19 @@ correct and maximally robust.
 
 A short epoch is closed by *declaring* the missing logical positions
 all-zero rather than writing padding blocks. Tape capacity is never spent
-on filler; the sidecar's `real_data_shard_count` tells readers which
+on filler; the sidecar's `real_data_shard_count` tells a Reader which
 positions are implicit; and the parity arithmetic is unaffected because
 all-zero shards contribute nothing to any accumulator.
 
 ### B.4. Derived Magics
 
-Sidecar and terminal-control magics are HMAC(tape_uuid, role label) so that a
-block can be attributed to *this tape* and *this role* without any further
-context — stale blocks from a recycled tape, or blocks from another tape in
-a mixed pile, fail the magic check immediately. The bootstrap's magic must
-stay fixed: it is the entry point read before the UUID is known. Derived
-magics are identity, not security (Section 16.1).
+Sidecar, ParityMap, terminal-replica and separation-extent magics are
+HMAC(tape_uuid, role label) so that a block can be attributed to *this tape*
+and *this role* without any further context — stale blocks from a recycled
+tape, or blocks from another tape in a mixed pile, fail the magic check
+immediately. The bootstrap's magic must stay fixed: it is the entry point read
+before the UUID is known. Derived magics are identity, not security
+(Section 16.1).
 
 ### B.5. The Bootstrap Endianness Mix Is Frozen
 
@@ -2747,18 +2812,18 @@ what recovery needs to be fenced by.
 
 ### B.7. Three Complete Replicas Are Separated Physically
 
-Each A/B/C member is independently usable: full header, streamed body, local
-footer, and trailing filemark. The two typed gaps are physical separation, not
-additional index copies. Three complete replicas tolerate the loss of either
-end and one middle region without any geometric placement rule. Requiring
-surviving editions to agree prevents ordinal preference from hiding a split
-authority.
+Each terminal replica is independently usable: full header, streamed body,
+local footer, and trailing filemark. The two separation extents are physical
+separation, not additional index copies. Three complete replicas tolerate the
+loss of either end and one middle region without any geometric placement rule.
+Requiring surviving editions to agree prevents ordinal preference from hiding
+a split authority.
 
 ### B.8. Checkpoint Authority Stays off Tape
 
 Open-tape commit state lives in durable off-tape commit records (Section 3.4).
 Ordinary checkpoint barriers close any pending parity epoch, prove the covered
-files durable, and advance those records; they do not append a Bootstrap or an
+files durable, and advance those records; they do not append a bootstrap or an
 index. On restart, the Writer reconciles the measured physical prefix against
 that host authority before it may append. Bare-tape inventory becomes complete
 only when finalization writes the three identical terminal replicas. If none
@@ -2785,9 +2850,9 @@ unbounded re-read of a tape that was supposedly fine.
 ### B.11. Sidecar Metadata Is Replicated Head and Tail, With a Locator
 
 The header/index copy is written before the parity shards *and* after them,
-with a footer locator at the very end. Contiguous damage at either end of
-the sidecar file leaves a survivable copy at the other; the footer makes
-the tail copy findable without trusting block arithmetic; and the epoch
+with a footer locator at the very end. Contiguous damage at either end of the
+sidecar file leaves a survivable copy at the other; the footer makes the tail
+copy findable without trusting block arithmetic; and the sidecar epoch
 directory makes it findable even with the footer gone (Section 13.3). The
 canonical metadata hash is copy-independent, so any surviving copy is
 verifiable against any directory entry.
@@ -2839,24 +2904,33 @@ an errata revision of draft.1.
   conditions into Sections 10.2 through 10.6, which renumbers Section 10. The
   replica-agreement rule is stated once, in Section 8.5, over the
   edition-common fields of the replica frame, and the discovery steps of
-  Section 8.4 consider every valid replica before accepting one. It corrects
-  the sidecar `schema_version` in Section 9.2 from 1 to 2, makes Bootstrap
-  keys 20, 21, and 30 reserved, scopes the Section 8.1.1 registry to
-  `schema_major` 2, replaces the deposit claim of Section 17 with the archive
-  digest, removes the Status sentence that called every Section 18 criterion
-  satisfied, and names the slot counts `structural_row_count` and
-  `object_row_count`. It also writes down rules the reference implementation
-  already enforces but no earlier revision stated: the record-count relations
-  of Section 8.3; the ParityMap copy agreement, the u32 bound on directory
-  flags and the Writer rule that the sidecar epoch directory is marked final,
-  in Section 10.1; the structural-slot container and the encoded-length
-  bounds of every fixed slot, structural and Object, in Section 10.2; the footer arithmetic and edition-identity rules in
-  Section 10.4; and the separation-extent validity rules in Section 10.6. The
-  draft.1 closed-item snapshot, formerly Appendix C,
-  described the checkpoint-bootstrap/parity-map design and does not establish
-  conformance to the generation-2 replacement; that appendix is removed, and
-  the revision history and the open items become Appendices C and D. No tape
-  byte changed.
+  Section 8.4 consider every valid replica before accepting one. It makes
+  these corrections:
+
+  - It corrects the sidecar `schema_version` in Section 9.2 from 1 to 2.
+  - It makes Bootstrap keys 20, 21, and 30 reserved.
+  - It scopes the Section 8.1.1 registry to `schema_major` 2.
+  - It replaces the deposit claim of Section 17 with the archive digest.
+  - It removes the Status sentence that called every Section 18 criterion
+    satisfied.
+  - It names the slot counts `structural_row_count` and `object_row_count`.
+
+  It also writes down rules the reference implementation already enforces but
+  no earlier revision stated:
+
+  - the record-count relations of Section 8.3;
+  - the ParityMap copy agreement, the u32 bound on directory flags and the
+    Writer rule that the sidecar epoch directory is marked final, in
+    Section 10.1;
+  - the structural-slot container and the encoded-length bounds of every fixed
+    slot, structural and Object, in Section 10.2;
+  - the footer arithmetic and edition-identity rules in Section 10.4;
+  - the separation-extent validity rules in Section 10.6.
+
+  The draft.1 closed-item snapshot, formerly Appendix C, described the
+  checkpoint-bootstrap/parity-map design and does not establish conformance to
+  the generation-2 replacement; that appendix is removed, and the revision
+  history and the open items become Appendices C and D. No tape byte changed.
 
   Section 1.5 is added. It states which rules belong in this document and
   points to the REM Implementation and Operations Guide for the rest. A rule
@@ -2864,8 +2938,9 @@ an errata revision of draft.1.
   three things. It would produce bytes another conformant reader cannot read
   or would misread. It would let two conformant readers reach different
   conclusions about what a medium or an object contains. Or it would let a
-  tool claim something the bytes do not support. The same section, word for
-  word, opens REM-OBJECT, REM-ENCRYPT and REM-PARITY.
+  tool claim something the bytes do not support. The same section appears,
+  word for word, as the last subsection of Section 1 of REM-OBJECT,
+  REM-ENCRYPT and REM-PARITY.
 
   The rules that Section 1.5 places outside this document have now left it.
   Most went to the REM Implementation and Operations Guide, whose chapters on
@@ -2904,6 +2979,70 @@ an errata revision of draft.1.
   report every nonconformity, to report progress to an operator, to record
   which software wrote a bootstrap, or to refuse an Object that would leave
   too little room to finalize; the Guide recommends each.
+
+  The readability pass then changed the text as follows. No byte of the format
+  changed, and no valid tape or vector changed.
+
+  - Sections 10.5, 12.3, 13.2 and 18 are retitled “Separation Extents”,
+    “The Classification Ladder”, “Typed Refusals” and
+    “Freeze Criteria and Status”, so that each title describes what its
+    section now holds. Appendix B's headings and the qualifiers of
+    Sections 8.1, 9.2, 9.6, 10.1.3 and 11.1 take title case.
+  - Section 2.2 defines two roles: the Reader, any role that reads a tape,
+    including the Writer when it reads back what it has written; and the
+    Inventory Consumer, which receives a Scanner's inventory. A requirement
+    that bound “readers”, “decoders” or a “Consumer” now names one of these
+    roles, or the single role it binds, such as the Recoverer in Section 3.4.
+    The rules of Sections 5.3, 7.4 and 10.1.5 keep the condition under which
+    they apply.
+  - Section 2.3 defines the terminal suffix, the terminal replica, the replica
+    envelope and the separation extent, and points to the sidecar epoch
+    directory. The document uses these terms where it said “gap”,
+    “typed extent”, “member”, “terminal triple”, “five-file suffix”,
+    “pre-tail” or a bare “envelope”, and names the tape-file kinds by them.
+  - Section 2.3 states that the capitalised word “Object” is the defined term
+    and that attributive uses are lower case. In running text the bootstrap is
+    “the bootstrap”, and “BOT” stays only where the position is the point. The
+    producing role is written “Writer” throughout.
+  - The symbol `E` now means only a separation extent's nominal bytes
+    (Sections 10.5 and 17). Section 3.3 and Appendices A.1 and B.2 write an
+    epoch's size as `S × k`.
+  - Section 2.1 declares that a paragraph opening with *Rationale.* is
+    informative, and that the steps of a numbered list are taken in the order
+    given unless the text says otherwise. Section 12.3 says that its items are
+    numbered for reference, not as an order of trial. An explanation of why a
+    rule exists now stands in a *Rationale.* paragraph.
+  - Section 1.3 states how this document cites its companions, and
+    Section 10.3 cites REM-ENCRYPT §5.2 and REM-OBJECT §4.5.1 in that form.
+  - The Status section gives this document's version axes as a table, and
+    limits “never reused for different bytes” to the version string of a
+    deposited revision. The legacy terms for generation 2, “replacement” and
+    Section 5.2's “retained codec”, are gone from the Status section,
+    Sections 2.5, 5.2, 8, 8.1, 8.1.1, 8.2 and 8.4, and Appendix D.
+  - Sections 1.2 and 3.1 say that the labels in their diagrams abbreviate the
+    terms of Section 2.3, and Section 1.2 and Appendix A.4 describe replica
+    selection by its outcome, since the order of trial is the Guide's.
+  - Errata in the tables and the ladder: Section 12.3 item 1 checks the
+    frame's `tape_uuid`, which the payload does not carry, and the ladder now
+    says where the tape identity comes from; the Section 8.1.1 registry names
+    REM-PARITY 1.0 as the revision that defines value 3, and reserves values 0
+    to 2 permanently: they are never assigned under `schema_major` 2; and
+    Section 8.2 lists key 3 as optional in its Presence cell, as key 4 is,
+    while the text below the table keeps the Reader's obligation.
+  - Errata in the text: the Abstract places the ParityMap before the terminal
+    suffix; Section 9.6 cites Section 12.3 item 6, the sidecar footer probe,
+    which the renumbering in draft.4 had left as item 4; Section 3.4 no longer
+    refers to “required contents” that moved to the Guide; Section 4.2 no
+    longer names a function of the reference implementation; Section 16.4 no
+    longer speaks of several bootstrap timestamps; and the paragraph above on
+    Section 1.5 says where that section stands in each document.
+  - The draft.1 entry's audit narrative is cut to the readings of the text it
+    concluded, one bullet each; how the implementation was fixed and tested is
+    left to the implementation's own record.
+  - Sentences that stated more than one requirement, or a requirement and an
+    aside, were split, among them Section 3.3's statement of where parity
+    shards live and Section 16.2's bounds on diagnostic text. Where a split or
+    rewritten requirement binds a role, it now names that role.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -2918,22 +3057,28 @@ an errata revision of draft.1.
 
   The generation-2 sizes and widths, taken from a diff of the Section 2.5
   constants and the byte tables of the published revision against this one:
-  `BOOTSTRAP_SCHEMA_MAJOR` 1 to 2; Bootstrap `sequence` widened from `u32` to
-  `u64`, which moves `cbor_payload_len` to 0x2C, the header CRC to 0x30 and
-  the payload to 0x38 (`BOOTSTRAP_HEADER_LEN` 0x34 to 0x38), and raises the
-  Bootstrap floor from 0x3C to 0x40; sidecar `schema_version` and footer
-  version 1 to 2; sidecar header `parity_block_count`, `data_crc_count`,
-  `sidecar_header_block_count` and `inline_index_entry_bytes` widened from
-  `u32` to `u64`, which moves the header CRC to 0xC0 and the inline index to
-  0xC8 (`SIDECAR_HEADER_LEN` 0xB8 to 0xC8); sidecar footer `H` and `P` widened
-  from `u32` to `u64` (`SIDECAR_FOOTER_LEN` 0x80 to 0x88, footer CRC 0x78 to
-  0x80); sidecar floor 0xD0 to 0xE0; ParityMap schema and footer versions 1 to
-  2; ParityMap `sequence` and `directory_scope_tape_file_count` widened from
-  `u32` to `u64` (the other two scope fields were already `u64`), which moves
-  every later header and footer field and makes the header and footer 0xC8
-  bytes (CRC at 0xC0), the payload offset 0xC8, and the ParityMap floor 0xC8;
-  and tape-file kinds 4 and 5 with the terminal replica and separation
-  constants added.
+
+  - `BOOTSTRAP_SCHEMA_MAJOR` 1 to 2.
+  - Bootstrap `sequence` widened from `u32` to `u64`, which moves
+    `cbor_payload_len` to 0x2C, the header CRC to 0x30 and the payload to 0x38
+    (`BOOTSTRAP_HEADER_LEN` 0x34 to 0x38), and raises the Bootstrap floor from
+    0x3C to 0x40.
+  - Sidecar `schema_version` and footer version 1 to 2.
+  - Sidecar header `parity_block_count`, `data_crc_count`,
+    `sidecar_header_block_count` and `inline_index_entry_bytes` widened from
+    `u32` to `u64`, which moves the header CRC to 0xC0 and the inline index to
+    0xC8 (`SIDECAR_HEADER_LEN` 0xB8 to 0xC8).
+  - Sidecar footer `H` and `P` widened from `u32` to `u64`
+    (`SIDECAR_FOOTER_LEN` 0x80 to 0x88, footer CRC 0x78 to 0x80).
+  - Sidecar floor 0xD0 to 0xE0.
+  - ParityMap schema and footer versions 1 to 2.
+  - ParityMap `sequence` and `directory_scope_tape_file_count` widened from
+    `u32` to `u64` (the other two scope fields were already `u64`), which
+    moves every later header and footer field and makes the header and footer
+    0xC8 bytes (CRC at 0xC0), the payload offset 0xC8, and the ParityMap floor
+    0xC8.
+  - Tape-file kinds 4 and 5 added, with the terminal replica and separation
+    constants.
 
 - **2026-08-08 — 1.0.0-draft.3 — review draft.** Defines *committed prefix*
   explicitly in Section 3.1 and clarifies the existing durable-boundary rule
@@ -2988,87 +3133,101 @@ an errata revision of draft.1.
   this draft.
 
   Relative to the review draft published on 2026-07-25 (see below), this
-  revision: replaces the draft Status text with the three-question change
-  policy (invalidate or change meaning → major; earlier readers cannot
-  identify and cleanly refuse → major; obligations or registry assignment →
-  minor under three conditions; otherwise erratum), and states the
-  axis-independence principle and the worked classifications; rewrites
-  Section 18's preamble, which described the document as a draft and
-  permitted only errata after freeze; rewrites Section 8.1.1 as the
-  schema-minor registry (Defined-by and wire meanings: 2 = `object_id`
-  optional, 3 = `object_id` required) and corrects the stale `1 / 3` pair in
-  Section 2.5; states the Reader obligation at `schema_minor` ≥ 3 in
-  Section 8.2.1 and the reader rule for unrecognised `flags` bits, both
-  matching the reference implementation; adds the semantics-freeze rule to
-  Section 5.3; re-anchors the key-30 overflow-carrier prohibition from the
-  document version to the registry mechanism; declares the Section 8.4
-  discovery-candidate set frozen for the life of `schema_major` 1; corrects
-  the parity_map footer magic in Sections 2.5, 5.2 and 10.3, which described
-  a `PARITY_MAP_FOOTER_MAGIC_LABEL` that appears in no implementation and on
-  no tape — the footer shares the header's magic; corrects the minimum
-  sidecar block size from 0xC0 to 0xD0 (a generation-1 value, here and below;
-  draft.4 raised it to 0xE0) in Sections 2.5, 9.1 and 9.4 and adds
-  the index-packing rejection the Section 9.4 pseudocode omitted; removes an
-  unimplementable final-directory redundancy requirement from Section 8.3
-  that contradicted Sections 10.1, 10.7 and 11.3; and records in Section 12.4
-  the `ParityMapReference`-locator precedence tier and the two-candidate
-  requirement for structural discovery, both of which the reference Scanner
-  already applied.
+  revision makes these changes:
 
-  **If you implemented from the review draft, re-check two things.** First,
-  Sections 2.5, 5.2 and 10.3 described a `PARITY_MAP_FOOTER_MAGIC_LABEL`
-  (`"REM\0PMAPFOOT\x01"`) as the derivation for the `parity_map` footer
-  locator's magic. No such label exists: the footer carries the *header's*
-  magic, `HMAC(tape_uuid, PARITY_MAP_MAGIC_LABEL)[0..8]`, on every published
-  artifact and in every implementation, and it is distinguished from a header
-  by its position and by `copy_kind`. An implementation built from the draft
-  computes eight wrong bytes and rejects every conformant `parity_map` tape
-  file, so this correction restores interoperability rather than removing it.
-  Second, the minimum sidecar block size is 0xD0, not 0xC0: sizes 0xC0 through
-  0xCF satisfy the header-plus-CRC floor but cannot pack even one index entry,
-  and Section 9.4's algorithm now carries the rejection that makes this
-  explicit. No tape byte and no published vector changed for either
-  correction.
+  - It replaces the draft Status text with the three-question change policy
+    (invalidate or change meaning → major; earlier readers cannot identify and
+    cleanly refuse → major; obligations or registry assignment → minor under
+    three conditions; otherwise erratum), and states the axis-independence
+    principle and the worked classifications.
+  - It rewrites Section 18's preamble, which described the document as a draft
+    and permitted only errata after freeze.
+  - It rewrites Section 8.1.1 as the schema-minor registry (Defined-by and
+    wire meanings: 2 = `object_id` optional, 3 = `object_id` required) and
+    corrects the stale `1 / 3` pair in Section 2.5.
+  - It states the Reader obligation at `schema_minor` ≥ 3 in Section 8.2.1 and
+    the reader rule for unrecognised `flags` bits, both matching the reference
+    implementation.
+  - It adds the semantics-freeze rule to Section 5.3.
+  - It re-anchors the key-30 overflow-carrier prohibition from the document
+    version to the registry mechanism.
+  - It declares the Section 8.4 discovery-candidate set frozen for the life of
+    `schema_major` 1.
+  - It corrects the parity_map footer magic in Sections 2.5, 5.2 and 10.3,
+    which described a `PARITY_MAP_FOOTER_MAGIC_LABEL` that appears in no
+    implementation and on no tape — the footer shares the header's magic.
+  - It corrects the minimum sidecar block size from 0xC0 to 0xD0 (a
+    generation-1 value, here and below; draft.4 raised it to 0xE0) in
+    Sections 2.5, 9.1 and 9.4, and adds the index-packing rejection the
+    Section 9.4 pseudocode omitted.
+  - It removes an unimplementable final-directory redundancy requirement from
+    Section 8.3 that contradicted Sections 10.1, 10.7 and 11.3.
+  - It records in Section 12.4 the `ParityMapReference`-locator precedence
+    tier and the two-candidate requirement for structural discovery, both of
+    which the reference Scanner already applied.
 
-  **Implementation conformance.** A line-by-line audit of this document against
-  the reference implementation, the pinned vectors, the repository
-  documentation and the project website found six divergences, all of which
-  were resolved by correcting the implementation — this text was not weakened
-  anywhere. The Scanner no longer aborts a whole catalog-less walk when one
-  tape file's recorded block count disagrees with its measured length
-  (Section 12.3); a sidecar footer that parses but contradicts the map entry
-  now falls back to the primary header rather than stopping (Section 13.3
-  step 2); directory-assisted tail rescue is implemented, so an epoch is
-  declared metadata-unavailable only when no header/index copy can be
-  validated (Section 13.3 steps 3 and 4); geometry and ordinal-range
-  disagreements raise `SchemeMismatch` as this document specifies rather than
-  a generic parse error; and the REM-OBJECT manifest depth bound is enforced
-  through map values as well as arrays. A gate was added that applies each
-  damage-matrix cell's recorded faults to the pinned image and drives the real
-  recovery path, which is what the earlier tooling never did.
+  **If you implemented from the review draft, re-check two things.**
 
-  Two further behaviours were examined and judged conformant rather than
-  divergent, and are recorded here so the discharge of criterion 1 is not
-  asserted over unexamined ground. First, the bulk region-recovery entry point
-  abandons a whole multi-epoch request when one epoch is metadata-unavailable;
-  Section 12.5's guarantee is that damage to one sidecar's metadata must not
-  degrade *recovery of any other epoch*, and it holds — the per-ordinal and
-  per-block paths, which are what the read path uses, recover every other
-  epoch normally. The all-or-nothing contract of the bulk call is an
-  interface shape, not a recovery-model divergence, and it has no consumer
-  outside the parity crate today. Second, Section 8.2 requires a parity
-  bootstrap's `scheme_id` to be `rs-cauchy-gf256-v1`; the Reader does not
-  reject an unrecognised value at parse time, but refuses cleanly at use time
-  with `SchemeMismatch`, naming the scheme found and the scheme expected. The
-  requirement binds what a conformant Writer may record; the Reader's
-  obligation is to refuse legibly, which it does.
+  - Sections 2.5, 5.2 and 10.3 described a `PARITY_MAP_FOOTER_MAGIC_LABEL`
+    (`"REM\0PMAPFOOT\x01"`) as the derivation for the `parity_map` footer
+    locator's magic. No such label exists: the footer carries the *header's*
+    magic, `HMAC(tape_uuid, PARITY_MAP_MAGIC_LABEL)[0..8]`, on every published
+    artifact and in every implementation, and it is distinguished from a
+    header by its position and by `copy_kind`. An implementation built from
+    the draft computes eight wrong bytes and rejects every conformant
+    `parity_map` tape file, so this correction restores interoperability
+    rather than removing it.
+  - The minimum sidecar block size is 0xD0, not 0xC0: sizes 0xC0 through 0xCF
+    satisfy the header-plus-CRC floor but cannot pack even one index entry,
+    and Section 9.4's algorithm now carries the rejection that makes this
+    explicit.
 
-- **2026-07-29 — [draft] pre-freeze revisions II.** Last-resort
-  filemark-walk operational envelope specified (Section 8.4.1), with
-  inter-file positioning exempted from the Section 8.4 rule-6 abort;
-  bootstrap re-typing promoted from SHOULD to MUST with operational
-  candidate criteria (Section 12.4) — reader-obligation changes with no
-  effect on the set of valid tapes; Appendix C items 3 and 4 resolved.
+  No tape byte and no published vector changed for either correction.
+
+  **Implementation conformance.** An audit of this document against the
+  reference implementation, the pinned vectors, the repository documentation
+  and the project website found divergences between the implementation and
+  this text. Each was resolved by correcting the implementation, and this text
+  was not weakened. The corrections bring the implementation to these readings
+  of the text:
+
+  - A Scanner does not abort a whole catalog-less walk when one tape file's
+    recorded block count disagrees with its measured length (Section 12.3).
+  - A sidecar footer that parses but contradicts the map entry is treated as
+    an invalid footer, and recovery falls back to the primary header rather
+    than stopping (Section 13.3 step 2).
+  - An epoch is metadata-unavailable only when no header/index copy can be
+    validated, directory-assisted tail rescue included (Section 13.3 steps 3
+    and 4).
+  - Geometry and ordinal-range disagreements raise `SchemeMismatch`, as this
+    document specifies, rather than a generic parse error.
+  - The REM-OBJECT manifest depth bound applies through map values as well as
+    arrays.
+
+  Two further behaviours were examined and judged conformant, on these
+  readings of the text:
+
+  - Section 12.5's guarantee, that damage to one sidecar's metadata does not
+    degrade recovery of any other epoch, concerns what can be recovered. A
+    request that covers several epochs may fail as a whole when one of them is
+    metadata-unavailable, provided each other epoch can still be recovered on
+    its own.
+  - Section 8.2's requirement that a parity bootstrap's `scheme_id` be
+    `rs-cauchy-gf256-v1` binds what a conformant Writer may record. A Reader
+    meets its obligation by refusing an unrecognised value legibly; it may do
+    so when the scheme is first used, with `SchemeMismatch`, naming the scheme
+    found and the scheme expected.
+
+- **2026-07-29 — [draft] pre-freeze revisions II.**
+
+  - Last-resort filemark-walk operational envelope specified (Section 8.4.1),
+    with inter-file positioning exempted from the Section 8.4 rule-6 abort.
+  - Bootstrap re-typing promoted from SHOULD to MUST with operational
+    candidate criteria (Section 12.4).
+  - Appendix C items 3 and 4 resolved.
+
+  The first two are reader-obligation changes with no effect on the set of
+  valid tapes.
 - **2026-07-25 — pre-release copy.** A copy of this document, marked "Draft
   for review" and dated 2026-06-11, was distributed inside software release
   v1.0.0 (Zenodo 10.5281/zenodo.21551571, a *software* record). It was not
@@ -3080,27 +3239,33 @@ an errata revision of draft.1.
   the independent re-derivation tool without altering any pre-existing
   member. The never-re-pin rule of the Status section binds published
   revisions and does not reach back into the draft era.
-- **2026-07-22 — [draft] tape-alone recovery claims.** Ordered persistence
-  and the synchronizing barrier made normative on the tape I/O layer
-  (Section 3.5); commit discipline extended with batched deferred
-  synchronization and staged-record semantics (Sections 3.4, 11.1); the
-  attested prefix and the bare-tape tail taxonomy specified with salvage
-  rules (Section 12.6); Appendix B.8 reframed to per-file-marker rationale
-  plus barrier-grain structural attestation.
-- **2026-07-21 — [draft] pre-freeze revisions.** Writer-legal block sizes
-  closed over the discovery-candidate set (Section 8.4); object identity
-  row keys clarified (Section 8.2.1); epochs redefined as explicit ordinal
-  ranges with bare-counter ids and short epochs legalized at any checkpoint
-  boundary with `FINAL_PARTIAL_EPOCH` reserved for terminal `finish()`
-  (Sections 3.3, 10.5, 11.2); the bootstrap directory ceiling made an
-  admission-time refusal with mandatory headroom and seal-at-ceiling
-  (Section 8.2.1); reference journal watermark note (Appendix B.12).
+- **2026-07-22 — [draft] tape-alone recovery claims.**
+
+  - Ordered persistence and the synchronizing barrier made normative on the
+    tape I/O layer (Section 3.5).
+  - Commit discipline extended with batched deferred synchronization and
+    staged-record semantics (Sections 3.4, 11.1).
+  - The attested prefix and the bare-tape tail taxonomy specified with salvage
+    rules (Section 12.6).
+  - Appendix B.8 reframed to per-file-marker rationale plus barrier-grain
+    structural attestation.
+- **2026-07-21 — [draft] pre-freeze revisions.**
+
+  - Writer-legal block sizes closed over the discovery-candidate set
+    (Section 8.4).
+  - Object identity row keys clarified (Section 8.2.1).
+  - Epochs redefined as explicit ordinal ranges with bare-counter ids, and
+    short epochs legalized at any checkpoint boundary with
+    `FINAL_PARTIAL_EPOCH` reserved for terminal `finish()` (Sections 3.3,
+    10.5, 11.2).
+  - The bootstrap directory ceiling made an admission-time refusal with
+    mandatory headroom and seal-at-ceiling (Section 8.2.1).
+  - Reference journal watermark note (Appendix B.12).
 - **2026-06-11 — [draft] first draft.** Initial working baseline.
 
 ## Appendix D. Open Items (Informative)
 
-This is the live preparing-copy snapshot for the current generation-2
-replacement.
+This is the live preparing-copy snapshot for generation 2.
 
 1. **TT-1 — independent byte derivation (candidate evidence passed).** The
    independent Python implementation reproduces all six review profiles and
@@ -3112,22 +3277,24 @@ replacement.
    selections, 68 interruption cuts, seven Object-row extension cases, and the
    million-Object streaming profile. Publication promotion remains gated by
    TT-5 and the other freeze criteria.
-3. **TT-3 — default-gap media exercise (VTL passed; physical open).** The exact
-   one-GiB layout has passed clean VTL writes and independent full verification
-   at all three legal block sizes. The 256 KiB and 512 KiB legs respectively
-   proved 4,096 and 2,048 records per separation extent, compression disabled,
-   five dense terminal files, their filemarks, and exact EOD. At least two
-   supervised physical-tape block sizes are still required, including footer,
+3. **TT-3 — media exercise of the default separation extents (VTL passed;
+   physical open).** The exact one-GiB layout has passed clean VTL writes and
+   independent full verification at all three legal block sizes. The 256 KiB
+   and 512 KiB legs respectively proved 4,096 and 2,048 records per separation
+   extent, compression disabled, the five dense tape files of the terminal
+   suffix, their filemarks, and exact EOD. At least two supervised
+   physical-tape block sizes are still required, including footer,
    filemark/EOD, PEW, and EOM observations.
 4. **TT-4 — end-to-end lifecycle reconciliation (implemented and rerun).** The
    VTL scenarios have exercised automatic and manual finalization, all 68
    interruption cuts, permanent Object refusal after finalization starts,
-   eventual five-component reconciliation, sole-BOT checkpoint replay, and
-   the full default-gap matrix. Each affected member ran from its own clean
-   slate at the recorded implementation head.
+   eventual reconciliation of the complete terminal suffix, sole-BOT
+   checkpoint replay, and the full matrix of default separation extents. Each
+   affected member ran from its own clean slate at the recorded implementation
+   head.
 5. **TT-5 — external prose and incremental-diff review.** The preparing copy
    has no normative dependence on geometric placement, `2M+1` index copies,
-   bootstrap Object-row ceilings, or singular final Bootstrap authority.
+   bootstrap Object-row ceilings, or singular final bootstrap authority.
    Review is incremental from the last recorded clean baseline; two
    consecutive clean reviews of the then-current increment satisfy the gate,
    and later commits reopen only the regions they touch.
