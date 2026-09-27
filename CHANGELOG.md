@@ -6,6 +6,16 @@ per-release summaries.
 
 ## Unreleased
 
+- A tape whose BOT bootstrap is unreadable can now be read when its tape
+  UUID, block size and parity scheme are supplied out of band.
+  `rem tape recovery-report` takes `--tape-uuid`, `--block-size` and
+  `--scheme` (`k,m,S` or `none`), all three together; the daemon's inventory,
+  index verification and reconcile paths use the request's tape UUID and the
+  catalog's block size and scheme. A first block counts as unreadable only
+  for genuine damage; a readable bootstrap whose checksummed fields disagree
+  with the supplied values, or that records drive compression, is refused.
+  Results say when the supplied values were used. Scans without these values
+  behave as before.
 - A Sealer now refuses recipients given out of slot order and a recipient whose
   epoch id is all zero, both with `InvalidInput`, before it draws any key
   material, on the production and the deterministic sealing paths alike.

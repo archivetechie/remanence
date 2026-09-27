@@ -2105,12 +2105,32 @@ struct TapeRecoveryReportArgs {
     #[arg(value_name = "SOURCE")]
     source: PathBuf,
 
+    /// Expected tape UUID; required with block size and scheme if BOT is unreadable.
+    #[arg(long, requires_all = ["block_size", "scheme"], value_parser = recovery_report::parse_tape_uuid)]
+    tape_uuid: Option<String>,
+
+    /// Supplied fixed block size in bytes (also accepts KiB/MiB suffixes).
+    #[arg(long, requires_all = ["tape_uuid", "scheme"], value_parser = recovery_report::parse_block_size)]
+    block_size: Option<u32>,
+
+    /// Supplied parity geometry k,m,S, or none for a tape without parity.
+    #[arg(long, requires_all = ["tape_uuid", "block_size"], value_parser = recovery_report::parse_scheme)]
+    scheme: Option<String>,
+
     /// Emit the stable machine-readable report instead of human rendering.
     #[arg(long)]
     json: bool,
 }
 
 impl TapeRecoveryReportArgs {
+    fn hints(&self) -> Option<recovery_report::RecoveryHints> {
+        Some(recovery_report::RecoveryHints {
+            tape_uuid: self.tape_uuid.clone()?,
+            block_size_bytes: self.block_size?,
+            scheme: self.scheme.clone()?,
+        })
+    }
+
     fn validate_before_discovery(&self) -> Result<(), String> {
         fs::metadata(&self.source)
             .map(|_| ())
@@ -4244,6 +4264,7 @@ where
             if args.source.is_dir() {
                 return recovery_report::run_image_recovery_report(
                     &args.source,
+                    args.hints(),
                     args.json,
                     out,
                     err,
@@ -8401,6 +8422,7 @@ fn run_direct_device_recovery_report(
     recovery_report::run_raw_recovery_report(
         &mut source,
         remanence_parity::DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
+        args.hints(),
         args.json,
         out,
         err,

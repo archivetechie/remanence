@@ -17,9 +17,88 @@ use super::actor_runtime::WriteOwnerConfig;
 use super::bot_recovery;
 use super::read_session::session_open_reject_tape_io_fences;
 use super::readiness::session_open_short_probe_or_load;
-use super::restore::verify_loaded_tape_identity;
 use super::SessionOpenReadinessContext;
 use crate::{pb, status_from_state_error, TapeUuid};
+
+/// Catalog authority and the outcome of checking it against the mounted bootstrap.
+pub(crate) struct CatalogRecoveryRead {
+    pub hints: remanence_parity::ScanRecoveryHints,
+    pub bootstrap_unreadable_reason: Option<String>,
+}
+
+impl CatalogRecoveryRead {
+    /// Retain gate provenance even when terminal discovery never walks BOT.
+    fn append_provenance(&self, detail: &mut String) {
+        if let Some(reason) = &self.bootstrap_unreadable_reason {
+            detail.push_str(&format!(
+                "; bootstrap treated as unreadable ({reason}); identity and geometry supplied by catalog hints"
+            ));
+        }
+    }
+}
+
+/// Prepare a catalog-backed recovery read without requiring a surviving BOT.
+/// Checksummed identity and validated refusals remain binding in recovery mode.
+pub(crate) fn prepare_catalog_recovery_read(
+    index: &CatalogIndex,
+    drive: &mut DriveHandle,
+    tape_uuid: &TapeUuid,
+) -> Result<CatalogRecoveryRead, Status> {
+    use remanence_parity::{
+        raw::tape_error_is_current_medium_damage, ParityError, PhysicalPositionHint,
+        RawReadOutcome, RawTapeSource, RecoveryBootstrap,
+    };
+
+    let tape = index
+        .get_tape(tape_uuid)
+        .map_err(status_from_state_error)?
+        .ok_or_else(|| Status::failed_precondition("tape catalog row is missing"))?;
+    let (block_size, scheme) = remanence_state::index::catalog_reset_geometry(&tape)
+        .map_err(|error| Status::failed_precondition(format!("catalog geometry: {error}")))?
+        .ok_or_else(|| Status::failed_precondition("catalog block size and scheme are missing"))?;
+    let mut prepared = CatalogRecoveryRead {
+        hints: remanence_parity::ScanRecoveryHints {
+            tape_uuid: *tape_uuid,
+            block_size,
+            scheme,
+        },
+        bootstrap_unreadable_reason: None,
+    };
+    prepare_drive_for_fixed_read(drive, tape_uuid, block_size, Uuid::new_v4())?;
+    let mut source = DriveHandleRawSource::new(drive);
+    source
+        .locate_physical(PhysicalPositionHint::new(0))
+        .map_err(|error| Status::unavailable(format!("locate BOT: {error}")))?;
+    let mut block = vec![0; block_size as usize];
+    let bytes = match source.read_record(&mut block) {
+        Ok(RawReadOutcome::Block { bytes, .. }) => bytes,
+        Ok(RawReadOutcome::Filemark { .. } | RawReadOutcome::EndOfData { .. }) => {
+            prepared.bootstrap_unreadable_reason = Some("no BOT block".to_string());
+            return Ok(prepared);
+        }
+        Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => {
+            prepared.bootstrap_unreadable_reason = Some(format!("read BOT: {error}"));
+            return Ok(prepared);
+        }
+        Err(error) => return Err(Status::unavailable(format!("read BOT: {error}"))),
+    };
+    if bytes != block.len() {
+        return Err(Status::failed_precondition(format!(
+            "short fixed-block bootstrap read: got {bytes} bytes, expected {block_size}"
+        )));
+    }
+    match prepared
+        .hints
+        .classify_bootstrap(&block)
+        .map_err(|error| Status::failed_precondition(error.to_string()))?
+    {
+        RecoveryBootstrap::Validated(_) => {}
+        RecoveryBootstrap::Unreadable(reason) => {
+            prepared.bootstrap_unreadable_reason = Some(reason);
+        }
+    }
+    Ok(prepared)
+}
 
 pub(crate) fn prepare_drive_for_read(
     index: &CatalogIndex,
@@ -111,9 +190,9 @@ pub(crate) fn handle_drive_tape_inventory(
         },
     )?;
     session_open_reject_tape_io_fences(index, &tape_uuid, barcode, "read terminal tape inventory")?;
-    verify_loaded_tape_identity(drive, &tape_uuid)?;
-    let block_size = catalog_tape_block_size(index, &tape_uuid)?;
-    prepare_drive_for_fixed_read(drive, &tape_uuid, block_size, Uuid::new_v4())?;
+    let prepared = prepare_catalog_recovery_read(index, drive, &tape_uuid)?;
+    let hints = &prepared.hints;
+    let block_size = hints.block_size;
 
     let outcome = {
         let mut source = DriveHandleRawSource::new(drive);
@@ -131,6 +210,7 @@ pub(crate) fn handle_drive_tape_inventory(
                 &cfg.checkpoint_journal_dir,
                 &tape_uuid,
                 block_size,
+                remanence_parity::ScanMode::Recovery(hints),
                 |event| {
                     let item = bot_recovery_control_event_to_proto(
                         event,
@@ -161,11 +241,13 @@ pub(crate) fn handle_drive_tape_inventory(
         )?;
         return Ok(());
     }
+    let mut summary = terminal_inventory_to_proto(tape_uuid, outcome);
+    prepared.append_provenance(&mut summary.detail);
     send_inventory_stream_item(
         stream_tx,
         pb::TapeInventoryStreamItem {
             item: Some(pb::tape_inventory_stream_item::Item::Summary(Box::new(
-                terminal_inventory_to_proto(tape_uuid, outcome),
+                summary,
             ))),
         },
     )
@@ -467,9 +549,9 @@ pub(crate) fn handle_drive_verify_tape_index(
         barcode,
         "fully verify terminal tape index",
     )?;
-    verify_loaded_tape_identity(drive, &tape_uuid)?;
-    let block_size = catalog_tape_block_size(index, &tape_uuid)?;
-    prepare_drive_for_fixed_read(drive, &tape_uuid, block_size, Uuid::new_v4())?;
+    let prepared = prepare_catalog_recovery_read(index, drive, &tape_uuid)?;
+    let hints = &prepared.hints;
+    let block_size = hints.block_size;
 
     let outcome = {
         let mut source = DriveHandleRawSource::new(drive);
@@ -478,10 +560,13 @@ pub(crate) fn handle_drive_verify_tape_index(
             &cfg.checkpoint_journal_dir,
             &tape_uuid,
             block_size,
+            remanence_parity::ScanMode::Recovery(hints),
         )
         .map_err(status_from_terminal_index_verification_error)?
     };
-    Ok(terminal_verification_to_proto(tape_uuid, outcome))
+    let mut report = terminal_verification_to_proto(tape_uuid, outcome);
+    prepared.append_provenance(&mut report.detail);
+    Ok(report)
 }
 
 pub(crate) fn terminal_verification_to_proto(
@@ -619,6 +704,11 @@ pub(crate) fn bot_structural_recovery_to_proto(
     tape_uuid: TapeUuid,
     summary: remanence_parity::BotStructuralRecoverySummary,
 ) -> pb::TapeInventory {
+    let provenance = if summary.bootstrap_recovery_hints.is_some() {
+        "; bootstrap treated as unreadable; identity and geometry supplied by catalog hints"
+    } else {
+        ""
+    };
     pb::TapeInventory {
         tape_uuid: tape_uuid.to_vec(),
         outcome: pb::TapeInventoryOutcome::BotStructuralRecovered as i32,
@@ -638,7 +728,7 @@ pub(crate) fn bot_structural_recovery_to_proto(
         canonical_map_digest: Some(summary.canonical_map_digest.to_vec()),
         inventory_basis: "bot_structural_recovery".to_string(),
         detail: format!(
-            "terminal index unavailable; BOT recovery classified {} recovered, {} unknown, and {} incomplete Object candidates",
+            "terminal index unavailable; BOT recovery classified {} recovered, {} unknown, and {} incomplete Object candidates{provenance}",
             summary.recovered_object_count,
             summary.unknown_object_count,
             summary.incomplete_object_count

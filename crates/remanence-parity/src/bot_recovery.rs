@@ -13,8 +13,8 @@ use crate::raw::{
     tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
 };
 use crate::scan::{
-    scan_reconstruct_filemark_map_with_control, ControlledScanWalkOutcome, ScanWalkControl,
-    ScanWalkProgress,
+    scan_reconstruct_filemark_map_with_control_mode, ControlledScanWalkOutcome, ScanMode,
+    ScanRecoveryHints, ScanWalkControl, ScanWalkProgress,
 };
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -113,6 +113,8 @@ pub struct BotStructuralRecoverySummary {
     pub canonical_map_digest: [u8; 32],
     /// Number of physical damage regions retained as recovery evidence.
     pub damaged_region_count: u64,
+    /// Supplied authority used because the bootstrap was treated as unreadable.
+    pub bootstrap_recovery_hints: Option<ScanRecoveryHints>,
 }
 
 /// Failure of the explicit BOT structural recovery path.
@@ -225,10 +227,34 @@ where
     C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
     F: FnMut(&BotRecoveredObject) -> Result<(), String>,
 {
-    recover_terminal_inventory_from_bot_with_authority_controlled(
+    recover_terminal_inventory_from_bot_controlled_mode(
         source,
         tape_uuid,
         block_size,
+        ScanMode::Standard,
+        visit_control,
+        visit_object,
+    )
+}
+
+/// Run the existing BOT recovery pass with scoped bootstrap recovery.
+pub fn recover_terminal_inventory_from_bot_controlled_mode<C, F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    visit_control: C,
+    visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
         &mut NoBotObjectRecoveryAuthority {
             tape_uuid: *tape_uuid,
             block_size,
@@ -270,6 +296,32 @@ pub fn recover_terminal_inventory_from_bot_with_authority_controlled<A, C, F>(
     tape_uuid: &[u8; 16],
     block_size: u32,
     authority: &mut A,
+    visit_control: C,
+    visit_object: F,
+) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
+where
+    A: BotObjectRecoveryAuthority + ?Sized,
+    C: FnMut(&BotStructuralRecoveryEvent) -> ScanWalkControl,
+    F: FnMut(&BotRecoveredObject) -> Result<(), String>,
+{
+    recover_terminal_inventory_from_bot_with_authority_controlled_mode(
+        source,
+        tape_uuid,
+        block_size,
+        ScanMode::Standard,
+        authority,
+        visit_control,
+        visit_object,
+    )
+}
+
+/// Run the existing BOT recovery pass with scoped bootstrap recovery.
+pub fn recover_terminal_inventory_from_bot_with_authority_controlled_mode<A, C, F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    authority: &mut A,
     mut visit_control: C,
     mut visit_object: F,
 ) -> Result<BotStructuralRecoverySummary, BotStructuralRecoveryError>
@@ -286,14 +338,22 @@ where
             elapsed_millis: 0,
         });
     }
-    reject_readable_foreign_bot_bootstrap(source, tape_uuid, block_size)?;
-    let walked =
-        scan_reconstruct_filemark_map_with_control(source, tape_uuid, block_size, |progress| {
-            visit_control(&BotStructuralRecoveryEvent::Progress(*progress))
-        })
-        .map_err(|error| BotStructuralRecoveryError::Scan {
+    if matches!(mode, ScanMode::Standard) {
+        reject_readable_foreign_bot_bootstrap(source, tape_uuid, block_size)?;
+    }
+    let walked = scan_reconstruct_filemark_map_with_control_mode(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        |progress| visit_control(&BotStructuralRecoveryEvent::Progress(*progress)),
+    )
+    .map_err(|error| match error {
+        ParityError::TapeIdentityMismatch(_) => BotStructuralRecoveryError::TapeIdentityMismatch,
+        error => BotStructuralRecoveryError::Scan {
             message: error.to_string(),
-        })?;
+        },
+    })?;
     let walked = match walked {
         ControlledScanWalkOutcome::Complete(walked) => walked,
         ControlledScanWalkOutcome::Aborted(aborted) => {
@@ -414,6 +474,7 @@ where
     }
 
     Ok(BotStructuralRecoverySummary {
+        bootstrap_recovery_hints: walked.bootstrap_recovery_hints,
         structural_entry_count: walked.map.tape_file_count(),
         complete_object_count,
         recovered_object_count,

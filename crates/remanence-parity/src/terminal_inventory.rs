@@ -5,12 +5,14 @@
 //! absolute reads. It never classifies or walks Object files. Replica payloads
 //! are decoded through the existing fixed-slot streaming codec.
 
+#[cfg(test)]
 use crate::bot_recovery::{
-    recover_terminal_inventory_from_bot, recover_terminal_inventory_from_bot_with_authority,
+    recover_terminal_inventory_from_bot, reject_readable_foreign_bot_bootstrap,
+    BotRecoveredObjectState,
+};
+use crate::bot_recovery::{
     BotObjectRecoveryAuthority, BotStructuralRecoveryError, BotStructuralRecoverySummary,
 };
-#[cfg(test)]
-use crate::bot_recovery::{reject_readable_foreign_bot_bootstrap, BotRecoveredObjectState};
 use crate::error::ParityError;
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::index_separation::{
@@ -20,7 +22,7 @@ use crate::index_separation::{
 use crate::raw::{
     tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
 };
-use crate::scan::{scan_reconstruct_filemark_map_with_report, ScanDamageKind};
+use crate::scan::{scan_reconstruct_filemark_map_with_report_mode, ScanDamageKind, ScanMode};
 use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
     validate_tape_index_replica_pair, validate_tape_index_replica_payload, TapeIndexEditionPlan,
@@ -768,7 +770,7 @@ pub fn verify_terminal_index_full(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut None)
+    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut None, ScanMode::Standard)
 }
 
 /// Perform complete physical verification with optional checkpoint identity
@@ -779,7 +781,24 @@ pub fn verify_terminal_index_full_with_authority(
     block_size: u32,
     authority: &mut dyn BotObjectRecoveryAuthority,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut Some(authority))
+    verify_terminal_index_full_inner(
+        source,
+        tape_uuid,
+        block_size,
+        &mut Some(authority),
+        ScanMode::Standard,
+    )
+}
+
+/// Verify using scoped bootstrap recovery and optional checkpoint authority.
+pub fn verify_terminal_index_full_with_scan_mode(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mut authority: Option<&mut dyn BotObjectRecoveryAuthority>,
+    mode: ScanMode<'_>,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut authority, mode)
 }
 
 fn verify_terminal_index_full_inner(
@@ -787,8 +806,9 @@ fn verify_terminal_index_full_inner(
     tape_uuid: &[u8; 16],
     block_size: u32,
     authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
+    mode: ScanMode<'_>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    match verify_terminal_index_strict(source, tape_uuid, block_size) {
+    match verify_terminal_index_strict(source, tape_uuid, block_size, mode) {
         Ok(complete) => {
             let replicas = complete
                 .replicas
@@ -818,6 +838,7 @@ fn verify_terminal_index_full_inner(
                 block_size,
                 error.to_string(),
                 authority,
+                mode,
             )
         }
         Err(error) => Err(error),
@@ -847,6 +868,7 @@ fn verify_terminal_index_after_damage(
     block_size: u32,
     initial_detail: String,
     authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
+    mode: ScanMode<'_>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
     let inventory = match read_terminal_index_inventory_summary(source, tape_uuid, block_size) {
         Ok(inventory) => inventory,
@@ -871,6 +893,7 @@ fn verify_terminal_index_after_damage(
                     "terminal replica {ordinal} failed while replaying its payload after physical damage: {error}"
                 ),
                 authority,
+                mode,
             );
         }
         Err(error) => return Err(inventory_error_to_verification(error)),
@@ -885,6 +908,7 @@ fn verify_terminal_index_after_damage(
                 recovery.replicas,
                 initial_detail,
                 authority,
+                mode,
             )
         }
     };
@@ -909,13 +933,14 @@ fn verify_terminal_index_after_damage(
                 layout.expected_eod_lba
             ),
             authority,
+            mode,
         );
     }
-    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
-        |error| TerminalIndexVerificationError::PrefixWalk {
-            message: error.to_string(),
-        },
-    )?;
+    let walked =
+        scan_reconstruct_filemark_map_with_report_mode(source, tape_uuid, block_size, mode)
+            .map_err(|error| TerminalIndexVerificationError::PrefixWalk {
+                message: error.to_string(),
+            })?;
     let prefix_count = layout.components[0].planned_tape_file_number;
     if walked
         .truncation
@@ -932,6 +957,7 @@ fn verify_terminal_index_after_damage(
             selection.replicas,
             "physical damage or truncation lies inside the canonical pre-tail prefix".to_string(),
             authority,
+            mode,
         );
     }
     let prefix_len = usize::try_from(prefix_count).map_err(|_| {
@@ -947,6 +973,7 @@ fn verify_terminal_index_after_damage(
             selection.replicas,
             "BOT walk ended before the canonical pre-tail prefix".to_string(),
             authority,
+            mode,
         );
     };
     let verified_prefix_record_count = physical_prefix.iter().try_fold(0u64, |total, entry| {
@@ -1030,6 +1057,7 @@ fn verify_terminal_index_after_damage(
             replicas,
             "no terminal replica survived full payload/canonical-prefix validation".to_string(),
             authority,
+            mode,
         );
     };
     let edition = replica_editions[selected_index]
@@ -1131,6 +1159,7 @@ fn terminal_recovery_required(
     replicas: [TerminalReplicaEvidence; 3],
     detail: String,
     authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
+    mode: ScanMode<'_>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
     source
         .configure_fixed_block_size(block_size)
@@ -1139,14 +1168,25 @@ fn terminal_recovery_required(
         .locate_end_of_data()
         .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
     let bot_recovery = match authority.as_deref_mut() {
-        Some(authority) => recover_terminal_inventory_from_bot_with_authority(
+        Some(authority) => {
+            crate::bot_recovery::recover_terminal_inventory_from_bot_with_authority_controlled_mode(
+                source,
+                tape_uuid,
+                block_size,
+                mode,
+                authority,
+                |_| crate::ScanWalkControl::Continue,
+                |_| Ok(()),
+            )
+        }
+        None => crate::bot_recovery::recover_terminal_inventory_from_bot_controlled_mode(
             source,
             tape_uuid,
             block_size,
-            authority,
+            mode,
+            |_| crate::ScanWalkControl::Continue,
             |_| Ok(()),
         ),
-        None => recover_terminal_inventory_from_bot(source, tape_uuid, block_size, |_| Ok(())),
     }
     .map_err(bot_recovery_verification_error)?;
     Ok(TerminalIndexVerificationOutcome::RecoveryRequired(
@@ -1183,6 +1223,7 @@ fn verify_terminal_index_strict(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
+    mode: ScanMode<'_>,
 ) -> Result<TerminalIndexCompleteEvidence, TerminalIndexVerificationError> {
     validate_terminal_index_block_size_hint(block_size)?;
     source
@@ -1218,11 +1259,11 @@ fn verify_terminal_index_strict(
         }
     };
 
-    let walked = scan_reconstruct_filemark_map_with_report(source, tape_uuid, block_size).map_err(
-        |error| TerminalIndexVerificationError::PrefixWalk {
-            message: error.to_string(),
-        },
-    )?;
+    let walked =
+        scan_reconstruct_filemark_map_with_report_mode(source, tape_uuid, block_size, mode)
+            .map_err(|error| TerminalIndexVerificationError::PrefixWalk {
+                message: error.to_string(),
+            })?;
     if let Some(truncation) = walked.truncation {
         return Err(TerminalIndexVerificationError::PrefixTruncated {
             tape_file_number: truncation.tape_file_number,

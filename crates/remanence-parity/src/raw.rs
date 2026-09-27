@@ -36,7 +36,8 @@ pub(crate) fn raw_read_error_proves_damage(error: &ParityError) -> bool {
     )
 }
 
-pub(crate) fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
+/// Whether current sense data positively identifies medium damage.
+pub fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
     #[cfg(target_os = "linux")]
     {
         matches!(
