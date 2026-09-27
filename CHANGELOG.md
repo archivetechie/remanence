@@ -6,6 +6,15 @@ per-release summaries.
 
 ## Unreleased
 
+- Added a review-only candidate supplement for REM-OBJECT and REM-ENCRYPT
+  (`fixtures/rem-object-supplement-draft/`): a Sealer refusing two recipients
+  that share an epoch id, an envelope whose metadata hides a negative integer
+  under an unknown key, and its valid control. Every case records all of its
+  inputs, runs in the Rust harness and in the independent verifier, and is
+  pinned by the set's `MANIFEST.tsv`. Its README maps each pinned-archive
+  case's section pointer to the section that now describes it. The pinned
+  archive is unchanged. The independent verifier now checks the REM-ENCRYPT
+  metadata profile everywhere in the metadata, including under unknown keys.
 - Recorded the writer's identity consistently in the diagnostic keys. Every
   bootstrap now carries the software (key 3) and the time it was written
   (key 4). The terminal ParityMap carries the software and time at which the

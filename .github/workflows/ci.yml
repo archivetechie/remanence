@@ -110,13 +110,19 @@ jobs:
         run: cargo doc --no-deps --workspace
 
       - name: Verify REM-OBJECT vectors and plaintext interop
-        run: python3 tools/verify_rem_object_vectors_independent.py --check-plaintext-interop
+        run: |
+          python3 tools/verify_rem_object_vectors_independent.py --check-plaintext-interop
+          python3 tools/verify_rem_object_vectors_independent.py --supplement fixtures/rem-object-supplement-draft
+          python3 -m unittest discover -s tools -p 'test_rem_object_*.py'
 
       - name: Verify publication vectors and specification consistency
         run: |
           python3 tools/verify_publication_test_vectors.py
           python3 tools/test_check_spec_versioning.py
           python3 tools/check_spec_versioning.py
+
+      - name: Verify REM-OBJECT mirror against the pinned archive
+        run: python3 tools/verify_publication_test_vectors.py --check-rem-object-mirror
 
       - name: Assert the published/current REM-PARITY compatibility boundary
         run: cargo test -p remanence-parity --test publication_damage_matrix

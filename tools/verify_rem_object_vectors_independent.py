@@ -44,6 +44,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
     X25519PublicKey,
 )
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 
@@ -539,11 +540,18 @@ def decode_cbor_head(data: bytes, offset: int) -> tuple[int, int, int]:
     raise ValueError("unsupported or indefinite-length CBOR item")
 
 
-def decode_cbor_item(data: bytes, offset: int = 0, depth: int = 0) -> tuple[Any, int, bytes]:
+def decode_cbor_item(data: bytes, offset: int = 0, depth: int = 0,
+                     metadata_budget: list[int] | None = None) -> tuple[Any, int, bytes]:
     if depth > 32:
         raise ValueError("CBOR nesting limit exceeded")
+    if metadata_budget is not None:
+        metadata_budget[0] -= 1
+        if metadata_budget[0] < 0:
+            raise ValueError("metadata exceeds 65536 decoded items")
     start = offset
     major, value, offset = decode_cbor_head(data, offset)
+    if metadata_budget is not None and major == 1:
+        raise MetadataProfileError("REM-ENCRYPT 5.6: negative integer")
     if major == 0:
         return value, offset, data[start:offset]
     if major == 1:
@@ -562,26 +570,31 @@ def decode_cbor_item(data: bytes, offset: int = 0, depth: int = 0) -> tuple[Any,
     if major == 4:
         items = []
         for _ in range(value):
-            item, offset, _encoded = decode_cbor_item(data, offset, depth + 1)
+            item, offset, _encoded = decode_cbor_item(data, offset, depth + 1, metadata_budget)
             items.append(item)
         return items, offset, data[start:offset]
     if major == 5:
         result: dict[Any, Any] = {}
         previous_key_encoding: bytes | None = None
         for _ in range(value):
-            key, offset, key_encoding = decode_cbor_item(data, offset, depth + 1)
+            key, offset, key_encoding = decode_cbor_item(data, offset, depth + 1, metadata_budget)
             if previous_key_encoding is not None and key_encoding <= previous_key_encoding:
                 raise ValueError("CBOR map keys are not strictly sorted")
             previous_key_encoding = key_encoding
+            # Ignored nested metadata maps may use any profile-conformant key,
+            # including arrays/maps and distinct CBOR false/0 or true/1 keys.
+            # Their encoded identity avoids Python hashability/equality limits.
+            if metadata_budget is not None and depth > 0:
+                key = key_encoding
             try:
                 duplicate = key in result
             except TypeError as exc:
                 raise ValueError("unhashable CBOR map key") from exc
             if duplicate:
                 raise ValueError("duplicate CBOR map key")
-            result[key], offset, _encoded = decode_cbor_item(data, offset, depth + 1)
+            result[key], offset, _encoded = decode_cbor_item(data, offset, depth + 1, metadata_budget)
         return result, offset, data[start:offset]
-    if major == 7:
+    if major == 7 and data[start] in (0xf4, 0xf5, 0xf6):
         if value == 20:
             return False, offset, data[start:offset]
         if value == 21:
@@ -1812,13 +1825,37 @@ def verify_xwing_kats(kat_directory: pathlib.Path) -> None:
     )
 
 
+class MetadataProfileError(ValueError):
+    """REM-ENCRYPT 5.6 metadata encoding or repertoire violation."""
+
+
+def decode_metadata(data: bytes) -> Any:
+    """Apply the metadata profile to every item, including ignored values."""
+    try:
+        value, offset, _ = decode_cbor_item(data, metadata_budget=[65536])
+        if offset != len(data):
+            raise ValueError("trailing bytes after CBOR item")
+        if not isinstance(value, dict):
+            raise ValueError("metadata is not a map")
+        if any(type(key) is not int or key < 0 for key in value):
+            raise ValueError("metadata top-level key is not unsigned")
+        return value
+    except MetadataProfileError:
+        raise
+    except ValueError as exc:
+        raise MetadataProfileError(f"REM-ENCRYPT 5.6: {exc}") from exc
+
+
 def validate_encrypted_metadata(vector_id: str, metadata: Any, chunk_size: int) -> tuple[int, bytes]:
     if not isinstance(metadata, dict):
         raise AssertionError(f"{vector_id}: metadata is not a CBOR map")
-    assert_eq(set(metadata), {0, 1, 2, 3}, f"{vector_id} metadata keys")
+    if not {0, 1, 2, 3} <= set(metadata):
+        raise AssertionError(f"{vector_id}: missing required metadata fields")
+    if type(metadata[0]) is not int:
+        raise AssertionError(f"{vector_id}: metadata_version is not unsigned")
     assert_eq(metadata[0], 1, f"{vector_id} metadata_version")
     plaintext_size = metadata[1]
-    if not isinstance(plaintext_size, int):
+    if type(plaintext_size) is not int:
         raise AssertionError(f"{vector_id}: plaintext_size is not an integer")
     if plaintext_size <= 0 or plaintext_size % chunk_size != 0:
         raise AssertionError(f"{vector_id}: invalid plaintext_size {plaintext_size}")
@@ -1875,7 +1912,7 @@ def open_encrypted_with_generic_crypto(
         raise AssertionError(f"{vector_id}: encrypted object ends inside metadata frame")
     metadata_frame = stored[metadata_start:metadata_end]
     metadata_plain = ChaCha20Poly1305(metadata_key).decrypt(b"\0" * 12, metadata_frame, b"")
-    metadata = decode_cbor_exact(metadata_plain)
+    metadata = decode_metadata(metadata_plain)
     plaintext_size, plaintext_digest = validate_encrypted_metadata(
         vector_id,
         metadata,
@@ -2370,7 +2407,7 @@ def check_cross_layer_binding_and_range_vectors(
         stored[metadata_start:metadata_end],
         b"",
     )
-    metadata = decode_cbor_exact(metadata_plain)
+    metadata = decode_metadata(metadata_plain)
     plaintext_size, plaintext_digest = validate_encrypted_metadata(
         "encrypted-last-object-chunk",
         metadata,
@@ -2625,8 +2662,198 @@ def write_core_plaintext_fixture_pins(fixture_directory: pathlib.Path) -> None:
         )
 
 
+def verify_supplement_manifest(directory: pathlib.Path) -> dict[str, Any]:
+    """Check exact file coverage, sizes, hashes, index artifacts and per-case sums."""
+    lines = (directory / "MANIFEST.tsv").read_text().splitlines()
+    assert_eq(lines[0], "path\tbytes\tsha256", "supplement manifest header")
+    paths = []
+    for line in lines[1:]:
+        name, size, digest = line.split("\t")
+        relative = pathlib.PurePosixPath(name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise AssertionError("unsafe supplement path")
+        paths.append(name)
+        path = directory / name
+        if path.is_symlink():
+            raise AssertionError(f"supplement symlink: {name}")
+        data = path.read_bytes()
+        assert_eq(len(data), int(size), f"{name} size")
+        assert_eq(hx(sha256(data)), digest, f"{name} SHA-256")
+    assert_eq(paths, sorted(set(paths)), "manifest order and uniqueness")
+    if any(p.is_symlink() for p in directory.rglob("*")):
+        raise AssertionError("supplement symlink")
+    actual = sorted(p.relative_to(directory).as_posix() for p in directory.rglob("*")
+                    if p.is_file() and p.relative_to(directory).as_posix() != "MANIFEST.tsv")
+    assert_eq(paths, actual, "manifest complete coverage")
+    index = load(directory, "vectors.json")
+    assert_eq(index["vector_set"], "REM-OBJECT-SUPPLEMENT-1-CANDIDATE", "vector set")
+    assert_eq(index["status"], "review-only-candidate", "candidate status")
+    with tarfile.open(ROOT / "specs/publication/remanence-test-vectors.tar", "r") as tar:
+        published = json.load(tar.extractfile("rem-object/vectors.json"))
+    assert_eq(index["checksum_definition"], published["checksum_definition"], "checksum definition")
+    for vector in index["vectors"]:
+        if not vector["spec_section"].startswith("REM-"):
+            raise AssertionError("document-qualified pointer")
+        records = []
+        artifact_paths = []
+        for artifact in vector["artifacts"]:
+            path = pathlib.Path(vector["archive_path"])
+            path = pathlib.Path(artifact["path"]) if path.suffix == ".json" else path / artifact["path"]
+            if path.as_posix() not in paths:
+                raise AssertionError(f"unlisted index artifact: {path}")
+            artifact_paths.append(path.as_posix())
+            data = (directory / path).read_bytes()
+            assert_eq(len(data), artifact["size"], f"{path} index size")
+            digest = hx(sha256(data))
+            assert_eq(digest, artifact["sha256"], f"{path} index digest")
+            records.append(f"{digest}  {artifact['path']}\n")
+        prefix = vector["archive_path"]
+        expected_paths = sorted(p for p in paths if p == prefix or p.startswith(prefix + "/"))
+        if not expected_paths:
+            raise AssertionError("empty vector artifacts")
+        assert_eq(sorted(artifact_paths), expected_paths, "index artifact coverage")
+        assert_eq(hx(sha256("".join(sorted(records)).encode())),
+                  vector["checksum_sha256"], f"{vector['id']} checksum")
+    return index
+
+
+def rederive_supplement_object(inputs: dict[str, Any], plaintext: bytes) -> bytes:
+    """Rebuild a defective-Sealer object from recorded secrets with independent crypto."""
+    dek = bytes.fromhex(inputs["deterministic_dek"])
+    seed = bytes.fromhex(inputs["deterministic_hpke_rng_seed"])
+    # At counter zero and nonce zero, the original/IETF ChaCha20 layouts coincide
+    # for these two blocks. This uses cryptography, not a Rust RNG or KEM.
+    rng = Cipher(algorithms.ChaCha20(seed, b"\0" * 16), mode=None).encryptor()
+    key_frame = bytearray(b"REMK" + bytes([len(inputs["recipients"])]))
+    for recipient in inputs["recipients"]:
+        public, *_ = xwing_keypair(bytes.fromhex(recipient["private_key"]))
+        assert_eq(recipient["private_key_role"], "xwing-seed-32", "recipient seed role")
+        assert_eq(hx(public), recipient["public_key"], "recipient public key")
+        enc, shared = xwing_encapsulate(public, rng.update(b"\0" * 64))
+        epoch = bytes.fromhex(recipient["recipient_epoch_id"])
+        slot = recipient["slot_index"]
+        info = WRAP_INFO_PREFIX + object_id_field(inputs["object_id"]) + epoch + bytes([slot, 1, 2])
+        key, nonce = hpke_base_context(shared, HPKE_XWING_ID, info)
+        wrapped = ChaCha20Poly1305(key).encrypt(nonce, dek, b"")
+        label = recipient["epoch_label"].encode("ascii")
+        key_frame.extend(bytes([slot]) + epoch + bytes([len(label)]) + label + enc + wrapped)
+    metadata = bytes.fromhex(inputs["metadata_plaintext_hex"])
+    salt, _ = derive_salt(dek, inputs["object_id"], sha256(plaintext), metadata)
+    chunk_size = inputs["chunk_size"]
+    header = bytearray(REM_OBJECT_HEADER_LEN)
+    header[:4] = b"REMO"
+    header[4:6] = REM_OBJECT_HEADER_LEN.to_bytes(2, "big")
+    header[6:8] = bytes([REM_OBJECT_FORMAT_VERSION, 1])
+    header[8:12] = chunk_size.to_bytes(4, "big")
+    header[32:48] = salt
+    header[48:56] = (len(metadata) + 16).to_bytes(8, "big")
+    header[56] = REM_OBJECT_WRAP_SUITE_XWING
+    header[60:64] = len(key_frame).to_bytes(4, "big")
+    header[64:128] = object_id_field(inputs["object_id"])
+    object_secret = hkdf(salt, dek, LABEL_OBJECT + sha256(header + key_frame), 32)
+    metadata_key = hkdf(b"", object_secret, LABEL_METADATA, 32)
+    payload_key = hkdf(b"", object_secret, LABEL_PAYLOAD, 32)
+    stored = header + key_frame
+    stored.extend(ChaCha20Poly1305(metadata_key).encrypt(b"\0" * 12, metadata, b""))
+    if not plaintext or len(plaintext) % chunk_size != 0:
+        raise AssertionError("plaintext must be nonempty and chunk-aligned")
+    for index in range(len(plaintext) // chunk_size):
+        end = (index + 1) * chunk_size
+        stored.extend(ChaCha20Poly1305(payload_key).encrypt(
+            stream_nonce(index, end == len(plaintext)), plaintext[end - chunk_size:end], b""))
+    stored.extend(REM_OBJECT_FOOTER)
+    stored.extend(b"\0" * (round_up(len(stored), chunk_size) - len(stored)))
+    return bytes(stored)
+
+
+def check_supplement(directory: pathlib.Path) -> None:
+    """Re-derive every candidate, require the precise negative cause and open the control."""
+    index = verify_supplement_manifest(directory)
+    p1 = load(FIXTURES, "rem-object-tv-p1.json")
+    plaintext, _ = build_plaintext(p1["inputs"], p1_file_specs())
+    assert_eq(hx(sha256(plaintext)), p1["expected"]["stored_digest"], "supplement P1")
+    ran = []
+    recorded_inputs = []
+    for manifest_name in ("negative-sealer.json", "metadata-envelope.json"):
+        manifest = load(directory / "manifests", manifest_name)
+        assert_eq(manifest["status"], "review-only-candidate", "manifest status")
+        for case in manifest["cases"]:
+            case_id = case["id"]
+            ran.append(case_id)
+            if case_id == "seal-duplicate-epoch-id":
+                inputs = case["inputs"]
+                assert_eq(case["operation"], "seal", case_id)
+                assert_eq(case["expected_error"], "InvalidInput", case_id)
+                recipients = inputs["recipients"]
+                assert_eq(len(recipients), 2, "duplicate-epoch recipient count")
+                assert_eq([r["slot_index"] for r in recipients], [0, 1], "distinct slots")
+                assert_eq(recipients[0]["recipient_epoch_id"], recipients[1]["recipient_epoch_id"], "duplicate epochs")
+                epoch = bytes.fromhex(recipients[0]["recipient_epoch_id"])
+                if len(epoch) != 16 or not any(epoch):
+                    raise AssertionError("valid nonzero epoch required")
+                for recipient in recipients:
+                    label = recipient["epoch_label"].encode("ascii")
+                    if len(label) > 32 or not all(0x20 <= b <= 0x7e for b in label):
+                        raise AssertionError("valid epoch label required")
+                for recipient in recipients:
+                    assert_eq(recipient["private_key_role"], "xwing-seed-32", "seed role")
+                    assert_eq(hx(xwing_keypair(bytes.fromhex(recipient["private_key"]))[0]),
+                              recipient["public_key"], "Sealer recipient public key")
+                print(f"{case_id}: inputs checked (two slots, one shared epoch id, keys matching seeds); expected InvalidInput (REM-ENCRYPT 5.3, 5.9, 11.2)")
+            else:
+                if case_id not in ("metadata-negative-integer-under-unknown-key", "metadata-unknown-key-control"):
+                    raise AssertionError(f"unknown supplement case: {case_id}")
+                base = directory / case["archive_path"]
+                inputs = load(base, "input.json")
+                assert_eq(case["operation"], "open", case_id)
+                assert_eq(len(inputs["recipients"]), 2, "both supplement recipients must run")
+                recorded_inputs.append(inputs)
+                expected = load(base, "expected.json")
+                for key, value in expected.items():
+                    assert_eq(case[key], value, f"{case_id} manifest expectation")
+                stored = (base / "object.rem-object").read_bytes()
+                assert_eq(rederive_supplement_object(inputs, plaintext), stored, f"{case_id} regenerated object")
+                assert_eq(hx(sha256(stored)), expected["stored_digest"], f"{case_id} stored digest")
+                for recipient in inputs["recipients"]:
+                    if case_id == "metadata-negative-integer-under-unknown-key":
+                        assert_eq(expected["expected_error"], "InvalidCborEncoding", case_id)
+                        try:
+                            open_encrypted_with_generic_crypto(case_id, stored, recipient, {}, bytes.fromhex(inputs["deterministic_dek"]))
+                        except MetadataProfileError as exc:
+                            assert_eq(str(exc), "REM-ENCRYPT 5.6: negative integer", case_id)
+                        else:
+                            raise AssertionError(f"{case_id}: negative integer accepted")
+                    else:
+                        assert_eq(expected["expected_outcome"], "accepted", case_id)
+                        recovered, _, _ = open_encrypted_with_generic_crypto(
+                            case_id, stored, recipient,
+                            {"plaintext_digest": expected["plaintext_digest"]},
+                            bytes.fromhex(inputs["deterministic_dek"]))
+                        assert_eq(recovered, plaintext, f"{case_id} recovered P1")
+                print(f"{case_id}: {expected.get('expected_error', 'accepted')} (re-derived; both recipients checked)")
+            assert_eq(inputs["plaintext_vector"], "REM-OBJECT-TV-P1", "plaintext source")
+            assert_eq(inputs["chunk_size"], p1["inputs"]["chunk_size"], "chunk size")
+            assert_eq(inputs["object_id"], p1["inputs"]["object_id"], "object id")
+            assert_eq(inputs["recipient_mode"], "hpke-xwing-draft10", "recipient mode")
+            for field in ("deterministic_dek", "deterministic_hpke_rng_seed"):
+                assert_eq(len(bytes.fromhex(inputs[field])), 32, field)
+    assert_eq(ran, ["seal-duplicate-epoch-id", "metadata-negative-integer-under-unknown-key",
+                    "metadata-unknown-key-control"], "supplement case completeness")
+    assert_eq([v["id"] for v in index["vectors"]], ran, "index completeness")
+    negative, control = recorded_inputs
+    negative_metadata = bytes.fromhex(negative["metadata_plaintext_hex"])
+    control_metadata = bytes.fromhex(control["metadata_plaintext_hex"])
+    assert_eq(negative_metadata[:-1], control_metadata[:-1], "single metadata difference")
+    assert_eq(negative_metadata[-2:], b"\x04\x20", "unknown key with -1")
+    assert_eq(control_metadata[-2:], b"\x04\x00", "unknown key with 0")
+    assert_eq({k: v for k, v in negative.items() if k != "metadata_plaintext_hex"},
+              {k: v for k, v in control.items() if k != "metadata_plaintext_hex"}, "otherwise identical inputs")
+    print("supplement MANIFEST.tsv and all 3 cases verified")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--supplement", type=pathlib.Path, help="verify a review-only REM-OBJECT supplement")
     parser.add_argument(
         "--check-plaintext-interop",
         action="store_true",
@@ -2696,6 +2923,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.supplement is not None:
+        check_supplement(args.supplement)
+        return 0
     fixture_directory = args.fixture_directory
     if args.write_new_plaintext_fixtures:
         for filename, vector_id, options, files in positive_plaintext_vector_definitions():

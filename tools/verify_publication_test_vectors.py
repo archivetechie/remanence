@@ -826,6 +826,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "defaults to the bundled tree or repository archive"
         ),
     )
+    parser.add_argument(
+        "--check-rem-object-mirror",
+        action="store_true",
+        help="compare the repository's REM-OBJECT fixtures with its pinned archive; when given alone, run only this check",
+    )
     parity = parser.add_mutually_exclusive_group()
     parity.add_argument(
         "--rederive-parity",
@@ -888,9 +893,39 @@ def _extract_archive(archive_path: pathlib.Path, destination: pathlib.Path) -> p
     return roots[0]
 
 
+def verify_rem_object_mirror() -> None:
+    """Compare every local mirror file with its member of the immutable archive."""
+    root = pathlib.Path(__file__).resolve().parents[1]
+    mirror = root / "fixtures/rem-object"
+    count = 0
+    with tarfile.open(root / "specs/publication/remanence-test-vectors.tar", "r") as archive:
+        for path in sorted(mirror.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(mirror).as_posix()
+            member = "rem-object/" + ("" if relative.startswith("objects/") else "manifests/") + relative
+            try:
+                archived = archive.extractfile(member)
+            except KeyError:
+                fail(f"REM-OBJECT mirror member missing from pinned archive: {relative}")
+            if archived is None:
+                fail(f"REM-OBJECT mirror member is not a file: {relative}")
+            if path.read_bytes() != archived.read():
+                fail(f"REM-OBJECT mirror differs from pinned archive: {relative}")
+            count += 1
+    if not count:
+        fail("REM-OBJECT mirror is empty")
+    print(f"REM-OBJECT mirror: {count} files byte-identical to pinned archive")
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Resolve a tree or tar input and run the complete verifier."""
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    """Run the mirror check alone, or verify a publication tree or tar input."""
+    argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(argv)
+    if args.check_rem_object_mirror:
+        verify_rem_object_mirror()
+        if argv == ["--check-rem-object-mirror"]:
+            return 0
     publication = (
         args.publication.resolve()
         if args.publication is not None

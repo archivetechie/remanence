@@ -1,4 +1,4 @@
-//! Executes REM-OBJECT Section 13.6 negative vector manifests.
+//! Executes the pinned REM-OBJECT manifests and review-only supplement through shared runners.
 
 use std::io::Cursor;
 
@@ -22,6 +22,9 @@ use remanence_format::{
 use remanence_library::{VecBlockSink, VecBlockSource};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+#[path = "support/rem_object_p1.rs"]
+mod rem_object_p1;
 
 const RECIPIENT_SLOT_FIXED_LEN: usize = 1 + 16 + 1 + XWING_CIPHERTEXT_LEN + 48;
 
@@ -1437,12 +1440,97 @@ fn build_key_frame(plaintext: &[u8], options: &SealOptions) -> Result<Vec<u8>, R
 fn assert_envelope_case(case: &Value) {
     let id = str_field(case, "id");
     let operation = str_field(case, "operation");
-    let expected = str_field(case, "expected_error");
-    let err = run_envelope_case(id, operation).unwrap_err();
-    assert_eq!(aead_error_name(&err), expected, "{id}: {err}");
+    let result = run_envelope_case(case, id, operation);
+    if let Some(expected) = case.get("expected_error") {
+        let err = result.unwrap_err();
+        assert_eq!(
+            aead_error_name(&err),
+            expected.as_str().unwrap(),
+            "{id}: {err}"
+        );
+    } else {
+        assert_eq!(str_field(case, "expected_outcome"), "accepted");
+        result.unwrap_or_else(|err| panic!("{id}: expected acceptance, got {err}"));
+    }
 }
 
-fn run_envelope_case(id: &str, operation: &str) -> Result<(), RemObjectAeadError> {
+fn run_envelope_case(case: &Value, id: &str, operation: &str) -> Result<(), RemObjectAeadError> {
+    if id == SUPPLEMENT_CASES[0] {
+        assert_eq!(operation, "seal");
+        let inputs = &case["inputs"];
+        assert_eq!(*inputs, supplement_inputs(true));
+        let plaintext = rem_object_p1::build_p1_plaintext();
+        let recipients = inputs["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                supplement_recipient(r)
+                    .public_key(u64_field(r, "slot_index").try_into().unwrap())
+                    .unwrap()
+            })
+            .collect();
+        let options = EnvelopeSealOptions {
+            allow_single_recipient: false,
+            common: supplement_options(&plaintext),
+            recipients,
+        };
+        let mut output = Vec::new();
+        let result = remanence_aead::seal(Cursor::new(&plaintext), &mut output, &options);
+        assert!(
+            output.is_empty(),
+            "rejected Sealer inputs must emit no bytes"
+        );
+        let err = result
+            .as_ref()
+            .expect_err("duplicate recipient epochs must fail");
+        assert!(
+            err.to_string()
+                .contains("recipient epochs must be distinct"),
+            "{id}: unexpected rejection reason: {err}"
+        );
+        return result.map(|_| ());
+    }
+    if SUPPLEMENT_CASES[1..].contains(&id) {
+        assert_eq!(operation, "open");
+        let directory = supplement_root().join(str_field(case, "archive_path"));
+        let inputs = fixture(&std::fs::read_to_string(directory.join("input.json")).unwrap());
+        let expected = fixture(&std::fs::read_to_string(directory.join("expected.json")).unwrap());
+        for (key, value) in expected.as_object().unwrap() {
+            assert_eq!(&case[key], value);
+        }
+        let object = std::fs::read(directory.join("object.rem-object")).unwrap();
+        assert_eq!(
+            hex(&sha256_array(&object)),
+            str_field(case, "stored_digest")
+        );
+        let recipients = inputs["recipients"].as_array().unwrap();
+        assert_eq!(recipients.len(), 2, "both supplement recipients must run");
+        let mut rejection = None;
+        for r in recipients {
+            match open_to_vec(&object, &supplement_recipient(r)) {
+                Ok((plaintext, _)) => {
+                    assert!(
+                        !expected["expected_outcome"].is_null(),
+                        "negative case opened"
+                    );
+                    assert_eq!(plaintext, rem_object_p1::build_p1_plaintext());
+                    assert_eq!(
+                        hex(&sha256_array(&plaintext)),
+                        str_field(&expected, "plaintext_digest")
+                    );
+                }
+                Err(err) => {
+                    assert_eq!(
+                        aead_error_name(&err),
+                        str_field(&expected, "expected_error")
+                    );
+                    rejection = Some(err);
+                }
+            }
+        }
+        return rejection.map_or(Ok(()), Err);
+    }
     let (mut sealed, recipient) = base_envelope();
     let inspected = inspect_bytes(&sealed).expect("base envelope inspects");
     let metadata_start = 128usize + inspected.header.key_frame_len as usize;
@@ -2158,4 +2246,287 @@ fn key_frame_negative_vectors_match_manifest_errors() {
             result.unwrap_or_else(|error| panic!("{id}: expected acceptance, got {error}"));
         }
     }
+}
+
+/// Review-only supplement inputs and bytes share the archive harness builders.
+const SUPPLEMENT_CASES: [&str; 3] = [
+    "seal-duplicate-epoch-id",
+    "metadata-negative-integer-under-unknown-key",
+    "metadata-unknown-key-control",
+];
+
+fn supplement_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/rem-object-supplement-draft")
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    assert!(text.len().is_multiple_of(2));
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn supplement_options(plaintext: &[u8]) -> SealOptions {
+    let p1 = rem_object_p1::p1_options();
+    SealOptions {
+        chunk_size: p1.chunk_size as u32,
+        object_id: p1.object_id,
+        plaintext_size: plaintext.len() as u64,
+        plaintext_digest: sha256_array(plaintext),
+    }
+}
+
+fn supplement_inputs(duplicate: bool) -> Value {
+    let (_, recipients) = recipient_pair();
+    let recipients: Vec<Value> = recipients.iter().enumerate().map(|(i, r)| {
+        serde_json::json!({
+            "slot_index": r.slot_index,
+            "recipient_epoch_id": hex(if duplicate { &recipients[0].recipient_epoch_id } else { &r.recipient_epoch_id }),
+            "epoch_label": r.epoch_label,
+            "private_key": hex(&[0x41 + i as u8; 32]),
+            "private_key_role": "xwing-seed-32",
+            "public_key": hex(&r.public_key),
+        })
+    }).collect();
+    let p1 = rem_object_p1::p1_options();
+    serde_json::json!({
+        "plaintext_vector": "REM-OBJECT-TV-P1", "chunk_size": p1.chunk_size,
+        "object_id": p1.object_id, "deterministic_dek": hex(&[0x5d; 32]),
+        "deterministic_hpke_rng_seed": hex(&[0xa7; 32]),
+        "recipient_mode": "hpke-xwing-draft10", "recipients": recipients,
+    })
+}
+
+fn supplement_recipient(value: &Value) -> RecipientPrivateKey {
+    assert_eq!(str_field(value, "private_key_role"), "xwing-seed-32");
+    let private = RecipientPrivateKey::new(
+        unhex(str_field(value, "recipient_epoch_id"))
+            .try_into()
+            .unwrap(),
+        str_field(value, "epoch_label"),
+        unhex(str_field(value, "private_key")).try_into().unwrap(),
+    )
+    .unwrap();
+    let public = private
+        .public_key(u64_field(value, "slot_index").try_into().unwrap())
+        .unwrap();
+    assert_eq!(hex(&public.public_key), str_field(value, "public_key"));
+    private
+}
+
+fn json_bytes(value: &Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn supplement_files() -> std::collections::BTreeMap<String, Vec<u8>> {
+    use serde_json::json;
+    let mut files = std::collections::BTreeMap::new();
+    let plaintext = rem_object_p1::build_p1_plaintext();
+    let options = supplement_options(&plaintext);
+    let mut sealer_case = json!({
+        "id": SUPPLEMENT_CASES[0], "operation": "seal", "expected_error": "InvalidInput",
+        "rule_section": "REM-ENCRYPT 5.3, 5.9, 11.2",
+    });
+    sealer_case["inputs"] = supplement_inputs(true);
+    files.insert(
+        "manifests/negative-sealer.json".into(),
+        json_bytes(&json!({
+            "vector_set": "REM-OBJECT-SUPPLEMENT-1-CANDIDATE", "status": "review-only-candidate",
+            "spec_section": "REM-ENCRYPT 13.4", "cases": [sealer_case],
+        })),
+    );
+    let mut envelope_cases = Vec::new();
+    for (id, value) in [(SUPPLEMENT_CASES[1], 0x20), (SUPPLEMENT_CASES[2], 0x00)] {
+        let metadata = metadata_cbor_with_extra(&options, &[value]);
+        let object = envelope_from_metadata_plaintext(
+            &plaintext,
+            &options,
+            &metadata,
+            options.plaintext_digest,
+            None,
+            true,
+        )
+        .unwrap();
+        let mut inputs = supplement_inputs(false);
+        inputs["metadata_plaintext_hex"] = json!(hex(&metadata));
+        let mut expected = json!({"stored_digest": hex(&sha256_array(&object))});
+        if value == 0x20 {
+            expected["expected_error"] = json!("InvalidCborEncoding");
+        } else {
+            expected["expected_outcome"] = json!("accepted");
+            expected["plaintext_digest"] = json!(hex(&options.plaintext_digest));
+        }
+        let mut case = expected.clone();
+        case["id"] = json!(id);
+        case["operation"] = json!("open");
+        case["rule_section"] = json!("REM-ENCRYPT 5.6");
+        case["archive_path"] = json!(format!("cases/{id}"));
+        envelope_cases.push(case);
+        files.insert(format!("cases/{id}/input.json"), json_bytes(&inputs));
+        files.insert(format!("cases/{id}/expected.json"), json_bytes(&expected));
+        files.insert(format!("cases/{id}/object.rem-object"), object);
+    }
+    files.insert(
+        "manifests/metadata-envelope.json".into(),
+        json_bytes(&json!({
+            "vector_set": "REM-OBJECT-SUPPLEMENT-1-CANDIDATE", "status": "review-only-candidate",
+            "spec_section": "REM-ENCRYPT 13.4", "cases": envelope_cases,
+        })),
+    );
+    let mut vectors = Vec::new();
+    for (id, path, category, section) in [
+        (
+            SUPPLEMENT_CASES[0],
+            "manifests/negative-sealer.json".to_string(),
+            "negative/sealer",
+            "REM-ENCRYPT 13.4",
+        ),
+        (
+            SUPPLEMENT_CASES[1],
+            format!("cases/{}", SUPPLEMENT_CASES[1]),
+            "negative/envelope",
+            "REM-ENCRYPT 13.4",
+        ),
+        (
+            SUPPLEMENT_CASES[2],
+            format!("cases/{}", SUPPLEMENT_CASES[2]),
+            "positive/envelope",
+            "REM-ENCRYPT 13.4",
+        ),
+    ] {
+        let mut records = Vec::new();
+        let mut artifacts = Vec::new();
+        for (name, bytes) in &files {
+            if name == &path || name.starts_with(&format!("{path}/")) {
+                let relative = name.strip_prefix(&format!("{path}/")).unwrap_or(name);
+                let digest = hex(&sha256_array(bytes));
+                records.push(format!("{digest}  {relative}\n"));
+                artifacts.push(json!({"path": relative, "size": bytes.len(), "sha256": digest}));
+            }
+        }
+        records.sort();
+        vectors.push(json!({"id": id, "archive_path": path, "category": category,
+            "spec_section": section, "artifacts": artifacts,
+            "checksum_sha256": hex(&sha256_array(records.concat().as_bytes()))}));
+    }
+    files.insert("vectors.json".into(), json_bytes(&json!({
+        "vector_set": "REM-OBJECT-SUPPLEMENT-1-CANDIDATE", "status": "review-only-candidate",
+        "spec_section": "REM-ENCRYPT 13.4",
+        "checksum_definition": "SHA-256 of sorted '<artifact-sha256>  <relative-path>\\n' records within each vector",
+        "vectors": vectors,
+    })));
+    let output = std::process::Command::new("python3")
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tools/rem_object_vector_pointers.py"),
+        )
+        .output()
+        .expect("python3 is required to generate the pointer table");
+    assert!(
+        output.status.success(),
+        "pointer script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let readme = format!(
+        "{}{}<!-- vector-pointers:end -->\n",
+        include_str!("support/rem_object_supplement_readme.md"),
+        String::from_utf8(output.stdout).unwrap()
+    );
+    files.insert("README.md".into(), readme.into_bytes());
+    let mut manifest = String::from("path\tbytes\tsha256\n");
+    for (name, bytes) in &files {
+        manifest.push_str(&format!(
+            "{name}\t{}\t{}\n",
+            bytes.len(),
+            hex(&sha256_array(bytes))
+        ));
+    }
+    files.insert("MANIFEST.tsv".into(), manifest.into_bytes());
+    files
+}
+
+fn read_supplement_files(
+    directory: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            assert!(
+                !entry.file_type().unwrap().is_symlink(),
+                "candidate files cannot be symlinks"
+            );
+            let path = entry.path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .replace('\\', "/"),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(directory, directory, &mut files);
+    files
+}
+
+#[test]
+fn supplement_regenerates_byte_exactly() {
+    let generated = supplement_files();
+    if let Some(directory) = std::env::var_os("REM_OBJECT_SUPPLEMENT_EXPORT_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        // The export directory must be empty, so no existing file is overwritten.
+        std::fs::create_dir_all(&directory).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            0,
+            "export directory must be empty"
+        );
+        for (name, bytes) in &generated {
+            let path = directory.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+    let checked_in = read_supplement_files(&supplement_root());
+    assert_eq!(
+        generated.keys().collect::<Vec<_>>(),
+        checked_in.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in generated {
+        assert_eq!(bytes, checked_in[&name], "{name}");
+    }
+}
+
+#[test]
+fn supplement_cases_match_manifests() {
+    let mut ran = Vec::new();
+    for name in ["negative-sealer.json", "metadata-envelope.json"] {
+        let manifest = fixture(
+            &std::fs::read_to_string(supplement_root().join("manifests").join(name)).unwrap(),
+        );
+        assert_eq!(str_field(&manifest, "status"), "review-only-candidate");
+        for case in cases(&manifest) {
+            assert_envelope_case(case);
+            ran.push(str_field(case, "id").to_owned());
+        }
+    }
+    assert_eq!(ran, SUPPLEMENT_CASES);
 }
