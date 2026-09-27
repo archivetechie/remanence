@@ -28,10 +28,9 @@ use super::capacity::{
     ensure_empty_checkpoint_matches_catalog_freshness, ensure_no_parity_terminal_close_capacity,
     ensure_request_pool_matches_config, ensure_selected_tape_accepts_session_write,
     ensure_selected_tape_accepts_write, ensure_selected_tape_binding,
-    ensure_selected_tape_has_capacity, first_batched_append_context, now_rfc3339,
-    parity_capacity_basis_blocks, reserve_parity_object_capacity,
-    selected_tape_seal_reason_at_barrier, terminal_capacity_basis_blocks,
-    terminal_watermark_blocks, uuid_text,
+    ensure_selected_tape_has_capacity, first_batched_append_context, parity_capacity_basis_blocks,
+    reserve_parity_object_capacity, selected_tape_seal_reason_at_barrier,
+    terminal_capacity_basis_blocks, terminal_watermark_blocks, uuid_text,
 };
 use super::model::{
     parity_post_write_projection_gate, require_rewritable_object_media, AppendCommitDiagnostics,
@@ -249,8 +248,12 @@ pub(super) fn build_direct_terminal_plan(
         PoolWriteError::InvalidInput("terminal edition sequence overflows u64".to_string())
     })?;
     let edition_id = *Uuid::new_v4().as_bytes();
-    let writer_version = format!("remanence-api/{}", env!("CARGO_PKG_VERSION"));
-    let write_timestamp = now_rfc3339()?;
+    let diagnostics = match terminal_prefix {
+        Some(prefix) => prefix.diagnostics.clone(),
+        None => remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")).capture()?,
+    };
+    let writer_version = diagnostics.writer_version;
+    let write_timestamp = diagnostics.write_timestamp;
     let edition = remanence_parity::plan_tape_index_edition(
         remanence_parity::TapeIndexEditionDescriptor {
             tape_uuid: selected.tape_uuid,
@@ -502,7 +505,8 @@ pub(super) fn finalize_direct_checkpoint_prefix(
             let (prefix, session_state) = {
                 let mut raw = BlockSinkRawTapeSink::new(sink);
                 let parity = ParitySink::from_session_state(&mut raw, journal, session_state)?;
-                let prefix = parity.plan_terminal_index_close()?;
+                let prefix =
+                    parity.plan_terminal_index_close(parity.writer_identity().capture()?)?;
                 let state = parity.into_session_state()?;
                 (prefix, state)
             };
@@ -890,6 +894,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                         parity_scheme.clone(),
                         selected.tape_uuid,
                         selected.block_size,
+                        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                     )?;
                     parity.write_bootstrap()?;
                     parity.into_session_state()?
@@ -926,6 +931,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                             resume_result: &resume_result,
                             live_epoch: None,
                         },
+                        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                     )?;
                     parity.into_session_state()?
                 };

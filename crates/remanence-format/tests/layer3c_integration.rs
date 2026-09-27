@@ -94,9 +94,18 @@ fn rem_tar_writer_composes_with_parity_sink_and_reads_back_object_blocks() {
     {
         let mut raw = BlockSinkRawTapeSink::new(&mut tape);
         let mut journal = TestJournal::default();
-        let mut parity =
-            ParitySink::new_with_journal(&mut raw, &mut journal, scheme(), TAPE_UUID, BLOCK_SIZE)
-                .expect("parity sink constructs");
+        let mut parity = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
+        )
+        .expect("parity sink constructs");
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
@@ -166,9 +175,18 @@ fn streaming_rem_tar_roundtrips_through_parity_object_source() {
     {
         let mut raw = BlockSinkRawTapeSink::new(&mut tape);
         let mut journal = TestJournal::default();
-        let mut parity =
-            ParitySink::new_with_journal(&mut raw, &mut journal, scheme(), TAPE_UUID, BLOCK_SIZE)
-                .expect("parity sink constructs");
+        let mut parity = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
+        )
+        .expect("parity sink constructs");
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity
@@ -300,9 +318,18 @@ fn encrypted_rem_object_ciphertext_recovers_through_parity_before_keyed_open() {
     {
         let mut raw = BlockSinkRawTapeSink::new(&mut tape);
         let mut journal = TestJournal::default();
-        let mut parity =
-            ParitySink::new_with_journal(&mut raw, &mut journal, scheme(), TAPE_UUID, BLOCK_SIZE)
-                .expect("parity sink constructs");
+        let mut parity = ParitySink::new_with_journal(
+            &mut raw,
+            &mut journal,
+            scheme(),
+            TAPE_UUID,
+            BLOCK_SIZE,
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
+        )
+        .expect("parity sink constructs");
         assert_eq!(parity.write_bootstrap().expect("BOT bootstrap"), 0);
         assert_eq!(
             parity

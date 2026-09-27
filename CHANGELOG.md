@@ -6,6 +6,15 @@ per-release summaries.
 
 ## Unreleased
 
+- Recorded the writer's identity consistently in the diagnostic keys. Every
+  bootstrap now carries the software (key 3) and the time it was written
+  (key 4). The terminal ParityMap carries the software and time at which the
+  tape's finalization was planned (keys 6 and 7), and the terminal edition
+  names the same software and time. The pair is captured once, before
+  planning, and kept in the persisted plan, so re-planning, recovery and media
+  adoption reproduce the planned bytes. The finalization companion intent and
+  the checkpoint record move to format version 3; version 2 files are refused,
+  so a state directory written by an earlier build needs a clean slate.
 - Disclosed the REM-PARITY generation boundary: released generation-1 tapes
   and vectors are incompatible with the generation-2 terminal-index reader and
   writer on `main`.

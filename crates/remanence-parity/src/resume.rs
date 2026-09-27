@@ -671,7 +671,9 @@ pub fn checked_checkpointed_terminal_close_summary(
 /// Reconstruct the exact terminal prefix without materializing the prefix map.
 pub fn plan_checkpointed_terminal_index_close(
     snapshot: &FileTapeFileJournalCommittedSnapshot,
+    diagnostics: crate::ParityMapDiagnostics,
 ) -> Result<TerminalPrefixPlan, ParityError> {
+    diagnostics.validate()?;
     let CheckedTerminalCloseProjection {
         summary,
         mut projected_map_hasher,
@@ -680,6 +682,7 @@ pub fn plan_checkpointed_terminal_index_close(
     let start_lba = summary.append_position.lba;
     if summary.sidecar_directory_entries.is_empty() {
         return Ok(TerminalPrefixPlan {
+            diagnostics,
             start_tape_file_number,
             tail_start_tape_file_number: start_tape_file_number,
             start_lba,
@@ -713,8 +716,8 @@ pub fn plan_checkpointed_terminal_index_close(
             sequence: summary.next_parity_map_sequence,
             directory: directory.clone(),
             canonical_map_digest: [0; 32],
-            writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            write_timestamp: None,
+            writer_version: Some(diagnostics.writer_version.clone()),
+            write_timestamp: Some(diagnostics.write_timestamp.clone()),
         },
         snapshot.block_size(),
     )?;
@@ -729,8 +732,8 @@ pub fn plan_checkpointed_terminal_index_close(
             sequence: summary.next_parity_map_sequence,
             directory,
             canonical_map_digest,
-            writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            write_timestamp: None,
+            writer_version: Some(diagnostics.writer_version.clone()),
+            write_timestamp: Some(diagnostics.write_timestamp.clone()),
         },
         snapshot.block_size(),
     )?;
@@ -767,6 +770,7 @@ pub fn plan_checkpointed_terminal_index_close(
     validate_committed_bundle_shape(&committed_bundle)
         .map_err(|error| resume_error(error.to_string()))?;
     Ok(TerminalPrefixPlan {
+        diagnostics,
         start_tape_file_number,
         tail_start_tape_file_number: scope_tape_file_count,
         start_lba,
@@ -790,7 +794,8 @@ pub fn close_checkpointed_terminal_index_prefix(
     expected_plan: &TerminalPrefixPlan,
     evidence: TerminalPrefixReconcileEvidence,
 ) -> Result<CheckpointedTerminalPrefixCloseResult, ParityError> {
-    let current_plan = plan_checkpointed_terminal_index_close(snapshot)?;
+    let current_plan =
+        plan_checkpointed_terminal_index_close(snapshot, expected_plan.diagnostics.clone())?;
     if &current_plan != expected_plan {
         return Err(ParityError::Invariant(
             "terminal prefix execution does not match persisted immutable plan",
@@ -1066,8 +1071,8 @@ fn write_planned_terminal_parity_map(
             sequence: summary.next_parity_map_sequence,
             directory,
             canonical_map_digest: projected_map_hasher.finalize().into(),
-            writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            write_timestamp: None,
+            writer_version: Some(plan.diagnostics.writer_version.clone()),
+            write_timestamp: Some(plan.diagnostics.write_timestamp.clone()),
         },
         snapshot.block_size(),
     )?;
@@ -4178,6 +4183,7 @@ mod tests {
 
     #[test]
     fn bounded_terminal_plan_writes_the_planned_bytes() {
+        let (identity, clock_calls) = crate::writer_identity::advancing_test_identity();
         let tape_uuid = [0x91; 16];
         let path = terminal_journal_path("bounded-terminal-exact");
         let mut journal = crate::journal::FileTapeFileJournal::open(
@@ -4191,8 +4197,15 @@ mod tests {
         let snapshot = journal
             .committed_snapshot_bounded()
             .expect("freeze bounded authority");
-        let bounded = plan_checkpointed_terminal_index_close(&snapshot)
-            .expect("plan bounded terminal prefix");
+        let bounded =
+            plan_checkpointed_terminal_index_close(&snapshot, identity.capture().unwrap())
+                .expect("plan bounded terminal prefix");
+        assert_ne!(identity.capture().unwrap(), bounded.diagnostics);
+        let calls_before = clock_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            plan_checkpointed_terminal_index_close(&snapshot, bounded.diagnostics.clone()).unwrap(),
+            bounded
+        );
 
         let mut raw = ExactTerminalRawSink {
             cursor: bounded.start_lba,
@@ -4214,6 +4227,39 @@ mod tests {
         assert_eq!(
             Some(decoded.header.payload_sha256),
             bounded.committed_bundle.entries[0].canonical_metadata_hash
+        );
+        assert_eq!(
+            decoded.payload.writer_version.as_ref(),
+            Some(&bounded.diagnostics.writer_version)
+        );
+        assert_eq!(
+            decoded.payload.write_timestamp.as_ref(),
+            Some(&bounded.diagnostics.write_timestamp)
+        );
+        let mut recovered = ExactTerminalRawSink {
+            cursor: bounded.start_lba,
+            blocks: Vec::new(),
+            filemark_calls: Vec::new(),
+        };
+        write_planned_terminal_parity_map(&mut recovered, &snapshot, &bounded)
+            .expect("re-encode persisted plan after interruption");
+        assert_eq!(recovered.blocks, raw.blocks);
+        let written_blocks = raw.blocks.clone();
+        close_checkpointed_terminal_index_prefix(
+            &mut raw,
+            &mut journal,
+            &snapshot,
+            &bounded,
+            TerminalPrefixReconcileEvidence::Complete,
+        )
+        .expect("adopt complete planned media");
+        assert_eq!(
+            raw.blocks, written_blocks,
+            "adoption must not rewrite media"
+        );
+        assert_eq!(
+            clock_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before
         );
         let checkpoint = CommittedBundle {
             kind: CommittedBundleKind::CheckpointedThrough,
@@ -4256,8 +4302,16 @@ mod tests {
         assert!(summary.peak_live_journal_entry_count <= 4);
         assert!(summary.peak_live_journal_entry_count < OBJECT_COUNT);
 
-        let bounded = plan_checkpointed_terminal_index_close(&snapshot)
-            .expect("plan high-count bounded terminal prefix");
+        let bounded = plan_checkpointed_terminal_index_close(
+            &snapshot,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            )
+            .capture()
+            .unwrap(),
+        )
+        .expect("plan high-count bounded terminal prefix");
         assert_eq!(
             bounded.start_tape_file_number,
             summary.committed_tape_file_count
@@ -4323,6 +4377,10 @@ mod tests {
                 resume_result: &resume_result,
                 live_epoch: None,
             },
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("seed high-count bounded sink");
         let state = sink.into_session_state().expect("detach bounded sink");

@@ -306,16 +306,17 @@ the [configuration reference](reference-configuration.md)):
 - **Per-tape checkpoint journals**
   (`checkpoints/<tape-uuid>.remcheckpoint`) — fsynced checkpoint histories with
   the barrier-proved physical EOD and replayable catalog projection. Records use
-  magic `REMCKPT\x01` and record format version 2.
+  magic `REMCKPT\x01` and record format version 3.
 - **Finalization companion intents**
   (`checkpoints/<tape-uuid>.remcheckpoint.finalizing`) — the fsynced record of a
   finalization in progress: what triggered it, the operator's identity for a
   manual close, the barrier-proved progress, whether the current boundary needs
   media reconciliation, and the edition being written. It has its own format
-  version (magic `REMFINT\x01`, version 2), independent of the journal and
-  checkpoint record versions. Version 2 added the reconciliation flag, so a
-  reader that knows only version 1 rejects a version-2 companion instead of
-  taking it for an ordinary intent.
+  version (magic `REMFINT\x01`, version 3), independent of the journal and
+  checkpoint record versions. Version 3 adds the finalization planning software
+  and time to the immutable terminal-prefix plan. The completed checkpoint
+  record embeds this plan and also uses version 3. Readers reject earlier
+  versions of both formats without migration.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
 - **SQLite index** — schema version 18, tracked via `PRAGMA

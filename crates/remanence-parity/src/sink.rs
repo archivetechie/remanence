@@ -18,6 +18,7 @@
 //! rejects external calls so a body format cannot silently introduce an
 //! untracked tape-file boundary.
 
+use crate::{ParityMapDiagnostics, WriterIdentity};
 use std::collections::BTreeMap;
 
 use remanence_library::scsi::ScsiError;
@@ -566,6 +567,8 @@ pub struct TerminalPrefixCloseResult {
 /// Pure deterministic terminal-prefix plan persisted before close motion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalPrefixPlan {
+    /// Diagnostics captured before planning and reused by every encoder.
+    pub diagnostics: ParityMapDiagnostics,
     /// First tape-file number that terminal-prefix emission may use.
     pub start_tape_file_number: u64,
     /// First tape-file number reserved for replica A after the prefix.
@@ -823,6 +826,7 @@ pub enum CloseReason {
 /// across object appends.
 #[allow(missing_debug_implementations)]
 pub struct ParitySinkSessionState {
+    identity: WriterIdentity,
     scheme: ParityScheme,
     tape_uuid: [u8; 16],
     codec: ReedSolomonCodec,
@@ -921,6 +925,7 @@ pub struct BoundedResumeWriterSeed<'a> {
 /// sidecar tape files, never as inline parity blocks in the object stream.
 #[allow(missing_debug_implementations)]
 pub struct ParitySink<'a> {
+    identity: WriterIdentity,
     backend: ParitySinkBackend<'a>,
     journal: Option<&'a mut dyn TapeFileJournal>,
     scheme: ParityScheme,
@@ -1056,6 +1061,11 @@ pub struct ParitySink<'a> {
 }
 
 impl<'a> ParitySink<'a> {
+    /// Identity retained by this session, including its injectable clock.
+    pub fn writer_identity(&self) -> &WriterIdentity {
+        &self.identity
+    }
+
     fn projected_map_digest_for_builder(
         &self,
         builder: &FilemarkMapBuilder,
@@ -1088,6 +1098,7 @@ impl<'a> ParitySink<'a> {
             ));
         }
         Ok(ParitySinkSessionState {
+            identity: self.identity,
             scheme: self.scheme,
             tape_uuid: self.tape_uuid,
             codec: self.codec,
@@ -1185,6 +1196,7 @@ impl<'a> ParitySink<'a> {
         Ok(Self {
             backend: ParitySinkBackend(inner),
             journal: Some(journal),
+            identity: state.identity,
             scheme: state.scheme,
             tape_uuid: state.tape_uuid,
             codec: state.codec,
@@ -1237,6 +1249,10 @@ impl<'a> ParitySink<'a> {
             scheme,
             tape_uuid,
             block_size_bytes,
+            WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
     }
 
@@ -1251,6 +1267,7 @@ impl<'a> ParitySink<'a> {
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
+        identity: WriterIdentity,
     ) -> Result<Self, ParityError> {
         if journal.tape_uuid() != tape_uuid {
             return Err(ParityError::SessionOpen(
@@ -1263,6 +1280,7 @@ impl<'a> ParitySink<'a> {
             scheme,
             tape_uuid,
             block_size_bytes,
+            identity,
         )
     }
 
@@ -1300,6 +1318,7 @@ impl<'a> ParitySink<'a> {
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
         resume_seed: BoundedResumeWriterSeed<'_>,
+        identity: WriterIdentity,
     ) -> Result<Self, ParityError> {
         if journal.tape_uuid() != tape_uuid {
             return Err(ParityError::SessionOpen(
@@ -1313,6 +1332,7 @@ impl<'a> ParitySink<'a> {
             tape_uuid,
             block_size_bytes,
             resume_seed,
+            identity,
         )
     }
 
@@ -1323,6 +1343,7 @@ impl<'a> ParitySink<'a> {
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
         resume_seed: BoundedResumeWriterSeed<'_>,
+        identity: WriterIdentity,
     ) -> Result<Self, ParityError> {
         let mut sink = Self::new_with_backend(
             ParitySinkBackend(inner),
@@ -1330,6 +1351,7 @@ impl<'a> ParitySink<'a> {
             scheme,
             tape_uuid,
             block_size_bytes,
+            identity,
         )?;
         sink.validate_bounded_resume_prefix(
             &resume_seed.committed_prefix_summary,
@@ -1382,6 +1404,7 @@ impl<'a> ParitySink<'a> {
         scheme: ParityScheme,
         tape_uuid: [u8; 16],
         block_size_bytes: u32,
+        identity: WriterIdentity,
     ) -> Result<Self, ParityError> {
         scheme.validate()?;
         if block_size_bytes == 0 {
@@ -1396,6 +1419,7 @@ impl<'a> ParitySink<'a> {
         })?;
         let parity_accumulators = new_epoch_parity_accumulators(&codec, s, fixed_block_size);
         Ok(Self {
+            identity,
             backend,
             journal,
             scheme,
@@ -1794,7 +1818,7 @@ impl<'a> ParitySink<'a> {
             self.highest_protected_ordinal,
             false,
         )?;
-        let tape_file_number = self.write_prepared_bootstrap(0, self.bootstrap_payload(digest))?;
+        let tape_file_number = self.write_prepared_bootstrap(0, self.bootstrap_payload(digest)?)?;
         if let Err(err) =
             self.commit_journal_map_range(CommittedBundleKind::BotBootstrap, bundle_start, &[])
         {
@@ -1816,8 +1840,11 @@ impl<'a> ParitySink<'a> {
         Ok(self.next_parity_map_sequence)
     }
 
-    fn bootstrap_payload(&self, digest: FilemarkMapDigest) -> BootstrapPayload {
-        BootstrapPayload {
+    fn bootstrap_payload(
+        &self,
+        digest: FilemarkMapDigest,
+    ) -> Result<BootstrapPayload, ParityError> {
+        Ok(BootstrapPayload {
             scheme: Some(ParitySchemeRecord {
                 id: self.scheme.id.as_str().to_string(),
                 data_blocks_per_stripe: self.scheme.data_blocks_per_stripe,
@@ -1828,12 +1855,14 @@ impl<'a> ParitySink<'a> {
             no_parity_flag: false,
             filemark_map_digest: Some(digest),
             tape_uuid: self.tape_uuid,
-            written_by_version: env!("CARGO_PKG_VERSION").to_string(),
-            written_at: String::new(),
+            written_by_version: self.identity.software().to_string(),
+            written_at: self.identity.written_at().map_err(|_| {
+                ParityError::Invariant("bootstrap clock cannot be formatted as RFC3339")
+            })?,
             sequence: 0,
             block_size_bytes: self.block_size_bytes,
             drive_compression: false,
-        }
+        })
     }
 
     fn sidecar_directory_for_scope(
@@ -1979,7 +2008,10 @@ impl<'a> ParitySink<'a> {
         Ok(())
     }
 
-    fn write_terminal_prefix_parity_map(&mut self) -> Result<Option<u64>, ParityError> {
+    fn write_terminal_prefix_parity_map(
+        &mut self,
+        diagnostics: &ParityMapDiagnostics,
+    ) -> Result<Option<u64>, ParityError> {
         if self.sidecar_directory_entries.is_empty() {
             return Ok(None);
         }
@@ -1999,8 +2031,8 @@ impl<'a> ParitySink<'a> {
                 sequence,
                 directory: provisional_directory,
                 canonical_map_digest: [0; 32],
-                writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                write_timestamp: None,
+                writer_version: Some(diagnostics.writer_version.clone()),
+                write_timestamp: Some(diagnostics.write_timestamp.clone()),
             },
             self.block_size_bytes,
         )?;
@@ -2025,8 +2057,8 @@ impl<'a> ParitySink<'a> {
                 sequence,
                 directory,
                 canonical_map_digest: digest.map_sha256,
-                writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                write_timestamp: None,
+                writer_version: Some(diagnostics.writer_version.clone()),
+                write_timestamp: Some(diagnostics.write_timestamp.clone()),
             },
             self.block_size_bytes,
         )?;
@@ -2213,7 +2245,11 @@ impl<'a> ParitySink<'a> {
     /// `BeforeReplicaA`, then passes the same value to
     /// [`Self::close_for_terminal_index`]. The execution path recomputes and
     /// compares it before motion, so stale or incomplete intent fails closed.
-    pub fn plan_terminal_index_close(&self) -> Result<TerminalPrefixPlan, ParityError> {
+    pub fn plan_terminal_index_close(
+        &self,
+        diagnostics: ParityMapDiagnostics,
+    ) -> Result<TerminalPrefixPlan, ParityError> {
+        diagnostics.validate()?;
         if self.poisoned {
             return Err(ParityError::Invariant(
                 "plan_terminal_index_close called on poisoned parity sink",
@@ -2325,8 +2361,8 @@ impl<'a> ParitySink<'a> {
                         sequence,
                         directory,
                         canonical_map_digest,
-                        writer_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                        write_timestamp: None,
+                        writer_version: Some(diagnostics.writer_version.clone()),
+                        write_timestamp: Some(diagnostics.write_timestamp.clone()),
                     },
                     self.block_size_bytes,
                 )
@@ -2381,6 +2417,7 @@ impl<'a> ParitySink<'a> {
             ParityError::Invariant("planned terminal prefix violates sink-journal grammar")
         })?;
         Ok(TerminalPrefixPlan {
+            diagnostics,
             start_tape_file_number,
             tail_start_tape_file_number,
             start_lba: self.last_physical_lba,
@@ -2518,7 +2555,7 @@ impl<'a> ParitySink<'a> {
                 "close_for_terminal_index called while an object is active",
             ));
         }
-        let current_plan = self.plan_terminal_index_close()?;
+        let current_plan = self.plan_terminal_index_close(expected_plan.diagnostics.clone())?;
         if &current_plan != expected_plan {
             return Err(ParityError::Invariant(
                 "terminal prefix execution does not match persisted immutable plan",
@@ -2541,7 +2578,8 @@ impl<'a> ParitySink<'a> {
                     self.queue_partial_sidecar_without_writing_padding(block_size, true)?;
                 }
                 let sidecars = self.emit_pending_sidecars()?;
-                let parity_map = self.write_terminal_prefix_parity_map()?;
+                let parity_map =
+                    self.write_terminal_prefix_parity_map(&expected_plan.diagnostics)?;
                 (sidecars, parity_map)
             }
             TerminalPrefixReconcileEvidence::TornRewritable => {
@@ -2554,7 +2592,8 @@ impl<'a> ParitySink<'a> {
                     self.queue_partial_sidecar_without_writing_padding(block_size, true)?;
                 }
                 let sidecars = self.emit_pending_sidecars()?;
-                let parity_map = self.write_terminal_prefix_parity_map()?;
+                let parity_map =
+                    self.write_terminal_prefix_parity_map(&expected_plan.diagnostics)?;
                 (sidecars, parity_map)
             }
             TerminalPrefixReconcileEvidence::Complete => {

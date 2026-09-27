@@ -5782,7 +5782,10 @@ fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
         SECOND_UUID,
         API_SESSION_BLOCK_SIZE,
         ParityConfig::None,
-        "test",
+        &remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
     )
     .expect("write fresh bootstrap");
     assert_eq!(action, TapeInitWriteAction::WroteBootstrap);

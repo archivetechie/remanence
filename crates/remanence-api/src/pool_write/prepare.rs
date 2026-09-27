@@ -1007,14 +1007,14 @@ pub(crate) fn write_no_parity_bootstrap(
     sink: &mut dyn BlockSink,
     tape_uuid: TapeUuid,
     block_size: u32,
-    written_at: &str,
+    identity: &remanence_parity::WriterIdentity,
 ) -> Result<(), PoolWriteError> {
     let payload = build_tape_bootstrap(
         tape_uuid,
         block_size,
         ParityConfig::None,
-        written_at.to_string(),
-        env!("CARGO_PKG_VERSION").to_string(),
+        identity.written_at()?,
+        identity.software(),
     );
     write_tape_bootstrap(sink, &payload)
 }

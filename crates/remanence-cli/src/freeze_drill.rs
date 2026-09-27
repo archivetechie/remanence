@@ -656,8 +656,8 @@ fn plan_drill_terminal_tail(
             counts,
             block_size,
             compression_enabled: false,
-            writer_version: "remanence-freeze-drill/2".to_string(),
-            write_timestamp: DRILL_TIMESTAMP.to_string(),
+            writer_version: prefix.diagnostics.writer_version.clone(),
+            write_timestamp: prefix.diagnostics.write_timestamp.clone(),
             terminal_layout: layout,
         },
         &mut planning_rows,
@@ -765,6 +765,7 @@ fn write_drill_tape(
         settings.scheme.clone(),
         tape_uuid,
         settings.block_size,
+        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
     )
     .map_err(|error| format!("open parity write sink: {error}"))?;
     parity
@@ -861,7 +862,12 @@ fn write_drill_tape(
         }
     }
     let prefix_plan = parity
-        .plan_terminal_index_close()
+        .plan_terminal_index_close(
+            parity
+                .writer_identity()
+                .capture()
+                .map_err(|error| error.to_string())?,
+        )
         .map_err(|error| format!("plan terminal prefix: {error}"))?;
     parity
         .close_for_terminal_index(&prefix_plan, TerminalPrefixReconcileEvidence::Absent)

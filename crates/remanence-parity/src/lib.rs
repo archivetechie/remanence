@@ -59,6 +59,8 @@ pub mod tape_index_replica;
 pub mod terminal_inventory;
 pub mod terminal_tail;
 pub mod terminal_writer;
+mod writer_identity;
+pub use writer_identity::{ParityMapDiagnostics, WriterIdentity};
 
 pub use bootstrap::{
     discover_bootstrap, discover_bootstrap_with_block_size,

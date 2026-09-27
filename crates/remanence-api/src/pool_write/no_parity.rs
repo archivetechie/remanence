@@ -95,7 +95,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                                 gated,
                                 tape_uuid,
                                 selected.block_size,
-                                &prepared.write_timestamp,
+                                &remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                             )?
                         }
                         PoolWriteDurability::Batched(BatchedNoParityAppendContext {
@@ -105,7 +105,7 @@ pub(super) fn write_no_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                             gated,
                             tape_uuid,
                             selected.block_size,
-                            &prepared.write_timestamp,
+                            &remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                         )?,
                         #[cfg(test)]
                         PoolWriteDurability::PerObject => {

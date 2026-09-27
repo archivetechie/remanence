@@ -1,6 +1,6 @@
 # REM Implementation and Operations Guide
 
-This revision: 26 September 2026. The history at the end records what each
+This revision: 27 September 2026. The history at the end records what each
 revision changed.
 
 ## 1. About this guide
@@ -1620,12 +1620,18 @@ by a space and a parenthesised build identifier, for example
 software, not the format, so two conformant implementations will not agree on
 it, and are not expected to. A ParityMap is written by software too, and can be
 written by a different version of it than the bootstrap it accompanies, so each
-should record its own. Readers tolerate the absence of both keys, as the
-specification requires: "A Reader MUST tolerate the absence of either key"
-(REM-PARITY §8.2). A tape written without them, or before this
-recommendation, therefore remains fully readable. Remanence, for example,
-writes both keys today with its version number alone, which identifies the
-version but not the software.
+should record the software responsible for its bytes. An implementation that
+fixes a ParityMap's bytes in a plan before writing them may record the planning
+software in key 6. This is a property of such implementations: REM-PARITY does
+not require a ParityMap's bytes to be planned (REM-PARITY §11.3). Readers
+tolerate the absence of both keys, as the specification requires: "A Reader
+MUST tolerate the absence of either key" (REM-PARITY §8.2). A tape written
+without them, or before this recommendation, therefore remains fully readable.
+Remanence, for example, writes bootstrap key 3 on every path, and writes
+ParityMap key 6 with the software that planned the tape's finalization. For an
+uninterrupted finalization, this is the software about to write it. A
+finalization completed after an interruption, even by a later version, keeps
+the planning software's identity.
 
 Serves REM-PARITY §8.2, CBOR Payload, and REM-PARITY §10.1.4, Payload (CBOR).
 
@@ -1635,8 +1641,15 @@ The time a structure was written helps an operator place a cartridge in its
 history, and it costs a few bytes.
 
 We recommend recording it in bootstrap key 4 and in ParityMap key 7, as an
-RFC 3339 `date-time` within the 64-byte bound. Remanence, for example, writes
-bootstrap key 4 but not ParityMap key 7.
+RFC 3339 `date-time` within the 64-byte bound. An implementation that fixes a
+ParityMap's bytes in a plan before writing them, as Section 13.2 describes, may
+record the time of that plan in key 7. Remanence, for example, writes bootstrap
+key 4 from the clock when each bootstrap is written, on every path. It writes
+ParityMap key 7 with the time at which the tape's finalization was planned. For
+an uninterrupted finalization, this is moments before the write. A finalization
+completed after an interruption, even by a later version, keeps that time,
+together with the planning software in key 6. These fields remain diagnostic:
+no reader decision depends on them.
 
 Serves REM-PARITY §8.2, CBOR Payload, and REM-PARITY §10.1.4, Payload (CBOR).
 
@@ -1664,6 +1677,11 @@ identity at random.
 
 ## 14. Revision history
 
+- **27 September 2026.** Fourth revision. Sections 13.2 and 13.3 qualify the
+  diagnostic recommendations for implementations that plan a ParityMap's bytes
+  before writing them. They describe Remanence's bootstrap identity on every
+  path and its preservation of the finalization planning software and time
+  through interrupted finalization.
 - **26 September 2026.** Third revision. Chapters 8 to 11 are new. They hold
   the practice that REM-PARITY 1.0.0-draft.5 moved out of that specification:
   commit records, barrier batching, writer poisoning, position tracking, the

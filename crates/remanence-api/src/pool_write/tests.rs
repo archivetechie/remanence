@@ -2025,9 +2025,18 @@ fn parity_capacity_reservation_uses_physical_cursor_exact_layout_and_atomic_spoo
         tape_uuid,
         bundles: Vec::new(),
     };
-    let mut parity =
-        ParitySink::new_with_journal(&mut raw, &mut journal, scheme, tape_uuid, block_size)
-            .expect("parity sink");
+    let mut parity = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        scheme,
+        tape_uuid,
+        block_size,
+        remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
+    )
+    .expect("parity sink");
     parity.write_bootstrap().expect("initial bootstrap");
     assert_eq!(
         parity
@@ -2217,9 +2226,18 @@ fn parity_spool_shortfall_is_rejected_before_object_tape_motion() {
         tape_uuid,
         bundles: Vec::new(),
     };
-    let mut parity =
-        ParitySink::new_with_journal(&mut raw, &mut journal, scheme, tape_uuid, block_size)
-            .expect("parity sink");
+    let mut parity = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        scheme,
+        tape_uuid,
+        block_size,
+        remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
+    )
+    .expect("parity sink");
     parity.write_bootstrap().expect("initial bootstrap");
     let position_before = parity
         .terminal_triple_capacity_runtime_state()
@@ -2534,6 +2552,10 @@ fn parity_capacity_distinguishes_fresh_media_limit_from_current_tape_shortfall()
         scheme.clone(),
         tape_uuid,
         block_size,
+        remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
     )
     .expect("parity sink");
     parity.write_bootstrap().expect("initial bootstrap");
@@ -2672,9 +2694,18 @@ fn batched_parity_post_motion_projection_failure_sets_dirty_after_retryable_spoo
         tape_uuid,
         bundles: Vec::new(),
     };
-    let mut parity =
-        ParitySink::new_with_journal(&mut raw, &mut journal, scheme, tape_uuid, block_size)
-            .expect("parity sink");
+    let mut parity = ParitySink::new_with_journal(
+        &mut raw,
+        &mut journal,
+        scheme,
+        tape_uuid,
+        block_size,
+        remanence_parity::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
+    )
+    .expect("parity sink");
     parity.write_bootstrap().expect("initial bootstrap");
     let position_before = parity
         .terminal_triple_capacity_runtime_state()
@@ -5106,4 +5137,21 @@ fn pinned_admission_refuses_fenced_tape() {
         }
         other => panic!("expected Fenced, got {other}"),
     }
+}
+
+/// The fresh no-parity writer records both injected bootstrap diagnostics.
+#[test]
+fn no_parity_bootstrap_records_fixed_writer_identity() {
+    let mut sink = VecBlockSink::new();
+    let identity = remanence_parity::WriterIdentity::fixed(
+        "remanence-test".into(),
+        std::time::SystemTime::UNIX_EPOCH.into(),
+    );
+    write_no_parity_bootstrap(&mut sink, [0x81; 16], 4096, &identity)
+        .expect("write fresh no-parity bootstrap");
+    let bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(&sink.blocks[0])
+        .expect("decode written BOT bootstrap");
+    assert!(bootstrap.no_parity_flag);
+    assert_eq!(bootstrap.written_by_version, identity.software());
+    assert_eq!(bootstrap.written_at, "1970-01-01T00:00:00Z");
 }

@@ -2263,6 +2263,10 @@ mod l1b_tests {
                 scheme(),
                 TAPE_UUID,
                 BLOCK_SIZE,
+                remanence_parity::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("open parity sink");
             sink.write_bootstrap().expect("write bootstrap");
