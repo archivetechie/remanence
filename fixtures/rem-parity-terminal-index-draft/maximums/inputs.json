@@ -1,0 +1,211 @@
+{
+  "artifacts": {
+    "bootstrap-footer.bin": {
+      "block_size": 262144,
+      "compression_enabled": false,
+      "counts": {
+        "object_row_count": 0,
+        "structural_entry_count": 1
+      },
+      "diagnostics": {
+        "write_timestamp": "2026-08-09T00:00:00.1111111111111111111111111111111111111111111Z",
+        "writer_version": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV"
+      },
+      "edition_id": "23232323232323232323232323232323",
+      "edition_sequence": 3,
+      "object_rows": [],
+      "observation": {
+        "record_count": 3,
+        "start_lba": 2,
+        "tape_file_number": 1
+      },
+      "replica_ordinal": 1,
+      "scope": {
+        "covered_prefix_tape_file_count": 1,
+        "highest_protected_ordinal": 0,
+        "total_data_ordinals": 0
+      },
+      "separation_extent": {
+        "nominal_extent_bytes": 786432,
+        "total_records": 3
+      },
+      "structural_entries": [
+        {
+          "block_count": 1,
+          "epoch_id": null,
+          "first_parity_data_ordinal": null,
+          "kind": "Bootstrap",
+          "protected_ordinal_end_exclusive": null,
+          "protected_ordinal_start": null,
+          "tape_file_number": 0
+        }
+      ],
+      "tape_uuid": "11111111111111111111111111111111",
+      "terminal_layout": {
+        "partition": 0,
+        "prefix_end_lba": 2,
+        "replica_record_count": 3,
+        "separation_records": 3,
+        "start_tape_file": 1
+      }
+    },
+    "encrypted-row.slot": {
+      "fields": {
+        "map": [
+          [
+            {
+              "uint": 1
+            },
+            {
+              "uint": 18446744073709551615
+            }
+          ],
+          [
+            {
+              "uint": 2
+            },
+            {
+              "text": "encrypted"
+            }
+          ],
+          [
+            {
+              "uint": 3
+            },
+            {
+              "uint": 18446744073709551615
+            }
+          ],
+          [
+            {
+              "uint": 4
+            },
+            {
+              "bytes": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            }
+          ],
+          [
+            {
+              "uint": 21
+            },
+            {
+              "uint": 16777216
+            }
+          ],
+          [
+            {
+              "uint": 22
+            },
+            {
+              "array": [
+                {
+                  "bytes": "01010101010101010101010101010101"
+                },
+                {
+                  "bytes": "02020202020202020202020202020202"
+                },
+                {
+                  "bytes": "03030303030303030303030303030303"
+                },
+                {
+                  "bytes": "04040404040404040404040404040404"
+                },
+                {
+                  "bytes": "05050505050505050505050505050505"
+                },
+                {
+                  "bytes": "06060606060606060606060606060606"
+                },
+                {
+                  "bytes": "07070707070707070707070707070707"
+                },
+                {
+                  "bytes": "08080808080808080808080808080808"
+                }
+              ]
+            }
+          ],
+          [
+            {
+              "uint": 23
+            },
+            {
+              "uint": 16384
+            }
+          ]
+        ]
+      }
+    },
+    "plaintext-row.slot": {
+      "fields": {
+        "map": [
+          [
+            {
+              "uint": 1
+            },
+            {
+              "uint": 18446744073709551615
+            }
+          ],
+          [
+            {
+              "uint": 2
+            },
+            {
+              "text": "plaintext"
+            }
+          ],
+          [
+            {
+              "uint": 3
+            },
+            {
+              "uint": 18446744073709551615
+            }
+          ],
+          [
+            {
+              "uint": 4
+            },
+            {
+              "bytes": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            }
+          ],
+          [
+            {
+              "uint": 10
+            },
+            {
+              "uint": 4294967296
+            }
+          ],
+          [
+            {
+              "uint": 11
+            },
+            {
+              "uint": 4294967296
+            }
+          ],
+          [
+            {
+              "uint": 12
+            },
+            {
+              "uint": 4294967296
+            }
+          ],
+          [
+            {
+              "uint": 13
+            },
+            {
+              "bytes": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+            }
+          ]
+        ]
+      }
+    }
+  },
+  "description": "Records the CBOR fields of both maximum rows and the plan inputs of the maximum footer."
+}

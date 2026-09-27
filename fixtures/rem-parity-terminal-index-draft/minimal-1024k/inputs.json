@@ -1,0 +1,44 @@
+{
+  "block_size": 1048576,
+  "compression_enabled": false,
+  "counts": {
+    "object_row_count": 0,
+    "structural_entry_count": 1
+  },
+  "description": "Records every input to this profile's terminal replicas and separation extents.",
+  "diagnostics": {
+    "write_timestamp": "2026-08-09T00:00:00Z",
+    "writer_version": "remanence-terminal-vector-generator/1"
+  },
+  "edition_id": "21212121212121212121212121212121",
+  "edition_sequence": 1,
+  "object_rows": [],
+  "scope": {
+    "covered_prefix_tape_file_count": 1,
+    "highest_protected_ordinal": 0,
+    "total_data_ordinals": 0
+  },
+  "separation_extent": {
+    "nominal_extent_bytes": 3145728,
+    "total_records": 3
+  },
+  "structural_entries": [
+    {
+      "block_count": 1,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "Bootstrap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 0
+    }
+  ],
+  "tape_uuid": "11111111111111111111111111111111",
+  "terminal_layout": {
+    "partition": 0,
+    "prefix_end_lba": 2,
+    "replica_record_count": 3,
+    "separation_records": 3,
+    "start_tape_file": 1
+  }
+}

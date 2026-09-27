@@ -98,6 +98,12 @@ jobs:
       - name: Check full-tape parity image digests and damage descriptors
         run: cargo run -p remanence-cli --example generate_tape_images -- --check
 
+      - name: Check terminal-index candidates
+        run: cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check
+
+      - name: Verify terminal-index candidates
+        run: python3 tools/verify_terminal_index_vectors.py fixtures/rem-parity-terminal-index-draft
+
       - name: Run tests
         run: cargo test --workspace --no-fail-fast
 

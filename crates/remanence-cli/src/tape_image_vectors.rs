@@ -318,5 +318,5 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
         assert!(*lba < image.eod_record as u64);
         json!({"lba": lba, "tape_file": f, "record_index": lba - file.start_record as u64, "filemark": file.filemark_record == Some(*lba as usize)})
     }).collect();
-    json!({"unreadable_records": records, "removed_filemark_after_tape_file": case["fault"]["removed_filemark_after_tape_file"], "failed_data_addresses": addresses, "hints": case["hints"]})
+    json!({"image": case["image"], "unreadable_records": records, "removed_filemark_after_tape_file": case["fault"]["removed_filemark_after_tape_file"], "failed_data_addresses": addresses, "hints": case["hints"]})
 }

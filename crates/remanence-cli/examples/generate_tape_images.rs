@@ -48,6 +48,12 @@ fn files_under(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--export-objects") {
+        if args.len() != 2 || args[1].starts_with('-') {
+            return Err("usage: generate_tape_images --export-objects <directory>".into());
+        }
+        return export_objects(Path::new(&args[1]));
+    }
     if args.iter().any(|a| a != "--check") {
         return Err("usage: generate_tape_images [--check]".into());
     }
@@ -160,5 +166,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{}: all six image digests and 25 case descriptors",
         if check { "CHECK PASS" } else { "GENERATED" }
     );
+    Ok(())
+}
+
+/// Export only tape files classified as Objects by the production writer's map.
+fn export_objects(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Reject fixture destinations, including paths redirected through symlinks.
+    let fixtures =
+        fs::canonicalize(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures"))?;
+    let mut destination = PathBuf::new();
+    for component in std::env::current_dir()?.join(directory).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                destination.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => destination.push(component),
+        }
+        if destination.exists() {
+            destination = fs::canonicalize(&destination)?;
+        }
+        if destination.starts_with(&fixtures) {
+            return Err("Object exports must be outside the fixture directory".into());
+        }
+    }
+    fs::create_dir_all(&destination)?;
+    for name in IMAGE_NAMES {
+        let image_directory = destination.join(name);
+        if fs::symlink_metadata(&image_directory).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err("Object export image directory must not be a symlink".into());
+        }
+        let vector = generate(name)?;
+        for entry in vector.written.map.entries() {
+            if entry.kind != remanence_parity::TapeFileKind::Object {
+                continue;
+            }
+            let file = vector
+                .image
+                .files
+                .get(usize::try_from(entry.tape_file_number)?)
+                .ok_or("writer Object tape file is absent from image")?;
+            fs::create_dir_all(&image_directory)?;
+            let path = image_directory.join(format!("tape-file-{}.bin", entry.tape_file_number));
+            let mut output = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            std::io::Write::write_all(&mut output, &file.bytes)?;
+        }
+    }
+    println!("EXPORTED: Object tape files for all six images");
     Ok(())
 }

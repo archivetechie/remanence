@@ -39,3 +39,6 @@ thiserror = { workspace = true }
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
+
+[dev-dependencies]
+serde_json = { workspace = true }

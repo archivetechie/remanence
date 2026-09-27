@@ -9,6 +9,7 @@
     },
     "tape_uuid": "the image's"
   },
+  "image": "a4-minimal",
   "removed_filemark_after_tape_file": null,
   "unreadable_records": [
     {

@@ -1,0 +1,146 @@
+{
+  "cases": [
+    {
+      "base_profile": "multi-256k",
+      "case_id": "unknown-positive-key",
+      "change": {
+        "integer_key": 24,
+        "value": {
+          "bytes": "667574757265"
+        }
+      },
+      "row_index": 0
+    },
+    {
+      "base_profile": "multi-256k",
+      "case_id": "unknown-negative-key",
+      "change": {
+        "integer_key": -1,
+        "value": {
+          "map": [
+            [
+              {
+                "uint": 1
+              },
+              {
+                "uint": 7
+              }
+            ],
+            [
+              {
+                "uint": 2
+              },
+              {
+                "null": true
+              }
+            ]
+          ]
+        }
+      },
+      "row_index": 0
+    },
+    {
+      "base_profile": "multi-256k",
+      "case_id": "unknown-nested-boolean",
+      "change": {
+        "integer_key": 25,
+        "value": {
+          "map": [
+            [
+              {
+                "uint": 1
+              },
+              {
+                "bool": false
+              }
+            ],
+            [
+              {
+                "uint": 2
+              },
+              {
+                "array": [
+                  {
+                    "bool": true
+                  },
+                  {
+                    "null": true
+                  }
+                ]
+              }
+            ]
+          ]
+        }
+      },
+      "row_index": 0
+    },
+    {
+      "base_profile": "multi-256k",
+      "case_id": "plaintext-with-encrypted-field",
+      "change": {
+        "integer_key": 21,
+        "value": {
+          "null": true
+        }
+      },
+      "row_index": 0
+    },
+    {
+      "base_profile": "multi-256k",
+      "case_id": "encrypted-with-plaintext-field",
+      "change": {
+        "integer_key": 10,
+        "value": {
+          "null": true
+        }
+      },
+      "row_index": 1
+    },
+    {
+      "base_profile": "multi-256k",
+      "byte_edit": {
+        "new_bytes": "1800",
+        "new_length_prefix": "5900",
+        "old_bytes": "0000",
+        "slot_offset": 89
+      },
+      "case_id": "unknown-noncanonical-value",
+      "change": {
+        "integer_key": 24,
+        "value": {
+          "uint": 0
+        }
+      },
+      "row_index": 0
+    },
+    {
+      "base_profile": "multi-256k",
+      "case_id": "unknown-nested-map-order",
+      "change": {
+        "integer_key": 24,
+        "value": {
+          "map": [
+            [
+              {
+                "uint": 2
+              },
+              {
+                "bool": true
+              }
+            ],
+            [
+              {
+                "uint": 1
+              },
+              {
+                "bool": false
+              }
+            ]
+          ]
+        }
+      },
+      "row_index": 0
+    }
+  ],
+  "description": "Records each extension slot's base row, typed CBOR field addition and optional byte edit."
+}

@@ -7,6 +7,8 @@
 //! source synthesizes one row at a time and records its pass counts without
 //! materializing the complete index.
 
+use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io::Cursor;
@@ -100,33 +102,53 @@ impl TapeIndexReplicaRecordSource for SyntheticRecords {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let output = env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("fixtures/rem-parity-terminal-index-draft"));
-    fs::create_dir_all(&output)?;
+    let mut check = false;
+    let mut directory = None;
+    for arg in env::args().skip(1) {
+        if arg == "--check" && !check {
+            check = true;
+        } else if arg.starts_with('-') || directory.is_some() {
+            return Err("usage: generate_terminal_index_vectors [--check] [directory]".into());
+        } else {
+            directory = Some(PathBuf::from(arg));
+        }
+    }
+    let directory =
+        directory.unwrap_or_else(|| PathBuf::from("fixtures/rem-parity-terminal-index-draft"));
+    if check {
+        let temporary = tempfile::tempdir()?;
+        generate(temporary.path())?;
+        compare_files(temporary.path(), &directory)?;
+        println!("CHECK PASS: all candidate files and file sets match");
+        return Ok(());
+    }
+    generate(&directory)
+}
+
+fn generate(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(output)?;
 
     let mut manifest = String::from(
         "profile\tblock_size\tstructural_rows\tobject_rows\treplica_records\tgap_records\texpected_eod_lba\tcomponent\tbytes\tsha256\tedition_digest\tlayout_digest\tpayload_sha256\tcanonical_map_sha256\n",
     );
     for &block_size in TERMINAL_INDEX_BLOCK_SIZES {
         emit_profile(
-            &output,
+            output,
             "minimal",
             block_size,
             minimal_records(),
             &mut manifest,
         )?;
-        emit_profile(&output, "multi", block_size, multi_records(), &mut manifest)?;
+        emit_profile(output, "multi", block_size, multi_records(), &mut manifest)?;
     }
     fs::write(output.join("MANIFEST.tsv"), manifest)?;
-    emit_maximum_vectors(&output)?;
-    emit_high_count_evidence(&output)?;
-    emit_object_row_extension_vectors(&output)?;
-    emit_matrix_manifests(&output)?;
+    emit_maximum_vectors(output)?;
+    emit_high_count_evidence(output)?;
+    emit_object_row_extension_vectors(output)?;
+    emit_matrix_manifests(output)?;
     fs::write(
         output.join("README.md"),
-        "# REM-PARITY terminal-index candidate vectors\n\nReview-only generation-2 candidate artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
+        "# REM-PARITY terminal-index candidate vectors\n\nReview-only generation-2 candidate artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. `inputs.json` files record the inputs of each pinned artifact for independent re-derivation (the streaming recipe is `streaming-inputs.json`). Run `cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check` to compare generated files and the file set. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
     )?;
     println!(
         "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, 7 Object-row extension slots, and executable hostile matrices in {}",
@@ -152,6 +174,11 @@ fn emit_profile(
     let edition = &assembled.edition;
     let directory = root.join(format!("{name}-{}k", block_size / 1024));
     fs::create_dir_all(&directory)?;
+    let mut inputs = plan_inputs(edition)?;
+    inputs["description"] =
+        json!("Records every input to this profile's terminal replicas and separation extents.");
+    add_records(&mut inputs, &records);
+    write_json(&directory.join("inputs.json"), &inputs)?;
 
     for (index, plan) in assembled.replicas.iter().enumerate() {
         let observation = TapeIndexReplicaObservation {
@@ -288,8 +315,8 @@ fn write_component(
 fn emit_maximum_vectors(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let directory = root.join("maximums");
     fs::create_dir_all(&directory)?;
-    let plaintext = maximum_plaintext_slot()?;
-    let encrypted = maximum_encrypted_slot()?;
+    let plaintext = fixed_slot(maximum_plaintext_value())?;
+    let encrypted = fixed_slot(maximum_encrypted_value())?;
     let block_size = TERMINAL_INDEX_BLOCK_SIZES[0];
     let records = minimal_records();
     let assembled = plan_records_edition(
@@ -298,6 +325,23 @@ fn emit_maximum_vectors(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
         records,
         &"V".repeat(128),
         MAX_TIMESTAMP,
+    )?;
+    let mut footer_inputs = plan_inputs(&assembled.edition)?;
+    add_records(&mut footer_inputs, &minimal_records());
+    footer_inputs["replica_ordinal"] = json!(assembled.replicas[0].replica_ordinal);
+    let component = &assembled.replicas[0].component;
+    footer_inputs["observation"] = json!({"tape_file_number": component.planned_tape_file_number,
+        "start_lba": component.planned_start_lba, "record_count": component.record_count});
+    write_json(
+        &directory.join("inputs.json"),
+        &json!({
+            "description": "Records the CBOR fields of both maximum rows and the plan inputs of the maximum footer.",
+            "artifacts": {
+                "plaintext-row.slot": {"fields": typed_cbor(&maximum_plaintext_value())?},
+                "encrypted-row.slot": {"fields": typed_cbor(&maximum_encrypted_value())?},
+                "bootstrap-footer.bin": footer_inputs
+            }
+        }),
     )?;
     let plan = &assembled.replicas[0];
     let header = encode_tape_index_replica_header(plan)?;
@@ -351,8 +395,8 @@ fn emit_maximum_vectors(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn maximum_plaintext_slot() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    fixed_slot(CborValue::Map(vec![
+fn maximum_plaintext_value() -> CborValue {
+    CborValue::Map(vec![
         integer_pair(1, u64::MAX),
         (
             CborValue::Integer(2.into()),
@@ -370,11 +414,11 @@ fn maximum_plaintext_slot() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             CborValue::Integer(13.into()),
             CborValue::Bytes(vec![0xFF; 32]),
         ),
-    ]))
+    ])
 }
 
-fn maximum_encrypted_slot() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    fixed_slot(CborValue::Map(vec![
+fn maximum_encrypted_value() -> CborValue {
+    CborValue::Map(vec![
         integer_pair(1, u64::MAX),
         (
             CborValue::Integer(2.into()),
@@ -395,7 +439,7 @@ fn maximum_encrypted_slot() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             ),
         ),
         integer_pair(23, 16_384),
-    ]))
+    ])
 }
 
 fn integer_pair(key: u64, value: u64) -> (CborValue, CborValue) {
@@ -463,6 +507,25 @@ fn emit_high_count_evidence(root: &Path) -> Result<(), Box<dyn std::error::Error
         COMPACT_GAP_RECORDS * u64::from(block_size),
     )?
     .edition;
+    let mut inputs = plan_inputs(&edition)?;
+    inputs["description"] = json!("Records the million-row stream's plan and zero-based row templates without materializing the stream.");
+    inputs["parameters"] = json!({"object_rows": HIGH_COUNT_OBJECT_ROWS});
+    inputs["structural_entries"] = json!({
+        "initial": [entry_input(&control_entry(0, TapeIndexReplicaFileKind::Bootstrap, 1))],
+        "repeat": {"i_start": 0, "i_end_exclusive": HIGH_COUNT_OBJECT_ROWS,
+            "template": entry_input(&object_entry(0, 1, 0)),
+            "i_dependent_fields": {"tape_file_number": {"i_plus": 1}, "first_parity_data_ordinal": {"i_plus": 0}}}
+    });
+    inputs["object_rows"] = json!({"i_start": 0, "i_end_exclusive": HIGH_COUNT_OBJECT_ROWS,
+        "template": row_input(&TapeIndexReplicaObjectRow {
+            tape_file_number: 0, stored_block_count: 1, object_id: b"x".to_vec(),
+            representation: ObjectRecoveryRepresentation::Plaintext {
+                manifest_first_chunk_lba: 0, manifest_size_bytes: 1, manifest_chunk_count: 1, manifest_sha256: [0x51; 32]
+            }
+        }),
+        "i_dependent_fields": {"tape_file_number": {"i_plus": 1}}
+    });
+    write_json(&root.join("streaming-inputs.json"), &inputs)?;
     fs::write(
         root.join("STREAMING.tsv"),
         format!(
@@ -486,20 +549,19 @@ fn emit_object_row_extension_vectors(root: &Path) -> Result<(), Box<dyn std::err
     let plaintext = generated_object_row(root, 0)?;
     let encrypted = generated_object_row(root, 1)?;
 
-    let unknown_positive = fixed_slot(with_integer_field(
+    let mut changes = Vec::new();
+    let unknown_positive = extension_slot(
+        &mut changes,
         plaintext.clone(),
         24,
         CborValue::Bytes(b"future".to_vec()),
-    )?)?;
+    )?;
     let unknown_negative_value = canonical_map(vec![
         (cbor_integer(1)?, CborValue::Integer(7.into())),
         (cbor_integer(2)?, CborValue::Null),
     ])?;
-    let unknown_negative = fixed_slot(with_integer_field(
-        plaintext.clone(),
-        -1,
-        unknown_negative_value,
-    )?)?;
+    let unknown_negative =
+        extension_slot(&mut changes, plaintext.clone(), -1, unknown_negative_value)?;
     let nested_boolean_value = canonical_map(vec![
         (cbor_integer(1)?, CborValue::Bool(false)),
         (
@@ -507,20 +569,18 @@ fn emit_object_row_extension_vectors(root: &Path) -> Result<(), Box<dyn std::err
             CborValue::Array(vec![CborValue::Bool(true), CborValue::Null]),
         ),
     ])?;
-    let unknown_nested_boolean = fixed_slot(with_integer_field(
-        plaintext.clone(),
-        25,
-        nested_boolean_value,
-    )?)?;
+    let unknown_nested_boolean =
+        extension_slot(&mut changes, plaintext.clone(), 25, nested_boolean_value)?;
     let plaintext_with_encrypted =
-        fixed_slot(with_integer_field(plaintext.clone(), 21, CborValue::Null)?)?;
-    let encrypted_with_plaintext = fixed_slot(with_integer_field(encrypted, 10, CborValue::Null)?)?;
+        extension_slot(&mut changes, plaintext.clone(), 21, CborValue::Null)?;
+    let encrypted_with_plaintext = extension_slot(&mut changes, encrypted, 10, CborValue::Null)?;
 
-    let mut unknown_noncanonical_value = fixed_slot(with_integer_field(
+    let mut unknown_noncanonical_value = extension_slot(
+        &mut changes,
         plaintext.clone(),
         24,
         CborValue::Integer(0.into()),
-    )?)?;
+    )?;
     let canonical_len = usize::from(u16::from_le_bytes(
         unknown_noncanonical_value[..2].try_into()?,
     ));
@@ -541,7 +601,7 @@ fn emit_object_row_extension_vectors(root: &Path) -> Result<(), Box<dyn std::err
         (cbor_integer(1)?, CborValue::Bool(false)),
     ]);
     let unknown_nested_map_order =
-        fixed_slot(with_integer_field(plaintext, 24, noncanonical_nested_map)?)?;
+        extension_slot(&mut changes, plaintext, 24, noncanonical_nested_map)?;
 
     let vectors = [
         ("unknown-positive-key", 0, unknown_positive, "valid"),
@@ -577,7 +637,18 @@ fn emit_object_row_extension_vectors(root: &Path) -> Result<(), Box<dyn std::err
     let mut manifest = String::from(
         "case_id\tbase_profile\trow_index\tartifact\tencoded_len\tbytes\tsha256\texpected\n",
     );
-    for (case_id, row_index, slot, expected) in vectors {
+    assert_eq!(
+        vectors.len(),
+        changes.len(),
+        "every extension must record its change"
+    );
+    let mut cases = Vec::new();
+    for ((case_id, row_index, slot, expected), change) in vectors.into_iter().zip(changes) {
+        let mut input = json!({"case_id": case_id, "base_profile": "multi-256k", "row_index": row_index, "change": change});
+        if case_id == "unknown-noncanonical-value" {
+            input["byte_edit"] = json!({"slot_offset": last_value, "old_bytes": "0000", "new_bytes": "1800", "new_length_prefix": hex(&slot[..2])});
+        }
+        cases.push(input);
         let artifact = format!("object-row-extensions/{case_id}.slot");
         fs::write(root.join(&artifact), &slot)?;
         manifest.push_str(&format!(
@@ -587,6 +658,13 @@ fn emit_object_row_extension_vectors(root: &Path) -> Result<(), Box<dyn std::err
             hex(&Sha256::digest(&slot)),
         ));
     }
+    write_json(
+        &directory.join("inputs.json"),
+        &json!({
+            "description": "Records each extension slot's base row, typed CBOR field addition and optional byte edit.",
+            "cases": cases
+        }),
+    )?;
     fs::write(root.join("OBJECT_ROW_EXTENSIONS.tsv"), manifest)?;
     Ok(())
 }
@@ -1042,4 +1120,182 @@ fn sidecar_entry(
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Record semantic inputs, retaining absent optional integers as JSON null.
+fn entry_input(entry: &TapeIndexReplicaMapEntry) -> Value {
+    json!({"tape_file_number": entry.tape_file_number, "kind": format!("{:?}", entry.kind),
+        "block_count": entry.block_count, "first_parity_data_ordinal": entry.first_parity_data_ordinal,
+        "protected_ordinal_start": entry.protected_ordinal_start,
+        "protected_ordinal_end_exclusive": entry.protected_ordinal_end_exclusive, "epoch_id": entry.epoch_id})
+}
+
+fn row_input(row: &TapeIndexReplicaObjectRow) -> Value {
+    let representation = match &row.representation {
+        ObjectRecoveryRepresentation::Plaintext {
+            manifest_first_chunk_lba,
+            manifest_size_bytes,
+            manifest_chunk_count,
+            manifest_sha256,
+        } => json!({
+            "kind": "Plaintext", "manifest_first_chunk_lba": manifest_first_chunk_lba,
+            "manifest_size_bytes": manifest_size_bytes, "manifest_chunk_count": manifest_chunk_count,
+            "manifest_sha256": hex(manifest_sha256)
+        }),
+        ObjectRecoveryRepresentation::Encrypted {
+            recipient_epoch_ids,
+            metadata_frame_len,
+            key_frame_len,
+        } => json!({
+            "kind": "Encrypted", "recipient_epoch_ids": recipient_epoch_ids.iter().map(|id| hex(id)).collect::<Vec<_>>(),
+            "metadata_frame_len": metadata_frame_len, "key_frame_len": key_frame_len
+        }),
+    };
+    json!({"tape_file_number": row.tape_file_number, "stored_block_count": row.stored_block_count,
+        "object_id": hex(&row.object_id), "representation": representation})
+}
+
+fn add_records(inputs: &mut Value, records: &Records) {
+    inputs["structural_entries"] =
+        json!(records.entries.iter().map(entry_input).collect::<Vec<_>>());
+    inputs["object_rows"] = json!(records.rows.iter().map(row_input).collect::<Vec<_>>());
+}
+
+fn plan_inputs(edition: &TapeIndexEditionPlan) -> Result<Value, Box<dyn std::error::Error>> {
+    let d = &edition.descriptor;
+    let first = &d.terminal_layout.components[0];
+    let separation_records = d.terminal_layout.separation(1)?.record_count;
+    Ok(json!({
+        "tape_uuid": hex(&d.tape_uuid), "edition_id": hex(&d.edition_id),
+        "edition_sequence": d.edition_sequence, "block_size": d.block_size,
+        "compression_enabled": d.compression_enabled,
+        "scope": {"covered_prefix_tape_file_count": d.scope.covered_prefix_tape_file_count,
+            "total_data_ordinals": d.scope.total_data_ordinals, "highest_protected_ordinal": d.scope.highest_protected_ordinal},
+        "counts": {"structural_entry_count": d.counts.structural_entry_count, "object_row_count": d.counts.object_row_count},
+        "terminal_layout": {"partition": d.terminal_layout.partition, "start_tape_file": first.planned_tape_file_number,
+            "prefix_end_lba": first.planned_start_lba, "replica_record_count": edition.replica_layout.replica_record_count,
+            "separation_records": separation_records},
+        "separation_extent": {"nominal_extent_bytes": COMPACT_GAP_RECORDS * u64::from(d.block_size), "total_records": separation_records},
+        "diagnostics": {"writer_version": d.writer_version, "write_timestamp": d.write_timestamp}
+    }))
+}
+
+/// Typed CBOR preserves byte strings, signedness and map entry order.
+fn typed_cbor(value: &CborValue) -> Result<Value, Box<dyn std::error::Error>> {
+    Ok(match value {
+        CborValue::Integer(n) => {
+            let n = i128::from(*n);
+            if n >= 0 {
+                json!({"uint": u64::try_from(n)?})
+            } else {
+                json!({"nint": i64::try_from(n)?})
+            }
+        }
+        CborValue::Bytes(bytes) => json!({"bytes": hex(bytes)}),
+        CborValue::Text(text) => json!({"text": text}),
+        CborValue::Bool(value) => json!({"bool": value}),
+        CborValue::Null => json!({"null": true}),
+        CborValue::Array(items) => {
+            json!({"array": items.iter().map(typed_cbor).collect::<Result<Vec<_>, _>>()?})
+        }
+        CborValue::Map(entries) => {
+            json!({"map": entries.iter().map(|(k, v)| Ok([typed_cbor(k)?, typed_cbor(v)?])).collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?})
+        }
+        _ => return Err("input uses an unsupported CBOR value".into()),
+    })
+}
+
+fn extension_slot(
+    changes: &mut Vec<Value>,
+    base: CborValue,
+    key: i128,
+    value: CborValue,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    changes.push(json!({"integer_key": i64::try_from(key)?, "value": typed_cbor(&value)?}));
+    fixed_slot(with_integer_field(base, key, value)?)
+}
+
+fn write_json(path: &Path, value: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+/// Only the two independently owned top-level directories are excluded.
+fn candidate_files(
+    root: &Path,
+    relative: &Path,
+    files: &mut BTreeSet<PathBuf>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(root.join(relative))? {
+        let entry = entry?;
+        let path = relative.join(entry.file_name());
+        if relative.as_os_str().is_empty()
+            && entry.file_type()?.is_dir()
+            && matches!(
+                entry.file_name().to_str(),
+                Some("tape-images" | "second-implementation")
+            )
+        {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            candidate_files(root, &path, files)?;
+        } else {
+            files.insert(path);
+        }
+    }
+    Ok(())
+}
+
+fn compare_files(generated: &Path, fixtures: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut expected = BTreeSet::new();
+    let mut actual = BTreeSet::new();
+    candidate_files(generated, Path::new(""), &mut expected)?;
+    candidate_files(fixtures, Path::new(""), &mut actual)?;
+    let mut errors = Vec::new();
+    for path in expected.difference(&actual) {
+        errors.push(format!("missing: {}", path.display()));
+    }
+    for path in actual.difference(&expected) {
+        errors.push(format!("extra: {}", path.display()));
+    }
+    for path in expected.intersection(&actual) {
+        if fs::read(generated.join(path))? != fs::read(fixtures.join(path))? {
+            errors.push(format!("differs: {}", path.display()));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("\n").into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_reports_every_file_difference_and_ignores_other_owners() {
+        let generated = tempfile::tempdir().unwrap();
+        let fixtures = tempfile::tempdir().unwrap();
+        for root in [generated.path(), fixtures.path()] {
+            fs::write(root.join("same"), b"same").unwrap();
+            fs::write(root.join("different"), b"original").unwrap();
+        }
+        fs::write(generated.path().join("missing"), b"missing").unwrap();
+        fs::write(fixtures.path().join("extra"), b"extra").unwrap();
+        fs::write(fixtures.path().join("different"), b"changed").unwrap();
+        for owner in ["tape-images", "second-implementation"] {
+            fs::create_dir(fixtures.path().join(owner)).unwrap();
+            fs::write(fixtures.path().join(owner).join("owned"), b"ignored").unwrap();
+        }
+        let error = compare_files(generated.path(), fixtures.path())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "missing: missing\nextra: extra\ndiffers: different");
+        fs::remove_file(generated.path().join("missing")).unwrap();
+        fs::remove_file(fixtures.path().join("extra")).unwrap();
+        fs::write(fixtures.path().join("different"), b"original").unwrap();
+        compare_files(generated.path(), fixtures.path()).unwrap();
+    }
 }
