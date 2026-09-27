@@ -1,0 +1,1218 @@
+{
+  "bootstrap-hinted": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: medium error at LBA 0"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "bootstrap unreadable or absent: its frame and trailing fill cannot be verified (TapeIo)"
+    ]
+  },
+  "bootstrap-unhinted": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: medium error at LBA 0",
+      "read size 524288: medium error at LBA 0",
+      "read size 1048576: medium error at LBA 0"
+    ]
+  },
+  "bootstrap-wrong-scheme": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: medium error at LBA 0"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "SchemeMismatch",
+        "stripe": null,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used"
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "bootstrap unreadable or absent: its frame and trailing fill cannot be verified (TapeIo)",
+      "sidecar tape file 2: SchemeMismatch against the bootstrap or supplied scheme",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+    ]
+  },
+  "burst-m": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          2
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "primary copy unreadable (LBA 7); footer valid; tail copy used",
+        "peers": [
+          "trusted",
+          "erasure (the failed block)",
+          "erasure (read failure at LBA 8)",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          1,
+          3
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 1,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "primary copy unreadable (LBA 7); footer valid; tail copy used",
+        "peers": [
+          "trusted",
+          "erasure (the failed block)",
+          "erasure (read failure at LBA 9)",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: primary copy unreadable (LBA 7); footer valid; tail copy used",
+      "parity shard at LBA 8: unreadable (TapeIo)",
+      "parity shard at LBA 9: unreadable (TapeIo)",
+      "Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)",
+      "Object tape file 1 block 3 (LBA 5): unreadable (TapeIo)"
+    ]
+  },
+  "burst-m-plus-one": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          2
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "Unrecoverable",
+        "stripe": 0,
+        "lost": 3,
+        "limit": 2,
+        "bytes_match": null,
+        "index_acquisition": "primary copy unreadable (LBA 7); footer valid; tail copy used",
+        "peers": [
+          "trusted",
+          "erasure (the failed block)",
+          "erasure (read failure at LBA 8)",
+          "erasure (read failure at LBA 10)"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: primary copy unreadable (LBA 7); footer valid; tail copy used",
+      "parity shard at LBA 8: unreadable (TapeIo)",
+      "parity shard at LBA 9: unreadable (TapeIo)",
+      "parity shard at LBA 10: unreadable (TapeIo)",
+      "Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)",
+      "Object tape file 1 block 3 (LBA 5): unreadable (TapeIo)"
+    ]
+  },
+  "editions-conflict": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    }
+  },
+  "editions-survivor": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "filemark-after-b": {
+    "fault_notes": [
+      "filemark at LBA 30 removed; later records move down by one"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 36 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "TerminalIndexSeparationParse: role magic does not match"
+    },
+    "verifier_prefix_findings": []
+  },
+  "filemark-prefix": {
+    "fault_notes": [
+      "filemark at LBA 6 removed; later records move down by one"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 36 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 11,
+        "kind": null,
+        "note": "classification failed: sidecar footer total 7 differs from the measured 11 blocks (hard error, Section 12.3 item 6)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 14,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 18,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 22,
+        "count": 3,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 26,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 30,
+        "count": 3,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 34,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "tape file(s) 1 could not be classified",
+    "separations": {
+      "A-B": "TerminalIndexSeparationParse: role magic does not match",
+      "B-C": "TerminalIndexSeparationParse: role magic does not match"
+    }
+  },
+  "object-head": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+    ]
+  },
+  "parity-and-data": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          2
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "trusted",
+          "erasure (the failed block)",
+          "erasure (read failure at LBA 8)",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "parity shard at LBA 8: unreadable (TapeIo)",
+      "Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)"
+    ]
+  },
+  "parity-map-and-sidecar": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "ParityMap does not validate (ParityMapParse: no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28))",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "SidecarMetadataUnavailable",
+        "stripe": null,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates)"
+      },
+      {
+        "address": [
+          1,
+          4
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates)",
+      "ParityMap tape file 4: ParityMapParse: no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28)",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
+      "Object block at LBA 3: CRC not checkable (epoch metadata unavailable)",
+      "Object block at LBA 4: CRC not checkable (epoch metadata unavailable)",
+      "Object block at LBA 5: CRC not checkable (epoch metadata unavailable)",
+      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+    ]
+  },
+  "parity-map-both": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "ParityMap does not validate (ParityMapParse: no header copy validates (primary: medium error at LBA 15; tail: medium error at LBA 16))",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "ParityMap tape file 3: ParityMapParse: no header copy validates (primary: medium error at LBA 15; tail: medium error at LBA 16)",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+    ]
+  },
+  "replica-c": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "replica-c-payload": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "replicas-a-b": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "replicas-all": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 19); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 27); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 35); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "separation": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "medium error at LBA 25",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "short-epoch-burst": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 39 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          1
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "Unrecoverable",
+        "stripe": 1,
+        "lost": 3,
+        "limit": 2,
+        "bytes_match": null,
+        "index_acquisition": "primary copy unreadable (LBA 5); footer valid; tail copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "implicit",
+          "erasure (read failure at LBA 7)",
+          "erasure (read failure at LBA 11)"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: primary copy unreadable (LBA 5); footer valid; tail copy used",
+      "parity shard at LBA 6: unreadable (TapeIo)",
+      "parity shard at LBA 7: unreadable (TapeIo)",
+      "parity shard at LBA 8: unreadable (TapeIo)",
+      "parity shard at LBA 9: unreadable (TapeIo)",
+      "parity shard at LBA 10: unreadable (TapeIo)",
+      "parity shard at LBA 11: unreadable (TapeIo)",
+      "Object tape file 1 block 1 (LBA 3): unreadable (TapeIo)"
+    ]
+  },
+  "short-epoch-recoverable": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 39 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          1
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 1,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "primary copy unreadable (LBA 5); footer valid; tail copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "implicit",
+          "erasure (read failure at LBA 7)",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: primary copy unreadable (LBA 5); footer valid; tail copy used",
+      "parity shard at LBA 6: unreadable (TapeIo)",
+      "parity shard at LBA 7: unreadable (TapeIo)",
+      "parity shard at LBA 8: unreadable (TapeIo)",
+      "parity shard at LBA 9: unreadable (TapeIo)",
+      "parity shard at LBA 10: unreadable (TapeIo)",
+      "Object tape file 1 block 1 (LBA 3): unreadable (TapeIo)"
+    ]
+  },
+  "sidecar-footer": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); primary copy used (fallback)",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          1,
+          4
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: footer unreadable (LBA 17); primary copy used (fallback)",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
+      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+    ]
+  },
+  "sidecar-primary": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "primary copy unreadable (LBA 11); footer valid; tail copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          1,
+          4
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: primary copy unreadable (LBA 11); footer valid; tail copy used",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
+      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+    ]
+  },
+  "sidecar-primary-and-footer": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy used (directory-assisted rescue)",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      },
+      {
+        "address": [
+          1,
+          4
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy used (directory-assisted rescue)",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
+      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+    ]
+  },
+  "walk-directory-rescue": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 2)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "Object candidate: head unreadable (medium error at LBA 7); last block unreadable; identified as a sidecar by the second pass",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 19); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 27); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 35); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 13); primary copy unreadable (LBA 7); tail copy used (directory-assisted rescue)",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: footer unreadable (LBA 13); primary copy unreadable (LBA 7); tail copy used (directory-assisted rescue)",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+    ]
+  },
+  "walk-sidecar-isolation": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 8,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 2)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 11,
+        "count": 7,
+        "kind": 1,
+        "note": "Object candidate: head unreadable (medium error at LBA 11); last block unreadable; identified as a sidecar by the second pass",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 19,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 1,
+        "start_ordinal": 4,
+        "end_ordinal": 8,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 27,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 31,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 31); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 35,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 39,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 39); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 43,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 9,
+        "start": 47,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 47); type established by its footer",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "SidecarMetadataUnavailable",
+        "stripe": null,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16)"
+      },
+      {
+        "address": [
+          1,
+          4
+        ],
+        "epoch": 1,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      "sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16)",
+      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
+      "Object block at LBA 3: CRC not checkable (epoch metadata unavailable)",
+      "Object block at LBA 4: CRC not checkable (epoch metadata unavailable)",
+      "Object block at LBA 5: CRC not checkable (epoch metadata unavailable)",
+      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+    ]
+  }
+}

@@ -1,0 +1,737 @@
+{
+  "schema": "rem-parity-second-implementation-build/1",
+  "results": [
+    {
+      "artifact": "a4-minimal tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 4",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 5",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 6",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 7",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file 8",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "a4-minimal tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 4",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 5",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 6",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 7",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file 8",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "short-epoch tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 4",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 5",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 6",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 7",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 8",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file 9",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-epoch tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 4",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 5",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 6",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 7",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file 8",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "two-edition tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-closed tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-closed tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-closed tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-closed tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-closed tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-open tape file 0",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-open tape file 1",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-open tape file 2",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-open tape file 3",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-open tape file 4",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "unfinalized-open tape file ALL",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/replica-a.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/replica-a.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/gap-ab.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/gap-ab.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/replica-b.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/replica-b.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/gap-bc.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/gap-bc.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/replica-c.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-256k/replica-c.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/replica-a.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/replica-a.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/gap-ab.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/gap-ab.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/replica-b.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/replica-b.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/gap-bc.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/gap-bc.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/replica-c.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-512k/replica-c.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/replica-a.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/replica-a.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/gap-ab.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/gap-ab.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/replica-b.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/replica-b.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/gap-bc.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/gap-bc.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/replica-c.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "minimal-1024k/replica-c.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/replica-a.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/replica-a.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/gap-ab.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/gap-ab.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/replica-b.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/replica-b.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/gap-bc.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/gap-bc.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/replica-c.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-256k/replica-c.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/replica-a.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/replica-a.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/gap-ab.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/gap-ab.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/replica-b.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/replica-b.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/gap-bc.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/gap-bc.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/replica-c.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-512k/replica-c.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/replica-a.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/replica-a.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/gap-ab.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/gap-ab.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/replica-b.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/replica-b.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/gap-bc.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/gap-bc.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/replica-c.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "multi-1024k/replica-c.bin [MANIFEST.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "maximums/plaintext-row.slot",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "maximums/plaintext-row.slot [MAXIMUMS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "maximums/encrypted-row.slot",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "maximums/encrypted-row.slot [MAXIMUMS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "maximums/bootstrap-footer.bin",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "maximums/bootstrap-footer.bin [MAXIMUMS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-positive-key",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-positive-key [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-negative-key",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-negative-key [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-nested-boolean",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-nested-boolean [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/plaintext-with-encrypted-field",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/plaintext-with-encrypted-field [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/encrypted-with-plaintext-field",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/encrypted-with-plaintext-field [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-noncanonical-value",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-noncanonical-value [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-nested-map-order",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "object-row-extensions/unknown-nested-map-order [OBJECT_ROW_EXTENSIONS.tsv row]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [block_size]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [structural_rows]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [object_rows]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [payload_bytes]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [payload_records]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [replica_records]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [expected_eod_lba]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [structural_passes]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [object_passes]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [retained_rows]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [payload_sha256]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [canonical_map_sha256]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [edition_digest]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    },
+    {
+      "artifact": "STREAMING.tsv large-count-million [layout_digest]",
+      "result": "reproduced",
+      "detail": "reproduced"
+    }
+  ],
+  "reproduced": 146,
+  "mismatched": 0
+}

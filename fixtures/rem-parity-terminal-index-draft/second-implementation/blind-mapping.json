@@ -1,0 +1,30 @@
+{
+  "description": "The opaque ids under which the second implementation decided the damage cases before it saw any expected outcome (decisions.json), and the repository case each stands for. decisions-real-ids.json equals decisions.json under this mapping.",
+  "mapping": {
+    "case-01": "replicas-a-b",
+    "case-02": "object-head",
+    "case-03": "sidecar-primary-and-footer",
+    "case-04": "editions-conflict",
+    "case-05": "replicas-all",
+    "case-06": "replica-c-payload",
+    "case-07": "filemark-after-b",
+    "case-08": "sidecar-primary",
+    "case-09": "bootstrap-hinted",
+    "case-10": "walk-sidecar-isolation",
+    "case-11": "walk-directory-rescue",
+    "case-12": "parity-and-data",
+    "case-13": "bootstrap-unhinted",
+    "case-14": "short-epoch-recoverable",
+    "case-15": "sidecar-footer",
+    "case-16": "replica-c",
+    "case-17": "separation",
+    "case-18": "editions-survivor",
+    "case-19": "burst-m",
+    "case-20": "filemark-prefix",
+    "case-21": "burst-m-plus-one",
+    "case-22": "bootstrap-wrong-scheme",
+    "case-23": "short-epoch-burst",
+    "case-24": "parity-map-both",
+    "case-25": "parity-map-and-sidecar"
+  }
+}

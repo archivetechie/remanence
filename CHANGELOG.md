@@ -6,6 +6,19 @@ per-release summaries.
 
 ## Unreleased
 
+- Added a second, independent implementation of REM-PARITY generation 2
+  (`tools/rem_parity_second_implementation.py`). Its author wrote it from the
+  specification text without reading the reference implementation. It
+  re-derives every pinned candidate byte from the recorded inputs: the six
+  tape images, the six terminal profiles, the maximum artifacts, the
+  Object-row extension slots and the million-row stream. All 146 comparisons
+  match. It also decided the 25 damage cases before seeing any expected
+  outcome, under opaque case ids. 23 of the 24 pinned cases agree. The
+  remaining case, a lost filemark that merges an Object with its sidecar,
+  turns on a question the text leaves open, and is recorded as such. Its
+  findings, including 29 places where the text is silent or ambiguous, are in
+  `fixtures/rem-parity-terminal-index-draft/second-implementation/`. CI
+  rebuilds everything and re-decides every case.
 - Added review-only full-tape candidates for REM-PARITY generation 2
   (`fixtures/rem-parity-terminal-index-draft/tape-images/`). There are six
   tape images: Appendix A.4's minimal tape, a short epoch, two epochs, a
