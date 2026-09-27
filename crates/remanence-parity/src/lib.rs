@@ -147,10 +147,10 @@ pub use scan::{
     scan_reconstruct_filemark_map_with_control, scan_reconstruct_filemark_map_with_control_mode,
     scan_reconstruct_filemark_map_with_report, scan_reconstruct_filemark_map_with_report_mode,
     validate_scan_reconstruction_with_report, CatalogFilemarkMapInput, ControlledScanWalkOutcome,
-    FilemarkMapScanResult, ParityMapContentConflict, ParityMapSelectionKey, RecoveryBootstrap,
-    ScanBootstrapCandidate, ScanDamageKind, ScanDamagedRegion, ScanMode, ScanOverlaySource,
-    ScanRecoveryHints, ScanTailTruncation, ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl,
-    ScanWalkProgress, ScanWalkResult, UnattestedTapeFile,
+    FilemarkMapScanResult, RecoveryBootstrap, ScanBootstrapCandidate, ScanDamageKind,
+    ScanDamagedRegion, ScanMode, ScanOverlaySource, ScanRecoveryHints, ScanTailTruncation,
+    ScanTailTruncationKind, ScanWalkAbort, ScanWalkControl, ScanWalkProgress, ScanWalkResult,
+    UnattestedTapeFile,
 };
 pub use sidecar::{
     checked_sidecar_index_capacity_layout, classify_sidecar_header_block, crc64_xz,
