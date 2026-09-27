@@ -1,0 +1,13 @@
+{
+  "description": "The opaque ids under which the second implementation decided the resume cases before it read any resume expectation or the reference's resumed tapes (resume-decisions.json), and the repository resume case each stands for. resume-decisions-real-ids.json equals resume-decisions.json under this mapping, apart from the case id each accepted resume records in its tape-file rows.",
+  "mapping": {
+    "resume-01": "resume-boundary-read",
+    "resume-02": "resume-open",
+    "resume-03": "resume-full-unprotected-epoch",
+    "resume-04": "resume-nonconsecutive-epochs",
+    "resume-05": "resume-closed",
+    "resume-06": "resume-noncontiguous-sidecars",
+    "resume-07": "resume-w-greater-than-t",
+    "resume-08": "resume-final-object-not-at-t"
+  }
+}

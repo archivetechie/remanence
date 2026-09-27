@@ -11,6 +11,9 @@ No change to the builder may follow a failed comparison without a row here.
 | 1 | the six images, six terminal profiles, maximums and Object-row extensions | 132 | 0 |
 | 2 | the million-row streaming vector | 14 | 0 |
 | 3 | everything, after the Writer-side input checks were added (no byte-producing code changed) | 146 | 0 |
+| 4 | everything, after the copied definitions were replaced by imports; `build-report.json` and the blind `decisions.json` were byte-identical to run 3's | 146 | 0 |
+| 5 | the two accepted resumes (resume-02, resume-05), compared file by file with the same Objects written in one uninterrupted session | 11 tape files | 0 |
+| 6 | everything, after the internal `session-end` stop was added for run 5; `build-report.json` and the blind `decisions.json` were byte-identical | 146 | 0 |
 
 ## Failed comparisons
 

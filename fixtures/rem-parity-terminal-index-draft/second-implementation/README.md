@@ -51,6 +51,7 @@ From the repository root:
 ```sh
 python3 tools/rem_parity_second_implementation.py build
 python3 tools/rem_parity_second_implementation.py decide <case.json> [<case.json> ...]
+python3 tools/rem_parity_second_implementation.py resume <resume-case.json> [<resume-case.json> ...]
 python3 -m unittest tools/test_rem_parity_second_implementation.py
 ```
 
@@ -80,11 +81,19 @@ writes two files here:
 - `decisions-trace.json`, which records what the Reader read and why each
   step ended as it did.
 
-The tests accept two optional environment variables:
+`resume` takes resume-case files. Each names an image, gives a committed
+prefix as Section 7.1 entries with its `W` and `T`, and gives an Object to
+append. For each case, the program acts as a Resumer under Section 14 on
+the undamaged image, treating the prefix as the off-tape commit authority.
+It writes `resume-decisions.json`; see "The resume schema" below.
+
+The tests accept three optional environment variables:
 
 - `REM_PARITY_SECOND_IMPL_SCRATCH` names a working directory;
 - `REM_PARITY_SECOND_IMPL_CASES` names a directory of case files for the
-  determinism test.
+  determinism test;
+- `REM_PARITY_SECOND_IMPL_RESUME` names a directory of resume-case files
+  for the resume determinism test.
 
 ## How the Reader works
 
@@ -128,6 +137,44 @@ the §8.4 hint path and reports `NoBootstrapFound` is also conformant
 different conformant outcome, the aspect is reported as `undecided`
 (entry B-2).
 
+## How the Resumer works
+
+The steps follow Section 14:
+
+1. W and T are derived from the prefix (Section 7.2) and compared with
+   the values given. The append point is `Σ(block_count + 1)` over the
+   prefix.
+2. The step-2 rules that need no scheme are checked first. Then the
+   bootstrap at LBA 0 is read for `S` and `k`, and the bound
+   `T − W < S × k` is checked. The text does not say where a Resumer
+   obtains the scheme (`GAPS.md` entry E-2).
+3. The open epoch `[W, T)` is re-read from the tape. A filemark, EOD, a
+   medium error or a record of the wrong size there is fatal.
+4. The Resumer positions to the append point and writes the Object as the
+   next tape file. At `S × k` ordinals the epoch closes at Object close.
+   When the session ends, the Writer closes an epoch still open by writing
+   its sidecar, even if it is short.
+
+After each decision, and only for reporting, an accepted resume is compared
+file by file with the same Objects written in one uninterrupted session.
+
+## The resume schema
+
+`resume-decisions.json` has `"schema": "rem-parity-second-implementation-resume/1"`
+and a `cases` map keyed by case id. Every case has the same aspects:
+
+| Key | Contents |
+| --- | --- |
+| `image` | The image the case names |
+| `prefix` | `entries`, `derived_W`, `derived_T`, `given_W`, `given_T`, `W_equal`, `T_equal`, `append_point_lba`, `map_findings` (Section 7.2 findings that step 2 does not list), `citations` |
+| `scheme` | `k`, `m`, `S` and their `source`, or nulls when step 2 refused before the scheme was needed |
+| `step2` | `result` (`pass`, `violation`, `undecided` or `not_run`), `violations`, `citations` |
+| `step3` | `result` (`run`, `fatal` or `not_run`), the `ordinals` re-read and their `lbas`, the `failure`, `citations` |
+| `step4` | `result` (`run` or `not_run`), `append_point_lba`, `citations` |
+| `decision` | `result` (`accepted` or `refused`), `error` (a Section 15 name, or `undecided`), `refused_at`, `before_any_tape_read` (`true`, `false` or `undecided`), `before_any_write`, `records_read` (LBAs, in order), `citations` |
+| `append` | `null` for a refusal. Otherwise: `object_tape_file`, `object_first_lba`, `object_blocks`, `object_first_ordinal`, `object_row` (Section 10.3 keys as strings, byte strings as hex), `sidecars` (each with `tape_file`, `first_lba`, `epoch_id`, the protected range, `total_blocks` and `closed_by`), `tape_files` (every tape file of the resulting tape and `ALL`, in the `tape-images/MANIFEST.tsv` convention), `eod`, `uninterrupted_equal`, `uninterrupted_differences` and the `session_end_citations` |
+| `undecided` | Aspects the text leaves open, each with its readings and citations |
+
 ## Files
 
 | File | Contents |
@@ -143,3 +190,4 @@ different conformant outcome, the aspect is reported as `undecided`
 | `COMPARISON.md` | The comparison of the blind decisions with each case's `expected.json` |
 | `comparison.json` | The same comparison in machine-readable form, with the interpretation used for each expected key |
 | `DECISION-LOG.md` | Every decision changed after the comparison (none) |
+| `resume-decisions.json` | The Resumer's decisions on the resume cases |

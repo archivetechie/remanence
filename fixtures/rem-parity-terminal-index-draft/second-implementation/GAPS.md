@@ -289,3 +289,64 @@ components" (replicas-all) was read as `TapeIndexReplica` or
 the block counts, start LBAs and Object sizes that the image's
 `expected.json` lists. That file also lists the terminal suffix, which the
 inventory excludes (Section 10.2).
+
+## E. Resuming a tape (Section 14)
+
+These were found while deciding the eight resume cases, before any
+expected outcome for them was read.
+
+**E-1. Section 14 step 3 names no error for its fatal read
+(resume-01).** "a boundary or short read where data is expected is fatal",
+but no error is named. Section 15's `ResumeAppend` is "Section 14 invariant
+violation", and `TapeIo` is a "transport/medium failure (not a format
+violation)". In resume-01 the prefix records a 3-block tape file 3, but
+the tape holds 2 blocks and a filemark. The re-read of ordinal 6 meets that
+filemark at LBA 17. *Undecided:* `decision.error`, between `ResumeAppend`
+and `TapeIo`.
+
+**E-2. Section 14 does not say where a Resumer obtains `S` and `k`
+(resume-03).** Step 2's bound `T − W < S × k` needs the scheme, and a
+committed prefix of Section 7.1 entries does not carry it. The claim
+rests on a search of every mention of the Resumer and of resuming: in
+Sections 1.3, 2.2, 3.4, 11.1 and 14, and in Appendix B.10. None gives a
+source. This Resumer reads the bootstrap at LBA 0. A Resumer whose own
+off-tape state carries the scheme refuses resume-03 before any tape read.
+*Undecided:* `decision.before_any_tape_read` for resume-03. The other
+step-2 refusals are decided from the prefix alone, before any read.
+
+**E-3. Section 14 does not check the prefix against the tape outside
+`[W, T)`.** Step 3 re-reads only the open epoch, and step 4 computes the
+append point from the prefix alone. A prefix that misstated the length of
+a protected tape file would put the append point inside committed data or
+short of it, and nothing in Section 14 would notice. resume-01's
+mismatch is caught only because the misstated file lies in `[W, T)`. No
+case exercises a mismatch elsewhere.
+
+**E-4. Section 14 has no rule for a finalized tape.** Section 11.3 says
+"A finalized tape accepts no further appends", but Section 14 gives a
+Resumer that relies on a portable prefix no way to detect finalization.
+The prefixes of resume-04 and resume-06 cover only tape files 0–3 of the
+finalized two-epoch image, which also carries a ParityMap and a terminal
+suffix. Step 2 refuses both first, so no decision depends on this.
+
+**E-5. Step 2 does not list the density of Object first ordinals.**
+Section 7.2 requires Object first ordinals to be "dense and contiguous from
+0 in tape order", but step 2 lists only four rules. resume-08 breaks
+density: its second Object starts at ordinal 1. It is refused by the listed
+rule that the final Object entry end exactly at `T`. A prefix whose Objects
+overlap but whose last Object still ends at `T` would pass step 2's list,
+unless Section 3.4's "validated combination" is read to include Section
+7.2's validity rules.
+
+**E-6. Closing a short epoch at the end of the session is a Writer
+choice.** A barrier "may" close a non-empty short epoch (Section 11.2). The
+resume task says the session ends with a sidecar for the open epoch, and
+resume-05's short sidecar (epoch 1, `[4, 6)`) exists only under that
+choice. The uninterrupted-session check makes the same choice (compare
+A-4).
+
+**E-7. Section 14 step 3 gives the re-read blocks nothing to be verified
+against.** No sidecar yet covers `[W, T)`, so a Resumer that re-reads a
+silently corrupted block there cannot detect it, and its new parity would
+protect the corrupted bytes. No case exercises this.
+

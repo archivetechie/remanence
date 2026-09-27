@@ -1,0 +1,981 @@
+{
+  "schema": "rem-parity-second-implementation-resume/1",
+  "cases": {
+    "resume-boundary-read": {
+      "image": "unfinalized-open",
+      "prefix": {
+        "entries": 4,
+        "derived_W": 4,
+        "derived_T": 7,
+        "given_W": 4,
+        "given_T": 7,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 19,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": 2,
+        "m": 2,
+        "S": 2,
+        "source": "bootstrap at LBA 0"
+      },
+      "step2": {
+        "result": "pass",
+        "violations": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "fatal",
+        "ordinals": [
+          4,
+          5,
+          6
+        ],
+        "lbas": [
+          15,
+          16,
+          17
+        ],
+        "failure": "ordinal 6 at LBA 17: filemark where data is expected",
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
+          },
+          {
+            "section": "3.5",
+            "quote": "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**."
+          }
+        ]
+      },
+      "step4": {
+        "result": "not_run",
+        "append_point_lba": null,
+        "citations": []
+      },
+      "decision": {
+        "result": "refused",
+        "error": "undecided",
+        "refused_at": "step 3",
+        "before_any_tape_read": false,
+        "before_any_write": true,
+        "records_read": [
+          0,
+          15,
+          16,
+          17
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
+          }
+        ]
+      },
+      "append": null,
+      "undecided": [
+        {
+          "aspect": "decision.error",
+          "readings": [
+            "ResumeAppend: the committed prefix does not describe the tape, a Section 14 invariant violation",
+            "TapeIo: a Filemark or EndOfData outcome where a block was expected is a tape I/O failure, not a format violation"
+          ],
+          "citations": [
+            {
+              "section": "14",
+              "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
+            },
+            {
+              "section": "15",
+              "quote": "ResumeAppend Section 14 invariant violation"
+            },
+            {
+              "section": "15",
+              "quote": "TapeIo transport/medium failure (not a format violation)"
+            }
+          ]
+        }
+      ]
+    },
+    "resume-closed": {
+      "image": "unfinalized-closed",
+      "prefix": {
+        "entries": 3,
+        "derived_W": 4,
+        "derived_T": 4,
+        "given_W": 4,
+        "given_T": 4,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 15,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": 2,
+        "m": 2,
+        "S": 2,
+        "source": "bootstrap at LBA 0"
+      },
+      "step2": {
+        "result": "pass",
+        "violations": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "run",
+        "ordinals": [],
+        "lbas": [],
+        "failure": null,
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
+          }
+        ]
+      },
+      "step4": {
+        "result": "run",
+        "append_point_lba": 15,
+        "citations": [
+          {
+            "section": "14",
+            "quote": "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+          },
+          {
+            "section": "14",
+            "quote": "The first block written lands exactly at the append point; a write issued anywhere else could land over committed data or short of the append point."
+          },
+          {
+            "section": "14",
+            "quote": "Anything physically on tape beyond the committed prefix is superseded by the next append and MUST NOT be trusted for recovery."
+          }
+        ]
+      },
+      "decision": {
+        "result": "accepted",
+        "error": null,
+        "refused_at": null,
+        "before_any_tape_read": false,
+        "before_any_write": null,
+        "records_read": [
+          0
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "A later session appends **after the last committed tape file** — not after the last object, and not at the watermark."
+          },
+          {
+            "section": "3.4",
+            "quote": "There is no on-tape commit marker and no on-tape \"unclean\" marker: an interrupted tail simply lies beyond the last committed file and is physically superseded on resume (Section 14)."
+          }
+        ]
+      },
+      "append": {
+        "object_tape_file": 3,
+        "object_first_lba": 15,
+        "object_blocks": 2,
+        "object_first_ordinal": 4,
+        "object_row": {
+          "1": 3,
+          "2": "plaintext",
+          "3": 2,
+          "4": "30303030303030302d303030302d343030302d383030302d303030303030303030303034",
+          "10": 1,
+          "11": 172,
+          "12": 1,
+          "13": "c0126a6092de061c33a12aba6b11a185b09f87dd0c2de9d905a89b64426d1263"
+        },
+        "sidecars": [
+          {
+            "epoch_id": 1,
+            "protected_ordinal_start": 4,
+            "protected_ordinal_end_exclusive": 6,
+            "total_blocks": 7,
+            "closed_by": "session-end barrier (short epoch)",
+            "tape_file": 4,
+            "first_lba": 18
+          }
+        ],
+        "tape_files": [
+          {
+            "image": "resume-closed",
+            "tape_file": "0",
+            "start_record": "0",
+            "data_records": "1",
+            "bytes": "262144",
+            "sha256": "313a8794ca3a3e3f93cd621faad2b7bf1f2cf7b1ac4315720a49288add6a3285",
+            "filemark_record": "1",
+            "eod_record": "26"
+          },
+          {
+            "image": "resume-closed",
+            "tape_file": "1",
+            "start_record": "2",
+            "data_records": "4",
+            "bytes": "1048576",
+            "sha256": "0d58595c1aab94f2b1db566a18241acd4418b0ea749f21b54e3f9f5245729eba",
+            "filemark_record": "6",
+            "eod_record": "26"
+          },
+          {
+            "image": "resume-closed",
+            "tape_file": "2",
+            "start_record": "7",
+            "data_records": "7",
+            "bytes": "1835008",
+            "sha256": "c1a8b15af1a996ba91a71dcf4ac714b66fac1f750f8782e880e86cd84888c108",
+            "filemark_record": "14",
+            "eod_record": "26"
+          },
+          {
+            "image": "resume-closed",
+            "tape_file": "3",
+            "start_record": "15",
+            "data_records": "2",
+            "bytes": "524288",
+            "sha256": "a7df64f1496a2e096fd7381aed55655fdd6ea3662b453f86f607765f2d1c8fa1",
+            "filemark_record": "17",
+            "eod_record": "26"
+          },
+          {
+            "image": "resume-closed",
+            "tape_file": "4",
+            "start_record": "18",
+            "data_records": "7",
+            "bytes": "1835008",
+            "sha256": "92c21866b2f5e4a6ce4329de817ddb357330da1c779942b8cad27d37e890f748",
+            "filemark_record": "25",
+            "eod_record": "26"
+          },
+          {
+            "image": "resume-closed",
+            "tape_file": "ALL",
+            "start_record": "0",
+            "data_records": "21",
+            "bytes": "5505024",
+            "sha256": "ba80f9fa8be5d91e8469e76f99b25c5a7d7a179c33bdb1dd707621d121a6ba14",
+            "filemark_record": "structural",
+            "eod_record": "26"
+          }
+        ],
+        "eod": 26,
+        "uninterrupted_equal": true,
+        "uninterrupted_differences": [],
+        "session_end_citations": [
+          {
+            "section": "11.2",
+            "quote": "A barrier may close a non-empty short epoch and emit its sidecar without `FINAL_PARTIAL_EPOCH`."
+          }
+        ]
+      },
+      "undecided": []
+    },
+    "resume-final-object-not-at-t": {
+      "image": "unfinalized-open",
+      "prefix": {
+        "entries": 4,
+        "derived_W": 4,
+        "derived_T": 4,
+        "given_W": 4,
+        "given_T": 4,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 18,
+        "map_findings": [
+          "Object at tape file 3 has first ordinal 1, not the running total 4"
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": null,
+        "m": null,
+        "S": null,
+        "source": null
+      },
+      "step2": {
+        "result": "violation",
+        "violations": [
+          "the final Object entry ends at 3, not at T = 4"
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "not_run",
+        "ordinals": [],
+        "lbas": [],
+        "failure": null,
+        "citations": []
+      },
+      "step4": {
+        "result": "not_run",
+        "append_point_lba": null,
+        "citations": []
+      },
+      "decision": {
+        "result": "refused",
+        "error": "ResumeAppend",
+        "refused_at": "step 2",
+        "before_any_tape_read": true,
+        "before_any_write": true,
+        "records_read": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          },
+          {
+            "section": "15",
+            "quote": "ResumeAppend Section 14 invariant violation"
+          }
+        ]
+      },
+      "append": null,
+      "undecided": []
+    },
+    "resume-full-unprotected-epoch": {
+      "image": "unfinalized-closed",
+      "prefix": {
+        "entries": 2,
+        "derived_W": 0,
+        "derived_T": 4,
+        "given_W": 0,
+        "given_T": 4,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 7,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": 2,
+        "m": 2,
+        "S": 2,
+        "source": "bootstrap at LBA 0"
+      },
+      "step2": {
+        "result": "violation",
+        "violations": [
+          "T − W = 4 is not below S × k = 4"
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "not_run",
+        "ordinals": [],
+        "lbas": [],
+        "failure": null,
+        "citations": []
+      },
+      "step4": {
+        "result": "not_run",
+        "append_point_lba": null,
+        "citations": []
+      },
+      "decision": {
+        "result": "refused",
+        "error": "ResumeAppend",
+        "refused_at": "step 2",
+        "before_any_tape_read": "undecided",
+        "before_any_write": true,
+        "records_read": [
+          0
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "15",
+            "quote": "ResumeAppend Section 14 invariant violation"
+          }
+        ]
+      },
+      "append": null,
+      "undecided": [
+        {
+          "aspect": "decision.before_any_tape_read",
+          "readings": [
+            "true: the Resumer's off-tape state carries the scheme, so the step-2 bound is applied before any tape read",
+            "false: the scheme comes from the bootstrap, so the Resumer reads LBA 0 before it can apply the step-2 bound; this Resumer does so"
+          ],
+          "citations": [
+            {
+              "section": "14",
+              "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+            },
+            {
+              "section": "14",
+              "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+            }
+          ]
+        }
+      ]
+    },
+    "resume-nonconsecutive-epochs": {
+      "image": "two-epoch",
+      "prefix": {
+        "entries": 4,
+        "derived_W": 8,
+        "derived_T": 8,
+        "given_W": 8,
+        "given_T": 8,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 27,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": null,
+        "m": null,
+        "S": null,
+        "source": null
+      },
+      "step2": {
+        "result": "violation",
+        "violations": [
+          "epoch ids not consecutive from 0: [0, 2]"
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          },
+          {
+            "section": "9.2",
+            "quote": "Epoch ids MUST increase by one but carry no range arithmetic."
+          }
+        ]
+      },
+      "step3": {
+        "result": "not_run",
+        "ordinals": [],
+        "lbas": [],
+        "failure": null,
+        "citations": []
+      },
+      "step4": {
+        "result": "not_run",
+        "append_point_lba": null,
+        "citations": []
+      },
+      "decision": {
+        "result": "refused",
+        "error": "ResumeAppend",
+        "refused_at": "step 2",
+        "before_any_tape_read": true,
+        "before_any_write": true,
+        "records_read": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          },
+          {
+            "section": "15",
+            "quote": "ResumeAppend Section 14 invariant violation"
+          }
+        ]
+      },
+      "append": null,
+      "undecided": []
+    },
+    "resume-noncontiguous-sidecars": {
+      "image": "two-epoch",
+      "prefix": {
+        "entries": 4,
+        "derived_W": 8,
+        "derived_T": 8,
+        "given_W": 8,
+        "given_T": 8,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 27,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": null,
+        "m": null,
+        "S": null,
+        "source": null
+      },
+      "step2": {
+        "result": "violation",
+        "violations": [
+          "sidecar ranges not contiguous from zero: tape file 3 starts at 5, not 4"
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "not_run",
+        "ordinals": [],
+        "lbas": [],
+        "failure": null,
+        "citations": []
+      },
+      "step4": {
+        "result": "not_run",
+        "append_point_lba": null,
+        "citations": []
+      },
+      "decision": {
+        "result": "refused",
+        "error": "ResumeAppend",
+        "refused_at": "step 2",
+        "before_any_tape_read": true,
+        "before_any_write": true,
+        "records_read": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          },
+          {
+            "section": "15",
+            "quote": "ResumeAppend Section 14 invariant violation"
+          }
+        ]
+      },
+      "append": null,
+      "undecided": []
+    },
+    "resume-open": {
+      "image": "unfinalized-open",
+      "prefix": {
+        "entries": 4,
+        "derived_W": 4,
+        "derived_T": 6,
+        "given_W": 4,
+        "given_T": 6,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 18,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": 2,
+        "m": 2,
+        "S": 2,
+        "source": "bootstrap at LBA 0"
+      },
+      "step2": {
+        "result": "pass",
+        "violations": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "run",
+        "ordinals": [
+          4,
+          5
+        ],
+        "lbas": [
+          15,
+          16
+        ],
+        "failure": null,
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
+          }
+        ]
+      },
+      "step4": {
+        "result": "run",
+        "append_point_lba": 18,
+        "citations": [
+          {
+            "section": "14",
+            "quote": "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+          },
+          {
+            "section": "14",
+            "quote": "The first block written lands exactly at the append point; a write issued anywhere else could land over committed data or short of the append point."
+          },
+          {
+            "section": "14",
+            "quote": "Anything physically on tape beyond the committed prefix is superseded by the next append and MUST NOT be trusted for recovery."
+          }
+        ]
+      },
+      "decision": {
+        "result": "accepted",
+        "error": null,
+        "refused_at": null,
+        "before_any_tape_read": false,
+        "before_any_write": null,
+        "records_read": [
+          0,
+          15,
+          16
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "A later session appends **after the last committed tape file** — not after the last object, and not at the watermark."
+          },
+          {
+            "section": "3.4",
+            "quote": "There is no on-tape commit marker and no on-tape \"unclean\" marker: an interrupted tail simply lies beyond the last committed file and is physically superseded on resume (Section 14)."
+          }
+        ]
+      },
+      "append": {
+        "object_tape_file": 4,
+        "object_first_lba": 18,
+        "object_blocks": 2,
+        "object_first_ordinal": 6,
+        "object_row": {
+          "1": 4,
+          "2": "plaintext",
+          "3": 2,
+          "4": "30303030303030302d303030302d343030302d383030302d303030303030303030303037",
+          "10": 1,
+          "11": 172,
+          "12": 1,
+          "13": "30037b569f817b5cfc927906d0949f98af4ef5db61fe23a26eb2593a1430d539"
+        },
+        "sidecars": [
+          {
+            "epoch_id": 1,
+            "protected_ordinal_start": 4,
+            "protected_ordinal_end_exclusive": 8,
+            "total_blocks": 7,
+            "closed_by": "Object close (full epoch)",
+            "tape_file": 5,
+            "first_lba": 21
+          }
+        ],
+        "tape_files": [
+          {
+            "image": "resume-open",
+            "tape_file": "0",
+            "start_record": "0",
+            "data_records": "1",
+            "bytes": "262144",
+            "sha256": "313a8794ca3a3e3f93cd621faad2b7bf1f2cf7b1ac4315720a49288add6a3285",
+            "filemark_record": "1",
+            "eod_record": "29"
+          },
+          {
+            "image": "resume-open",
+            "tape_file": "1",
+            "start_record": "2",
+            "data_records": "4",
+            "bytes": "1048576",
+            "sha256": "0d58595c1aab94f2b1db566a18241acd4418b0ea749f21b54e3f9f5245729eba",
+            "filemark_record": "6",
+            "eod_record": "29"
+          },
+          {
+            "image": "resume-open",
+            "tape_file": "2",
+            "start_record": "7",
+            "data_records": "7",
+            "bytes": "1835008",
+            "sha256": "c1a8b15af1a996ba91a71dcf4ac714b66fac1f750f8782e880e86cd84888c108",
+            "filemark_record": "14",
+            "eod_record": "29"
+          },
+          {
+            "image": "resume-open",
+            "tape_file": "3",
+            "start_record": "15",
+            "data_records": "2",
+            "bytes": "524288",
+            "sha256": "a7df64f1496a2e096fd7381aed55655fdd6ea3662b453f86f607765f2d1c8fa1",
+            "filemark_record": "17",
+            "eod_record": "29"
+          },
+          {
+            "image": "resume-open",
+            "tape_file": "4",
+            "start_record": "18",
+            "data_records": "2",
+            "bytes": "524288",
+            "sha256": "7d16f8b3b11afeb9133debd277b7e561f523bf8a31aaeb2b51be36b7fbcd1d12",
+            "filemark_record": "20",
+            "eod_record": "29"
+          },
+          {
+            "image": "resume-open",
+            "tape_file": "5",
+            "start_record": "21",
+            "data_records": "7",
+            "bytes": "1835008",
+            "sha256": "61ff8ad6b25ef033bbf7acbdb449fc132d2d63f5266123a1da1800d1a41efb39",
+            "filemark_record": "28",
+            "eod_record": "29"
+          },
+          {
+            "image": "resume-open",
+            "tape_file": "ALL",
+            "start_record": "0",
+            "data_records": "23",
+            "bytes": "6029312",
+            "sha256": "f9eef783b1e00511a3a8fff21bb8fc7e092ef315db61bd0b855ee94428e8d80d",
+            "filemark_record": "structural",
+            "eod_record": "29"
+          }
+        ],
+        "eod": 29,
+        "uninterrupted_equal": true,
+        "uninterrupted_differences": [],
+        "session_end_citations": [
+          {
+            "section": "11.2",
+            "quote": "At `S × k` data blocks the epoch closes into a **pending** sidecar; no tape I/O occurs mid-object."
+          },
+          {
+            "section": "11.2",
+            "quote": "Pending sidecars are emitted as tape files when the current object closes."
+          }
+        ]
+      },
+      "undecided": []
+    },
+    "resume-w-greater-than-t": {
+      "image": "unfinalized-closed",
+      "prefix": {
+        "entries": 3,
+        "derived_W": 4,
+        "derived_T": 3,
+        "given_W": 4,
+        "given_T": 3,
+        "W_equal": true,
+        "T_equal": true,
+        "append_point_lba": 14,
+        "map_findings": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+          },
+          {
+            "section": "3.4",
+            "quote": "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."
+          },
+          {
+            "section": "3.2",
+            "quote": "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."
+          }
+        ]
+      },
+      "scheme": {
+        "k": null,
+        "m": null,
+        "S": null,
+        "source": null
+      },
+      "step2": {
+        "result": "violation",
+        "violations": [
+          "W ≤ T fails: W = 4, T = 3"
+        ],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."
+          },
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          },
+          {
+            "section": "2.3",
+            "quote": "Always `W ≤ T`."
+          }
+        ]
+      },
+      "step3": {
+        "result": "not_run",
+        "ordinals": [],
+        "lbas": [],
+        "failure": null,
+        "citations": []
+      },
+      "step4": {
+        "result": "not_run",
+        "append_point_lba": null,
+        "citations": []
+      },
+      "decision": {
+        "result": "refused",
+        "error": "ResumeAppend",
+        "refused_at": "step 2",
+        "before_any_tape_read": true,
+        "before_any_write": true,
+        "records_read": [],
+        "citations": [
+          {
+            "section": "14",
+            "quote": "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+          },
+          {
+            "section": "15",
+            "quote": "ResumeAppend Section 14 invariant violation"
+          }
+        ]
+      },
+      "append": null,
+      "undecided": []
+    }
+  }
+}

@@ -21,7 +21,8 @@ Usage:
     rem_parity_second_implementation.py build [--out DIR]
     rem_parity_second_implementation.py decide CASE.json [CASE.json ...] [--out FILE]
 
-A case file named ``fault-map.json`` takes its case id from its directory.
+A case file named ``fault-map.json`` or ``inputs.json`` takes its case id from
+its directory.
 """
 
 from __future__ import annotations
@@ -1447,6 +1448,14 @@ def build_image(inputs: Mapping[str, Any], name: str) -> ImageBuild:
             info = {"records": len(component), "block_size": block_size,
                     "structural_rows": len(prefix_entries), "object_rows": len(object_rows)}
             files.append(TapeFile(len(files), kind, component, True, info))
+    elif stop.get("kind") == "session-end":
+        # Not a fixture stop kind: the session ends after its last Object and a
+        # barrier closes the open epoch, even a short one (Section 11.2). Used
+        # only to build the uninterrupted-session check for the resume cases.
+        if ordinal > epoch_start:
+            emit_sidecar(next_epoch, epoch_start, ordinal, directory_flags)
+            next_epoch += 1
+            epoch_start = ordinal
     elif stop.get("kind") == "committed-prefix":
         torn_records = stop.get("torn_records")
         fill = stop.get("torn_record_fill")
@@ -3437,12 +3446,333 @@ def recover_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The Resumer (Section 14, and Section 3.4 as far as a portable committed
+# prefix reaches).
+# ---------------------------------------------------------------------------
+
+QUOTES.update({
+    "resume_after": ("14", "A later session appends **after the last committed tape file** — not after the last object, and not at the watermark."),
+    "resume_step1": ("14", "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."),
+    "resume_step2": ("14", "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."),
+    "resume_step2_rules": ("14", "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."),
+    "resume_step3": ("14", "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."),
+    "resume_step4": ("14", "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"),
+    "resume_first_block": ("14", "The first block written lands exactly at the append point; a write issued anywhere else could land over committed data or short of the append point."),
+    "resume_superseded": ("14", "Anything physically on tape beyond the committed prefix is superseded by the next append and MUST NOT be trusted for recovery."),
+    "resume_validated_records": ("3.4", "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point."),
+    "append_point": ("3.2", "The append point after a committed prefix is `Σ(block_count + 1)` over all committed files."),
+    "w_le_t": ("2.3", "Always `W ≤ T`."),
+    "derived_scalars": ("7.2", "Tape file numbers are dense from 0. Object first-ordinals are dense and contiguous from 0 in tape order (Section 3.2)."),
+    "epoch_ids": ("9.2", "Epoch ids MUST increase by one but carry no range arithmetic."),
+    "epoch_close": ("11.2", "At `S × k` data blocks the epoch closes into a **pending** sidecar; no tape I/O occurs mid-object."),
+    "pending_emit": ("11.2", "Pending sidecars are emitted as tape files when the current object closes."),
+    "barrier_short": ("11.2", "A barrier may close a non-empty short epoch and emit its sidecar without `FINAL_PARTIAL_EPOCH`."),
+    "boundary_outcomes": ("3.5", "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**."),
+    "err_resume": ("15", "ResumeAppend                    Section 14 invariant violation"),
+    "torn_superseded": ("3.4", "There is no on-tape commit marker and no on-tape \"unclean\" marker: an interrupted tail simply lies beyond the last committed file and is physically superseded on resume (Section 14)."),
+    "finalized_no_append": ("11.3", "A finalized tape accepts no further appends."),
+})
+
+
+def prefix_from_json(entries: list[Mapping[str, Any]]) -> list[MapEntry]:
+    return structural_from_json(entries)
+
+
+def step2_violations(prefix: list[MapEntry], watermark: int, total: int) -> list[str]:
+    """The Section 14 step-2 rules that need no scheme, each violation named."""
+    violations = []
+    if watermark > total:
+        violations.append(f"W ≤ T fails: W = {watermark}, T = {total}")
+    chain = 0
+    for entry in [e for e in prefix if e.kind == KIND_SIDECAR]:
+        if entry.protected_ordinal_start != chain:
+            violations.append(f"sidecar ranges not contiguous from zero: tape file {entry.tape_file_number} starts at "
+                              f"{entry.protected_ordinal_start}, not {chain}")
+            break
+        chain = entry.protected_ordinal_end_exclusive
+    else:
+        if chain != watermark:
+            violations.append(f"sidecar ranges do not reach W: they end at {chain}, W = {watermark}")
+    epochs = [e.epoch_id for e in prefix if e.kind == KIND_SIDECAR]
+    if epochs != list(range(len(epochs))):
+        violations.append(f"epoch ids not consecutive from 0: {epochs}")
+    objects = [e for e in prefix if e.kind == KIND_OBJECT]
+    final_end = objects[-1].first_parity_data_ordinal + objects[-1].block_count if objects else 0
+    if final_end != total:
+        violations.append(f"the final Object entry ends at {final_end}, not at T = {total}")
+    return violations
+
+
+def prefix_map_findings(prefix: list[MapEntry]) -> list[str]:
+    """Section 7.2 validity findings that step 2 does not list (reported, not decisive)."""
+    findings = []
+    ordinal = 0
+    for index, entry in enumerate(prefix):
+        if entry.tape_file_number != index:
+            findings.append(f"tape file numbers not dense at entry {index}")
+        if entry.kind == KIND_OBJECT:
+            if entry.first_parity_data_ordinal != ordinal:
+                findings.append(f"Object at tape file {entry.tape_file_number} has first ordinal "
+                                f"{entry.first_parity_data_ordinal}, not the running total {ordinal}")
+            ordinal = entry.first_parity_data_ordinal + entry.block_count
+    return findings
+
+
+def empty_resume_decision(image_name: str) -> dict[str, Any]:
+    return {
+        "image": image_name,
+        "prefix": {"entries": None, "derived_W": None, "derived_T": None, "given_W": None, "given_T": None,
+                   "W_equal": None, "T_equal": None, "append_point_lba": None, "map_findings": [], "citations": []},
+        "scheme": {"k": None, "m": None, "S": None, "source": None},
+        "step2": {"result": "not_run", "violations": [], "citations": []},
+        "step3": {"result": "not_run", "ordinals": [], "lbas": [], "failure": None, "citations": []},
+        "step4": {"result": "not_run", "append_point_lba": None, "citations": []},
+        "decision": {"result": None, "error": None, "refused_at": None, "before_any_tape_read": None,
+                     "before_any_write": None, "records_read": [], "citations": []},
+        "append": None,
+        "undecided": [],
+    }
+
+
+def resume_case(case: Mapping[str, Any], image: ImageBuild,
+                trace: dict[str, Any]) -> tuple[dict[str, Any], ImageBuild | None]:
+    """Act as a Resumer on the undamaged image with the given prefix as commit authority."""
+    decision = empty_resume_decision(case["image"])
+    tape = DamagedTape(image.records(), set())
+    reads: list[int] = []
+
+    def read(lba: int) -> Any:
+        reads.append(lba)
+        return tape.read(lba)
+
+    # Step 1: the prefix is the commit authority; W and T come from it (Section 7.2).
+    prefix = prefix_from_json(case["committed_prefix"])
+    watermark = derived_watermark(prefix)
+    total = derived_total(prefix)
+    append_point = sum(entry.block_count + 1 for entry in prefix)
+    p = decision["prefix"]
+    p.update(entries=len(prefix), derived_W=watermark, derived_T=total, given_W=case["W"], given_T=case["T"],
+             W_equal=watermark == case["W"], T_equal=total == case["T"], append_point_lba=append_point,
+             map_findings=prefix_map_findings(prefix))
+    p["citations"].extend([cite("resume_step1"), cite("resume_validated_records"), cite("append_point")])
+    refusal = decision["decision"]
+
+    def refuse(at: str, error: str, citations: list[str]) -> tuple[dict[str, Any], None]:
+        refusal.update(result="refused", error=error, refused_at=at, before_any_tape_read=not reads,
+                       before_any_write=True, records_read=list(reads))
+        refusal["citations"].extend(cite(key) for key in citations)
+        return decision, None
+
+    # Step 2, the rules that need no scheme.
+    step2 = decision["step2"]
+    step2["citations"].extend([cite("resume_step2"), cite("resume_step2_rules")])
+    violations = step2_violations(prefix, watermark, total)
+    if violations:
+        step2.update(result="violation", violations=violations)
+        if any("W ≤ T" in v for v in violations):
+            step2["citations"].append(cite("w_le_t"))
+        if any("epoch ids" in v for v in violations):
+            step2["citations"].append(cite("epoch_ids"))
+        return refuse("step 2", "ResumeAppend", ["resume_step2_rules", "err_resume"])
+
+    # The step-2 bound needs S and k, which the prefix does not carry. The text
+    # does not say where a Resumer obtains them; this one reads the bootstrap.
+    try:
+        block = read(0)
+        boot = parse_bootstrap(block, len(block))
+    except (MediumError, ReadFailure) as failure:
+        reason = failure.reason if isinstance(failure, ReadFailure) else f"medium error at LBA {failure.args[0]}"
+        step2.update(result="undecided", violations=[f"the scheme is unavailable: bootstrap {reason}"])
+        return refuse("step 2", "undecided", ["resume_step2"])
+    k, m, stripes = boot["scheme"]
+    decision["scheme"].update(k=k, m=m, S=stripes, source="bootstrap at LBA 0")
+    if not total - watermark < stripes * k:
+        step2.update(result="violation",
+                     violations=[f"T − W = {total - watermark} is not below S × k = {stripes * k}"])
+        refuse("step 2", "ResumeAppend", ["resume_step2", "err_resume"])
+        refusal["before_any_tape_read"] = "undecided"
+        decision["undecided"].append({
+            "aspect": "decision.before_any_tape_read",
+            "readings": [
+                "true: the Resumer's off-tape state carries the scheme, so the step-2 bound is applied before any "
+                "tape read",
+                "false: the scheme comes from the bootstrap, so the Resumer reads LBA 0 before it can apply the "
+                "step-2 bound; this Resumer does so",
+            ],
+            "citations": [cite("resume_step2"), cite("resume_step1")],
+        })
+        return decision, None
+    step2["result"] = "pass"
+
+    # Step 3: re-read [W, T) from the committed prefix on tape.
+    step3 = decision["step3"]
+    step3["citations"].append(cite("resume_step3"))
+    open_blocks: dict[int, bytes] = {}
+    for ordinal in range(watermark, total):
+        holder = next(e for e in prefix if e.kind == KIND_OBJECT
+                      and e.first_parity_data_ordinal <= ordinal < e.first_parity_data_ordinal + e.block_count)
+        lba = lba_of_file(prefix, holder.tape_file_number) + ordinal - holder.first_parity_data_ordinal
+        step3["ordinals"].append(ordinal)
+        step3["lbas"].append(lba)
+        try:
+            value = read(lba)
+        except MediumError:
+            value = "medium error"
+        if not isinstance(value, bytes) or len(value) != boot["block_size"]:
+            found = value if isinstance(value, str) else f"a {len(value)}-byte record"
+            step3.update(result="fatal", failure=f"ordinal {ordinal} at LBA {lba}: {found} where data is expected")
+            step3["citations"].append(cite("boundary_outcomes"))
+            decision["undecided"].append({
+                "aspect": "decision.error",
+                "readings": [
+                    "ResumeAppend: the committed prefix does not describe the tape, a Section 14 invariant violation",
+                    "TapeIo: a Filemark or EndOfData outcome where a block was expected is a tape I/O failure, "
+                    "not a format violation",
+                ],
+                "citations": [cite("resume_step3"), cite("err_resume"), cite("err_tapeio")],
+            })
+            return refuse("step 3", "undecided", ["resume_step3"])
+        open_blocks[ordinal] = value
+    step3["result"] = "run"
+
+    # Step 4: position to the append point, then write the Object and end the session.
+    step4 = decision["step4"]
+    step4.update(result="run", append_point_lba=append_point)
+    step4["citations"].extend([cite("resume_step4"), cite("resume_first_block"), cite("resume_superseded")])
+    block_size = boot["block_size"]
+    stored, layout = build_rem_object(case["append_object"], block_size, 0)
+    new_blocks = [stored[i : i + block_size] for i in range(0, len(stored), block_size)]
+    data = dict(open_blocks)
+    ordinal = total
+    epoch_start = watermark
+    next_epoch = len([e for e in prefix if e.kind == KIND_SIDECAR])
+    files: list[TapeFile] = []
+    physical = image.records()
+    lba = 0
+    for entry in prefix:
+        blocks = physical[lba : lba + entry.block_count]
+        files.append(TapeFile(entry.tape_file_number, entry.kind, blocks, True, {}))
+        lba += entry.block_count + 1
+    object_tape_file = len(files)
+    files.append(TapeFile(object_tape_file, KIND_OBJECT, new_blocks, True, {}))
+    first_ordinal = ordinal
+    sidecars: list[tuple[int, int, int, bool]] = []
+    for block in new_blocks:
+        data[ordinal] = block
+        ordinal += 1
+        if ordinal - epoch_start == stripes * k:
+            sidecars.append((next_epoch, epoch_start, ordinal, False))
+            next_epoch += 1
+            epoch_start = ordinal
+    if ordinal > epoch_start:
+        sidecars.append((next_epoch, epoch_start, ordinal, True))
+    sidecar_reports = []
+    for epoch_id, start, end, short in sidecars:
+        built = build_sidecar(boot["tape_uuid"], block_size, (k, m, stripes), epoch_id, start, end, data.__getitem__)
+        files.append(TapeFile(len(files), KIND_SIDECAR, built.blocks, True, {}))
+        sidecar_reports.append({"epoch_id": epoch_id, "protected_ordinal_start": start,
+                                "protected_ordinal_end_exclusive": end, "total_blocks": built.total_blocks,
+                                "closed_by": "session-end barrier (short epoch)" if short else "Object close (full epoch)",
+                                "tape_file": len(files) - 1})
+    result_name = trace.get("case_id", "resumed")
+    result = ImageBuild(result_name, block_size, boot["tape_uuid"], (k, m, stripes), files, [], [], None, False)
+    rows = image_rows(result)
+    for report in sidecar_reports:
+        report["first_lba"] = int(rows[report["tape_file"]]["start_record"])
+    manifest = layout["manifest"]
+    decision["append"] = {
+        "object_tape_file": object_tape_file,
+        "object_first_lba": append_point,
+        "object_blocks": len(new_blocks),
+        "object_first_ordinal": first_ordinal,
+        "object_row": {"1": object_tape_file, "2": "plaintext", "3": len(new_blocks),
+                       "4": case["append_object"]["options"]["object_id"].encode("utf-8").hex(),
+                       "10": manifest.first_chunk_lba, "11": manifest.size_bytes, "12": manifest.chunk_count,
+                       "13": layout["manifest_sha256"].hex()},
+        "sidecars": sidecar_reports,
+        "tape_files": rows,
+        "eod": int(rows[-1]["eod_record"]),
+        "uninterrupted_equal": None,
+        "uninterrupted_differences": [],
+    }
+    if any(r["closed_by"].startswith("session-end") for r in sidecar_reports):
+        decision["append"]["session_end_citations"] = [cite("barrier_short")]
+    else:
+        decision["append"]["session_end_citations"] = [cite("epoch_close"), cite("pending_emit")]
+    refusal.update(result="accepted", error=None, refused_at=None, before_any_tape_read=False,
+                   before_any_write=None, records_read=list(reads))
+    refusal["citations"].extend([cite("resume_after"), cite("torn_superseded")])
+    return decision, result
+
+
+def uninterrupted_build(case: Mapping[str, Any], image_inputs: Mapping[str, Any]) -> ImageBuild:
+    """My own check: the prefix's Objects and the appended Object in one session, ended by a barrier."""
+    prefix = prefix_from_json(case["committed_prefix"])
+    count = len([e for e in prefix if e.kind == KIND_OBJECT])
+    inputs = json.loads(json.dumps(image_inputs))
+    inputs["objects"] = inputs["objects"][:count] + [case["append_object"]]
+    inputs["checkpoint_after_objects"] = [c for c in inputs["checkpoint_after_objects"] if c < count]
+    inputs["stop"] = {"kind": "session-end"}
+    return build_image(inputs, "uninterrupted")
+
+
+def compare_tapes(resumed: ImageBuild, other: ImageBuild) -> list[str]:
+    differences = []
+    if len(resumed.files) != len(other.files):
+        differences.append(f"tape-file count: resumed {len(resumed.files)}, uninterrupted {len(other.files)}")
+    for mine, theirs in zip(resumed.files, other.files):
+        a, b = b"".join(mine.blocks), b"".join(theirs.blocks)
+        if a != b or mine.has_filemark != theirs.has_filemark:
+            index = first_difference(a, b)
+            differences.append(f"tape file {mine.tape_file_number}: first differing byte {index}")
+    return differences
+
+
+def run_resume(case_paths: list[pathlib.Path], out_path: pathlib.Path) -> dict[str, Any]:
+    images: dict[str, ImageBuild] = {}
+    cases: dict[str, Any] = {}
+    for path in sorted(case_paths, key=case_id_of):
+        case = load_json(path)
+        name = case["image"]
+        if name not in images:
+            images[name] = build_image(load_image_inputs(name), name)
+        trace = {"case_id": case_id_of(path)}
+        decision, resumed = resume_case(case, images[name], trace)
+        if resumed is not None:
+            # Reporting-only, after the decision: compare with one uninterrupted session.
+            other = uninterrupted_build(case, load_image_inputs(name))
+            differences = compare_tapes(resumed, other)
+            decision["append"]["uninterrupted_equal"] = not differences
+            decision["append"]["uninterrupted_differences"] = differences
+        cases[case_id_of(path)] = decision
+    output = {"schema": "rem-parity-second-implementation-resume/1", "cases": cases}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return output
+
+
+def resume_summary(decision: dict[str, Any]) -> str:
+    d = decision["decision"]
+    text = f"{decision['image']}: W {decision['prefix']['derived_W']} T {decision['prefix']['derived_T']}; {d['result']}"
+    if d["result"] == "refused":
+        text += f" at {d['refused_at']} ({d['error']}); reads {d['records_read'] or 'none'}"
+    else:
+        a = decision["append"]
+        text += (f"; re-read LBAs {decision['step3']['lbas'] or 'none'}; append at LBA {decision['step4']['append_point_lba']}; "
+                 f"Object tape file {a['object_tape_file']}; sidecar(s) " +
+                 ", ".join(f"file {s['tape_file']} epoch {s['epoch_id']} [{s['protected_ordinal_start']}, "
+                           f"{s['protected_ordinal_end_exclusive']})" for s in a["sidecars"]) +
+                 f"; EOD {a['eod']}; equals uninterrupted: {a['uninterrupted_equal']}")
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Deciding one case.
 # ---------------------------------------------------------------------------
 
 
 def case_id_of(path: pathlib.Path) -> str:
-    return path.parent.name if path.name == "fault-map.json" else path.stem
+    return path.parent.name if path.name in ("fault-map.json", "inputs.json") else path.stem
 
 
 def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[DamagedTape, list[str]]:
@@ -3968,6 +4298,9 @@ def main(argv: list[str] | None = None) -> int:
     decide = commands.add_parser("decide", help="decide damage cases as a Reader under the text")
     decide.add_argument("cases", nargs="+", type=pathlib.Path)
     decide.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "decisions.json")
+    resume = commands.add_parser("resume", help="act as a Resumer under Section 14 on resume cases")
+    resume.add_argument("cases", nargs="+", type=pathlib.Path)
+    resume.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "resume-decisions.json")
     args = parser.parse_args(argv)
     if args.command == "build":
         report = run_build(args.out, include_streaming=not args.skip_streaming)
@@ -3976,6 +4309,12 @@ def main(argv: list[str] | None = None) -> int:
                 "" if result["result"] == "reproduced" else f"  -- {result['detail']}"))
         print(f"reproduced {report['reproduced']}, mismatched {report['mismatched']}")
         return 0 if report["mismatched"] == 0 else 1
+    if args.command == "resume":
+        output = run_resume(args.cases, args.out)
+        for case_id, decision in output["cases"].items():
+            print(case_id, resume_summary(decision))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
     output = run_decide(args.cases, args.out)
     for case_id, decision in output["cases"].items():
         print(case_id, one_line_summary(decision))

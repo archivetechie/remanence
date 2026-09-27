@@ -9,7 +9,9 @@ Two environment variables are optional:
   into (default: ``test-scratch`` under the second-implementation output
   directory, removed afterwards);
 * ``REM_PARITY_SECOND_IMPL_CASES`` names a directory of damage-case JSON files
-  for the determinism test (default: three synthetic cases written by the test).
+  for the determinism test (default: three synthetic cases written by the test);
+* ``REM_PARITY_SECOND_IMPL_RESUME`` names a directory of resume-case JSON files
+  for the resume determinism test (default: synthetic cases written by the test).
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import rem_parity_second_implementation as impl  # noqa: E402
 DEFAULT_SCRATCH = impl.OUTPUT_ROOT / "test-scratch"
 SCRATCH = pathlib.Path(os.environ.get("REM_PARITY_SECOND_IMPL_SCRATCH", DEFAULT_SCRATCH))
 CASES = os.environ.get("REM_PARITY_SECOND_IMPL_CASES")
+RESUME_CASES = os.environ.get("REM_PARITY_SECOND_IMPL_RESUME")
 
 
 def setUpModule() -> None:
@@ -439,6 +442,74 @@ class DecideDeterminismTests(unittest.TestCase):
         decisions = impl.run_decide([path], out)
         self.assertEqual(list(decisions["cases"]), ["replica-headers"])
         self.assertTrue((SCRATCH / "repository-layout" / "decisions-trace.json").exists())
+
+
+# ---------------------------------------------------------------------------
+# resume (Section 14).
+# ---------------------------------------------------------------------------
+
+
+def entry_json(entry):
+    return {"block_count": entry.block_count, "epoch_id": entry.epoch_id,
+            "first_parity_data_ordinal": entry.first_parity_data_ordinal, "kind": impl.KIND_NAMES[entry.kind],
+            "protected_ordinal_end_exclusive": entry.protected_ordinal_end_exclusive,
+            "protected_ordinal_start": entry.protected_ordinal_start, "tape_file_number": entry.tape_file_number}
+
+
+APPEND_OBJECT = {"files": [], "options": {
+    "caller_object_id": "test-append", "chunk_size": 262144, "encryption": "none", "extensions": {},
+    "manifest_file_id": "00000000-0000-4000-8000-0000000000aa", "metadata_preservation": "archival",
+    "object_id": "00000000-0000-4000-8000-0000000000ab", "write_timestamp": "2026-08-09T00:00:00Z"}}
+
+
+def synthetic_resume_cases():
+    image = impl.build_image(impl.load_image_inputs("unfinalized-open"), "unfinalized-open")
+    prefix = [entry_json(e) for e in image.prefix_entries]
+    accepted = {"image": "unfinalized-open", "committed_prefix": prefix, "W": 4, "T": 6, "append_object": APPEND_OBJECT}
+    gapped = json.loads(json.dumps(accepted))
+    gapped["committed_prefix"][2]["epoch_id"] = 1
+    return {"synthetic-accepted": accepted, "synthetic-epoch-gap": gapped}
+
+
+class ResumeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.case_dir = SCRATCH / "resume-cases"
+        cls.case_dir.mkdir(parents=True, exist_ok=True)
+        cls.synthetic = {}
+        for name, case in synthetic_resume_cases().items():
+            path = cls.case_dir / f"{name}.json"
+            path.write_text(json.dumps(case), encoding="utf-8")
+            cls.synthetic[name] = path
+
+    def test_resume_twice_gives_identical_output(self) -> None:
+        paths = sorted(pathlib.Path(RESUME_CASES).glob("*.json")) if RESUME_CASES else sorted(self.synthetic.values())
+        first, second = SCRATCH / "resume-first.json", SCRATCH / "resume-second.json"
+        impl.run_resume(paths, first)
+        impl.run_resume(list(reversed(paths)), second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(json.loads(first.read_text())["schema"], "rem-parity-second-implementation-resume/1")
+
+    def test_accepted_resume_equals_one_uninterrupted_session(self) -> None:
+        out = impl.run_resume([self.synthetic["synthetic-accepted"]], SCRATCH / "resume-accepted.json")
+        decision = out["cases"]["synthetic-accepted"]
+        self.assertEqual(decision["decision"]["result"], "accepted")
+        self.assertEqual(decision["step3"]["lbas"], [15, 16])
+        self.assertEqual(decision["step4"]["append_point_lba"], 18)
+        self.assertTrue(decision["append"]["uninterrupted_equal"])
+        rows = decision["append"]["tape_files"]
+        pinned = {r["tape_file"]: r["sha256"] for r in impl.read_tsv(impl.FIXTURE_ROOT / "tape-images" / "MANIFEST.tsv")
+                  if r["image"] == "unfinalized-open"}
+        for tape_file in ("0", "1", "2", "3"):
+            self.assertEqual(rows[int(tape_file)]["sha256"], pinned[tape_file])
+
+    def test_step2_refusal_reads_nothing(self) -> None:
+        out = impl.run_resume([self.synthetic["synthetic-epoch-gap"]], SCRATCH / "resume-gap.json")
+        decision = out["cases"]["synthetic-epoch-gap"]["decision"]
+        self.assertEqual((decision["result"], decision["error"], decision["refused_at"]),
+                         ("refused", "ResumeAppend", "step 2"))
+        self.assertEqual(decision["records_read"], [])
+        self.assertIs(decision["before_any_tape_read"], True)
 
 
 if __name__ == "__main__":
