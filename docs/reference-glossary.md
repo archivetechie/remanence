@@ -32,7 +32,7 @@ and wrapped once per recipient with HPKE (RFC 9180 Base mode, HKDF-
 SHA256, ChaCha20-Poly1305) running the **X-Wing hybrid KEM** (see below)
 into a **key frame** (wire tag `REMK`, 1-8 recipient slots accepted by
 readers) sitting between the header and metadata frame. Production
-sealers require 2-8 distinct recipient epochs. `archive build`,
+sealers require 2-8 distinct, nonzero recipient epochs. `archive build`,
 pool-selected `archive write`, and a full `archive reseal` produce it;
 `archive extract`/`restore`/`read`/`verify`, the streaming range commands,
 and `rem-recover` open it with a matching REMP private key.

@@ -731,7 +731,9 @@ magic = HMAC-SHA-256(key = tape_uuid[16 bytes], message = LABEL)[0..8]
 ```
 
 where HMAC is [RFC2104] with SHA-256 [FIPS180-4], `tape_uuid` is the 16-byte
-tape identity from the bootstrap, `LABEL` is the role's ASCII label from
+tape identity from the bootstrap or, when the bootstrap is unreadable, from
+the tape UUID supplied under Section 8.4.1, `LABEL` is the role's ASCII label
+from
 Section 2.5 (label bytes exactly as listed, including the embedded NUL, the
 0x01 version byte, and, for the terminal replica and separation labels, the
 role letter that follows it; no terminator added), and `[0..8]` takes the
@@ -855,7 +857,8 @@ k ≥ 2      1 ≤ m ≤ k      S ≥ 1      k + m ≤ 255      S × (k + m) ≤
 ```
 
 The scheme triple is recorded in the bootstrap and in every sidecar; Readers
-MUST use the recorded values, never defaults. The profiles below are
+MUST use the recorded values or, when the bootstrap is unreadable, the values
+supplied under Section 8.4.1, never defaults. The profiles below are
 informative Writer defaults, with `S` chosen as
 `max(1, ceil(target / (block_size × m)))` for a contiguous-damage target:
 
@@ -1211,6 +1214,15 @@ discovers the terminal replicas:
 4. if no replica validates, perform the BOT structural recovery walk in
    Section 8.4.1.
 
+When footers propose different planned layouts, Section 8.5 decides which
+replicas are accepted.
+
+A Scanner that cannot read the bootstrap MAY perform the discovery above
+when it is given the three values Section 8.4.1 names. It then uses the
+supplied tape UUID as the key of the role magics (Section 5.2). A readable
+bootstrap whose values disagree with the supplied ones is refused; the
+supplied values never take its place.
+
 Footer-local observed positions MUST agree with the footer's planned shared
 layout before that replica is eligible. A planned position or digest for a
 later component does not prove that the component was written. Filemarks and
@@ -1255,8 +1267,9 @@ candidate, while a non-medium transport error aborts discovery.
 
 When A, B, and C are all absent or invalid, the Scanner MUST offer a full
 structural walk from BOT. The bootstrap supplies tape identity and geometry
-when it is readable. If it is unreadable, an operator-supplied block-size hint
-and expected tape-identity UUID are required.
+when it is readable. If it is unreadable, the expected tape UUID, the block
+size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no
+parity) supplied out of band are required.
 
 *Rationale.* The identity hint is required because terminal, ParitySidecar,
 and ParityMap frame magics are derived from the tape UUID; geometry alone
@@ -1282,9 +1295,10 @@ authority was not recovered.
   an error. The Scanner MUST fail closed on conflicting, corrupt, or
   non-repeatable authority rather than emit a guessed identity.
 
-- **Identity and geometry hints.** A Scanner MUST accept an expected tape UUID
-  and a block size supplied out of band. Expected tape UUID and block size are
-  mandatory when the bootstrap is unreadable. A block-size hint makes the
+- **Identity and geometry hints.** A Scanner MUST accept an expected tape UUID,
+  a block size and a parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`,
+  or no parity) supplied out of band. Expected tape UUID, block size and parity scheme are mandatory when
+  the bootstrap is unreadable. A block-size hint makes the
   size known and is applied as a configured read size under the Section 8.4
   hint path, suppressing candidate rotation. Hints MUST NOT cause any tape
   file to be skipped.
@@ -1358,7 +1372,7 @@ entry, and the trailing 8-byte CRC.
 | Offset | Len | Field | Constraint |
 | --- | ---: | --- | --- |
 | 0x00 | 8 | magic | HMAC(tape_uuid, `SIDECAR_MAGIC_LABEL`)[0..8] (Section 5.2) |
-| 0x08 | 16 | tape_uuid | MUST match the bootstrap |
+| 0x08 | 16 | tape_uuid | MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1 |
 | 0x18 | 8 | epoch_id u64 | |
 | 0x20 | 2 | k u16 | ≠ 0 |
 | 0x22 | 2 | m u16 | ≠ 0 |
@@ -1750,9 +1764,10 @@ CBOR bytes. Key 21 is the REM-ENCRYPT header's `metadata_frame_len`; key 22
 records the recipient epoch ids present in its key frame; key 23 is the
 header's `key_frame_len`. The semantics of these three keys, and the key 21
 and key 23 bounds, are defined by [REMENCRYPT], which is a normative reference
-for implementations of terminal Object recovery rows. The requirement that
-key 22's `recipient_epoch_id` values be distinct and nonzero is imposed by
-this document.
+for implementations of terminal Object recovery rows. REM-ENCRYPT requires
+distinct `recipient_epoch_id` values of every key frame and forbids a Sealer
+to use an all-zero id (REM-ENCRYPT §5.3); this document requires both of an
+Object recovery row's key 22.
 
 *Rationale.* A catalog-less scan must tell recipient slots apart.
 
@@ -2178,11 +2193,12 @@ never as a signal to truncate an object.
 
 ### 12.1. Inputs and Authority
 
-An off-tape catalog is a cache. The mounted tape's bootstrap establishes
-identity, and a finalized tape's selected terminal replica supplies the
-authoritative inventory. If terminal selection yields no valid replica, the
-Scanner returns the explicit BOT structural-recovery outcome and walks from
-LBA 0.
+An off-tape catalog is a cache. The mounted tape's identity comes from the
+bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied
+under Section 8.4.1, and a finalized tape's selected terminal replica
+supplies the authoritative inventory. If terminal selection yields no valid
+replica, the Scanner returns the explicit BOT structural-recovery outcome and
+walks from LBA 0.
 
 ### 12.2. The Walk
 
@@ -2195,7 +2211,8 @@ structural damage; EOD at a file start ends the walk.
 
 The bootstrap at tape file 0 establishes the tape identity against which every
 later classification is checked. When the bootstrap cannot be read, the
-identity is the expected tape UUID supplied out of band (Section 8.4.1). The
+identity is the expected tape UUID supplied out of band (Sections 8.4 and
+8.4.1). The
 items below are numbered for reference, not as an order of trial. Items 1 to 6
 recognise kinds that are disjoint by magic; items 5 and 6 are two ways of
 recognising a sidecar. When the primary header parses, item 5 requires the
@@ -2297,7 +2314,9 @@ an Object.
 
 ### 13.1. Inputs
 
-A validated, scoped map (Section 12); the bootstrap's scheme record; and
+A validated, scoped map (Section 12); the bootstrap's scheme record, or the
+scheme supplied out of band when the bootstrap is unreadable (Section
+8.4.1); and
 the failed addresses — `(tape_file_number, object_block_index)` pairs or
 ordinals.
 
@@ -2335,7 +2354,9 @@ Locate the epoch's sidecar tape file via the map, then, in order:
 This is the **recovery-usable rule**: at least one valid header/index copy
 plus CRC-passing needed shards ⇒ the epoch is usable. The acquired index
 MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`,
-block size) and the map entry's ordinal range; disagreement is
+block size), or against the supplied scheme and block size when the
+bootstrap is unreadable, and against the map entry's ordinal range;
+disagreement is
 `SchemeMismatch`.
 
 ### 13.4. Erasure Taxonomy
@@ -2419,7 +2440,7 @@ TerminalIndexReplicaParse       replica framing or fixed-slot payload violates S
 TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6
 TerminalIndexReplicaConflict    independently valid survivors disagree
 BotStructuralRecoveryRequired   no terminal replica validates; explicit BOT walk required
-SchemeMismatch                  sidecar geometry disagrees with the bootstrap scheme
+SchemeMismatch                  sidecar geometry disagrees with the bootstrap or supplied scheme
 FilemarkMapDigestMismatch       replica structural projection digest disagrees
 FilemarkMapReconstruct          BOT recovery walk could not produce a valid map
 OutsideValidatedMapPrefix       refusal: address beyond the validated scope (Section 13.2)
@@ -3073,6 +3094,31 @@ an errata revision of draft.1.
     independent verifier does not yet re-derive. TT-2 also says that no
     vector yet covers append resume, and how the pinned archive's
     generation-1 cases are covered.
+
+  Decisions on questions the review raised then changed the text as follows.
+
+  - Section 8.4 now points to Section 8.5 when footers propose different
+    planned layouts. The pointer is informative and changes no requirement.
+  - Section 8.4 now permits a Scanner to discover terminal replicas when the
+    bootstrap is unreadable and the expected tape UUID, block size and parity
+    scheme are supplied out of band. A readable bootstrap that disagrees
+    with the supplied values is refused, not overridden. Section 8.4.1 now
+    names the parity scheme (`k`, `m`, `S`, or no parity) as a third mandatory
+    hint for the BOT walk. The Reader permission and the third mandatory
+    hint are a minor change of the draft.
+  - Sections 5.2, 9.2 and 12.1 now name the supplied tape UUID as the source
+    of tape identity when the bootstrap is unreadable, and Section 12.3's
+    pointer also cites Section 8.4. Sections 6.6, 13.1 and 13.3 now name the
+    supplied scheme for that case, and Section 15's `SchemeMismatch`
+    description includes it. These changes carry the hint rule through the
+    identity and scheme checks.
+  - Section 10.3 now points to REM-ENCRYPT §5.3 for distinct epoch ids in
+    every key frame and the Sealer's nonzero rule. The Object recovery row
+    still requires both. The pointer adds no requirement.
+  - Appendix D gains item TT-7: which bootstraps count as unreadable is to be
+    decided before freeze.
+
+  No byte of the format changed, and no valid tape or vector changed.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -3347,6 +3393,15 @@ This is the live preparing-copy snapshot for generation 2.
    512 KiB, and 1 MiB record sizes. REM-PARITY freeze criterion 3, recorded in
    `specs/README.md`, remains open until those targets, committed corpus
    replay, and measured plateau reports exist.
+7. **TT-7 — which bootstraps count as unreadable (open).** Section 8.4 lets a
+   Scanner that cannot read the bootstrap proceed with supplied values, but the
+   text does not yet say which bootstraps count as unreadable. The reference
+   treats as unreadable a block that cannot be read, is short, lacks the magic
+   or fails a checksum, and a checksum-valid bootstrap whose payload breaks a
+   later rule while its scheme and compression agree with the supplied values.
+   It refuses a checksum-valid bootstrap with another format major, a nonzero
+   sequence, drive compression, or a value that disagrees with the supplied
+   ones. This is to be decided before freeze.
 
 ## Author's Address
 
