@@ -126,7 +126,7 @@ Six crates share this layer:
   API, and `rem-recover`.
 - `remanence-parity` owns the physical tape layout: bootstrap blocks,
   filemark discipline, Reed-Solomon sidecar parity, resume, and catalog-less
-  recovery — primarily the terminal triple index, three complete inventories
+  recovery — primarily the terminal index, three complete inventories
   written at the tape's tail and read from EOD without walking a single
   Object, with a full BOT structural scan as the fallback when no terminal
   replica survives. On clean reads it is transparent; on medium errors it
@@ -166,7 +166,7 @@ events, health snapshots, clean runs, alarms).
 
 `rem-daemon` holds the kernel `flock` on `<state_dir>/state.lock` for its
 complete process lifetime. `StateHandle`-based `rem-debug` mutations (tape
-init, existing-Bootstrap identity adoption, pool operations, catalog reset,
+init, existing-bootstrap identity adoption, pool operations, catalog reset,
 and similar offline work) acquire the same lock. A second daemon cannot evade
 this ownership boundary by choosing another socket, and an offline mutator
 cannot race SQLite, checkpoint recovery, or the hash-chained audit log while
@@ -330,9 +330,9 @@ advancing.
 For parity tapes, the checkpoint journal and Layer 3c tape-file journal jointly
 form the required open-prefix and terminal-progress authority. The first
 durable finalization transition permanently disables Object admission. A
-failure enters `RecoveryRequired`, where only missing terminal control
+failure enters `RecoveryRequired`, where only missing terminal suffix
 components may be repaired at proved positions; there is no path back to Open
-and no second terminal triple. SQLite is a replayable projection. On a
+and no second terminal suffix. SQLite is a replayable projection. On a
 finalized cartridge the three terminal replicas, selected C then B then A with
 agreement required between survivors, provide catalog-less tape authority.
 The finalization lifecycle, the companion intent and the recovery rules are

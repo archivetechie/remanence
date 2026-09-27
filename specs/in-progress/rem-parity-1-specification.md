@@ -908,7 +908,7 @@ contiguous from 0 in tape order (Section 3.2). Kind-specific fields are
 exclusive to their kinds; an entry carrying a field outside its kind is
 invalid. A terminal-replica payload describes only the prefix before A, so
 kinds 4 and 5 inside that payload are invalid, even though a Scanner
-recognizes those kinds in the terminal suffix it measures. Derived scalars:
+recognizes those kinds in the measured physical tail. Derived scalars:
 
 ```text
 T = max(first_parity_data_ordinal + block_count) over object entries    (0 if none)
@@ -2193,9 +2193,11 @@ structural damage; EOD at a file start ends the walk.
 The bootstrap at tape file 0 establishes the tape identity against which every
 later classification is checked. When the bootstrap cannot be read, the
 identity is the expected tape UUID supplied out of band (Section 8.4.1). The
-items below are numbered for reference, not as an order of trial: items 1 to 6
-recognise kinds that their magics keep disjoint, and item 7 applies to a tape
-file that none of them recognises.
+items below are numbered for reference, not as an order of trial. Items 1 to 6
+recognise kinds that are disjoint by magic; items 5 and 6 are two ways of
+recognising a sidecar. When the primary header parses, item 5 requires the
+header's total block count to match the measured count. A mismatch is a hard
+error. Item 7 applies to a tape file that none of items 1 to 6 recognises.
 
 1. **Bootstrap**: the fixed magic matches, the full frame parses, the frame's
    `block_size_bytes` equals the read size, the frame's `tape_uuid` equals the

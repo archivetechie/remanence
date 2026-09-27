@@ -5,7 +5,7 @@ the stable formats lives in the published specifications —
 [REM-OBJECT Core](../specs/publication/rem-object-core-1-specification.md),
 [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md), and
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md). The
-terminal triple index described below is the experimental generation-2
+terminal index described below is the experimental generation-2
 replacement in the current preparing copy,
 [REM-PARITY 1.0.0-draft.5](../specs/in-progress/rem-parity-1-specification.md),
 whose Sections 8.3 and 10 give its byte tables. It is not part of the
@@ -25,14 +25,14 @@ fixed-size records. Six structural kinds are emitted by the replacement draft:
 `TapeIndexReplica` (4), and `IndexSeparationExtent` (5).
 Scale-derived file numbers, block counts, data ordinals, edition sequences,
 and logical-block positions are carried as `u64`. Closed-topology fields use
-their bounded widths instead: replica/gap ordinals and component kinds are
+their bounded widths instead: replica and separation ordinals and component kinds are
 `u16`, while partitions and block sizes are `u32`. The closed block-size
 profile remains 256 KiB, 512 KiB, and 1 MiB.
 
 - **Bootstrap** at tape file 0 is the volume label and geometry root: tape UUID,
   fixed block size, and parity profile. It is Object-count independent and
   contains no Object recovery rows, including on a no-parity tape. Host
-  checkpoint operations do not emit a Bootstrap. The terminal design does not write
+  checkpoint operations do not emit a bootstrap. The terminal design does not write
   intermediate bootstrap indexes and does not append a singular final
   bootstrap.
 - **Object** tape files contain only body-format blocks (a stored REM-OBJECT
@@ -44,12 +44,12 @@ profile remains 256 KiB, 512 KiB, and 1 MiB.
   directory is nonempty. It appears immediately before A and is covered as a
   structural row in every terminal replica; it is not terminal inventory
   authority and is never written at an intermediate checkpoint.
-- **Tape-index replicas** are three complete, payload-equivalent final
+- **Terminal replicas** are three complete, payload-equivalent final
   inventories. Each is one header record, streamed fixed-slot structural and
   Object-recovery rows, and its own one-record `BootstrapFooter`, followed by
   one filemark. The footer points backward to that replica's header. It has a
   fixed 1024-byte meaningful frame and carries no per-Object data.
-- **Index-separation extents** are two typed control files between the three
+- **Separation extents** are two typed control files between the three
   replicas. Each default extent occupies `ceil(1 GiB / block_size)` records,
   including its header and footer, then one filemark. Its interior is zero only
   because the write session has already verified hardware compression is off.
@@ -69,9 +69,9 @@ EOD
 All three payloads describe the complete prefix before A. Headers and footers
 differ where ordinal and position require it. The shared `edition_digest`
 binds the canonical inventory, while `layout_digest` binds the planned ordered
-five-file tail. Planned future components do not prove that they were written.
+terminal suffix. Planned future components do not prove that they were written.
 
-The BOT Bootstrap keeps the fixed literal magic
+The BOT bootstrap keeps the fixed literal magic
 `52 45 4D 00 42 4F 4F 01` (`REM\0BOO\x01`). Sidecar, sidecar-footer,
 ParityMap, terminal replica, and separation role magics are
 derived per tape as the first 8 bytes of an
@@ -102,7 +102,7 @@ Durability barriers may close the current epoch even when it is short. A
 batch-of-one workload therefore pays for more short-epoch sidecars than a
 well-batched workload. Before an Object moves, admission includes the complete
 Object commit and the exact terminal reserve: parity closeout, three replica
-charges, two gap charges, and safety allowance. Each header, footer, record,
+charges, two separation extent charges, and safety allowance. Each header, footer, record,
 and filemark is charged once.
 
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/layout.rs crates/remanence-format/src/writer.rs @ 1dd451b2 -->
@@ -186,11 +186,11 @@ Finalization becomes irreversible before replica A moves. The durable
 five-component progress states are `BeforeReplicaA`, `AfterReplicaA`,
 `AfterSeparationAb`, `AfterReplicaB`, `AfterSeparationBc`, and
 `AfterReplicaC`. The convenient completed-replica count (0, 1, 2, or 3) is a
-projection, not authority: a crash after a complete gap must not cause that
-gap to be duplicated. Ordinary `sealed` state requires `AfterReplicaC` plus
+projection, not authority: a crash after a complete separation extent must not cause that
+extent to be duplicated. Ordinary `sealed` state requires `AfterReplicaC` plus
 the final journal and catalog projection order. A barrier-proved A, or A and
-B, is already a complete inventory, and a scan of the tape alone reports it as
-degraded; in host state the finalization stays resumable. No finalizing state
+B, is already a complete inventory. A scan of the tape alone reports it as
+degraded. In host state the finalization stays resumable. No finalizing state
 permits another Object.
 
 Accepting a finalization durably publishes the finalization companion intent
@@ -217,10 +217,10 @@ On restart, before any terminal positioning or write, Remanence reconstructs
 the immutable final edition. It compares every recorded component and
 watermark digest with that plan. It accepts only equal progress in both
 journals. The one exception is a tape-file journal exactly one canonical
-transition ahead. In that case Remanence completes the missing watermark,
-advances the checkpoint journal to the same component, and rebuilds SQLite, all
-before any media motion. A skip, a regression, a record that is not the next
-one, or a conflicting digest fails closed.
+transition ahead. In that case Remanence completes the missing watermark.
+It then advances the checkpoint journal to the same component. It then rebuilds
+SQLite. All three steps come before any media motion. A skip, a regression, a
+record that is not the next one, or a conflicting digest fails closed.
 
 A component failure or a completion-unknown result marks the companion as
 needing media reconciliation (`RecoveryRequired`). Restart keeps that mark at
@@ -228,7 +228,7 @@ the same progress. Only a successful next component clears it.
 
 The header of a terminal component is written before its streamed payload, so
 an interrupted replay can leave a header-only or partial component at its
-planned start. Restart classifies that as torn terminal control, never as an
+planned start. Restart classifies that as a torn terminal component, never as an
 Object. A proved rewritable start is rewritten from that component. On WORM
 media, or at a start that cannot be proved, the tape stays in
 `RecoveryRequired` and no media command is issued.
@@ -236,11 +236,12 @@ media, or at a start that cannot be proved, the tape stays in
 `AfterReplicaC` stays `Finalizing` until three things are durable: its SQLite
 progress projection, a sealed checkpoint holding the exact completed intent,
 and the final SQLite projection. On the uninterrupted path the checkpoint
-journal fsyncs the sealed record. It then retires the companion, before the
-final SQLite projection. If a crash leaves the sealed checkpoint beside its
+journal fsyncs the sealed record. It then retires the companion. The final SQLite
+projection follows. If a crash leaves the sealed checkpoint beside its
 companion, startup recovery takes a recovery lease. It checks that the sealed
-completion equals the normalized companion, and a mismatch fails closed. It
-then projects the sealed checkpoint while the companion still routes retries.
+completion equals the normalized companion. A mismatch fails closed. If they
+agree, it projects the sealed checkpoint. During this projection, the
+companion still routes retries.
 It retires the companion only after the projection succeeds. Only this
 terminal-recovery path may take the checkpoint journal while a companion
 exists; an ordinary append owner cannot.
@@ -248,10 +249,10 @@ exists; an ordinary append owner cannot.
 Once replica C is proved, the reserved tail is already on the medium. Completing
 the host steps therefore does not reapply a changed capacity cap or watermark.
 
-The catalog can represent a `finalized_degraded` outcome, and requires it to
-name one or two complete replicas, but nothing in Remanence produces it yet:
-there is no operation that accepts a degraded replica set, so a tape whose
-finalization cannot complete stays in `RecoveryRequired`.
+The catalog can represent a `finalized_degraded` outcome, which must name one
+or two complete replicas. Nothing in Remanence produces it yet. There is no
+operation that accepts a degraded replica set. A tape whose finalization
+cannot complete therefore stays in `RecoveryRequired`.
 
 Healthy inventory reads BOT identity, positions to EOD, and validates C
 without walking an Object. If C is missing or invalid it tries B, then A, and

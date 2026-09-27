@@ -210,7 +210,7 @@ pub use terminal_writer::{
 // ====================================================================
 
 /// Caller's intent for parity on a write session: a specific
-/// scheme, or `None` (write a no-parity tape per §11.5).
+/// scheme, or `None` (write a no-parity tape per REM-PARITY §8.1 and §8.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParityConfig {
     /// Use this scheme. The bootstrap will record it.
