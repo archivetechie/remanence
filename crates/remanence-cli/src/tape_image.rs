@@ -716,4 +716,435 @@ mod tests {
             assert_eq!(decoded.payload.directory.entries[0].flags, expected_flags);
         }
     }
+
+    /// Reload production-written bytes into the chaos model with physical READ faults.
+    fn damaged_image_drive(
+        image: &ExportedTapeImage,
+        faults: Vec<u64>,
+    ) -> (DriveHandle, remanence_chaos::FaultEngine) {
+        use remanence_chaos::model::Record;
+        use remanence_chaos::{ChaosTransport, DeviceCtx, FaultEngine};
+        let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK);
+        for file in &image.files {
+            assert_eq!(tape.records.len(), file.start_record);
+            for block in file.bytes.chunks_exact(BLOCK as usize) {
+                tape.records.push(Record::Block(block.to_vec()));
+            }
+            assert_eq!(file.filemark_record, Some(tape.records.len()));
+            tape.records.push(Record::Filemark);
+        }
+        assert_eq!(tape.records.len(), image.eod_record);
+        let mut world = VirtualWorld::single_drive("IMAGE-LIB", 0x100, "IMAGE-DRV", 0x400, 1);
+        world.put_tape_in_drive(0x100, "IMAGE001", None, tape);
+        let transport = ModelTransport::new(
+            Arc::new(Mutex::new(world)),
+            DeviceRole::Drive { bay: 0x100 },
+        );
+        let engine = FaultEngine::for_read_medium_errors(faults).unwrap();
+        let transport = ChaosTransport::new(
+            transport,
+            engine.clone(),
+            DeviceCtx::new().with_backend("model"),
+        );
+        let drive = DriveHandle::open_standalone_with_transport(
+            Path::new("/dev/sg-image-model"),
+            Box::new(transport),
+        )
+        .expect("open damaged image");
+        (drive, engine)
+    }
+
+    /// Exercise Q4 on actual writer bytes, with a failed data read and lost
+    /// sidecar primary/footer. Directory mutations retain valid ParityMap CRCs.
+    fn directory_rescue_case(walk: bool, damage: &str) {
+        use remanence_parity::{
+            encode_parity_map_tape_file, read_terminal_index_inventory,
+            recover_ordinal_from_sidecar, recover_terminal_inventory_from_bot,
+            scan_reconstruct_filemark_map_with_report, validate_scan_reconstruction_with_report,
+            DriveHandleRawSource, PhysicalPositionHint, RawTapeSource, ScopedFilemarkMap,
+            SidecarMetadataHealth, TapeFileMapEntry, TapeIndexReplicaFileKind,
+            TerminalInventoryOutcome,
+        };
+        let (written, mut image) = write_model(fixed_inputs(true, true, true));
+        let uuid = written.inputs.tape_uuid;
+        let sidecar_file = 2usize;
+        let map_file = 3usize;
+        let sidecar_start = image.files[sidecar_file].start_record as u64;
+        let sidecar_count = image.files[sidecar_file].record_offsets.len() as u64;
+        let map_start = image.files[map_file].start_record as u64;
+        let map_blocks: Vec<_> = image.files[map_file]
+            .bytes
+            .chunks_exact(BLOCK as usize)
+            .map(|block| block.to_vec())
+            .collect();
+        let decoded_map = parse_parity_map_tape_file(&map_blocks, &uuid).unwrap();
+        let map_tail_start = map_start + decoded_map.header.tail_copy_start_block;
+        let mut payload = decoded_map.payload.clone();
+        let tail_start = sidecar_start
+            + payload.directory.entries[0].sidecar_header_block_count
+            + payload.directory.entries[0].parity_shard_block_count;
+        let mut faults = vec![sidecar_start, sidecar_start + sidecar_count - 1];
+        let data_start = image.files[1].start_record as u64;
+        faults.push(data_start);
+        match damage {
+            "none" => {}
+            "map-primary" => faults.push(map_start),
+            "map-both" => faults.extend([map_start, map_tail_start]),
+            "range" => {
+                payload.directory.entries[0].protected_ordinal_end_exclusive -= 1;
+                payload.directory.directory_scope_highest_protected_ordinal -= 1;
+            }
+            "count" => payload.directory.entries[0].sidecar_total_block_count += 1,
+            "hash" => payload.directory.entries[0].canonical_metadata_hash[0] ^= 1,
+            _ => panic!("unknown damage case"),
+        }
+        if matches!(damage, "range" | "count" | "hash") {
+            let encoded = encode_parity_map_tape_file(&payload, BLOCK).unwrap();
+            assert_eq!(encoded.blocks.len(), map_blocks.len());
+            image.files[map_file].bytes = encoded.blocks.concat();
+            // Prove that map disagreements reject the locator before a tail read.
+            if damage != "hash" {
+                faults.push(tail_start);
+            }
+        }
+        if walk {
+            for entry in written
+                .map
+                .entries()
+                .iter()
+                .filter(|entry| entry.kind == TapeFileKind::TapeIndexReplica)
+            {
+                let file = &image.files[entry.tape_file_number as usize];
+                faults.extend(
+                    (file.start_record as u64)..(file.start_record as u64 + entry.block_count),
+                );
+            }
+        }
+        let (mut drive, engine) = damaged_image_drive(&image, faults);
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        raw.configure_fixed_block_size(BLOCK).unwrap();
+        raw.locate_physical(PhysicalPositionHint::new(data_start))
+            .unwrap();
+        assert!(
+            raw.read_record(&mut vec![0; BLOCK as usize]).is_err(),
+            "recovery subject must fail to read"
+        );
+        let mut rows = Vec::new();
+        let outcome = read_terminal_index_inventory(
+            &mut raw,
+            &uuid,
+            BLOCK,
+            |row| {
+                rows.push(row.clone());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        let scoped = if walk {
+            assert!(matches!(
+                outcome,
+                TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)
+            ));
+            assert!(rows.is_empty());
+            let walked = scan_reconstruct_filemark_map_with_report(&mut raw, &uuid, BLOCK).unwrap();
+            assert!(
+                walked.map.tape_file_count() > payload.directory.directory_scope_tape_file_count
+            );
+            let expected_kind = if damage == "count" {
+                TapeFileKind::Object
+            } else {
+                TapeFileKind::ParitySidecar
+            };
+            assert_eq!(walked.map.entries()[sidecar_file].kind, expected_kind);
+            let mut objects = Vec::new();
+            recover_terminal_inventory_from_bot(&mut raw, &uuid, BLOCK, |object| {
+                objects.push(object.tape_file_number);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(
+                objects.contains(&(sidecar_file as u64)),
+                expected_kind == TapeFileKind::Object
+            );
+            if expected_kind == TapeFileKind::Object {
+                assert!(matches!(
+                    ScopedFilemarkMap::validate_against_final_parity_map(walked.map, &decoded_map),
+                    Err(ParityError::FilemarkMapDigestMismatch { .. })
+                ));
+                return;
+            }
+            let bootstrap = walked.authoritative_bootstrap().unwrap().payload.clone();
+            let current_blocks: Vec<_> = image.files[map_file]
+                .bytes
+                .chunks_exact(BLOCK as usize)
+                .map(|block| block.to_vec())
+                .collect();
+            let current_map = parse_parity_map_tape_file(&current_blocks, &uuid).unwrap();
+            let expected = ScopedFilemarkMap::validate_against_final_parity_map(
+                walked.map.clone(),
+                &current_map,
+            )
+            .unwrap();
+            let acquired = validate_scan_reconstruction_with_report(&mut raw, &bootstrap, walked)
+                .unwrap()
+                .scoped_map;
+            assert_eq!(acquired, expected);
+            assert_eq!(
+                acquired.validated_prefix_tape_files,
+                Some(payload.directory.directory_scope_tape_file_count)
+            );
+            assert_eq!(
+                acquired.sidecar_directory.as_ref(),
+                Some(&payload.directory)
+            );
+            acquired
+        } else {
+            assert!(matches!(outcome, TerminalInventoryOutcome::Inventory(_)));
+            let map = FilemarkMap::new(
+                rows.iter()
+                    .map(|row| TapeFileMapEntry {
+                        tape_file_number: row.tape_file_number,
+                        kind: match row.kind {
+                            TapeIndexReplicaFileKind::Bootstrap => TapeFileKind::Bootstrap,
+                            TapeIndexReplicaFileKind::Object => TapeFileKind::Object,
+                            TapeIndexReplicaFileKind::ParitySidecar => TapeFileKind::ParitySidecar,
+                            TapeIndexReplicaFileKind::ParityMap => TapeFileKind::ParityMap,
+                            TapeIndexReplicaFileKind::TapeIndexReplica => {
+                                TapeFileKind::TapeIndexReplica
+                            }
+                            TapeIndexReplicaFileKind::IndexSeparationExtent => {
+                                TapeFileKind::IndexSeparationExtent
+                            }
+                        },
+                        block_count: row.block_count,
+                        first_parity_data_ordinal: row.first_parity_data_ordinal,
+                        protected_ordinal_start: row.protected_ordinal_start,
+                        protected_ordinal_end_exclusive: row.protected_ordinal_end_exclusive,
+                        epoch_id: row.epoch_id,
+                    })
+                    .collect(),
+            )
+            .unwrap();
+            let scoped = ScopedFilemarkMap::from_catalog(map, 4);
+            assert!(
+                scoped.sidecar_directory.is_none(),
+                "exercise lazy loading, not an injected directory"
+            );
+            scoped
+        };
+        let result =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &written.inputs.scheme, uuid, BLOCK, 0);
+        if matches!(damage, "map-both" | "range" | "count" | "hash") {
+            assert!(
+                matches!(
+                    result,
+                    Err(ParityError::SidecarMetadataUnavailable { epoch_id: 0 })
+                ),
+                "{result:?}"
+            );
+            if matches!(damage, "range" | "count") {
+                assert!(
+                    !engine.observed_medium_error_lbas().contains(&tail_start),
+                    "disagreeing directory must not place a tail read"
+                );
+            }
+        } else {
+            let recovered = result.expect("directory must rescue the sidecar tail");
+            assert_eq!(
+                recovered.recovered_block,
+                image.files[1].bytes[..BLOCK as usize]
+            );
+            assert_eq!(
+                recovered.sidecar_metadata_health,
+                SidecarMetadataHealth::PrimaryHeaderLost
+            );
+            let observed = engine.observed_medium_error_lbas();
+            assert!(observed.contains(&data_start));
+            assert!(observed.contains(&sidecar_start));
+            assert!(observed.contains(&(sidecar_start + sidecar_count - 1)));
+        }
+    }
+
+    #[test]
+    fn directory_rescue_lazily_loads_from_replica_rows() {
+        directory_rescue_case(false, "none");
+        directory_rescue_case(false, "map-primary");
+    }
+
+    #[test]
+    fn directory_rescue_reconciles_bot_walk_without_any_replica() {
+        directory_rescue_case(true, "none");
+    }
+
+    #[test]
+    fn directory_rescue_rejects_map_disagreement_before_tail_read() {
+        directory_rescue_case(false, "range");
+        directory_rescue_case(false, "count");
+        directory_rescue_case(true, "count");
+    }
+
+    #[test]
+    fn directory_rescue_requires_a_valid_parity_map_copy() {
+        directory_rescue_case(false, "map-both");
+    }
+
+    #[test]
+    fn directory_rescue_requires_the_directory_metadata_hash() {
+        directory_rescue_case(false, "hash");
+        directory_rescue_case(true, "hash");
+    }
+
+    /// A wholly unreadable epoch's metadata cannot deny another epoch the walked
+    /// map or recovery. Build the two-epoch shape through the production writer.
+    #[test]
+    fn directory_walk_isolates_wholly_unreadable_epoch_metadata() {
+        use remanence_parity::{
+            read_terminal_index_inventory, recover_ordinal_from_sidecar,
+            scan_reconstruct_filemark_map_with_report, validate_scan_reconstruction_with_report,
+            DriveHandleRawSource, PhysicalPositionHint, RawTapeSource, TerminalInventoryOutcome,
+        };
+        let mut inputs = fixed_inputs(true, true, true);
+        let bytes = vec![0x35; 5 * BLOCK as usize];
+        inputs.objects[0].files = vec![TapeImageFile::from_bytes(
+            RemTarFileSpec::new(
+                "payload.bin",
+                "00000000-0000-4000-8000-000000000003",
+                bytes.len() as u64,
+                Sha256::digest(&bytes).into(),
+            ),
+            bytes,
+        )];
+        let (written, image) = write_model(inputs);
+        assert_eq!(written.object_rows.len(), 1);
+        assert_eq!(written.object_rows[0].stored_block_count, 8);
+        assert_eq!(written.sidecars.len(), 2);
+        let uuid = written.inputs.tape_uuid;
+        let map_file = written
+            .map
+            .entries()
+            .iter()
+            .find(|entry| entry.kind == TapeFileKind::ParityMap)
+            .unwrap();
+        let blocks: Vec<_> = image.files[map_file.tape_file_number as usize]
+            .bytes
+            .chunks_exact(BLOCK as usize)
+            .map(|block| block.to_vec())
+            .collect();
+        let decoded = parse_parity_map_tape_file(&blocks, &uuid).unwrap();
+        let directory = &decoded.payload.directory;
+        assert_eq!(directory.entries.len(), 2);
+        let epoch = &directory.entries[0];
+        assert_eq!(epoch.epoch_id, 0);
+        assert_eq!(epoch.protected_ordinal_start, 0);
+        assert_eq!(epoch.protected_ordinal_end_exclusive, 4);
+        assert_eq!(directory.entries[1].protected_ordinal_start, 4);
+        assert_eq!(directory.entries[1].protected_ordinal_end_exclusive, 8);
+        let sidecar_start = image.files[epoch.tape_file_number as usize].start_record as u64;
+        let tail_start =
+            sidecar_start + epoch.sidecar_total_block_count - 1 - epoch.sidecar_header_block_count;
+        let footer = sidecar_start + epoch.sidecar_total_block_count - 1;
+        let mut faults = Vec::new();
+        faults.extend(sidecar_start..sidecar_start + epoch.sidecar_header_block_count);
+        faults.extend(tail_start..=footer);
+        for entry in written
+            .map
+            .entries()
+            .iter()
+            .filter(|entry| entry.kind == TapeFileKind::TapeIndexReplica)
+        {
+            let start = image.files[entry.tape_file_number as usize].start_record as u64;
+            faults.extend(start..start + entry.block_count);
+        }
+        let data_start = image.files[1].start_record as u64;
+        faults.extend([data_start, data_start + 4]);
+        let (mut drive, engine) = damaged_image_drive(&image, faults);
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        raw.configure_fixed_block_size(BLOCK).unwrap();
+        for lba in [data_start, data_start + 4] {
+            raw.locate_physical(PhysicalPositionHint::new(lba)).unwrap();
+            assert!(
+                raw.read_record(&mut vec![0; BLOCK as usize]).is_err(),
+                "each epoch's recovery subject must fail to read"
+            );
+        }
+        let outcome = read_terminal_index_inventory(
+            &mut raw,
+            &uuid,
+            BLOCK,
+            |_| panic!("unreadable replicas cannot supply inventory rows"),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)
+        ));
+        let walked = scan_reconstruct_filemark_map_with_report(&mut raw, &uuid, BLOCK).unwrap();
+        let scope = directory.directory_scope_tape_file_count as usize;
+        assert_eq!(
+            &walked.map.entries()[..scope],
+            &written.map.entries()[..scope]
+        );
+        let bootstrap = walked.authoritative_bootstrap().unwrap().payload.clone();
+        let scoped = validate_scan_reconstruction_with_report(&mut raw, &bootstrap, walked)
+            .unwrap()
+            .scoped_map;
+        assert_eq!(
+            scoped.validated_prefix_tape_files,
+            Some(directory.directory_scope_tape_file_count)
+        );
+        assert_eq!(scoped.scope.watermark(), 8);
+        assert_eq!(scoped.sidecar_directory.as_ref(), Some(directory));
+        assert!(
+            !engine.observed_medium_error_lbas().contains(&tail_start),
+            "walk identification and digest validation must not read the sidecar tail"
+        );
+        assert!(matches!(
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &written.inputs.scheme, uuid, BLOCK, 0),
+            Err(ParityError::SidecarMetadataUnavailable { epoch_id: 0 })
+        ));
+        let observed = engine.observed_medium_error_lbas();
+        for lba in [sidecar_start, tail_start, footer] {
+            assert!(
+                observed.contains(&lba),
+                "epoch 0 metadata fault must be exercised"
+            );
+        }
+        let recovered =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &written.inputs.scheme, uuid, BLOCK, 4)
+                .expect("epoch 1 must recover despite epoch 0 metadata damage");
+        assert_eq!(
+            recovered.recovered_block,
+            image.files[1].bytes[4 * BLOCK as usize..5 * BLOCK as usize]
+        );
+    }
+
+    /// Reclassification removes sidecar blocks from the Object ordinal stream
+    /// while preserving every other measured classification, including sidecars.
+    #[test]
+    fn directory_rescue_walk_recomputes_later_object_ordinals() {
+        use remanence_parity::{scan_reconstruct_filemark_map_with_report, DriveHandleRawSource};
+        let mut inputs = fixed_inputs(true, true, true);
+        let mut second = inputs.objects[0].clone();
+        second.options.object_id = "00000000-0000-4000-8000-000000000004".to_string();
+        inputs.objects.push(second);
+        let (written, image) = write_model(inputs);
+        assert_eq!(written.sidecars.len(), 2);
+        let sidecar = &image.files[2];
+        let faults = vec![
+            sidecar.start_record as u64,
+            (sidecar.start_record + sidecar.record_offsets.len() - 1) as u64,
+        ];
+        let (mut drive, _) = damaged_image_drive(&image, faults);
+        let walked = scan_reconstruct_filemark_map_with_report(
+            &mut DriveHandleRawSource::new(&mut drive),
+            &written.inputs.tape_uuid,
+            BLOCK,
+        )
+        .unwrap();
+        assert_eq!(walked.map, written.map);
+        assert_eq!(walked.map.entries()[3].first_parity_data_ordinal, Some(4));
+        assert_eq!(walked.map.entries()[4].kind, TapeFileKind::ParitySidecar);
+    }
 }

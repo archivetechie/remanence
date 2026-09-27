@@ -839,6 +839,69 @@ pub fn parse_parity_map_tape_file_with_unreadable_blocks(
     select_parity_map_copy(primary, tail)
 }
 
+/// Load the final ParityMap directory through a measured or replica-supplied map.
+/// Medium damage is retained as an absent block so the common parser can use
+/// either metadata copy. Invalid or absent ParityMaps supply no directory.
+pub(crate) fn read_final_sidecar_directory(
+    source: &mut dyn crate::raw::RawTapeSource,
+    map: &crate::filemark_map::FilemarkMap,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<Option<SidecarEpochDirectory>, ParityError> {
+    Ok(read_final_parity_map(source, map, tape_uuid, block_size)?
+        .map(|decoded| decoded.payload.directory))
+}
+
+/// Load validated final ParityMap metadata, retaining its canonical map digest
+/// so a reconciled BOT walk can establish a bounded recovery scope.
+pub(crate) fn read_final_parity_map(
+    source: &mut dyn crate::raw::RawTapeSource,
+    map: &crate::filemark_map::FilemarkMap,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<Option<DecodedParityMapTapeFile>, ParityError> {
+    use crate::filemark_map::{TapeFileKind, TapeFilePosition};
+    use crate::raw::{tape_error_is_current_medium_damage, RawReadOutcome};
+
+    let Some(entry) = map
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == TapeFileKind::ParityMap)
+    else {
+        return Ok(None);
+    };
+    let mut blocks = Vec::new();
+    for block_within_file in 0..entry.block_count {
+        source.locate_physical(map.physical_position(TapeFilePosition {
+            tape_file_number: entry.tape_file_number,
+            block_within_file,
+        })?)?;
+        let mut block = vec![0; block_size as usize];
+        let block = match source.read_record(&mut block) {
+            Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block.len() => Some(block),
+            Ok(_) => None,
+            Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => None,
+            Err(error) => return Err(error),
+        };
+        blocks.push(block);
+    }
+    let Ok(decoded) = parse_parity_map_tape_file_with_unreadable_blocks(&blocks, tape_uuid) else {
+        return Ok(None);
+    };
+    let directory = &decoded.payload.directory;
+    // A valid ParityMap marked not final supplies no directory for rescue.
+    if !directory.is_final_directory {
+        return Ok(None);
+    }
+    if directory.directory_scope_tape_file_count > map.tape_file_count() {
+        return Err(ParityError::FilemarkMapDigestMismatch {
+            truncation_position: None,
+        });
+    }
+    Ok(Some(decoded))
+}
+
 fn select_parity_map_copy(
     primary: Result<DecodedParityMapTapeFile, ParityError>,
     tail: Result<DecodedParityMapTapeFile, ParityError>,

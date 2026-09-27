@@ -14,13 +14,16 @@ use crate::codec::ReedSolomonCodec;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
 use crate::filemark_map::{
-    MapScope, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    FilemarkMap, MapScope, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
 };
 #[cfg(test)]
 use crate::mapping::{data_shards_per_epoch, ordinal_to_stripe};
 use crate::mapping::{ordinal_to_stripe_in_epoch, stripe_data_to_ordinal_in_epoch};
 use crate::model::{ParityScheme, SidecarMetadataHealth, StripeAddress, StripePosition};
-use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::parity_map::{read_final_sidecar_directory, SidecarEpochDirectoryEntry};
+use crate::raw::{
+    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+};
 use crate::sidecar::{
     data_shard_crc64, parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
     parse_sidecar_header_block, parse_sidecar_index_blocks, DecodedSidecarIndex,
@@ -979,8 +982,13 @@ fn read_and_parse_sidecar_index(
             tape_uuid,
             block_size,
         )
-        .map_err(|_| ParityError::SidecarMetadataUnavailable {
-            epoch_id: footer.epoch_id,
+        .map_err(|error| match error {
+            ParityError::SidecarParse(_) | ParityError::SidecarMetadataUnavailable { .. } => {
+                ParityError::SidecarMetadataUnavailable {
+                    epoch_id: footer.epoch_id,
+                }
+            }
+            error => error,
         }),
     }
 }
@@ -1019,13 +1027,16 @@ fn read_sidecar_index_without_footer(
         Ok(read) => Ok(read),
         // The rescue is only available when a directory is present and agrees;
         // when it is not, the primary attempt's error is the honest answer.
-        Err(_) => Err(primary_err),
+        Err(ParityError::SidecarParse(_) | ParityError::SidecarMetadataUnavailable { .. }) => {
+            Err(primary_err)
+        }
+        Err(error) => Err(error),
     }
 }
 
 /// REM-PARITY 13.3 step 3. The directory records, per sidecar, the total block
 /// count, the header/index copy block count `H` and the canonical metadata hash
-/// shared by both copies. The tail copy begins at block `H`, so the directory
+/// shared by both copies. The tail copy begins at block `H + P`, so the directory
 /// both locates it and supplies the hash that validates it — which is what makes
 /// the rescue possible with the primary header and the footer both gone.
 fn rescue_tail_sidecar_index_with_directory(
@@ -1035,23 +1046,64 @@ fn rescue_tail_sidecar_index_with_directory(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<SidecarIndexRead, ParityError> {
-    let directory = scoped_map
-        .sidecar_directory
-        .as_ref()
-        .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
+    let loaded_directory;
+    let directory = match scoped_map.sidecar_directory.as_ref() {
+        Some(directory) => directory,
+        None => {
+            loaded_directory =
+                read_final_sidecar_directory(source, &scoped_map.map, tape_uuid, block_size)?;
+            loaded_directory
+                .as_ref()
+                .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?
+        }
+    };
+    if sidecar_entry.tape_file_number >= directory.directory_scope_tape_file_count {
+        return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
+    }
     let entry = directory
         .entries
         .iter()
         .find(|entry| entry.tape_file_number == sidecar_entry.tape_file_number)
         .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
+    let index = read_directory_tail_index(
+        source,
+        &scoped_map.map,
+        sidecar_entry,
+        entry,
+        tape_uuid,
+        block_size,
+    )?;
+    Ok(SidecarIndexRead {
+        index,
+        metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
+    })
+}
 
-    // The directory is an independent witness, so it must agree with the map
-    // before it is trusted to place a read.
-    if entry.sidecar_total_block_count != sidecar_entry.block_count {
-        return Err(ParityError::SidecarParse(format!(
-            "sidecar directory total {} does not match map block_count {}",
-            entry.sidecar_total_block_count, sidecar_entry.block_count
-        )));
+/// Check the directory's structural claims before using its counts to place I/O.
+pub(crate) fn directory_entry_matches_sidecar(
+    entry: &SidecarEpochDirectoryEntry,
+    sidecar: &TapeFileMapEntry,
+) -> bool {
+    sidecar.kind == TapeFileKind::ParitySidecar
+        && entry.tape_file_number == sidecar.tape_file_number
+        && Some(entry.epoch_id) == sidecar.epoch_id
+        && Some(entry.protected_ordinal_start) == sidecar.protected_ordinal_start
+        && Some(entry.protected_ordinal_end_exclusive) == sidecar.protected_ordinal_end_exclusive
+        && entry.sidecar_total_block_count == sidecar.block_count
+}
+
+/// Read and verify the directory-located tail before using its metadata for rescue.
+/// Replica and walk recovery share geometry, copy-kind and canonical-hash checks.
+pub(crate) fn read_directory_tail_index(
+    source: &mut dyn RawTapeSource,
+    map: &FilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    entry: &SidecarEpochDirectoryEntry,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<DecodedSidecarIndex, ParityError> {
+    if !directory_entry_matches_sidecar(entry, sidecar_entry) {
+        return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
     }
     let h = entry.sidecar_header_block_count;
     let parity = entry.parity_shard_block_count;
@@ -1063,15 +1115,17 @@ fn rescue_tail_sidecar_index_with_directory(
     // Section 9.1 layout: primary 0..H-1, parity shards H..H+P-1, tail copy
     // H+P..2H+P-1, footer at 2H+P. The directory carries both H and P, which is
     // what lets the tail be located with the primary header and footer gone.
-    let tail_start = h
-        .checked_add(parity)
-        .ok_or(ParityError::Invariant("sidecar tail copy start overflows"))?;
-    let tail_end = tail_start
-        .checked_add(h)
-        .ok_or(ParityError::Invariant("sidecar tail copy range overflows"))?;
+    // Directory counts come from tape bytes, so an overflow is a malformed
+    // entry (the epoch stays metadata-unavailable), not an internal invariant failure.
+    let tail_start = h.checked_add(parity).ok_or_else(|| {
+        ParityError::SidecarParse("sidecar directory tail copy start overflows".into())
+    })?;
+    let tail_end = tail_start.checked_add(h).ok_or_else(|| {
+        ParityError::SidecarParse("sidecar directory tail copy range overflows".into())
+    })?;
     let expected_total = tail_end
         .checked_add(1)
-        .ok_or(ParityError::Invariant("sidecar total overflows"))?;
+        .ok_or_else(|| ParityError::SidecarParse("sidecar directory total overflows".into()))?;
     if expected_total != sidecar_entry.block_count {
         return Err(ParityError::SidecarParse(format!(
             "sidecar directory geometry 2H+P+1 = {expected_total} does not match \
@@ -1080,15 +1134,22 @@ fn rescue_tail_sidecar_index_with_directory(
         )));
     }
 
-    let mut blocks = Vec::with_capacity(entry.sidecar_header_block_count as usize);
+    let mut blocks = Vec::new();
     for offset in 0..h {
-        blocks.push(read_sidecar_block(
-            source,
-            scoped_map,
-            sidecar_entry,
-            tail_start + offset,
-            block_size,
-        )?);
+        let physical = map.physical_position(TapeFilePosition {
+            tape_file_number: sidecar_entry.tape_file_number,
+            block_within_file: tail_start + offset,
+        })?;
+        source.locate_physical(physical)?;
+        let mut block = vec![0; block_size as usize];
+        match source.read_record(&mut block) {
+            Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block.len() => blocks.push(block),
+            Ok(_) => return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry)),
+            Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => {
+                return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
+            }
+            Err(error) => return Err(error),
+        }
     }
     let decoded = parse_sidecar_index_blocks(&blocks, tape_uuid)?;
     if decoded.header.copy_kind != SidecarCopyKind::Tail {
@@ -1101,16 +1162,16 @@ fn rescue_tail_sidecar_index_with_directory(
             "sidecar tail copy metadata hash does not match the directory".into(),
         ));
     }
-    if decoded.header.sidecar_total_block_count != sidecar_entry.block_count {
-        return Err(ParityError::SidecarParse(format!(
-            "sidecar tail copy total {} does not match map block_count {}",
-            decoded.header.sidecar_total_block_count, sidecar_entry.block_count
-        )));
+    if decoded.header.sidecar_total_block_count != entry.sidecar_total_block_count
+        || decoded.header.shard_index_block_count != h
+        || decoded.header.parity_block_count != parity
+        || decoded.header.epoch_id != entry.epoch_id
+        || decoded.header.protected_ordinal_start != entry.protected_ordinal_start
+        || decoded.header.protected_ordinal_end_exclusive != entry.protected_ordinal_end_exclusive
+    {
+        return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
     }
-    Ok(SidecarIndexRead {
-        index: decoded,
-        metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
-    })
+    Ok(decoded)
 }
 
 fn read_primary_sidecar_index_without_footer(
