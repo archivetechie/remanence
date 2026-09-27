@@ -6,6 +6,13 @@ per-release summaries.
 
 ## Unreleased
 
+- The second implementation of REM-PARITY generation 2 gains a `resume`
+  command. It decided the eight portable resume cases under opaque ids, before
+  reading the resume expectations or the reference's resumed tapes. All eight
+  agree with the pinned expectations. Both accepted resumes reproduce the
+  reference's resumed tapes byte for byte, and each equals one uninterrupted
+  session. It found seven more places where §14 is silent, including where a
+  Resumer learns the parity scheme. CI now re-runs the resume decisions.
 - Resume refusals now follow REM-PARITY §14 and §3.4. The resume path reports
   `ResumeAppend` for a prefix that breaks §14's rules, and for commit records
   that are missing, conflict, or are incomplete or ambiguous. It keeps the

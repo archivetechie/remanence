@@ -112,6 +112,11 @@ jobs:
             --out "$RUNNER_TEMP/second-decisions.json"
           cmp "$RUNNER_TEMP/second-decisions.json" \
             fixtures/rem-parity-terminal-index-draft/second-implementation/decisions-real-ids.json
+          python3 tools/rem_parity_second_implementation.py resume \
+            fixtures/rem-parity-terminal-index-draft/tape-images/resume/*/inputs.json \
+            --out "$RUNNER_TEMP/second-resume-decisions.json"
+          cmp "$RUNNER_TEMP/second-resume-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/resume-decisions-real-ids.json
           python3 -m unittest tools/test_rem_parity_second_implementation.py
 
       - name: Run tests
