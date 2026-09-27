@@ -1178,6 +1178,8 @@ Core §13 owns plaintext vectors. This section owns encrypted positive objects,
 component KATs, encrypted range vectors, and envelope negative vectors.
 Core §14 owns the general conformance roles. An implementation that claims a
 REM-ENCRYPT role MUST pass the applicable vectors here.
+The cases of the candidate supplement Core §13 describes are not among the
+applicable vectors until the revision that adds them is frozen.
 
 A negative vector records the error it expects in its `expected_error` field,
 as a Section 11.2 identifier. A result is matched to that field by identifier
@@ -1280,9 +1282,16 @@ the applicable `AeadAuthenticationFailed`, `HpkeFailed`,
 vector.
 
 **Metadata.** Each metadata-profile repertoire violation (float, tag,
-indefinite length, duplicate key, non-shortest encoding); missing key 1;
-`metadata_version = 2`; `plaintext_size` zero, not a multiple of
-`chunk_size`, or large enough to overflow geometry.
+indefinite length, duplicate key, non-shortest encoding, `undefined`); a
+top-level item that is an array rather than a map; a top-level key that is
+text rather than an unsigned integer; a missing required key (0, 1, 2 or 3);
+`metadata_version = 2`; `metadata_version` of text type; `plaintext_size` of
+text type, zero, not a multiple of `chunk_size`, or large enough to overflow
+geometry; `plaintext_digest_alg` a text value other than `sha256` or of bytes
+type; `plaintext_digest` of 31 bytes or of text type; and trailing bytes
+after the top-level item. The candidate supplement that Core §13 describes
+adds a negative integer inside the value of an unknown key, with a valid
+control that differs only in that value.
 
 **Framing.** EOF inside the metadata frame; EOF mid-chunk; payload absent
 after metadata (`MissingFinalChunk`); footer bytes wrong at the correct
@@ -1297,8 +1306,10 @@ header, and inner `REMANENCE.encryption` other than `none`; each produces
 
 **Sealer inputs.** Sealing input whose size is not a multiple of
 `chunk_size`; an `object_id` longer than 64 bytes; recipient counts zero or
-greater than eight; duplicate epoch ids; non-canonical slot order; and entropy
-failure.
+greater than eight; duplicate epoch ids; and non-canonical slot order.
+The duplicate epoch-id case is in the candidate supplement that Core §13
+describes. Entropy failure has no portable input, so no vector covers it.
+Its handling is left to each implementation's own tests.
 
 In the case `writer-one-slot`, a Sealer is given one recipient with no
 explicit opt-in. The expected error is `InvalidInput`. The case tests the
@@ -1309,7 +1320,8 @@ Sealer-input vector keeps its normative force.
 
 **Key-frame structure and key use.** Slot counts 0 and 9, duplicate or
 misordered slot indices, duplicate `recipient_epoch_id` values, internal slot
-truncation, trailing frame bytes, malformed `REMK` magic, malformed
+truncation, EOF inside the declared key frame, trailing frame bytes,
+malformed `REMK` magic, malformed
 encapsulation, and a wrong recipient private key. A positive case opens a
 structurally valid one-slot object. A Sealer MAY emit one through eight slots.
 Readers accept one through eight.
@@ -1614,6 +1626,26 @@ effect on conformance.
     role. The bounds of Section 12.9 and the tag rule of Section 12.4 bind
     every implementation that parses an envelope or checks a tag, and name the
     roles that do as examples.
+
+  The vector step then changed the text as follows.
+
+  - Section 13.4 now describes the archive's metadata-structure,
+    required-field and key-frame EOF cases that it omitted. Core §13.6 now
+    describes its omitted hardlink-target and non-map extension cases.
+    Describing these existing cases adds no requirement.
+  - Section 13.4's Sealer-input list no longer lists entropy failure among
+    the vectors that keep their normative force, because no portable vector
+    for it can exist; the archive never held one, and the rule on entropy
+    failure itself is unchanged. The list now places the duplicate-epoch case
+    in the candidate supplement, and Section 13.4 points to the supplement's
+    metadata cases.
+  - Section 13 now excludes the cases of the review-only candidate
+    supplement Core §13 describes from the applicable vectors until the
+    revision that adds them is frozen. Core §14 also excludes them from
+    conformance evidence until that freeze. The pinned conformance target is
+    unchanged.
+
+  No byte of the format changed, and no valid object or vector changed.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** This revision makes
   three changes.
 

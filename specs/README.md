@@ -101,6 +101,14 @@ evidence for the review of that revision. They become conformance vectors only
 when the revision is frozen and publishes its own archive, and until then they
 are kept apart from the published artifacts.
 
+A revision that changes no bytes can still need additive cases, because
+writing tests shows cases the archive lacks. REM-ENCRYPT 1.0.0-draft.4 has
+such cases, prepared the same way, as review-only candidates under
+`fixtures/rem-object-supplement-draft/`; REM-OBJECT §13 describes the
+supplement, because the two documents share one archive. The rule below on keeping
+candidate vectors apart from publication artifacts applies to both candidate
+sets.
+
 The terminal bytes of REM-PARITY 1.0.0-draft.5 are review-only candidate vectors
 under `fixtures/rem-parity-terminal-index-draft/`. Candidate vectors MUST NOT be
 copied into or substituted for publication artifacts before independent review
