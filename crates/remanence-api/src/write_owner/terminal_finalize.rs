@@ -27,7 +27,7 @@ use super::checkpoint::{
 };
 use super::read_session::session_open_reject_tape_io_fences;
 use super::readiness::session_open_short_probe_or_load;
-use super::restore::{now_rfc3339, status_from_parity_error, status_from_pool_write_error};
+use super::restore::{status_from_parity_error, status_from_pool_write_error};
 use super::terminal_types::{
     parity_progress_from_state, persist_terminal_recovery_required,
     reconcile_and_authorize_parity_resume, reconcile_terminal_component_host_authority,
@@ -352,8 +352,13 @@ pub(super) fn plan_terminal_prefix_without_motion(
     let snapshot = journal
         .committed_snapshot_bounded()
         .map_err(|error| Status::failed_precondition(format!("replay parity journal: {error}")))?;
-    let prefix = remanence_parity::plan_checkpointed_terminal_index_close(&snapshot)
-        .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+    let prefix = remanence_parity::plan_checkpointed_terminal_index_close(
+        &snapshot,
+        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
+            .capture()
+            .map_err(|error| status_from_parity_error(&error, error.to_string()))?,
+    )
+    .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
     let expected_start_file = previous.next_tape_file_number;
     if prefix.start_tape_file_number != expected_start_file || prefix.start_lba != previous.eod_lba
     {
@@ -444,9 +449,14 @@ pub(super) fn build_new_terminal_plan(
         .checked_add(1)
         .ok_or_else(|| Status::failed_precondition("terminal edition sequence overflows u64"))?;
     let edition_id = Uuid::new_v4();
-    let writer_version = format!("remanence-api/{}", env!("CARGO_PKG_VERSION"));
-    let write_timestamp = now_rfc3339()
-        .map_err(|error| Status::internal(format!("format terminal timestamp: {error}")))?;
+    let diagnostics = match terminal_prefix {
+        Some(prefix) => prefix.diagnostics.clone(),
+        None => remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
+            .capture()
+            .map_err(|error| status_from_parity_error(&error, error.to_string()))?,
+    };
+    let writer_version = diagnostics.writer_version;
+    let write_timestamp = diagnostics.write_timestamp;
     let edition = remanence_parity::plan_tape_index_edition(
         remanence_parity::TapeIndexEditionDescriptor {
             tape_uuid: spec.tape_uuid,
@@ -1409,9 +1419,11 @@ pub(super) fn finalize_terminal_with_parity_journal(
                     .map_err(|error| {
                         Status::failed_precondition(format!("freeze terminal-prefix base: {error}"))
                     })?;
-                let reconstructed =
-                    remanence_parity::plan_checkpointed_terminal_index_close(&snapshot)
-                        .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+                let reconstructed = remanence_parity::plan_checkpointed_terminal_index_close(
+                    &snapshot,
+                    prefix.diagnostics.clone(),
+                )
+                .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
                 if reconstructed != prefix {
                     return Err(Status::failed_precondition(
                         "bounded terminal close seed conflicts with persisted prefix plan",
@@ -1442,8 +1454,13 @@ pub(super) fn finalize_terminal_with_parity_journal(
             let snapshot = journal.committed_snapshot_bounded().map_err(|error| {
                 Status::failed_precondition(format!("freeze parity journal: {error}"))
             })?;
-            let prefix = remanence_parity::plan_checkpointed_terminal_index_close(&snapshot)
-                .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
+            let prefix = remanence_parity::plan_checkpointed_terminal_index_close(
+                &snapshot,
+                remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION"))
+                    .capture()
+                    .map_err(|error| status_from_parity_error(&error, error.to_string()))?,
+            )
+            .map_err(|error| status_from_parity_error(&error, error.to_string()))?;
             let expected_start_file = previous.next_tape_file_number;
             if prefix.start_tape_file_number != expected_start_file
                 || prefix.start_lba != previous.eod_lba

@@ -1504,6 +1504,27 @@ pub fn software_build() -> &'static str {
     env!("REMANENCE_SOFTWARE_BUILD")
 }
 
+/// Build the production tape identity using the calling workspace's version.
+/// Build overrides are included only when the complete diagnostic fits REM's bounds.
+pub fn writer_identity(version: &str) -> remanence_parity::WriterIdentity {
+    remanence_parity::WriterIdentity::system(writer_software(version, software_build()))
+}
+
+fn writer_software(version: &str, build: &str) -> String {
+    let bare = format!("remanence/{version}");
+    if build == version {
+        return bare;
+    }
+    let prefix = format!("{version}+");
+    let build = build.strip_prefix(&prefix).unwrap_or(build);
+    let long = format!("{bare} ({build})");
+    if long.len() <= 128 && long.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+        long
+    } else {
+        bare
+    }
+}
+
 fn sync_directory(path: &Path) -> Result<(), StateError> {
     let dir = File::open(path).map_err(|err| StateError::io_at("open audit dir", path, err))?;
     dir.sync_all()
@@ -1516,6 +1537,34 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     use super::*;
+
+    #[test]
+    fn tape_writer_software_preserves_build_or_falls_back_without_rewriting() {
+        assert_eq!(writer_software("1.0.0", "1.0.0"), "remanence/1.0.0");
+        assert_eq!(
+            writer_software("1.0.0", "1.0.0+v1.0.0-12-g874b111"),
+            "remanence/1.0.0 (v1.0.0-12-g874b111)"
+        );
+        assert_eq!(
+            writer_software("1.0.0", "custom build"),
+            "remanence/1.0.0 (custom build)"
+        );
+        assert_eq!(
+            writer_software("1.0.0", "other+build"),
+            "remanence/1.0.0 (other+build)"
+        );
+        let overhead = "remanence/1.0.0 ()".len();
+        let at_limit = "x".repeat(128 - overhead);
+        assert_eq!(writer_software("1.0.0", &at_limit).len(), 128);
+        for invalid in [
+            format!("{at_limit}x"),
+            "build\n".into(),
+            "build\u{7f}".into(),
+            "būild".into(),
+        ] {
+            assert_eq!(writer_software("1.0.0", &invalid), "remanence/1.0.0");
+        }
+    }
 
     fn event(subject_id: &str) -> AuditEventRecord {
         AuditEventRecord {

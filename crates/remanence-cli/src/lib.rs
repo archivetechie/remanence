@@ -11186,7 +11186,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
             planned_uuid,
             block_size,
             parity.clone(),
-            env!("CARGO_PKG_VERSION"),
+            &remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
         )
     };
     let action = match action_result {

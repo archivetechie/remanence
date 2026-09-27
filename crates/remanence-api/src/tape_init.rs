@@ -646,7 +646,7 @@ pub fn maybe_write_tape_init_bootstrap(
     tape_uuid: TapeUuid,
     block_size: u32,
     parity: ParityConfig,
-    written_by_version: &str,
+    identity: &remanence_parity::WriterIdentity,
 ) -> Result<TapeInitWriteAction, TapeInitWriteError> {
     if options.dry_run && options.clobber_data_confirmed {
         return Err(TapeInitWriteError::ClobberDataInDryRun);
@@ -678,8 +678,8 @@ pub fn maybe_write_tape_init_bootstrap(
         tape_uuid,
         block_size,
         parity,
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?,
-        written_by_version,
+        identity.written_at()?,
+        identity.software(),
     );
     write_tape_bootstrap(sink, &payload)?;
     Ok(TapeInitWriteAction::WroteBootstrap)
@@ -1807,7 +1807,10 @@ mod tests {
                 BOT_UUID,
                 4096,
                 ParityConfig::None,
-                "test",
+                &remanence_parity::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("write gate returns");
             assert_eq!(action, TapeInitWriteAction::Refused);
@@ -1838,7 +1841,10 @@ mod tests {
             BOT_UUID,
             4096,
             ParityConfig::None,
-            "test",
+            &remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("write gate returns");
 
@@ -1857,13 +1863,20 @@ mod tests {
             BOT_UUID,
             4096,
             ParityConfig::None,
-            "test",
+            &remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("fresh write");
 
         assert_eq!(action, TapeInitWriteAction::WroteBootstrap);
         assert_eq!(sink.blocks.len(), 1);
         assert_eq!(sink.filemarks, vec![1]);
+        let bootstrap = remanence_parity::bootstrap::parse_bootstrap_block(&sink.blocks[0])
+            .expect("decode written BOT bootstrap");
+        assert_eq!(bootstrap.written_by_version, "remanence-test");
+        assert_eq!(bootstrap.written_at, "1970-01-01T00:00:00Z");
     }
 
     #[test]
@@ -1880,7 +1893,10 @@ mod tests {
             BOT_UUID,
             4096,
             ParityConfig::None,
-            "test",
+            &remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("dry-run write gate");
 

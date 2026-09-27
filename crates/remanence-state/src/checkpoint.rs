@@ -33,8 +33,8 @@ const CHECKPOINT_JOURNAL_SUFFIX: &str = ".remcheckpoint";
 const CHECKPOINT_JOURNAL_MAGIC: &[u8; 8] = b"REMCKPT\x01";
 const CHECKPOINT_FINALIZATION_INTENT_MAGIC: &[u8; 8] = b"REMFINT\x01";
 const CHECKPOINT_JOURNAL_HEADER_LEN: u64 = 8 + 16 + 8;
-const CHECKPOINT_RECORD_VERSION: u16 = 2;
-const CHECKPOINT_FINALIZATION_INTENT_VERSION: u16 = 2;
+const CHECKPOINT_RECORD_VERSION: u16 = 3;
+const CHECKPOINT_FINALIZATION_INTENT_VERSION: u16 = 3;
 const CHECKPOINT_RECORD_PREFIX_LEN: u64 = 2 + 4;
 const MAX_CHECKPOINT_RECORD_LEN: u64 = 64 * 1024 * 1024;
 const MAX_FINALIZATION_INTENT_LEN: u64 = MAX_CHECKPOINT_RECORD_LEN;
@@ -261,6 +261,8 @@ impl TryFrom<remanence_parity::TerminalTailLayout> for TerminalFinalizationLayou
 /// prefix reconstructible without consulting mutable sink state after restart.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct TerminalFinalizationPrefixPlan {
+    /// Immutable planning software and time for the ParityMap and edition.
+    pub diagnostics: remanence_parity::ParityMapDiagnostics,
     /// First tape-file number the prefix may emit.
     pub start_tape_file_number: u64,
     /// First tape-file number reserved for replica A.
@@ -338,6 +340,10 @@ impl From<&TerminalFinalizationSidecarDirectoryEntry>
 
 impl TerminalFinalizationPrefixPlan {
     fn validate(&self) -> Result<(), StateError> {
+        self.diagnostics.validate().map_err(|error| {
+            StateError::JournalReplayFailed(format!("invalid terminal prefix diagnostics: {error}"))
+        })?;
+
         remanence_parity::validate_committed_bundle_shape(&self.committed_bundle).map_err(
             |error| {
                 StateError::JournalReplayFailed(format!(
@@ -483,6 +489,7 @@ impl TerminalFinalizationPrefixPlan {
 impl From<&remanence_parity::TerminalPrefixPlan> for TerminalFinalizationPrefixPlan {
     fn from(plan: &remanence_parity::TerminalPrefixPlan) -> Self {
         Self {
+            diagnostics: plan.diagnostics.clone(),
             start_tape_file_number: plan.start_tape_file_number,
             tail_start_tape_file_number: plan.tail_start_tape_file_number,
             start_lba: plan.start_lba,
@@ -504,6 +511,7 @@ impl TryFrom<&TerminalFinalizationPrefixPlan> for remanence_parity::TerminalPref
     fn try_from(plan: &TerminalFinalizationPrefixPlan) -> Result<Self, Self::Error> {
         plan.validate()?;
         Ok(Self {
+            diagnostics: plan.diagnostics.clone(),
             start_tape_file_number: plan.start_tape_file_number,
             tail_start_tape_file_number: plan.tail_start_tape_file_number,
             start_lba: plan.start_lba,
@@ -616,6 +624,13 @@ impl TerminalFinalizationIntent {
         self.layout.validate()?;
         if let Some(prefix) = &self.terminal_prefix {
             prefix.validate()?;
+            if prefix.diagnostics.writer_version != self.writer_version
+                || prefix.diagnostics.write_timestamp != self.write_timestamp
+            {
+                return Err(StateError::JournalReplayFailed(
+                    "terminal edition diagnostics differ from prefix plan".into(),
+                ));
+            }
             let replica_a = self.layout.components[0];
             if prefix.tail_start_tape_file_number != replica_a.tape_file_number
                 || prefix.tail_start_lba != replica_a.start_lba
@@ -1210,8 +1225,14 @@ impl<'a> CheckpointTerminalIndexRecordSource<'a> {
             counts: self.summary.counts,
             block_size: intent.layout.block_size,
             compression_enabled: false,
-            writer_version: intent.writer_version.clone(),
-            write_timestamp: intent.write_timestamp.clone(),
+            writer_version: intent.terminal_prefix.as_ref().map_or_else(
+                || intent.writer_version.clone(),
+                |prefix| prefix.diagnostics.writer_version.clone(),
+            ),
+            write_timestamp: intent.terminal_prefix.as_ref().map_or_else(
+                || intent.write_timestamp.clone(),
+                |prefix| prefix.diagnostics.write_timestamp.clone(),
+            ),
             terminal_layout: intent.layout.try_to_parity_layout()?,
         };
         let plan =
@@ -4796,6 +4817,10 @@ mod tests {
         parity_map.physical_start_hint = Some(record.eod_lba);
         parity_map.canonical_metadata_hash = Some([0x70; 32]);
         TerminalFinalizationPrefixPlan {
+            diagnostics: remanence_parity::ParityMapDiagnostics {
+                writer_version: "remanence-test".into(),
+                write_timestamp: "2026-08-09T00:00:00Z".into(),
+            },
             start_tape_file_number: 3,
             tail_start_tape_file_number: 4,
             start_lba: record.eod_lba,
@@ -5029,6 +5054,102 @@ mod tests {
             timestamp.to_string().contains("write_timestamp"),
             "{timestamp}"
         );
+    }
+
+    /// Decode must validate identity fields after framing and CRC checks succeed.
+    #[test]
+    fn terminal_intent_decode_rejects_mismatched_or_invalid_diagnostics() {
+        let dir = tempfile::tempdir().expect("temporary intent directory");
+        let tape_uuid = [0x7B; 16];
+        let record = partial_epoch_parity_record(tape_uuid);
+        let prefix = terminal_prefix_plan_for_parity_record(&record);
+        let mut intent = finalization_intent(tape_uuid);
+        intent.layout = TerminalFinalizationLayout::try_from(
+            remanence_parity::TerminalTailLayout::new(
+                0,
+                record.block_size,
+                prefix.tail_start_tape_file_number,
+                prefix.tail_start_lba,
+                4,
+                4096,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        intent.terminal_prefix = Some(prefix);
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        journal.append(&record).unwrap();
+        write_terminal_finalization_intent(journal.path(), &intent, false).unwrap();
+        assert_eq!(
+            journal.terminal_finalization_intent().unwrap(),
+            Some(intent.clone())
+        );
+
+        for (field, value, prefix_field, expected) in [
+            (
+                "writer_version",
+                "different-writer".to_string(),
+                false,
+                "diagnostics differ from prefix plan",
+            ),
+            (
+                "write_timestamp",
+                "2026-08-09T00:00:01Z".to_string(),
+                false,
+                "diagnostics differ from prefix plan",
+            ),
+            (
+                "writer_version",
+                "x".repeat(129),
+                true,
+                "invalid terminal prefix diagnostics",
+            ),
+            (
+                "writer_version",
+                "writer\n".to_string(),
+                true,
+                "invalid terminal prefix diagnostics",
+            ),
+            (
+                "writer_version",
+                "writer\u{7f}".to_string(),
+                true,
+                "invalid terminal prefix diagnostics",
+            ),
+            (
+                "write_timestamp",
+                "not-a-time".to_string(),
+                true,
+                "invalid terminal prefix diagnostics",
+            ),
+            (
+                "write_timestamp",
+                "2026-08-09T01:00:00+01:00".to_string(),
+                true,
+                "planning timestamp is not UTC",
+            ),
+        ] {
+            let mut json = serde_json::to_value(&intent).unwrap();
+            if prefix_field {
+                json["terminal_prefix"]["diagnostics"][field] = value.clone().into();
+            } else {
+                json[field] = value.clone().into();
+            }
+            let payload = serde_json::to_vec(&json).unwrap();
+            let mut frame = CHECKPOINT_FINALIZATION_INTENT_MAGIC.to_vec();
+            frame.extend_from_slice(&CHECKPOINT_FINALIZATION_INTENT_VERSION.to_le_bytes());
+            frame.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+            frame.extend_from_slice(&payload);
+            frame.extend_from_slice(&remanence_parity::crc64_xz(&frame).to_le_bytes());
+            fs::write(terminal_finalization_intent_path(journal.path()), frame).unwrap();
+            let error = journal
+                .terminal_finalization_intent()
+                .expect_err("invalid persisted identity must fail decode");
+            assert!(
+                error.to_string().contains(expected),
+                "{field}={value:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -5372,11 +5493,22 @@ mod tests {
     fn structured_finalization_intent_is_idempotent_monotonic_and_append_fencing() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x71; 16];
+        let base = partial_epoch_parity_record(tape_uuid);
         let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
-        journal
-            .append(&record(tape_uuid))
-            .expect("append ordinary checkpoint");
-        let intent = finalization_intent(tape_uuid);
+        journal.append(&base).expect("append ordinary checkpoint");
+        let mut intent = finalization_intent(tape_uuid);
+        let prefix = terminal_prefix_plan_for_parity_record(&base);
+        let layout = remanence_parity::TerminalTailLayout::new(
+            0,
+            base.block_size,
+            prefix.tail_start_tape_file_number,
+            prefix.tail_start_lba,
+            4,
+            4096,
+        )
+        .expect("layout after persisted prefix");
+        intent.layout = TerminalFinalizationLayout::try_from(layout).unwrap();
+        intent.terminal_prefix = Some(prefix.clone());
 
         let mut lease = journal.acquire_exclusive().expect("acquire journal lease");
         assert_eq!(
@@ -5414,12 +5546,20 @@ mod tests {
         let recovery_authority = recovery
             .replay_for_terminal_recovery()
             .expect("replay prefix without clearing pending fence");
-        assert_eq!(recovery_authority.records, vec![record(tape_uuid)]);
+        assert_eq!(recovery_authority.records, vec![base.clone()]);
         assert_eq!(recovery_authority.finalization_intent, Some(intent.clone()));
         let classified = recovery
             .mark_terminal_recovery_required()
             .expect("persist recovery-required classification");
         assert!(classified.recovery_required);
+        assert_eq!(classified.terminal_prefix.as_ref(), Some(&prefix));
+        assert_eq!(
+            read_terminal_finalization_intent(journal.path(), tape_uuid)
+                .unwrap()
+                .unwrap()
+                .terminal_prefix,
+            Some(prefix.clone())
+        );
         assert_eq!(
             recovery
                 .mark_terminal_recovery_required()
@@ -5453,6 +5593,14 @@ mod tests {
                 .advance_terminal_finalization(expected, next)
                 .expect("advance one proved component");
             assert_eq!(advanced.progress, next);
+            assert_eq!(advanced.terminal_prefix.as_ref(), Some(&prefix));
+            assert_eq!(
+                read_terminal_finalization_intent(journal.path(), tape_uuid)
+                    .unwrap()
+                    .unwrap()
+                    .terminal_prefix,
+                Some(prefix.clone())
+            );
             assert!(!advanced.recovery_required);
             assert_eq!(
                 advanced.progress.completed_replicas(),
@@ -5491,6 +5639,14 @@ mod tests {
             TerminalFinalizationProgress::AfterReplicaC
         );
         assert!(classified.recovery_required);
+        assert_eq!(classified.terminal_prefix.as_ref(), Some(&prefix));
+        assert_eq!(
+            read_terminal_finalization_intent(journal.path(), tape_uuid)
+                .unwrap()
+                .unwrap()
+                .terminal_prefix,
+            Some(prefix.clone())
+        );
     }
 
     #[test]
@@ -5720,6 +5876,39 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_record_rejects_versions_one_and_two() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x72; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        journal.append(&record(tape_uuid)).unwrap();
+        let mut lease = journal.acquire_exclusive().unwrap();
+        let mut bytes = fs::read(journal.path()).unwrap();
+        let offset = CHECKPOINT_JOURNAL_HEADER_LEN as usize;
+        for version in [1u16, 2] {
+            bytes[offset..offset + 2].copy_from_slice(&version.to_le_bytes());
+            fs::write(journal.path(), &bytes).unwrap();
+            let error = lease
+                .replay()
+                .expect_err("legacy checkpoint record must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported version {version}")),
+                "{error}"
+            );
+            let error = lease
+                .bounded_replay_snapshot()
+                .expect_err("bounded replay must reject legacy records");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported version {version}")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn structured_finalization_rejects_pool_guard_and_corrupt_frame_before_motion() {
         let dir = tempfile::tempdir().expect("temporary checkpoint directory");
         let tape_uuid = [0x72; 16];
@@ -5747,15 +5936,19 @@ mod tests {
         drop(lease);
         let intent_path = terminal_finalization_intent_path(journal.path());
         let mut bytes = fs::read(&intent_path).expect("read finalization frame");
-        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
-        fs::write(&intent_path, &bytes).expect("write legacy finalization frame version");
-        let error = journal
-            .terminal_finalization_intent()
-            .expect_err("legacy intent version must fail closed");
-        assert!(
-            error.to_string().contains("unsupported version 1"),
-            "{error}"
-        );
+        for version in [1u16, 2] {
+            bytes[8..10].copy_from_slice(&version.to_le_bytes());
+            fs::write(&intent_path, &bytes).expect("write legacy finalization frame version");
+            let error = journal
+                .terminal_finalization_intent()
+                .expect_err("legacy intent version must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unsupported version {version}")),
+                "{error}"
+            );
+        }
         bytes[8..10].copy_from_slice(&CHECKPOINT_FINALIZATION_INTENT_VERSION.to_le_bytes());
         bytes[14] ^= 1;
         fs::write(&intent_path, bytes).expect("corrupt finalization frame");
@@ -5901,6 +6094,142 @@ mod tests {
         )
         .expect("replay frozen prefix after later append");
         assert_eq!(files, vec![0, 1]);
+    }
+
+    /// A reopened intent preserves the advancing clock's planned bytes during recovery.
+    #[test]
+    fn advancing_identity_survives_intent_reopen_and_recovery_encoding() {
+        mod clock_fixture {
+            use remanence_parity::WriterIdentity;
+            use std::sync::Arc;
+            use time::OffsetDateTime;
+            include!("../../remanence-parity/src/advancing_test_identity.rs");
+        }
+        let dir = tempfile::tempdir().expect("temporary authority directory");
+        let tape_uuid = [0x7E; 16];
+        let mut record = partial_epoch_parity_record(tape_uuid);
+        // Two index copies, two parity shards, and the tail header form this sidecar.
+        record.barrier_bundle.as_mut().unwrap().entries[0].block_count = 5;
+        record.barrier_bundle.as_mut().unwrap().entries[0].physical_start_hint = Some(6);
+        let scheme = record.scheme.clone().expect("parity scheme");
+        let checkpoint_journal =
+            FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open checkpoint journal");
+        let mut checkpoint_lease = checkpoint_journal
+            .acquire_exclusive()
+            .expect("acquire checkpoint lease");
+        checkpoint_lease
+            .append(&record)
+            .expect("append checkpoint authority");
+
+        let parity_path = dir.path().join("owned-planned-prefix.remjournal");
+        let mut parity = remanence_parity::FileTapeFileJournal::open(
+            &parity_path,
+            tape_uuid,
+            record.block_size,
+            scheme,
+        )
+        .expect("open trusted parity journal");
+        let bot = remanence_parity::CommittedBundle {
+            kind: remanence_parity::CommittedBundleKind::BotBootstrap,
+            entries: vec![parity_entry(0, remanence_parity::TapeFileKind::Bootstrap)],
+            highest_protected_ordinal: 0,
+            total_committed_ordinals: 0,
+        };
+        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &bot)
+            .expect("commit BOT Bootstrap");
+        for bundle in &record.object_tape_file_bundles {
+            remanence_parity::TapeFileJournal::commit_bundle(&mut parity, bundle)
+                .expect("commit Object bundle");
+        }
+        let barrier = record.barrier_bundle.as_ref().expect("checkpoint barrier");
+        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, barrier)
+            .expect("commit checkpoint sidecar bundle");
+        let checkpoint = remanence_parity::CommittedBundle {
+            kind: remanence_parity::CommittedBundleKind::CheckpointedThrough,
+            entries: Vec::new(),
+            highest_protected_ordinal: barrier.highest_protected_ordinal,
+            total_committed_ordinals: barrier.total_committed_ordinals,
+        };
+        remanence_parity::TapeFileJournal::commit_bundle(&mut parity, &checkpoint)
+            .expect("commit checkpoint watermark");
+
+        let snapshot = parity.committed_snapshot_bounded().unwrap();
+        let (identity, calls) = clock_fixture::advancing_test_identity();
+        let plan = remanence_parity::plan_checkpointed_terminal_index_close(
+            &snapshot,
+            identity.capture().unwrap(),
+        )
+        .unwrap();
+        assert_ne!(identity.capture().unwrap(), plan.diagnostics);
+        let calls_before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let mut intent = finalization_intent(tape_uuid);
+        intent.writer_version = plan.diagnostics.writer_version.clone();
+        intent.write_timestamp = plan.diagnostics.write_timestamp.clone();
+        intent.layout = TerminalFinalizationLayout::try_from(
+            remanence_parity::TerminalTailLayout::new(
+                0,
+                record.block_size,
+                plan.tail_start_tape_file_number,
+                plan.tail_start_lba,
+                4,
+                4096,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        intent.terminal_prefix = Some(TerminalFinalizationPrefixPlan::from(&plan));
+        checkpoint_lease
+            .begin_terminal_finalization(&intent)
+            .unwrap();
+        drop(checkpoint_lease);
+        drop(checkpoint_journal);
+        let reopened = FileCheckpointJournal::open(dir.path(), tape_uuid).unwrap();
+        let restored = reopened
+            .terminal_finalization_intent()
+            .unwrap()
+            .expect("persisted intent");
+        assert_eq!(restored, intent);
+        let restored_plan = remanence_parity::TerminalPrefixPlan::try_from(
+            restored.terminal_prefix.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored_plan, plan);
+        assert_eq!(
+            remanence_parity::plan_checkpointed_terminal_index_close(
+                &snapshot,
+                restored_plan.diagnostics.clone(),
+            )
+            .unwrap(),
+            plan
+        );
+        let mut sink = remanence_library::block_io::VecBlockSink::new();
+        sink.set_next_lba_for_test(restored_plan.start_lba);
+        remanence_parity::close_checkpointed_terminal_index_prefix(
+            &mut remanence_parity::BlockSinkRawTapeSink::new(&mut sink),
+            &mut parity,
+            &snapshot,
+            &restored_plan,
+            remanence_parity::TerminalPrefixReconcileEvidence::Absent,
+        )
+        .expect("re-encode reopened plan during recovery");
+        let decoded = remanence_parity::parse_parity_map_tape_file(&sink.blocks, &tape_uuid)
+            .expect("decode recovered ParityMap");
+        assert_eq!(
+            Some(decoded.header.payload_sha256),
+            plan.committed_bundle.entries[0].canonical_metadata_hash
+        );
+        assert_eq!(
+            decoded.payload.writer_version.as_ref(),
+            Some(&plan.diagnostics.writer_version)
+        );
+        assert_eq!(
+            decoded.payload.write_timestamp.as_ref(),
+            Some(&plan.diagnostics.write_timestamp)
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before
+        );
     }
 
     #[test]

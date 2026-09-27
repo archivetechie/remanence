@@ -277,6 +277,7 @@ pub(crate) fn write_parity_object_to_selected_tape<S: BlockSink + ?Sized>(
                         scheme.clone(),
                         tape_uuid,
                         block_size,
+                        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                     )?;
                     parity.write_bootstrap()?;
                     let report = match &stored {

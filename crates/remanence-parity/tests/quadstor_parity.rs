@@ -498,6 +498,10 @@ fn quadstor_parity_roundtrip() {
             scheme.clone(),
             TAPE_UUID,
             block_size,
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("construct hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
@@ -597,6 +601,10 @@ fn quadstor_parity_journaled_session() {
                 scheme.clone(),
                 TAPE_UUID,
                 block_size,
+                remanence_parity::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("construct journaled hardware parity sink");
             assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
@@ -691,6 +699,10 @@ fn quadstor_parity_recovers_from_injected_read_fault() {
             scheme.clone(),
             TAPE_UUID,
             block_size,
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("construct hardware parity sink");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
@@ -795,6 +807,10 @@ fn quadstor_parity_bounded_resume_append_roundtrip() {
             scheme.clone(),
             TAPE_UUID,
             block_size,
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("construct initial bounded-resume sink");
         assert_eq!(sink.write_bootstrap().expect("write sole BOT Bootstrap"), 0);
@@ -852,6 +868,10 @@ fn quadstor_parity_bounded_resume_append_roundtrip() {
                 resume_result: &resume_result,
                 live_epoch: rebuild.live_epoch,
             },
+            remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("open bounded append sink");
         begin_two_block_object(&mut sink, block_size, 1, 3, 1);

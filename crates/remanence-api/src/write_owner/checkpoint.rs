@@ -223,6 +223,7 @@ pub(super) fn open_parity_actor_session(
                     scheme.clone(),
                     selected.tape_uuid,
                     selected.block_size,
+                    remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
                 )?;
                 sink.into_session_state()
             })()
@@ -304,6 +305,7 @@ pub(super) fn open_parity_actor_session(
                 resume_result: &resume_result,
                 live_epoch: None,
             },
+            remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
         )
         .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
         sink.into_session_state()

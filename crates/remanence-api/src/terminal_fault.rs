@@ -832,6 +832,12 @@ mod tests {
 
     fn terminal_prefix_plan() -> TerminalPrefixPlan {
         TerminalPrefixPlan {
+            diagnostics: remanence_parity::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            )
+            .capture()
+            .unwrap(),
             start_tape_file_number: 9,
             tail_start_tape_file_number: 10,
             start_lba: 91,

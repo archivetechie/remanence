@@ -1943,6 +1943,10 @@ mod tests {
                 scheme(),
                 TAPE_UUID,
                 BLOCK_SIZE,
+                remanence_parity::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("serial parity");
             parity.write_bootstrap().expect("serial bootstrap");
@@ -1966,6 +1970,10 @@ mod tests {
                 scheme(),
                 TAPE_UUID,
                 BLOCK_SIZE,
+                remanence_parity::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("overlap parity");
             parity.write_bootstrap().expect("overlap bootstrap");
@@ -2018,6 +2026,10 @@ mod tests {
                 scheme(),
                 TAPE_UUID,
                 BLOCK_SIZE,
+                remanence_parity::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .unwrap();
             assert_eq!(parity.write_bootstrap().unwrap(), 0);

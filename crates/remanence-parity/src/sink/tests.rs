@@ -866,6 +866,10 @@ fn unwritten_object_rollback_restores_detachable_session_state() {
         small_scheme(),
         tape_uuid,
         block_size,
+        crate::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
     )
     .expect("session sink");
     let input = capacity_input_with_block_size(2, 10_000, block_size);
@@ -905,6 +909,10 @@ fn parity_attach_position_or_journal_mismatch_returns_session_state() {
         small_scheme(),
         tape_uuid,
         block_size,
+        crate::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
     )
     .expect("session sink")
     .into_session_state()
@@ -1023,6 +1031,10 @@ fn journaled_sink_commits_object_bundle_as_one_record() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         start_object(&mut sink, 12, block_size);
@@ -1064,6 +1076,10 @@ fn fresh_tape_first_object_span_starts_after_bootstrap_prefix() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         assert_eq!(sink.write_bootstrap().expect("BOT bootstrap"), 0);
@@ -1114,6 +1130,10 @@ fn journaled_write_bootstrap_commits_bot_bundle() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         assert_eq!(sink.write_bootstrap().expect("bootstrap writes"), 0);
@@ -1126,6 +1146,10 @@ fn journaled_write_bootstrap_commits_bot_bundle() {
     assert_eq!(bundle.total_committed_ordinals, 0);
     assert_eq!(bundle.entries.len(), 1);
     assert_eq!(bundle.entries[0].kind, TapeFileKind::Bootstrap);
+    let bootstrap = crate::bootstrap::parse_bootstrap_block(&raw.blocks[0])
+        .expect("decode written BOT bootstrap");
+    assert_eq!(bootstrap.written_by_version, "remanence-test");
+    assert_eq!(bootstrap.written_at, "1970-01-01T00:00:00Z");
 }
 
 #[test]
@@ -1141,6 +1165,10 @@ fn nonexact_control_block_forbids_filemark_and_journal_commit() {
                 small_scheme(),
                 sample_uuid(),
                 block_size,
+                crate::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("journaled sink opens");
             let error = sink
@@ -1201,6 +1229,10 @@ fn nonexact_sidecar_block_forbids_sidecar_filemark_and_bundle_commit() {
                 small_scheme(),
                 sample_uuid(),
                 block_size,
+                crate::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                ),
             )
             .expect("journaled sink opens");
             start_object(&mut sink, data_blocks as u64, block_size);
@@ -1246,6 +1278,10 @@ fn checkpoint_returns_committed_prefix_summary() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         sink.write_bootstrap().expect("BOT Bootstrap writes");
@@ -1286,6 +1322,10 @@ fn failed_checkpoint_barrier_poisons_without_committing_journal_bundle() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
 
@@ -1329,6 +1369,10 @@ fn checkpoint_barrier_end_of_medium_is_tape_io_and_poisons_without_commit() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
 
@@ -1371,6 +1415,10 @@ fn checkpoint_rejects_mid_object() {
         small_scheme(),
         sample_uuid(),
         block_size,
+        crate::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
     )
     .expect("journaled sink opens");
     start_object(&mut sink, 3, block_size);
@@ -1390,18 +1438,23 @@ fn checkpoint_rejects_mid_object() {
 
 #[test]
 fn terminal_prefix_close_emits_sidecar_and_parity_map_without_bootstrap() {
+    let (identity, clock_calls) = crate::writer_identity::advancing_test_identity();
     let block_size: u32 = 1024;
     let mut raw = RecordingRawTapeSink::default();
     let mut journal = RecordingJournal::new(sample_uuid());
     let (result, plan) = {
-        let mut sink = ParitySink::new_with_journal(
+        let sink = ParitySink::new_with_journal(
             &mut raw,
             &mut journal,
             small_scheme(),
             sample_uuid(),
             block_size,
+            identity.clone(),
         )
         .expect("journaled sink opens");
+        let session = sink.into_session_state().expect("detach before BOT");
+        let mut sink = ParitySink::from_session_state(&mut raw, &mut journal, session)
+            .expect("reattach identity and clock");
         start_object(&mut sink, 5, block_size);
         for i in 0..5 {
             sink.write_block(&fixed_block(i + 1, block_size))
@@ -1409,25 +1462,42 @@ fn terminal_prefix_close_emits_sidecar_and_parity_map_without_bootstrap() {
         }
         sink.finish_object().expect("object closes");
         let plan = sink
-            .plan_terminal_index_close()
+            .plan_terminal_index_close(identity.capture().expect("capture planning diagnostics"))
             .expect("terminal prefix preflight plans");
         assert_eq!(
             plan.committed_bundle.kind,
             CommittedBundleKind::TerminalPrefix
         );
         assert!(plan.tail_start_lba > plan.start_lba);
+        assert_ne!(identity.capture().unwrap(), plan.diagnostics);
+        let calls_before = clock_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            sink.plan_terminal_index_close(plan.diagnostics.clone())
+                .unwrap(),
+            plan
+        );
+
         let result = sink
             .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
             .expect("terminal parity prefix closes");
+        assert_eq!(
+            clock_calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_before
+        );
         (result, plan)
     };
 
+    let calls_before = clock_calls.load(std::sync::atomic::Ordering::SeqCst);
     let mut physical = RecordingRawTapeSource::from_sink(&raw);
     assert_eq!(
         reconcile_terminal_prefix(&mut physical, &plan, &sample_uuid(), block_size, true,),
         TerminalPrefixReconcileEvidence::Complete
     );
     assert_eq!(physical.cursor, plan.tail_start_lba);
+    assert_eq!(
+        clock_calls.load(std::sync::atomic::Ordering::SeqCst),
+        calls_before
+    );
     let parity_lba = plan
         .start_lba
         .checked_add(plan.sidecar_directory_entries[0].sidecar_header_block_count)
@@ -1492,6 +1562,10 @@ fn terminal_prefix_read_failures_only_authorize_overwrite_for_proved_damage() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         start_object(&mut sink, 5, block_size);
@@ -1501,7 +1575,14 @@ fn terminal_prefix_read_failures_only_authorize_overwrite_for_proved_damage() {
         }
         sink.finish_object().expect("object closes");
         let plan = sink
-            .plan_terminal_index_close()
+            .plan_terminal_index_close(
+                crate::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                )
+                .capture()
+                .unwrap(),
+            )
             .expect("terminal prefix preflight plans");
         sink.close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
             .expect("terminal prefix fixture closes");
@@ -1567,6 +1648,10 @@ fn successful_mislocate_never_becomes_terminal_prefix_overwrite_authority() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         start_object(&mut sink, 5, block_size);
@@ -1576,7 +1661,14 @@ fn successful_mislocate_never_becomes_terminal_prefix_overwrite_authority() {
         }
         sink.finish_object().expect("object closes");
         let plan = sink
-            .plan_terminal_index_close()
+            .plan_terminal_index_close(
+                crate::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                )
+                .capture()
+                .unwrap(),
+            )
             .expect("terminal prefix preflight plans");
         sink.close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Absent)
             .expect("terminal prefix fixture closes");
@@ -1620,6 +1712,10 @@ fn unproved_terminal_prefix_causes_no_media_or_journal_motion() {
         small_scheme(),
         sample_uuid(),
         block_size,
+        crate::WriterIdentity::fixed(
+            "remanence-test".into(),
+            std::time::SystemTime::UNIX_EPOCH.into(),
+        ),
     )
     .expect("journaled sink opens");
     start_object(&mut sink, 5, block_size);
@@ -1629,7 +1725,14 @@ fn unproved_terminal_prefix_causes_no_media_or_journal_motion() {
     }
     sink.finish_object().expect("object closes");
     let plan = sink
-        .plan_terminal_index_close()
+        .plan_terminal_index_close(
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            )
+            .capture()
+            .unwrap(),
+        )
         .expect("terminal prefix preflight plans");
     let error = sink
         .close_for_terminal_index(&plan, TerminalPrefixReconcileEvidence::Unproved)
@@ -1654,6 +1757,10 @@ fn terminal_prefix_execution_rejects_stale_preflight_before_motion() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         start_object(&mut sink, 1, block_size);
@@ -1661,7 +1768,14 @@ fn terminal_prefix_execution_rejects_stale_preflight_before_motion() {
             .expect("object block writes");
         sink.finish_object().expect("object closes");
         let mut stale = sink
-            .plan_terminal_index_close()
+            .plan_terminal_index_close(
+                crate::WriterIdentity::fixed(
+                    "remanence-test".into(),
+                    std::time::SystemTime::UNIX_EPOCH.into(),
+                )
+                .capture()
+                .unwrap(),
+            )
             .expect("terminal prefix preflight plans");
         stale.tail_start_lba += 1;
         sink.close_for_terminal_index(&stale, TerminalPrefixReconcileEvidence::Absent)
@@ -3439,6 +3553,10 @@ fn mid_batch_early_warning_survives_until_checkpoint_barrier_state() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         sink.write_bootstrap().expect("BOT bootstrap writes");
@@ -3472,6 +3590,10 @@ fn session_state_carries_open_epoch_fill_across_two_objects_before_barrier() {
             small_scheme(),
             sample_uuid(),
             block_size,
+            crate::WriterIdentity::fixed(
+                "remanence-test".into(),
+                std::time::SystemTime::UNIX_EPOCH.into(),
+            ),
         )
         .expect("journaled sink opens");
         sink.write_bootstrap().expect("BOT bootstrap writes");
