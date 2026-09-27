@@ -59,6 +59,36 @@ pub struct EnvelopeSealOptions {
     pub recipients: Vec<RecipientPublicKey>,
 }
 
+/// Validate Sealer-only recipient constraints before obtaining any key material.
+fn validate_recipient_set(recipients: &[RecipientPublicKey]) -> Result<()> {
+    if recipients.iter().enumerate().any(|(index, recipient)| {
+        recipients[..index]
+            .iter()
+            .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
+    }) {
+        return Err(RemObjectAeadError::InvalidInput(
+            "recipient epochs must be distinct".to_string(),
+        ));
+    }
+    if recipients
+        .windows(2)
+        .any(|pair| pair[0].slot_index >= pair[1].slot_index)
+    {
+        return Err(RemObjectAeadError::InvalidInput(
+            "recipient slot indices must be strictly increasing in the order given".to_string(),
+        ));
+    }
+    if recipients
+        .iter()
+        .any(|recipient| recipient.recipient_epoch_id == [0; 16])
+    {
+        return Err(RemObjectAeadError::InvalidInput(
+            "recipient epoch ids must be nonzero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Seal a canonical plaintext REM-OBJECT object as an HPKE envelope.
 pub fn seal<R: Read, W: Write>(
     plaintext: R,
@@ -75,6 +105,7 @@ fn seal_with_entropy<R: Read, W: Write>(
     options: &EnvelopeSealOptions,
     entropy: &mut impl EntropySource,
 ) -> Result<SealReport> {
+    validate_recipient_set(&options.recipients)?;
     let dek = DataEncryptionKey::generate_with_entropy(entropy)?;
     let mut rng = EphemeralRng::from_entropy(entropy)?;
     seal_with_material(plaintext, output, options, &dek, &mut rng)
@@ -92,6 +123,7 @@ pub fn seal_deterministic_for_test_vectors<R: Read, W: Write>(
     dek: DataEncryptionKey,
     hpke_rng_seed: [u8; 32],
 ) -> Result<SealReport> {
+    validate_recipient_set(&options.recipients)?;
     let mut rng = EphemeralRng::from_seed(&hpke_rng_seed);
     seal_with_material(plaintext, output, options, &dek, &mut rng)
 }
@@ -127,20 +159,6 @@ where
                 .to_string(),
         )),
         _ => {}
-    }
-    if options
-        .recipients
-        .iter()
-        .enumerate()
-        .any(|(index, recipient)| {
-            options.recipients[..index]
-                .iter()
-                .any(|earlier| earlier.recipient_epoch_id == recipient.recipient_epoch_id)
-        })
-    {
-        return Err(RemObjectAeadError::InvalidInput(
-            "recipient epochs must be distinct".to_string(),
-        ));
     }
 
     let metadata = RemObjectMetadata::new(
@@ -413,6 +431,75 @@ mod tests {
     #[test]
     fn seal_hpke_entropy_failure_writes_nothing() {
         assert_entropy_failure_writes_nothing(2);
+    }
+
+    /// Both public paths refuse invalid recipients without output; the production
+    /// entropy seam additionally proves that refusal precedes both secret draws.
+    fn assert_recipient_refusal(options: &EnvelopeSealOptions, message: &str) {
+        let plaintext = vec![0x5a; 512];
+        let mut output = Vec::new();
+        let mut entropy = FailOnDraw {
+            fail_on: 1,
+            draws: 0,
+        };
+        let error =
+            seal_with_entropy(&plaintext[..], &mut output, options, &mut entropy).unwrap_err();
+        assert!(matches!(error, RemObjectAeadError::InvalidInput(ref reason) if reason == message));
+        assert_eq!(entropy.draws, 0);
+        assert!(output.is_empty());
+
+        let error = seal(&plaintext[..], &mut output, options).unwrap_err();
+        assert!(matches!(error, RemObjectAeadError::InvalidInput(ref reason) if reason == message));
+        assert!(output.is_empty());
+
+        let error = seal_deterministic_for_test_vectors(
+            &plaintext[..],
+            &mut output,
+            options,
+            DataEncryptionKey::from_bytes([0x44; 32]),
+            [0x55; 32],
+        )
+        .unwrap_err();
+        assert!(matches!(error, RemObjectAeadError::InvalidInput(ref reason) if reason == message));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn sealer_entry_points_reject_slot_order_before_entropy_or_output() {
+        let mut options = envelope_options(options(&[0x5a; 512]));
+        options.recipients.swap(0, 1);
+        assert_recipient_refusal(
+            &options,
+            "recipient slot indices must be strictly increasing in the order given",
+        );
+    }
+
+    #[test]
+    fn sealer_entry_points_reject_equal_slots_before_entropy_or_output() {
+        let mut options = envelope_options(options(&[0x5a; 512]));
+        options.recipients[1].slot_index = 0;
+        assert_recipient_refusal(
+            &options,
+            "recipient slot indices must be strictly increasing in the order given",
+        );
+    }
+
+    #[test]
+    fn sealer_entry_points_reject_zero_epoch_before_entropy_or_output() {
+        for index in 0..2 {
+            let mut options = envelope_options(options(&[0x5a; 512]));
+            options.recipients[index].recipient_epoch_id = [0; 16];
+            assert_recipient_refusal(&options, "recipient epoch ids must be nonzero");
+        }
+    }
+
+    #[test]
+    fn sealer_entry_points_reject_duplicate_epochs_before_entropy_or_output() {
+        let mut options = envelope_options(options(&[0x5a; 512]));
+        let mut duplicate = options.recipients[0].clone();
+        duplicate.slot_index = 2;
+        options.recipients.push(duplicate);
+        assert_recipient_refusal(&options, "recipient epochs must be distinct");
     }
 
     struct FailAfterWriter {

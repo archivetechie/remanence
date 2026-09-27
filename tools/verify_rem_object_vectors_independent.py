@@ -2774,23 +2774,36 @@ def check_supplement(directory: pathlib.Path) -> None:
     assert_eq(hx(sha256(plaintext)), p1["expected"]["stored_digest"], "supplement P1")
     ran = []
     recorded_inputs = []
+    sealer_inputs = {}
     for manifest_name in ("negative-sealer.json", "metadata-envelope.json"):
         manifest = load(directory / "manifests", manifest_name)
         assert_eq(manifest["status"], "review-only-candidate", "manifest status")
         for case in manifest["cases"]:
             case_id = case["id"]
             ran.append(case_id)
-            if case_id == "seal-duplicate-epoch-id":
+            if case_id in ("seal-duplicate-epoch-id", "seal-slot-order", "seal-zero-epoch-id"):
                 inputs = case["inputs"]
+                sealer_inputs[case_id] = inputs
                 assert_eq(case["operation"], "seal", case_id)
                 assert_eq(case["expected_error"], "InvalidInput", case_id)
                 recipients = inputs["recipients"]
-                assert_eq(len(recipients), 2, "duplicate-epoch recipient count")
-                assert_eq([r["slot_index"] for r in recipients], [0, 1], "distinct slots")
-                assert_eq(recipients[0]["recipient_epoch_id"], recipients[1]["recipient_epoch_id"], "duplicate epochs")
-                epoch = bytes.fromhex(recipients[0]["recipient_epoch_id"])
-                if len(epoch) != 16 or not any(epoch):
-                    raise AssertionError("valid nonzero epoch required")
+                assert_eq(len(recipients), 2, "Sealer recipient count")
+                slots = [r["slot_index"] for r in recipients]
+                epochs = [bytes.fromhex(r["recipient_epoch_id"]) for r in recipients]
+                if any(len(epoch) != 16 for epoch in epochs):
+                    raise AssertionError("16-byte epoch ids required")
+                if case_id == "seal-slot-order":
+                    assert_eq(slots, [1, 0], "out-of-order distinct slots")
+                else:
+                    assert_eq(slots, [0, 1], "strictly increasing slots")
+                if case_id == "seal-duplicate-epoch-id":
+                    assert_eq(epochs[0], epochs[1], "duplicate epochs")
+                elif epochs[0] == epochs[1]:
+                    raise AssertionError("distinct epoch ids required")
+                if case_id == "seal-zero-epoch-id":
+                    assert_eq([not any(epoch) for epoch in epochs], [True, False], "only first epoch zero")
+                elif not all(any(epoch) for epoch in epochs):
+                    raise AssertionError("valid nonzero epochs required")
                 for recipient in recipients:
                     label = recipient["epoch_label"].encode("ascii")
                     if len(label) > 32 or not all(0x20 <= b <= 0x7e for b in label):
@@ -2799,7 +2812,7 @@ def check_supplement(directory: pathlib.Path) -> None:
                     assert_eq(recipient["private_key_role"], "xwing-seed-32", "seed role")
                     assert_eq(hx(xwing_keypair(bytes.fromhex(recipient["private_key"]))[0]),
                               recipient["public_key"], "Sealer recipient public key")
-                print(f"{case_id}: inputs checked (two slots, one shared epoch id, keys matching seeds); expected InvalidInput (REM-ENCRYPT 5.3, 5.9, 11.2)")
+                print(f"{case_id}: inputs checked (single recipient-set fault, keys matching seeds); expected InvalidInput (REM-ENCRYPT 5.3, 5.9, 11.2)")
             else:
                 if case_id not in ("metadata-negative-integer-under-unknown-key", "metadata-unknown-key-control"):
                     raise AssertionError(f"unknown supplement case: {case_id}")
@@ -2837,7 +2850,8 @@ def check_supplement(directory: pathlib.Path) -> None:
             assert_eq(inputs["recipient_mode"], "hpke-xwing-draft10", "recipient mode")
             for field in ("deterministic_dek", "deterministic_hpke_rng_seed"):
                 assert_eq(len(bytes.fromhex(inputs[field])), 32, field)
-    assert_eq(ran, ["seal-duplicate-epoch-id", "metadata-negative-integer-under-unknown-key",
+    assert_eq(ran, ["seal-duplicate-epoch-id", "seal-slot-order", "seal-zero-epoch-id",
+                    "metadata-negative-integer-under-unknown-key",
                     "metadata-unknown-key-control"], "supplement case completeness")
     assert_eq([v["id"] for v in index["vectors"]], ran, "index completeness")
     negative, control = recorded_inputs
@@ -2848,7 +2862,20 @@ def check_supplement(directory: pathlib.Path) -> None:
     assert_eq(control_metadata[-2:], b"\x04\x00", "unknown key with 0")
     assert_eq({k: v for k, v in negative.items() if k != "metadata_plaintext_hex"},
               {k: v for k, v in control.items() if k != "metadata_plaintext_hex"}, "otherwise identical inputs")
-    print("supplement MANIFEST.tsv and all 3 cases verified")
+    # Pin each negative to the valid control with exactly its advertised mutation.
+    # This also checks framing, deterministic secrets and every recipient field.
+    for case_id, inputs in sealer_inputs.items():
+        expected_inputs = {k: v for k, v in control.items() if k != "metadata_plaintext_hex"}
+        recipients = [dict(r) for r in control["recipients"]]
+        if case_id == "seal-duplicate-epoch-id":
+            recipients[1]["recipient_epoch_id"] = recipients[0]["recipient_epoch_id"]
+        elif case_id == "seal-slot-order":
+            recipients.reverse()
+        elif case_id == "seal-zero-epoch-id":
+            recipients[0]["recipient_epoch_id"] = "00" * 16
+        expected_inputs["recipients"] = recipients
+        assert_eq(inputs, expected_inputs, f"{case_id} exactly one fault")
+    print("supplement MANIFEST.tsv and all 5 cases verified")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

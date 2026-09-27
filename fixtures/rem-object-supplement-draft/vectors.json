@@ -9,13 +9,41 @@
       "artifacts": [
         {
           "path": "manifests/negative-sealer.json",
-          "sha256": "c4fe65bb3670b3aada72f0098cb7581338eb420b62bb88ae4ecaab91c0c92f59",
-          "size": 6312
+          "sha256": "9448384b7431a40720940d1e23b5bea32175f0abe37f705ea28b00db551ebf64",
+          "size": 18627
         }
       ],
       "category": "negative/sealer",
-      "checksum_sha256": "504aff4406cda59f1755f865c0cac893c85eca84da241b0f5cd0857acbc78ba0",
+      "checksum_sha256": "ae3b1bf80723e0c6cfc96f01a52ae85ea58634bc90db267ec844b399ad113506",
       "id": "seal-duplicate-epoch-id",
+      "spec_section": "REM-ENCRYPT 13.4"
+    },
+    {
+      "archive_path": "manifests/negative-sealer.json",
+      "artifacts": [
+        {
+          "path": "manifests/negative-sealer.json",
+          "sha256": "9448384b7431a40720940d1e23b5bea32175f0abe37f705ea28b00db551ebf64",
+          "size": 18627
+        }
+      ],
+      "category": "negative/sealer",
+      "checksum_sha256": "ae3b1bf80723e0c6cfc96f01a52ae85ea58634bc90db267ec844b399ad113506",
+      "id": "seal-slot-order",
+      "spec_section": "REM-ENCRYPT 13.4"
+    },
+    {
+      "archive_path": "manifests/negative-sealer.json",
+      "artifacts": [
+        {
+          "path": "manifests/negative-sealer.json",
+          "sha256": "9448384b7431a40720940d1e23b5bea32175f0abe37f705ea28b00db551ebf64",
+          "size": 18627
+        }
+      ],
+      "category": "negative/sealer",
+      "checksum_sha256": "ae3b1bf80723e0c6cfc96f01a52ae85ea58634bc90db267ec844b399ad113506",
+      "id": "seal-zero-epoch-id",
       "spec_section": "REM-ENCRYPT 13.4"
     },
     {
