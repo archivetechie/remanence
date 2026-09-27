@@ -339,6 +339,9 @@ documents and published artifacts themselves.
   of the revision that generated it. A future revision needing new
   vectors publishes its own additional archive and cites it by name, DOI
   and digest; nothing is ever re-pinned.
+  Additive cases for a revision in preparation are first prepared as
+  review-only candidates. They become that revision's own supplement archive
+  at its freeze.
 
 ### 20. The software
 

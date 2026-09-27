@@ -1835,6 +1835,19 @@ envelope vectors in the same archive. The archive's checksums, rather than abbre
 in this prose, are the byte-identity authority. Payload digests are
 independently checkable with `sha256sum`.
 
+The revision in preparation also has a candidate supplement, under
+`fixtures/rem-object-supplement-draft/` in the source repository. Its present
+cases are REM-ENCRYPT cases, which REM-ENCRYPT §13.4 describes; this section
+describes the supplement because the two documents share one archive. Its
+cases are review-only. They become conformance vectors only when the revision
+that adds them is frozen and publishes its own archive. Until independent
+review and freeze, they are not copied into or substituted for publication
+artifacts. At that freeze the supplement becomes a separate archive in the
+form described above, with its own name, DOI and digest, and the revision
+that adds it cites it. The archive this section names is never re-cut.
+`specs/README.md` states the release rules for candidate vectors under “How a
+revision is frozen”.
+
 ### 13.1. Plaintext-Stream Positive Vectors
 
 The plaintext suite MUST include at least the vectors in the following table.
@@ -1984,7 +1997,7 @@ Builder's input.
 | Symlink or directory with nonzero size | `InvalidInput` |
 | Symlink missing target | `InvalidInput` |
 | Directory path without trailing slash | `InvalidInput` |
-| A hardlink whose target is absent or not a regular-file primary | `InvalidHardlinkTarget` |
+| A hardlink whose target is absent, appears later in the stream, or is not a regular-file primary | `InvalidHardlinkTarget` |
 
 **Plaintext stream, Reader side.** These are byte vectors.
 
@@ -2010,6 +2023,7 @@ Builder's input.
 | Pax record missing trailing newline | `PaxRecordMalformed` |
 | Pax value with control character | `PaxRecordMalformed` |
 | Non-UTF-8 pax value | `PaxRecordMalformed` |
+| A hardlink whose target is absent, appears later in archive order, or is a preceding symlink rather than a regular-file primary | `InvalidHardlinkTarget` |
 
 **Manifest.**
 
@@ -2035,6 +2049,7 @@ Builder's input.
 | --- | --- |
 | An inventory that disagrees with the entries: a non-`user.` attribute is present but the inventory is empty or wrong | `ManifestInvalid` |
 | A non-canonical `ext` value | `Cbor` |
+| A canonically encoded `ext` value that is not a map | `ManifestInvalid` |
 | A manifest tamper with constant payload, with an anchor present: a repointed `path`, swapped `file_sha256`, or altered `first_chunk_lba` | `ManifestDigestMismatch` |
 
 Each additive negative vector pins the typed Section 11 error name and names
@@ -2072,6 +2087,8 @@ Conformance evidence MUST include:
 
 The `expected.default_restore` fields that Section 13.1 describes as
 informative are not part of this evidence.
+Neither are the cases of the candidate supplement Section 13 describes,
+until the revision that adds them is frozen.
 
 The archive SHA-256 in Section 13 identifies one specific version of the
 frozen vector distribution. Changing an existing entry's byte encoding or
@@ -2303,6 +2320,26 @@ effect on conformance.
     Section 12.10 no longer calls a Windows path such as `C:\x`
     drive-relative; and Appendix E cites REM-ENCRYPT §6 in the document's
     usual form.
+
+  The vector step then changed the text as follows.
+
+  - Section 13.6 now describes the archive's forward-target Builder hardlink
+    case, the three Reader hardlink-target cases, and the non-map extension
+    value. REM-ENCRYPT §13.4 now describes the metadata and key-frame cases
+    it omitted. Describing these existing cases adds no requirement.
+  - REM-ENCRYPT §13.4's Sealer-input list no longer lists entropy failure
+    among the vectors that keep their normative force, because no portable
+    vector for it can exist; the archive never held one, and the rule on
+    entropy failure itself is unchanged. The list now places the
+    duplicate-epoch case in the candidate supplement.
+  - Section 13 now describes the candidate supplement, whose present cases
+    are REM-ENCRYPT's, and its review-only status. Section 14 excludes its
+    cases from conformance evidence until the revision that adds them is
+    frozen. REM-ENCRYPT §13 excludes them from its
+    applicable vectors until that freeze. The pinned conformance target is
+    unchanged.
+
+  No byte of the format changed, and no valid object or vector changed.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** Adds Appendix E,
   an informative description of the capacity cost the alignment rule imposes
   on very small entries and of the `.remwrap.tar` / `.remwrap.idx` wrapper
