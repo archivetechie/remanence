@@ -204,10 +204,10 @@ pub use terminal_tail::{
     TERMINAL_INDEX_REPLICA_COUNT, TERMINAL_INDEX_SEPARATION_COUNT, TERMINAL_TAIL_COMPONENT_COUNT,
 };
 pub use terminal_writer::{
-    reconcile_terminal_tail_next, terminal_component_bundle, write_terminal_tail,
-    write_terminal_tail_step, TerminalComponentCommit, TerminalComponentReconcileEvidence,
-    TerminalTailAuthority, TerminalTailRunOutcome, TerminalTailStepOutcome, TerminalTailWriteError,
-    TerminalTripleWritePlan,
+    assemble_terminal_plan, reconcile_terminal_tail_next, terminal_component_bundle,
+    write_terminal_tail, write_terminal_tail_step, TerminalComponentCommit,
+    TerminalComponentReconcileEvidence, TerminalTailAuthority, TerminalTailRunOutcome,
+    TerminalTailStepOutcome, TerminalTailWriteError, TerminalTripleWritePlan,
 };
 
 // ====================================================================

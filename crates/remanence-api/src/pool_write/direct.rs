@@ -252,22 +252,20 @@ pub(super) fn build_direct_terminal_plan(
         Some(prefix) => prefix.diagnostics.clone(),
         None => remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")).capture()?,
     };
-    let writer_version = diagnostics.writer_version;
-    let write_timestamp = diagnostics.write_timestamp;
-    let edition = remanence_parity::plan_tape_index_edition(
-        remanence_parity::TapeIndexEditionDescriptor {
-            tape_uuid: selected.tape_uuid,
-            edition_id,
-            edition_sequence,
-            scope: summary.scope,
-            counts: summary.counts,
-            block_size: selected.block_size,
-            compression_enabled: false,
-            writer_version: writer_version.clone(),
-            write_timestamp: write_timestamp.clone(),
-            terminal_layout: layout,
-        },
+    let writer_version = diagnostics.writer_version.clone();
+    let write_timestamp = diagnostics.write_timestamp.clone();
+    let plan = remanence_parity::assemble_terminal_plan(
+        selected.tape_uuid,
+        selected.block_size,
+        false,
+        edition_sequence,
+        summary.scope,
+        summary.counts,
         source,
+        layout,
+        diagnostics,
+        edition_id,
+        remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
     )
     .map_err(|error| {
         PoolWriteError::InvalidInput(format!("plan direct terminal edition: {error}"))
@@ -280,15 +278,12 @@ pub(super) fn build_direct_terminal_plan(
         recovery_required: false,
         edition_id,
         edition_sequence,
-        edition_digest: edition.edition_digest,
+        edition_digest: plan.edition.edition_digest,
         writer_version,
         write_timestamp,
         terminal_prefix: terminal_prefix.map(remanence_state::TerminalFinalizationPrefixPlan::from),
         layout: remanence_state::TerminalFinalizationLayout::try_from(layout)?,
     };
-    let plan = TerminalTripleWritePlan::new(edition).map_err(|error| {
-        PoolWriteError::InvalidInput(format!("plan direct terminal writer: {error}"))
-    })?;
     Ok((intent, plan))
 }
 

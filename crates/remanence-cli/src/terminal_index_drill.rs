@@ -16,17 +16,16 @@ use std::process::ExitCode;
 use clap::{Args, ValueEnum};
 use remanence_library::{scsi::ScsiError, DriveHandle, LinuxSgTransport, TapeIoError};
 use remanence_parity::{
-    encode_tape_index_bootstrap_footer, encode_tape_index_replica_header, plan_index_separation,
-    plan_tape_index_edition, plan_tape_index_replica, read_terminal_index_inventory,
-    reconcile_terminal_tail_next, recover_terminal_inventory_from_bot, verify_terminal_index_full,
-    write_terminal_tail_step, BotStructuralRecoveryReason, DriveHandleRawSource,
-    IndexSeparationDescriptor, ParityError, PhysicalPositionHint, RawReadOutcome, RawTapeSink,
-    RawTapeSource, RawWriteOutcome, SpaceFilemarksOutcome, TapeIndexReplicaMapEntry,
-    TapeIndexReplicaObjectRow, TapeIndexReplicaObservation, TapeIndexReplicaRecordSource,
-    TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalInventoryOutcome,
-    TerminalInventoryReadError, TerminalReplicaEvidence, TerminalSeparationEvidence,
-    TerminalTailAuthority, TerminalTailComponentPlan, TerminalTailProgress,
-    TerminalTailStepOutcome, TerminalTripleWritePlan,
+    encode_tape_index_bootstrap_footer, encode_tape_index_replica_header,
+    read_terminal_index_inventory, reconcile_terminal_tail_next,
+    recover_terminal_inventory_from_bot, verify_terminal_index_full, write_terminal_tail_step,
+    BotStructuralRecoveryReason, DriveHandleRawSource, ParityError, PhysicalPositionHint,
+    RawReadOutcome, RawTapeSink, RawTapeSource, RawWriteOutcome, SpaceFilemarksOutcome,
+    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaObservation,
+    TapeIndexReplicaRecordSource, TerminalComponentCommit, TerminalComponentReconcileEvidence,
+    TerminalInventoryOutcome, TerminalInventoryReadError, TerminalReplicaEvidence,
+    TerminalSeparationEvidence, TerminalTailAuthority, TerminalTailComponentPlan,
+    TerminalTailProgress, TerminalTailStepOutcome, TerminalTripleWritePlan,
 };
 use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -626,39 +625,31 @@ fn run_terminal_reconciliation_drill<S: RawTapeSource>(
     edition: remanence_parity::TapeIndexEditionPlan,
     requested: TerminalReconcileDrill,
 ) -> Result<(TerminalReconciliationReport, Vec<String>), String> {
-    let replicas = [
-        plan_tape_index_replica(edition.clone(), 1)
-            .map_err(|error| format!("plan reconciliation replica A: {error}"))?,
-        plan_tape_index_replica(edition.clone(), 2)
-            .map_err(|error| format!("plan reconciliation replica B: {error}"))?,
-        plan_tape_index_replica(edition.clone(), 3)
-            .map_err(|error| format!("plan reconciliation replica C: {error}"))?,
-    ];
-    let separation = |ordinal| {
-        let component = edition
-            .descriptor
-            .terminal_layout
-            .separation(ordinal)
-            .map_err(|error| format!("resolve reconciliation gap {ordinal}: {error}"))?;
-        let nominal_extent_bytes = component
-            .record_count
-            .checked_mul(u64::from(edition.descriptor.block_size))
-            .ok_or_else(|| "reconciliation drill separation extent overflows".to_string())?;
-        plan_index_separation(IndexSeparationDescriptor {
-            tape_uuid: edition.descriptor.tape_uuid,
-            edition_id: edition.descriptor.edition_id,
-            gap_ordinal: ordinal,
-            block_size: edition.descriptor.block_size,
-            nominal_extent_bytes,
-            total_records: component.record_count,
-            compression_enabled: edition.descriptor.compression_enabled,
-            terminal_layout: edition.descriptor.terminal_layout,
-        })
-        .map_err(|error| format!("plan reconciliation gap {ordinal}: {error}"))
-    };
-    let separations = [separation(1)?, separation(2)?];
-    let plan = TerminalTripleWritePlan::from_parts(edition, replicas, separations)
-        .map_err(|error| format!("plan terminal reconciliation drill: {error}"))?;
+    let descriptor = edition.descriptor;
+    let nominal_extent_bytes = descriptor
+        .terminal_layout
+        .separation(1)
+        .map_err(|error| error.to_string())?
+        .record_count
+        .checked_mul(u64::from(descriptor.block_size))
+        .ok_or_else(|| "reconciliation drill separation extent overflows".to_string())?;
+    let plan = remanence_parity::assemble_terminal_plan(
+        descriptor.tape_uuid,
+        descriptor.block_size,
+        descriptor.compression_enabled,
+        descriptor.edition_sequence,
+        descriptor.scope,
+        descriptor.counts,
+        records,
+        descriptor.terminal_layout,
+        remanence_parity::ParityMapDiagnostics {
+            writer_version: descriptor.writer_version,
+            write_timestamp: descriptor.write_timestamp,
+        },
+        descriptor.edition_id,
+        nominal_extent_bytes,
+    )
+    .map_err(|error| format!("plan terminal reconciliation drill: {error}"))?;
     let component = plan.edition.descriptor.terminal_layout.components[0];
     source.unreadable_lbas.clear();
     source.replacement_records.clear();
@@ -900,11 +891,31 @@ fn inspect_source<S: RawTapeSource>(
         descriptor.edition_id[0] ^= 0xff;
         descriptor.writer_version = "remanence-tix-conflicting-edition".to_string();
         let mut records = captured.clone();
-        let conflicting_edition = plan_tape_index_edition(descriptor, &mut records)
-            .map_err(|error| format!("plan conflicting terminal edition: {error}"))?;
-        let conflicting = plan_tape_index_replica(conflicting_edition, 1)
-            .map_err(|error| format!("plan conflicting replica A: {error}"))?;
-        let header = encode_tape_index_replica_header(&conflicting)
+        let conflicting_plan = remanence_parity::assemble_terminal_plan(
+            descriptor.tape_uuid,
+            descriptor.block_size,
+            descriptor.compression_enabled,
+            descriptor.edition_sequence,
+            descriptor.scope,
+            descriptor.counts,
+            &mut records,
+            descriptor.terminal_layout,
+            remanence_parity::ParityMapDiagnostics {
+                writer_version: descriptor.writer_version,
+                write_timestamp: descriptor.write_timestamp,
+            },
+            descriptor.edition_id,
+            descriptor
+                .terminal_layout
+                .separation(1)
+                .map_err(|error| error.to_string())?
+                .record_count
+                .checked_mul(u64::from(descriptor.block_size))
+                .ok_or_else(|| "conflicting edition separation extent overflows".to_string())?,
+        )
+        .map_err(|error| format!("plan conflicting terminal edition: {error}"))?;
+        let conflicting = &conflicting_plan.replicas[0];
+        let header = encode_tape_index_replica_header(conflicting)
             .map_err(|error| format!("encode conflicting replica A header: {error}"))?;
         let header_sha256: [u8; 32] = Sha256::digest(&header).into();
         let observation = TapeIndexReplicaObservation {
@@ -912,7 +923,7 @@ fn inspect_source<S: RawTapeSource>(
             start_lba: component.planned_start_lba,
             record_count: component.record_count,
         };
-        let footer = encode_tape_index_bootstrap_footer(&conflicting, header_sha256, observation)
+        let footer = encode_tape_index_bootstrap_footer(conflicting, header_sha256, observation)
             .map_err(|error| format!("encode conflicting replica A footer: {error}"))?;
         let footer_lba = component
             .planned_start_lba

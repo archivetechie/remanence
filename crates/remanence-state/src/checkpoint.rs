@@ -1216,15 +1216,17 @@ impl<'a> CheckpointTerminalIndexRecordSource<'a> {
         &mut self,
         intent: &TerminalFinalizationIntent,
     ) -> Result<remanence_parity::TapeIndexEditionPlan, StateError> {
+        Ok(self.reconstruct_final_plan(intent)?.edition)
+    }
+
+    /// Reconstruct the complete tail through the shared pure assembly, failing
+    /// closed if either persisted digest differs from replayed authority.
+    pub fn reconstruct_final_plan(
+        &mut self,
+        intent: &TerminalFinalizationIntent,
+    ) -> Result<remanence_parity::TerminalTripleWritePlan, StateError> {
         intent.validate_for_tape(self.tape_uuid)?;
-        let descriptor = remanence_parity::TapeIndexEditionDescriptor {
-            tape_uuid: intent.tape_uuid,
-            edition_id: intent.edition_id,
-            edition_sequence: intent.edition_sequence,
-            scope: self.summary.scope,
-            counts: self.summary.counts,
-            block_size: intent.layout.block_size,
-            compression_enabled: false,
+        let diagnostics = remanence_parity::ParityMapDiagnostics {
             writer_version: intent.terminal_prefix.as_ref().map_or_else(
                 || intent.writer_version.clone(),
                 |prefix| prefix.diagnostics.writer_version.clone(),
@@ -1233,16 +1235,27 @@ impl<'a> CheckpointTerminalIndexRecordSource<'a> {
                 || intent.write_timestamp.clone(),
                 |prefix| prefix.diagnostics.write_timestamp.clone(),
             ),
-            terminal_layout: intent.layout.try_to_parity_layout()?,
         };
-        let plan =
-            remanence_parity::plan_tape_index_edition(descriptor, self).map_err(|error| {
-                StateError::JournalReplayFailed(format!(
-                    "reconstruct terminal final edition from checkpoint authority: {error}"
-                ))
-            })?;
-        if plan.edition_digest != intent.edition_digest
-            || plan.layout_digest != intent.layout.layout_digest
+        let plan = remanence_parity::assemble_terminal_plan(
+            intent.tape_uuid,
+            intent.layout.block_size,
+            false,
+            intent.edition_sequence,
+            self.summary.scope,
+            self.summary.counts,
+            self,
+            intent.layout.try_to_parity_layout()?,
+            diagnostics,
+            intent.edition_id,
+            remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+        )
+        .map_err(|error| {
+            StateError::JournalReplayFailed(format!(
+                "reconstruct terminal final edition from checkpoint authority: {error}"
+            ))
+        })?;
+        if plan.edition.edition_digest != intent.edition_digest
+            || plan.edition.layout_digest != intent.layout.layout_digest
         {
             return Err(StateError::JournalReplayFailed(
                 "reconstructed terminal edition digest does not match persisted intent".to_string(),
@@ -6502,6 +6515,82 @@ mod tests {
             .reconstruct_final_edition(&intent)
             .expect_err("changed writer diagnostics must change the edition digest");
         assert!(mismatch.to_string().contains("digest"), "{mismatch}");
+    }
+
+    #[test]
+    fn finalization_resume_reconstructs_persisted_intent_through_shared_assembly() {
+        let dir = tempfile::tempdir().expect("temporary checkpoint directory");
+        let tape_uuid = [0x7C; 16];
+        let journal = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("open journal");
+        let mut lease = journal.acquire_exclusive().expect("acquire lease");
+        let checkpoint = record(tape_uuid);
+        lease.append(&checkpoint).expect("persist checkpoint");
+        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+            .expect("checkpoint authority");
+        let summary = source.summary();
+        let replica = remanence_parity::checked_tape_index_replica_layout(
+            checkpoint.block_size,
+            summary.counts,
+        )
+        .expect("replica geometry");
+        let layout = remanence_parity::TerminalTailLayout::new(
+            0,
+            checkpoint.block_size,
+            checkpoint.next_tape_file_number,
+            checkpoint.eod_lba,
+            replica.replica_record_count,
+            4096,
+        )
+        .expect("tail layout");
+        let mut intent = finalization_intent(tape_uuid);
+        let planned = remanence_parity::assemble_terminal_plan(
+            tape_uuid,
+            checkpoint.block_size,
+            false,
+            intent.edition_sequence,
+            summary.scope,
+            summary.counts,
+            &mut source,
+            layout,
+            remanence_parity::ParityMapDiagnostics {
+                writer_version: intent.writer_version.clone(),
+                write_timestamp: intent.write_timestamp.clone(),
+            },
+            intent.edition_id,
+            remanence_parity::DEFAULT_INDEX_SEPARATION_BYTES,
+        )
+        .expect("shared assembly");
+        intent.layout = TerminalFinalizationLayout::try_from(layout).expect("persist layout");
+        intent.edition_digest = planned.edition.edition_digest;
+        lease
+            .begin_terminal_finalization(&intent)
+            .expect("persist new intent");
+        drop(lease);
+        drop(journal);
+
+        let reopened = FileCheckpointJournal::open(dir.path(), tape_uuid).expect("reopen journal");
+        let lease = reopened
+            .acquire_exclusive_for_terminal_recovery()
+            .expect("resume lease");
+        let persisted = lease
+            .terminal_finalization_intent()
+            .expect("read intent")
+            .expect("existing intent");
+        assert_eq!(persisted, intent);
+        let mut source = CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(&lease)
+            .expect("replay checkpoint authority");
+        let resumed = source
+            .reconstruct_final_edition(&persisted)
+            .expect("resume exact edition");
+        assert_eq!(resumed, planned.edition);
+        assert_eq!(resumed.descriptor.edition_id, persisted.edition_id);
+        let mut corrupt = persisted;
+        corrupt.edition_digest[0] ^= 1;
+        assert!(source
+            .reconstruct_final_edition(&corrupt)
+            .expect_err("digest mismatch must fail closed")
+            .to_string()
+            .contains("digest"));
     }
 
     #[test]

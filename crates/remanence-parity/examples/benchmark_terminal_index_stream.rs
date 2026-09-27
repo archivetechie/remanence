@@ -13,11 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use remanence_parity::{
-    checked_tape_index_replica_layout, plan_tape_index_edition, plan_tape_index_replica,
-    write_tape_index_replica, ObjectRecoveryRepresentation, ParityError,
-    TapeIndexEditionDescriptor, TapeIndexReplicaCounts, TapeIndexReplicaFileKind,
-    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaObservation,
-    TapeIndexReplicaRecordSource, TapeIndexReplicaScope, TerminalTailLayout,
+    assemble_terminal_plan, checked_tape_index_replica_layout, write_tape_index_replica,
+    ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics, TapeIndexReplicaCounts,
+    TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
+    TapeIndexReplicaObservation, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
+    TerminalTailLayout,
 };
 
 const DEFAULT_REPRESENTATIVE_ROWS: u64 = 10_000;
@@ -226,39 +226,42 @@ fn run_profile(
         replica_layout.replica_record_count,
         COMPACT_GAP_RECORDS,
     )?;
-    let descriptor = TapeIndexEditionDescriptor {
-        tape_uuid: [identity_byte; 16],
-        edition_id: [identity_byte.wrapping_add(1); 16],
-        edition_sequence: 1,
-        scope: TapeIndexReplicaScope {
-            covered_prefix_tape_file_count: structural_rows,
-            total_data_ordinals: object_rows,
-            highest_protected_ordinal: 0,
-        },
-        counts,
-        block_size: BLOCK_SIZE,
-        compression_enabled: false,
-        writer_version: "terminal-index-stream-benchmark/1".to_string(),
-        write_timestamp: "2026-08-09T00:00:00Z".to_string(),
-        terminal_layout,
-    };
     let mut source = SyntheticRecords {
         object_rows,
         structural_passes: 0,
         object_passes: 0,
     };
     let started = Instant::now();
-    let edition = plan_tape_index_edition(descriptor, &mut source)?;
+    let assembled = assemble_terminal_plan(
+        [identity_byte; 16],
+        BLOCK_SIZE,
+        false,
+        1,
+        TapeIndexReplicaScope {
+            covered_prefix_tape_file_count: structural_rows,
+            total_data_ordinals: object_rows,
+            highest_protected_ordinal: 0,
+        },
+        counts,
+        &mut source,
+        terminal_layout,
+        ParityMapDiagnostics {
+            writer_version: "terminal-index-stream-benchmark/1".to_string(),
+            write_timestamp: "2026-08-09T00:00:00Z".to_string(),
+        },
+        [identity_byte.wrapping_add(1); 16],
+        COMPACT_GAP_RECORDS * u64::from(BLOCK_SIZE),
+    )?;
+    let edition = &assembled.edition;
     let mut emitted_blocks = 0u64;
     let mut emitted_bytes = 0u64;
-    for ordinal in 1..=3 {
-        let plan = plan_tape_index_replica(edition.clone(), ordinal)?;
+    for plan in &assembled.replicas {
         let observation = TapeIndexReplicaObservation {
             tape_file_number: plan.component.planned_tape_file_number,
             start_lba: plan.component.planned_start_lba,
             record_count: plan.component.record_count,
         };
-        write_tape_index_replica(&plan, observation, &mut source, |block| {
+        write_tape_index_replica(plan, observation, &mut source, |block| {
             black_box(block);
             emitted_blocks = emitted_blocks.checked_add(1).ok_or(ParityError::Invariant(
                 "benchmark emitted block count overflows",

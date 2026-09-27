@@ -391,9 +391,10 @@ fn new_epoch_parity_accumulators(
         .collect()
 }
 
-fn sidecar_summary_to_directory_entry(sidecar: &SidecarWriteSummary) -> SidecarEpochDirectoryEntry {
-    let mut flags =
-        SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD;
+fn sidecar_summary_to_directory_entry(
+    sidecar: &SidecarWriteSummary,
+    mut flags: u32,
+) -> SidecarEpochDirectoryEntry {
     if sidecar.final_partial_epoch {
         flags |= SIDECAR_DIRECTORY_FLAG_FINAL_PARTIAL_EPOCH;
     }
@@ -851,6 +852,8 @@ pub struct ParitySinkSessionState {
     hardware_early_warning_seen: bool,
     bot_bootstrap_committed: bool,
     next_parity_map_sequence: u64,
+    directory_flags: u32,
+    parity_map_diagnostic_keys: bool,
     last_physical_lba: u64,
     tape_file_start_lbas: BTreeMap<u64, u64>,
 }
@@ -1045,6 +1048,8 @@ pub struct ParitySink<'a> {
 
     /// Next sink-owned parity_map sequence number.
     next_parity_map_sequence: u64,
+    directory_flags: u32,
+    parity_map_diagnostic_keys: bool,
 
     /// Physical cursor after the most recent successful raw operation. This
     /// avoids issuing extra POSITION probes solely for placement distance
@@ -1064,6 +1069,38 @@ impl<'a> ParitySink<'a> {
     /// Identity retained by this session, including its injectable clock.
     pub fn writer_identity(&self) -> &WriterIdentity {
         &self.identity
+    }
+
+    /// Set explicit ParityMap encoding choices before any fresh-tape emission.
+    /// The partial-epoch flag remains derived from each sidecar's geometry;
+    /// `directory_flags` selects only the primary/tail known-good hints.
+    pub fn configure_parity_map_encoding(
+        &mut self,
+        sequence_start: u64,
+        directory_flags: u32,
+        diagnostic_keys_present: bool,
+    ) -> Result<(), ParityError> {
+        if self.bot_bootstrap_committed
+            || self.active_object.is_some()
+            || self.last_physical_lba != 0
+            || self.filemark_map.next_tape_file_number()? != 0
+        {
+            return Err(ParityError::Invariant(
+                "ParityMap encoding must be selected before writing",
+            ));
+        }
+        if directory_flags
+            & !(SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD)
+            != 0
+        {
+            return Err(ParityError::Invariant(
+                "invalid ParityMap directory hint flags",
+            ));
+        }
+        self.next_parity_map_sequence = sequence_start;
+        self.directory_flags = directory_flags;
+        self.parity_map_diagnostic_keys = diagnostic_keys_present;
+        Ok(())
     }
 
     fn projected_map_digest_for_builder(
@@ -1123,6 +1160,8 @@ impl<'a> ParitySink<'a> {
             hardware_early_warning_seen: self.hardware_early_warning_seen,
             bot_bootstrap_committed: self.bot_bootstrap_committed,
             next_parity_map_sequence: self.next_parity_map_sequence,
+            directory_flags: self.directory_flags,
+            parity_map_diagnostic_keys: self.parity_map_diagnostic_keys,
             last_physical_lba: self.last_physical_lba,
             tape_file_start_lbas: self.tape_file_start_lbas,
         })
@@ -1222,6 +1261,8 @@ impl<'a> ParitySink<'a> {
             hardware_early_warning_seen: state.hardware_early_warning_seen,
             bot_bootstrap_committed: state.bot_bootstrap_committed,
             next_parity_map_sequence: state.next_parity_map_sequence,
+            directory_flags: state.directory_flags,
+            parity_map_diagnostic_keys: state.parity_map_diagnostic_keys,
             last_physical_lba: state.last_physical_lba,
             tape_file_start_lbas: state.tape_file_start_lbas,
         })
@@ -1447,6 +1488,9 @@ impl<'a> ParitySink<'a> {
             hardware_early_warning_seen: false,
             bot_bootstrap_committed: false,
             next_parity_map_sequence: 0,
+            directory_flags: SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
+                | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+            parity_map_diagnostic_keys: true,
             last_physical_lba: 0,
             tape_file_start_lbas: BTreeMap::new(),
         })
@@ -2031,8 +2075,12 @@ impl<'a> ParitySink<'a> {
                 sequence,
                 directory: provisional_directory,
                 canonical_map_digest: [0; 32],
-                writer_version: Some(diagnostics.writer_version.clone()),
-                write_timestamp: Some(diagnostics.write_timestamp.clone()),
+                writer_version: self
+                    .parity_map_diagnostic_keys
+                    .then(|| diagnostics.writer_version.clone()),
+                write_timestamp: self
+                    .parity_map_diagnostic_keys
+                    .then(|| diagnostics.write_timestamp.clone()),
             },
             self.block_size_bytes,
         )?;
@@ -2057,8 +2105,12 @@ impl<'a> ParitySink<'a> {
                 sequence,
                 directory,
                 canonical_map_digest: digest.map_sha256,
-                writer_version: Some(diagnostics.writer_version.clone()),
-                write_timestamp: Some(diagnostics.write_timestamp.clone()),
+                writer_version: self
+                    .parity_map_diagnostic_keys
+                    .then(|| diagnostics.writer_version.clone()),
+                write_timestamp: self
+                    .parity_map_diagnostic_keys
+                    .then(|| diagnostics.write_timestamp.clone()),
             },
             self.block_size_bytes,
         )?;
@@ -2292,8 +2344,7 @@ impl<'a> ParitySink<'a> {
                 sidecar.protected_ordinal_start,
                 sidecar.protected_ordinal_end_exclusive,
             )?;
-            let mut flags =
-                SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD | SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD;
+            let mut flags = self.directory_flags;
             let final_partial_epoch = sidecar.is_terminal
                 && encoded.header.real_data_shard_count < encoded.header.logical_shard_count;
             if final_partial_epoch {
@@ -2361,8 +2412,12 @@ impl<'a> ParitySink<'a> {
                         sequence,
                         directory,
                         canonical_map_digest,
-                        writer_version: Some(diagnostics.writer_version.clone()),
-                        write_timestamp: Some(diagnostics.write_timestamp.clone()),
+                        writer_version: self
+                            .parity_map_diagnostic_keys
+                            .then(|| diagnostics.writer_version.clone()),
+                        write_timestamp: self
+                            .parity_map_diagnostic_keys
+                            .then(|| diagnostics.write_timestamp.clone()),
                     },
                     self.block_size_bytes,
                 )
@@ -3268,7 +3323,10 @@ impl<'a> ParitySink<'a> {
             physical_start_lba: self.tape_file_start_lba(entry.tape_file_number),
         };
         self.sidecar_directory_entries
-            .push(sidecar_summary_to_directory_entry(&summary));
+            .push(sidecar_summary_to_directory_entry(
+                &summary,
+                self.directory_flags,
+            ));
 
         Ok(summary)
     }

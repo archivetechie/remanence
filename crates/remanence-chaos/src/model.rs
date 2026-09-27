@@ -93,6 +93,132 @@ impl VirtualTape {
     }
 }
 
+/// One exported tape file. Offsets retain individual data-record boundaries;
+/// the optional filemark records its absolute physical record index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedTapeFile {
+    /// Physical record index of the first record in this file.
+    pub start_record: usize,
+    /// Concatenated data bytes, with sparse zero records expanded.
+    pub bytes: Vec<u8>,
+    /// Byte offset of each data record within `bytes`.
+    pub record_offsets: Vec<usize>,
+    /// Physical index of the terminating filemark, absent for a torn tail.
+    pub filemark_record: Option<usize>,
+}
+
+/// Portable byte streams and physical boundaries from the chaos tape model.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportedTapeImage {
+    /// Files in order, including empty files terminated by filemarks.
+    pub files: Vec<ExportedTapeFile>,
+    /// EOD is immediately after the last physical record.
+    pub eod_record: usize,
+}
+
+impl VirtualTape {
+    /// Export all physical records, including consecutive filemarks and a
+    /// possible unterminated tail. A final filemark does not invent an extra file.
+    pub fn export_image(&self) -> ExportedTapeImage {
+        let mut files = Vec::new();
+        let mut file = ExportedTapeFile {
+            start_record: 0,
+            bytes: Vec::new(),
+            record_offsets: Vec::new(),
+            filemark_record: None,
+        };
+        for (index, record) in self.records.iter().enumerate() {
+            match record {
+                Record::Block(bytes) => {
+                    file.record_offsets.push(file.bytes.len());
+                    file.bytes.extend_from_slice(bytes);
+                }
+                Record::ZeroBlock(len) => {
+                    file.record_offsets.push(file.bytes.len());
+                    file.bytes.resize(
+                        file.bytes
+                            .len()
+                            .checked_add(*len as usize)
+                            .expect("exported tape file length overflows usize"),
+                        0,
+                    );
+                }
+                Record::Filemark => {
+                    file.filemark_record = Some(index);
+                    files.push(file);
+                    file = ExportedTapeFile {
+                        start_record: index + 1,
+                        bytes: Vec::new(),
+                        record_offsets: Vec::new(),
+                        filemark_record: None,
+                    };
+                }
+            }
+        }
+        if !file.record_offsets.is_empty() {
+            files.push(file);
+        }
+        ExportedTapeImage {
+            files,
+            eod_record: self.records.len(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_export_tests {
+    use super::*;
+
+    #[test]
+    fn export_expands_zeros_preserves_filemarks_and_physical_eod() {
+        let mut tape = VirtualTape::empty(1024, 4);
+        assert_eq!(
+            tape.export_image(),
+            ExportedTapeImage {
+                files: vec![],
+                eod_record: 0
+            }
+        );
+        tape.records = vec![
+            Record::Block(vec![1, 2]),
+            Record::ZeroBlock(4),
+            Record::Filemark,
+            Record::Filemark,
+            Record::Block(vec![3]),
+        ];
+        let exported = tape.export_image();
+        assert_eq!(exported.eod_record, 5);
+        assert_eq!(
+            exported.files,
+            vec![
+                ExportedTapeFile {
+                    start_record: 0,
+                    bytes: vec![1, 2, 0, 0, 0, 0],
+                    record_offsets: vec![0, 2],
+                    filemark_record: Some(2)
+                },
+                ExportedTapeFile {
+                    start_record: 3,
+                    bytes: vec![],
+                    record_offsets: vec![],
+                    filemark_record: Some(3)
+                },
+                ExportedTapeFile {
+                    start_record: 4,
+                    bytes: vec![3],
+                    record_offsets: vec![0],
+                    filemark_record: None
+                },
+            ]
+        );
+        tape.records.push(Record::Filemark);
+        let complete = tape.export_image();
+        assert_eq!(complete.eod_record, 6);
+        assert_eq!(complete.files.len(), 3);
+        assert_eq!(complete.files[2].filemark_record, Some(5));
+    }
+}
+
 fn record_data_bytes(records: &[Record]) -> u64 {
     records
         .iter()

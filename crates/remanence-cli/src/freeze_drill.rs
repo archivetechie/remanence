@@ -19,25 +19,16 @@ use std::time::{Duration, Instant};
 
 use clap::ValueEnum;
 use remanence_format::{
-    plan_rem_tar_object, stream_rem_tar_object, write_rem_tar_object_from_readers, FormatError,
-    RemTarEntrySink, RemTarFileSpec, RemTarFileStream, RemTarObjectOptions, RemTarStreamEntry,
+    stream_rem_tar_object, FormatError, RemTarEntrySink, RemTarFileSpec, RemTarObjectOptions,
+    RemTarStreamEntry,
 };
 use remanence_library::{DriveHandle, DriveHandleSource, SgTransport};
 use remanence_parity::{
-    checked_tape_index_replica_layout, default_scheme_for_block_size, index_separation_records,
-    plan_index_separation, plan_tape_index_edition, plan_tape_index_replica,
-    read_terminal_index_inventory, scan_reconstruct_filemark_map_with_report, write_terminal_tail,
-    CommittedBundle, CommittedBundleKind, CommittedState, DriveHandleRawSink, DriveHandleRawSource,
-    FilemarkMap, IndexSeparationDescriptor, JournalError, ObjectParitySource,
-    ObjectRecoveryRepresentation, OpenTrust, ParityAuditHook, ParityError, ParityScheme,
-    ParitySink, RecoveryEvent, RecoveryOutcome, ScanDamageKind, ScopedFilemarkMap, TapeFileEntry,
-    TapeFileJournal, TapeFileKind, TapeFileMapEntry, TapeFilePosition, TapeIndexEditionDescriptor,
-    TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
-    TapeIndexReplicaObjectRow, TapeIndexReplicaRecordSource, TapeIndexReplicaScope,
-    TerminalComponentCommit, TerminalComponentReconcileEvidence, TerminalInventoryOutcome,
-    TerminalPrefixPlan, TerminalPrefixReconcileEvidence, TerminalTailAuthority,
-    TerminalTailComponentPlan, TerminalTailLayout, TerminalTailProgress, TerminalTailRunOutcome,
-    TerminalTripleCapacityRuntimeState, TerminalTripleCloseInput, TerminalTripleWritePlan,
+    default_scheme_for_block_size, index_separation_records, read_terminal_index_inventory,
+    scan_reconstruct_filemark_map_with_report, DriveHandleRawSource, FilemarkMap,
+    ObjectParitySource, OpenTrust, ParityAuditHook, ParityScheme, RecoveryEvent, RecoveryOutcome,
+    ScanDamageKind, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TerminalInventoryOutcome,
     DEFAULT_INDEX_SEPARATION_BYTES,
 };
 use serde::{Serialize, Serializer};
@@ -274,115 +265,6 @@ trait DrillTransportFactory {
     ) -> Result<DamagedDrive, String>;
 }
 
-struct DrillJournal {
-    tape_uuid: [u8; 16],
-    bundles: Vec<CommittedBundle>,
-}
-
-impl DrillJournal {
-    fn new(tape_uuid: [u8; 16]) -> Self {
-        Self {
-            tape_uuid,
-            bundles: Vec::new(),
-        }
-    }
-}
-
-impl TapeFileJournal for DrillJournal {
-    fn tape_uuid(&self) -> [u8; 16] {
-        self.tape_uuid
-    }
-
-    fn commit_bundle(&mut self, bundle: &CommittedBundle) -> Result<(), JournalError> {
-        self.bundles.push(bundle.clone());
-        Ok(())
-    }
-
-    fn load_committed(&self) -> Result<CommittedState, JournalError> {
-        let retained_end = self
-            .bundles
-            .iter()
-            .rposition(|bundle| bundle.kind == CommittedBundleKind::CheckpointedThrough)
-            .map_or(0, |index| index + 1);
-        let retained = &self.bundles[..retained_end];
-        let last = retained
-            .iter()
-            .rev()
-            .find(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough);
-        Ok(CommittedState {
-            entries: retained
-                .iter()
-                .filter(|bundle| bundle.kind != CommittedBundleKind::CheckpointedThrough)
-                .flat_map(|bundle| bundle.entries.iter().cloned())
-                .collect(),
-            highest_protected_ordinal: last.map_or(0, |bundle| bundle.highest_protected_ordinal),
-            total_committed_ordinals: last.map_or(0, |bundle| bundle.total_committed_ordinals),
-            orphaned_bundles: self.bundles[retained_end..].to_vec(),
-        })
-    }
-}
-
-#[derive(Clone)]
-struct DrillTerminalRows {
-    entries: Vec<TapeIndexReplicaMapEntry>,
-    object_rows: Vec<TapeIndexReplicaObjectRow>,
-}
-
-impl TapeIndexReplicaRecordSource for DrillTerminalRows {
-    fn visit_structural_entries(
-        &mut self,
-        visitor: &mut dyn FnMut(&TapeIndexReplicaMapEntry) -> Result<(), ParityError>,
-    ) -> Result<(), ParityError> {
-        for entry in &self.entries {
-            visitor(entry)?;
-        }
-        Ok(())
-    }
-
-    fn visit_object_rows(
-        &mut self,
-        visitor: &mut dyn FnMut(&TapeIndexReplicaObjectRow) -> Result<(), ParityError>,
-    ) -> Result<(), ParityError> {
-        for row in &self.object_rows {
-            visitor(row)?;
-        }
-        Ok(())
-    }
-}
-
-struct DrillTerminalAuthority<'a> {
-    journal: &'a mut DrillJournal,
-    progress: TerminalTailProgress,
-}
-
-impl TerminalTailAuthority for DrillTerminalAuthority<'_> {
-    fn load_progress(&mut self) -> Result<TerminalTailProgress, String> {
-        Ok(self.progress)
-    }
-
-    fn reconcile_next(
-        &mut self,
-        progress: TerminalTailProgress,
-        _component: TerminalTailComponentPlan,
-    ) -> Result<TerminalComponentReconcileEvidence, String> {
-        if progress != self.progress {
-            return Err("freeze-drill terminal progress changed before reconciliation".to_string());
-        }
-        Ok(TerminalComponentReconcileEvidence::Absent)
-    }
-
-    fn commit_after_barrier(&mut self, commit: &TerminalComponentCommit) -> Result<(), String> {
-        if commit.previous_progress != self.progress {
-            return Err("freeze-drill terminal commit used stale progress".to_string());
-        }
-        self.journal
-            .commit_terminal_component_transition(&commit.journal_bundle, &commit.checkpoint_bundle)
-            .map_err(|error| error.to_string())?;
-        self.progress = commit.next_progress;
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 struct ExpectedObject {
     object_id: String,
@@ -391,7 +273,6 @@ struct ExpectedObject {
     payload_sha256: [u8; 32],
     tape_file_number: u64,
     stored_block_count: u64,
-    recovery_row: TapeIndexReplicaObjectRow,
 }
 
 struct WrittenDrill {
@@ -511,71 +392,6 @@ fn payload_sizes(data_mib: u64) -> Result<[u64; OBJECT_COUNT], String> {
     Ok([first, second])
 }
 
-fn capacity_input(
-    scheme: &ParityScheme,
-    block_size: u32,
-    projected_object_blocks: u64,
-    runtime: TerminalTripleCapacityRuntimeState,
-) -> Result<TerminalTripleCloseInput, String> {
-    let capacity_blocks = DRILL_CAPACITY_BYTES / u64::from(block_size);
-    let remaining_tape_blocks = capacity_blocks
-        .checked_sub(runtime.used_tape_blocks)
-        .ok_or_else(|| {
-            format!(
-                "freeze-drill physical cursor {} exceeds conservative capacity basis {capacity_blocks}",
-                runtime.used_tape_blocks
-            )
-        })?;
-    let low_watermark_blocks = capacity_blocks.saturating_mul(92) / 100;
-    let high_watermark_blocks = capacity_blocks.saturating_mul(97) / 100;
-    Ok(TerminalTripleCloseInput {
-        projected_object_present: true,
-        projected_object_blocks,
-        block_size_bytes: block_size,
-        current_epoch_fill_blocks: runtime.current_epoch_fill_blocks,
-        data_shards_per_epoch: u64::from(scheme.data_blocks_per_stripe)
-            * u64::from(scheme.stripes_per_neighborhood),
-        parity_shards_per_epoch: u64::from(scheme.parity_blocks_per_stripe)
-            * u64::from(scheme.stripes_per_neighborhood),
-        pending_completed_sidecars: runtime.pending_completed_sidecars,
-        sidecar_entries_before_object: runtime.sidecar_entries_before_object,
-        structural_entries_before_object: runtime.structural_entries_before_object,
-        object_rows_before_object: runtime.object_rows_before_object,
-        object_filemark_blocks: 1,
-        sidecar_filemark_blocks: 1,
-        parity_map_filemark_blocks: 1,
-        replica_filemark_blocks: 1,
-        gap_filemark_blocks: 1,
-        gap_nominal_bytes: DEFAULT_INDEX_SEPARATION_BYTES,
-        safety_margin_blocks: 4,
-        remaining_tape_blocks,
-        capacity_basis_blocks: capacity_blocks,
-        low_watermark_blocks,
-        high_watermark_blocks,
-        pending_completed_epoch_parity_bytes: runtime.pending_completed_epoch_parity_bytes,
-        remaining_spool_bytes: u64::MAX,
-    })
-}
-
-fn terminal_map_entry(entry: &TapeFileEntry) -> TapeIndexReplicaMapEntry {
-    TapeIndexReplicaMapEntry {
-        tape_file_number: entry.tape_file_number,
-        kind: match entry.kind {
-            TapeFileKind::Object => TapeIndexReplicaFileKind::Object,
-            TapeFileKind::ParitySidecar => TapeIndexReplicaFileKind::ParitySidecar,
-            TapeFileKind::Bootstrap => TapeIndexReplicaFileKind::Bootstrap,
-            TapeFileKind::ParityMap => TapeIndexReplicaFileKind::ParityMap,
-            TapeFileKind::TapeIndexReplica => TapeIndexReplicaFileKind::TapeIndexReplica,
-            TapeFileKind::IndexSeparationExtent => TapeIndexReplicaFileKind::IndexSeparationExtent,
-        },
-        block_count: entry.block_count,
-        first_parity_data_ordinal: entry.first_parity_data_ordinal,
-        protected_ordinal_start: entry.protected_ordinal_start,
-        protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive,
-        epoch_id: entry.epoch_id,
-    }
-}
-
 fn filemark_entry_from_terminal(entry: &TapeIndexReplicaMapEntry) -> TapeFileMapEntry {
     TapeFileMapEntry {
         tape_file_number: entry.tape_file_number,
@@ -593,113 +409,6 @@ fn filemark_entry_from_terminal(entry: &TapeIndexReplicaMapEntry) -> TapeFileMap
         protected_ordinal_end_exclusive: entry.protected_ordinal_end_exclusive,
         epoch_id: entry.epoch_id,
     }
-}
-
-fn plan_drill_terminal_tail(
-    tape_uuid: [u8; 16],
-    block_size: u32,
-    gap_records: u64,
-    prefix: &TerminalPrefixPlan,
-    committed: &CommittedState,
-    expected_objects: &[ExpectedObject],
-) -> Result<(DrillTerminalRows, TerminalTripleWritePlan), String> {
-    let rows = DrillTerminalRows {
-        entries: committed.entries.iter().map(terminal_map_entry).collect(),
-        object_rows: expected_objects
-            .iter()
-            .map(|object| object.recovery_row.clone())
-            .collect(),
-    };
-    let structural_entry_count = u64::try_from(rows.entries.len())
-        .map_err(|_| "freeze-drill structural row count exceeds u64::MAX".to_string())?;
-    if structural_entry_count != prefix.tail_start_tape_file_number {
-        return Err(format!(
-            "freeze-drill terminal prefix has {structural_entry_count} rows, expected {}",
-            prefix.tail_start_tape_file_number
-        ));
-    }
-    let counts = TapeIndexReplicaCounts {
-        structural_entry_count,
-        object_row_count: u64::try_from(rows.object_rows.len())
-            .map_err(|_| "freeze-drill Object row count exceeds u64::MAX".to_string())?,
-    };
-    let replica_records = checked_tape_index_replica_layout(block_size, counts)
-        .map_err(|error| format!("plan freeze-drill terminal replica layout: {error}"))?
-        .replica_record_count;
-    let layout = TerminalTailLayout::new(
-        0,
-        block_size,
-        structural_entry_count,
-        prefix.tail_start_lba,
-        replica_records,
-        gap_records,
-    )
-    .map_err(|error| format!("plan freeze-drill terminal tail layout: {error}"))?;
-    let mut edition_hasher = Sha256::new();
-    edition_hasher.update(DRILL_SEED);
-    edition_hasher.update(tape_uuid);
-    edition_hasher.update(b"terminal-index-edition");
-    let edition_digest = edition_hasher.finalize();
-    let mut edition_id = [0u8; 16];
-    edition_id.copy_from_slice(&edition_digest[..16]);
-    let mut planning_rows = rows.clone();
-    let edition = plan_tape_index_edition(
-        TapeIndexEditionDescriptor {
-            tape_uuid,
-            edition_id,
-            edition_sequence: 1,
-            scope: TapeIndexReplicaScope {
-                covered_prefix_tape_file_count: structural_entry_count,
-                total_data_ordinals: committed.total_committed_ordinals,
-                highest_protected_ordinal: committed.highest_protected_ordinal,
-            },
-            counts,
-            block_size,
-            compression_enabled: false,
-            writer_version: prefix.diagnostics.writer_version.clone(),
-            write_timestamp: prefix.diagnostics.write_timestamp.clone(),
-            terminal_layout: layout,
-        },
-        &mut planning_rows,
-    )
-    .map_err(|error| format!("plan freeze-drill terminal edition: {error}"))?;
-    if gap_records
-        .checked_mul(u64::from(block_size))
-        .ok_or_else(|| "freeze-drill separation byte count overflows u64".to_string())?
-        == DEFAULT_INDEX_SEPARATION_BYTES
-    {
-        let plan = TerminalTripleWritePlan::new(edition)
-            .map_err(|error| format!("assemble default freeze-drill terminal plan: {error}"))?;
-        return Ok((rows, plan));
-    }
-    let replicas = [
-        plan_tape_index_replica(edition.clone(), 1)
-            .map_err(|error| format!("plan freeze-drill replica A: {error}"))?,
-        plan_tape_index_replica(edition.clone(), 2)
-            .map_err(|error| format!("plan freeze-drill replica B: {error}"))?,
-        plan_tape_index_replica(edition.clone(), 3)
-            .map_err(|error| format!("plan freeze-drill replica C: {error}"))?,
-    ];
-    let separation = |gap_ordinal| {
-        let nominal_extent_bytes = gap_records
-            .checked_mul(u64::from(block_size))
-            .ok_or_else(|| "freeze-drill separation byte count overflows u64".to_string())?;
-        plan_index_separation(IndexSeparationDescriptor {
-            tape_uuid,
-            edition_id,
-            gap_ordinal,
-            block_size,
-            nominal_extent_bytes,
-            total_records: gap_records,
-            compression_enabled: false,
-            terminal_layout: layout,
-        })
-        .map_err(|error| format!("plan freeze-drill separation {gap_ordinal}: {error}"))
-    };
-    let separations = [separation(1)?, separation(2)?];
-    let plan = TerminalTripleWritePlan::from_parts(edition, replicas, separations)
-        .map_err(|error| format!("assemble freeze-drill terminal plan: {error}"))?;
-    Ok((rows, plan))
 }
 
 fn authorize_bot(
@@ -755,169 +464,96 @@ fn write_drill_tape(
         .rewind()
         .map_err(|error| format!("rewind scratch tape before write: {error}"))?;
 
-    let mut raw = DriveHandleRawSink::new(drive);
-    raw.configure_parity_write_session(settings.block_size)
-        .map_err(|error| format!("configure parity write session: {error}"))?;
-    let mut journal = DrillJournal::new(tape_uuid);
-    let mut parity = ParitySink::new_with_journal(
-        &mut raw,
-        &mut journal,
-        settings.scheme.clone(),
-        tape_uuid,
-        settings.block_size,
-        remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
-    )
-    .map_err(|error| format!("open parity write sink: {error}"))?;
-    parity
-        .write_bootstrap()
-        .map_err(|error| format!("write BOT bootstrap: {error}"))?;
-
     let sizes = payload_sizes(settings.data_mib)?;
-    let mut expected_objects = Vec::with_capacity(OBJECT_COUNT);
-    let mut first_sidecar_header_block_count = None;
+    let mut objects = Vec::with_capacity(OBJECT_COUNT);
     for (object_index, payload_size) in sizes.into_iter().enumerate() {
-        let object_id = deterministic_uuid(settings.block_size, object_index, b"object");
-        let manifest_file_id = deterministic_uuid(settings.block_size, object_index, b"manifest");
-        let payload_path = format!("freeze-drill/object-{object_index}.bin");
-        let payload_sha256 = deterministic_digest(settings.block_size, object_index, payload_size)?;
         let mut options = RemTarObjectOptions::new(
-            object_id.clone(),
+            deterministic_uuid(settings.block_size, object_index, b"object"),
             format!("freeze-drill-{object_index}"),
             DRILL_TIMESTAMP,
-            manifest_file_id,
+            deterministic_uuid(settings.block_size, object_index, b"manifest"),
         );
         options.chunk_size = settings.block_size as usize;
         let spec = RemTarFileSpec::new(
-            payload_path.clone(),
+            format!("freeze-drill/object-{object_index}.bin"),
             deterministic_uuid(settings.block_size, object_index, b"file"),
             payload_size,
-            payload_sha256,
+            deterministic_digest(settings.block_size, object_index, payload_size)?,
         );
-        let layout = plan_rem_tar_object(&options, std::slice::from_ref(&spec))
-            .map_err(|error| format!("plan deterministic object {object_index}: {error}"))?;
-        let runtime = parity
-            .terminal_triple_capacity_runtime_state()
-            .map_err(|error| {
-                format!("project capacity state for object {object_index}: {error}")
-            })?;
-        let reserve = capacity_input(
-            &settings.scheme,
-            settings.block_size,
-            layout.projected_size_blocks,
-            runtime,
-        )?
-        .reserve_object()
-        .map_err(|error| format!("reserve deterministic object {object_index}: {error}"))?;
-        let opened = parity
-            .begin_object_with_terminal_triple_reservation(reserve)
-            .map_err(|error| format!("admit deterministic object {object_index}: {error}"))?;
-        let mut payload =
-            DeterministicPayload::new(settings.block_size, object_index, payload_size);
-        let mut streams = [RemTarFileStream::new(spec, &mut payload)];
-        let written_layout = write_rem_tar_object_from_readers(&mut parity, &options, &mut streams)
-            .map_err(|error| format!("write deterministic object {object_index}: {error}"))?;
-        let recovery_row = TapeIndexReplicaObjectRow {
-            tape_file_number: opened.0,
-            stored_block_count: written_layout.projected_size_blocks,
-            object_id: object_id.as_bytes().to_vec(),
-            representation: ObjectRecoveryRepresentation::Plaintext {
-                manifest_first_chunk_lba: written_layout
-                    .manifest
-                    .first_chunk_lba
-                    .ok_or_else(|| {
-                        format!("object {object_index} manifest has no first chunk LBA")
-                    })?
-                    .0,
-                manifest_size_bytes: written_layout.manifest.size_bytes,
-                manifest_chunk_count: written_layout.manifest.chunk_count,
-                manifest_sha256: written_layout.manifest_sha256,
-            },
-        };
-        let closed = parity
-            .finish_object()
-            .map_err(|error| format!("close deterministic object {object_index}: {error}"))?;
-        if recovery_row.stored_block_count != closed.data_block_count {
-            return Err(format!(
-                "object {object_index} recovery row records {} blocks, writer closed {}",
-                recovery_row.stored_block_count, closed.data_block_count
-            ));
-        }
-        expected_objects.push(ExpectedObject {
-            object_id,
-            payload_path,
-            payload_size,
-            payload_sha256,
-            tape_file_number: closed.tape_file_number,
-            stored_block_count: closed.data_block_count,
-            recovery_row,
+        let block_size = settings.block_size;
+        objects.push(crate::tape_image::TapeImageObject {
+            options,
+            files: vec![crate::tape_image::TapeImageFile {
+                spec,
+                open: Arc::new(move || {
+                    Box::new(DeterministicPayload::new(
+                        block_size,
+                        object_index,
+                        payload_size,
+                    ))
+                }),
+            }],
         });
-        if object_index == 0 {
-            let checkpoint = parity
-                .checkpoint()
-                .map_err(|error| format!("write intermediate checkpoint: {error}"))?;
-            first_sidecar_header_block_count = checkpoint
-                .sidecars_emitted
-                .first()
-                .map(|sidecar| sidecar.sidecar_header_block_count);
-        }
     }
-    let prefix_plan = parity
-        .plan_terminal_index_close(
-            parity
-                .writer_identity()
-                .capture()
-                .map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| format!("plan terminal prefix: {error}"))?;
-    parity
-        .close_for_terminal_index(&prefix_plan, TerminalPrefixReconcileEvidence::Absent)
-        .map_err(|error| format!("write terminal prefix: {error}"))?;
-    let committed = journal
-        .load_committed()
-        .map_err(|error| format!("replay in-memory drill journal: {error}"))?;
-    if !committed.orphaned_bundles.is_empty() {
-        return Err("drill journal retained orphaned bundles after final checkpoint".to_string());
-    }
-    let (mut terminal_rows, terminal_plan) = plan_drill_terminal_tail(
-        tape_uuid,
-        settings.block_size,
-        settings.gap_records,
-        &prefix_plan,
-        &committed,
-        &expected_objects,
+    let mut edition_hasher = Sha256::new();
+    edition_hasher.update(DRILL_SEED);
+    edition_hasher.update(tape_uuid);
+    edition_hasher.update(b"terminal-index-edition");
+    let mut edition_id = [0u8; 16];
+    edition_id.copy_from_slice(&edition_hasher.finalize()[..16]);
+    let image = crate::tape_image::write_tape_image(
+        drive,
+        crate::tape_image::TapeImageInputs {
+            tape_uuid,
+            scheme: settings.scheme.clone(),
+            block_size: settings.block_size,
+            objects,
+            checkpoint_after_objects: vec![0],
+            nominal_extent_bytes: settings
+                .gap_records
+                .checked_mul(u64::from(settings.block_size))
+                .ok_or_else(|| "drill separation bytes overflow".to_string())?,
+            writer_identity: remanence_state::audit::writer_identity(env!("CARGO_PKG_VERSION")),
+            edition_id,
+            edition_sequence: 1,
+            parity_map_sequence_start: 0,
+            directory_flags: remanence_parity::SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD
+                | remanence_parity::SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
+            diagnostic_keys_present: true,
+            capacity_bytes: DRILL_CAPACITY_BYTES,
+        },
     )?;
-    let terminal_replica_c_tape_file = terminal_plan.replicas[2].component.planned_tape_file_number;
-    let mut authority = DrillTerminalAuthority {
-        journal: &mut journal,
-        progress: TerminalTailProgress::BeforeReplicaA,
-    };
-    match write_terminal_tail(&mut raw, &mut terminal_rows, &mut authority, &terminal_plan)
-        .map_err(|error| format!("write terminal A/gap/B/gap/C tail: {error}"))?
-    {
-        TerminalTailRunOutcome::Complete => {}
-        TerminalTailRunOutcome::RecoveryRequired {
-            progress,
-            component,
-            evidence,
-        } => {
-            return Err(format!(
-                "fresh freeze-drill terminal write requires recovery at {progress:?} {component:?}: {evidence:?}"
-            ))
-        }
-    }
-    let committed = journal
-        .load_committed()
-        .map_err(|error| format!("replay completed drill journal: {error}"))?;
-    let map = committed
-        .filemark_map()
-        .map_err(|error| format!("build committed drill filemark map: {error}"))?;
+    let expected_objects = image
+        .inputs
+        .objects
+        .iter()
+        .zip(image.object_rows)
+        .map(|(object, recovery_row)| {
+            let file = &object.files[0].spec;
+            Ok(ExpectedObject {
+                object_id: object.options.object_id.clone(),
+                payload_path: file.path.clone(),
+                payload_size: file.size_bytes,
+                payload_sha256: file
+                    .file_sha256
+                    .ok_or_else(|| "drill file has no payload digest".to_string())?,
+                tape_file_number: recovery_row.tape_file_number,
+                stored_block_count: recovery_row.stored_block_count,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(WrittenDrill {
         tape_uuid,
         expected_objects,
-        map,
-        terminal_replica_c_tape_file,
-        first_sidecar_header_block_count: first_sidecar_header_block_count
-            .ok_or_else(|| "drill checkpoint emitted no parity sidecar".to_string())?,
+        map: image.map,
+        terminal_replica_c_tape_file: image.terminal_plan.replicas[2]
+            .component
+            .planned_tape_file_number,
+        first_sidecar_header_block_count: image
+            .sidecars
+            .first()
+            .ok_or_else(|| "drill emitted no parity sidecar".to_string())?
+            .sidecar_header_block_count,
     })
 }
 
@@ -1988,17 +1624,6 @@ mod tests {
             payload_sha256: Sha256::digest([]).into(),
             tape_file_number: 1,
             stored_block_count: 1,
-            recovery_row: TapeIndexReplicaObjectRow {
-                tape_file_number: 1,
-                stored_block_count: 1,
-                object_id: b"id".to_vec(),
-                representation: ObjectRecoveryRepresentation::Plaintext {
-                    manifest_first_chunk_lba: 0,
-                    manifest_size_bytes: 1,
-                    manifest_chunk_count: 1,
-                    manifest_sha256: [0; 32],
-                },
-            },
         };
         let mut verifier = PayloadVerifier::new(&expected);
         let manifest = RemTarStreamEntry {
