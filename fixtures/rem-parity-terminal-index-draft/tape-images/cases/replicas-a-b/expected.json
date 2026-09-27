@@ -1,0 +1,1 @@
+{"id": "replicas-a-b", "image": "a4-minimal", "fault": {"unreadable_lbas": [19, 27]}, "expected": {"inventory": "replica C", "degraded": true}, "pinned": true, "sections": ["8.5"]}

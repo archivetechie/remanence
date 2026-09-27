@@ -1,0 +1,1 @@
+{"id": "replica-c-payload", "image": "a4-minimal", "fault": {"unreadable_lbas": [36]}, "expected": {"inventory": "an agreeing valid replica", "informative": "degraded depends on whether the reader validated C's payload (§8.4 step 2)"}, "pinned": true, "sections": ["8.4 step 2", "8.5"]}

@@ -1,0 +1,1 @@
+{"id": "editions-conflict", "image": "two-edition", "fault": {}, "expected": {"error": "TerminalIndexReplicaConflict"}, "pinned": true, "sections": ["8.5"]}

@@ -1,0 +1,1 @@
+{"id": "parity-map-both", "image": "a4-minimal", "fault": {"unreadable": "both ParityMap copies (tape file 3)"}, "failed_data_addresses": [[1, 0]], "expected": {"inventory_unaffected": true, "recovered": true}, "pinned": true, "sections": ["10.1.1", "8.4", "13"]}

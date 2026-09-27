@@ -1,0 +1,32 @@
+{
+  "failed_data_addresses": [
+    [
+      1,
+      0
+    ]
+  ],
+  "hints": {
+    "block_size": 262144,
+    "scheme": {
+      "S": 2,
+      "k": 2,
+      "m": 1
+    },
+    "tape_uuid": "the image's"
+  },
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 0,
+      "record_index": 0,
+      "tape_file": 0
+    },
+    {
+      "filemark": false,
+      "lba": 2,
+      "record_index": 0,
+      "tape_file": 1
+    }
+  ]
+}

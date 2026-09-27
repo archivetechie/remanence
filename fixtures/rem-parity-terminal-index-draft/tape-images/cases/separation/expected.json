@@ -1,0 +1,1 @@
+{"id": "separation", "image": "a4-minimal", "fault": {"unreadable_lbas": [25]}, "expected": {"inventory_unaffected": true, "verifier_reports_separation": true, "verifier_suffix_complete": false}, "pinned": true, "sections": ["10.6"]}

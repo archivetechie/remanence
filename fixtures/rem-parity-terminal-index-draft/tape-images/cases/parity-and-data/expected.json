@@ -1,0 +1,1 @@
+{"id": "parity-and-data", "image": "a4-minimal", "fault": {"unreadable_lbas": [4, 8]}, "failed_data_addresses": [[1, 2]], "expected": {"recovered": true, "note": "from parity (0,1) at LBA 10"}, "pinned": true, "sections": ["13"]}

@@ -1,0 +1,38 @@
+{
+  "block_size": 262144,
+  "extent_records": 3,
+  "file_blocks": [
+    1,
+    4,
+    7,
+    3,
+    3,
+    3,
+    3,
+    3,
+    3
+  ],
+  "file_starts": [
+    0,
+    2,
+    7,
+    15,
+    19,
+    23,
+    27,
+    31,
+    35
+  ],
+  "objects": [
+    {
+      "blocks": 4
+    }
+  ],
+  "records": 39,
+  "scheme": {
+    "S": 2,
+    "k": 2,
+    "m": 2
+  },
+  "tape_files": 9
+}

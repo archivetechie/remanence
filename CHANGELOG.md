@@ -6,6 +6,26 @@ per-release summaries.
 
 ## Unreleased
 
+- Added review-only full-tape candidates for REM-PARITY generation 2
+  (`fixtures/rem-parity-terminal-index-draft/tape-images/`). There are six
+  tape images: Appendix A.4's minimal tape, a short epoch, two epochs, a
+  second edition, and two unfinalized tapes that stop in a torn tail. There
+  are 25 damage cases, each of which makes stated records unreadable or
+  removes a filemark. One builder regenerates the images from recorded inputs,
+  and `MANIFEST.tsv` pins the size and SHA-256 of every tape file; no image
+  bytes are checked in. Each case's expected outcome was written from the
+  specification text, not taken from the reference. The workspace tests run
+  every case through the production Scanner, BOT walk, Recoverer and Verifier.
+  24 cases are pinned. The remaining one, whose outcome the text does not yet
+  decide, is reported but not asserted.
+- The Recoverer can now rescue a parity sidecar whose primary header and
+  footer are both unreadable, as REM-PARITY §13.3 step 3 describes, by finding
+  its tail copy through the sidecar epoch directory of the tape's final
+  ParityMap. Before, the directory was never attached on a generation-2 tape,
+  so the rescue could not run. It works both when the inventory comes from a
+  terminal replica and after a BOT walk. After a walk, a file is taken to be a
+  sidecar only when the reconciled map matches the ParityMap's recorded
+  digest.
 - A tape whose BOT bootstrap is unreadable can now be read when its tape
   UUID, block size and parity scheme are supplied out of band.
   `rem tape recovery-report` takes `--tape-uuid`, `--block-size` and

@@ -1,0 +1,1 @@
+{"id": "filemark-prefix", "image": "a4-minimal", "fault": {"removed_filemark_after_tape_file": 1}, "expected": {"records": 38, "every_replica_invalid": true, "walk": "an 11-block Object candidate where the Object and the sidecar merged", "terminal_authority_recovered": false}, "pinned": true, "sections": ["8.3", "12.2", "12.3"]}
