@@ -19,6 +19,10 @@ use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
 
+#[path = "support/rem_object_p1.rs"]
+mod rem_object_p1;
+use rem_object_p1::{build_p1_plaintext, p1_files, p1_options};
+
 const D1_DEK: [u8; 32] = [0x5d; 32];
 const D1_HPKE_RNG_SEED: [u8; 32] = [0xa7; 32];
 const E2_DEK: [u8; 32] = [0x7d; 32];
@@ -167,15 +171,6 @@ fn e2_recipient_pair() -> (RecipientPrivateKey, Vec<RecipientPublicKey>) {
     (primary, recipients)
 }
 
-fn build_p1_plaintext() -> Vec<u8> {
-    let hello = b"hello, rem-object\n";
-    let pattern: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
-    let files = p1_files(hello, &pattern);
-    let mut sink = VecBlockSink::new();
-    write_rem_tar_object(&mut sink, &p1_options(), &files).unwrap();
-    flatten_sink(&sink)
-}
-
 fn build_d1_plaintext() -> Vec<u8> {
     let payload: Vec<u8> = (0..262145).map(|i| (i % 256) as u8).collect();
     let files = [RemTarFile {
@@ -287,18 +282,6 @@ fn fixture_object_path(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/rem-object/objects")
         .join(filename)
-}
-
-fn p1_options() -> RemTarObjectOptions {
-    let mut options = RemTarObjectOptions::new(
-        "00000000-0000-4000-8000-000000000001",
-        "rem-object-tv-1",
-        "2026-01-01T00:00:00Z",
-        "00000000-0000-4000-8000-0000000000ff",
-    );
-    options.chunk_size = 4096;
-    options.metadata_preservation = MetadataPreservation::Minimal;
-    options
 }
 
 fn d1_options() -> RemTarObjectOptions {
@@ -572,25 +555,6 @@ impl TestEntry {
         spec.executable = self.executable;
         spec
     }
-}
-
-fn p1_files<'a>(hello: &'a [u8], pattern: &'a [u8]) -> [RemTarFile<'a>; 2] {
-    [
-        RemTarFile {
-            path: "a/hello.txt",
-            file_id: "00000000-0000-4000-8000-000000000010",
-            data: hello,
-            mtime: None,
-            executable: None,
-        },
-        RemTarFile {
-            path: "b/pattern.bin",
-            file_id: "00000000-0000-4000-8000-000000000011",
-            data: pattern,
-            mtime: None,
-            executable: None,
-        },
-    ]
 }
 
 fn assert_layout(actual: &remanence_format::RemTarFileLayout, expected: &Value) {

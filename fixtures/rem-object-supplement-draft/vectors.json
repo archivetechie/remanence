@@ -1,0 +1,70 @@
+{
+  "checksum_definition": "SHA-256 of sorted '<artifact-sha256>  <relative-path>\\n' records within each vector",
+  "spec_section": "REM-ENCRYPT 13.4",
+  "status": "review-only-candidate",
+  "vector_set": "REM-OBJECT-SUPPLEMENT-1-CANDIDATE",
+  "vectors": [
+    {
+      "archive_path": "manifests/negative-sealer.json",
+      "artifacts": [
+        {
+          "path": "manifests/negative-sealer.json",
+          "sha256": "c4fe65bb3670b3aada72f0098cb7581338eb420b62bb88ae4ecaab91c0c92f59",
+          "size": 6312
+        }
+      ],
+      "category": "negative/sealer",
+      "checksum_sha256": "504aff4406cda59f1755f865c0cac893c85eca84da241b0f5cd0857acbc78ba0",
+      "id": "seal-duplicate-epoch-id",
+      "spec_section": "REM-ENCRYPT 13.4"
+    },
+    {
+      "archive_path": "cases/metadata-negative-integer-under-unknown-key",
+      "artifacts": [
+        {
+          "path": "expected.json",
+          "sha256": "917ef4603f04150bf3ce5e85afc9d896bac766e021a022f2fb7ed7361ab59bd4",
+          "size": 133
+        },
+        {
+          "path": "input.json",
+          "sha256": "001ea7301da8a1a737538cc51fdc3bd502abdb47cafb8c23d994cce71a6f67ee",
+          "size": 5963
+        },
+        {
+          "path": "object.rem-object",
+          "sha256": "25d9d80b654255484fb68a33d6619b4e4638b1dac012da132b6f3c73810fc156",
+          "size": 24576
+        }
+      ],
+      "category": "negative/envelope",
+      "checksum_sha256": "858f13bac59e3e690b477bdff8698876c589dbbe46b41c39379e25b61e0283b0",
+      "id": "metadata-negative-integer-under-unknown-key",
+      "spec_section": "REM-ENCRYPT 13.4"
+    },
+    {
+      "archive_path": "cases/metadata-unknown-key-control",
+      "artifacts": [
+        {
+          "path": "expected.json",
+          "sha256": "cf6668daf4e4e5f50d7ab84d33830ac1abc8061dc662bcf18c07f5a1cfb99c80",
+          "size": 214
+        },
+        {
+          "path": "input.json",
+          "sha256": "ef0fd33f5f6332cd7b7ee855ea6f759690bc4d3e02f2a9c39e19212c31981fd1",
+          "size": 5963
+        },
+        {
+          "path": "object.rem-object",
+          "sha256": "c16657f155227fe3eb37385ad9ea877ae0b6880c10e3221d2cf4d46be467f04b",
+          "size": 24576
+        }
+      ],
+      "category": "positive/envelope",
+      "checksum_sha256": "1156b958ace1daf7dc78b02f6f897d2ed2c69c0438d0c4dc8ac573ee243c8c57",
+      "id": "metadata-unknown-key-control",
+      "spec_section": "REM-ENCRYPT 13.4"
+    }
+  ]
+}

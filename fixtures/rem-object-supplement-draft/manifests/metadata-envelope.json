@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "archive_path": "cases/metadata-negative-integer-under-unknown-key",
+      "expected_error": "InvalidCborEncoding",
+      "id": "metadata-negative-integer-under-unknown-key",
+      "operation": "open",
+      "rule_section": "REM-ENCRYPT 5.6",
+      "stored_digest": "25d9d80b654255484fb68a33d6619b4e4638b1dac012da132b6f3c73810fc156"
+    },
+    {
+      "archive_path": "cases/metadata-unknown-key-control",
+      "expected_outcome": "accepted",
+      "id": "metadata-unknown-key-control",
+      "operation": "open",
+      "plaintext_digest": "d59a4a3e4cf2c447c8ed402b109fbb4060ca84dc5b1cebbdc3acb8ca62d8888c",
+      "rule_section": "REM-ENCRYPT 5.6",
+      "stored_digest": "c16657f155227fe3eb37385ad9ea877ae0b6880c10e3221d2cf4d46be467f04b"
+    }
+  ],
+  "spec_section": "REM-ENCRYPT 13.4",
+  "status": "review-only-candidate",
+  "vector_set": "REM-OBJECT-SUPPLEMENT-1-CANDIDATE"
+}

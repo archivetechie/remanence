@@ -1,0 +1,4 @@
+{
+  "expected_error": "InvalidCborEncoding",
+  "stored_digest": "25d9d80b654255484fb68a33d6619b4e4638b1dac012da132b6f3c73810fc156"
+}
