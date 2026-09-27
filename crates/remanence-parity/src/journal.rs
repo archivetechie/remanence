@@ -458,6 +458,17 @@ pub trait TapeFileJournal {
     /// erase evidence merely because an append or replay handle was opened.
     fn load_committed(&self) -> Result<CommittedState, JournalError>;
 
+    /// Optional durable authority when reattaching an in-process session.
+    ///
+    /// In-memory journals have no off-tape records to replay. File-backed
+    /// journals must return their snapshot or its error, never hide a failed
+    /// replay as an absent capability. Restarted bounded sessions require Some.
+    fn session_resume_snapshot(
+        &self,
+    ) -> Result<Option<FileTapeFileJournalCommittedSnapshot>, JournalError> {
+        self.committed_snapshot_bounded_authority().map(Some)
+    }
+
     /// Freeze an allocation-bounded committed-prefix snapshot.
     ///
     /// Production append/resume must fail closed rather than fall back to

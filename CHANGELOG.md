@@ -6,6 +6,23 @@ per-release summaries.
 
 ## Unreleased
 
+- Resume refusals now follow REM-PARITY §14 and §3.4. The resume path reports
+  `ResumeAppend` for a prefix that breaks §14's rules, and for commit records
+  that are missing, conflict, or are incomplete or ambiguous. It keeps the
+  journal's own diagnostic in the message. Before this, some of these cases
+  surfaced as journal or state errors. Operational I/O failures keep their own
+  errors. A resume refusal now reaches clients as `FailedPrecondition` instead
+  of `Internal`, and no client retries it. A reattach at a checkpoint boundary
+  now refuses a damaged or unreadable journal before touching the tape, instead
+  of carrying on. At shutdown, a write session's checkpoint failure is now
+  reported instead of being dropped.
+- Added review-only resume vectors for REM-PARITY generation 2
+  (`fixtures/rem-parity-terminal-index-draft/tape-images/resume/`). There are
+  two accepted resumes, one at W = T and one at W < T. The W < T resume
+  rebuilds the open epoch from the tape, and its sidecar equals the one an
+  uninterrupted session writes. There are also six refusals and a
+  commit-record case. The expected outcomes were written from the text before
+  the executor existed. The resumed tapes are pinned by digest.
 - Added a second, independent implementation of REM-PARITY generation 2
   (`tools/rem_parity_second_implementation.py`). Its author wrote it from the
   specification text without reading the reference implementation. It

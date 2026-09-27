@@ -1,0 +1,4 @@
+{"id": "resume-final-object-not-at-t", "image": "unfinalized-open", "prefix_mutation": "file 3 (the final Object) records first_parity_data_ordinal 1, so it ends at 3 while T = 4 (file 1 ends at 4)", "W": 4, "T": 4,
+     "expected": {"accepted": false, "before_any_read_or_write": true},
+     "informative": "§14 step 2 names ResumeAppend; the mutated prefix also breaks §7.2's dense, contiguous first-ordinals, and the text does not order the two checks, so the error name is informative",
+     "pinned": true, "sections": ["7.2", "14 step 2"]}

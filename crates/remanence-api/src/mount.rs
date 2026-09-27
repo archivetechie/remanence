@@ -254,7 +254,12 @@ async fn open_write_session_reserved(
                             reservation,
                         };
                     }
-                    Err(err) if err.code() == tonic::Code::FailedPrecondition => continue,
+                    Err(err)
+                        if err.code() == tonic::Code::FailedPrecondition
+                            && err.message() == "tape is already mounted" =>
+                    {
+                        continue
+                    }
                     Err(err) => return Err(err),
                 }
             }
@@ -2002,7 +2007,10 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                     )),
                 }
             }
-            Ok(Err(err)) if err.code() == tonic::Code::FailedPrecondition => {
+            Ok(Err(err))
+                if err.code() == tonic::Code::FailedPrecondition
+                    && err.message() == "active session is a read session" =>
+            {
                 // Read sessions have no checkpoint barrier and remain handled by
                 // the existing open-session shutdown diagnostic below.
             }
@@ -2279,7 +2287,15 @@ async fn resolve_and_reserve_actor_mount(
                     return Ok((mount, reservation));
                 }
             },
-            Err(err) if err.code() == tonic::Code::FailedPrecondition && attempt + 1 < ATTEMPTS => {
+            Err(err)
+                if err.code() == tonic::Code::FailedPrecondition
+                    && err.message()
+                        == format!(
+                            "{} drive bay 0x{:04x} is busy",
+                            drive_key.library_serial, drive_key.bay
+                        )
+                    && attempt + 1 < ATTEMPTS =>
+            {
                 continue;
             }
             Err(err) => return Err(err),

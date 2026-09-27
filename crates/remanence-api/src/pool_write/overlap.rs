@@ -204,6 +204,16 @@ pub(crate) struct PerObjectTestJournal {
 
 #[cfg(test)]
 impl TapeFileJournal for PerObjectTestJournal {
+    // In-memory session journals have no durable resume authority to replay.
+    fn session_resume_snapshot(
+        &self,
+    ) -> Result<
+        Option<remanence_parity::FileTapeFileJournalCommittedSnapshot>,
+        remanence_parity::JournalError,
+    > {
+        Ok(None)
+    }
+
     fn tape_uuid(&self) -> [u8; 16] {
         self.tape_uuid
     }

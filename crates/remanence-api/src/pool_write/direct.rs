@@ -10,12 +10,13 @@ use remanence_library::{
 };
 use remanence_parity::{
     bootstrap::{parse_bootstrap_block, write_bootstrap_block},
-    checked_bounded_resume_summary, sole_bot_filemark_map_digest, BlockSinkRawTapeSink,
-    BootstrapPayload, BoundedResumeWriterSeed, CommittedBundle, CommittedBundleKind,
-    FileTapeFileJournal, ParityConfig, ParityError, ParityScheme, ParitySchemeRecord, ParitySink,
-    ParitySinkSessionState, RawTapeSink, TapeFileEntry, TapeFileJournal, TapeFileKind,
-    TerminalPrefixPlan, TerminalPrefixReconcileEvidence, TerminalTailProgress,
-    TerminalTailRunOutcome, TerminalTripleCloseInput, TerminalTripleWritePlan,
+    checked_bounded_resume_summary, resume_record_result, sole_bot_filemark_map_digest,
+    BlockSinkRawTapeSink, BootstrapPayload, BoundedResumeWriterSeed, CommittedBundle,
+    CommittedBundleKind, FileTapeFileJournal, ParityConfig, ParityError, ParityScheme,
+    ParitySchemeRecord, ParitySink, ParitySinkSessionState, RawTapeSink, TapeFileEntry,
+    TapeFileJournal, TapeFileKind, TerminalPrefixPlan, TerminalPrefixReconcileEvidence,
+    TerminalTailProgress, TerminalTailRunOutcome, TerminalTripleCloseInput,
+    TerminalTripleWritePlan,
 };
 use remanence_state::{
     CatalogIndex, StateError, StateHandle, TapeJournalIndexInput, TapePoolConfig,
@@ -56,6 +57,44 @@ use super::{TERMINAL_CAPACITY_SAFETY_MARGIN_BLOCKS, VERIFY_BOOTSTRAP_READ_BYTES}
 use crate::bytes_to_hex;
 #[cfg(test)]
 use std::collections::HashSet;
+
+/// Why the combined durable authorities refused a resume.
+#[derive(Debug)]
+pub(crate) enum ResumeAuthorityRefusal {
+    /// The commit records are missing, conflict, or are incomplete or
+    /// ambiguous (REM-PARITY 3.4): reported as `ResumeAppend` with its detail.
+    Records(ParityError),
+    /// An operational failure reading the checkpoint journal, which keeps
+    /// its own error, as `resume_record_result` does for the parity journal.
+    State(remanence_state::StateError),
+}
+
+/// Validate the combined durable authorities only at the resume boundary.
+/// Missing or conflicting claims retain their diagnostic as ResumeAppend;
+/// operational failures propagate unchanged.
+pub(crate) fn validate_parity_resume_checkpoint_authority(
+    checkpoint: &remanence_state::FileCheckpointJournalLease,
+    parity: &FileTapeFileJournal,
+    checkpoint_is_empty: bool,
+    committed_tape_file_count: u64,
+) -> Result<(), ResumeAuthorityRefusal> {
+    if checkpoint_is_empty {
+        if committed_tape_file_count != 0 {
+            return Err(ResumeAuthorityRefusal::Records(ParityError::ResumeAppend(
+                "parity journal has a committed prefix but checkpoint authority is empty".into(),
+            )));
+        }
+    } else {
+        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(checkpoint, parity)
+            .map_err(|error| match error {
+                remanence_state::StateError::JournalReplayFailed(_) => {
+                    ResumeAuthorityRefusal::Records(ParityError::ResumeAppend(error.to_string()))
+                }
+                other => ResumeAuthorityRefusal::State(other),
+            })?;
+    }
+    Ok(())
+}
 
 /// Write one regular file to a caller-named pool using the Phase 1
 /// non-hardware-compatible `BlockSink` path, commit catalog rows, and return
@@ -842,13 +881,12 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
             )
         }
         ParityConfig::Scheme(parity_scheme) => {
-            let mut parity_journal = FileTapeFileJournal::open(
+            let mut parity_journal = resume_record_result(FileTapeFileJournal::open(
                 parity_journal_path,
                 selected.tape_uuid,
                 selected.block_size,
                 parity_scheme.clone(),
-            )
-            .map_err(ParityError::from)?;
+            ))?;
             if parity_journal.orphaned_bundles_preserved_on_open() != 0 {
                 tracing::warn!(
                     tape_uuid = %uuid_text(selected.tape_uuid),
@@ -856,23 +894,18 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                     "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
                 );
             }
-            let snapshot = parity_journal
-                .committed_snapshot_bounded()
-                .map_err(ParityError::from)?;
+            let snapshot = resume_record_result(parity_journal.committed_snapshot_bounded())?;
             let summary = checked_bounded_resume_summary(&snapshot)?;
-            if prior_records.is_empty() {
-                if summary.committed_tape_file_count != 0 {
-                    return Err(PoolWriteError::InvalidInput(
-                        "parity journal has a committed prefix but checkpoint authority is empty"
-                            .to_string(),
-                    ));
-                }
-            } else {
-                remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
-                    &checkpoint_lease,
-                    &parity_journal,
-                )?;
-            }
+            validate_parity_resume_checkpoint_authority(
+                &checkpoint_lease,
+                &parity_journal,
+                prior_records.is_empty(),
+                summary.committed_tape_file_count,
+            )
+            .map_err(|refusal| match refusal {
+                ResumeAuthorityRefusal::Records(error) => PoolWriteError::from(error),
+                ResumeAuthorityRefusal::State(error) => PoolWriteError::from(error),
+            })?;
             let session_state = if summary.committed_tape_file_count == 0 {
                 let located = sink.locate(0)?;
                 if located.partition != 0 || located.lba != 0 {

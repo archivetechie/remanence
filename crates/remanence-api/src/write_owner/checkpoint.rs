@@ -6,9 +6,10 @@ use std::time::{Duration as StdDuration, Instant};
 
 use remanence_library::DriveHandle;
 use remanence_parity::{
-    checked_bounded_resume_summary, BoundedResumeSummary, BoundedResumeWriterSeed, CloseReason,
-    DriveHandleRawSink, FileTapeFileJournal, FileTapeFileJournalCommittedSnapshot, ParityError,
-    ParitySink, ParitySinkSessionState, PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
+    checked_bounded_resume_summary, resume_record_result, BoundedResumeSummary,
+    BoundedResumeWriterSeed, CloseReason, DriveHandleRawSink, FileTapeFileJournal,
+    FileTapeFileJournalCommittedSnapshot, ParityError, ParitySink, ParitySinkSessionState,
+    PhysicalPositionHint, RawTapeSink, RawWriteOutcome,
 };
 use remanence_state::{AuditEvent, CatalogIndex, TapePoolConfig};
 use tokio::sync::mpsc;
@@ -153,13 +154,13 @@ pub(super) fn validate_parity_actor_authority(
         }
     };
     let path = parity_journal_path(cfg, selected.tape_uuid)?;
-    let journal = FileTapeFileJournal::open(
+    let journal = resume_record_result(FileTapeFileJournal::open(
         path,
         selected.tape_uuid,
         selected.block_size,
         scheme.clone(),
-    )
-    .map_err(|err| Status::internal(format!("open parity tape journal: {err}")))?;
+    ))
+    .map_err(|err| status_from_parity_error(&err, format!("open parity tape journal: {err}")))?;
     if journal.orphaned_bundles_preserved_on_open() != 0 {
         tracing::warn!(
             tape_uuid = %Uuid::from_bytes(selected.tape_uuid),
@@ -167,28 +168,25 @@ pub(super) fn validate_parity_actor_authority(
             "preserved sink-journal bundles beyond the last checkpoint watermark; reconciliation required"
         );
     }
-    if checkpoints.is_empty() {
-        if journal.orphaned_bundles_preserved_on_open() != 0 {
-            return Err(Status::failed_precondition(
-                "parity journal has orphan rows but checkpoint authority is empty",
-            ));
-        }
-    } else {
-        remanence_state::CheckpointTerminalIndexRecordSource::new_replay_backed(
-            checkpoint, &journal,
-        )
-        .map_err(crate::status_from_state_error)?;
-    }
-    let snapshot = journal
-        .committed_snapshot_bounded()
-        .map_err(|err| Status::internal(format!("freeze parity tape journal: {err}")))?;
+    let snapshot = resume_record_result(journal.committed_snapshot_bounded()).map_err(|err| {
+        status_from_parity_error(&err, format!("freeze parity tape journal: {err}"))
+    })?;
     let summary = checked_bounded_resume_summary(&snapshot)
         .map_err(|err| status_from_parity_error(&err, err.to_string()))?;
-    if checkpoints.is_empty() && summary.committed_tape_file_count != 0 {
-        return Err(Status::failed_precondition(
-            "parity journal has a committed prefix but checkpoint authority is empty",
-        ));
-    }
+    crate::pool_write::validate_parity_resume_checkpoint_authority(
+        checkpoint,
+        &journal,
+        checkpoints.is_empty(),
+        summary.committed_tape_file_count,
+    )
+    .map_err(|refusal| match refusal {
+        crate::pool_write::ResumeAuthorityRefusal::Records(err) => {
+            status_from_parity_error(&err, err.to_string())
+        }
+        crate::pool_write::ResumeAuthorityRefusal::State(err) => {
+            crate::status_from_state_error(err)
+        }
+    })?;
     Ok(ParityActorAuthority {
         scheme,
         snapshot,

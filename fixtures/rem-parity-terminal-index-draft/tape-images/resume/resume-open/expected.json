@@ -1,0 +1,8 @@
+{"id": "resume-open", "image": "unfinalized-open", "prefix": "the image's committed prefix: files 0-3, blocks [1, 4, 7, 2]", "W": 4, "T": 6,
+     "append": "one further Object of 2 blocks; the epoch [4, 8) is then complete and its sidecar is written",
+     "expected": {"accepted": true, "append_lba": 18, "reread_ordinals": [4, 5], "reread_lbas": [15, 16], "appended_object_tape_file": 4, "appended_object_first_lba": 18,
+                  "sidecar": {"tape_file": 5, "first_lba": 21, "epoch_id": 1, "protected_ordinal_start": 4, "protected_ordinal_end_exclusive": 8, "total_blocks": 7},
+                  "sidecar_equals_uninterrupted": true,
+                  "appended_object_recovery_row": {"tape_file_number": 4, "stored_block_count": 2}},
+     "informative": "sidecar_equals_uninterrupted compares the resumed sidecar's bytes with those of the same three Objects written in one session with no interruption; §14 step 3 rebuilds the open epoch's parity and per-block CRCs from the committed data, and §9 defines a sidecar from its epoch's data and metadata only. If the text lets any sidecar byte depend on the session, this becomes a disagreement settled by citation",
+     "route": "library (rebuild_open_epoch_from_bounded_summary, ParitySink::new_sidecar_only_from_bounded_resume)", "pinned": true, "sections": ["7.2", "9.1", "14 steps 2-4"]}

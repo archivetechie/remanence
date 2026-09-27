@@ -350,6 +350,16 @@ impl ImageJournal {
 }
 
 impl TapeFileJournal for ImageJournal {
+    // In-memory session journals have no durable resume authority to replay.
+    fn session_resume_snapshot(
+        &self,
+    ) -> Result<
+        Option<remanence_parity::FileTapeFileJournalCommittedSnapshot>,
+        remanence_parity::JournalError,
+    > {
+        Ok(None)
+    }
+
     fn tape_uuid(&self) -> [u8; 16] {
         self.tape_uuid
     }
@@ -444,7 +454,7 @@ impl TerminalTailAuthority for ImageTerminalAuthority<'_> {
     }
 }
 
-fn capacity_input(
+pub(crate) fn capacity_input(
     scheme: &ParityScheme,
     block_size: u32,
     projected_object_blocks: u64,

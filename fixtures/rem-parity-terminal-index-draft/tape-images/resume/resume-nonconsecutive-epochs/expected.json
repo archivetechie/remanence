@@ -1,0 +1,2 @@
+{"id": "resume-nonconsecutive-epochs", "image": "two-epoch", "prefix_mutation": "the prefix is files 0-3 with the second sidecar's epoch_id recorded as 2 instead of 1", "W": 8, "T": 8,
+     "expected": {"accepted": false, "error": "ResumeAppend", "before_any_read_or_write": true}, "pinned": true, "sections": ["14 step 2"]}

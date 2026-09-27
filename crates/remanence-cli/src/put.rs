@@ -724,7 +724,9 @@ pub(crate) async fn wait_before_open_retry(
     status: &tonic::Status,
     err: &mut dyn Write,
 ) -> Result<(), DaemonClientError> {
-    if status.code() != tonic::Code::FailedPrecondition {
+    if status.code() != tonic::Code::FailedPrecondition
+        || status.message().contains("resume append error:")
+    {
         return Err(status_error(status.clone()));
     }
     if let Some(operation_id) = media_readiness_operation_id(status.message()) {
@@ -1134,6 +1136,26 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tonic::{Request, Response, Status, Streaming};
+
+    /// A resume refusal must surface unchanged without waiting or a second open.
+    #[tokio::test]
+    async fn resume_refusals_are_not_open_retries() {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        for detail in [
+            "freeze parity tape journal: resume append error: journal recovery required: journal exposes 1 valid bundle(s) beyond its last checkpoint marker",
+            "resume append error: parity journal has a committed prefix but checkpoint authority is empty",
+            "resume append error: bounded parity terminal authority mismatch: checkpoint and sink prefixes differ",
+            "resume append error: conflicting record claims drive bay is busy",
+            "resume append error: conflicting media-readiness operation=00000000-0000-4000-8000-000000000001",
+        ] {
+            let status = Status::failed_precondition(detail);
+            let mut output = Vec::new();
+            let error = wait_before_open_retry(channel.clone(), &status, &mut output)
+                .await.expect_err("resume refusal must not retry");
+            assert!(error.message.contains(detail), "{error:?}");
+            assert!(output.is_empty(), "refusal was reported as a wait or retry");
+        }
+    }
 
     // -- pure helpers -------------------------------------------------------
 
