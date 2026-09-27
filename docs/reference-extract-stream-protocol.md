@@ -1,4 +1,4 @@
-<!-- code-anchor: crates/remanence-aead crates/remanence-format/src/envelope.rs crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-aead crates/remanence-format/src/envelope.rs crates/remanence-cli/src/lib.rs @ bc2f9f90 -->
 # `rem archive extract-stream` protocol
 
 Status: current, REM-ENCRYPT 1.0 with on-tape `format_version = 2` only

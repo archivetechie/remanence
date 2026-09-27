@@ -79,7 +79,7 @@ HMAC-SHA-256 keyed by the tape UUID, so blocks from one tape cannot
 masquerade as another's. All parity-layer structures carry CRC-64/XZ
 checksums.
 
-<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ bc2f9f90 -->
 ## Parity scheme
 
 Erasure coding is Reed-Solomon over GF(2^8) with a Cauchy matrix; the

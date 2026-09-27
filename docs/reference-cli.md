@@ -368,7 +368,7 @@ it never substitutes labels from the new retry request.
   `format_version: 2`; ranged mode reports the recipients parsed from the
   authenticated prefix and the authenticated-chunk/stored-range geometry.
 
-<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/freeze_drill.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-cli/src/rem_debug.rs crates/remanence-cli/src/lib.rs crates/remanence-cli/src/freeze_drill.rs @ bc2f9f90 -->
 ## rem-debug extras
 
 Everything above exists in `rem-debug` too. What `rem-debug` adds:
