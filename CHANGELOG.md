@@ -6,6 +6,10 @@ per-release summaries.
 
 ## Unreleased
 
+- The second implementation of REM-PARITY generation 2 now decides the negative cases. It decided
+  them under opaque ids with every expected outcome withheld, and it disagrees with none of the
+  text-written expectations (`NEGATIVES-COMPARISON.md`). Its Reader now uses checked arithmetic
+  wherever it combines values read from the tape.
 - Added review-only negative vectors for REM-PARITY generation 2
   (`fixtures/rem-parity-terminal-index-draft/tape-images/negatives/`).
   - **Cases.** There are 58 cases and 48 single-rule variants covering the sidecar, the ParityMap, the

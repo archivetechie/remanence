@@ -11,7 +11,11 @@ Two environment variables are optional:
 * ``REM_PARITY_SECOND_IMPL_CASES`` names a directory of damage-case JSON files
   for the determinism test (default: three synthetic cases written by the test);
 * ``REM_PARITY_SECOND_IMPL_RESUME`` names a directory of resume-case JSON files
-  for the resume determinism test (default: synthetic cases written by the test).
+  for the resume determinism test (default: synthetic cases written by the test);
+* ``REM_PARITY_SECOND_IMPL_NEGATIVES`` names a negative-case JSON file for the
+  negatives determinism test (default: a small synthetic file written by the test);
+* ``REM_PARITY_SECOND_IMPL_SUPPLEMENT`` names a supplement-variant JSON file for
+  the supplement tests (default: a small synthetic file written by the test).
 """
 
 from __future__ import annotations
@@ -35,6 +39,8 @@ DEFAULT_SCRATCH = impl.OUTPUT_ROOT / "test-scratch"
 SCRATCH = pathlib.Path(os.environ.get("REM_PARITY_SECOND_IMPL_SCRATCH", DEFAULT_SCRATCH))
 CASES = os.environ.get("REM_PARITY_SECOND_IMPL_CASES")
 RESUME_CASES = os.environ.get("REM_PARITY_SECOND_IMPL_RESUME")
+NEGATIVE_CASES = os.environ.get("REM_PARITY_SECOND_IMPL_NEGATIVES")
+SUPPLEMENT_CASES = os.environ.get("REM_PARITY_SECOND_IMPL_SUPPLEMENT")
 
 
 def setUpModule() -> None:
@@ -510,6 +516,106 @@ class ResumeTests(unittest.TestCase):
                          ("refused", "ResumeAppend", "step 2"))
         self.assertEqual(decision["records_read"], [])
         self.assertIs(decision["before_any_tape_read"], True)
+
+
+# ---------------------------------------------------------------------------
+# negatives (design D6).
+# ---------------------------------------------------------------------------
+
+SYNTHETIC_NEGATIVES = {"description": "synthetic subset for the tests", "conventions": {}, "cases": [
+    {"id": "neg-13", "target": "sidecar header logical_shard_count rule (Section 9.2)"},
+    {"id": "neg-21", "target": "replica record-geometry validation", "variants": [{"variant": "a-64s"}]},
+    {"id": "neg-33", "target": "directory-assisted tail rescue", "variants": [{"variant": "a-H-seven"}]},
+    {"id": "neg-35", "target": "the Resumer (Section 14 step 2)"},
+    {"id": "neg-26", "target": "Writer capacity admission", "evaluation": "Only the Writer evaluates this."},
+]}
+
+
+class NegativeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if NEGATIVE_CASES:
+            cls.path = pathlib.Path(NEGATIVE_CASES)
+        else:
+            cls.path = SCRATCH / "negatives.json"
+            cls.path.write_text(json.dumps(SYNTHETIC_NEGATIVES), encoding="utf-8")
+
+    def test_negatives_twice_gives_identical_output(self) -> None:
+        first, second = SCRATCH / "negatives-first.json", SCRATCH / "negatives-second.json"
+        impl.run_negatives(self.path, first)
+        impl.run_negatives(self.path, second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(json.loads(first.read_text())["schema"], "rem-parity-second-implementation-negatives/1")
+
+    def test_every_self_check_agrees_and_every_mutation_resolves(self) -> None:
+        out = impl.run_negatives(self.path, SCRATCH / "negatives-check.json")
+        for entry_id, entry in out["entries"].items():
+            with self.subTest(entry=entry_id):
+                self.assertIsNot(entry["apply"]["resolved"], False)
+                if entry["self_check"]["agrees"] is not None:
+                    self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
+
+    def test_a_from_value_that_differs_is_reported_not_guessed(self) -> None:
+        ws = impl.Workspace(image=impl._image_cache("a4-minimal"))
+        res = impl.Resolution()
+        impl.edit_int(ws, res, (2, 0), 0x40, 8, 99, 5, "logical_shard_count")
+        self.assertFalse(res.resolved)
+        self.assertEqual(res.checks[0]["found"], 4)
+
+
+SYNTHETIC_SUPPLEMENT = {"description": "synthetic subset for the tests", "conventions": {}, "variants": [
+    {"id": "sup-01", "parent_blind_id": "neg-45", "group": "7c", "mutation": {"inputs": "L = 2^64 - 1"}},
+    {"id": "sup-05", "parent_blind_id": "neg-22", "group": "7a", "every_other_rule_holds": "synthetic"},
+    {"id": "sup-10", "parent_blind_id": "neg-52", "group": "7a", "every_other_rule_holds": "synthetic"},
+    {"id": "sup-37", "parent_blind_id": "neg-43", "group": "7a", "every_other_rule_holds": "synthetic"},
+    {"id": "sup-39", "parent_blind_id": "neg-56", "group": "7c", "every_other_rule_holds": "synthetic"},
+]}
+
+
+class SupplementTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if SUPPLEMENT_CASES:
+            cls.path = pathlib.Path(SUPPLEMENT_CASES)
+        else:
+            cls.path = SCRATCH / "supplement.json"
+            cls.path.write_text(json.dumps(SYNTHETIC_SUPPLEMENT), encoding="utf-8")
+
+    def test_supplement_twice_gives_identical_output(self) -> None:
+        first, second = SCRATCH / "supplement-first.json", SCRATCH / "supplement-second.json"
+        impl.run_supplement(self.path, first)
+        impl.run_supplement(self.path, second)
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+
+    def test_every_variant_resolves_and_self_checks(self) -> None:
+        out = impl.run_supplement(self.path, SCRATCH / "supplement-check.json")
+        for entry_id, entry in out["entries"].items():
+            with self.subTest(entry=entry_id):
+                self.assertIsNot(entry["apply"]["resolved"], False)
+                self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
+
+    def test_the_auditor_counts_one_rule_under_the_text_reading(self) -> None:
+        out = impl.run_supplement(self.path, SCRATCH / "supplement-audit.json")
+        for entry_id in ("sup-05", "sup-10", "sup-37"):
+            entry = out["entries"].get(entry_id)
+            if entry is None:
+                continue
+            with self.subTest(entry=entry_id):
+                view = entry["isolation"]["by_copy"]["primary"]
+                text_key = "text (H = 0x60 field, P = S × m); hash over wire bytes"
+                self.assertEqual(len(view[text_key]), 1, view[text_key])
+
+    def test_a_rebuilt_tape_keeps_valid_replicas(self) -> None:
+        values = dict(impl.a4_sidecar_values(), total=8)
+        image = impl._image_cache("a4-minimal")
+        parity = image.files[2].blocks[1:5]
+        entries = [__import__("struct").pack("<IHHQ", s, j, 0, impl.crc64_xz(parity[j * 2 + s]))
+                   for s in range(2) for j in range(2)] + [impl.le64(impl.crc64_xz(b)) for b in image.files[1].blocks]
+        blocks, metadata_hash = impl.build_sidecar_explicit(image.tape_uuid, image.block_size, values, entries, parity, 1, 1)
+        rebuilt = impl.rebuild_a4(blocks, impl.MapEntry(2, 1, 8, None, 0, 4, 0),
+                                  {1: 2, 2: 0, 3: 0, 4: 4, 5: 8, 6: 1, 7: 4, 8: metadata_hash, 9: 6})
+        self.assertIn("A valid, B valid, C valid", impl.role_terminal_image(rebuilt))
+        self.assertEqual(impl.image_rows(rebuilt)[-1]["eod_record"], "40")
 
 
 if __name__ == "__main__":

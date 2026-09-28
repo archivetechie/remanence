@@ -52,6 +52,8 @@ From the repository root:
 python3 tools/rem_parity_second_implementation.py build
 python3 tools/rem_parity_second_implementation.py decide <case.json> [<case.json> ...]
 python3 tools/rem_parity_second_implementation.py resume <resume-case.json> [<resume-case.json> ...]
+python3 tools/rem_parity_second_implementation.py negatives <negative-cases.json>
+python3 tools/rem_parity_second_implementation.py negatives-supplement <supplement.json>
 python3 -m unittest tools/test_rem_parity_second_implementation.py
 ```
 
@@ -87,13 +89,50 @@ append. For each case, the program acts as a Resumer under Section 14 on
 the undamaged image, treating the prefix as the off-tape commit authority.
 It writes `resume-decisions.json`; see "The resume schema" below.
 
-The tests accept three optional environment variables:
+`negatives` takes a negative-case file. For each case and variant it does
+three things:
+- it applies the text-level mutation to my own build of the base artifact,
+  checking every stated `from` value against my bytes;
+- it applies the listed repairs;
+- it runs the target role on the mutated bytes.
+
+The decision for each entry comes from reading the text: the Section 15
+name, a set where Section 15 permits one, acceptance, or `undecided` with
+the readings. The implementation's result is recorded beside it as a
+self-check. The command writes `negative-decisions.json`; see "The
+negatives schema" below.
+
+`negatives-supplement` takes the supplemental single-rule variants. For each
+variant it does three things:
+
+- **Apply.** It applies the variant against my own bytes. That includes the
+  recipes that rebuild a sidecar, a ParityMap or a terminal suffix, block
+  faults presented as medium errors, and unit-level inputs.
+- **Check isolation.** A rule-by-rule auditor checks the claim that only one
+  rule fails. It evaluates each Section 9.2–9.5 rule of both sidecar copies
+  on its own, under both readings of the locator symbols (GAPS G-1) and
+  both readings of the Section 9.5 hash (F-1). It also runs the
+  cross-structure rules, and evaluates the ParityMap and directory rules one
+  by one. For terminal variants it uses the problems the replica validation
+  collects.
+- **Decide.** It decides the outcome under the text.
+
+It writes `negative-supplement-decisions.json`, whose entries add an
+`isolation` block (`claim`, `by_copy` failing rules per reading,
+`cross_structure_failing`, `disputed_by_implementation`, `disputes`) to the
+keys of the negatives schema below.
+
+The tests accept five optional environment variables:
 
 - `REM_PARITY_SECOND_IMPL_SCRATCH` names a working directory;
 - `REM_PARITY_SECOND_IMPL_CASES` names a directory of case files for the
   determinism test;
 - `REM_PARITY_SECOND_IMPL_RESUME` names a directory of resume-case files
-  for the resume determinism test.
+  for the resume determinism test;
+- `REM_PARITY_SECOND_IMPL_NEGATIVES` names a negative-case file for the
+  negatives tests;
+- `REM_PARITY_SECOND_IMPL_SUPPLEMENT` names a supplement-variant file for the
+  supplement tests.
 
 ## How the Reader works
 
@@ -175,6 +214,24 @@ and a `cases` map keyed by case id. Every case has the same aspects:
 | `append` | `null` for a refusal. Otherwise: `object_tape_file`, `object_first_lba`, `object_blocks`, `object_first_ordinal`, `object_row` (Section 10.3 keys as strings, byte strings as hex), `sidecars` (each with `tape_file`, `first_lba`, `epoch_id`, the protected range, `total_blocks` and `closed_by`), `tape_files` (every tape file of the resulting tape and `ALL`, in the `tape-images/MANIFEST.tsv` convention), `eod`, `uninterrupted_equal`, `uninterrupted_differences` and the `session_end_citations` |
 | `undecided` | Aspects the text leaves open, each with its readings and citations |
 
+## The negatives schema
+
+`negative-decisions.json` has `"schema": "rem-parity-second-implementation-negatives/1"`
+and an `entries` map keyed `neg-NN`, or `neg-NN/<variant>` for a case with
+variants. Every entry has the same keys:
+
+| Key | Contents |
+| --- | --- |
+| `id`, `variant`, `target` | The case, its variant, and the target as the case names it |
+| `apply` | `resolved` (`true`, `false`, or `null` when there is no tape vector), `vector` (`bytes`, an injected commit record, or `none`), `checks` (each stated `from` value against the byte found), `repairs` applied, `mutated_blocks` (size and SHA-256 of each changed block after repair), `notes` |
+| `decision` | The text decision. `outcome` is `rejected`, `accepted`, `undecided`, `no-vector` or `unresolved`. `error` is a Section 15 name, `undecided`, or `null` where no name applies. `error_set` holds the names where Section 15 permits a set. `readings` are given where the text leaves the outcome or the name open. `rules` are the quoted sentences that fail. `order` says which rule fires first, or that the text fixes no order. `reader_must_reject` is `true`, `false` or `undecided`. `formula` gives a named formula evaluated with the case's inputs, with its type and whether it overflows. `note` gives the consequence at the level of the whole tape. |
+| `implementation` | What my implementation reported for each role run: a copy or footer validator, the Recoverer, a Verifier reading both copies, the bootstrap parser, ParityMap validation, terminal selection with separation checks, or the Resumer |
+| `self_check` | Whether the implementation's result agrees with the text decision, with the detail |
+
+Entries whose inputs are off tape, reported by the device, or evaluated by
+no role (neg-04, neg-05, neg-26) have no vector. For them the decision
+records what the text lets a Reader decide.
+
 ## Files
 
 | File | Contents |
@@ -191,3 +248,5 @@ and a `cases` map keyed by case id. Every case has the same aspects:
 | `comparison.json` | The same comparison in machine-readable form, with the interpretation used for each expected key |
 | `DECISION-LOG.md` | Every decision changed after the comparison (none) |
 | `resume-decisions.json` | The Resumer's decisions on the resume cases |
+| `negative-decisions.json` | The decisions on the generation-2 negative cases |
+| `negative-supplement-decisions.json` | The decisions and isolation audits for the supplemental single-rule variants |

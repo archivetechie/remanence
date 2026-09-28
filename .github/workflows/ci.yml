@@ -117,6 +117,16 @@ jobs:
             --out "$RUNNER_TEMP/second-resume-decisions.json"
           cmp "$RUNNER_TEMP/second-resume-decisions.json" \
             fixtures/rem-parity-terminal-index-draft/second-implementation/resume-decisions-real-ids.json
+          python3 tools/rem_parity_second_implementation.py negatives \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/negative-cases-blind.json \
+            --out "$RUNNER_TEMP/second-negative-decisions.json"
+          cmp "$RUNNER_TEMP/second-negative-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/negative-decisions.json
+          python3 tools/rem_parity_second_implementation.py negatives-supplement \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/supplement-blind.json \
+            --out "$RUNNER_TEMP/second-supplement-decisions.json"
+          cmp "$RUNNER_TEMP/second-supplement-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/negative-supplement-decisions.json
           python3 -m unittest tools/test_rem_parity_second_implementation.py
 
       - name: Run tests

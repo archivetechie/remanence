@@ -1,0 +1,1727 @@
+{
+ "description": "Negative cases for blind decision: base artifact, text-level mutation, integrity repair and target role only. Expected outcomes are withheld.",
+ "conventions": {
+  "image_geometry": {
+   "note": "Derived from tape-images/inputs/*.json and tape-images/MANIFEST.tsv with the Section 9.1/9.4/10.1.2 formulas. All images: block size B = 262144 (0x40000), scheme rs-cauchy-gf256-v1, k = 2, m = 2.",
+   "a4-minimal": "S = 2. file 0 bootstrap (LBA 0); file 1 Object, 4 blocks, ordinals [0,4) (LBA 2); file 2 ParitySidecar epoch 0, range [0,4), real_data_shard_count 4 = S*k (full epoch), P = S*m = 4, H = 1, inline_index_entry_bytes = 4*16 + 4*8 = 96, total = 2H+P+1 = 7, tail copy at block H+P = 5, footer at block 2H+P = 6 (LBA 7..13); file 3 ParityMap, 3 blocks, M = 1 (LBA 15); files 4..8 = A, AB, B, BC, C (3 records each, compact separation E = 3*B); EOD LBA 39.",
+   "two-epoch": "S = 2. file 1 Object, 8 blocks; file 2 sidecar epoch 0 [0,4) (LBA 11); file 3 sidecar epoch 1 [4,8) (LBA 19); both H = 1, P = 4, total 7, inline 96; file 4 ParityMap (3 blocks, M = 1), directory with two entries naming tape files 2 and 3; files 5..9 terminal suffix; EOD 51.",
+   "short-epoch": "S = 4. file 1 Object, 2 blocks; file 2 sidecar epoch 0 [0,2), real 2 < logical S*k = 8, P = 8, H = 1, inline = 8*16 + 2*8 = 144, total = 11; file 3 ParityMap; EOD 41.",
+   "sidecar_copy_offsets": "Within a sidecar header/index copy block (Section 9.2): header 0x00..0xC8; parity entries (16 bytes each, stripe-major) from 0xC8; data-CRC entries (8 bytes each) follow; zero fill to B-8; block0_crc64 at B-8 = 0x3FFF8. For a4-minimal/two-epoch: parity entries 0xC8..0x108 (entry j: u32 stripe at +0, u16 parity_index at +4, u16 reserved at +6, u64 crc at +8), data-CRC entries 0x108..0x128, fill 0x128..0x3FFF8.",
+   "terminal_profiles": "minimal-{256k,512k,1024k}: prefix = bootstrap only, 1 structural row, 0 Object rows, payload_len 64, A at tape file 1 / LBA 2, EOD 22. multi-{256k,512k,1024k}: 6 structural rows (files 0..5: Bootstrap, Object 2 blk ordinals [0,2), Sidecar epoch 0 [0,2), Object 3 blk ordinals [2,5), Sidecar epoch 1 [2,5), ParityMap 3 blk), 2 Object rows (file 1 plaintext, file 3 encrypted), payload_len = 64*6 + 256*2 = 896, T = W = 5, covered = 6, A at tape file 6 / LBA 25, EOD 45. Every replica and separation file is 3 records: header record at file offset 0, payload record (replica) or zero interior (separation) at offset B, footer record at offset 2B. In multi replicas the payload record holds structural slot i at payload offset 64*i and Object-row slot j at 384 + 256*j."
+  },
+  "repair_profiles": {
+   "R-SC-HASHED": "Mutation inside sidecar header bytes 0x00..0x8F or inside an index entry: recompute canonical_metadata_hash (0x98, Section 9.5) over the mutated copy's own bytes, then header_crc64 (0xC0, over 0x00..0xC0), then block0_crc64 (B-8, over 0..B-8). Leave the other copy, the footer and the ParityMap directory entry unchanged unless the case says otherwise.",
+   "R-SC-UNHASHED": "Mutation inside 0x90..0xBF other than the hash field (copy_kind, reserved 0x92, copy_generation, reserved 0xB8): these are excluded from the hash (Section 9.5), so recompute header_crc64 (0xC0) and block0_crc64 (B-8) only.",
+   "R-SC-FILL": "Mutation in the zero fill of an index block: recompute that block's trailing CRC (B-8) only; fill is outside the header CRC range and outside the hash (entries are hashed 'without block padding').",
+   "R-SC-FOOTER": "Mutation in sidecar footer bytes 0x00..0x80: recompute footer_crc64 (0x80). Footer fill (0x88..end) is covered by no CRC and needs no repair.",
+   "R-PM-PAYLOAD": "ParityMap payload change applied identically to both copies (primary block 0 and tail block M, payload from offset 0xC8): recompute payload_sha256 (0x38) in the primary header, the tail header and the footer; update payload_len (0x30) in all three if the length changes (keep M unchanged); recompute the CRC-64/XZ at 0xC0 of all three blocks. canonical_map_digest is unaffected (it covers the Section 7.3 projection, not payload bytes). Terminal replicas are unaffected (their structural row for the ParityMap carries only tape file, kind and block count).",
+   "R-PM-FOOTER": "ParityMap footer-only change: recompute the footer's CRC-64/XZ at 0xC0.",
+   "R-TR-COMMON": "Replica edition-common field change: write the same value in the header record and the footer record; recompute the edition digest (0x0E8) when the field is in its preimage, the terminal-layout digest (0x108) when a component tuple changes, the replica descriptor digest (0x128) in both frames, the header CRC (0x3F8), the footer's complete header-record SHA-256 (0x2B8), and the footer CRC (0x3F8).",
+   "R-TR-PAYLOAD": "Replica payload slot change: rewrite the slot as encoded_len:u16 LE || deterministic CBOR || zero padding; recompute the domain-separated payload SHA-256 (0x0A8); if a structural slot changed, recompute the canonical-map SHA-256 (0x0C8); then apply R-TR-COMMON (the edition digest preimage contains payload_sha256 and canonical_map_sha256).",
+   "R-TR-FOOTER-LOCAL": "Replica footer-local field change (0x2B8..0x300): recompute the footer CRC (0x3F8) only; the observed fields are in no digest preimage.",
+   "R-SEP": "Separation extent header change: write shared fields in both header and footer; recompute the separation descriptor digest (0x0B8) when the field is in its preimage; recompute the header CRC (0x1F8), the footer's header-record SHA-256 (0x180) and the footer CRC (0x1F8).",
+   "R-BOOT-HDR": "Bootstrap fixed-frame change inside 0x00..0x30: recompute crc64_header (0x30)."
+  }
+ },
+ "cases": [
+  {
+   "id": "neg-01",
+   "formula": "EOD = start(C) + record_count(C) + 1",
+   "type": "u64",
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer",
+    "location": "five tuples at 0x148; expected EOD at 0x0A0"
+   },
+   "mutation": [
+    {
+     "name": "planned_start_lba of the five tuples",
+     "position": "0x158, 0x178, 0x198, 0x1B8, 0x1D8",
+     "value": "2^64-20, 2^64-16, 2^64-12, 2^64-8, 2^64-4 (each advances by 3 + 1, so the start rule holds)"
+    },
+    {
+     "name": "planned terminal EOD LBA",
+     "position": "0x0A0",
+     "value": "0"
+    },
+    {
+     "name": "local planned start LBA",
+     "position": "0x090",
+     "value": "2^64 - 20"
+    }
+   ],
+   "evaluation": "EOD = (2^64 - 4) + 3 + 1 = 2^64 overflows u64; only the EOD formula overflows.",
+   "target": "planned-layout validation (Section 8.3) within replica local eligibility (Section 10.6)",
+   "integrity_repair": [
+    "R-TR-COMMON (layout digest, descriptor digests, header CRC, footer 0x2B8, footer CRC)"
+   ]
+  },
+  {
+   "id": "neg-02",
+   "formula": "P = S \u00d7 m",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 0,
+    "copy": "bootstrap"
+   },
+   "mutation": [
+    {
+     "name": "S",
+     "position": "bootstrap key 1 key 4",
+     "value": "2^63"
+    },
+    {
+     "name": "m",
+     "position": "bootstrap key 1 key 3",
+     "value": "2 (unchanged)"
+    }
+   ],
+   "evaluation": "Sidecar header route: S u32 \u00d7 m u16 < 2^48, so it cannot overflow u64 and needs no vector. Bootstrap route: 2^63 \u00d7 2 = 2^64 overflows.",
+   "target": "a Reader deriving P from the bootstrap's scheme record (Section 9.1) before or during Section 6.6 validation",
+   "integrity_repair": [
+    "as overflow-6.6-scheme-product"
+   ]
+  },
+  {
+   "id": "neg-03",
+   "formula": "T = max(first_parity_data_ordinal + block_count) over Object entries",
+   "type": "u64",
+   "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin",
+    "location": "structural slot 3 (tape file 3, Object, first ordinal 2) at payload offset 192; Object-row slot 1 at payload offset 640"
+   },
+   "mutation": [
+    {
+     "name": "block_count(3)",
+     "position": "structural slot 3 element 2",
+     "value": "2^64 - 2"
+    },
+    {
+     "name": "stored_block_count",
+     "position": "Object-row slot 1 key 3",
+     "value": "2^64 - 2 (keeps the bijection)"
+    }
+   ],
+   "evaluation": "2 + (2^64 - 2) = 2^64 overflows u64.",
+   "target": "replica scope validation (Sections 7.4, 10.6)",
+   "integrity_repair": [
+    "R-TR-PAYLOAD (both slots; canonical-map SHA-256 recomputed because a structural slot changed)"
+   ]
+  },
+  {
+   "id": "neg-04",
+   "formula": "block_count = position delta \u2212 1",
+   "type": "u64",
+   "base": {
+    "artifact": "any image, under a fault-injecting transport"
+   },
+   "mutation": [
+    {
+     "name": "post-space position",
+     "position": "device report after spacing to the next filemark",
+     "value": "equal to the file's start position (delta 0)"
+    }
+   ],
+   "evaluation": "0 \u2212 1 underflows. No byte mutation of an image can produce it; it needs a device model that reports inconsistent positions.",
+   "target": "the Scanner walk (Section 12.2)",
+   "integrity_repair": [
+    "not applicable"
+   ],
+   "note": "Listed among the formulas with no hostile tape-byte input."
+  },
+  {
+   "id": "neg-05",
+   "formula": "o = start + data_index\u00b7S + stripe",
+   "type": "u64",
+   "base": {
+    "artifact": "synthetic descriptor (unit level)",
+    "note": "Not constructible as a byte image: a validated map needs contiguous epochs from ordinal 0 (Sections 9.2, 10.1.5), and with S*k < 2^32 (Section 6.6) reaching start = 2^64 - 2 needs more than 2^32 sidecar rows."
+   },
+   "mutation": [
+    {
+     "name": "start",
+     "position": "sidecar header 0x30 / map entry element 4",
+     "value": "2^64 - 2"
+    },
+    {
+     "name": "end",
+     "position": "sidecar header 0x38",
+     "value": "2^64 - 1 (real_data_shard_count 1)"
+    },
+    {
+     "name": "S, k",
+     "position": "sidecar header 0x24, 0x20",
+     "value": "S = 2, k = 2"
+    }
+   ],
+   "evaluation": "Peer of the stripe-0 shard at data_index 1: o = (2^64 - 2) + 1*2 + 0 = 2^64, which overflows. That peer is an implicit zero (ordinal >= end), so its exact value is never needed.",
+   "target": "the Recoverer gathering stripe peers and classifying implicit zeros (Sections 13.4, 6.4)",
+   "integrity_repair": [
+    "not applicable (unit-level vector)"
+   ],
+   "blocker_reason": "The vector exists only at unit level, and its outcome depends on the evaluation form. The text must say whether peer classification is computed in ordinal space."
+  },
+  {
+   "id": "neg-06",
+   "variants": [
+    {
+     "variant": "a-hash-over-wire",
+     "repair": [
+      "recompute canonical_metadata_hash over the header wire bytes as mutated (0x78 = 1)",
+      "header_crc64",
+      "block0_crc64"
+     ],
+     "reaches_target_if": "the hash covers the wire value of 0x78"
+    },
+    {
+     "variant": "b-hash-with-zero",
+     "repair": [
+      "keep the original canonical_metadata_hash (which equals the hash computed with 0x78 read as 0)",
+      "header_crc64",
+      "block0_crc64"
+     ],
+     "reaches_target_if": "the hash is computed with primary_header_start_block substituted by 0"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header primary_header_start_block rule (Section 9.2)",
+   "mutation": {
+    "field": "primary_header_start_block u64",
+    "offset": "0x78",
+    "from": 0,
+    "to": 1
+   },
+   "integrity_repair": [
+    "per variant"
+   ]
+  },
+  {
+   "id": "neg-07",
+   "variants": [
+    {
+     "variant": "a-index-block-fill",
+     "copy": "primary",
+     "block_within_file": 0,
+     "offset": "0x20000",
+     "from": "00",
+     "to": "01",
+     "repair": [
+      "R-SC-FILL"
+     ],
+     "rule": "Section 9.2 'zero fill | MUST be zero up to offset block_size \u2212 8'; Section 9.3 'unused space below the CRC MUST be zero'"
+    },
+    {
+     "variant": "b-tail-copy-fill",
+     "copy": "tail",
+     "block_within_file": 5,
+     "offset": "0x20000",
+     "from": "00",
+     "to": "01",
+     "repair": [
+      "R-SC-FILL"
+     ]
+    },
+    {
+     "variant": "c-footer-fill",
+     "copy": "footer",
+     "block_within_file": 6,
+     "offset": "0x1000",
+     "from": "00",
+     "to": "01",
+     "repair": [
+      "none: footer fill is outside footer_crc64 (0x00..0x80)"
+     ],
+     "rule": "Section 9.6 '0x88\u2026 | zero fill, MUST be zero'"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2
+   },
+   "target": "zero-fill verification of sidecar index blocks and footer (Sections 9.2, 9.3, 9.6, 16.2)",
+   "mutation": {
+    "field": "one fill byte",
+    "from": 0,
+    "to": 1
+   },
+   "integrity_repair": [
+    "per variant"
+   ],
+   "coverage_note": "Spill-block fill (blocks 1..H-1) cannot be exercised: every sidecar in the six images has H = 1."
+  },
+  {
+   "id": "neg-08",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header m rule (Section 9.2)",
+   "mutation": {
+    "field": "m u16",
+    "offset": "0x22",
+    "from": 2,
+    "to": 0,
+    "le_bytes": "00 00",
+    "isolation": "only m changes"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-09",
+   "formula": "H from Section 9.4 packing over (block_size, S, m, real_data_shard_count)",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "copy": "primary"
+   },
+   "mutation": [
+    {
+     "name": "real_data_shard_count",
+     "position": "sidecar header 0x48",
+     "value": "2^61"
+    },
+    {
+     "name": "protected_ordinal_end_exclusive",
+     "position": "0x38",
+     "value": "2^61 (so real = end \u2212 start holds)"
+    }
+   ],
+   "evaluation": "A closed-form stream length 16\u00b7S\u00b7m + 8\u00b7real = 64 + 2^64 overflows. The literal loop does not overflow but would iterate 2^61 times, which exhausts resources rather than arithmetic.",
+   "target": "the Reader's layout recomputation (Section 9.4) during sidecar header validation",
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-10",
+   "formula": "real_data_shard_count = end \u2212 start",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image two-epoch",
+    "tape_file": 3,
+    "copy": "primary",
+    "note": "epoch 1, [4,8)"
+   },
+   "mutation": [
+    {
+     "name": "protected_ordinal_end_exclusive",
+     "position": "sidecar header 0x38",
+     "value": 3
+    },
+    {
+     "name": "protected_ordinal_start",
+     "position": "0x30",
+     "value": "4 (unchanged)"
+    }
+   ],
+   "evaluation": "3 \u2212 4 underflows u64.",
+   "target": "sidecar header validation (Section 9.2)",
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-11",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 5,
+    "copy": "tail (primary and footer untouched)"
+   },
+   "target": "primary/tail agreement check (Section 9.1), as run by a Verifier reading both copies",
+   "mutation": {
+    "field": "data_shard_crc64 of data-CRC entry 0 (ordinal 0) in the tail copy",
+    "offset": "0x108",
+    "change": "XOR 0x01 into byte 0x108",
+    "effect": "each copy on its own satisfies Sections 9.2-9.5 (the tail's hash is recomputed over its own entries); the copies differ in index content and in canonical_metadata_hash"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED applied to the tail copy (canonical_metadata_hash 0x98, header_crc64 0xC0, block0_crc64 B-8)"
+   ]
+  },
+  {
+   "id": "neg-12",
+   "variants": [
+    {
+     "variant": "a-one-past",
+     "to": 262081,
+     "le_bytes": "c1 ff 03 00",
+     "why": "0x38 + len + 8 = 262145 = B + 1"
+    },
+    {
+     "variant": "b-hostile-max",
+     "to": 4294967295,
+     "le_bytes": "ff ff ff ff",
+     "why": "0x38 + len + 8 overflows u32 and exceeds B in u64; evaluation MUST be checked (Section 2.4)"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 0,
+    "copy": "sole bootstrap block"
+   },
+   "target": "the bootstrap frame parser's payload-bounds step (Section 8.1 parse order), in Scanner discovery (Section 8.4)",
+   "mutation": {
+    "field": "cbor_payload_len u32 LE",
+    "offset": "0x2C",
+    "from": "the recorded payload length",
+    "to": "see variants"
+   },
+   "integrity_repair": [
+    "R-BOOT-HDR (crc64_header at 0x30 covers 0x00..0x30, which includes 0x2C)",
+    "no payload CRC repair is possible or needed: the bounds step precedes the payload CRC"
+   ]
+  },
+  {
+   "id": "neg-13",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header logical_shard_count rule (Section 9.2)",
+   "mutation": {
+    "field": "logical_shard_count u64",
+    "offset": "0x40",
+    "from": 4,
+    "to": 5,
+    "formula": "MUST = S*k = 2*2 = 4"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-14",
+   "formula": "total = 2M + 1; footer at 2M",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 3,
+    "copy": "all three blocks"
+   },
+   "mutation": [
+    {
+     "name": "block_size",
+     "position": "ParityMap 0x28 (u32) in blocks 0, 1, 2",
+     "value": 2
+    },
+    {
+     "name": "payload_len",
+     "position": "0x30 in blocks 0, 1, 2",
+     "value": "2^64 \u2212 0xC9 (so 0xC8 + L = 2^64 \u2212 1 does not overflow)"
+    }
+   ],
+   "evaluation": "M = ceil((2^64 \u2212 1) / 2) = 2^63, so 2M = 2^64 overflows. With any B >= 0xC8 (the ParityMap minimum), M <= 2^64/200 and 2M + 1 cannot overflow; the vector reaches the formula only if the Reader takes B from the header field.",
+   "target": "ParityMap locator validation (Section 10.1.4)",
+   "integrity_repair": [
+    "CRC at 0xC0 of all three blocks"
+   ]
+  },
+  {
+   "id": "neg-15",
+   "formula": "manifest_first_chunk_lba + manifest_chunk_count \u2264 stored_block_count; manifest_size_bytes \u2264 manifest_chunk_count \u00d7 block_size_bytes",
+   "type": "u64",
+   "variants": [
+    {
+     "variant": "a-range-sum",
+     "key_10": "2^64 \u2212 1 (CBOR 1b ff ff ff ff ff ff ff ff)",
+     "key_12": 1,
+     "overflow": "(2^64 \u2212 1) + 1 = 2^64"
+    },
+    {
+     "variant": "b-byte-product",
+     "key_10": 0,
+     "key_12": "2^46",
+     "overflow": "2^46 \u00d7 262144 = 2^64"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin",
+    "location": "Object-row slot 0 (tape file 1, plaintext) at payload offset 384"
+   },
+   "mutation": [
+    {
+     "name": "manifest_first_chunk_lba",
+     "position": "Object row key 10"
+    },
+    {
+     "name": "manifest_chunk_count",
+     "position": "Object row key 12"
+    }
+   ],
+   "evaluation": "per variant",
+   "target": "the terminal Object-row validation (Section 10.3) within replica eligibility (Section 10.6)",
+   "integrity_repair": [
+    "R-TR-PAYLOAD (Object slot; canonical-map digest unchanged)"
+   ]
+  },
+  {
+   "id": "neg-16",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header copy_generation rule (Section 9.2)",
+   "mutation": {
+    "field": "copy_generation u32",
+    "offset": "0x94",
+    "from": 0,
+    "to": 1,
+    "le_bytes": "01 00 00 00"
+   },
+   "integrity_repair": [
+    "R-SC-UNHASHED"
+   ]
+  },
+  {
+   "id": "neg-17",
+   "formula": "tail header start = H + P",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "copy": "footer (block 6)"
+   },
+   "mutation": [
+    {
+     "name": "P",
+     "position": "sidecar footer 0x40 (u64)",
+     "value": "2^64 - 1"
+    },
+    {
+     "name": "H",
+     "position": "footer 0x38",
+     "value": "1 (unchanged)"
+    }
+   ],
+   "evaluation": "1 + (2^64 - 1) overflows; the footer's tail_header_start_block (0x58) = 5 cannot be checked against it.",
+   "target": "sidecar footer locator validation (Section 9.6), when the Scanner probes the footer (Section 12.3 item 6) or the Recoverer reads it first (Section 13.3 step 1)",
+   "integrity_repair": [
+    "R-SC-FOOTER"
+   ]
+  },
+  {
+   "id": "neg-18",
+   "variants": [
+    {
+     "variant": "a-equal",
+     "offset": "0x38",
+     "from": 8,
+     "to": 4,
+     "note": "end = start = 4"
+    },
+    {
+     "variant": "b-below",
+     "offset": "0x38",
+     "from": 8,
+     "to": 3,
+     "note": "end < start; end - start underflows u64 and MUST be rejected, not wrapped (Section 2.4); also listed as 7c overflow-9.2-end-minus-start"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image two-epoch",
+    "tape_file": 3,
+    "block_within_file": 0,
+    "copy": "primary",
+    "note": "epoch 1, range [4,8), real 4"
+   },
+   "target": "sidecar header protected range rule (Section 9.2)",
+   "mutation": {
+    "field": "protected_ordinal_end_exclusive u64",
+    "offset": "0x38",
+    "from": 8,
+    "to": "see variants"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-19",
+   "formula": "d = o \u2212 start; stripe = d mod S; data_index = d / S",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "copy": "primary"
+   },
+   "mutation": [
+    {
+     "name": "S",
+     "position": "sidecar header 0x24 (u32)",
+     "value": 0
+    }
+   ],
+   "evaluation": "d cannot underflow: the descriptor is chosen because start <= o < end. d mod S and d / S are undefined for S = 0 (division, not overflow).",
+   "target": "the Recoverer's ordinal-to-stripe mapping (Section 3.3) after index acquisition (Section 13.3)",
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ],
+   "note": "No overflow vector exists for the forward direction; the only hazard is S = 0, which earlier rules reject."
+  },
+  {
+   "id": "neg-20",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header k rule (Section 9.2)",
+   "mutation": {
+    "field": "k u16",
+    "offset": "0x20",
+    "from": 2,
+    "to": 0,
+    "le_bytes": "00 00",
+    "isolation": "only k changes"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-21",
+   "formula": "payload_len = 64 \u00d7 structural_row_count + 256 \u00d7 object_row_count",
+   "type": "u64",
+   "variants": [
+    {
+     "variant": "a-64s",
+     "structural_row_count": "2^58",
+     "object_row_count": 0,
+     "overflow": "64 \u00d7 2^58 = 2^64"
+    },
+    {
+     "variant": "b-256o",
+     "structural_row_count": 1,
+     "object_row_count": "2^56",
+     "overflow": "256 \u00d7 2^56 = 2^64"
+    },
+    {
+     "variant": "c-sum",
+     "structural_row_count": "2^57",
+     "object_row_count": "2^55",
+     "overflow": "2^63 + 2^63 = 2^64 (each product fits; the sum does not)"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer"
+   },
+   "mutation": [
+    {
+     "name": "structural_row_count",
+     "position": "replica frame 0x060"
+    },
+    {
+     "name": "object_row_count",
+     "position": "replica frame 0x068"
+    }
+   ],
+   "evaluation": "per variant",
+   "target": "replica record-geometry validation (Sections 10.4, 10.6)",
+   "integrity_repair": [
+    "R-TR-COMMON (both counts are in the edition digest preimage)"
+   ]
+  },
+  {
+   "id": "neg-22",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header data_crc_count rule (Section 9.2)",
+   "mutation": {
+    "field": "data_crc_count u64",
+    "offset": "0x58",
+    "from": 4,
+    "to": 3,
+    "formula": "MUST = real_data_shard_count (4)"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-23",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header/index copy validation, block_size rule (Section 9.2), as run by the Recoverer's index acquisition (Section 13.3) and by a Verifier",
+   "mutation": {
+    "field": "block_size u32",
+    "offset": "0x28",
+    "from": 262144,
+    "to": 524288,
+    "le_bytes": "00 00 08 00"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-24",
+   "variants": [
+    {
+     "variant": "a",
+     "to": 3,
+     "le_bytes": "03 00"
+    },
+    {
+     "variant": "b",
+     "to": 0,
+     "le_bytes": "00 00"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header copy_kind rule (Section 9.2)",
+   "mutation": {
+    "field": "copy_kind u16",
+    "offset": "0x90",
+    "from": 1,
+    "to": "see variants (neither 1 = primary nor 2 = tail)"
+   },
+   "integrity_repair": [
+    "R-SC-UNHASHED"
+   ]
+  },
+  {
+   "id": "neg-25",
+   "formula": "footer_offset = total_records \u2212 1; interior_records = total_records \u2212 2",
+   "type": "u64",
+   "variants": [
+    {
+     "variant": "a-E-zero",
+     "E": 0,
+     "total_records": 0,
+     "underflow": "0 \u2212 1 and 0 \u2212 2"
+    },
+    {
+     "variant": "b-E-one-block",
+     "E": 262144,
+     "total_records": 1,
+     "underflow": "1 \u2212 2"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "gap-ab.bin header and footer"
+   },
+   "mutation": [
+    {
+     "name": "nominal total extent bytes (E)",
+     "position": "separation 0x050 (header and footer)",
+     "value": "per variant"
+    }
+   ],
+   "evaluation": "per variant",
+   "target": "separation extent validity (Sections 10.5, 10.6)",
+   "integrity_repair": [
+    "R-SEP"
+   ]
+  },
+  {
+   "id": "neg-26",
+   "formula": "close reserve = parity closeout + (64 \u00d7 structural_row_count + 256 \u00d7 object_row_count) in three rounded replica records + both separation extents + five filemark charges",
+   "type": "u64",
+   "base": {
+    "artifact": "none"
+   },
+   "mutation": [],
+   "evaluation": "Only the Writer evaluates this, from its own prefix state, for capacity admission. No input is read from tape bytes, so no vector can reach it. The payload-length part is covered on the Reader side by overflow-10.4-slot-product.",
+   "target": "Writer capacity admission (Section 10.3; practice in the Guide)",
+   "integrity_repair": []
+  },
+  {
+   "id": "neg-27",
+   "formula": "tail copy at block M",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 3
+   },
+   "mutation": [
+    {
+     "name": "payload_len",
+     "position": "0x30",
+     "value": "as overflow-10.1.2-M"
+    }
+   ],
+   "evaluation": "The tail index is M itself; it adds no arithmetic beyond computing M, so its only overflow is overflow-10.1.2-M's.",
+   "target": "ParityMap locator validation (Section 10.1.4)",
+   "integrity_repair": [
+    "as overflow-10.1.2-M"
+   ]
+  },
+  {
+   "id": "neg-28",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header tail_header_start_block rule (Section 9.2)",
+   "mutation": {
+    "field": "tail_header_start_block u64",
+    "offset": "0x80",
+    "from": 5,
+    "to": 6,
+    "formula": "MUST = H + P = 1 + 4 = 5"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-29",
+   "variants": [
+    {
+     "variant": "a-header-0xB8",
+     "field": "reserved u64",
+     "offset": "0xB8",
+     "to": 1,
+     "le_bytes": "01 00 00 00 00 00 00 00",
+     "repair": [
+      "R-SC-UNHASHED"
+     ]
+    },
+    {
+     "variant": "b-parity-entry-reserved",
+     "field": "reserved u16 of parity entry 0 (stripe 0, parity 0)",
+     "offset": "0xCE",
+     "to": 1,
+     "le_bytes": "01 00",
+     "repair": [
+      "R-SC-HASHED (index entry bytes are hashed, Section 9.5 item 3)"
+     ],
+     "rule": "Section 9.3: 'u16 reserved, MUST be 0'"
+    },
+    {
+     "variant": "c-footer-reserved",
+     "block_within_file": 6,
+     "copy": "footer",
+     "field": "reserved (2 + 4 bytes)",
+     "offset": "0x0A",
+     "to": 1,
+     "le_bytes": "01 00",
+     "repair": [
+      "R-SC-FOOTER"
+     ]
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "reserved-field verify-zero rule for sidecar structures (Sections 9.2, 9.3, 9.6, 16.2)",
+   "mutation": {
+    "field": "see variants",
+    "from": 0
+   },
+   "integrity_repair": [
+    "per variant"
+   ]
+  },
+  {
+   "id": "neg-30",
+   "formula": "S \u00d7 (k + m) \u2264 2^32 \u2212 1",
+   "type": "u64 (CBOR uint operands)",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 0,
+    "copy": "bootstrap"
+   },
+   "mutation": [
+    {
+     "name": "S",
+     "position": "bootstrap payload key 1 (scheme record), key 4",
+     "value": "2^63 (CBOR 1b 80 00 00 00 00 00 00 00; the payload grows by 8 bytes)"
+    },
+    {
+     "name": "k, m",
+     "position": "key 1 keys 2, 3",
+     "value": "unchanged (2, 2)"
+    }
+   ],
+   "evaluation": "2^63 \u00d7 4 = 2^65 overflows u64. From the sidecar header the operands are u32 \u00d7 (u16 + u16) < 2^49, so only the bootstrap route can overflow.",
+   "target": "the bootstrap payload validation (Section 8.2: '(k, m, S) MUST satisfy Section 6.6 validity') in Scanner discovery (Section 8.4)",
+   "integrity_repair": [
+    "cbor_payload_len (0x2C) += 8",
+    "crc64_header (0x30)",
+    "crc64_payload (u64 LE after the payload) recomputed at its new position; zero fill follows"
+   ]
+  },
+  {
+   "id": "neg-31",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header reserved field after copy_kind (Section 9.2)",
+   "mutation": {
+    "field": "reserved u16",
+    "offset": "0x92",
+    "from": 0,
+    "to": 1,
+    "le_bytes": "01 00"
+   },
+   "integrity_repair": [
+    "R-SC-UNHASHED"
+   ]
+  },
+  {
+   "id": "neg-32",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar index layout recomputation (Section 9.4) against inline_index_entry_bytes (Section 9.2)",
+   "mutation": {
+    "field": "inline_index_entry_bytes u64",
+    "offset": "0x68",
+    "from": 96,
+    "to": 88,
+    "formula": "Section 9.4: inline = offset - 0xC8 after packing 4 parity (16 B) + 4 data-CRC (8 B) entries = 96"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-33",
+   "formula": "tail copy block = sidecar_total_block_count \u2212 1 \u2212 sidecar_header_block_count (directory entry counts)",
+   "type": "u64",
+   "variants": [
+    {
+     "variant": "a-H-seven",
+     "key_6": 7,
+     "evaluation": "7 \u2212 1 \u2212 7 underflows"
+    },
+    {
+     "variant": "b-H-max",
+     "key_6": "2^64 \u2212 1 (CBOR 1b ff..ff; payload grows by 8 bytes, M stays 1)",
+     "evaluation": "7 \u2212 1 \u2212 (2^64 \u2212 1) underflows"
+    },
+    {
+     "variant": "c-total-zero",
+     "key_5": 0,
+     "evaluation": "0 \u2212 1 \u2212 1 would underflow, but a zero total breaks the decoder invariant 'non-zero sidecar_total_block_count', and the Section 13.3 agreement rule forbids the read because the block count differs from the map entry's 7"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 3,
+    "copy": "ParityMap directory entry 0 (names tape file 2), in both copies",
+    "precondition": "also make the sidecar at tape file 2 reach step 3: corrupt its footer (flip a byte of footer_crc64 at block 6 offset 0x80) and its primary (flip a byte of header_crc64 at block 0 offset 0xC0)"
+   },
+   "mutation": [
+    {
+     "name": "entry key 6 (sidecar_header_block_count)",
+     "position": "SidecarEpochDirectory entry 0, key 6",
+     "value": "per variant"
+    },
+    {
+     "name": "entry key 5 (sidecar_total_block_count)",
+     "position": "entry 0, key 5",
+     "value": "7 (unchanged, except variant c)"
+    }
+   ],
+   "evaluation": "per variant",
+   "target": "the Recoverer's directory-assisted tail rescue (Section 13.3 step 3)",
+   "integrity_repair": [
+    "R-PM-PAYLOAD on the ParityMap (both copies, payload_sha256 x 3, CRCs x 3, payload_len if the length changes)",
+    "no repair on the corrupted sidecar blocks (the corruption is intended)"
+   ]
+  },
+  {
+   "id": "neg-34",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header S rule (Section 9.2)",
+   "mutation": {
+    "field": "S u32",
+    "offset": "0x24",
+    "from": 2,
+    "to": 0,
+    "le_bytes": "00 00 00 00",
+    "isolation": "only S changes"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-35",
+   "formula": "T \u2212 W < S \u00d7 k",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image unfinalized-open",
+    "note": "true prefix: T = 6, W = 4"
+   },
+   "mutation": [
+    {
+     "name": "protected range of the sidecar at tape file 2",
+     "position": "its commit record (abstract, injected by the harness)",
+     "value": "[0, 8), so W = 8 > T = 6"
+    }
+   ],
+   "evaluation": "6 \u2212 8 underflows. Step 2 lists 'T \u2212 W < S \u00d7 k' before 'W \u2264 T', so a Resumer that evaluates in the listed order meets the underflow first.",
+   "target": "the Resumer (Section 14 step 2)",
+   "integrity_repair": [
+    "none on tape"
+   ]
+  },
+  {
+   "id": "neg-36",
+   "variants": [
+    {
+     "variant": "a-footer-sequence",
+     "field": "sequence u64",
+     "offset": "0x20",
+     "block_within_file": 2,
+     "from": 0,
+     "to": 1,
+     "rule": "the decoded payload (key 3 sequence = 0) MUST match the header/footer locator fields; header and footer disagree"
+    },
+    {
+     "variant": "b-footer-payload-len",
+     "field": "payload_len u64",
+     "offset": "0x30",
+     "block_within_file": 2,
+     "from": "L (the header's payload_len)",
+     "to": "L + 1",
+     "rule": "footer locator input disagrees with both headers while its own M = ceil((0xC8 + L + 1)/B) is still 1, so the footer is self-consistent and only the header/footer comparison fails"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 3,
+    "copy": "footer (block 2M = 2); both headers untouched",
+    "note": "M = 1, total = 2M + 1 = 3, primary at 0, tail at M = 1, footer at 2M = 2"
+   },
+   "target": "ParityMap locator and agreement validation (Sections 10.1.3, 10.1.4); in a BOT walk also ladder item 4 (Section 12.3)",
+   "mutation": {
+    "field": "see variants"
+   },
+   "integrity_repair": [
+    "R-PM-FOOTER (footer CRC at 0xC0)"
+   ]
+  },
+  {
+   "id": "neg-37",
+   "base": {
+    "artifact": "tape-image two-epoch",
+    "tape_file": 4,
+    "copy": "both (primary block 0 and tail block 1 carry identical payloads)",
+    "note": "ParityMap M = 1, total 3. Directory {1: 5, 2: 8, 3: 8, 4: true, 5: [e0, e1]}, e0 names tape file 2 (epoch 0, [0,4)), e1 names tape file 3 (epoch 1, [4,8)); both entries have H = 1, P = 4, total 7"
+   },
+   "target": "the SidecarEpochDirectory decoder invariants (Section 10.1.5), run whenever a Reader decodes the directory: the Recoverer's Section 13.1 input, the Scanner's second pass (Section 12.3), a Verifier",
+   "mutation": {
+    "field": "payload key 4 (SidecarEpochDirectory) key 5 (entries array)",
+    "offset": "CBOR inside the payload at 0xC8 of each copy",
+    "from": "[e0, e1]",
+    "to": "[e1, e0]",
+    "note": "the two entry maps have equal encoded length, so payload_len and M are unchanged"
+   },
+   "integrity_repair": [
+    "R-PM-PAYLOAD (payload_sha256 in primary header, tail header and footer; CRC at 0xC0 of all three blocks)"
+   ]
+  },
+  {
+   "id": "neg-38",
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "gap-ab.bin",
+    "location": "header record, file offset 0"
+   },
+   "target": "separation extent validity (Section 10.6 read against Section 10.5), as checked by a Verifier",
+   "mutation": {
+    "field": "role magic",
+    "offset": "0x000",
+    "change": "XOR 0x01 into byte 0"
+   },
+   "integrity_repair": [
+    "R-SEP: header CRC (0x1F8); footer 0x180 header-record SHA-256; footer CRC (0x1F8). The magic is in no descriptor preimage."
+   ]
+  },
+  {
+   "id": "neg-39",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header tape_uuid rule (Section 9.2)",
+   "mutation": {
+    "field": "tape_uuid",
+    "offset": "0x08..0x18",
+    "from": "12 34 56 78 12 34 42 34 82 34 12 34 56 78 9a bc",
+    "to": "ee ee ee ee ee ee ee ee ee ee ee ee ee ee ee ee",
+    "keep": "magic at 0x00 stays HMAC(real tape UUID, SIDECAR_MAGIC_LABEL)[0..8], so the block is still recognised as this tape's sidecar"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-40",
+   "formula": "total = 2H + P + 1 (also footer index 2H + P)",
+   "type": "u64",
+   "variants": [
+    {
+     "variant": "a-footer",
+     "position": "sidecar footer 0x38 (H u64)",
+     "block_within_file": 6,
+     "value": "2^63",
+     "repair": [
+      "R-SC-FOOTER"
+     ]
+    },
+    {
+     "variant": "b-header",
+     "position": "sidecar header 0x60 (H u64)",
+     "block_within_file": 0,
+     "value": "2^63",
+     "repair": [
+      "R-SC-HASHED"
+     ]
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2
+   },
+   "mutation": [
+    {
+     "name": "H",
+     "position": "per variant",
+     "value": "2^63"
+    }
+   ],
+   "evaluation": "2 \u00d7 2^63 = 2^64 overflows before + P + 1 (and before + P for the footer index).",
+   "target": "sidecar footer locator validation (Sections 9.6, 12.3 item 6, 13.3 step 1) and sidecar header validation (Section 9.2)",
+   "integrity_repair": [
+    "per variant"
+   ]
+  },
+  {
+   "id": "neg-41",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header footer_block_index rule (Section 9.2)",
+   "mutation": {
+    "field": "footer_block_index u64",
+    "offset": "0x88",
+    "from": 6,
+    "to": 7,
+    "formula": "MUST = 2H + P = 2*1 + 4 = 6"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-42",
+   "formula": "start(next component) = start + record_count + 1",
+   "type": "u64",
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer",
+    "location": "tuple (4,1) at 0x148; its planned_start_lba at 0x148 + 0x10 = 0x158; local planned start LBA at 0x090"
+   },
+   "mutation": [
+    {
+     "name": "planned_start_lba of (4,1)",
+     "position": "0x158 (and 0x090, the local copy, to keep them equal)",
+     "value": "2^64 - 2"
+    },
+    {
+     "name": "record_count of (4,1)",
+     "position": "0x148 + 0x18",
+     "value": "3 (unchanged)"
+    }
+   ],
+   "evaluation": "(2^64 - 2) + 3 + 1 overflows before it can be compared with (5,1)'s start of 6.",
+   "target": "planned-layout validation (Section 8.3) within replica local eligibility (Section 10.6)",
+   "integrity_repair": [
+    "R-TR-COMMON: terminal-layout digest (0x108), descriptor digest (0x128) in both frames, header CRC, footer 0x2B8, footer CRC"
+   ]
+  },
+  {
+   "id": "neg-43",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar index layout recomputation (Section 9.4) against header H (Section 9.2)",
+   "mutation": {
+    "field": "sidecar_header_block_count u64 (H)",
+    "offset": "0x60",
+    "from": 1,
+    "to": 2,
+    "formula": "Section 9.4 over (B = 262144, S = 2, m = 2, real = 4): stream 96 bytes, 0xC8 + 96 <= B - 8, so H = 1, inline = 96"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-44",
+   "formula": "LBA(f, b) = \u03a3_{g<f}(block_count(g) + 1) + b",
+   "type": "u64",
+   "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin, replica-b.bin, replica-c.bin (all three, so they agree)",
+    "location": "structural slot 4 (tape file 4, ParitySidecar, block_count 5) at payload offset 256"
+   },
+   "mutation": [
+    {
+     "name": "block_count(4)",
+     "position": "structural slot 4, array element 2 (Section 10.2)",
+     "value": "0xFFFFFFFFFFFFFFFF (CBOR 1b ff ff ff ff ff ff ff ff)"
+    }
+   ],
+   "evaluation": "LBA(5, 0) = (1+1) + (2+1) + (5+1) + (3+1) + (2^64 - 1 + 1): the last term overflows u64.",
+   "target": "no Reader step named by the text; candidates are the Recoverer resolving a map entry to a position (Section 13.3 'Locate the epoch's sidecar tape file via the map') and a check of replica A's planned start LBA (25) against the prefix sum, which the text does not require",
+   "integrity_repair": [
+    "R-TR-PAYLOAD in each replica, including the canonical-map SHA-256 (structural slot changed)"
+   ],
+   "blocker_reason": "A vector exists, but the text names no role that evaluates LBA(f, b) over tape-derived counts, so the vector's consumer and outcome cannot be fixed."
+  },
+  {
+   "id": "neg-45",
+   "formula": "M = ceil((0xC8 + L) / B)",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 3,
+    "copy": "primary header, tail header and footer (the same value in all three, so they do not disagree)"
+   },
+   "mutation": [
+    {
+     "name": "payload_len (L)",
+     "position": "ParityMap 0x30 in blocks 0, 1, 2",
+     "value": "0xFFFFFFFFFFFFFFFF"
+    }
+   ],
+   "evaluation": "0xC8 + L overflows u64.",
+   "target": "ParityMap locator validation (Section 10.1.4)",
+   "integrity_repair": [
+    "CRC at 0xC0 of all three blocks"
+   ]
+  },
+  {
+   "id": "neg-46",
+   "formula": "payload_record_count = ceil(payload_len / B); payload_padding_bytes = payload_record_count \u00d7 B \u2212 payload_len; footer_block_offset = 1 + count; replica_record_count = 2 + count",
+   "type": "u64",
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer"
+   },
+   "mutation": [
+    {
+     "name": "structural_row_count",
+     "position": "0x060",
+     "value": "2^58 \u2212 1"
+    },
+    {
+     "name": "object_row_count",
+     "position": "0x068",
+     "value": 0
+    },
+    {
+     "name": "B",
+     "position": "0x040",
+     "value": "262144 (unchanged)"
+    }
+   ],
+   "evaluation": "payload_len = 2^64 \u2212 64 (fits); ceil = 2^46 (the form (L + B \u2212 1)/B already overflows); count \u00d7 B = 2^64 overflows in the padding formula. footer_block_offset and replica_record_count cannot overflow: payload_len <= 2^64 \u2212 64, so count <= 2^64 \u2212 64 even at B = 1, and 2 + count fits. No vector exists for those two.",
+   "target": "replica record-geometry validation (Sections 10.4, 10.6)",
+   "integrity_repair": [
+    "R-TR-COMMON"
+   ]
+  },
+  {
+   "id": "neg-47",
+   "variants": [
+    {
+     "variant": "a-covered-prefix",
+     "field": "covered-prefix tape-file count",
+     "offset": "0x048",
+     "from": 6,
+     "to": 7,
+     "must_match": "structural_row_count (6) and replica A's planned tape-file number (6) (Section 10.6); the digest scope of exactly the leading tape_file_count entries (Section 7.4)"
+    },
+    {
+     "variant": "b-total-data-ordinals",
+     "field": "total data ordinals",
+     "offset": "0x050",
+     "from": 5,
+     "to": 6,
+     "must_match": "T recomputed over the prefix (Sections 7.2, 7.4) = 5; and highest_protected_ordinal (5), because sidecars are present (Section 10.6)"
+    },
+    {
+     "variant": "c-highest-protected",
+     "field": "highest protected ordinal",
+     "offset": "0x058",
+     "from": 5,
+     "to": 4,
+     "must_match": "W recomputed over the prefix (Sections 7.2, 7.4) = 5; and total_data_ordinals (5) (Section 10.6)"
+    },
+    {
+     "variant": "d-total-isolated",
+     "base_override": "terminal profile minimal-256k replica A",
+     "field": "total data ordinals",
+     "offset": "0x050",
+     "from": 0,
+     "to": 1,
+     "must_match": "T recomputed = 0 (no Object rows). No sidecars, so the W = T rule does not apply and only the Section 7.4 cross-check fails; W (0) <= T (1) still holds"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin",
+    "location": "header record (file offset 0) and footer record (file offset 524288); the same value is written in both"
+   },
+   "target": "replica scope validation (Sections 7.4, 10.6)",
+   "mutation": {
+    "field": "see variants"
+   },
+   "integrity_repair": [
+    "R-TR-COMMON: all three fields are in the edition digest preimage, so recompute the edition digest (0x0E8) and the descriptor digest (0x128) in both frames, the header CRC, the footer's header-record SHA-256 (0x2B8) and the footer CRC. Payload and canonical-map digests are unchanged and still verify."
+   ]
+  },
+  {
+   "id": "neg-48",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "canonical metadata hash verification on index parse (Section 9.5)",
+   "mutation": {
+    "field": "canonical_metadata_hash",
+    "offset": "0x98",
+    "change": "XOR 0x01 into byte 0x98; the other 31 bytes unchanged"
+   },
+   "integrity_repair": [
+    "header_crc64 (0xC0)",
+    "block0_crc64 (B-8)",
+    "do NOT recompute the hash"
+   ]
+  },
+  {
+   "id": "neg-49",
+   "formula": "block(stripe, parity_index) = H + parity_index\u00b7S + stripe",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "copy": "primary"
+   },
+   "mutation": [
+    {
+     "name": "H",
+     "position": "sidecar header 0x60",
+     "value": "2^64 - 1"
+    }
+   ],
+   "evaluation": "block(0, 1) = (2^64 - 1) + 1\u00d72 + 0 overflows. parity_index\u00b7S < 2^16 \u00d7 2^32, so only a hostile H reaches overflow.",
+   "target": "the Recoverer locating a parity shard from the acquired index (Sections 9.1, 13.4)",
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-50",
+   "formula": "total_records = ceil(E / B); actual_bytes = total_records \u00d7 B",
+   "type": "u64",
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "gap-ab.bin header and footer"
+   },
+   "mutation": [
+    {
+     "name": "nominal total extent bytes (E)",
+     "position": "separation 0x050 (header and footer)",
+     "value": "2^64 \u2212 1"
+    },
+    {
+     "name": "total record count",
+     "position": "0x058",
+     "value": "3 (left; also mismatches)"
+    }
+   ],
+   "evaluation": "ceil((2^64 \u2212 1) / 2^18) = 2^46 (the form (E + B \u2212 1)/B overflows first); actual_bytes = 2^46 \u00d7 2^18 = 2^64 overflows in either form.",
+   "target": "separation extent validity (Section 10.6, size formulas read against Section 10.5), as checked by a Verifier",
+   "integrity_repair": [
+    "R-SEP (nominal_extent_bytes is in the separation descriptor preimage: recompute 0x0B8 in both frames, header CRC, footer 0x180, footer CRC)"
+   ]
+  },
+  {
+   "id": "neg-51",
+   "variants": [
+    {
+     "variant": "a-header-magic-flipped",
+     "offset": "0x000",
+     "change": "XOR 0x01 into byte 0 of replica A's header record"
+    },
+    {
+     "variant": "b-header-carries-footer-magic",
+     "offset": "0x000..0x008",
+     "to": "HMAC-SHA-256(key = tape UUID 11 x 16, 'REM\\0TIREP\\x01F')[0..8]; role field 0x00A left as 1 (header)"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin",
+    "location": "header record, file offset 0"
+   },
+   "target": "replica local eligibility, role-magic condition (Section 10.6), reached from the planned layout of C's footer during discovery (Section 8.4)",
+   "mutation": {
+    "field": "role magic (derived)",
+    "see": "variants"
+   },
+   "integrity_repair": [
+    "header CRC (0x3F8, covers 0x000..0x3F8)",
+    "footer 0x2B8 complete header-record SHA-256",
+    "footer CRC (0x3F8)"
+   ]
+  },
+  {
+   "id": "neg-52",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header parity_block_count rule (Section 9.2)",
+   "mutation": {
+    "field": "parity_block_count u64",
+    "offset": "0x50",
+    "from": 4,
+    "to": 3,
+    "formula": "MUST = S*m = 4"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  },
+  {
+   "id": "neg-53",
+   "variants": [
+    {
+     "variant": "a-replica-A-only",
+     "replicas": [
+      "A"
+     ]
+    },
+    {
+     "variant": "b-all-replicas",
+     "replicas": [
+      "A",
+      "B",
+      "C"
+     ],
+     "tape_level_error": "BotStructuralRecoveryRequired"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin (and b, c for variant b)",
+    "location": "Object-row slot 0 (tape file 1, plaintext) at payload offset 384 = file offset 262144 + 384 = 0x40180"
+   },
+   "target": "the terminal replica Object-row decoder (Section 10.3) within replica local eligibility (Section 10.6)",
+   "mutation": {
+    "field": "Object row key 4 (object_id, bytes 1-64)",
+    "from": "24 bytes 'minimal-plaintext-object' (CBOR 04 58 18 ...)",
+    "to": "65 bytes of 0x61 (CBOR 04 58 41 61 x 65); every byte non-NUL, so only the length rule is broken",
+    "slot_fit": "the slot's CBOR grows by 41 bytes and stays under the 254-byte limit of a 256-byte slot"
+   },
+   "integrity_repair": [
+    "R-TR-PAYLOAD: slot encoded_len and zero padding; payload SHA-256 (0x0A8); canonical-map SHA-256 unchanged (not a structural slot); edition digest (0x0E8); descriptor digest (0x128) in header and footer; header CRC; footer 0x2B8 header-record SHA-256; footer CRC"
+   ]
+  },
+  {
+   "id": "neg-54",
+   "variants": [
+    {
+     "variant": "a-header-wrong",
+     "copy": "primary",
+     "block_within_file": 0,
+     "offset": "0x70",
+     "from": 7,
+     "to": 8,
+     "repair": [
+      "R-SC-HASHED"
+     ],
+     "target": "Section 9.2 total rule; also Scanner ladder item 5 measured-count comparison when the BOT walk runs"
+    },
+    {
+     "variant": "b-header-zero-hostile",
+     "copy": "primary",
+     "block_within_file": 0,
+     "offset": "0x70",
+     "from": 7,
+     "to": 0,
+     "repair": [
+      "R-SC-HASHED"
+     ],
+     "target": "Section 9.2 total rule; any Reader use of total - 1 (last block) or total - 1 - H from this field would underflow and MUST be rejected (Section 2.4)"
+    },
+    {
+     "variant": "c-footer-zero-hostile",
+     "copy": "footer",
+     "block_within_file": 6,
+     "offset": "0x48",
+     "from": 7,
+     "to": 0,
+     "repair": [
+      "R-SC-FOOTER"
+     ],
+     "target": "sidecar footer locator validation: measured-count comparison (Section 12.3 item 6) and map-entry comparison (Section 13.3 step 1)"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2
+   },
+   "target": "sidecar header total rule (Section 9.2) for variants a and b; sidecar footer locator validation (Sections 9.6, 12.3 item 6, 13.3 step 1) for variant c",
+   "mutation": {
+    "field": "sidecar_total_block_count u64",
+    "formula": "MUST = 2H + P + 1 = 7 (header); footer total MUST equal the measured count (7)"
+   },
+   "integrity_repair": [
+    "per variant"
+   ]
+  },
+  {
+   "id": "neg-55",
+   "formula": "backward start delta (0x2F8) = observed record count (0x2E8) \u2212 1; observed footer LBA (0x2F0) = observed start LBA (0x2E0) + delta",
+   "type": "u64",
+   "variants": [
+    {
+     "variant": "a-count-zero",
+     "position": "replica footer 0x2E8",
+     "value": 0,
+     "overflow": "0 \u2212 1 underflows"
+    },
+    {
+     "variant": "b-start-max",
+     "position": "replica footer 0x2E0",
+     "value": "2^64 \u2212 1",
+     "other": "0x2E8 = 3, 0x2F8 = 2 unchanged",
+     "overflow": "(2^64 \u2212 1) + 2 overflows"
+    },
+    {
+     "variant": "c-separation-count-zero",
+     "component": "gap-ab.bin footer",
+     "position": "0x1B0",
+     "value": 0,
+     "repair": [
+      "separation footer CRC (0x1F8)"
+     ],
+     "note": "Section 10.6 applies the Section 10.4 footer arithmetic to 0x1A8, 0x1B0, 0x1B8, 0x1C0"
+    }
+   ],
+   "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin footer record (file offset 524288)"
+   },
+   "mutation": [
+    {
+     "name": "footer observation fields",
+     "position": "per variant"
+    }
+   ],
+   "evaluation": "per variant",
+   "target": "replica footer validation (Section 10.4) within local eligibility (Section 10.6)",
+   "integrity_repair": [
+    "R-TR-FOOTER-LOCAL (footer CRC only; observation fields are in no digest)"
+   ]
+  },
+  {
+   "id": "neg-56",
+   "formula": "append point = \u03a3(block_count + 1) over all committed files (Section 3.2; Section 14 step 4)",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image unfinalized-open",
+    "note": "committed prefix files 0..3 (bootstrap 1, Object 4, sidecar 7 [0,4), Object 2); T = 6, W = 4; append point 17"
+   },
+   "mutation": [
+    {
+     "name": "block_count of tape file 3",
+     "position": "the commit record for tape file 3 (abstract; injected by the harness, not a tape byte)",
+     "value": "0xFFFFFFFFFFFFFFFF"
+    }
+   ],
+   "evaluation": "(1+1) + (4+1) + (7+1) + (2^64 - 1 + 1) overflows; T = 4 + (2^64 - 1) overflows too.",
+   "target": "the Resumer (Section 14 steps 1, 2 and 4)",
+   "integrity_repair": [
+    "none on tape; the record must be self-consistent in whatever commit-record format the implementation uses"
+   ]
+  },
+  {
+   "id": "neg-57",
+   "formula": "logical_shard_count = S \u00d7 k",
+   "type": "u64",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 0,
+    "copy": "bootstrap"
+   },
+   "mutation": [
+    {
+     "name": "S",
+     "position": "bootstrap key 1 key 4",
+     "value": "2^63"
+    },
+    {
+     "name": "k",
+     "position": "bootstrap key 1 key 2",
+     "value": "2"
+    }
+   ],
+   "evaluation": "From the sidecar header: S u32 \u00d7 k u16 < 2^48, so no overflow and no vector. From the bootstrap: 2^63 \u00d7 2 = 2^64 overflows, e.g. in the Recoverer's pin (Section 13.3) or the Resumer's bound T \u2212 W < S \u00d7 k (Section 14).",
+   "target": "any Reader using the bootstrap's S and k",
+   "integrity_repair": [
+    "as overflow-6.6-scheme-product"
+   ]
+  },
+  {
+   "id": "neg-58",
+   "variants": [
+    {
+     "variant": "a-not-end-minus-start",
+     "mutation": [
+      {
+       "field": "real_data_shard_count",
+       "offset": "0x48",
+       "from": 4,
+       "to": 3
+      },
+      {
+       "field": "data_crc_count",
+       "offset": "0x58",
+       "from": 4,
+       "to": 3,
+       "why": "keeps the 0x58 rule satisfied"
+      },
+      {
+       "field": "inline_index_entry_bytes",
+       "offset": "0x68",
+       "from": 96,
+       "to": 88,
+       "why": "Section 9.4 recomputed with real = 3"
+      },
+      {
+       "field": "fourth data-CRC entry",
+       "offset": "0x120..0x128",
+       "to": "zero",
+       "why": "stream now has 3 data-CRC entries; the freed bytes become fill"
+      }
+     ],
+     "isolated_violation": "real (3) != end - start (4 - 0)"
+    },
+    {
+     "variant": "b-above-logical",
+     "mutation": [
+      {
+       "field": "protected_ordinal_end_exclusive",
+       "offset": "0x38",
+       "from": 4,
+       "to": 5
+      },
+      {
+       "field": "real_data_shard_count",
+       "offset": "0x48",
+       "from": 4,
+       "to": 5
+      },
+      {
+       "field": "data_crc_count",
+       "offset": "0x58",
+       "from": 4,
+       "to": 5
+      },
+      {
+       "field": "inline_index_entry_bytes",
+       "offset": "0x68",
+       "from": 96,
+       "to": 104
+      },
+      {
+       "field": "fifth data-CRC entry",
+       "offset": "0x128..0x130",
+       "to": "any u64 LE, e.g. 0x261BDF3D299838FC (crc64 of a zero block)"
+      }
+     ],
+     "isolated_violation": "real (5) > logical_shard_count (S*k = 4), i.e. outside 1..=S*k"
+    }
+   ],
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 2,
+    "block_within_file": 0,
+    "copy": "primary"
+   },
+   "target": "sidecar header real_data_shard_count rule (Section 9.2)",
+   "mutation": {
+    "field": "real_data_shard_count u64",
+    "offset": "0x48",
+    "from": 4,
+    "to": "3 (variant a) or 5 (variant b), with the companion edits listed per variant so that exactly one Section 9.2 rule is broken"
+   },
+   "integrity_repair": [
+    "R-SC-HASHED"
+   ]
+  }
+ ]
+}
