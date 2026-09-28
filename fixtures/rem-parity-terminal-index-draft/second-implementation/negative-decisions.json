@@ -7744,7 +7744,7 @@
         "rules": [
           {
             "section": "14",
-            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."
+            "quote": "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it."
           },
           {
             "section": "3.2",

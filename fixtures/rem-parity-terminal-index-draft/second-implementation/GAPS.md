@@ -531,3 +531,137 @@ divergence in BUILD-LOG.
   the variants do not specify. My choices are listed in the entries'
   `apply.notes`, and no decision depends on them.
 
+
+## H. Mutated-block digests, terminal mutations and survivor sets
+
+These were found while comparing the negatives' mutated blocks with
+`tape-images/negatives/MANIFEST.tsv`, and while deciding the 50 terminal-index
+mutations and the 14 survivor sets. The mutations and survivor sets were
+decided before any expected outcome for them was read, and none has been
+compared with one.
+
+Three earlier entries recur. B-6 (an unread payload and degraded evidence)
+leaves `tape.degraded` open for the five mutations that damage only replica
+A's payload: mut-09, mut-22, mut-30, mut-34 and mut-36. B-4 (no category for
+an invalid separation extent) leaves the Verifier's category open for the 14
+mutations that damage only extent A-B. B-5 is decided as before: in mut-05
+the extents are compared with the accepted edition.
+
+**H-1. Section 6.2: no parity is defined for an epoch longer than `S × k`
+(sup-14).** The generator is defined by "X_j = k + j (j in 0..m) Y_i = i (i in
+0..k)", so it has a column only for data indices below `k`. sup-14's sidecar
+protects `[0, 5)` at `k = 2` and `S = 2`. Ordinal 4 then has data index 2,
+which has no column, and the text determines no parity for the epoch. The
+variant says the same: "Parity bytes are arbitrary". My build encodes the
+first `S × k` ordinals. The pinned blocks keep the base image's parity. Six
+pinned blocks therefore differ. In each, the first differing byte is a field
+derived from the parity CRCs: `canonical_metadata_hash` in both header copies
+(offset 0x98) and in the footer (0x60), and `payload_sha256` in the three
+ParityMap blocks (0x38). My four parity blocks appear only on my side,
+because the pinned parity equals the base's. A diagnostic candidate with the
+base parity reproduces all 26 pinned digests of the case; it is used only to
+locate the differences.
+
+**H-2. The profile that sup-15 generates is not determined by its
+variant.** The variant fixes the structural rows, the Object rows' counts and
+manifest fields, and `T = W = 0`, and leaves the rest to the generator: the
+tape UUID, edition, diagnostic text and extent size, the Object ids and
+manifest digests, and replica A's start LBA ("the profile may present A at
+any LBA the harness chooses"). No rule of the text could fix those values. My
+choices are listed in the supplement decision's `apply.notes`. All 13 pinned
+blocks of the case differ from mine. The manifest pins only digests and no
+candidate reproduces them, so the first differing byte cannot be located.
+
+**H-3. Fixture note: the manifest lists some blocks whose bytes did not
+change.** 28 manifest rows name a block that my mutation leaves
+byte-identical to the base. Twelve are the footer and ParityMap blocks of the
+three supplement variants confined to hash-excluded fields (sup-09, sup-26,
+sup-40), whose convention says such a mutation "changes neither the footer
+nor the directory". Three are the ParityMap blocks of sup-06, which keeps the
+original hash. The other 13 are blocks of the four rebuilt images (sup-11,
+sup-14, sup-37, sup-45) that the rebuild wrote with unchanged bytes: the
+separation-extent interiors, sup-45's four parity blocks and sup-14's Object
+block 1. In every one, the pinned digest equals my block's. This implementation emits a block only when its bytes
+differ from the base's at the same key. No text defect is involved.
+
+**H-4. Section 8.4 step 1: an ineligible footer as the source of the layout
+now decides outcomes (sel-08, sel-10; extends B-8).** Step 1 says "locate,
+from EOD, the local footer of a terminal replica, and from it the planned
+terminal layout". It does not require that footer to be eligible first. The
+eligibility rule ("Footer-local observed positions MUST agree with the
+footer's planned shared layout before that replica is eligible") speaks of
+the replica, not of the layout. "When footers propose different planned
+layouts, Section 8.5 decides which replicas are accepted" implies that a
+Scanner may meet more than one layout, but not that it must look for one. In
+sel-08 and sel-10 the first replica footer found from EOD is that of a
+replica from the minimal profile, planned for the minimal tape's
+coordinates. A Scanner that takes its layout finds no valid replica at any
+coordinate it plans, and walks from BOT (`BotStructuralRecoveryRequired`). A
+Scanner that passes over a footer whose positions the device contradicts, or
+that considers every footer's layout, reaches B's footer and the profile's
+plan. It then accepts B (sel-08) or A and B (sel-10), degraded. Two
+conformant Scanners reach different outcomes. *Undecided:* `tape.outcome`.
+This implementation's Scanner takes the first footer that parses (B-8), so
+it reports the walk.
+
+**H-5. Section 3.5 and Section 10.6: a record that is not one full block
+(mut-01, mut-18, mut-26, mut-27, sel-01).** Section 3.5 says that "a read
+returning other than exactly one block is an error" and classifies only the
+Filemark and EndOfData outcomes. Section 8.4 says that "a non-medium
+transport error aborts discovery". A short record could therefore be read as
+a transport error that aborts discovery. Section 10.6, however, lists
+"record length" among the frame conditions a replica or extent must meet,
+and Section 15 requires I/O faults to "remain distinct from format
+violations". A short record on the medium is a format violation, not a
+fault of the transport. *Decided:* a record that is not one full block
+fails the record-length condition, so the component is invalid and discovery
+continues. Under the other reading, a Reader that reads the short record
+would abort: mut-26 would end in a transport error at replica A's footer
+instead of an inventory from B and C, and sel-01 would end at the first
+footer read from EOD instead of in `BotStructuralRecoveryRequired`.
+
+**H-6. Fixture note: the event row mut-35 defines no mutation.** Its
+description says that "No exact byte effect is defined". The decision is
+made for the bytes as they stand, which are the base profile's. Its note
+says what the text would decide under the two meanings the description
+names, the removal of replica A's trailing filemark and an edit of a
+component tuple's filemark count, and marks both as informative.
+
+**H-7. Fixture note: status S3 does not say whether an absent replica's
+trailing filemark remains (sel-07).** "the component's records are absent"
+leaves the filemark unstated. With all three replicas absent, no replica
+footer exists under either model, so no replica validates and the outcome is
+`BotStructuralRecoveryRequired` under both. The selection run checks both
+models.
+
+**H-8. Sections 10.6 and 12.3: a separation position that holds a replica
+header (mut-33).** Read as the planned extent A-B, the tape file's header
+fails the separation role magic, and "A magic or CRC miss invalidates that
+candidate": `TerminalIndexSeparationParse`. The header carries the
+terminal-replica header magic, however, and "a matching role magic commits
+the tape file to its control type". Read that way, tape file 7 is a damaged
+terminal replica whose frame plans itself at tape file 6:
+`TerminalIndexReplicaParse`. The text fixes no order between the two
+readings. *Decided:* the component is rejected, and the name is the set
+{`TerminalIndexSeparationParse`, `TerminalIndexReplicaParse`}. The tape-level
+outcome does not depend on it.
+
+**H-9. Section 10.4: digest preimages that hold a constant or the tape's
+identity where the frame holds a field (mut-02, mut-17, mut-28, mut-32).**
+The edition preimage holds "compression_mode:u32=0", the replica descriptor
+preimage holds "replica_count:u16=3", and each preimage holds a
+`tape_uuid[16]` that may be the tape's identity or the frame's own field.
+When a mutation changes the frame field and leaves the digest stale, a
+Reader that hashes the constant or the tape's UUID finds the digest valid,
+and one that hashes the field finds it invalid. Each such mutation also
+breaks the field's own rule, so no decision depends on the reading. This
+implementation hashes the constants and the tape's UUID.
+
+**H-10. Section 15: the canonical-map digest condition has two names
+(mut-39).** Section 10.6 lists the canonical-map digest among the payload
+conditions of a replica, whose failures Section 15 names
+`TerminalIndexReplicaParse`. Section 15 also names a "replica structural
+projection digest mismatch" `FilemarkMapDigestMismatch`. In mut-39 the stale
+edition digest fails as well, and the text fixes no order. *Decided:* the
+component is rejected, and the name is the set
+{`TerminalIndexReplicaParse`, `FilemarkMapDigestMismatch`}.
