@@ -13,6 +13,8 @@ use std::{
     fs,
     path::PathBuf,
 };
+#[cfg(test)]
+mod mutations;
 mod overflow;
 mod profiles;
 pub mod supplement;
@@ -251,6 +253,8 @@ enum ObservedError {
     FormulaValue(u64),
     Replica(TapeIndexReplicaError),
     Separation(IndexSeparationError),
+    #[cfg(test)]
+    ScannerReplica(remanence_parity::TerminalReplicaFailure),
 }
 impl std::fmt::Display for ObservedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -259,6 +263,8 @@ impl std::fmt::Display for ObservedError {
             Self::Parity(e) => write!(f, "{e}"),
             Self::Replica(e) => write!(f, "{e}"),
             Self::Separation(e) => write!(f, "{e}"),
+            #[cfg(test)]
+            Self::ScannerReplica(e) => write!(f, "{:?}: {}", e.kind, e.detail),
         }
     }
 }
@@ -358,6 +364,17 @@ impl TapeIndexReplicaPayloadBlockSource for Payload<'_> {
         Ok(())
     }
 }
+impl IndexSeparationInteriorBlockSource for Payload<'_> {
+    fn visit_interior_blocks(
+        &mut self,
+        visitor: &mut dyn FnMut(&[u8]) -> Result<(), IndexSeparationError>,
+    ) -> Result<(), IndexSeparationError> {
+        for block in self.0 {
+            visitor(block)?;
+        }
+        Ok(())
+    }
+}
 // The dispatch table is the single target-role to production-entry-point map.
 const ROLES: &[RoleEntry] = &[
     RoleEntry {role:Role::Recovery, entry:"recover_ordinal_from_sidecar (directory-assisted tail rescue)", run:overflow::recover},
@@ -374,16 +391,21 @@ const ROLES: &[RoleEntry] = &[
     }},
     RoleEntry {role:Role::Bootstrap, entry:"parse_bootstrap_block", run:|v,f,_| { parse_bootstrap_block(&v.files[&f][0])?; Ok(()) }},
     RoleEntry {role:Role::Replica, entry:"parse_tape_index_replica_header + parse_tape_index_bootstrap_footer + validate_tape_index_replica_payload", run:|v,f,_| {
-        let blocks=&v.files[&f];let h=parse_tape_index_replica_header(&blocks[0],&v.uuid)?;let t=parse_tape_index_bootstrap_footer(&blocks[2],&v.uuid)?;
-        validate_tape_index_replica_payload(&h,&t,&mut Payload(&blocks[1..2]), |_|Ok(()), |_|Ok(()))?;Ok(())
+        let blocks=&v.files[&f];let h=parse_tape_index_replica_header(&blocks[0],&v.uuid)?;let t=parse_tape_index_bootstrap_footer(blocks.last().expect("replica footer record"),&v.uuid)?;
+        validate_tape_index_replica_payload(&h,&t,&mut Payload(&blocks[1..blocks.len()-1]), |_|Ok(()), |_|Ok(()))?;Ok(())
     }},
     RoleEntry {role:Role::Separation, entry:"parse_index_separation_header + parse_index_separation_footer + validate_index_separation_pair", run:|v,f,_| {
-        let h=parse_index_separation_header(&v.files[&f][0],&v.uuid)?;let t=parse_index_separation_footer(&v.files[&f][2],&v.uuid)?;validate_index_separation_pair(&h,&t)?; Ok(())
+        let blocks=&v.files[&f];let h=parse_index_separation_header(&blocks[0],&v.uuid)?;let t=parse_index_separation_footer(blocks.last().expect("separation footer record"),&v.uuid)?;validate_index_separation_full(&h,&t,&mut Payload(&blocks[1..blocks.len()-1]))?; Ok(())
     }},
 ];
 /// Map only actual typed errors, never the case's expectation, to §15 names.
 fn section15(error: &ObservedError) -> &'static str {
     match error {
+        #[cfg(test)]
+        ObservedError::ScannerReplica(remanence_parity::TerminalReplicaFailure {
+            kind: remanence_parity::TerminalReplicaFailureKind::TrailingFilemark,
+            ..
+        }) => "TerminalIndexReplicaParse",
         ObservedError::Parity(ParityError::SidecarParse(_)) => "SidecarParse",
         ObservedError::Parity(ParityError::ParityMapParse(_)) => "ParityMapParse",
         ObservedError::Parity(ParityError::DirectoryInvalid(_)) => "DirectoryInvalid",

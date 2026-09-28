@@ -1,51 +1,51 @@
-case_id	kind	base_profile	target	mutation	other_profile	expected
-replica-header-damaged	replica	multi-256k	replica-a.bin	damage-header		crc-header
-replica-footer-damaged	replica	multi-256k	replica-a.bin	damage-footer		crc-footer
-replica-header-torn	replica	multi-256k	replica-a.bin	torn-header		wrong-length
-replica-footer-torn	replica	multi-256k	replica-a.bin	torn-footer		wrong-length
-replica-wrong-tape	replica	multi-256k	replica-a.bin	wrong-tape		wrong-tape
-replica-wrong-edition	replica	multi-256k	replica-a.bin	wrong-edition		wrong-edition
-replica-wrong-ordinal	replica	multi-256k	replica-a.bin	wrong-ordinal		wrong-ordinal
-replica-wrong-count	replica	multi-256k	replica-a.bin	wrong-count		wrong-replica-count
-replica-wrong-scope	replica	multi-256k	replica-a.bin	wrong-scope		wrong-scope
-replica-wrong-range	replica	multi-256k	replica-a.bin	wrong-range		wrong-scope
-replica-wrong-payload-digest	replica	multi-256k	replica-a.bin	wrong-payload-digest		payload-digest
-replica-wrong-map-digest	replica	multi-256k	replica-a.bin	wrong-map-digest		map-digest
-replica-wrong-edition-digest	replica	multi-256k	replica-a.bin	wrong-edition-digest		wrong-edition
-replica-wrong-descriptor-digest	replica	multi-256k	replica-a.bin	wrong-descriptor-digest		descriptor-digest
-replica-wrong-layout-digest	replica	multi-256k	replica-a.bin	wrong-layout-digest		layout-digest
-replica-wrong-start	replica	multi-256k	replica-a.bin	wrong-start		wrong-start
-replica-wrong-block-size	replica	multi-256k	replica-a.bin	wrong-block-size		wrong-block-size
-replica-compression-enabled	replica	multi-256k	replica-a.bin	compression-enabled		compression-enabled
-replica-mixed-header-footer	replica	multi-256k	replica-a.bin	mixed-header-footer	multi-256k/replica-b.bin	mixed-header-footer
-replica-wrong-header-hash	replica	multi-256k	replica-a.bin	wrong-header-hash		header-hash
-replica-wrong-observed-start	replica	multi-256k	replica-a.bin	wrong-observed-start		wrong-observation
-replica-wrong-observed-count	replica	multi-256k	replica-a.bin	wrong-observed-count		wrong-observation
-replica-payload-corrupt	replica	multi-256k	replica-a.bin	payload-corrupt		payload-digest
-replica-slot-truncated	replica	multi-256k	replica-a.bin	slot-length		slot-length
-replica-map-row-mismatch	replica	multi-256k	replica-a.bin	swap-object-rows		map-row-bijection
-replica-metadata-frame-too-short	replica	multi-256k	replica-a.bin	metadata-frame-too-short		map-row-bijection
-replica-payload-padding	replica	multi-256k	replica-a.bin	payload-padding		payload-padding
-replica-frame-padding	replica	multi-256k	replica-a.bin	frame-padding		frame-padding
-replica-reserved-nonzero	replica	multi-256k	replica-a.bin	reserved-nonzero		reserved-nonzero
-replica-structural-overflow	replica	multi-256k	replica-a.bin	structural-overflow		arithmetic-overflow
-replica-object-overflow	replica	multi-256k	replica-a.bin	object-overflow		arithmetic-overflow
-replica-payload-add-overflow	replica	multi-256k	replica-a.bin	payload-add-overflow		arithmetic-overflow
-gap-header-damaged	gap	multi-256k	gap-ab.bin	damage-header		crc-header
-gap-footer-damaged	gap	multi-256k	gap-ab.bin	damage-footer		crc-footer
-gap-header-torn	gap	multi-256k	gap-ab.bin	torn-header		wrong-length
-gap-footer-torn	gap	multi-256k	gap-ab.bin	torn-footer		wrong-length
-gap-header-missing	gap	multi-256k	gap-ab.bin	missing-header		gap-misclassification
-gap-footer-missing	gap	multi-256k	gap-ab.bin	missing-footer		gap-misclassification
-gap-misclassified	gap	multi-256k	gap-ab.bin	misclassify-as-replica		gap-misclassification
-gap-wrong-total-length	gap	multi-256k	gap-ab.bin	wrong-total-length		wrong-length
-gap-compression-enabled	gap	multi-256k	gap-ab.bin	compression-enabled		compression-enabled
-gap-wrong-nominal-range	gap	multi-256k	gap-ab.bin	wrong-range		wrong-range
-gap-wrong-record-count	gap	multi-256k	gap-ab.bin	wrong-count		wrong-count
-gap-wrong-tape	gap	multi-256k	gap-ab.bin	wrong-tape		wrong-tape
-gap-wrong-edition	gap	multi-256k	gap-ab.bin	wrong-edition		wrong-edition
-gap-wrong-ordinal	gap	multi-256k	gap-ab.bin	wrong-ordinal		wrong-ordinal
-gap-mixed-header-footer	gap	multi-256k	gap-ab.bin	mixed-header-footer	multi-256k/gap-bc.bin	mixed-header-footer
-gap-wrong-observed-start	gap	multi-256k	gap-ab.bin	wrong-observed-start		wrong-observation
-gap-interior-damaged	gap	multi-256k	gap-ab.bin	interior-nonzero		damaged-interior
-filemark-missing	event	multi-256k	replica-a.bin	missing-filemark		missing-filemark
+case_id	kind	base_profile	target	mutation	other_profile	expected	section15
+replica-header-damaged	replica	multi-256k	replica-a.bin	damage-header		crc-header	TerminalIndexReplicaParse
+replica-footer-damaged	replica	multi-256k	replica-a.bin	damage-footer		crc-footer	TerminalIndexReplicaParse
+replica-header-torn	replica	multi-256k	replica-a.bin	torn-header		wrong-length	TerminalIndexReplicaParse|TapeIo
+replica-footer-torn	replica	multi-256k	replica-a.bin	torn-footer		wrong-length	TerminalIndexReplicaParse|TapeIo
+replica-wrong-tape	replica	multi-256k	replica-a.bin	wrong-tape		wrong-tape	TerminalIndexReplicaParse
+replica-wrong-edition	replica	multi-256k	replica-a.bin	wrong-edition		wrong-edition	TerminalIndexReplicaParse
+replica-wrong-ordinal	replica	multi-256k	replica-a.bin	wrong-ordinal		wrong-ordinal	TerminalIndexReplicaParse
+replica-wrong-count	replica	multi-256k	replica-a.bin	wrong-count		wrong-replica-count	TerminalIndexReplicaParse
+replica-wrong-scope	replica	multi-256k	replica-a.bin	wrong-scope		wrong-scope	TerminalIndexReplicaParse
+replica-wrong-range	replica	multi-256k	replica-a.bin	wrong-range		wrong-scope	TerminalIndexReplicaParse
+replica-wrong-payload-digest	replica	multi-256k	replica-a.bin	wrong-payload-digest		payload-digest	TerminalIndexReplicaParse
+replica-wrong-map-digest	replica	multi-256k	replica-a.bin	wrong-map-digest		map-digest	FilemarkMapDigestMismatch|TerminalIndexReplicaParse
+replica-wrong-edition-digest	replica	multi-256k	replica-a.bin	wrong-edition-digest		wrong-edition	TerminalIndexReplicaParse
+replica-wrong-descriptor-digest	replica	multi-256k	replica-a.bin	wrong-descriptor-digest		descriptor-digest	TerminalIndexReplicaParse
+replica-wrong-layout-digest	replica	multi-256k	replica-a.bin	wrong-layout-digest		layout-digest	TerminalIndexReplicaParse
+replica-wrong-start	replica	multi-256k	replica-a.bin	wrong-start		wrong-start	TerminalIndexReplicaParse
+replica-wrong-block-size	replica	multi-256k	replica-a.bin	wrong-block-size		wrong-block-size	TerminalIndexReplicaParse
+replica-compression-enabled	replica	multi-256k	replica-a.bin	compression-enabled		compression-enabled	TerminalIndexReplicaParse|DriveCompressionEnabled
+replica-mixed-header-footer	replica	multi-256k	replica-a.bin	mixed-header-footer	multi-256k/replica-b.bin	mixed-header-footer	TerminalIndexReplicaParse
+replica-wrong-header-hash	replica	multi-256k	replica-a.bin	wrong-header-hash		header-hash	TerminalIndexReplicaParse
+replica-wrong-observed-start	replica	multi-256k	replica-a.bin	wrong-observed-start		wrong-observation	TerminalIndexReplicaParse
+replica-wrong-observed-count	replica	multi-256k	replica-a.bin	wrong-observed-count		wrong-observation	TerminalIndexReplicaParse
+replica-payload-corrupt	replica	multi-256k	replica-a.bin	payload-corrupt		payload-digest	TerminalIndexReplicaParse
+replica-slot-truncated	replica	multi-256k	replica-a.bin	slot-length		slot-length	TerminalIndexReplicaParse
+replica-map-row-mismatch	replica	multi-256k	replica-a.bin	swap-object-rows		map-row-bijection	TerminalIndexReplicaParse
+replica-metadata-frame-too-short	replica	multi-256k	replica-a.bin	metadata-frame-too-short		map-row-bijection	TerminalIndexReplicaParse
+replica-payload-padding	replica	multi-256k	replica-a.bin	payload-padding		payload-padding	TerminalIndexReplicaParse
+replica-frame-padding	replica	multi-256k	replica-a.bin	frame-padding		frame-padding	TerminalIndexReplicaParse
+replica-reserved-nonzero	replica	multi-256k	replica-a.bin	reserved-nonzero		reserved-nonzero	TerminalIndexReplicaParse
+replica-structural-overflow	replica	multi-256k	replica-a.bin	structural-overflow		arithmetic-overflow	TerminalIndexReplicaParse
+replica-object-overflow	replica	multi-256k	replica-a.bin	object-overflow		arithmetic-overflow	TerminalIndexReplicaParse
+replica-payload-add-overflow	replica	multi-256k	replica-a.bin	payload-add-overflow		arithmetic-overflow	TerminalIndexReplicaParse
+gap-header-damaged	gap	multi-256k	gap-ab.bin	damage-header		crc-header	TerminalIndexSeparationParse
+gap-footer-damaged	gap	multi-256k	gap-ab.bin	damage-footer		crc-footer	TerminalIndexSeparationParse
+gap-header-torn	gap	multi-256k	gap-ab.bin	torn-header		wrong-length	TerminalIndexSeparationParse|TapeIo
+gap-footer-torn	gap	multi-256k	gap-ab.bin	torn-footer		wrong-length	TerminalIndexSeparationParse|TapeIo
+gap-header-missing	gap	multi-256k	gap-ab.bin	missing-header		gap-misclassification	TerminalIndexSeparationParse
+gap-footer-missing	gap	multi-256k	gap-ab.bin	missing-footer		gap-misclassification	TerminalIndexSeparationParse
+gap-misclassified	gap	multi-256k	gap-ab.bin	misclassify-as-replica		gap-misclassification	TerminalIndexSeparationParse|TerminalIndexReplicaParse
+gap-wrong-total-length	gap	multi-256k	gap-ab.bin	wrong-total-length		wrong-length	TerminalIndexSeparationParse|TapeIo
+gap-compression-enabled	gap	multi-256k	gap-ab.bin	compression-enabled		compression-enabled	TerminalIndexSeparationParse|DriveCompressionEnabled
+gap-wrong-nominal-range	gap	multi-256k	gap-ab.bin	wrong-range		wrong-range	TerminalIndexSeparationParse
+gap-wrong-record-count	gap	multi-256k	gap-ab.bin	wrong-count		wrong-count	TerminalIndexSeparationParse
+gap-wrong-tape	gap	multi-256k	gap-ab.bin	wrong-tape		wrong-tape	TerminalIndexSeparationParse
+gap-wrong-edition	gap	multi-256k	gap-ab.bin	wrong-edition		wrong-edition	TerminalIndexSeparationParse
+gap-wrong-ordinal	gap	multi-256k	gap-ab.bin	wrong-ordinal		wrong-ordinal	TerminalIndexSeparationParse
+gap-mixed-header-footer	gap	multi-256k	gap-ab.bin	mixed-header-footer	multi-256k/gap-bc.bin	mixed-header-footer	TerminalIndexSeparationParse
+gap-wrong-observed-start	gap	multi-256k	gap-ab.bin	wrong-observed-start		wrong-observation	TerminalIndexSeparationParse
+gap-interior-damaged	gap	multi-256k	gap-ab.bin	interior-nonzero		damaged-interior	TerminalIndexSeparationParse
+filemark-missing	event	multi-256k	replica-a.bin	missing-filemark		missing-filemark	TerminalIndexReplicaParse

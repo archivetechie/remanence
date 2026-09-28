@@ -6,6 +6,12 @@ per-release summaries.
 
 ## Unreleased
 
+- `MUTATIONS.tsv`, the table of hostile terminal-index mutations, gains a `section15` column: the
+  REM-PARITY §15 error each row requires. An author working from the specification text wrote these
+  names from byte-level descriptions of the mutations, without the reference or its verifier
+  (`mutation-section15.json`). The workspace tests run every row through the reference. 41 rows match,
+  9 are informative (the text permits more than one name, or the reference records no typed failure),
+  and none disagrees.
 - The second implementation of REM-PARITY generation 2 now decides the negative cases. It decided
   them under opaque ids with every expected outcome withheld, and it disagrees with none of the
   text-written expectations (`NEGATIVES-COMPARISON.md`). Its Reader now uses checked arithmetic
