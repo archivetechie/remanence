@@ -1,0 +1,110 @@
+{
+ "description": "Terminal-replica survivor sets on the multi-256k profile, under opaque ids. Each of A, B and C is one of the statuses defined below; the separation extents and the prefix are the profile's, unchanged.",
+ "statuses": {
+  "S0": "the profile's replica, unchanged",
+  "S1": "the profile's replica with this byte change: {\"component\": \"replica-a.bin\", \"record_size_bytes\": 262144, \"offset_convention\": \"Frame offsets are relative to the named record, using \\u00a710.4; numeric fixed-width fields are unsigned little-endian. Payload slot offsets follow \\u00a710.2\\u2013\\u00a710.3. Ranges are half-open.\", \"component_length\": {\"old\": 786432, \"new\": 786432}, \"edits\": [{\"record\": \"header record 0\", \"section\": \"10.4\", \"field\": \"reserved zero\", \"offset\": \"0x300\", \"component_byte_offset\": 768, \"size\": 248, \"old\": {\"byte_pattern\": \"0x00 repeated 248 times\"}, \"new\": {\"hex\": \"0100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\"}}]}; repairs: {\"recomputed\": [], \"not_recomputed\": [{\"record\": \"header\", \"field\": \"payload length\", \"offset\": \"0x070\", \"value\": {\"unsigned_little_endian\": 896, \"hex\": \"8003000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"payload record count\", \"offset\": \"0x078\", \"value\": {\"unsigned_little_endian\": 1, \"hex\": \"0100000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"replica record count\", \"offset\": \"0x080\", \"value\": {\"unsigned_little_endian\": 3, \"hex\": \"0300000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"forward footer block offset\", \"offset\": \"0x098\", \"value\": {\"unsigned_little_endian\": 2, \"hex\": \"0200000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"domain-separated payload SHA-256\", \"offset\": \"0x0A8\", \"value\": {\"hex\": \"2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"canonical-map SHA-256\", \"offset\": \"0x0C8\", \"value\": {\"hex\": \"f69b1bb72687cfc27172848896f2f18877b711b93fa1078fd79a3b0b5045eff8\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"edition digest\", \"offset\": \"0x0E8\", \"value\": {\"hex\": \"ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"terminal-layout digest\", \"offset\": \"0x108\", \"value\": {\"hex\": \"1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"replica descriptor digest\", \"offset\": \"0x128\", \"value\": {\"hex\": \"c057f822cb90e70f2e90cf161945147dcdf1f3b55a412847303cc203fac6a149\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"writer-version byte length\", \"offset\": \"0x1F0\", \"value\": {\"unsigned_little_endian\": 37, \"hex\": \"2500\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"write-timestamp byte length\", \"offset\": \"0x1F2\", \"value\": {\"unsigned_little_endian\": 20, \"hex\": \"1400\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"footer local observed record count; header: zero\", \"offset\": \"0x2E8\", \"value\": {\"unsigned_little_endian\": 0, \"hex\": \"0000000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"header\", \"field\": \"CRC-64/XZ\", \"offset\": \"0x3F8\", \"value\": {\"unsigned_little_endian\": 12426359866472286134, \"hex\": \"b64740fc754c73ac\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"payload length\", \"offset\": \"0x070\", \"value\": {\"unsigned_little_endian\": 896, \"hex\": \"8003000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"payload record count\", \"offset\": \"0x078\", \"value\": {\"unsigned_little_endian\": 1, \"hex\": \"0100000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"replica record count\", \"offset\": \"0x080\", \"value\": {\"unsigned_little_endian\": 3, \"hex\": \"0300000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"forward footer block offset\", \"offset\": \"0x098\", \"value\": {\"unsigned_little_endian\": 2, \"hex\": \"0200000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"domain-separated payload SHA-256\", \"offset\": \"0x0A8\", \"value\": {\"hex\": \"2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"canonical-map SHA-256\", \"offset\": \"0x0C8\", \"value\": {\"hex\": \"f69b1bb72687cfc27172848896f2f18877b711b93fa1078fd79a3b0b5045eff8\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"edition digest\", \"offset\": \"0x0E8\", \"value\": {\"hex\": \"ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"terminal-layout digest\", \"offset\": \"0x108\", \"value\": {\"hex\": \"1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"replica descriptor digest\", \"offset\": \"0x128\", \"value\": {\"hex\": \"c057f822cb90e70f2e90cf161945147dcdf1f3b55a412847303cc203fac6a149\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"writer-version byte length\", \"offset\": \"0x1F0\", \"value\": {\"unsigned_little_endian\": 37, \"hex\": \"2500\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"write-timestamp byte length\", \"offset\": \"0x1F2\", \"value\": {\"unsigned_little_endian\": 20, \"hex\": \"1400\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"footer: complete header-record SHA-256; header: zero\", \"offset\": \"0x2B8\", \"value\": {\"hex\": \"d0d7bab9042c5888acd8fcb8b551a9612d721fcd0c30b930bb63fb0a8b48f63c\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"footer local observed record count; header: zero\", \"offset\": \"0x2E8\", \"value\": {\"unsigned_little_endian\": 3, \"hex\": \"0300000000000000\"}, \"operation\": \"retained without recomputation\"}, {\"record\": \"footer\", \"field\": \"CRC-64/XZ\", \"offset\": \"0x3F8\", \"value\": {\"unsigned_little_endian\": 7922972412167829723, \"hex\": \"dbb87b606e0df46d\"}, \"operation\": \"retained without recomputation\"}], \"left_stale\": [\"Header CRC-64/XZ at 0x3F8\", \"Footer complete header-record SHA-256 at 0x2B8\"], \"notes\": [], \"scope\": \"No other checksum, digest, slot length, geometry field or component tuple is recomputed. Fixed slot prefixes not explicitly edited or exchanged remain byte-for-byte unchanged.\"}",
+  "S2": "the profile's replica with this byte change: {\"component\": \"replica-a.bin\", \"record_size_bytes\": 262144, \"offset_convention\": \"Frame offsets are relative to the named record, using \\u00a710.4; numeric fixed-width fields are unsigned little-endian. Payload slot offsets follow \\u00a710.2\\u2013\\u00a710.3. Ranges are half-open.\", \"component_length\": {\"old\": 786432, \"new\": 786332}, \"edits\": [], \"description\": \"Remove 100 bytes from the end of the component: output = original[:-100]. Original bytes [0, 786332) retain their positions.\", \"removed_record_region\": \"footer record offsets [0x3ff9c, 0x40000)\", \"removed_or_partial_fields\": [{\"field\": \"record zero padding after meaningful frame\", \"offset\": \"0x3ff9c\", \"size\": 100, \"old\": \"0x00 repeated 100 times\", \"new\": \"removed\"}]}; repairs: {\"recomputed\": [], \"not_recomputed\": [], \"left_stale\": [], \"notes\": [\"No surviving byte is rewritten. All surviving stored CRCs, digests, slot lengths and geometry values are retained from their original records; none is adjusted for the removed bytes. A wholly removed record also removes its stored checksum and digest fields.\"], \"scope\": \"No other checksum, digest, slot length, geometry field or component tuple is recomputed. Fixed slot prefixes not explicitly edited or exchanged remain byte-for-byte unchanged.\"}",
+  "S3": "no replica at this position: the component's records are absent",
+  "S4": "at this position, the replica of the same position taken from the minimal profile at the same block size (a different edition of a different tape prefix), unchanged"
+ },
+ "rows": [
+  {
+   "id": "sel-01",
+   "base_profile": "multi-256k",
+   "A": "S2",
+   "B": "S2",
+   "C": "S2"
+  },
+  {
+   "id": "sel-02",
+   "base_profile": "multi-256k",
+   "A": "S1",
+   "B": "S1",
+   "C": "S1"
+  },
+  {
+   "id": "sel-03",
+   "base_profile": "multi-256k",
+   "A": "S0",
+   "B": "S0",
+   "C": "S0"
+  },
+  {
+   "id": "sel-04",
+   "base_profile": "multi-256k",
+   "A": "S0",
+   "B": "S0",
+   "C": "S1"
+  },
+  {
+   "id": "sel-05",
+   "base_profile": "multi-256k",
+   "A": "S1",
+   "B": "S0",
+   "C": "S1"
+  },
+  {
+   "id": "sel-06",
+   "base_profile": "multi-256k",
+   "A": "S0",
+   "B": "S1",
+   "C": "S0"
+  },
+  {
+   "id": "sel-07",
+   "base_profile": "multi-256k",
+   "A": "S3",
+   "B": "S3",
+   "C": "S3"
+  },
+  {
+   "id": "sel-08",
+   "base_profile": "multi-256k",
+   "A": "S4",
+   "B": "S0",
+   "C": "S4"
+  },
+  {
+   "id": "sel-09",
+   "base_profile": "multi-256k",
+   "A": "S1",
+   "B": "S0",
+   "C": "S0"
+  },
+  {
+   "id": "sel-10",
+   "base_profile": "multi-256k",
+   "A": "S0",
+   "B": "S0",
+   "C": "S4"
+  },
+  {
+   "id": "sel-11",
+   "base_profile": "multi-256k",
+   "A": "S4",
+   "B": "S0",
+   "C": "S0"
+  },
+  {
+   "id": "sel-12",
+   "base_profile": "multi-256k",
+   "A": "S1",
+   "B": "S1",
+   "C": "S0"
+  },
+  {
+   "id": "sel-13",
+   "base_profile": "multi-256k",
+   "A": "S0",
+   "B": "S4",
+   "C": "S0"
+  },
+  {
+   "id": "sel-14",
+   "base_profile": "multi-256k",
+   "A": "S0",
+   "B": "S1",
+   "C": "S1"
+  }
+ ]
+}

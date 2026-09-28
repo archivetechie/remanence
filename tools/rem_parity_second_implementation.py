@@ -3475,7 +3475,7 @@ def recover_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
 
 QUOTES.update({
     "resume_after": ("14", "A later session appends **after the last committed tape file** — not after the last object, and not at the watermark."),
-    "resume_step1": ("14", "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping any torn tail, and compute `W` and `T` from it."),
+    "resume_step1": ("14", "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it."),
     "resume_step2": ("14", "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch)."),
     "resume_step2_rules": ("14", "`W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."),
     "resume_step3": ("14", "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."),
@@ -6203,7 +6203,9 @@ def supplement_summary(entry: dict[str, Any]) -> str:
 
 
 def case_id_of(path: pathlib.Path) -> str:
-    return path.parent.name if path.name == "fault-map.json" else path.stem
+    """A case's id: its directory's name for the repository layouts
+    (cases/<id>/fault-map.json, resume/<id>/inputs.json), else its file's stem."""
+    return path.parent.name if path.name in ("fault-map.json", "inputs.json") else path.stem
 
 
 def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[DamagedTape, list[str]]:
@@ -6716,6 +6718,1195 @@ def _json_default(value: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# The negatives' mutated-block digests (Appendix D TT-2, first open item).
+#
+# The `negatives` and `negatives-supplement` commands already apply each
+# mutation and its repairs to my own builds. This re-runs only that apply
+# step, emits every block whose bytes the mutation and repairs change, and
+# compares each with tape-images/negatives/MANIFEST.tsv. It writes a file of
+# its own and leaves both earlier decision files untouched.
+# ---------------------------------------------------------------------------
+
+NEGATIVES_ROOT = FIXTURE_ROOT / "tape-images" / "negatives"
+BLIND_INPUTS = OUTPUT_ROOT / "blind-inputs"
+
+
+def _profile_first_tape_file(profile: str) -> int:
+    """The tape-file number of replica A in a profile (component index 0)."""
+    return load_json(FIXTURE_ROOT / profile / "inputs.json")["terminal_layout"]["start_tape_file"]
+
+
+def _block_row(artifact: str, tape_file: int, block: int, data: bytes) -> dict[str, Any]:
+    return {"artifact": artifact, "tape_file": tape_file, "block_within_file": block, "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _diff_image(base: ImageBuild, mutated: ImageBuild) -> list[dict[str, Any]]:
+    """Blocks of a mutated image whose bytes differ from the base at the same (tape file, block),
+    or that have no counterpart in the base."""
+    rows = []
+    for tape_file in mutated.files:
+        number = tape_file.tape_file_number
+        base_blocks = base.files[number].blocks if number < len(base.files) else []
+        for index, block in enumerate(tape_file.blocks):
+            if index >= len(base_blocks) or base_blocks[index] != block:
+                rows.append(_block_row(f"tape-image {base.name}", number, index, block))
+    return rows
+
+
+def _diff_terminal(base: TerminalBuild, mutated_components: list[list[bytes]], profile: str) -> list[dict[str, Any]]:
+    """Records of a mutated terminal suffix that differ from the base profile's, keyed by the
+    profile's tape-file numbering (replica A = the profile's start tape file)."""
+    first = _profile_first_tape_file(profile)
+    rows = []
+    for component, records in enumerate(mutated_components):
+        base_records = base.components[component] if component < len(base.components) else []
+        for index, record in enumerate(records):
+            if index >= len(base_records) or base_records[index] != record:
+                rows.append(_block_row(f"terminal profile {profile}", first + component, index, record))
+    return rows
+
+
+def _diff_workspace(ws: Workspace) -> list[dict[str, Any]]:
+    rows = []
+    for key in sorted(ws.blocks):
+        data = bytes(ws.blocks[key])
+        if data == ws.original(key):
+            continue
+        if ws.profile is not None:
+            rows.append(_block_row(f"terminal profile {ws.profile}", _profile_first_tape_file(ws.profile) + key[0],
+                                   key[1], data))
+        else:
+            rows.append(_block_row(f"tape-image {ws.image.name}", key[0], key[1], data))
+    return rows
+
+
+def _unchanged_block(artifact: str, tape_file: int, block: int, mutated: Any) -> bytes | None:
+    """My block at a manifest key that my diff did not emit (for reporting only)."""
+    if mutated is None:
+        return None
+    kind, value = mutated
+    try:
+        if kind == "image":
+            return value.files[tape_file].blocks[block]
+        if kind == "terminal":
+            components, profile = value
+            return components[tape_file - _profile_first_tape_file(profile)][block]
+        if kind == "workspace":
+            ws = value
+            key = (tape_file - _profile_first_tape_file(ws.profile), block) if ws.profile is not None else (tape_file, block)
+            return bytes(ws.blocks[key]) if key in ws.blocks else ws.original(key)
+    except (IndexError, KeyError):
+        return None
+    return None
+
+
+def _sup14_base_parity_candidate() -> ImageBuild:
+    """A diagnostic alternative for sup-14, used only to locate differences.
+
+    The variant says "Parity bytes are arbitrary (data_index 2 >= k has no
+    generator column)": Section 6.2 defines the generator only for i in 0..k,
+    so no parity is defined for an epoch of 5 ordinals at k = 2, S = 2. My
+    build encodes the first S × k ordinals. This candidate keeps the base
+    image's parity shards instead, a choice the variant equally permits. It
+    never replaces my emitted bytes; a mismatch is located against it only
+    when it reproduces the pinned digest.
+    """
+    base = _image_cache("a4-minimal")
+    mine, _ = supplement_table()["sup-14"]["rebuild"]()
+    objects = mine.files[1].blocks
+    parity = base.files[2].blocks[1:5]
+    values = dict(a4_sidecar_values(), end=5, real=5, crc_count=5, inline=104)
+    entries = [struct.pack("<IHHQ", s, j, 0, crc64_xz(parity[j * 2 + s])) for s in range(2) for j in range(2)] + \
+              [le64(crc64_xz(block)) for block in objects]
+    blocks, metadata_hash = build_sidecar_explicit(base.tape_uuid, base.block_size, values, entries, parity, 1)
+    return rebuild_a4(blocks, MapEntry(2, KIND_SIDECAR, len(blocks), None, 0, 5, 0),
+                      {1: 2, 2: 0, 3: 0, 4: 5, 5: values["total"], 6: values["H"], 7: values["P"], 8: metadata_hash, 9: 6},
+                      objects, mine.object_rows[0], "a4-minimal (sup-14, base parity)")
+
+
+DIAGNOSTIC_CANDIDATES = {"sup-14": _sup14_base_parity_candidate}
+
+
+def _field_at(tape_file: int, block: int, offset: int, image: ImageBuild) -> str:
+    """Name the field at an offset of a block of an a4-minimal-shaped image (for locating only)."""
+    kind = image.files[tape_file].kind
+    count = len(image.files[tape_file].blocks)
+    if kind == KIND_SIDECAR:
+        if block == count - 1:
+            return "sidecar footer: " + (describe_table(SIDECAR_FOOTER_FIELDS, offset) or "zero fill")
+        if offset < 0xC8:
+            return "sidecar header copy: " + (describe_table(SIDECAR_HEADER_FIELDS, offset) or "header")
+        return "sidecar index entries or fill"
+    if kind == KIND_PARITY_MAP:
+        return "ParityMap: " + (describe_table(PARITY_MAP_FIELDS, offset) or "payload or fill")
+    return f"{KIND_NAMES.get(kind, 'tape file')} byte {offset}"
+
+
+def negative_entry_blocks(spec: dict[str, Any]) -> tuple[str, list[dict[str, Any]], Any, list[dict[str, Any]]]:
+    """Apply one negative or supplement entry; return (vector, changed blocks, the mutated artifact, failed checks)."""
+    if spec.get("none") or "resume" in spec or "unit" in spec:
+        return ("none" if spec.get("none") else "resume" if "resume" in spec else "unit"), [], None, []
+    if "rebuild" in spec:
+        image, _ = spec["rebuild"]()
+        return "bytes", _diff_image(_image_cache("a4-minimal"), image), ("image", image), []
+    if "terminal" in spec:
+        ws = spec["terminal"]()
+        base = build_terminal_suffix(terminal_inputs_from_profile(multi_inputs()))
+        return "bytes", _diff_terminal(base, ws.terminal.components, "multi-256k"), \
+            ("terminal", (ws.terminal.components, "multi-256k")), []
+    ws = Workspace(image=_image_cache(spec["image"])) if "image" in spec else Workspace(profile=spec["profile"])
+    res = Resolution()
+    spec["apply"](ws, res)
+    failed = [check for check in res.checks if not check["matches"]]
+    return "bytes", _diff_workspace(ws), ("workspace", ws), failed
+
+
+def run_negative_blocks(negatives_path: pathlib.Path, supplement_path: pathlib.Path, manifest_path: pathlib.Path,
+                        out_path: pathlib.Path) -> dict[str, Any]:
+    negatives_mapping = load_json(OUTPUT_ROOT / "blind-negatives-mapping.json")["mapping"]
+    supplement_mapping = load_json(OUTPUT_ROOT / "blind-supplement-mapping.json")["mapping"]
+    entries: dict[str, Any] = {}
+    table = negatives_table()
+    for case in load_json(negatives_path)["cases"]:
+        for variant in [v["variant"] for v in case.get("variants", [])] or [None]:
+            entry_id = case["id"] + (f"/{variant}" if variant else "")
+            real = negatives_mapping[case["id"]] + (f"/{variant}" if variant else "")
+            entries[entry_id] = {"real_id": real, "spec": table.get(entry_id)}
+    supplement = supplement_table()
+    for variant in load_json(supplement_path)["variants"]:
+        entries[variant["id"]] = {"real_id": supplement_mapping[variant["id"]], "spec": supplement.get(variant["id"])}
+    mine: dict[tuple, dict[str, Any]] = {}
+    mutated_by_case: dict[str, Any] = {}
+    per_entry: dict[str, Any] = {}
+    for entry_id, item in entries.items():
+        spec = item["spec"]
+        if spec is None:
+            per_entry[entry_id] = {"real_id": item["real_id"], "vector": "not in this implementation's tables",
+                                   "blocks": 0, "failed_from_checks": []}
+            continue
+        vector, rows, mutated, failed = negative_entry_blocks(spec)
+        per_entry[entry_id] = {"real_id": item["real_id"], "vector": vector, "blocks": len(rows),
+                               "failed_from_checks": failed}
+        mutated_by_case[item["real_id"]] = mutated
+        for row in rows:
+            mine[(item["real_id"], row["artifact"], row["tape_file"], row["block_within_file"])] = dict(row, entry=entry_id)
+    manifest: dict[tuple, dict[str, str]] = {}
+    for row in read_tsv(manifest_path):
+        manifest[(row["case"], row["artifact"], int(row["tape_file"]), int(row["block_within_file"]))] = row
+    candidates = {supplement_mapping.get(entry_id, entry_id): builder() for entry_id, builder in DIAGNOSTIC_CANDIDATES.items()
+                  if entry_id in entries}
+    rows_out = []
+    counts = {"matched": 0, "mismatched": 0, "missing_from_mine": 0, "missing_from_manifest": 0}
+    for key in sorted(set(mine) | set(manifest), key=lambda k: (k[0], k[1], k[2], k[3])):
+        case, artifact, tape_file, block = key
+        out: dict[str, Any] = {"case": case, "artifact": artifact, "tape_file": tape_file, "block_within_file": block}
+        mine_row, pinned = mine.get(key), manifest.get(key)
+        if mine_row is not None:
+            out["entry"] = mine_row["entry"]
+        if mine_row is not None and pinned is not None:
+            same = str(mine_row["bytes"]) == pinned["bytes"] and mine_row["sha256"] == pinned["sha256"]
+            out.update(result="matched" if same else "mismatched", bytes=mine_row["bytes"], sha256=mine_row["sha256"],
+                       pinned_bytes=int(pinned["bytes"]), pinned_sha256=pinned["sha256"])
+            if not same:
+                out["first_differing_byte"] = None
+                out["detail"] = ("the manifest pins only the size and SHA-256 of the block, so the first differing "
+                                 "byte cannot be located against it (compare GAPS C-1)")
+                candidate = candidates.get(case)
+                mutated = mutated_by_case.get(case)
+                if candidate is not None and mutated is not None and mutated[0] == "image":
+                    theirs = candidate.files[tape_file].blocks[block]
+                    confirmed = hashlib.sha256(theirs).hexdigest() == pinned["sha256"]
+                    out["diagnostic_candidate"] = {"name": candidate.name, "reproduces_pinned_digest": confirmed}
+                    if confirmed:
+                        ours = mutated[1].files[tape_file].blocks[block]
+                        index = first_difference(ours, theirs)
+                        out["first_differing_byte"] = index
+                        out["field"] = _field_at(tape_file, block, index, mutated[1])
+                        out["detail"] = ("located against the diagnostic candidate, which reproduces the pinned digest; "
+                                         "my emitted bytes are unchanged")
+        elif pinned is not None:
+            out.update(result="missing_from_mine", pinned_bytes=int(pinned["bytes"]), pinned_sha256=pinned["sha256"])
+            data = _unchanged_block(artifact, tape_file, block, mutated_by_case.get(case))
+            if data is None:
+                out["detail"] = "my build of this case has no block at this key"
+            else:
+                digest_here = hashlib.sha256(data).hexdigest()
+                out["detail"] = ("my mutation leaves this block's bytes equal to the base's at the same key, so it is "
+                                 "not emitted as changed; my block here has "
+                                 + ("the pinned size and SHA-256" if (len(data), digest_here) == (int(pinned["bytes"]), pinned["sha256"])
+                                    else f"{len(data)} bytes and SHA-256 {digest_here}"))
+                out["unchanged_block_matches_pinned"] = (len(data), digest_here) == (int(pinned["bytes"]), pinned["sha256"])
+        else:
+            out.update(result="missing_from_manifest", bytes=mine_row["bytes"], sha256=mine_row["sha256"])
+            pinned_cases = {k[0] for k in manifest}
+            if case not in pinned_cases:
+                out["detail"] = "the manifest pins no block for this case"
+            elif case in candidates and artifact.startswith("tape-image "):
+                candidate_block = candidates[case].files[tape_file].blocks[block]
+                base_block = _image_cache(artifact.split(" ", 1)[1]).files[tape_file].blocks[block]
+                out["detail"] = ("my block differs from the base's here; the diagnostic candidate's block "
+                                 + ("equals the base's, so a manifest of changed blocks has no row for it"
+                                    if candidate_block == base_block else "also differs from the base's"))
+            else:
+                out["detail"] = "the manifest has no row for this block of a case it pins"
+        counts[out["result"]] += 1
+        rows_out.append(out)
+    output = {"schema": "rem-parity-second-implementation-negative-blocks/1",
+              "sources": {"negatives": negatives_path.name, "supplement": supplement_path.name,
+                          "manifest": "tape-images/negatives/MANIFEST.tsv"},
+              "counts": dict(counts, manifest_rows=len(manifest), emitted_blocks=len(mine)),
+              "entries": per_entry, "rows": rows_out}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False, default=_json_default) + "\n", encoding="utf-8")
+    return output
+
+
+# ---------------------------------------------------------------------------
+# The terminal-index mutations and survivor sets (Appendix D TT-2), decided
+# blind. Each description is applied byte by byte to my own profile build,
+# the Reader runs on the resulting record stream, and the decision comes from
+# the text; the Reader's result is recorded beside it as a self-check.
+# ---------------------------------------------------------------------------
+
+QUOTES.update({
+    "frame_fields": ("10.6", "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3."),
+    "digests_recompute": ("10.6", "The edition digest and the local descriptor digest recompute to the recorded values."),
+    "backward_delta": ("10.6", "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."),
+    "record_whole": ("10.4", "The header and footer each occupy one complete tape record."),
+    "frame_zero": ("10.4", "Their meaningful frame is the first `0x400` bytes; bytes from `0x400` through the end of the record are zero."),
+    "record_sizes": ("8.3", "Terminal replicas and separation extents are written and read only at the record sizes 256 KiB, 512 KiB, and 1 MiB;"),
+    "sep_not_affect": ("10.6", "The validity of a separation extent does not affect whether a replica is accepted for an inventory."),
+    "sep_interior_invalid": ("10.6", "An extent whose interior is not entirely zero is invalid for full verification."),
+    "sep_derive": ("10.5", "The frame records `E`, and Readers derive the geometry from the recorded value; the default of Section 2.5 is a Writer choice, not a validity condition."),
+    "sep_frame_zero": ("10.5", "The meaningful frame is `0x200` bytes and the rest of the full record is zero."),
+    "sep_full_records": ("10.5", "One extent is a full header record, the zero-filled interior records, a full footer record, and a trailing filemark."),
+    "sep_digest_only": ("10.6", "and in the digest condition only the separation descriptor digest is recomputed, because an extent's frame carries no edition digest."),
+    "slot_len": ("10.2", "`encoded_len` is little-endian, nonzero, and at most the slot size minus two; it counts exactly the bytes of the one deterministic CBOR item that follows, and every byte after that item in the slot is zero."),
+    "payload_padding": ("10.4", "It runs contiguously across the payload records, and the `payload_padding_bytes` that follow it in the last payload record are zero."),
+    "payload_digest_formula": ("10.4", "SHA256(\"REM-TAPE-INDEX-REPLICA-PAYLOAD-V1\\0\" || every complete fixed slot)"),
+    "canonical_is": ("10.4", "The canonical-map digest is the Section 7.3 canonical digest of the structural rows."),
+    "row_order": ("10.3", "After all `structural_row_count` structural slots, every terminal replica carries exactly `object_row_count` 256-byte fixed slots, one for each kind-0 structural row, in strictly increasing `tape_file_number` order — the same tape-file order as the structural rows."),
+    "row_bijection": ("10.3", "The row set is the complete final-prefix Object inventory. Its count MUST equal the number of kind-0 structural slots, and the ordered `(tape_file_number, stored_block_count)` pairs MUST be a bijection with those slots."),
+    "key21_bounds": ("10.3", "| 21 | uint | encrypted only | REM-ENCRYPT header `metadata_frame_len`; bounds `[17, 16 MiB]` |"),
+    "compression_fixed": ("10.4", "| `0x044` | 4 | compression mode `0` (disabled) | fixed |"),
+    "replica_count_fixed": ("10.4", "| `0x03A` | 2 | replica count `3` | fixed |"),
+    "reserved_fixed": ("10.4", "| `0x300` | 248 | reserved zero | fixed |"),
+    "kind_local": ("10.4", "| local | Replica-local: belongs to one replica | Compared with that replica's plan, its measured observation, or its recomputed digest |"),
+    "kind_fixed": ("10.4", "| fixed | A format constant, a reserved zero, or a value set by the frame's role | Equal to the value the row states |"),
+    "kind_common": ("10.4", "| common | Edition-common: a fact of the edition that A, B, and C share | Equal in every agreeing replica (Section 8.5); recomputed from, or bound by, the digests of this section |"),
+    "fixed_io": ("3.5", "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**."),
+    "footers_differ": ("8.4", "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."),
+    "later_component": ("8.4", "A planned position or digest for a later component does not prove that the component was written."),
+    "payload_need": ("8.4", "a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"),
+    "footer_arith_reject": ("10.4", "A Reader rejects a footer whose values differ."),
+    "edition_preimage_compression": ("10.4", "compression_mode:u32=0"),
+    "descriptor_preimage_count": ("10.4", "replica_count:u16=3"),
+    "generator_cols": ("6.2", "X_j = k + j   (j in 0..m)        Y_i = i   (i in 0..k)"),
+    "tuple_filemark": ("8.3", "| `0x04` | 4 | trailing filemark count, exactly `1` |"),
+    "missing_filemark": ("12.2", "a zero-block file or a missing trailing filemark is structural damage;"),
+    "ladder_count": ("12.3", "The header and measured block count are checked against the encoded component plan."),
+    "malformed_control": ("12.3", "A malformed frame or count mismatch is reported as a damaged terminal replica; it MUST NOT fall through to Object."),
+})
+
+MUTATIONS_SCHEMA = "rem-parity-second-implementation-mutations/1"
+SELECTION_SCHEMA = "rem-parity-second-implementation-selection/1"
+REPLICA_POSITIONS = {"A": 0, "B": 2, "C": 4}
+_PROFILE_BUILDS: dict[str, tuple[dict[str, Any], TerminalBuild]] = {}
+
+
+def profile_build(name: str) -> tuple[dict[str, Any], TerminalBuild]:
+    """My own build of a terminal profile, from its inputs.json (cached)."""
+    if name not in _PROFILE_BUILDS:
+        inputs = load_json(FIXTURE_ROOT / name / "inputs.json")
+        _PROFILE_BUILDS[name] = (inputs, build_terminal_suffix(terminal_inputs_from_profile(inputs)))
+    return _PROFILE_BUILDS[name]
+
+
+def component_stream(profile: str, filename: str) -> bytes:
+    _, terminal = profile_build(profile)
+    return b"".join(terminal.components[PROFILE_COMPONENT_FILES.index(filename)])
+
+
+_BYTE_PATTERN = re.compile(r"^0x([0-9A-Fa-f]{2}) repeated (\d+) times$")
+
+
+def _spec_bytes(spec: Any, size: int | None = None) -> bytes | None:
+    """The bytes a mutation description gives for a field value, or None when it gives none."""
+    if isinstance(spec, dict):
+        if "hex" in spec:
+            return bytes.fromhex(spec["hex"])
+        if "byte_pattern" in spec:
+            match = _BYTE_PATTERN.match(spec["byte_pattern"])
+            if match:
+                return bytes([int(match.group(1), 16)]) * int(match.group(2))
+        if "unsigned_little_endian" in spec and size:
+            return spec["unsigned_little_endian"].to_bytes(size, "little")
+        return None
+    if isinstance(spec, str):
+        match = _BYTE_PATTERN.match(spec)
+        if match:
+            return bytes([int(match.group(1), 16)]) * int(match.group(2))
+        match = re.match(r"^0x([0-9A-Fa-f]{2})\b", spec)
+        return bytes([int(match.group(1), 16)]) if match else None
+    if isinstance(spec, int) and not isinstance(spec, bool) and size:
+        return spec.to_bytes(size, "little")
+    return None
+
+
+def _record_index(text: str) -> int:
+    match = re.search(r"record (\d+)", text or "")
+    return int(match.group(1)) if match else 0
+
+
+class ByteChange:
+    """Apply one component's byte change as a description states it, checking every stated old value."""
+
+    def __init__(self, stream: bytes, block_size: int, where: str, res: Resolution) -> None:
+        self.original = bytes(stream)
+        self.stream = bytearray(stream)
+        self.block_size = block_size
+        self.where = where
+        self.res = res
+
+    def check(self, what: str, offset: int, expected: bytes | None, found: bytes, phase: str) -> None:
+        self.res.checks.append({"where": self.where, "offset": f"0x{offset:X}" if offset >= 0 else str(offset),
+                                "field": what, "phase": phase,
+                                "expected": expected.hex() if expected is not None and len(expected) <= 64 else
+                                (hashlib.sha256(expected).hexdigest()[:16] + "… (sha256 prefix)" if expected is not None else None),
+                                "found": found.hex() if len(found) <= 64 else hashlib.sha256(found).hexdigest()[:16] + "… (sha256 prefix)",
+                                "matches": expected is None or expected == found})
+
+    def edit(self, edit: dict[str, Any], apply: bool = True) -> None:
+        """Check an edit's old value against my original bytes; write (or, when apply is False, verify) its new value."""
+        field_name = edit.get("field", "")
+        if "changed_bytes" in edit:
+            base = _record_index(edit.get("record", "")) * self.block_size
+            for change in edit["changed_bytes"]:
+                offset = base + int(change["offset"], 16)
+                self.check(f"{field_name} byte", offset, bytes([change["old"]]), self.original[offset : offset + 1], "old")
+                if apply:
+                    self.stream[offset] = change["new"]
+                self.check(f"{field_name} byte", offset, bytes([change["new"]]), bytes(self.stream[offset : offset + 1]), "new")
+            return
+        if "component_byte_offsets" in edit:
+            offsets = edit["component_byte_offsets"]
+            olds = [bytes.fromhex(h) for h in edit["old_slot_hex"]]
+            news = [bytes.fromhex(h) for h in edit["new_slot_hex"]]
+            slots = [bytes(self.original[o : o + len(olds[i])]) for i, o in enumerate(offsets)]
+            for i, offset in enumerate(offsets):
+                self.check(f"{field_name} (slot {i})", offset, olds[i], slots[i], "old")
+            if apply and "Swap" in edit.get("description", ""):
+                for i, offset in enumerate(offsets):
+                    self.stream[offset : offset + len(slots[i])] = slots[len(offsets) - 1 - i]
+            for i, offset in enumerate(offsets):
+                self.check(f"{field_name} (slot {i})", offset, news[i], bytes(self.stream[offset : offset + len(news[i])]), "new")
+            return
+        offset = edit["component_byte_offset"]
+        if "old_slot_hex" in edit:
+            old_slot, new_slot = bytes.fromhex(edit["old_slot_hex"]), bytes.fromhex(edit["new_slot_hex"])
+            self.check(field_name, offset, old_slot, self.original[offset : offset + len(old_slot)], "old")
+            if apply:
+                match = re.search(r"key (\d+) replaced by (\d+)", edit.get("description", ""))
+                slot = bytes(self.original[offset : offset + OBJECT_SLOT])
+                value = decode_deterministic_cbor(slot[2 : 2 + rd16(slot, 0)])
+                key, to = int(match.group(1)), int(match.group(2))
+                self.check(f"{field_name}: key {key}", offset, str(edit["old"]).encode(), str(value.get(key)).encode(), "old")
+                value[key] = to
+                self.stream[offset : offset + OBJECT_SLOT] = encode_slot(encode_deterministic_cbor(value), OBJECT_SLOT)
+            self.check(field_name, offset, new_slot, bytes(self.stream[offset : offset + len(new_slot)]), "new")
+            return
+        if "operation" in edit:
+            match = re.search(r"XOR the first byte with 0x([0-9A-Fa-f]{2})", edit["operation"])
+            old, new = _spec_bytes(edit["old"]), _spec_bytes(edit["new"])
+            self.check(field_name, offset, old, self.original[offset : offset + 1], "old")
+            if apply:
+                self.stream[offset] ^= int(match.group(1), 16)
+            self.check(field_name, offset, new, bytes(self.stream[offset : offset + 1]), "new")
+            return
+        size = edit.get("size")
+        if size is None and isinstance(edit.get("byte_pattern"), str) and edit["byte_pattern"].replace(" ", "") and \
+                all(c in "0123456789abcdefABCDEF " for c in edit["byte_pattern"]):
+            size = len(bytes.fromhex(edit["byte_pattern"].replace(" ", "")))
+        old, new = _spec_bytes(edit["old"], size), _spec_bytes(edit["new"], size)
+        width = len(new) if new is not None else (len(old) if old is not None else size or 1)
+        self.check(field_name, offset, old, self.original[offset : offset + width], "old")
+        if apply and new is not None:
+            self.stream[offset : offset + width] = new
+        self.check(field_name, offset, new, bytes(self.stream[offset : offset + width]), "new")
+
+    def repair(self, text: str, frame_len: int) -> None:
+        """Recompute one checksum or hash the description lists as recomputed, from my bytes."""
+        records = len(self.stream) // self.block_size
+        match = re.match(r"(Header|Footer) CRC-64/XZ at 0x([0-9A-Fa-f]+), over (?:header|footer) bytes \[0x000, 0x([0-9A-Fa-f]+)\)", text)
+        if match:
+            base = 0 if match.group(1) == "Header" else (records - 1) * self.block_size
+            at, end = int(match.group(2), 16), int(match.group(3), 16)
+            self.stream[base + at : base + at + 8] = le64(crc64_xz(bytes(self.stream[base : base + end])))
+            self.res.repairs.append(f"{match.group(1).lower()} CRC-64/XZ at 0x{at:X} recomputed from my bytes")
+            return
+        match = re.match(r"Footer complete header-record SHA-256 at 0x([0-9A-Fa-f]+)", text)
+        if match:
+            base = (records - 1) * self.block_size
+            at = int(match.group(1), 16)
+            self.stream[base + at : base + at + 32] = digest(bytes(self.stream[0 : self.block_size]))
+            self.res.repairs.append(f"footer header-record SHA-256 at 0x{at:X} recomputed from my header record")
+            return
+        if "encoded_len" in text:
+            self.res.repairs.append("slot encoded_len and zero fill: part of my re-encoding of the slot")
+            return
+        self.res.notes.append(f"repair not recognised, not applied: {text}")
+        self.res.checks.append({"where": self.where, "offset": "-", "field": "repair", "phase": "repair",
+                                "expected": text, "found": None, "matches": False})
+
+    def retained(self, item: dict[str, Any]) -> None:
+        """Check a value the description says is retained without recomputation."""
+        records = len(self.stream) // self.block_size
+        base = 0 if item["record"] == "header" else (records - 1) * self.block_size
+        offset = base + int(item["offset"], 16)
+        value = item["value"]
+        expected = _spec_bytes(value, 8 if "unsigned_little_endian" in value and "hex" not in value else None)
+        size = len(expected) if expected is not None else 8
+        self.check(f"retained {item['record']} {item['field']}", offset, expected,
+                   bytes(self.stream[offset : offset + size]), "retained")
+
+
+def apply_byte_change(stream: bytes, change: dict[str, Any], repairs: dict[str, Any], block_size: int, where: str,
+                      res: Resolution, component_kind: int, profile: str, check_retained: bool = True) -> bytes:
+    """Apply one described byte change (with its repairs) to my component bytes."""
+    work = ByteChange(stream, block_size, where, res)
+    description = change.get("description", "")
+    frame_len = REPLICA_FRAME_LEN if component_kind == KIND_REPLICA else SEPARATION_FRAME_LEN
+    length = change.get("component_length") or {}
+    if "old" in length:
+        work.check("component length", -1, str(length["old"]).encode(), str(len(work.original)).encode(), "old")
+    edits = change.get("edits", [])
+    recomputed = list(repairs.get("recomputed") or [])
+    removal = re.match(r"Remove (\d+) bytes from the (beginning|end) of the component", description)
+    append = re.match(r"Append one 0x([0-9A-Fa-f]{2}) byte at component offset (\d+)", description)
+    footer_swap = re.match(r"Replace the entire footer record with the final (\d+) bytes of ([\w.\-]+)/([\w.\-]+)\.", description)
+    header_swap = re.match(r"Replace ([\w.\-]+) header record 0 with the complete ([\w.\-]+) header record 0 from the same base profile",
+                           description)
+    if removal:
+        count = int(removal.group(1))
+        base = 0 if removal.group(2) == "beginning" else len(work.original) - block_size
+        for item in change.get("removed_or_partial_fields", []) + change.get("removed_frame_fields", []):
+            offset = int(item["offset"], 16)
+            expected = _spec_bytes(item.get("old"), item.get("size"))
+            if expected is not None:
+                work.check(f"removed {item['field']}", base + offset, expected,
+                           work.original[base + offset : base + offset + len(expected)], "old")
+        work.stream = bytearray(work.original[count:] if removal.group(2) == "beginning" else work.original[:-count])
+        res.repairs.append(f"removed {count} bytes from the {removal.group(2)} of the component; no byte rewritten")
+    elif append:
+        offset = int(append.group(2))
+        work.check("append offset", offset, str(len(work.original)).encode(), str(offset).encode(), "old")
+        work.stream = bytearray(work.original[:offset] + bytes([int(append.group(1), 16)]) + work.original[offset:])
+        res.repairs.append(f"appended one byte at component offset {offset}; no byte rewritten")
+    elif footer_swap:
+        count = int(footer_swap.group(1))
+        donor = component_stream(footer_swap.group(2), footer_swap.group(3))
+        work.stream[-count:] = donor[-count:]
+        res.repairs.append(f"footer record replaced by the last {count} bytes of my {footer_swap.group(2)}/{footer_swap.group(3)}")
+        for edit in edits:
+            work.edit(edit, apply=False)
+    elif header_swap:
+        donor = component_stream(profile, header_swap.group(2))
+        work.stream[0:block_size] = donor[0:block_size]
+        res.repairs.append(f"header record replaced by my {profile}/{header_swap.group(2)} header record")
+        for edit in edits:
+            work.edit(edit, apply=False)
+    elif description:
+        res.notes.append(f"description not recognised: {description}")
+        res.checks.append({"where": where, "offset": "-", "field": "description", "phase": "apply", "expected": description,
+                           "found": None, "matches": False})
+    if not (removal or append or footer_swap or header_swap):
+        outputs = []
+        for edit in edits:
+            name = edit.get("field", "")
+            role = "Header" if edit.get("record", "").startswith("header") else "Footer"
+            # An edit is a repair's output only when the description lists that
+            # very checksum or hash as recomputed; otherwise it is the mutation.
+            is_output = ("CRC-64/XZ" in name and any(text.startswith(f"{role} CRC-64/XZ") for text in recomputed)) or \
+                        ("header-record SHA-256" in name and any("header-record SHA-256" in text for text in recomputed))
+            if is_output:
+                outputs.append(edit)
+                continue
+            work.edit(edit)
+        for text in recomputed:
+            work.repair(text, frame_len)
+        for edit in outputs:
+            work.edit(edit, apply=False)
+    if "new" in length:
+        work.check("component length", -1, str(length["new"]).encode(), str(len(work.stream)).encode(), "new")
+    if check_retained:
+        for item in repairs.get("not_recomputed") or []:
+            work.retained(item)
+    for text in repairs.get("left_stale") or []:
+        res.notes.append("left stale by the description: " + text)
+    for text in repairs.get("notes") or []:
+        res.notes.append(text)
+    return bytes(work.stream)
+
+
+def terminal_tape(profile_inputs: dict[str, Any], streams: list[bytes | None], block_size: int,
+                  absent_keeps_filemark: bool = True) -> DamagedTape:
+    """The profile's prefix (placeholder records) and the five components as fixed-size records.
+
+    A component stream is written as records of the block size in order; a
+    stream whose length is not a multiple leaves a short final record. A
+    component given as None has no records; its trailing filemark stays or
+    goes as the caller asks.
+    """
+    records: list[Any] = []
+    for entry in structural_from_json(profile_inputs["structural_entries"]):
+        records.extend([bytes(block_size)] * entry.block_count)
+        records.append(None)
+    for stream in streams:
+        if stream is None:
+            if absent_keeps_filemark:
+                records.append(None)
+            continue
+        records.extend(stream[i : i + block_size] for i in range(0, len(stream), block_size))
+        records.append(None)
+    return DamagedTape(records, set())
+
+
+def _component_error(reason: str, parse_error: str) -> str | None:
+    """The Section 15 name this Reader gives a failed component from its check reason."""
+    if reason.startswith("medium error") or reason.startswith("payload record unreadable"):
+        return "TapeIo"
+    body = reason[len("payload: "):] if reason.startswith("payload: ") else reason
+    head = body.split(":")[0]
+    if head == "TapeIo" and ("found filemark" in body or "found end of data" in body):
+        # A filemark or EOD where the plan puts a data record: the declared
+        # location disagrees with the device (Section 10.6), a validity failure.
+        return parse_error
+    if head in ("TerminalIndexReplicaParse", "TerminalIndexSeparationParse", "FilemarkMapDigestMismatch", "TapeIo"):
+        return head
+    return parse_error
+
+
+def scan_terminal(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> dict[str, Any]:
+    """This implementation's Scanner and Verifier over the terminal suffix (Sections 8.4, 8.5, 10.6)."""
+    layout, note = discover_layout(tape, tape_uuid, block_size)
+    out: dict[str, Any] = {"layout_source": note, "replicas": {}, "separations": {}}
+    checks: dict[str, ReplicaCheck] = {}
+    if layout is None:
+        for letter in "ABC":
+            out["replicas"][letter] = {"valid": False, "error": None, "reason": "no planned layout: no replica footer found from EOD"}
+    else:
+        for ordinal in (1, 2, 3):
+            check = check_replica(tape, layout, ordinal, tape_uuid, block_size)
+            checks[check.letter] = check
+            out["replicas"][check.letter] = {"valid": check.fully_valid, "envelope_valid": check.envelope_valid,
+                                             "error": None if check.fully_valid else _component_error(check.reason, "TerminalIndexReplicaParse"),
+                                             "reason": check.reason}
+    valid = [letter for letter, check in checks.items() if check.fully_valid]
+    if not valid:
+        out.update(outcome="BotStructuralRecoveryRequired", acceptable_selections=[], degraded=None)
+    elif len({checks[letter].header["common"] for letter in valid}) > 1:
+        out.update(outcome="TerminalIndexReplicaConflict", acceptable_selections=[], degraded=None)
+    else:
+        out.update(outcome="inventory", acceptable_selections=sorted(valid), degraded=len(valid) < 3)
+    accepted_edition = checks[valid[0]].header["edition_id"] if valid and out["outcome"] == "inventory" else None
+    for ordinal, name in ((1, "A-B"), (2, "B-C")):
+        if layout is None:
+            out["separations"][name] = {"status": "not_run", "error": None, "reason": "no planned layout"}
+            continue
+        status, reason, edition_id = check_separation(tape, layout, ordinal, tape_uuid, block_size)
+        if status == "valid" and accepted_edition is not None and edition_id != accepted_edition:
+            status, reason = "invalid", "edition ID differs from the replicas'"
+        error = None if status == "valid" else ("TapeIo" if status == "unreadable" else
+                                                _component_error(reason, "TerminalIndexSeparationParse"))
+        out["separations"][name] = {"status": status, "error": error, "reason": reason}
+    return out
+
+
+# ----- the text decisions ----------------------------------------------------
+
+def _component(name: str | None, error: str | None, rules: list[str], why: str, error_set: list[str] | None = None,
+               readings: list[str] | None = None, outcome: str = "rejected") -> dict[str, Any]:
+    return {"name": name, "outcome": outcome, "error": error, "error_set": error_set, "readings": readings,
+            "rules": [cite(k) for k in rules], "why": why}
+
+
+B6_READINGS = [
+    "true: a Scanner that validates replica A's payload (for example, because it tries A first and must validate a "
+    "payload to accept a replica) finds A invalid, so a sibling is invalid and the result is degraded",
+    "false: a Scanner that accepts B or C after validating only that payload, as Section 8.4 permits when the "
+    "envelopes agree, never reads A's payload and reports no degraded evidence",
+]
+B4_READINGS = [
+    "degraded: every replica is valid but separation extent A-B is not, and the Verifier reports the terminal suffix "
+    "as degraded",
+    "error: the Verifier reports separation extent A-B as a failure (TerminalIndexSeparationParse), and no category of "
+    "Section 12.6 applies",
+]
+
+
+def _tape(kind: str) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """The tape-level decision, the Verifier's and the undecided aspects for one class of damage."""
+    undecided: list[dict[str, Any]] = []
+    if kind == "replica-A-envelope":
+        tape = {"outcome": "inventory", "acceptable_selections": ["B", "C"], "degraded": True,
+                "replicas": {"A": "invalid: its envelope fails a Section 10.6 condition", "B": "valid", "C": "valid"},
+                "rules": [cite(k) for k in ("validate_every", "fully_valid", "consider_conflict", "degraded_evidence",
+                                            "survivor", "degraded_result")],
+                "why": "The Scanner must validate the header, footer and trailing filemark of every planned replica, so it "
+                       "finds A invalid. B and C are fully valid and agree, and an invalid replica is degraded evidence, "
+                       "not a conflict. The text does not order the selection among agreeing replicas, so B and C are both "
+                       "acceptable."}
+        verifier = {"result": "degraded", "separations": {"A-B": "valid", "B-C": "valid"},
+                    "rules": [cite("verifier_role"), cite("degraded_result")]}
+    elif kind == "replica-A-payload":
+        tape = {"outcome": "inventory", "acceptable_selections": ["B", "C"], "degraded": "undecided",
+                "replicas": {"A": "invalid: its payload fails; its envelope is valid and agrees with B's and C's",
+                             "B": "valid", "C": "valid"},
+                "rules": [cite(k) for k in ("validate_every", "fully_valid", "survivor", "degraded_result", "selection_guide")],
+                "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can "
+                       "arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because "
+                       "its payload fails; B and C are fully valid and agree. Whether the result is degraded depends on "
+                       "whether the Scanner reads A's payload (GAPS B-6)."}
+        undecided.append({"aspect": "tape.degraded", "readings": B6_READINGS,
+                          "citations": [cite("payload_need"), cite("degraded_result"), cite("selection_guide")]})
+        verifier = {"result": "degraded", "separations": {"A-B": "valid", "B-C": "valid"},
+                    "rules": [cite("verifier_role"), cite("payload_valid"), cite("degraded_result")]}
+    elif kind == "separation-AB":
+        tape = {"outcome": "inventory", "acceptable_selections": ["A", "B", "C"], "degraded": False,
+                "replicas": {"A": "valid", "B": "valid", "C": "valid"},
+                "rules": [cite(k) for k in ("sep_not_affect", "separation_not_needed", "consider_conflict", "survivor")],
+                "why": "The separation extent does not affect replica acceptance, and all three replicas are fully valid "
+                       "and agree. The Scanner's result is not degraded: Section 12.6's degraded evidence concerns "
+                       "replicas."}
+        verifier = {"result": "not complete", "separations": {"A-B": "invalid", "B-C": "valid"},
+                    "rules": [cite("verifier_separation"), cite("verifier_interior")]}
+        undecided.append({"aspect": "verifier.result", "readings": B4_READINGS,
+                          "citations": [cite("verifier_separation"), cite("degraded_result")]})
+    elif kind == "separation-AB-shifts-suffix":
+        tape = {"outcome": "inventory", "acceptable_selections": ["A"], "degraded": True,
+                "replicas": {"A": "valid", "B": "invalid: not at its planned coordinate",
+                             "C": "invalid: not at its planned coordinate"},
+                "rules": [cite(k) for k in ("locate_planned", "device_agree", "later_component", "sep_not_affect",
+                                            "degraded_evidence", "survivor", "degraded_result")],
+                "why": "The extent's record count changed, so every record after it moved by the difference: B, B-C and C "
+                       "are no longer at the positions the immutable plan gives, and their declared locations disagree "
+                       "with the device's measurements. A precedes the change and stays valid. The footer found first "
+                       "from EOD (C's) is itself displaced, but A's footer carries the same plan, so every reading of GAPS "
+                       "B-8 reaches the same replicas."}
+        verifier = {"result": "degraded", "separations": {"A-B": "invalid", "B-C": "invalid"},
+                    "rules": [cite("verifier_separation"), cite("degraded_result")]}
+    else:
+        raise ValueError(kind)
+    return tape, verifier, undecided
+
+
+def mutations_table() -> dict[str, dict[str, Any]]:
+    """The text decision for each blind mutation, written from the description and the text."""
+    t: dict[str, dict[str, Any]] = {}
+    A, AB = "replica A", "separation extent A-B"
+    SEP_ORDER = " Section 10.6 fixes no order among its conditions, and every failing one has the same name."
+
+    def replica(mid, rules, why, kind="replica-A-envelope", error="TerminalIndexReplicaParse", error_set=None):
+        t[mid] = {"component": _component(A, error, rules + ["err_replica"], why, error_set=error_set), "kind": kind}
+
+    def separation(mid, rules, why, kind="separation-AB", error="TerminalIndexSeparationParse", error_set=None):
+        t[mid] = {"component": _component(AB, error, rules + ["sep_valid", "err_separation"], why, error_set=error_set),
+                  "kind": kind}
+
+    separation("mut-01", ["magic_crc_miss", "frame_fields", "sep_full_records"],
+               "Every record of the extent now starts 100 bytes later in the original stream: the header record begins "
+               "with original byte 100, so its role magic does not match, and the footer record begins with byte 100 of "
+               "the old footer and is 262 044 bytes long. The magic miss alone invalidates the extent; the short record "
+               "also fails the record-length condition (GAPS H-5). The extent still has three records, so nothing after "
+               "it moves." + SEP_ORDER)
+    replica("mut-02", ["frame_fields", "compression_fixed", "kind_fixed"],
+            "Both frames record compression mode 1; the row is fixed at 0. The edition digest was left stale, but its "
+            "preimage holds the constant compression_mode:u32=0, so whether it still recomputes depends on whether a "
+            "Reader hashes the constant or the field (GAPS H-9); the fixed-field rule fails either way.")
+    replica("mut-03", ["frame_fields", "record_sizes", "digests_recompute", "layout_valid"],
+            "Both frames record a block size of 131 072, which is neither the record size read (262 144) nor a terminal "
+            "record size; the stale edition and layout digests also fail. The block size is edition-common, but A is not "
+            "fully valid, so it takes no part in the conflict rule." + SEP_ORDER)
+    separation("mut-04", ["device_agree", "sep_full_records"],
+               "The footer record is removed: the extent has two records, and the planned footer coordinate holds its "
+               "trailing filemark, so the footer, the count and the trailing filemark all disagree with the plan.",
+               kind="separation-AB-shifts-suffix")
+    replica("mut-05", ["digests_recompute", "kind_common", "fully_valid"],
+            "The edition ID is in the edition-digest preimage and the digest was left stale, so it does not recompute. A "
+            "differs from B and C in an edition-common field, but a replica that is not fully valid takes no part in "
+            "the conflict rule: this is degraded evidence, not a conflict. The separation extents carry the accepted "
+            "edition's ID, so they stay valid (GAPS B-5).")
+    replica("mut-06", ["digests_recompute"],
+            "The recorded edition digest (0x94 x 32) is not the digest of the frame's fields. The descriptor digest, whose "
+            "preimage holds the edition digest, was left stale as well.")
+    separation("mut-07", ["magic_crc_miss", "device_agree", "sep_full_records"],
+               "The header record is removed: the record at the planned header coordinate is the zero interior, whose "
+               "magic does not match, and the extent has two records.", kind="separation-AB-shifts-suffix")
+    replica("mut-08", ["backward_delta", "device_agree", "footer_local"],
+            "A's footer is now B's: it names ordinal 2 and B's planned coordinates, its backward delta names B's header "
+            "start (LBA 33) rather than A's (25), its recorded header hash is B's header's, and its descriptor differs "
+            "from A's header's. It also declares a footer LBA the device does not measure." + SEP_ORDER)
+    replica("mut-09", ["payload_valid", "row_order", "row_bijection", "payload_digest_formula"],
+            "The two Object-row slots are exchanged: the rows are no longer in tape-file order or in bijection with the "
+            "kind-0 structural rows, and the payload digest was left stale." + SEP_ORDER, kind="replica-A-payload")
+    separation("mut-10", ["magic_crc_miss", "frame_fields"],
+               "A reserved header byte is set and the header CRC was left stale: the CRC miss invalidates the extent, and "
+               "the reserved bytes and the footer's header-record hash also fail." + SEP_ORDER)
+    separation("mut-11", ["frame_fields", "sep_digest_only"],
+               "Both frames claim separation ordinal 2 at the first extent's planned coordinate, so the ordinal disagrees "
+               "with the plan, and the descriptor digest (left stale) does not recompute." + SEP_ORDER)
+    replica("mut-12", ["frame_zero", "frame_fields", "backward_delta"],
+            "Header byte 0x400 lies outside the CRC-covered frame, but the record past the frame must be zero, and the "
+            "footer's header-record hash no longer matches the header record." + SEP_ORDER)
+    replica("mut-13", ["footer_delta", "footer_arith_reject", "footer_local"],
+            "The footer's observed record count is 4 with backward delta 2 and footer LBA 27, so the footer arithmetic "
+            "fails, and the observation differs from the planned tuple (3 records)." + SEP_ORDER)
+    replica("mut-14", ["layout_valid", "digests_recompute"],
+            "The recorded layout digest (0x93 x 32) does not recompute from the tuples, and the descriptor digest (left "
+            "stale) does not either." + SEP_ORDER)
+    replica("mut-15", ["backward_delta"],
+            "The footer's recorded header-record SHA-256 differs from the SHA-256 of the header record at the planned "
+            "coordinate.")
+    separation("mut-16", ["magic_crc_miss", "frame_fields"],
+               "A reserved footer byte is set and the footer CRC was left stale: the CRC miss invalidates the extent.")
+    separation("mut-17", ["frame_fields", "sep_digest_only"],
+               "Both frames record tape UUID 0x12 x 16, not the tape's; the role magics still derive from the tape's UUID, "
+               "so they match. The descriptor digest (left stale) does not recompute over either UUID." + SEP_ORDER)
+    separation("mut-18", ["frame_fields", "sep_full_records"],
+               "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, "
+               "not a full record. The record-length condition fails (GAPS H-5). The record count is unchanged, so "
+               "nothing after the extent moves.")
+    replica("mut-19", ["digest_scope", "w_equals_t", "digests_recompute", "scope_in_list"],
+            "The recorded total data ordinals (6) differs from T recomputed over the structural rows (5), W (5) no "
+            "longer equals it although sidecars are present, and the edition digest (left stale) does not recompute."
+            + SEP_ORDER)
+    replica("mut-20", ["kind_local", "device_agree"],
+            "The frames' planned local start LBA (26) differs from the local tuple's start (25) and from the device's "
+            "measurement of A's start.")
+    replica("mut-21", ["frame_fields", "kind_local", "digests_recompute"],
+            "Both frames claim replica ordinal 2 at A's planned coordinate: the local tuple for ordinal 2 is B's (tape "
+            "file 8), not the frame's planned tape file 6, and the descriptor digest (left stale) does not recompute."
+            + SEP_ORDER)
+    replica("mut-22", ["key21_bounds", "payload_valid", "payload_digest_formula"],
+            "The encrypted row's metadata_frame_len (16) is below the bound [17, 16 MiB], and the payload digest was "
+            "left stale." + SEP_ORDER, kind="replica-A-payload")
+    replica("mut-23", ["digests_recompute", "kind_local"],
+            "The recorded replica descriptor digest (0x95 x 32) does not recompute.")
+    replica("mut-24", ["reserved_fixed", "kind_fixed", "frame_fields"],
+            "The reserved field at 0x300 is nonzero in both frames; the checksums were repaired, so only the reserved-zero "
+            "rule fails.")
+    replica("mut-25", ["digests_recompute", "payload_valid", "payload_digest_formula"],
+            "The recorded payload SHA-256 (0x91 x 32) is not the digest of the fixed slots, and the edition digest, whose "
+            "preimage holds it, was left stale." + SEP_ORDER)
+    replica("mut-26", ["frame_fields", "record_whole", "record_sizes"],
+            "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, "
+            "not one complete record. The record-length condition fails (GAPS H-5).")
+    replica("mut-27", ["magic_crc_miss", "role_magic", "frame_fields"],
+            "Every record now starts 100 bytes later in the original stream: the header record begins with original "
+            "byte 100, so its role magic does not match, and the footer record is short and begins inside the old "
+            "footer." + SEP_ORDER)
+    replica("mut-28", ["frame_fields", "digests_recompute"],
+            "Both frames record tape UUID 0x12 x 16, not the tape's; the role magics still derive from the tape's UUID. "
+            "The edition digest (left stale) does not recompute." + SEP_ORDER)
+    replica("mut-29", ["magic_crc_miss", "reserved_fixed"],
+            "A reserved header byte is set and the header CRC was left stale: the CRC miss invalidates the candidate.")
+    replica("mut-30", ["slot_len", "payload_valid", "payload_digest_formula"],
+            "The first structural slot's encoded_len is 65 535, more than the slot size minus two, so the slot does not "
+            "decode; the payload digest was left stale." + SEP_ORDER, kind="replica-A-payload")
+    separation("mut-31", ["backward_delta", "frame_fields", "device_agree"],
+               "The extent's footer is now B-C's: its ordinal, local and neighbour coordinates and descriptor are B-C's, "
+               "its backward delta names B-C's header, and its header-record hash is B-C's header's." + SEP_ORDER)
+    replica("mut-32", ["replica_count_fixed", "kind_fixed", "frame_fields"],
+            "Both frames record a replica count of 2; the row is fixed at 3. The descriptor digest was left stale, but its "
+            "preimage holds the constant replica_count:u16=3 (GAPS H-9); the fixed-field rule fails either way.")
+    separation("mut-33", ["role_magic", "conjunction", "magic_crc_miss", "malformed_control"],
+               "The extent's header record is replica A's header record. For the extent at its planned coordinate the "
+               "separation role magic does not match, which invalidates it (TerminalIndexSeparationParse). The record "
+               "carries the terminal-replica header magic, however, and a matching role magic commits a tape file to its "
+               "control type; read that way, tape file 7 is a damaged terminal replica, whose frame plans itself at tape "
+               "file 6 (TerminalIndexReplicaParse). The text fixes no order between the two (GAPS H-8). Replica A itself, "
+               "at tape file 6, is untouched.",
+               error=None, error_set=["TerminalIndexSeparationParse", "TerminalIndexReplicaParse"])
+    t["mut-33"]["component"]["rules"].append(cite("err_replica"))
+    replica("mut-34", ["payload_padding", "payload_valid"],
+            "The first byte of the payload padding is nonzero. The payload digest covers the fixed slots only, so it "
+            "still matches; the zero-padding rule is the one that fails.", kind="replica-A-payload")
+    t["mut-35"] = {"component": _component(None, None, ["tuple_filemark", "missing_filemark"],
+                                           "The row is an event with no byte effect: its description defines no changed "
+                                           "byte, filemark or tuple, so the bytes to decide are the base profile's.",
+                                           outcome="no-vector"),
+                   "kind": "none"}
+    replica("mut-36", ["payload_digest_formula", "payload_valid"],
+            "The first Object row's object_id begins 'l' instead of 'm'. The row itself still decodes and fits every "
+            "row rule, but the payload digest, left stale, no longer matches the slots.", kind="replica-A-payload")
+    separation("mut-37", ["sep_arith", "footer_delta", "footer_arith_reject", "footer_local"],
+               "The footer's observed start LBA is 30 with delta 2 and footer LBA 31, so the footer arithmetic fails, and "
+               "the observation differs from the planned tuple (start 29)." + SEP_ORDER)
+    separation("mut-38", ["device_agree", "sep_full_records"],
+               "One byte appended after the footer record makes a fourth, one-byte record: the extent's measured count "
+               "and trailing filemark disagree with the plan (3 records), and the extra record is not a full record.",
+               kind="separation-AB-shifts-suffix")
+    replica("mut-39", ["digests_recompute", "payload_valid", "canonical_is", "conjunction", "err_digest_mismatch"],
+            "The recorded canonical-map SHA-256 (0x92 x 32) is not the canonical digest of the structural rows, and the "
+            "edition digest, whose preimage holds it, was left stale. The edition-digest failure is "
+            "TerminalIndexReplicaParse; the canonical-map mismatch is Section 15's FilemarkMapDigestMismatch ('replica "
+            "structural projection digest mismatch') and also a Section 10.6 payload condition. Section 10.6 fixes no "
+            "order, so either name is permitted (GAPS H-10).",
+            error=None, error_set=["TerminalIndexReplicaParse", "FilemarkMapDigestMismatch"])
+    separation("mut-40", ["verifier_interior", "sep_interior_invalid", "separation_not_needed"],
+               "The first interior byte is 0x01. No CRC or digest covers the interior, so the frames validate; a Verifier "
+               "performing full verification must find the interior nonzero, and such an extent is invalid for full "
+               "verification. A Scanner need not read the extent at all.")
+    replica("mut-41", ["covered_equal", "digest_scope", "digests_recompute"],
+            "The covered-prefix tape-file count (7) differs from structural_row_count (6) and from A's planned tape-file "
+            "number (6), and the edition digest (left stale) does not recompute." + SEP_ORDER)
+    replica("mut-42", ["footer_delta", "footer_arith_reject", "backward_delta", "footer_local"],
+            "The footer's observed start LBA is 26 with delta 2 and footer LBA 27, so the footer arithmetic fails; the "
+            "backward delta no longer names the planned header start, and the observation differs from the plan."
+            + SEP_ORDER)
+    replica("mut-43", ["magic_crc_miss", "reserved_fixed"],
+            "A reserved footer byte is set and the footer CRC was left stale: the CRC miss invalidates the candidate.")
+    separation("mut-44", ["frame_fields"],
+               "Both frames record compression mode 1; a separation frame's compression mode is 0. The checksums were "
+               "repaired, and the descriptor preimage does not hold the compression mode, so only this rule fails.")
+    separation("mut-45", ["separation_edition", "sep_digest_only"],
+               "Both frames record edition ID 0x24 x 16, not the replicas' (0x22 x 16), and the descriptor digest (left "
+               "stale) does not recompute." + SEP_ORDER)
+    separation("mut-46", ["sep_records", "sep_derive", "sep_digest_only", "device_agree"],
+               "The recorded total record count (4) is not ceil(E / B) = 3 from the recorded E, and differs from the "
+               "planned tuple and the measured count; the descriptor digest (left stale) does not recompute." + SEP_ORDER)
+    replica("mut-47", ["size_formulas", "checked", "terminal_u64"],
+            "object_row_count = 2^56 makes payload_len = 64 x 6 + 256 x 2^56 = 2^64 + 384, which overflows u64; Section "
+            "10.6 requires every size formula to evaluate without overflow. The stale edition digest and the retained "
+            "geometry also fail." + SEP_ORDER)
+    replica("mut-48", ["size_formulas", "checked", "terminal_u64"],
+            "structural_row_count = 2^58 - 1 and object_row_count = 1 make payload_len = 64 x (2^58 - 1) + 256 = 2^64 + "
+            "192, which overflows u64. The stale edition digest and the retained geometry also fail." + SEP_ORDER)
+    separation("mut-49", ["sep_records", "sep_derive", "sep_digest_only"],
+               "The recorded E (786 433) gives total_records = ceil(E / B) = 4, not the recorded 3, the planned tuple's 3 "
+               "or the measured 3; the descriptor digest (left stale) does not recompute." + SEP_ORDER)
+    replica("mut-50", ["size_formulas", "checked", "terminal_u64"],
+            "structural_row_count = 2^64 - 1 makes payload_len = 64 x (2^64 - 1) + 512, which overflows u64. The stale "
+            "edition digest and the retained geometry also fail." + SEP_ORDER)
+    return t
+
+
+def mutation_decision(mid: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """Assemble one mutation's decision: the component, the tape, the Verifier and the undecided aspects."""
+    if entry["kind"] == "none":
+        tape = {"outcome": "inventory", "acceptable_selections": ["A", "B", "C"], "degraded": False,
+                "replicas": {"A": "valid", "B": "valid", "C": "valid"},
+                "rules": [cite(k) for k in ("consider_conflict", "survivor")],
+                "why": "With no byte changed, the three replicas are the base profile's: fully valid and in agreement."}
+        return {"component": entry["component"], "tape": tape,
+                "verifier": {"result": "complete", "separations": {"A-B": "valid", "B-C": "valid"},
+                             "rules": [cite("normal_finalized")]},
+                "undecided": [],
+                "note": ("Informative only; the row does not define these. If the event removed replica A's trailing "
+                         "filemark, A would fail its trailing-filemark condition and every later record would move down "
+                         "one position, so B and C would not be at their planned coordinates either: no replica would "
+                         "validate, BotStructuralRecoveryRequired. If it edited a component tuple's trailing filemark count "
+                         "(Section 8.3: exactly 1), every frame carrying that tuple would fail layout validation; the "
+                         "outcome would depend on which frames and which repairs, which the row does not say.")}
+    tape, verifier, undecided = _tape(entry["kind"])
+    return {"component": entry["component"], "tape": tape, "verifier": verifier, "undecided": undecided, "note": ""}
+
+
+def _self_check_tape(decision: dict[str, Any], found: dict[str, Any], readings: list[dict[str, Any]] | None = None) -> list[str]:
+    problems = []
+    tape = decision
+    options = readings or [tape]
+    matched = False
+    for option in options:
+        if option["outcome"] != found["outcome"]:
+            continue
+        if option["outcome"] == "inventory":
+            if option["acceptable_selections"] != found["acceptable_selections"]:
+                continue
+            if option["degraded"] not in ("undecided", found["degraded"]):
+                continue
+        matched = True
+    if not matched:
+        problems.append(f"tape: implementation {found['outcome']} {found.get('acceptable_selections')} "
+                        f"degraded {found.get('degraded')}")
+    return problems
+
+
+def run_mutations(path: pathlib.Path, out_path: pathlib.Path) -> dict[str, Any]:
+    source = load_json(path)
+    table = mutations_table()
+    entries: dict[str, Any] = {}
+    for row in source["rows"]:
+        mid = row["case_id"]
+        profile = row["base_profile"]
+        inputs, terminal = profile_build(profile)
+        block_size = inputs["block_size"]
+        tape_uuid = bytes.fromhex(inputs["tape_uuid"])
+        streams: list[bytes | None] = [b"".join(c) for c in terminal.components]
+        res = Resolution()
+        target = PROFILE_COMPONENT_FILES.index(row["target"])
+        vector = "bytes"
+        if row["kind"] == "event":
+            vector = "none"
+            res.notes.append("event row: " + row["bytes"].get("description", ""))
+            res.notes.append("repairs: " + (row["repairs"].get("description") or ""))
+        else:
+            kind = KIND_REPLICA if target in (0, 2, 4) else KIND_SEPARATION
+            streams[target] = apply_byte_change(streams[target], row["bytes"], row["repairs"], block_size,
+                                                f"{profile}/{row['target']}", res, kind, profile)
+        records = {PROFILE_COMPONENT_FILES[i]: [len(s[j : j + block_size]) for j in range(0, len(s), block_size)]
+                   for i, s in enumerate(streams) if s is not None}
+        changed = []
+        for i, stream in enumerate(streams):
+            base = b"".join(terminal.components[i])
+            if stream != base:
+                changed.append({"component": PROFILE_COMPONENT_FILES[i], "bytes": len(stream),
+                                "sha256": hashlib.sha256(stream).hexdigest()})
+        spec = table.get(mid)
+        out: dict[str, Any] = {"id": mid, "kind": row["kind"], "base_profile": profile, "target": row["target"],
+                               "other_profile": row.get("other_profile") or None,
+                               "apply": {"resolved": res.resolved, "vector": vector,
+                                         "checks_total": len(res.checks),
+                                         "checks_failed": [c for c in res.checks if not c["matches"]],
+                                         "repairs": res.repairs, "notes": res.notes,
+                                         "record_lengths": {name: (lengths if len(set(lengths)) > 1 or len(lengths) != 3 else
+                                                                   f"3 x {lengths[0]}") for name, lengths in records.items()},
+                                         "changed_components": changed},
+                               "decision": None, "implementation": None, "self_check": None}
+        if not res.resolved or spec is None:
+            out["decision"] = {"component": _component(None, None, [], "the description does not resolve against my bytes"
+                                                       if spec is not None else "not analysed", outcome="unresolved"),
+                               "tape": None, "verifier": None, "undecided": [], "note": ""}
+            entries[mid] = out
+            continue
+        decision = mutation_decision(mid, spec)
+        out["decision"] = decision
+        found = scan_terminal(terminal_tape(inputs, streams, block_size), tape_uuid, block_size)
+        out["implementation"] = found
+        problems = _self_check_tape(decision["tape"], found)
+        component = decision["component"]
+        if component["name"] is not None:
+            got = (found["replicas"]["A"] if component["name"] == "replica A" else
+                   {"valid": found["separations"]["A-B"]["status"] == "valid", "error": found["separations"]["A-B"]["error"]})
+            allowed = component["error_set"] or [component["error"]]
+            if got["valid"] or got["error"] not in allowed:
+                problems.append(f"{component['name']}: implementation {'valid' if got['valid'] else got['error']}")
+        verifier_separation = decision["verifier"]["separations"]["A-B"]
+        if verifier_separation in ("valid", "invalid") and \
+                (found["separations"]["A-B"]["status"] == "valid") != (verifier_separation == "valid"):
+            problems.append(f"separation A-B: implementation {found['separations']['A-B']['status']}")
+        out["self_check"] = {"agrees": not problems, "detail": "; ".join(problems) or
+                             f"implementation: {found['outcome']} {'/'.join(found['acceptable_selections'])}"
+                             + (" degraded" if found.get("degraded") else "")}
+        entries[mid] = out
+    output = {"schema": MUTATIONS_SCHEMA, "source": path.name, "entries": entries}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False, default=_json_default) + "\n", encoding="utf-8")
+    return output
+
+
+def mutation_summary(entry: dict[str, Any]) -> str:
+    d = entry["decision"]
+    component = d["component"]
+    text = ""
+    if component["outcome"] == "unresolved":
+        return "UNRESOLVED: " + component["why"]
+    if component["name"]:
+        name = component["error"] or "{" + " | ".join(component["error_set"] or []) + "}"
+        text += f"{component['name']} {component['outcome']} {name}; "
+    else:
+        text += f"no component mutated ({component['outcome']}); "
+    tape = d["tape"]
+    if tape["outcome"] == "inventory":
+        degraded = {True: "degraded", False: "not degraded", "undecided": "degraded undecided (B-6)"}[tape["degraded"]]
+        text += f"tape: inventory from {'/'.join(tape['acceptable_selections'])}, {degraded}"
+    else:
+        text += f"tape: {tape['outcome']}"
+    if d["verifier"] and d["verifier"]["result"] not in ("degraded", "complete"):
+        text += f"; Verifier: {d['verifier']['result']}"
+    if entry["self_check"] and not entry["self_check"]["agrees"]:
+        text += f" [SELF-CHECK FAILED: {entry['self_check']['detail']}]"
+    return text
+
+
+# ----- survivor sets ---------------------------------------------------------
+
+def parse_status(text: str) -> dict[str, Any]:
+    """Classify one survivor status by its definition in the selection file."""
+    if text.startswith("the profile's replica, unchanged"):
+        return {"class": "unchanged"}
+    if text.startswith("the profile's replica with this byte change:"):
+        decoder = json.JSONDecoder()
+        body = text[len("the profile's replica with this byte change:"):].lstrip()
+        change, end = decoder.raw_decode(body)
+        rest = body[end:].lstrip()
+        repairs = {}
+        if rest.startswith("; repairs:"):
+            repairs, _ = decoder.raw_decode(rest[len("; repairs:"):].lstrip())
+        return {"class": "byte-change", "change": change, "repairs": repairs}
+    if text.startswith("no replica at this position"):
+        return {"class": "absent"}
+    match = re.match(r"at this position, the replica of the same position taken from the (\w+) profile at the same block size", text)
+    if match:
+        return {"class": "foreign", "profile_family": match.group(1)}
+    return {"class": "unknown", "text": text}
+
+
+def _status_text_decision(position: str, status: dict[str, Any], base_letter_valid: bool = True) -> tuple[str, list[str], str]:
+    """(validity, rule keys, reason) for a replica of a given status, from the text."""
+    cls = status["class"]
+    if cls == "unchanged":
+        return "valid", ["fully_valid"], "the profile's replica, which is locally eligible"
+    if cls == "absent":
+        return "missing", ["degraded_evidence", "walk_offer"], "no records at the planned coordinate"
+    if cls == "foreign":
+        return "invalid", ["device_agree", "locate_planned", "backward_delta", "degraded_evidence"], (
+            "a replica of another edition planned for other coordinates (the minimal profile's layout): its declared "
+            "tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never "
+            "locally eligible and takes no part in the conflict rule")
+    change = status["change"]
+    edits = change.get("edits", [])
+    description = change.get("description", "")
+    stale = " ".join(status.get("repairs", {}).get("left_stale") or [])
+    if re.match(r"Remove \d+ bytes from the end", description):
+        return "invalid", ["frame_fields", "record_whole", "record_sizes"], (
+            "its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)")
+    if edits and all(e.get("record", "").startswith("header") for e in edits) and "Header CRC" in stale:
+        return "invalid", ["magic_crc_miss", "reserved_fixed"], "a header byte changed under a stale header CRC: a CRC miss"
+    return "unknown", [], "status not analysed"
+
+
+def selection_decision(row: dict[str, Any], statuses: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Decide one survivor set from the text."""
+    per = {letter: _status_text_decision(letter, statuses[row[letter]]) for letter in "ABC"}
+    rules = ["locate_footer", "validate_every", "consider_conflict", "fully_valid", "conflict_rule", "degraded_evidence"]
+    replicas = {letter: f"{v[0]}: {v[2]}" for letter, v in per.items()}
+    for v in per.values():
+        rules += [k for k in v[1] if k not in rules]
+    if any(v[0] == "unknown" for v in per.values()):
+        return {"outcome": "unresolved", "replicas": replicas, "rules": [], "undecided": []}
+    valid = [letter for letter in "ABC" if per[letter][0] == "valid"]
+
+    def inventory(selected: list[str]) -> dict[str, Any]:
+        if not selected:
+            return {"outcome": "BotStructuralRecoveryRequired", "acceptable_selections": [], "degraded": None}
+        return {"outcome": "inventory", "acceptable_selections": selected, "degraded": len(selected) < 3}
+
+    decided = inventory(valid)
+    undecided = []
+    readings = None
+    c_status = statuses[row["C"]]["class"]
+    if c_status == "foreign" and valid:
+        # Section 8.4 step 1 takes the planned layout from the replica footer
+        # found from EOD. Here that footer is C's, a foreign replica whose plan
+        # names other coordinates. Whether an ineligible footer may supply the
+        # layout is not settled (GAPS B-8, H-4).
+        readings = [
+            dict(inventory([]), reading="the Scanner takes the planned layout from the first replica footer it finds from "
+                                        "EOD, C's; under that plan no planned coordinate holds a valid replica, so it "
+                                        "walks from BOT"),
+            dict(inventory(valid), reading="a footer that is not locally eligible cannot supply the layout (or every footer's "
+                                           "layout is considered, Section 8.4's pointer to Section 8.5); the next replica "
+                                           "footer from EOD gives the profile's plan, under which the valid replicas are "
+                                           + " and ".join(valid)),
+        ]
+        undecided.append({"aspect": "tape.outcome", "readings": [r["reading"] for r in readings],
+                          "citations": [cite("locate_footer"), cite("footers_differ"), cite("footer_local"),
+                                        cite("no_replica_walk")]})
+        decided = {"outcome": "undecided", "acceptable_selections": None, "degraded": None}
+        rules += ["footers_differ", "footer_local"]
+    if decided["outcome"] == "BotStructuralRecoveryRequired":
+        rules += ["no_replica_walk", "select_walk", "bot_required", "err_bot"]
+    elif decided["outcome"] == "inventory":
+        rules += ["survivor"] + (["degraded_result"] if decided["degraded"] else []) + \
+                 (["selection_guide"] if len(decided["acceptable_selections"]) > 1 else [])
+    return dict(decided, replicas=replicas, rules=[cite(k) for k in dict.fromkeys(rules)], readings=readings,
+                undecided=undecided)
+
+
+def build_status_stream(status: dict[str, Any], position: str, profile: str, block_size: int, res: Resolution) -> bytes | None:
+    filename = {"A": "replica-a.bin", "B": "replica-b.bin", "C": "replica-c.bin"}[position]
+    cls = status["class"]
+    if cls == "unchanged":
+        return component_stream(profile, filename)
+    if cls == "absent":
+        return None
+    if cls == "foreign":
+        other = f"{status['profile_family']}-{profile.split('-', 1)[1]}"
+        res.notes.append(f"position {position}: my {other}/{filename}")
+        return component_stream(other, filename)
+    if cls == "byte-change":
+        return apply_byte_change(component_stream(profile, filename), status["change"], status["repairs"], block_size,
+                                 f"{profile}/{filename} (position {position})", res, KIND_REPLICA, profile,
+                                 check_retained=(position == "A"))
+    raise ValueError(f"unknown status {status}")
+
+
+def run_selection(path: pathlib.Path, out_path: pathlib.Path) -> dict[str, Any]:
+    source = load_json(path)
+    statuses = {name: parse_status(text) for name, text in source["statuses"].items()}
+    entries: dict[str, Any] = {}
+    for row in source["rows"]:
+        profile = row["base_profile"]
+        inputs, terminal = profile_build(profile)
+        block_size = inputs["block_size"]
+        tape_uuid = bytes.fromhex(inputs["tape_uuid"])
+        res = Resolution()
+        streams: list[bytes | None] = [b"".join(c) for c in terminal.components]
+        for letter in "ABC":
+            streams[REPLICA_POSITIONS[letter]] = build_status_stream(statuses[row[letter]], letter, profile, block_size, res)
+        decision = selection_decision(row, statuses)
+        results = {}
+        models = [True, False] if any(statuses[row[l]]["class"] == "absent" for l in "ABC") else [True]
+        for keeps in models:
+            results["filemark kept" if keeps else "filemark absent"] = scan_terminal(
+                terminal_tape(inputs, streams, block_size, absent_keeps_filemark=keeps), tape_uuid, block_size)
+        found = results["filemark kept"]
+        problems = []
+        if not res.resolved:
+            problems.append("a status description does not resolve against my bytes")
+        for label, result in results.items():
+            if decision["outcome"] == "unresolved":
+                problems.append("decision unresolved")
+            elif decision["outcome"] == "undecided":
+                problems += [f"{label}: {p}" for p in _self_check_tape(decision, result, decision["readings"])]
+            else:
+                problems += [f"{label}: {p}" for p in _self_check_tape(decision, result)]
+        entry = {"id": row["id"], "base_profile": profile, "A": row["A"], "B": row["B"], "C": row["C"],
+                 "apply": {"resolved": res.resolved, "checks_total": len(res.checks),
+                           "checks_failed": [c for c in res.checks if not c["matches"]], "repairs": res.repairs,
+                           "notes": res.notes},
+                 "decision": decision,
+                 "implementation": found if len(results) == 1 else results,
+                 "self_check": {"agrees": not problems, "detail": "; ".join(problems) or
+                                f"implementation: {found['outcome']} {'/'.join(found['acceptable_selections'])}"
+                                + (" degraded" if found.get("degraded") else "")}}
+        entries[row["id"]] = entry
+    output = {"schema": SELECTION_SCHEMA, "source": path.name,
+              "statuses": {name: {"class": s["class"]} for name, s in statuses.items()}, "entries": entries}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False, default=_json_default) + "\n", encoding="utf-8")
+    return output
+
+
+def selection_summary(entry: dict[str, Any]) -> str:
+    d = entry["decision"]
+    text = f"A {entry['A']} B {entry['B']} C {entry['C']}: "
+    if d["outcome"] == "inventory":
+        text += f"inventory from {'/'.join(d['acceptable_selections'])}, {'degraded' if d['degraded'] else 'not degraded'}"
+    elif d["outcome"] == "undecided":
+        text += "undecided: " + " | ".join(
+            (f"inventory from {'/'.join(r['acceptable_selections'])}{' degraded' if r['degraded'] else ''}"
+             if r["outcome"] == "inventory" else r["outcome"]) for r in d["readings"])
+    else:
+        text += d["outcome"]
+    if not entry["self_check"]["agrees"]:
+        text += f" [SELF-CHECK FAILED: {entry['self_check']['detail']}]"
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Command line.
 # ---------------------------------------------------------------------------
 
@@ -6738,7 +7929,40 @@ def main(argv: list[str] | None = None) -> int:
     resume = commands.add_parser("resume", help="act as a Resumer under Section 14 on resume cases")
     resume.add_argument("cases", nargs="+", type=pathlib.Path)
     resume.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "resume-decisions.json")
+    blocks = commands.add_parser("negative-blocks",
+                                 help="emit every block the negatives change and compare with tape-images/negatives/MANIFEST.tsv")
+    blocks.add_argument("--negatives", type=pathlib.Path, default=BLIND_INPUTS / "negative-cases-blind.json")
+    blocks.add_argument("--supplement", type=pathlib.Path, default=BLIND_INPUTS / "supplement-blind.json")
+    blocks.add_argument("--manifest", type=pathlib.Path, default=NEGATIVES_ROOT / "MANIFEST.tsv")
+    blocks.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-block-digests.json")
+    mutations_cmd = commands.add_parser("mutations", help="apply and decide the terminal-index mutations")
+    mutations_cmd.add_argument("mutations", type=pathlib.Path)
+    mutations_cmd.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "mutation-decisions.json")
+    selection_cmd = commands.add_parser("selection", help="build and decide the terminal survivor sets")
+    selection_cmd.add_argument("selection", type=pathlib.Path)
+    selection_cmd.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "selection-decisions.json")
     args = parser.parse_args(argv)
+    if args.command == "negative-blocks":
+        output = run_negative_blocks(args.negatives, args.supplement, args.manifest, args.out)
+        for row in output["rows"]:
+            if row["result"] != "matched":
+                print(f"{row['result']:22} {row['case']} {row['artifact']} tape file {row['tape_file']} block "
+                      f"{row['block_within_file']}" + (f" -- {row['detail']}" if row.get("detail") else ""))
+        print("counts", json.dumps(output["counts"], sort_keys=True))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
+    if args.command == "mutations":
+        output = run_mutations(args.mutations, args.out)
+        for entry_id, entry in output["entries"].items():
+            print(entry_id, mutation_summary(entry))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
+    if args.command == "selection":
+        output = run_selection(args.selection, args.out)
+        for entry_id, entry in output["entries"].items():
+            print(entry_id, selection_summary(entry))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
     if args.command == "build":
         report = run_build(args.out, include_streaming=not args.skip_streaming)
         for result in report["results"]:

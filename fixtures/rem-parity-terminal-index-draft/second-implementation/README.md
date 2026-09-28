@@ -54,6 +54,9 @@ python3 tools/rem_parity_second_implementation.py decide <case.json> [<case.json
 python3 tools/rem_parity_second_implementation.py resume <resume-case.json> [<resume-case.json> ...]
 python3 tools/rem_parity_second_implementation.py negatives <negative-cases.json>
 python3 tools/rem_parity_second_implementation.py negatives-supplement <supplement.json>
+python3 tools/rem_parity_second_implementation.py negative-blocks
+python3 tools/rem_parity_second_implementation.py mutations <mutations.json>
+python3 tools/rem_parity_second_implementation.py selection <selection.json>
 python3 -m unittest tools/test_rem_parity_second_implementation.py
 ```
 
@@ -74,7 +77,8 @@ the field that byte belongs to. It writes `build-report.json`. When a
 refused input stops the build, the refusal names that input field.
 
 `decide` takes damage-case files. A case's id is its file's stem, or, for a
-file named `fault-map.json`, its directory's name. For each case it builds
+file named `fault-map.json` (a damage case) or `inputs.json` (a resume case,
+as the repository lays them out), its directory's name. For each case it builds
 the named image, applies the case's faults, and then acts as a Reader. It
 writes two files here:
 
@@ -122,7 +126,61 @@ It writes `negative-supplement-decisions.json`, whose entries add an
 `cross_structure_failing`, `disputed_by_implementation`, `disputes`) to the
 keys of the negatives schema below.
 
-The tests accept five optional environment variables:
+`negative-blocks` closes the first criterion-2 gap that Appendix D item TT-2
+lists for the negative vectors. It re-runs only the apply step of every
+negative case and supplement variant in `blind-inputs/`, on my own builds,
+and emits every block whose bytes the mutation and its repairs change, with
+its size and SHA-256. A block counts as changed when its bytes differ from the
+base artifact's block at the same tape file and block, or when the base has no
+block there. It relates the opaque ids to the real case ids through the two
+mapping files, compares each block with `tape-images/negatives/MANIFEST.tsv`,
+and reports every row as matched, mismatched or missing from one side. The
+manifest pins only sizes and digests, so a mismatch can be located only
+against a candidate that reproduces the pinned digest. The one such candidate
+is a diagnostic for sup-14, whose variant says its parity bytes are
+arbitrary; it keeps the base image's parity, and it never replaces the bytes
+this implementation emits. The command writes `negative-block-digests.json`
+and leaves both earlier decision files untouched.
+
+`mutations` takes the 50 terminal-index mutations, described byte by byte
+under opaque ids. For each row it does three things:
+
+- **Apply.** It applies the description to my own build of the named
+  profile. Every stated old value is checked against my bytes, every
+  checksum or hash the row lists as recomputed is recomputed from my bytes
+  and checked against the stated new value, and every value the row says is
+  retained is checked in place. Length changes and record replacements are
+  applied as described, from my own builds of the donor components. A row
+  that is an event with no byte effect changes nothing.
+- **Decide.** It decides from the text what happens to the mutated
+  component (the Section 15 name, a permitted set, or `undecided` with its
+  readings) and to the tape: an inventory with its acceptable selections and
+  whether it is degraded, a conflict, or `BotStructuralRecoveryRequired`.
+  It also states what a Verifier must report.
+- **Run.** Its Scanner runs on the resulting record stream, and the result
+  is recorded beside the decision as a self-check.
+
+It writes `mutation-decisions.json`.
+
+`selection` takes the 14 survivor sets. Each names a status (S0 to S4) for
+replicas A, B and C, and each status is defined in the file by its bytes. For
+each set the command builds the three replicas from my own builds (a byte
+change is applied as `mutations` applies one; the foreign status takes my
+build of the other profile's replica at that position), decides the outcome
+from the text, and runs the Scanner as a self-check. Where the text does not
+decide which of several valid, agreeing replicas is selected, every one of
+them is listed as acceptable. It writes `selection-decisions.json`.
+
+For both commands the tape is the profile's prefix, written as placeholder
+records of the profile's recorded block counts, followed by the five
+components. A component stream is written as records of the block size in
+order, so a stream whose length is not a multiple of the block size ends in a
+short record. The profiles pin no bootstrap bytes, so the Reader takes the
+tape UUID and block size from the profile's inputs, as a readable bootstrap
+would supply them. No bootstrap walk is run; where the outcome is
+`BotStructuralRecoveryRequired`, that outcome is the decision.
+
+The tests accept seven optional environment variables:
 
 - `REM_PARITY_SECOND_IMPL_SCRATCH` names a working directory;
 - `REM_PARITY_SECOND_IMPL_CASES` names a directory of case files for the
@@ -132,7 +190,11 @@ The tests accept five optional environment variables:
 - `REM_PARITY_SECOND_IMPL_NEGATIVES` names a negative-case file for the
   negatives tests;
 - `REM_PARITY_SECOND_IMPL_SUPPLEMENT` names a supplement-variant file for the
-  supplement tests.
+  supplement tests;
+- `REM_PARITY_SECOND_IMPL_MUTATIONS` names a terminal-mutation file for the
+  mutation tests (default `blind-inputs/mutations-blind.json`);
+- `REM_PARITY_SECOND_IMPL_SELECTION` names a survivor-set file for the
+  selection tests (default `blind-inputs/selection-blind.json`).
 
 ## How the Reader works
 
@@ -232,6 +294,48 @@ Entries whose inputs are off tape, reported by the device, or evaluated by
 no role (neg-04, neg-05, neg-26) have no vector. For them the decision
 records what the text lets a Reader decide.
 
+## The negative-blocks schema
+
+`negative-block-digests.json` has
+`"schema": "rem-parity-second-implementation-negative-blocks/1"`.
+
+| Key | Contents |
+| --- | --- |
+| `counts` | `matched`, `mismatched`, `missing_from_mine`, `missing_from_manifest`, the number of manifest rows and the number of blocks emitted |
+| `entries` | For each opaque id: its real id, its `vector` (`bytes`, `unit`, `resume` or `none`), the number of blocks emitted, and any stated old value that did not match my bytes |
+| `rows` | One row per key in either set, keyed by real case id, artifact, tape file and block. A row gives my size and SHA-256, the pinned ones, and the `result`. A mismatch carries `first_differing_byte` and `field` when a diagnostic candidate reproduces the pinned digest, and says why not otherwise. A row missing from my side says whether my block at that key has the pinned digest. |
+
+A terminal profile's blocks are keyed by the profile's own tape-file
+numbering, in which replica A is the profile's first terminal tape file (6
+for `multi-256k`, 1 for `minimal-256k`). The profiles that the supplement
+generates are compared with `multi-256k`, component by component.
+
+## The mutations and selection schemas
+
+`mutation-decisions.json` has `"schema": "rem-parity-second-implementation-mutations/1"`
+and an `entries` map keyed `mut-NN`.
+
+| Key | Contents |
+| --- | --- |
+| `id`, `kind`, `base_profile`, `target`, `other_profile` | The row as the file gives it |
+| `apply` | `resolved`, `vector` (`bytes` or `none`), `checks_total` and `checks_failed` (stated old values, recomputed checksums and retained values against my bytes), `repairs` performed, `notes` (including what the row leaves stale), `record_lengths` of each component as written to tape, and `changed_components` with their size and SHA-256 |
+| `decision.component` | The mutated component (`replica A`, `separation extent A-B`, or `null`), `outcome` (`rejected`, `no-vector` or `unresolved`), `error`, `error_set` where more than one name is permitted, `readings`, the quoted `rules` and the reasoning (`why`) |
+| `decision.tape` | `outcome` (`inventory`, `TerminalIndexReplicaConflict`, `BotStructuralRecoveryRequired` or `undecided`), `acceptable_selections`, `degraded` (`true`, `false` or `undecided`), each replica's status, the quoted `rules` and the reasoning |
+| `decision.verifier` | What a Verifier must report: `result` (`complete`, `degraded` or `not complete`) and each separation extent's status |
+| `decision.undecided` | Aspects the text leaves open, each with its readings and citations |
+| `implementation` | What my Scanner and Verifier reported: the layout source, each replica's and extent's validity, error and reason, and the selection |
+| `self_check` | Whether the implementation's result agrees with the decision; where the decision is `undecided`, it must be one of the readings |
+
+`selection-decisions.json` has `"schema": "rem-parity-second-implementation-selection/1"`,
+the class of each status, and an `entries` map keyed `sel-NN`. Each entry
+gives the statuses of A, B and C, an `apply` block like the one above, the
+`decision` (`outcome`, `acceptable_selections`, `degraded`, each replica's
+status and reason, the quoted `rules`, the `readings` of an undecided
+outcome, and the `undecided` aspects), the `implementation` result and the
+`self_check`. A set that includes an absent replica is run twice, with and
+without that position's trailing filemark, because the status does not say
+whether the filemark remains.
+
 ## Files
 
 | File | Contents |
@@ -250,3 +354,7 @@ records what the text lets a Reader decide.
 | `resume-decisions.json` | The Resumer's decisions on the resume cases |
 | `negative-decisions.json` | The decisions on the generation-2 negative cases |
 | `negative-supplement-decisions.json` | The decisions and isolation audits for the supplemental single-rule variants |
+| `negative-block-digests.json` | Every block the negatives change, compared with `tape-images/negatives/MANIFEST.tsv` |
+| `mutation-decisions.json` | The decisions on the 50 terminal-index mutations |
+| `selection-decisions.json` | The decisions on the 14 terminal survivor sets |
+| `blind-inputs/mutations-blind.json`, `blind-inputs/selection-blind.json` | The mutation and survivor-set descriptions this implementation decided from, exactly as it received them |

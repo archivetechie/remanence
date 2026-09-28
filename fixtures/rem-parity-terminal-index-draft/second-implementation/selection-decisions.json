@@ -1,0 +1,1827 @@
+{
+  "schema": "rem-parity-second-implementation-selection/1",
+  "source": "selection-blind.json",
+  "statuses": {
+    "S0": {
+      "class": "unchanged"
+    },
+    "S1": {
+      "class": "byte-change"
+    },
+    "S2": {
+      "class": "byte-change"
+    },
+    "S3": {
+      "class": "absent"
+    },
+    "S4": {
+      "class": "foreign"
+    }
+  },
+  "entries": {
+    "sel-01": {
+      "id": "sel-01",
+      "base_profile": "multi-256k",
+      "A": "S2",
+      "B": "S2",
+      "C": "S2",
+      "apply": {
+        "resolved": true,
+        "checks_total": 9,
+        "checks_failed": [],
+        "repairs": [
+          "removed 100 bytes from the end of the component; no byte rewritten",
+          "removed 100 bytes from the end of the component; no byte rewritten",
+          "removed 100 bytes from the end of the component; no byte rewritten"
+        ],
+        "notes": [
+          "No surviving byte is rewritten. All surviving stored CRCs, digests, slot lengths and geometry values are retained from their original records; none is adjusted for the removed bytes. A wholly removed record also removes its stored checksum and digest fields.",
+          "No surviving byte is rewritten. All surviving stored CRCs, digests, slot lengths and geometry values are retained from their original records; none is adjusted for the removed bytes. A wholly removed record also removes its stored checksum and digest fields.",
+          "No surviving byte is rewritten. All surviving stored CRCs, digests, slot lengths and geometry values are retained from their original records; none is adjusted for the removed bytes. A wholly removed record also removes its stored checksum and digest fields."
+        ]
+      },
+      "decision": {
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": "invalid: its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)",
+          "B": "invalid: its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)",
+          "C": "invalid: its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "10.6",
+            "quote": "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3."
+          },
+          {
+            "section": "10.4",
+            "quote": "The header and footer each occupy one complete tape record."
+          },
+          {
+            "section": "8.3",
+            "quote": "Terminal replicas and separation extents are written and read only at the record sizes 256 KiB, 512 KiB, and 1 MiB;"
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "no terminal-replica footer found from EOD",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "error": null,
+            "reason": "no planned layout: no replica footer found from EOD"
+          },
+          "B": {
+            "valid": false,
+            "error": null,
+            "reason": "no planned layout: no replica footer found from EOD"
+          },
+          "C": {
+            "valid": false,
+            "error": null,
+            "reason": "no planned layout: no replica footer found from EOD"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "not_run",
+            "error": null,
+            "reason": "no planned layout"
+          },
+          "B-C": {
+            "status": "not_run",
+            "error": null,
+            "reason": "no planned layout"
+          }
+        },
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: BotStructuralRecoveryRequired "
+      }
+    },
+    "sel-02": {
+      "id": "sel-02",
+      "base_profile": "multi-256k",
+      "A": "S1",
+      "B": "S1",
+      "C": "S1",
+      "apply": {
+        "resolved": true,
+        "checks_total": 39,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8",
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8",
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "B": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "C": "invalid: a header byte changed under a stale header CRC: a CRC miss"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "C": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: BotStructuralRecoveryRequired "
+      }
+    },
+    "sel-03": {
+      "id": "sel-03",
+      "base_profile": "multi-256k",
+      "A": "S0",
+      "B": "S0",
+      "C": "S0",
+      "apply": {
+        "resolved": true,
+        "checks_total": 0,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": []
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "B",
+          "C"
+        ],
+        "degraded": false,
+        "replicas": {
+          "A": "valid: the profile's replica, which is locally eligible",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "valid: the profile's replica, which is locally eligible"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "B": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "C": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "B",
+          "C"
+        ],
+        "degraded": false
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory A/B/C"
+      }
+    },
+    "sel-04": {
+      "id": "sel-04",
+      "base_profile": "multi-256k",
+      "A": "S0",
+      "B": "S0",
+      "C": "S1",
+      "apply": {
+        "resolved": true,
+        "checks_total": 4,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "B"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "valid: the profile's replica, which is locally eligible",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "invalid: a header byte changed under a stale header CRC: a CRC miss"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "B": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "C": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "B"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory A/B degraded"
+      }
+    },
+    "sel-05": {
+      "id": "sel-05",
+      "base_profile": "multi-256k",
+      "A": "S1",
+      "B": "S0",
+      "C": "S1",
+      "apply": {
+        "resolved": true,
+        "checks_total": 35,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8",
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "invalid: a header byte changed under a stale header CRC: a CRC miss"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "B": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "C": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory B degraded"
+      }
+    },
+    "sel-06": {
+      "id": "sel-06",
+      "base_profile": "multi-256k",
+      "A": "S0",
+      "B": "S1",
+      "C": "S0",
+      "apply": {
+        "resolved": true,
+        "checks_total": 4,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "C"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "valid: the profile's replica, which is locally eligible",
+          "B": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "C": "valid: the profile's replica, which is locally eligible"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "C": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "C"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory A/C degraded"
+      }
+    },
+    "sel-07": {
+      "id": "sel-07",
+      "base_profile": "multi-256k",
+      "A": "S3",
+      "B": "S3",
+      "C": "S3",
+      "apply": {
+        "resolved": true,
+        "checks_total": 0,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": []
+      },
+      "decision": {
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": "missing: no records at the planned coordinate",
+          "B": "missing: no records at the planned coordinate",
+          "C": "missing: no records at the planned coordinate"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "filemark kept": {
+          "layout_source": "no terminal-replica footer found from EOD",
+          "replicas": {
+            "A": {
+              "valid": false,
+              "error": null,
+              "reason": "no planned layout: no replica footer found from EOD"
+            },
+            "B": {
+              "valid": false,
+              "error": null,
+              "reason": "no planned layout: no replica footer found from EOD"
+            },
+            "C": {
+              "valid": false,
+              "error": null,
+              "reason": "no planned layout: no replica footer found from EOD"
+            }
+          },
+          "separations": {
+            "A-B": {
+              "status": "not_run",
+              "error": null,
+              "reason": "no planned layout"
+            },
+            "B-C": {
+              "status": "not_run",
+              "error": null,
+              "reason": "no planned layout"
+            }
+          },
+          "outcome": "BotStructuralRecoveryRequired",
+          "acceptable_selections": [],
+          "degraded": null
+        },
+        "filemark absent": {
+          "layout_source": "no terminal-replica footer found from EOD",
+          "replicas": {
+            "A": {
+              "valid": false,
+              "error": null,
+              "reason": "no planned layout: no replica footer found from EOD"
+            },
+            "B": {
+              "valid": false,
+              "error": null,
+              "reason": "no planned layout: no replica footer found from EOD"
+            },
+            "C": {
+              "valid": false,
+              "error": null,
+              "reason": "no planned layout: no replica footer found from EOD"
+            }
+          },
+          "separations": {
+            "A-B": {
+              "status": "not_run",
+              "error": null,
+              "reason": "no planned layout"
+            },
+            "B-C": {
+              "status": "not_run",
+              "error": null,
+              "reason": "no planned layout"
+            }
+          },
+          "outcome": "BotStructuralRecoveryRequired",
+          "acceptable_selections": [],
+          "degraded": null
+        }
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: BotStructuralRecoveryRequired "
+      }
+    },
+    "sel-08": {
+      "id": "sel-08",
+      "base_profile": "multi-256k",
+      "A": "S4",
+      "B": "S0",
+      "C": "S4",
+      "apply": {
+        "resolved": true,
+        "checks_total": 0,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "position A: my minimal-256k/replica-a.bin",
+          "position C: my minimal-256k/replica-c.bin"
+        ]
+      },
+      "decision": {
+        "outcome": "undecided",
+        "acceptable_selections": null,
+        "degraded": null,
+        "replicas": {
+          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "10.6",
+            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "10.6",
+            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+          },
+          {
+            "section": "8.4",
+            "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
+          },
+          {
+            "section": "8.4",
+            "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
+          }
+        ],
+        "readings": [
+          {
+            "outcome": "BotStructuralRecoveryRequired",
+            "acceptable_selections": [],
+            "degraded": null,
+            "reading": "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT"
+          },
+          {
+            "outcome": "inventory",
+            "acceptable_selections": [
+              "B"
+            ],
+            "degraded": true,
+            "reading": "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are B"
+          }
+        ],
+        "undecided": [
+          {
+            "aspect": "tape.outcome",
+            "readings": [
+              "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT",
+              "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are B"
+            ],
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+              },
+              {
+                "section": "8.4",
+                "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
+              },
+              {
+                "section": "8.4",
+                "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
+              },
+              {
+                "section": "8.4",
+                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+              }
+            ]
+          }
+        ]
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: role magic does not match"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TapeIo: LBA 10: expected a data block, found filemark"
+          },
+          "C": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: role magic does not match"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "invalid",
+            "error": "TerminalIndexSeparationParse",
+            "reason": "TerminalIndexSeparationParse: role magic does not match"
+          },
+          "B-C": {
+            "status": "invalid",
+            "error": "TerminalIndexSeparationParse",
+            "reason": "TapeIo: LBA 14: expected a data block, found filemark"
+          }
+        },
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: BotStructuralRecoveryRequired "
+      }
+    },
+    "sel-09": {
+      "id": "sel-09",
+      "base_profile": "multi-256k",
+      "A": "S1",
+      "B": "S0",
+      "C": "S0",
+      "apply": {
+        "resolved": true,
+        "checks_total": 31,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B",
+          "C"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "valid: the profile's replica, which is locally eligible"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "B": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "C": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B",
+          "C"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory B/C degraded"
+      }
+    },
+    "sel-10": {
+      "id": "sel-10",
+      "base_profile": "multi-256k",
+      "A": "S0",
+      "B": "S0",
+      "C": "S4",
+      "apply": {
+        "resolved": true,
+        "checks_total": 0,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "position C: my minimal-256k/replica-c.bin"
+        ]
+      },
+      "decision": {
+        "outcome": "undecided",
+        "acceptable_selections": null,
+        "degraded": null,
+        "replicas": {
+          "A": "valid: the profile's replica, which is locally eligible",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "10.6",
+            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "10.6",
+            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+          },
+          {
+            "section": "8.4",
+            "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
+          },
+          {
+            "section": "8.4",
+            "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
+          }
+        ],
+        "readings": [
+          {
+            "outcome": "BotStructuralRecoveryRequired",
+            "acceptable_selections": [],
+            "degraded": null,
+            "reading": "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT"
+          },
+          {
+            "outcome": "inventory",
+            "acceptable_selections": [
+              "A",
+              "B"
+            ],
+            "degraded": true,
+            "reading": "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are A and B"
+          }
+        ],
+        "undecided": [
+          {
+            "aspect": "tape.outcome",
+            "readings": [
+              "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT",
+              "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are A and B"
+            ],
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+              },
+              {
+                "section": "8.4",
+                "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
+              },
+              {
+                "section": "8.4",
+                "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
+              },
+              {
+                "section": "8.4",
+                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+              }
+            ]
+          }
+        ]
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: role magic does not match"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TapeIo: LBA 10: expected a data block, found filemark"
+          },
+          "C": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: role magic does not match"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "invalid",
+            "error": "TerminalIndexSeparationParse",
+            "reason": "TerminalIndexSeparationParse: role magic does not match"
+          },
+          "B-C": {
+            "status": "invalid",
+            "error": "TerminalIndexSeparationParse",
+            "reason": "TapeIo: LBA 14: expected a data block, found filemark"
+          }
+        },
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: BotStructuralRecoveryRequired "
+      }
+    },
+    "sel-11": {
+      "id": "sel-11",
+      "base_profile": "multi-256k",
+      "A": "S4",
+      "B": "S0",
+      "C": "S0",
+      "apply": {
+        "resolved": true,
+        "checks_total": 0,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "position A: my minimal-256k/replica-a.bin"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B",
+          "C"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule",
+          "B": "valid: the profile's replica, which is locally eligible",
+          "C": "valid: the profile's replica, which is locally eligible"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "10.6",
+            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "10.6",
+            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+          },
+          "B": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "C": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B",
+          "C"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory B/C degraded"
+      }
+    },
+    "sel-12": {
+      "id": "sel-12",
+      "base_profile": "multi-256k",
+      "A": "S1",
+      "B": "S1",
+      "C": "S0",
+      "apply": {
+        "resolved": true,
+        "checks_total": 35,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8",
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "C"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "B": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "C": "valid: the profile's replica, which is locally eligible"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "C": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "C"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory C degraded"
+      }
+    },
+    "sel-13": {
+      "id": "sel-13",
+      "base_profile": "multi-256k",
+      "A": "S0",
+      "B": "S4",
+      "C": "S0",
+      "apply": {
+        "resolved": true,
+        "checks_total": 0,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "position B: my minimal-256k/replica-b.bin"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "C"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "valid: the profile's replica, which is locally eligible",
+          "B": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule",
+          "C": "valid: the profile's replica, which is locally eligible"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "10.6",
+            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "10.6",
+            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+          },
+          "C": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "C"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory A/C degraded"
+      }
+    },
+    "sel-14": {
+      "id": "sel-14",
+      "base_profile": "multi-256k",
+      "A": "S0",
+      "B": "S1",
+      "C": "S1",
+      "apply": {
+        "resolved": true,
+        "checks_total": 8,
+        "checks_failed": [],
+        "repairs": [],
+        "notes": [
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8",
+          "left stale by the description: Header CRC-64/XZ at 0x3F8",
+          "left stale by the description: Footer complete header-record SHA-256 at 0x2B8"
+        ]
+      },
+      "decision": {
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A"
+        ],
+        "degraded": true,
+        "replicas": {
+          "A": "valid: the profile's replica, which is locally eligible",
+          "B": "invalid: a header byte changed under a stale header CRC: a CRC miss",
+          "C": "invalid: a header byte changed under a stale header CRC: a CRC miss"
+        },
+        "rules": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "8.5",
+            "quote": "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)."
+          },
+          {
+            "section": "8.5",
+            "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A magic or CRC miss invalidates that candidate."
+          },
+          {
+            "section": "10.4",
+            "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          }
+        ],
+        "readings": null,
+        "undecided": []
+      },
+      "implementation": {
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "replicas": {
+          "A": {
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
+          },
+          "B": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          },
+          "C": {
+            "valid": false,
+            "envelope_valid": false,
+            "error": "TerminalIndexReplicaParse",
+            "reason": "TerminalIndexReplicaParse: frame CRC does not verify"
+          }
+        },
+        "separations": {
+          "A-B": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          },
+          "B-C": {
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
+          }
+        },
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A"
+        ],
+        "degraded": true
+      },
+      "self_check": {
+        "agrees": true,
+        "detail": "implementation: inventory A degraded"
+      }
+    }
+  }
+}

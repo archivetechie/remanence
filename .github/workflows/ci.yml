@@ -127,6 +127,23 @@ jobs:
             --out "$RUNNER_TEMP/second-supplement-decisions.json"
           cmp "$RUNNER_TEMP/second-supplement-decisions.json" \
             fixtures/rem-parity-terminal-index-draft/second-implementation/negative-supplement-decisions.json
+          python3 tools/rem_parity_second_implementation.py negative-blocks \
+            --negatives fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/negative-cases-blind.json \
+            --supplement fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/supplement-blind.json \
+            --manifest fixtures/rem-parity-terminal-index-draft/tape-images/negatives/MANIFEST.tsv \
+            --out "$RUNNER_TEMP/second-negative-block-digests.json"
+          cmp "$RUNNER_TEMP/second-negative-block-digests.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/negative-block-digests.json
+          python3 tools/rem_parity_second_implementation.py mutations \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/mutations-blind.json \
+            --out "$RUNNER_TEMP/second-mutation-decisions.json"
+          cmp "$RUNNER_TEMP/second-mutation-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/mutation-decisions.json
+          python3 tools/rem_parity_second_implementation.py selection \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/selection-blind.json \
+            --out "$RUNNER_TEMP/second-selection-decisions.json"
+          cmp "$RUNNER_TEMP/second-selection-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/selection-decisions.json
           python3 -m unittest tools/test_rem_parity_second_implementation.py
 
       - name: Run tests

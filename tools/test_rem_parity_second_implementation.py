@@ -15,7 +15,11 @@ Two environment variables are optional:
 * ``REM_PARITY_SECOND_IMPL_NEGATIVES`` names a negative-case JSON file for the
   negatives determinism test (default: a small synthetic file written by the test);
 * ``REM_PARITY_SECOND_IMPL_SUPPLEMENT`` names a supplement-variant JSON file for
-  the supplement tests (default: a small synthetic file written by the test).
+  the supplement tests (default: a small synthetic file written by the test);
+* ``REM_PARITY_SECOND_IMPL_MUTATIONS`` names a terminal-mutation JSON file for the
+  mutation tests (default: ``blind-inputs/mutations-blind.json``);
+* ``REM_PARITY_SECOND_IMPL_SELECTION`` names a survivor-set JSON file for the
+  selection tests (default: ``blind-inputs/selection-blind.json``).
 """
 
 from __future__ import annotations
@@ -616,6 +620,155 @@ class SupplementTests(unittest.TestCase):
                                   {1: 2, 2: 0, 3: 0, 4: 4, 5: 8, 6: 1, 7: 4, 8: metadata_hash, 9: 6})
         self.assertIn("A valid, B valid, C valid", impl.role_terminal_image(rebuilt))
         self.assertEqual(impl.image_rows(rebuilt)[-1]["eod_record"], "40")
+
+
+# ---------------------------------------------------------------------------
+# negative-blocks: the negatives' mutated-block digests.
+# ---------------------------------------------------------------------------
+
+SYNTHETIC_BLOCK_NEGATIVES = {"description": "synthetic subset for the tests", "conventions": {}, "cases": [
+    {"id": "neg-13"}, {"id": "neg-21", "variants": [{"variant": "a-64s"}]},
+    {"id": "neg-33", "variants": [{"variant": "a-H-seven"}]}, {"id": "neg-44"}, {"id": "neg-26"}]}
+SYNTHETIC_BLOCK_SUPPLEMENT = {"description": "synthetic subset for the tests", "conventions": {}, "variants": [
+    {"id": "sup-05"}, {"id": "sup-37"}, {"id": "sup-14"}, {"id": "sup-01"}]}
+
+
+class NegativeBlockTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.negatives = SCRATCH / "block-negatives.json"
+        cls.supplement = SCRATCH / "block-supplement.json"
+        cls.negatives.write_text(json.dumps(SYNTHETIC_BLOCK_NEGATIVES), encoding="utf-8")
+        cls.supplement.write_text(json.dumps(SYNTHETIC_BLOCK_SUPPLEMENT), encoding="utf-8")
+        cls.manifest = impl.NEGATIVES_ROOT / "MANIFEST.tsv"
+        cls.out = impl.run_negative_blocks(cls.negatives, cls.supplement, cls.manifest, SCRATCH / "blocks-first.json")
+
+    def rows(self, case):
+        return [row for row in self.out["rows"] if row["case"] == case]
+
+    def test_negative_blocks_twice_gives_identical_output(self) -> None:
+        impl.run_negative_blocks(self.negatives, self.supplement, self.manifest, SCRATCH / "blocks-second.json")
+        self.assertEqual((SCRATCH / "blocks-first.json").read_bytes(), (SCRATCH / "blocks-second.json").read_bytes())
+        self.assertEqual(self.out["schema"], "rem-parity-second-implementation-negative-blocks/1")
+
+    def test_in_place_mutations_match_the_manifest(self) -> None:
+        for case, count in (("sidecar-logical-shard-count", 1), ("overflow-10.4-slot-product/a-64s", 2),
+                            ("overflow-13.3-tail-location/a-H-seven", 5), ("sidecar-data-crc-count/isolated", 6)):
+            with self.subTest(case=case):
+                rows = self.rows(case)
+                self.assertEqual(len(rows), count)
+                self.assertTrue(all(row["result"] == "matched" for row in rows), rows)
+
+    def test_a_rebuilt_image_lists_unchanged_blocks_only_on_the_manifest_side(self) -> None:
+        rows = self.rows("sidecar-header-block-count/isolated")
+        self.assertEqual(sum(row["result"] == "matched" for row in rows), 25)
+        extra = [row for row in rows if row["result"] != "matched"]
+        self.assertEqual([(r["tape_file"], r["block_within_file"]) for r in extra], [(5, 1), (7, 1)])
+        self.assertTrue(all(r["result"] == "missing_from_mine" and r["unchanged_block_matches_pinned"] for r in extra))
+
+    def test_sup14_differences_are_located_in_parity_derived_fields(self) -> None:
+        mismatched = [row for row in self.rows("sidecar-real-data-shard-count/isolated-2") if row["result"] == "mismatched"]
+        self.assertEqual(len(mismatched), 6)
+        for row in mismatched:
+            self.assertTrue(row["diagnostic_candidate"]["reproduces_pinned_digest"])
+            self.assertIn(row["field"].split(": ")[1].split(" ")[0], ("canonical_metadata_hash", "payload_sha256"))
+
+    def test_unpinned_and_unit_cases(self) -> None:
+        self.assertTrue(all(row["result"] == "missing_from_manifest" for row in self.rows("overflow-3.2-lba")))
+        self.assertEqual(self.out["entries"]["neg-26"]["vector"], "none")
+        self.assertEqual(self.out["entries"]["sup-01"]["vector"], "unit")
+
+
+# ---------------------------------------------------------------------------
+# mutations and selection: the terminal-index mutations and survivor sets.
+# ---------------------------------------------------------------------------
+
+MUTATIONS = pathlib.Path(os.environ.get("REM_PARITY_SECOND_IMPL_MUTATIONS", impl.BLIND_INPUTS / "mutations-blind.json"))
+SELECTION = pathlib.Path(os.environ.get("REM_PARITY_SECOND_IMPL_SELECTION", impl.BLIND_INPUTS / "selection-blind.json"))
+
+
+class MutationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.out = impl.run_mutations(MUTATIONS, SCRATCH / "mutations-first.json")
+
+    def test_mutations_twice_gives_identical_output(self) -> None:
+        impl.run_mutations(MUTATIONS, SCRATCH / "mutations-second.json")
+        self.assertEqual((SCRATCH / "mutations-first.json").read_bytes(), (SCRATCH / "mutations-second.json").read_bytes())
+        self.assertEqual(self.out["schema"], "rem-parity-second-implementation-mutations/1")
+
+    def test_every_mutation_resolves_and_self_checks(self) -> None:
+        for entry_id, entry in self.out["entries"].items():
+            with self.subTest(entry=entry_id):
+                self.assertTrue(entry["apply"]["resolved"], entry["apply"]["checks_failed"])
+                self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
+
+    def test_every_decision_cites_the_text(self) -> None:
+        text = " ".join(impl.SPEC_PATH.read_text(encoding="utf-8").split())
+        for entry_id, entry in self.out["entries"].items():
+            decision = entry["decision"]
+            for citation in decision["component"]["rules"] + decision["tape"]["rules"]:
+                self.assertIn(citation["quote"], text, entry_id)
+
+    def test_a_stated_old_value_that_differs_is_reported_not_guessed(self) -> None:
+        inputs, terminal = impl.profile_build("multi-256k")
+        stream = b"".join(terminal.components[0])
+        change = {"edits": [{"record": "header record 0", "field": "replica count 3", "offset": "0x03A",
+                             "component_byte_offset": 58, "size": 2, "old": {"unsigned_little_endian": 9, "hex": "0900"},
+                             "new": {"unsigned_little_endian": 2, "hex": "0200"}}]}
+        res = impl.Resolution()
+        impl.apply_byte_change(stream, change, {}, inputs["block_size"], "test", res, impl.KIND_REPLICA, "multi-256k")
+        self.assertFalse(res.resolved)
+        self.assertEqual(res.checks[0]["found"], "0300")
+
+    def test_listed_repairs_are_recomputed_not_copied(self) -> None:
+        inputs, terminal = impl.profile_build("multi-256k")
+        stream = b"".join(terminal.components[0])
+        wrong_crc = {"unsigned_little_endian": 0, "hex": "0000000000000000"}
+        change = {"edits": [
+            {"record": "header record 0", "field": "reserved zero", "offset": "0x300", "component_byte_offset": 768, "size": 1,
+             "old": {"hex": "00"}, "new": {"hex": "01"}},
+            {"record": "header record 0", "field": "CRC-64/XZ", "offset": "0x3F8", "component_byte_offset": 1016, "size": 8,
+             "old": {"hex": stream[1016:1024].hex()}, "new": wrong_crc}]}
+        repairs = {"recomputed": ["Header CRC-64/XZ at 0x3F8, over header bytes [0x000, 0x3F8)."]}
+        res = impl.Resolution()
+        out = impl.apply_byte_change(stream, change, repairs, inputs["block_size"], "test", res, impl.KIND_REPLICA, "multi-256k")
+        self.assertFalse(res.resolved)
+        self.assertEqual(out[1016:1024], impl.le64(impl.crc64_xz(out[:0x3F8])))
+
+
+class SelectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.out = impl.run_selection(SELECTION, SCRATCH / "selection-first.json")
+
+    def test_selection_twice_gives_identical_output(self) -> None:
+        impl.run_selection(SELECTION, SCRATCH / "selection-second.json")
+        self.assertEqual((SCRATCH / "selection-first.json").read_bytes(), (SCRATCH / "selection-second.json").read_bytes())
+        self.assertEqual(self.out["schema"], "rem-parity-second-implementation-selection/1")
+
+    def test_every_set_resolves_and_self_checks(self) -> None:
+        for entry_id, entry in self.out["entries"].items():
+            with self.subTest(entry=entry_id):
+                self.assertTrue(entry["apply"]["resolved"], entry["apply"]["checks_failed"])
+                self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
+
+    def test_a_foreign_replica_at_c_leaves_the_layout_reading_open(self) -> None:
+        statuses = {"S0": impl.parse_status("the profile's replica, unchanged"),
+                    "S4": impl.parse_status("at this position, the replica of the same position taken from the minimal "
+                                            "profile at the same block size, unchanged")}
+        decision = impl.selection_decision({"A": "S0", "B": "S0", "C": "S4"}, statuses)
+        self.assertEqual(decision["outcome"], "undecided")
+        self.assertEqual([r["outcome"] for r in decision["readings"]], ["BotStructuralRecoveryRequired", "inventory"])
+        self.assertEqual(decision["readings"][1]["acceptable_selections"], ["A", "B"])
+        decided = impl.selection_decision({"A": "S4", "B": "S0", "C": "S0"}, statuses)
+        self.assertEqual((decided["outcome"], decided["acceptable_selections"], decided["degraded"]), ("inventory", ["B", "C"], True))
+
+    def test_agreeing_valid_replicas_are_all_acceptable(self) -> None:
+        statuses = {"S0": impl.parse_status("the profile's replica, unchanged")}
+        decision = impl.selection_decision({"A": "S0", "B": "S0", "C": "S0"}, statuses)
+        self.assertEqual((decision["outcome"], decision["acceptable_selections"], decision["degraded"]),
+                         ("inventory", ["A", "B", "C"], False))
 
 
 if __name__ == "__main__":
