@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "a Reader deriving P = S × m from a scheme record"
+  },
+  "every_other_rule_holds": "At unit level nothing else is evaluated. Image level is impossible: from a sidecar header S × m < 2^48, and from the bootstrap any S with S × m ≥ 2^64 also has S × (k + m) > 2^32 − 1, which breaks Section 6.6 validity (required by Section 8.2) in the same bytes.",
+  "expected": {
+    "outcome": "rejection; Section 15 names no error"
+  },
+  "group": "7c",
+  "id": "overflow-9.1-P/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "S = 2^63, m = 2"
+  },
+  "parent": "overflow-9.1-P",
+  "pin_reason": "At unit level there is no structure whose parse error could carry the name.",
+  "pinned": false,
+  "quotes": [
+    "`P = S × m` is the parity shard block count"
+  ],
+  "sections": [
+    "9.1",
+    "6.6",
+    "2.4"
+  ],
+  "target": "P = S × m",
+  "violates_only": "Checked evaluation of 2^63 × 2"
+}

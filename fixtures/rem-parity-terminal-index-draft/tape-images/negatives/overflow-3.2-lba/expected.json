@@ -1,0 +1,48 @@
+{
+  "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin, replica-b.bin, replica-c.bin (all three, so they agree)",
+    "location": "structural slot 4 (tape file 4, ParitySidecar, block_count 5) at payload offset 256"
+  },
+  "blocker_reason": "A vector exists, but the text names no role that evaluates LBA(f, b) over tape-derived counts, so the vector's consumer and outcome cannot be fixed.",
+  "evaluation": "LBA(5, 0) = (1+1) + (2+1) + (5+1) + (3+1) + (2^64 - 1 + 1): the last term overflows u64.",
+  "expected": {
+    "one_of": [
+      "TerminalIndexReplicaParse",
+      "no error"
+    ],
+    "permitting_text": "Sections 2.4 and 8.3 require checked u64 arithmetic, but no validity condition of Section 10.6 evaluates Section 3.2 over structural rows, and no rule ties a sidecar row's block_count to 2H+P+1 or A's planned start to Σ(block_count + 1). A Reader that positions by filemark spacing never evaluates the sum and accepts the replicas."
+  },
+  "formula": "LBA(f, b) = Σ_{g<f}(block_count(g) + 1) + b",
+  "freeze_blocker": true,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-3.2-lba",
+  "integrity_repair": [
+    "R-TR-PAYLOAD in each replica, including the canonical-map SHA-256 (structural slot changed)"
+  ],
+  "mutation": [
+    {
+      "name": "block_count(4)",
+      "position": "structural slot 4, array element 2 (Section 10.2)",
+      "value": "0xFFFFFFFFFFFFFFFF (CBOR 1b ff ff ff ff ff ff ff ff)"
+    }
+  ],
+  "pin_reason": "The consuming role and the step that evaluates the formula are not defined, and Section 15 has no overflow name.",
+  "pinned": false,
+  "quotes": [
+    "`LBA(f, b) = Σ_{g<f}(block_count(g) + 1) + b`",
+    "Arithmetic on these fields is checked in `u64` (Section 2.4).",
+    "Every structural and ordinal-range invariant is validated."
+  ],
+  "sections": [
+    "3.2",
+    "2.4",
+    "8.3",
+    "10.6",
+    "13.3"
+  ],
+  "shadowed": false,
+  "target": "no Reader step named by the text; candidates are the Recoverer resolving a map entry to a position (Section 13.3 'Locate the epoch's sidecar tape file via the map') and a check of replica A's planned start LBA (25) against the prefix sum, which the text does not require",
+  "type": "u64"
+}

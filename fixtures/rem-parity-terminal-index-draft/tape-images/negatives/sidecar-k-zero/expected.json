@@ -1,0 +1,43 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "logical_shard_count (4) = S*k (0) violated",
+    "real_data_shard_count (4) <= logical and in 1..=S*k violated",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-k-zero",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "k u16",
+    "from": 2,
+    "isolation": "only k changes",
+    "le_bytes": "00 00",
+    "offset": "0x20",
+    "to": 0
+  },
+  "pin_note": "k = 0 is intrinsically invalid under Section 9.2, so the copy is never acquired and the Section 13.3 SchemeMismatch pin is not reached. A Reader that pinned against the bootstrap before validating the copy would say SchemeMismatch; the text's 'then' excludes that order for the Recoverer.",
+  "pinned": true,
+  "quotes": [
+    "| 0x20 | 2 | k u16 | ≠ 0 |",
+    "The acquired index MUST then be pinned against the bootstrap's scheme record"
+  ],
+  "sections": [
+    "9.2",
+    "13.3",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header k rule (Section 9.2)"
+}

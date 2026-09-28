@@ -1,0 +1,73 @@
+{
+  "artifact": "terminal profile minimal-256k",
+  "case": "overflow-10.5-extent-geometry",
+  "edits": [
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 80,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "00000c0000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 80,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "00000c0000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 184,
+      "new_bytes": "b81b68733abd4c941a54b72c768fa8c01817fc12998c81c619fee2f67a95cc40",
+      "old_bytes": "8b225540d6ff4d67d4c8e235e777a369e4a7fb48a8767414e2e5288c07fd9bbc",
+      "repair": "R-SEP descriptor digest",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 184,
+      "new_bytes": "b81b68733abd4c941a54b72c768fa8c01817fc12998c81c619fee2f67a95cc40",
+      "old_bytes": "8b225540d6ff4d67d4c8e235e777a369e4a7fb48a8767414e2e5288c07fd9bbc",
+      "repair": "R-SEP descriptor digest",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 504,
+      "new_bytes": "55c5d912025fd2ad",
+      "old_bytes": "208c57f61bcb8379",
+      "repair": "R-SEP header CRC",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 384,
+      "new_bytes": "be65bd8617bcdfbe949ffd587c2e4feb461b444b85208d867357e7bc7c686bc9",
+      "old_bytes": "61063cea569d4968f3bc6398774ed274ef0f522b9a3ccf00152170ea78ec3e5d",
+      "repair": "R-SEP footer header SHA-256",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 504,
+      "new_bytes": "17965c30fa671ce4",
+      "old_bytes": "59b40d4d2608ed83",
+      "repair": "R-SEP footer CRC",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_index_separation_header + parse_index_separation_footer + validate_index_separation_pair"
+  ],
+  "target_role": "Separation"
+}

@@ -1,0 +1,7 @@
+{
+  "evaluation": "7 − 1 − (2^64 − 1) underflows",
+  "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+  "key_6": "2^64 − 1 (CBOR 1b ff..ff; payload grows by 8 bytes, M stays 1)",
+  "pinned": false,
+  "variant": "b-H-max"
+}

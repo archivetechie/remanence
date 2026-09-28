@@ -1,0 +1,41 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "logical_shard_count = S*k and parity_block_count = S*m violated",
+    "Section 3.3 'd mod S' and 'd / S' are undefined for S = 0; a Reader must reject before using S",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-s-zero",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "S u32",
+    "from": 2,
+    "isolation": "only S changes",
+    "le_bytes": "00 00 00 00",
+    "offset": "0x24",
+    "to": 0
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x24 | 4 | S u32 | ≠ 0 |"
+  ],
+  "sections": [
+    "9.2",
+    "3.3",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header S rule (Section 9.2)"
+}

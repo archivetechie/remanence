@@ -1,0 +1,32 @@
+{
+  "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin",
+    "location": "Object-row slot 0 (tape file 1, plaintext)"
+  },
+  "every_other_rule_holds": "Key 10 has no rule other than the range fit, and it decodes as u64. Keys 11 (32) and 12 (1) are positive, and 32 ≤ 1 × 262144. The plaintext row carries keys 10-13 and none of 21-23. stored_block_count 2 matches structural row 1. The bijection, slot framing, digests and frames are consistent. The parent variant a is therefore already isolated at image level; only its variant b was not.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.3-manifest-range/isolated-1",
+  "integrity_repair": [
+    "R-TR-PAYLOAD"
+  ],
+  "mutation": {
+    "field": "Object row key 10 (manifest_first_chunk_lba)",
+    "from": 0,
+    "to": "2^64 − 1; key 12 stays 1"
+  },
+  "parent": "overflow-10.3-manifest-range (variant a)",
+  "pinned": true,
+  "quotes": [
+    "the manifest chunk range MUST fit within `stored_block_count`"
+  ],
+  "sections": [
+    "10.3",
+    "10.6"
+  ],
+  "target": "manifest chunk range fit (Section 10.3)",
+  "violates_only": "Checked evaluation of key 10 + key 12 = (2^64 − 1) + 1"
+}

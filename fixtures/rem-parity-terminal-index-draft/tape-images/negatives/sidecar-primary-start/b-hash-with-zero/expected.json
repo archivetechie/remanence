@@ -1,0 +1,9 @@
+{
+  "reaches_target_if": "the hash is computed with primary_header_start_block substituted by 0",
+  "repair": [
+    "keep the original canonical_metadata_hash (which equals the hash computed with 0x78 read as 0)",
+    "header_crc64",
+    "block0_crc64"
+  ],
+  "variant": "b-hash-with-zero"
+}

@@ -1,0 +1,37 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies, the footer and the directory entry",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "No other byte changes. The copies agree (the hash field is identical in both), the footer's hash equals the copies' and the directory's equals both, all CRCs verify, and every Section 9.2 field rule and the Section 9.4 layout hold.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-canonical-hash/isolated",
+  "integrity_repair": [
+    "header_crc64 and block0_crc64 of both copies",
+    "footer_crc64",
+    "R-PM-PAYLOAD for the directory entry"
+  ],
+  "mutation": {
+    "change": "the same wrong value everywhere: the correct hash with byte 0 XOR 0x01",
+    "field": "canonical_metadata_hash",
+    "offset": "0x98 in blocks 0 and 5; footer 0x60; directory entry key 8"
+  },
+  "parent": "sidecar-canonical-hash",
+  "pinned": true,
+  "quotes": [
+    "Readers MUST verify the hash on every index parse.",
+    "Only when no header/index copy can be validated is the epoch **metadata-unavailable**"
+  ],
+  "sections": [
+    "9.5",
+    "13.3",
+    "15"
+  ],
+  "target": "canonical metadata hash verification (Section 9.5)",
+  "violates_only": "Section 9.5 'Readers MUST verify the hash on every index parse'. The stored hash is not the SHA-256 of the domain string, bytes 0x00..0x8F and the entries."
+}

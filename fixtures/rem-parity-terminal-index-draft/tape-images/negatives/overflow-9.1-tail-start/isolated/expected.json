@@ -1,0 +1,36 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "footer (block 6) mutated; both header copies (blocks 0 and 5) presented unreadable (medium error, no byte change)",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The footer's magic, version, reserved bytes, UUID, epoch, range, H = 1, total 7 (= measured count and map entry), primary start 0 and CRC are all valid. Section 9.6 states no rule for P itself. The header copies are unreadable, so they are compared with nothing. The directory entry is unchanged, and its P is not compared with the footer.",
+  "expected": {
+    "footer": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7c",
+  "id": "overflow-9.1-tail-start/isolated",
+  "integrity_repair": [
+    "R-SC-FOOTER"
+  ],
+  "mutation": {
+    "field": "footer P u64",
+    "from": 4,
+    "offset": "0x40",
+    "to": "0xFFFFFFFFFFFFFFFF"
+  },
+  "parent": "overflow-9.1-tail-start (added: in the parent, the footer's P also disagreed with the header copies' parity_block_count)",
+  "pinned": true,
+  "quotes": [
+    "| 0x58 | 8 | tail_header_start_block u64 = H + P |"
+  ],
+  "sections": [
+    "9.6",
+    "13.3",
+    "2.4"
+  ],
+  "tape_level": "Footer invalid, then step 2: the primary is unreadable. Step 3: the tail at 7 − 1 − 1 = 5 is unreadable. No copy validates.",
+  "target": "sidecar footer locator validation, tail_header_start_block = H + P (Section 9.6), in the Recoverer's footer-first step (Section 13.3 step 1)",
+  "violates_only": "Checked evaluation of H + P = 1 + (2^64 − 1)"
+}

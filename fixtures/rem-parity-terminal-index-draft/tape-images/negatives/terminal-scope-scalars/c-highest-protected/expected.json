@@ -1,0 +1,8 @@
+{
+  "field": "highest protected ordinal",
+  "from": 5,
+  "must_match": "W recomputed over the prefix (Sections 7.2, 7.4) = 5; and total_data_ordinals (5) (Section 10.6)",
+  "offset": "0x058",
+  "to": 4,
+  "variant": "c-highest-protected"
+}

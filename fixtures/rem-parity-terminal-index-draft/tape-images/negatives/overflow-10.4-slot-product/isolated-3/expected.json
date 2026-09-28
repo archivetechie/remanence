@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "as isolated-1"
+  },
+  "every_other_rule_holds": "As isolated-1.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.4-slot-product/isolated-3",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "structural_row_count = 2^57, object_row_count = 2^55"
+  },
+  "parent": "overflow-10.4-slot-product (variant c)",
+  "pinned": true,
+  "quotes": [
+    "the checked terminal payload `64 × structural_row_count + 256 × object_row_count`"
+  ],
+  "sections": [
+    "10.4",
+    "10.6"
+  ],
+  "target": "the sum 64s + 256o",
+  "violates_only": "Checked evaluation of 2^63 + 2^63 (each product fits)"
+}

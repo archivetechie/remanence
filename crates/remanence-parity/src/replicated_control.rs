@@ -4,16 +4,23 @@ use crate::error::ParityError;
 
 /// Physical `copy 1 + copy 2 + footer` layout used by large control files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReplicatedControlLayout {
-    pub(crate) copy_block_count: u64,
-    pub(crate) total_block_count: u64,
-    pub(crate) primary_copy_start_block: u64,
-    pub(crate) tail_copy_start_block: u64,
-    pub(crate) footer_block_index: u64,
+#[doc(hidden)]
+pub struct ReplicatedControlLayout {
+    /// Blocks in each metadata copy.
+    pub copy_block_count: u64,
+    /// Blocks in the complete replicated control file.
+    pub total_block_count: u64,
+    /// Block offset of the primary copy.
+    pub primary_copy_start_block: u64,
+    /// Block offset of the tail copy.
+    pub tail_copy_start_block: u64,
+    /// Block offset of the footer.
+    pub footer_block_index: u64,
 }
 
 /// Calculate the exact `2M + 1` layout without converting through `usize`.
-pub(crate) fn checked_replicated_control_layout(
+#[doc(hidden)]
+pub fn checked_replicated_control_layout(
     block_size: u64,
     header_len: u64,
     payload_len: u64,

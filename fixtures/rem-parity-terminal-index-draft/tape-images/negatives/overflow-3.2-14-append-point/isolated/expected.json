@@ -1,0 +1,32 @@
+{
+  "base": {
+    "artifact": "tape-image unfinalized-open",
+    "note": "committed prefix files 0..3; T = 6, W = 4"
+  },
+  "every_other_rule_holds": "The huge count sits on a sidecar, so T = 6 and W = 4 are unaffected, unlike the parent, whose huge Object count also overflowed T. Step 2 holds: T − W = 2 < S*k = 4, W ≤ T, the ranges are contiguous from 0 to W, the epoch ids are consecutive, and the final object ends at T. A single record makes no conflicting claim (Section 3.4). The re-read of [4,6) in step 3 finds data where it is expected, when positioning is by filemarks.",
+  "expected": {
+    "error": "ResumeAppend"
+  },
+  "group": "7c",
+  "id": "overflow-3.2-14-append-point/isolated",
+  "integrity_repair": [
+    "none on tape; the injected record must be well formed in the implementation's commit-record format"
+  ],
+  "mutation": {
+    "input": "the commit record for tape file 2 (the sidecar) claims block_count 0xFFFFFFFFFFFFFFFF; object records and ranges are unchanged"
+  },
+  "parent": "overflow-3.2-14-append-point",
+  "pin_reason": "As the parent: commit-record values are off-tape, and Section 2.4 names 'values read from tape'.",
+  "pinned": false,
+  "quotes": [
+    "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+  ],
+  "sections": [
+    "3.2",
+    "3.4",
+    "14",
+    "2.4"
+  ],
+  "target": "the Resumer's Σ(block_count + 1) over the prefix (Section 3.2, used at Section 14 step 4 and by any LBA-based positioning in step 3)",
+  "violates_only": "Checked evaluation of Σ(block_count + 1): (1+1) + (4+1) + (2^64 - 1 + 1) overflows"
+}

@@ -1,0 +1,45 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "all three blocks",
+    "tape_file": 3
+  },
+  "evaluation": "M = ceil((2^64 − 1) / 2) = 2^63, so 2M = 2^64 overflows. With any B >= 0xC8 (the ParityMap minimum), M <= 2^64/200 and 2M + 1 cannot overflow; the vector reaches the formula only if the Reader takes B from the header field.",
+  "expected": {
+    "error": "ParityMapParse"
+  },
+  "formula": "total = 2M + 1; footer at 2M",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-10.1.2-2M-footer",
+  "integrity_repair": [
+    "CRC at 0xC0 of all three blocks"
+  ],
+  "mutation": [
+    {
+      "name": "block_size",
+      "position": "ParityMap 0x28 (u32) in blocks 0, 1, 2",
+      "value": 2
+    },
+    {
+      "name": "payload_len",
+      "position": "0x30 in blocks 0, 1, 2",
+      "value": "2^64 − 0xC9 (so 0xC8 + L = 2^64 − 1 does not overflow)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "total = 2M + 1",
+    "The minimum block size for ParityMap files is 0xC8."
+  ],
+  "sections": [
+    "10.1.2",
+    "10.1.3",
+    "10.1.4",
+    "2.4"
+  ],
+  "shadowed": "If the Reader first checks the header block_size against the actual block size (a rule the text does not state for ParityMaps) or against the 0xC8 minimum, that check fires; the name is ParityMapParse either way.",
+  "target": "ParityMap locator validation (Section 10.1.4)",
+  "type": "u64"
+}

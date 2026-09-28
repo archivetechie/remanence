@@ -1,0 +1,13 @@
+{
+  "block_within_file": 0,
+  "copy": "primary",
+  "from": 7,
+  "offset": "0x70",
+  "repair": [
+    "R-SC-HASHED"
+  ],
+  "tape_level": "as variant a",
+  "target": "Section 9.2 total rule; any Reader use of total - 1 (last block) or total - 1 - H from this field would underflow and MUST be rejected (Section 2.4)",
+  "to": 0,
+  "variant": "b-header-zero-hostile"
+}

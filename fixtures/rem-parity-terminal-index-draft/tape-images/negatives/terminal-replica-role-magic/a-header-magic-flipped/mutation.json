@@ -1,0 +1,46 @@
+{
+  "artifact": "terminal profile minimal-256k",
+  "case": "terminal-replica-role-magic/a-header-magic-flipped",
+  "edits": [
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 0,
+      "new_bytes": "e2",
+      "old_bytes": "e3",
+      "repair": "mutation",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 1016,
+      "new_bytes": "8780213b3ec1cd61",
+      "old_bytes": "63399b7220e5baba",
+      "repair": "replica header CRC",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 696,
+      "new_bytes": "c390091a39e48a522f72611c4c096d24885aa1c7af82e8bada882bda44adf544",
+      "old_bytes": "56c41ca01c6bb08ed844028b760e2aed479ac77bf01c1338cef797194f5a79eb",
+      "repair": "footer header-record SHA-256",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "0fb8ded8c4795bc9",
+      "old_bytes": "e7de41680ac459d7",
+      "repair": "replica footer CRC",
+      "tape_file": 1
+    }
+  ],
+  "entry_points": [
+    "parse_tape_index_replica_header + parse_tape_index_bootstrap_footer + validate_tape_index_replica_payload"
+  ],
+  "target_role": "Replica"
+}

@@ -1,0 +1,28 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "sidecar-header-reserved/c-footer-reserved",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 10,
+      "new_bytes": "0100",
+      "old_bytes": "0000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 128,
+      "new_bytes": "4afc524542906fdf",
+      "old_bytes": "d8ed158e3575f1a0",
+      "repair": "R-SC-FOOTER footer_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_footer_block"
+  ],
+  "target_role": "SidecarFooter"
+}

@@ -1,0 +1,55 @@
+{
+  "base": {
+    "artifact": "synthetic descriptor (unit level)",
+    "note": "Not constructible as a byte image: a validated map needs contiguous epochs from ordinal 0 (Sections 9.2, 10.1.5), and with S*k < 2^32 (Section 6.6) reaching start = 2^64 - 2 needs more than 2^32 sidecar rows."
+  },
+  "blocker_reason": "The vector exists only at unit level, and its outcome depends on the evaluation form. The text must say whether peer classification is computed in ordinal space.",
+  "evaluation": "Peer of the stripe-0 shard at data_index 1: o = (2^64 - 2) + 1*2 + 0 = 2^64, which overflows. That peer is an implicit zero (ordinal >= end), so its exact value is never needed.",
+  "expected": {
+    "one_of": [
+      "rejection (no Section 15 name)",
+      "successful reconstruction"
+    ],
+    "permitting_text": "Section 2.4 makes the overflow a rejection, but a Recoverer that tests data_index·S + stripe >= real_data_shard_count in epoch-relative space never overflows and recovers the block. Section 13.4 states the implicit-zero test as 'an ordinal ≥ protected_ordinal_end_exclusive'."
+  },
+  "formula": "o = start + data_index·S + stripe",
+  "freeze_blocker": true,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-3.3-stripe-mapping-inverse",
+  "integrity_repair": [
+    "not applicable (unit-level vector)"
+  ],
+  "mutation": [
+    {
+      "name": "start",
+      "position": "sidecar header 0x30 / map entry element 4",
+      "value": "2^64 - 2"
+    },
+    {
+      "name": "end",
+      "position": "sidecar header 0x38",
+      "value": "2^64 - 1 (real_data_shard_count 1)"
+    },
+    {
+      "name": "S, k",
+      "position": "sidecar header 0x24, 0x20",
+      "value": "S = 2, k = 2"
+    }
+  ],
+  "pin_reason": "Two conformant evaluation forms reach different outcomes on the same descriptor, and a wrapped value (to 0) would silently name a real ordinal.",
+  "pinned": false,
+  "quotes": [
+    "inverse:  o = start + data_index·S + stripe",
+    "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
+  ],
+  "sections": [
+    "3.3",
+    "13.4",
+    "6.4",
+    "2.4"
+  ],
+  "shadowed": false,
+  "target": "the Recoverer gathering stripe peers and classifying implicit zeros (Sections 13.4, 6.4)",
+  "type": "u64"
+}

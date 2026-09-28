@@ -1,0 +1,28 @@
+{
+  "artifact": "terminal profile minimal-256k",
+  "case": "overflow-10.4-footer-delta/b-start-max",
+  "edits": [
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 736,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "0200000000000000",
+      "repair": "mutation",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "5522b7d6ecf588a8",
+      "old_bytes": "e7de41680ac459d7",
+      "repair": "R-TR-FOOTER-LOCAL CRC",
+      "tape_file": 1
+    }
+  ],
+  "entry_points": [
+    "parse_tape_index_replica_header + parse_tape_index_bootstrap_footer + validate_tape_index_replica_payload"
+  ],
+  "target_role": "Replica"
+}

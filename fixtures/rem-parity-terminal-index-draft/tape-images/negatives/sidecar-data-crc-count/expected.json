@@ -1,0 +1,40 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "a parser that reads only data_crc_count entries finds the fourth data-CRC entry (0x120..0x128) as nonzero unused space (Section 9.3)",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-data-crc-count",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "data_crc_count u64",
+    "formula": "MUST = real_data_shard_count (4)",
+    "from": 4,
+    "offset": "0x58",
+    "to": 3
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x58 | 8 | data_crc_count u64 | MUST = real_data_shard_count |",
+    "There are exactly `S × m` parity entries and `real_data_shard_count` data-CRC entries."
+  ],
+  "sections": [
+    "9.2",
+    "9.3",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable. H and inline bytes are computed from real_data_shard_count (Section 9.4), so they still match.",
+  "target": "sidecar header data_crc_count rule (Section 9.2)"
+}

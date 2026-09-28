@@ -1,0 +1,38 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies; footer presented unreadable",
+    "tape_file": 2
+  },
+  "caveat": "Isolated only if the header's own locator rules read P as S × m, as Section 9.1 defines it. A Reader that reads P from 0x50 finds H + P = 4 ≠ 5 as well, with the same name. With a readable footer no isolation is possible: the footer's P either disagrees with 0x50 or, mirrored as 3, breaks the footer's own tail = H + P.",
+  "every_other_rule_holds": "Section 9.1 defines P = S × m = 4, and with that P the header's tail start 5 = H + P, footer index 6 = 2H + P and total 7 = 2H + P + 1 hold, matching the 7-block file. The index still has S*m = 4 parity entries (Section 9.3). The copies agree with each other. The footer is unreadable, so its P = 4 is compared with nothing. Directory key 7 is not compared with the header (Section 13.3 agreement set).",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-parity-block-count/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (new hash in both copies and directory key 8; directory key 7 stays 4)",
+    "ISO-FAULT-FOOTER"
+  ],
+  "mutation": {
+    "field": "parity_block_count u64",
+    "from": 4,
+    "offset": "0x50",
+    "to": 3
+  },
+  "parent": "sidecar-parity-block-count",
+  "pinned": true,
+  "quotes": [
+    "| 0x50 | 8 | parity_block_count u64 | MUST = S × m |",
+    "`P = S × m` is the parity shard block count"
+  ],
+  "sections": [
+    "9.1",
+    "9.2",
+    "13.3"
+  ],
+  "target": "parity_block_count rule (Section 9.2)",
+  "violates_only": "Section 9.2 'parity_block_count MUST = S × m'"
+}

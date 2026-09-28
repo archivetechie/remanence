@@ -1,0 +1,63 @@
+{
+  "description": "Supervisor adjudications of negative cases where the pinned expectation and the reference disagree (design D4). The expectations' author's file, negative-cases.json, is never edited. 'open' entries are questions the specification text does not decide (class (c)); the executor reports them as DISPUTED and they stay open until the text decides them. 'settled' entries are disagreements the text decides against the expectation (class (a)); each gives the corrected outcome and the sentence that decides it, and the executor asserts the corrected outcome for the named observation only. Each entry's `match` names the case variant ('' for none) and the executor observation it applies to; open entries list the outcomes that are disputed (either is reported as DISPUTED, any other outcome fails); settled entries give the corrected outcome.",
+  "open": [
+    {
+      "id": "sidecar-primary-tail-disagreement",
+      "expected": "SidecarParse, for a Verifier reading both copies (the case's target)",
+      "reference": "The reference implements no Verifier role for sidecars; its Verifier checks the terminal index only. The executor therefore observes the Recoverer's parser, which validates both copies against the footer first; the divergent tail fails that check, the primary is valid, and the file is accepted.",
+      "readings": [
+        "For a Verifier the text decides it: Section 9.1 says the copies MUST be identical and that a Reader MUST reject divergence, so a Verifier reports this sidecar as non-conformant (SidecarParse). The reference lacks that Verifier check, which is a reference gap, not a disagreement about the text.",
+        "For a Recoverer the text does not decide it: 'when both copies parse' either means each copy satisfies Sections 9.2-9.5 on its own, so divergence is rejected and the epoch's metadata is lost; or it includes agreement with the footer locator (Section 13.3 step 1), so the copy the footer contradicts is invalid and the primary is used."
+      ],
+      "sentence": "Section 9.1: \"When both copies parse, a Reader MUST verify that they agree and reject divergence.\"",
+      "status": "open: (1) the reference gains a Verifier-level sidecar agreement check, or the Verifier's scope is stated to exclude sidecars (D9); (2) the Recoverer's consequence is an owner question in the next text revision (D9). Until then the observation is DISPUTED, never a pass; a PANIC or any other outcome fails.",
+      "observation": "the Recoverer's sidecar tape-file parser (parse_sidecar_tape_file); the reference has no Verifier-level sidecar check",
+      "match": {
+        "variant": "",
+        "observation": "agreement"
+      },
+      "disputed_outcomes": [
+        "SidecarParse",
+        "ACCEPTED"
+      ]
+    },
+    {
+      "id": "sidecar-primary-tail-disagreement",
+      "variant": "isolated",
+      "observation": "per_sidecar_validation",
+      "expected": "SidecarParse, for a role that parses both copies (the footer is unreadable, so both copies parse on their own and diverge)",
+      "reference": "The reference has no role that parses both copies when the footer is unreadable: it has no Verifier for sidecars, and its BOT Scanner classifies from the primary header (Section 12.3 item 5) without reading the tail copy. The executor observes that Scanner, which accepts.",
+      "readings": [
+        "The same question as the parent entry: the text requires a Reader that parses both copies to reject divergence, and the reference implements no such Reader for sidecars. Whether the Verifier's scope includes sidecars is to be stated (D9)."
+      ],
+      "sentence": "Section 9.1: \"When both copies parse, a Reader MUST verify that they agree and reject divergence.\"",
+      "status": "open, with the parent entry. The observation is DISPUTED, never a pass; a PANIC or any other outcome fails.",
+      "match": {
+        "variant": "isolated",
+        "observation": "per_sidecar_validation"
+      },
+      "disputed_outcomes": [
+        "SidecarParse",
+        "ACCEPTED"
+      ]
+    }
+  ],
+  "settled": [
+    {
+      "id": "overflow-13.3-tail-location",
+      "variant": "c-total-zero",
+      "observation": "recovery",
+      "expected": "{DirectoryInvalid, ParityMapParse} at the Recoverer",
+      "corrected": "SidecarMetadataUnavailable{epoch_id: 0}",
+      "reason": "A zero total breaks a Section 10.1.5 invariant, so the final ParityMap does not validate. The directory is then not a Recoverer input, and with the sidecar's primary and footer corrupted (the case's precondition) no header/index copy can be validated, so the epoch is metadata-unavailable. The ParityMap's own failure is the decoder's outcome, which the case's decoder observations keep ({DirectoryInvalid, ParityMapParse}); it is not the Recoverer's.",
+      "sentences": [
+        "Section 13.1: \"The sidecar epoch directory of the tape's final ParityMap is also an input whenever that ParityMap validates and is marked `is_final_directory`.\"",
+        "Section 13.3: \"Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5).\""
+      ],
+      "match": {
+        "variant": "c-total-zero",
+        "observation": "recovery"
+      }
+    }
+  ]
+}

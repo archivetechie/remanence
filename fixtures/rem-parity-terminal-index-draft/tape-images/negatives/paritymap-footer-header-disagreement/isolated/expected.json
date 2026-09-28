@@ -1,0 +1,34 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "footer (block 2)",
+    "tape_file": 3
+  },
+  "every_other_rule_holds": "Both headers equal the payload, so the header side of the rule holds. The copies agree. The locator arithmetic is unchanged in all three blocks (M = 1, total 3, starts 0/1/2, measured 3). payload_sha256 matches, the CRCs verify, and the scope fields and is_final_directory match. The header/footer disagreement on sequence is the same inequality, because the headers must equal the payload. The 'reject disagreement' sentence of Section 10.1.4 names the locator arithmetic, which sequence is not part of.",
+  "expected": {
+    "error": "ParityMapParse"
+  },
+  "group": "7b",
+  "id": "paritymap-footer-header-disagreement/isolated",
+  "integrity_repair": [
+    "R-PM-FOOTER"
+  ],
+  "mutation": {
+    "field": "sequence u64",
+    "from": 0,
+    "offset": "0x20",
+    "to": 1
+  },
+  "note": "Parent variant b (footer payload_len L+1) breaks nothing else either, but whether a payload_len difference that leaves M unchanged counts as 'disagreement between header, footer' is unstated, so variant a is the isolated form.",
+  "parent": "paritymap-footer-header-disagreement (variant a)",
+  "pinned": true,
+  "quotes": [
+    "The decoded payload MUST match the header/footer locator fields (UUID, sequence, digest, scope, and `is_final_directory`)"
+  ],
+  "sections": [
+    "10.1.4",
+    "15"
+  ],
+  "target": "ParityMap payload-to-locator match (Section 10.1.4)",
+  "violates_only": "Section 10.1.4 'The decoded payload MUST match the header/footer locator fields (UUID, sequence, ...)': payload key 3 = 0 while the footer's sequence = 1"
+}

@@ -1,0 +1,41 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 5,
+    "copy": "tail (primary and footer untouched)",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "tail vs footer 0x60 hash comparison (Section 13.3 step 1): the footer still carries the primary's hash, so on the Recoverer's footer-first route the tail is simply invalid against the locator"
+  ],
+  "defined": true,
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-primary-tail-disagreement",
+  "integrity_repair": [
+    "R-SC-HASHED applied to the tail copy (canonical_metadata_hash 0x98, header_crc64 0xC0, block0_crc64 B-8)"
+  ],
+  "mutation": {
+    "change": "XOR 0x01 into byte 0x108",
+    "effect": "each copy on its own satisfies Sections 9.2-9.5 (the tail's hash is recomputed over its own entries); the copies differ in index content and in canonical_metadata_hash",
+    "field": "data_shard_crc64 of data-CRC entry 0 (ordinal 0) in the tail copy",
+    "offset": "0x108"
+  },
+  "pin_note": "Pinned for the per-sidecar validation outcome (a Section 9 violation, SidecarParse). The Recoverer's tape-level consequence is not decided; see NOTES.md.",
+  "pinned": true,
+  "quotes": [
+    "The tail copy MUST carry metadata and index content identical to the primary; only `copy_kind` and the recomputed CRCs differ. When both copies parse, a Reader MUST verify that they agree and reject divergence."
+  ],
+  "sections": [
+    "9.1",
+    "9.5",
+    "13.3",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Unpinned. Verifier: reports the divergence (SidecarParse). Recoverer: step 1 verifies both copies against the footer; only the primary matches the footer's hash, so the primary is 'valid' and used, and epoch 0 appears usable; but Section 9.1 also says to 'reject divergence' when both copies parse, which could instead make the epoch's metadata unusable (SidecarMetadataUnavailable{0}). The text does not say which copy, if any, survives a divergence.",
+  "target": "primary/tail agreement check (Section 9.1), as run by a Verifier reading both copies",
+  "why_defined": "Section 9.1 writes the contract down: the tail copy MUST be identical to the primary except copy_kind and CRCs, and when both copies parse a Reader MUST verify agreement and reject divergence."
+}

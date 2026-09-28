@@ -1,0 +1,52 @@
+{
+  "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer",
+    "location": "five tuples at 0x148; expected EOD at 0x0A0"
+  },
+  "concurrent_checks": [
+    "device measurements (A is really at LBA 2)",
+    "footer observations vs plan"
+  ],
+  "evaluation": "EOD = (2^64 - 4) + 3 + 1 = 2^64 overflows u64; only the EOD formula overflows.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "formula": "EOD = start(C) + record_count(C) + 1",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-8.3-eod",
+  "integrity_repair": [
+    "R-TR-COMMON (layout digest, descriptor digests, header CRC, footer 0x2B8, footer CRC)"
+  ],
+  "mutation": [
+    {
+      "name": "planned_start_lba of the five tuples",
+      "position": "0x158, 0x178, 0x198, 0x1B8, 0x1D8",
+      "value": "2^64-20, 2^64-16, 2^64-12, 2^64-8, 2^64-4 (each advances by 3 + 1, so the start rule holds)"
+    },
+    {
+      "name": "planned terminal EOD LBA",
+      "position": "0x0A0",
+      "value": "0"
+    },
+    {
+      "name": "local planned start LBA",
+      "position": "0x090",
+      "value": "2^64 - 20"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "EOD is the start of C plus C's record count plus one filemark."
+  ],
+  "sections": [
+    "8.3",
+    "10.6",
+    "2.4"
+  ],
+  "shadowed": false,
+  "target": "planned-layout validation (Section 8.3) within replica local eligibility (Section 10.6)",
+  "type": "u64"
+}

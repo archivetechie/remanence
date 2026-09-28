@@ -1,0 +1,46 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "sidecar-primary-tail-disagreement",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 264,
+      "new_bytes": "69",
+      "old_bytes": "68",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 152,
+      "new_bytes": "e1b76f83a49ca3452a73226a41245225bb1dab638938561f68acd04160663043",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 192,
+      "new_bytes": "7a15e81d15c039c5",
+      "old_bytes": "358cbf1ac8453e6e",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 262136,
+      "new_bytes": "01945ae6ede82cc4",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_tape_file (copy agreement after footer validation)"
+  ],
+  "target_role": "SidecarAgreement"
+}

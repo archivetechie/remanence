@@ -1,0 +1,43 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "bootstrap",
+    "tape_file": 0
+  },
+  "evaluation": "Sidecar header route: S u32 × m u16 < 2^48, so it cannot overflow u64 and needs no vector. Bootstrap route: 2^63 × 2 = 2^64 overflows.",
+  "expected": {
+    "error": "BootstrapParse"
+  },
+  "formula": "P = S × m",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-9.1-P",
+  "integrity_repair": [
+    "as overflow-6.6-scheme-product"
+  ],
+  "mutation": [
+    {
+      "name": "S",
+      "position": "bootstrap key 1 key 4",
+      "value": "2^63"
+    },
+    {
+      "name": "m",
+      "position": "bootstrap key 1 key 3",
+      "value": "2 (unchanged)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "`P = S × m` is the parity shard block count"
+  ],
+  "sections": [
+    "9.1",
+    "6.6",
+    "8.2"
+  ],
+  "shadowed": "By the Section 6.6 validity check (S × (k + m) ≤ 2^32 − 1), which Section 8.2 requires of the bootstrap; either way the bootstrap is rejected.",
+  "target": "a Reader deriving P from the bootstrap's scheme record (Section 9.1) before or during Section 6.6 validation",
+  "type": "u64"
+}

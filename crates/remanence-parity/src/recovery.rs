@@ -69,7 +69,7 @@ struct RequestedDataShard {
 
 #[derive(Clone, Debug, Default)]
 struct EpochRegionRequest {
-    stripes: BTreeMap<u32, Vec<RequestedDataShard>>,
+    ordinals: Vec<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -156,24 +156,12 @@ pub fn recover_object_region_from_sidecar(
             ordinal,
         )?;
         let sidecar_entry = find_sidecar_covering_ordinal(scoped_map, ordinal)?;
-        let stripe = stripe_for_sidecar_ordinal(sidecar_entry, ordinal, scheme)?;
-        let StripePosition::Data { index } = stripe.position else {
-            return Err(ParityError::Invariant(
-                "ordinal_to_stripe returned a parity address",
-            ));
-        };
-        let requested = RequestedDataShard {
-            body_lba,
-            ordinal,
-            data_index: index,
-        };
+        let epoch_id = sidecar_range(sidecar_entry)?.2;
         epochs
-            .entry(stripe.neighborhood)
+            .entry(epoch_id)
             .or_default()
-            .stripes
-            .entry(stripe.stripe_index)
-            .or_default()
-            .push(requested);
+            .ordinals
+            .push((body_lba, ordinal));
         output_order.push(body_lba);
         body_lba = body_lba.checked_add(1).ok_or(ParityError::Invariant(
             "bulk recovery request scan overflows",
@@ -300,15 +288,6 @@ fn recover_ordinal_from_sidecar_inside_boundary(
     )?;
 
     let sidecar_entry = find_sidecar_covering_ordinal(scoped_map, failed_ordinal)?;
-    let failed_stripe = stripe_for_sidecar_ordinal(sidecar_entry, failed_ordinal, scheme)?;
-    let failed_data_index = match failed_stripe.position {
-        StripePosition::Data { index } => index as usize,
-        StripePosition::Parity { .. } => {
-            return Err(ParityError::Invariant(
-                "ordinal_to_stripe returned a parity address",
-            ));
-        }
-    };
     let epoch_start = sidecar_range(sidecar_entry)?.0;
     ensure_inside_durable_recovery_boundary(
         scoped_map,
@@ -324,10 +303,18 @@ fn recover_ordinal_from_sidecar_inside_boundary(
         &sidecar.index,
         sidecar_entry,
         scheme,
-        &failed_stripe,
-        epoch_start,
+        sidecar_range(sidecar_entry)?.2,
         block_size,
     )?;
+    let failed_stripe = stripe_for_sidecar_ordinal(sidecar_entry, failed_ordinal, scheme)?;
+    let failed_data_index = match failed_stripe.position {
+        StripePosition::Data { index } => index as usize,
+        StripePosition::Parity { .. } => {
+            return Err(ParityError::Invariant(
+                "ordinal_to_stripe returned a parity address",
+            ));
+        }
+    };
 
     let codec = ReedSolomonCodec::new(scheme)?;
     let k = codec.data_blocks();
@@ -462,24 +449,24 @@ fn recover_epoch_region_from_sidecar(
     )?;
     let sidecar =
         read_and_parse_sidecar_index(source, scoped_map, sidecar_entry, tape_uuid, block_size)?;
-    let representative_stripe = request
-        .stripes
-        .keys()
-        .next()
-        .copied()
-        .ok_or(ParityError::Invariant("bulk recovery epoch has no stripes"))?;
-    validate_sidecar_for_recovery(
-        &sidecar.index,
-        sidecar_entry,
-        scheme,
-        &StripeAddress {
-            neighborhood: epoch_id,
-            stripe_index: representative_stripe,
-            position: StripePosition::Data { index: 0 },
-        },
-        epoch_start,
-        block_size,
-    )?;
+    validate_sidecar_for_recovery(&sidecar.index, sidecar_entry, scheme, epoch_id, block_size)?;
+    let mut stripes: BTreeMap<u32, Vec<RequestedDataShard>> = BTreeMap::new();
+    for (body_lba, ordinal) in request.ordinals {
+        let stripe = stripe_for_sidecar_ordinal(sidecar_entry, ordinal, scheme)?;
+        let StripePosition::Data { index } = stripe.position else {
+            return Err(ParityError::Invariant(
+                "ordinal_to_stripe returned a parity address",
+            ));
+        };
+        stripes
+            .entry(stripe.stripe_index)
+            .or_default()
+            .push(RequestedDataShard {
+                body_lba,
+                ordinal,
+                data_index: index,
+            });
+    }
 
     let window_size = usize::try_from(max_stripes_per_window).map_err(|_| {
         ParityError::Invariant("bulk recovery max_stripes_per_window does not fit usize")
@@ -490,7 +477,7 @@ fn recover_epoch_region_from_sidecar(
         ));
     }
     let codec = ReedSolomonCodec::new(scheme)?;
-    let stripes: Vec<(u32, Vec<RequestedDataShard>)> = request.stripes.into_iter().collect();
+    let stripes: Vec<(u32, Vec<RequestedDataShard>)> = stripes.into_iter().collect();
     for window in stripes.chunks(window_size) {
         let cache = read_bulk_window_peers(
             source,
@@ -585,7 +572,7 @@ fn read_bulk_window_peers(
                 sidecar.header.stripes_per_epoch,
                 sidecar.header.m,
                 sidecar.header.shard_index_block_count,
-            );
+            )?;
             let entry = sidecar
                 .index
                 .parity_entries
@@ -872,15 +859,31 @@ fn sidecar_range(entry: &TapeFileMapEntry) -> Result<(u64, u64, u64), ParityErro
     }
 }
 
+/// Guard the mapping precondition after recovery has acquired and pinned a copy.
+/// Also used for best-effort audit addressing; it never declares metadata unavailable.
 pub(crate) fn stripe_for_sidecar_ordinal(
     entry: &TapeFileMapEntry,
     ordinal: u64,
     scheme: &ParityScheme,
 ) -> Result<StripeAddress, ParityError> {
-    let (start, end, epoch_id) = sidecar_range(entry)?;
+    let (start, end, epoch_id) = match (
+        entry.protected_ordinal_start,
+        entry.protected_ordinal_end_exclusive,
+        entry.epoch_id,
+    ) {
+        (Some(start), Some(end), Some(epoch_id)) => (start, end, epoch_id),
+        _ => sidecar_range(entry)?,
+    };
+    // S is u32 and k is u16, so their product fits in u64.
+    let logical_data_shards =
+        u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.data_blocks_per_stripe);
     let real_data_shard_count = end
         .checked_sub(start)
-        .ok_or(ParityError::Invariant("sidecar protected range underflows"))?;
+        .filter(|count| (1..=logical_data_shards).contains(count))
+        .ok_or_else(|| ParityError::SchemeMismatch {
+            tape: format!("ordinals {start}..{end}"),
+            expected: format!("range length in 1..={logical_data_shards}"),
+        })?;
     ordinal_to_stripe_in_epoch(ordinal, epoch_id, start, real_data_shard_count, scheme)
 }
 
@@ -1323,7 +1326,7 @@ fn read_verified_parity_peer(
         header.stripes_per_epoch,
         header.m,
         header.shard_index_block_count,
-    );
+    )?;
     let position = TapeFilePosition {
         tape_file_number: sidecar_entry.tape_file_number,
         block_within_file,
@@ -1343,20 +1346,13 @@ fn validate_sidecar_for_recovery(
     sidecar: &DecodedSidecarIndex,
     sidecar_entry: &TapeFileMapEntry,
     scheme: &ParityScheme,
-    failed_stripe: &StripeAddress,
-    epoch_start: u64,
+    epoch_id: u64,
     block_size: u32,
 ) -> Result<(), ParityError> {
-    if sidecar.header.epoch_id != failed_stripe.neighborhood {
+    if sidecar.header.epoch_id != epoch_id {
         return Err(ParityError::SidecarParse(format!(
             "sidecar epoch {} does not match failed epoch {}",
-            sidecar.header.epoch_id, failed_stripe.neighborhood
-        )));
-    }
-    if sidecar.header.protected_ordinal_start != epoch_start {
-        return Err(ParityError::SidecarParse(format!(
-            "sidecar starts at ordinal {}, expected epoch start {epoch_start}",
-            sidecar.header.protected_ordinal_start
+            sidecar.header.epoch_id, epoch_id
         )));
     }
     let descriptor_real_data_shards = sidecar
@@ -1774,6 +1770,30 @@ mod tests {
         encode_sidecar_tape_file(&descriptor, &parity_shards, data_crcs).unwrap()
     }
 
+    /// Tape ranges are checked per epoch, including both valid boundary lengths.
+    #[test]
+    fn sidecar_mapping_checks_range_lengths_before_mapping() {
+        let scheme = scheme(2, 1, 2);
+        for (epoch_id, start, end) in [(7, 10, 15), (8, 20, 20), (9, 30, 29)] {
+            let entry = TapeFileMapEntry::parity_sidecar(2, 7, epoch_id, start, end);
+            assert!(matches!(
+                stripe_for_sidecar_ordinal(&entry, start, &scheme),
+                Err(ParityError::SchemeMismatch { .. })
+            ));
+        }
+        for (epoch_id, start, end) in [(10, 40, 41), (11, 41, 45)] {
+            let entry = TapeFileMapEntry::parity_sidecar(3, 7, epoch_id, start, end);
+            for ordinal in start..end {
+                let stripe = stripe_for_sidecar_ordinal(&entry, ordinal, &scheme).unwrap();
+                assert_eq!(stripe.neighborhood, epoch_id);
+                assert_eq!(
+                    stripe_data_to_ordinal_in_epoch(&stripe, start, &scheme).unwrap(),
+                    ordinal
+                );
+            }
+        }
+    }
+
     fn scoped_map(sidecar_blocks: u64, object_blocks: u64) -> ScopedFilemarkMap {
         let map = FilemarkMap::new(vec![
             TapeFileMapEntry::bootstrap(0, 1),
@@ -2129,7 +2149,8 @@ mod tests {
             sidecar.header.stripes_per_epoch,
             sidecar.header.m,
             sidecar.header.shard_index_block_count,
-        );
+        )
+        .unwrap();
         let physical = scoped
             .map
             .physical_position(TapeFilePosition {
@@ -2590,6 +2611,58 @@ mod tests {
                 .expect("a parsing footer that contradicts the map must fall back to the primary");
 
         assert_eq!(recovered.recovered_block, object_blocks[2]);
+    }
+
+    /// A valid copy is pinned before mapping, including map ranges above S*k.
+    /// If neither copy validates, copy acquisition instead reports the epoch unavailable.
+    #[test]
+    fn sidecar_range_disagreement_is_pinned_after_copy_acquisition() {
+        let scheme = scheme(2, 1, 2);
+        let encoded_objects = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_epoch(&scheme, &encoded_objects);
+        for map_count in [3, 5] {
+            let objects: Vec<_> = (1..=map_count).map(|n| block(n as u8)).collect();
+            let scoped = scoped_map(sidecar.blocks.len() as u64, map_count);
+            for valid_copy in [true, false] {
+                let mut blocks = sidecar.blocks.clone();
+                if !valid_copy {
+                    blocks[0][0] ^= 0xff;
+                    blocks[sidecar.header.tail_header_start_block as usize][0] ^= 0xff;
+                }
+                for bulk in [false, true] {
+                    let mut raw = raw_tape(&objects, &blocks);
+                    let error = if bulk {
+                        recover_object_region_from_sidecar(
+                            &mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 1, 0, 1, 1,
+                        )
+                        .unwrap_err()
+                    } else {
+                        recover_ordinal_from_sidecar(
+                            &mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 0,
+                        )
+                        .unwrap_err()
+                    };
+                    assert!(
+                        !raw.read_lbas.is_empty(),
+                        "copy acquisition must precede refusal"
+                    );
+                    if valid_copy {
+                        assert!(
+                            matches!(error, ParityError::SchemeMismatch { .. }),
+                            "{error:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(
+                                error,
+                                ParityError::SidecarMetadataUnavailable { epoch_id: 0 }
+                            ),
+                            "{error:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// REM-PARITY 13.3: an acquired index that disagrees with the bootstrap
@@ -4739,7 +4812,8 @@ mod tests {
                     sidecar.header.stripes_per_epoch,
                     sidecar.header.m,
                     sidecar.header.shard_index_block_count,
-                ),
+                )
+                .unwrap(),
             })
             .unwrap();
         damaged_lbas.push(usize::try_from(parity_position.lba).unwrap());
@@ -6411,14 +6485,16 @@ mod tests {
                 sidecar.header.stripes_per_epoch,
                 sidecar.header.m,
                 sidecar.header.shard_index_block_count,
-            ) as usize;
+            )
+            .unwrap() as usize;
             let stripe_zero_parity_one = parity_block_position(
                 0,
                 1,
                 sidecar.header.stripes_per_epoch,
                 sidecar.header.m,
                 sidecar.header.shard_index_block_count,
-            ) as usize;
+            )
+            .unwrap() as usize;
             assert_eq!(
                 parity_shard_crc64(&sidecar.blocks[stripe_one_parity_zero]),
                 sidecar.index.parity_entries[2].parity_shard_crc64

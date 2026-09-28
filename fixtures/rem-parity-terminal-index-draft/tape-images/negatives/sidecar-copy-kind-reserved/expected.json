@@ -1,0 +1,37 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-copy-kind-reserved",
+  "integrity_repair": [
+    "R-SC-UNHASHED"
+  ],
+  "mutation": {
+    "field": "reserved u16",
+    "from": 0,
+    "le_bytes": "01 00",
+    "offset": "0x92",
+    "to": 1
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x92 | 2 | reserved | MUST be 0 |",
+    "Reserved fields and declared zero-fill MUST be verified zero."
+  ],
+  "sections": [
+    "9.2",
+    "16.2",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header reserved field after copy_kind (Section 9.2)"
+}

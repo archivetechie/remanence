@@ -1,0 +1,8 @@
+{
+  "expected_for_A": "TerminalIndexReplicaParse",
+  "replicas": [
+    "A"
+  ],
+  "tape_level": "A is not locally eligible; B and C validate and agree, so the Scanner accepts the inventory as degraded. A is not 'fully valid', so its different edition digest is not a conflict (Section 8.5)",
+  "variant": "a-replica-A-only"
+}

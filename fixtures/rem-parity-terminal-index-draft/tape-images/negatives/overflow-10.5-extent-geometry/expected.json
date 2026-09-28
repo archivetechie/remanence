@@ -1,0 +1,49 @@
+{
+  "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "gap-ab.bin header and footer"
+  },
+  "concurrent_checks": [
+    "recorded total 3 vs recomputed",
+    "device-measured record count"
+  ],
+  "evaluation": "ceil((2^64 − 1) / 2^18) = 2^46 (the form (E + B − 1)/B overflows first); actual_bytes = 2^46 × 2^18 = 2^64 overflows in either form.",
+  "expected": {
+    "error": "TerminalIndexSeparationParse"
+  },
+  "formula": "total_records = ceil(E / B); actual_bytes = total_records × B",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-10.5-extent-geometry",
+  "integrity_repair": [
+    "R-SEP (nominal_extent_bytes is in the separation descriptor preimage: recompute 0x0B8 in both frames, header CRC, footer 0x180, footer CRC)"
+  ],
+  "mutation": [
+    {
+      "name": "nominal total extent bytes (E)",
+      "position": "separation 0x050 (header and footer)",
+      "value": "2^64 − 1"
+    },
+    {
+      "name": "total record count",
+      "position": "0x058",
+      "value": "3 (left; also mismatches)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "total_records    = ceil(E / B), required ≥ 2",
+    "actual_bytes     = total_records × B",
+    "The frame records `E`, and Readers derive the geometry from the recorded value"
+  ],
+  "sections": [
+    "10.5",
+    "10.6",
+    "2.4"
+  ],
+  "shadowed": false,
+  "tape_level": "Inventory unaffected; a Verifier MUST NOT report the terminal suffix complete.",
+  "target": "separation extent validity (Section 10.6, size formulas read against Section 10.5), as checked by a Verifier",
+  "type": "u64"
+}

@@ -1,0 +1,82 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "sidecar-real-data-shard-count/b-above-logical",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 72,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 88,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 104,
+      "new_bytes": "6800000000000000",
+      "old_bytes": "6000000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "fc3898293ddf1b26",
+      "old_bytes": "0000000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "04ebe30d1d767f108f9c60e8ae25ff1a4b33a77a673c9a7527fd7fdfb9ff6c4b",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "99e6c2c917671cbc",
+      "old_bytes": "5c6785f5e9c5d822",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 262136,
+      "new_bytes": "cf90a57eae2e41b3",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "target_role": "SidecarCopy"
+}

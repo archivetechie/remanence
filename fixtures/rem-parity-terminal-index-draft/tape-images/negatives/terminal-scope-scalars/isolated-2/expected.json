@@ -1,0 +1,33 @@
+{
+  "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer"
+  },
+  "caveat": "Section 15 gives this failure no name of its own; see NOTES.md gap 15 (FilemarkMapDigestMismatch reading).",
+  "every_other_rule_holds": "There are no sidecar rows, so the W = T rule of Section 10.6 does not apply. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7b",
+  "id": "terminal-scope-scalars/isolated-2",
+  "integrity_repair": [
+    "R-TR-COMMON"
+  ],
+  "mutation": {
+    "field": "total data ordinals",
+    "from": 0,
+    "offset": "0x050",
+    "to": 1
+  },
+  "parent": "terminal-scope-scalars (variant d)",
+  "pinned": true,
+  "quotes": [
+    "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars."
+  ],
+  "sections": [
+    "7.4",
+    "10.6"
+  ],
+  "target": "the Section 7.4 T cross-check",
+  "violates_only": "Section 7.4 'cross-check all three scalars': T recomputed over the prefix is 0 (no Object rows), but 1 is recorded"
+}

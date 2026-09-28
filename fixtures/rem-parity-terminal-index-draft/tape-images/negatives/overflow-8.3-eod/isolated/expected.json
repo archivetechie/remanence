@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "planned-layout validation of Section 8.3"
+  },
+  "every_other_rule_holds": "Every start advance holds (the starts step by 4 and none overflows), and the order, ordinals, filemark counts, dense files and equal counts hold. Image level is impossible: EOD is the position after C's trailing filemark, and if it overflows that position is unrepresentable, so the trailing-filemark and EOD measurements (Sections 10.6, 12.6) cannot agree with any device report.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-8.3-eod/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "the five tuples with starts 2^64−20, 2^64−16, 2^64−12, 2^64−8, 2^64−4 and counts 3 (files 1..5), expected_eod_lba any"
+  },
+  "parent": "overflow-8.3-eod",
+  "pinned": true,
+  "quotes": [
+    "EOD is the start of C plus C's record count plus one filemark."
+  ],
+  "sections": [
+    "8.3",
+    "10.6"
+  ],
+  "target": "EOD = start(C) + count(C) + 1",
+  "violates_only": "Checked evaluation of (2^64 − 4) + 3 + 1"
+}

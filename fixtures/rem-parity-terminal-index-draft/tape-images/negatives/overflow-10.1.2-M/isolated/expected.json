@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "ParityMap locator validation (Section 10.1.4)"
+  },
+  "every_other_rule_holds": "Image level is impossible: a payload_len that makes 0xC8 + L overflow exceeds any readable payload, so the payload hash (Section 10.1.4) and the measured tape file length cannot agree with it.",
+  "expected": {
+    "error": "ParityMapParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.1.2-M/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "L = 2^64 − 1, B = 262144"
+  },
+  "parent": "overflow-10.1.2-M (added: a hostile payload_len also contradicts the payload bytes and the measured file length)",
+  "pinned": true,
+  "quotes": [
+    "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy"
+  ],
+  "sections": [
+    "10.1.2",
+    "10.1.4"
+  ],
+  "target": "M = ceil((0xC8 + L) / B)",
+  "violates_only": "Checked evaluation of 0xC8 + (2^64 − 1)"
+}

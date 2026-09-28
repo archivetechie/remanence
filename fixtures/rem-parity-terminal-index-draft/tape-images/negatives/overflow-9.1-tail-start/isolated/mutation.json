@@ -1,0 +1,51 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "authored_mutation": {
+    "field": "footer P u64",
+    "from": 4,
+    "offset": "0x40",
+    "to": "0xFFFFFFFFFFFFFFFF"
+  },
+  "case": "overflow-9.1-tail-start/isolated",
+  "commit_record_inputs": null,
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 64,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 128,
+      "new_bytes": "6c2f85bfaae10db8",
+      "old_bytes": "d8ed158e3575f1a0",
+      "repair": "R-SC-FOOTER footer_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_footer_block",
+    "recover_ordinal_from_sidecar (both header blocks unreadable)",
+    "parse_sidecar_footer_block"
+  ],
+  "faults": [
+    {
+      "block": 0,
+      "byte_changes": false,
+      "kind": "medium error",
+      "tape_file": 2
+    },
+    {
+      "block": 5,
+      "byte_changes": false,
+      "kind": "medium error",
+      "tape_file": 2
+    }
+  ],
+  "unit_inputs": null
+}

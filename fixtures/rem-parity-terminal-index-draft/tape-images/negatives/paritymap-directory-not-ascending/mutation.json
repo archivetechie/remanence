@@ -1,0 +1,83 @@
+{
+  "artifact": "tape-image two-epoch",
+  "case": "paritymap-directory-not-ascending",
+  "edits": [
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 200,
+      "new_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501050208030804f50582a90103020103040408050706010704085820c883b7d7577ddb8843a5e4051b3ec7e51261b48a38c6a9270490899a7d696ca60906a9010202000300040405070601070408582010b29de5f8fadb57ba39a437c1e7d506c85c8f2f4b0a7a5d503b21e2068898ce090605582013ee95cb4ba3d6a396ce8fcec6150565b55cd663c6fe80f6c1b94ca4904f24c806782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "old_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501050208030804f50582a9010202000300040405070601070408582010b29de5f8fadb57ba39a437c1e7d506c85c8f2f4b0a7a5d503b21e2068898ce0906a90103020103040408050706010704085820c883b7d7577ddb8843a5e4051b3ec7e51261b48a38c6a9270490899a7d696ca6090605582013ee95cb4ba3d6a396ce8fcec6150565b55cd663c6fe80f6c1b94ca4904f24c806782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "repair": "mutation: swap complete CBOR directory entries",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 1,
+      "byte_offset": 200,
+      "new_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501050208030804f50582a90103020103040408050706010704085820c883b7d7577ddb8843a5e4051b3ec7e51261b48a38c6a9270490899a7d696ca60906a9010202000300040405070601070408582010b29de5f8fadb57ba39a437c1e7d506c85c8f2f4b0a7a5d503b21e2068898ce090605582013ee95cb4ba3d6a396ce8fcec6150565b55cd663c6fe80f6c1b94ca4904f24c806782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "old_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501050208030804f50582a9010202000300040405070601070408582010b29de5f8fadb57ba39a437c1e7d506c85c8f2f4b0a7a5d503b21e2068898ce0906a90103020103040408050706010704085820c883b7d7577ddb8843a5e4051b3ec7e51261b48a38c6a9270490899a7d696ca6090605582013ee95cb4ba3d6a396ce8fcec6150565b55cd663c6fe80f6c1b94ca4904f24c806782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "repair": "mutation: swap complete CBOR directory entries",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "16cce46b7efb9dacfa821f00474838af43f53b6431c0e1ac1172868e7dd9a698",
+      "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+      "repair": "R-PM-PAYLOAD payload_sha256",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "a6e8f8ec76adc6f8",
+      "old_bytes": "30274b7578ea464c",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 1,
+      "byte_offset": 56,
+      "new_bytes": "16cce46b7efb9dacfa821f00474838af43f53b6431c0e1ac1172868e7dd9a698",
+      "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+      "repair": "R-PM-PAYLOAD payload_sha256",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 1,
+      "byte_offset": 192,
+      "new_bytes": "c9a7adb694b323cd",
+      "old_bytes": "5f681e2f9af4a379",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 2,
+      "byte_offset": 56,
+      "new_bytes": "16cce46b7efb9dacfa821f00474838af43f53b6431c0e1ac1172868e7dd9a698",
+      "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+      "repair": "R-PM-PAYLOAD payload_sha256",
+      "tape_file": 4
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 2,
+      "byte_offset": 192,
+      "new_bytes": "832d3425d7589aeb",
+      "old_bytes": "15e287bcd91f1a5f",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 4
+    }
+  ],
+  "entry_points": [
+    "parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor",
+    "decode_sidecar_epoch_directory_cbor (each copy's payload key 4)"
+  ],
+  "target_role": "ParityMap"
+}

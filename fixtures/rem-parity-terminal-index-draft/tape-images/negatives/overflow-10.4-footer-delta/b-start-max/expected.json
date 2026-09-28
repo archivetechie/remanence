@@ -1,0 +1,7 @@
+{
+  "other": "0x2E8 = 3, 0x2F8 = 2 unchanged",
+  "overflow": "(2^64 − 1) + 2 overflows",
+  "position": "replica footer 0x2E0",
+  "value": "2^64 − 1",
+  "variant": "b-start-max"
+}

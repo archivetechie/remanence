@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "L = 2^64 − 1, B = 262144"
+  },
+  "case": "overflow-10.1.2-M/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "replicated_control::checked_replicated_control_layout (ParityMap error boundary)"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "L = 2^64 − 1, B = 262144"
+  }
+}

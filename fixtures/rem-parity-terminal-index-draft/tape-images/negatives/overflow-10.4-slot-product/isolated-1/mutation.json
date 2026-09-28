@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "structural_row_count = 2^58, object_row_count = 0"
+  },
+  "case": "overflow-10.4-slot-product/isolated-1",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "checked_tape_index_payload_len"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "structural_row_count = 2^58, object_row_count = 0"
+  }
+}

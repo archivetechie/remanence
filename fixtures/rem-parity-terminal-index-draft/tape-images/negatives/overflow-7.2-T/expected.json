@@ -1,0 +1,47 @@
+{
+  "base": {
+    "artifact": "terminal profile multi-256k",
+    "component": "replica-a.bin",
+    "location": "structural slot 3 (tape file 3, Object, first ordinal 2) at payload offset 192; Object-row slot 1 at payload offset 640"
+  },
+  "evaluation": "2 + (2^64 - 2) = 2^64 overflows u64.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "formula": "T = max(first_parity_data_ordinal + block_count) over Object entries",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-7.2-T",
+  "integrity_repair": [
+    "R-TR-PAYLOAD (both slots; canonical-map SHA-256 recomputed because a structural slot changed)"
+  ],
+  "mutation": [
+    {
+      "name": "block_count(3)",
+      "position": "structural slot 3 element 2",
+      "value": "2^64 - 2"
+    },
+    {
+      "name": "stored_block_count",
+      "position": "Object-row slot 1 key 3",
+      "value": "2^64 - 2 (keeps the bijection)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "T = max(first_parity_data_ordinal + block_count) over object entries    (0 if none)",
+    "Arithmetic on these fields is checked in `u64` (Section 2.4)."
+  ],
+  "sections": [
+    "7.2",
+    "7.4",
+    "8.3",
+    "10.6",
+    "2.4"
+  ],
+  "shadowed": false,
+  "tape_level": "A invalid; B and C accepted, degraded.",
+  "target": "replica scope validation (Sections 7.4, 10.6)",
+  "type": "u64"
+}

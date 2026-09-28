@@ -1,0 +1,48 @@
+{
+  "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer",
+    "location": "tuple (4,1) at 0x148; its planned_start_lba at 0x148 + 0x10 = 0x158; local planned start LBA at 0x090"
+  },
+  "concurrent_checks": [
+    "device measurement of A's start (Section 10.6)",
+    "footer observed start LBA 0x2E0 (= 2) must equal the plan"
+  ],
+  "evaluation": "(2^64 - 2) + 3 + 1 overflows before it can be compared with (5,1)'s start of 6.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "formula": "start(next component) = start + record_count + 1",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-8.3-component-starts",
+  "integrity_repair": [
+    "R-TR-COMMON: terminal-layout digest (0x108), descriptor digest (0x128) in both frames, header CRC, footer 0x2B8, footer CRC"
+  ],
+  "mutation": [
+    {
+      "name": "planned_start_lba of (4,1)",
+      "position": "0x158 (and 0x090, the local copy, to keep them equal)",
+      "value": "2^64 - 2"
+    },
+    {
+      "name": "record_count of (4,1)",
+      "position": "0x148 + 0x18",
+      "value": "3 (unchanged)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "Logical start positions advance by `record_count + 1`, where the `1` is the actual trailing filemark.",
+    "The planned layout of the terminal suffix validates against Section 8.3, and its layout digest recomputes to the recorded value."
+  ],
+  "sections": [
+    "8.3",
+    "10.6",
+    "2.4"
+  ],
+  "shadowed": false,
+  "target": "planned-layout validation (Section 8.3) within replica local eligibility (Section 10.6)",
+  "type": "u64"
+}

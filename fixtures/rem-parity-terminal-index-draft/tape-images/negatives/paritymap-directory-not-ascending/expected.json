@@ -1,0 +1,45 @@
+{
+  "base": {
+    "artifact": "tape-image two-epoch",
+    "copy": "both (primary block 0 and tail block 1 carry identical payloads)",
+    "note": "ParityMap M = 1, total 3. Directory {1: 5, 2: 8, 3: 8, 4: true, 5: [e0, e1]}, e0 names tape file 2 (epoch 0, [0,4)), e1 names tape file 3 (epoch 1, [4,8)); both entries have H = 1, P = 4, total 7",
+    "tape_file": 4
+  },
+  "concurrent_checks": [
+    "partition invariant if evaluated in array order (first protected_ordinal_start is 4, not 0)",
+    "epoch ids 'consecutive starting from 0' if read in array order"
+  ],
+  "expected": {
+    "one_of": [
+      "DirectoryInvalid",
+      "ParityMapParse"
+    ],
+    "permitting_text": "Section 15: 'The name is normative as a category: this document does not specify which of the two a Reader reports once it has failed both ParityMap copies.' Both copies carry the violation, so a Reader that tries both has failed both."
+  },
+  "group": "7b",
+  "id": "paritymap-directory-not-ascending",
+  "integrity_repair": [
+    "R-PM-PAYLOAD (payload_sha256 in primary header, tail header and footer; CRC at 0xC0 of all three blocks)"
+  ],
+  "mutation": {
+    "field": "payload key 4 (SidecarEpochDirectory) key 5 (entries array)",
+    "from": "[e0, e1]",
+    "note": "the two entry maps have equal encoded length, so payload_len and M are unchanged",
+    "offset": "CBOR inside the payload at 0xC8 of each copy",
+    "to": "[e1, e0]"
+  },
+  "pin_note": "The text pins the two-name set, not one name. A Reader that stops at the first copy reports DirectoryInvalid.",
+  "pinned": true,
+  "quotes": [
+    "entries strictly ascending by `tape_file_number`, each `< scope_tape_file_count`;",
+    "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15)."
+  ],
+  "sections": [
+    "10.1.5",
+    "15",
+    "13.1"
+  ],
+  "shadowed": false,
+  "tape_level": "Inventory is unaffected: the ParityMap is 'not terminal inventory authority' and the replicas bind only its structural row. The Recoverer loses the directory (no Section 13.3 step-3 rescue); footer and primary routes still work.",
+  "target": "the SidecarEpochDirectory decoder invariants (Section 10.1.5), run whenever a Reader decodes the directory: the Recoverer's Section 13.1 input, the Scanner's second pass (Section 12.3), a Verifier"
+}

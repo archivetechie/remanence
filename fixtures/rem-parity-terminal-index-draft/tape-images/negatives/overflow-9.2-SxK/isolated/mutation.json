@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "S = 2^63, k = 2"
+  },
+  "case": "overflow-9.2-SxK/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "sidecar::checked_sidecar_shard_product"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "S = 2^63, k = 2"
+  }
+}

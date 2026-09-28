@@ -458,25 +458,26 @@ pub fn data_shard_crc64(block: &[u8]) -> u64 {
 ///
 /// Sidecar index entries remain stripe-major, but physical parity blocks are
 /// parity-index-major. `stripes_per_epoch` is the constant scheme `S` recorded
-/// in the sidecar header, including for short epochs.
+/// in the sidecar header, including for short epochs. Invalid tape geometry or
+/// an overflowing position is rejected as `SidecarParse`.
 pub fn parity_block_position(
     stripe_index: u32,
     parity_index: u16,
     stripes_per_epoch: u32,
     parity_blocks_per_stripe: u16,
     shard_index_block_count: u64,
-) -> u64 {
-    assert!(
-        stripe_index < stripes_per_epoch,
-        "parity stripe index must be below scheme S"
-    );
-    assert!(
-        parity_index < parity_blocks_per_stripe,
-        "parity index must be below scheme m"
-    );
-    shard_index_block_count
-        + u64::from(parity_index) * u64::from(stripes_per_epoch)
-        + u64::from(stripe_index)
+) -> Result<u64, ParityError> {
+    if stripe_index >= stripes_per_epoch {
+        return Err(sidecar_parse("parity stripe index must be below scheme S"));
+    }
+    if parity_index >= parity_blocks_per_stripe {
+        return Err(sidecar_parse("parity index must be below scheme m"));
+    }
+    u64::from(parity_index)
+        .checked_mul(u64::from(stripes_per_epoch))
+        .and_then(|offset| shard_index_block_count.checked_add(offset))
+        .and_then(|position| position.checked_add(u64::from(stripe_index)))
+        .ok_or_else(|| sidecar_parse("sidecar parity block position overflows u64"))
 }
 
 /// Encode sidecar header/index blocks from a descriptor and index entries.
@@ -581,7 +582,7 @@ pub fn encode_sidecar_tape_file<B: AsRef<[u8]>>(
                 descriptor.stripes_per_epoch,
                 descriptor.m,
                 encoded_index.header.shard_index_block_count,
-            );
+            )?;
             if block_position != blocks.len() as u64 {
                 return Err(sidecar_parse(
                     "sidecar parity locator disagrees with physical emission order",
@@ -1043,7 +1044,7 @@ pub fn parse_sidecar_tape_file<B: AsRef<[u8]>>(
             decoded.header.stripes_per_epoch,
             decoded.header.m,
             decoded.header.shard_index_block_count,
-        ))
+        )?)
         .map_err(|_| sidecar_parse("sidecar parity block position overflows usize"))?;
         let shard = blocks[block_index].as_ref();
         if shard.len() != block_size {
@@ -1081,7 +1082,7 @@ fn validate_descriptor(descriptor: &SidecarDescriptor) -> Result<usize, ParityEr
             "sidecar block_size smaller than header plus trailing CRC",
         ));
     }
-    validate_header_counts(HeaderCounts {
+    validate_shard_counts(HeaderCounts {
         k: descriptor.k,
         m: descriptor.m,
         stripes_per_epoch: descriptor.stripes_per_epoch,
@@ -1112,7 +1113,22 @@ fn validate_descriptor(descriptor: &SidecarDescriptor) -> Result<usize, ParityEr
     Ok(block_size)
 }
 
+// Reader validation always includes layout, even for a hostile zero total.
 fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
+    validate_shard_counts(counts)?;
+    validate_sidecar_layout(
+        counts.shard_index_block_count,
+        counts.parity_block_count,
+        counts.sidecar_total_block_count,
+        counts.primary_header_start_block,
+        counts.tail_header_start_block,
+        counts.footer_block_index,
+    )
+}
+
+// Writer descriptors have no encoded layout yet. Only their shard geometry
+// is validated here; build_header computes the nonzero on-tape layout.
+fn validate_shard_counts(counts: HeaderCounts) -> Result<(), ParityError> {
     let HeaderCounts {
         k,
         m,
@@ -1123,12 +1139,8 @@ fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
         real_data_shard_count,
         parity_block_count,
         data_crc_count,
-        shard_index_block_count,
-        sidecar_total_block_count,
-        primary_header_start_block,
-        tail_header_start_block,
-        footer_block_index,
         copy_generation,
+        ..
     } = counts;
     if k == 0 || m == 0 || stripes_per_epoch == 0 {
         return Err(sidecar_parse("sidecar k, m, and S must all be non-zero"));
@@ -1139,7 +1151,8 @@ fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
     if range_len == 0 {
         return Err(sidecar_parse("sidecar protects zero real ordinals"));
     }
-    let expected_logical = stripes_per_epoch as u64 * k as u64;
+    let expected_logical =
+        checked_sidecar_shard_product(u64::from(stripes_per_epoch), u64::from(k))?;
     if logical_shard_count != expected_logical {
         return Err(sidecar_parse(format!(
             "sidecar logical_shard_count {logical_shard_count} != S*k {expected_logical}"
@@ -1156,9 +1169,11 @@ fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
         ));
     }
     let expected_parity = u64::from(
-        stripes_per_epoch
-            .checked_mul(m as u32)
-            .ok_or_else(|| sidecar_parse("sidecar parity block count overflows u32"))?,
+        u32::try_from(checked_sidecar_shard_product(
+            u64::from(stripes_per_epoch),
+            u64::from(m),
+        )?)
+        .map_err(|_| sidecar_parse("sidecar parity block count overflows u32"))?,
     );
     if parity_block_count != expected_parity {
         return Err(sidecar_parse(format!(
@@ -1175,16 +1190,6 @@ fn validate_header_counts(counts: HeaderCounts) -> Result<(), ParityError> {
         return Err(sidecar_parse(format!(
             "unsupported sidecar copy_generation: {copy_generation}"
         )));
-    }
-    if sidecar_total_block_count != 0 {
-        validate_sidecar_layout(
-            shard_index_block_count,
-            parity_block_count,
-            sidecar_total_block_count,
-            primary_header_start_block,
-            tail_header_start_block,
-            footer_block_index,
-        )?;
     }
     Ok(())
 }
@@ -1221,9 +1226,7 @@ fn validate_sidecar_layout(
             "sidecar footer_block_index {footer_block_index} != expected {expected_footer}"
         )));
     }
-    let expected_total = expected_footer
-        .checked_add(1)
-        .ok_or_else(|| sidecar_parse("sidecar total block count overflows"))?;
+    let expected_total = checked_sidecar_total_blocks(shard_index_block_count, parity_block_count)?;
     if sidecar_total_block_count != expected_total {
         return Err(sidecar_parse(format!(
             "sidecar_total_block_count {sidecar_total_block_count} != expected {expected_total}"
@@ -1314,9 +1317,8 @@ fn compute_canonical_metadata_hash(
     let footer_block_index = tail_header_start_block
         .checked_add(shard_index_block_count)
         .ok_or_else(|| sidecar_parse("sidecar footer block index overflows"))?;
-    let sidecar_total_block_count = footer_block_index
-        .checked_add(1)
-        .ok_or_else(|| sidecar_parse("sidecar total block count overflows"))?;
+    let sidecar_total_block_count =
+        checked_sidecar_total_blocks(shard_index_block_count, parity_block_count)?;
 
     let mut hash = Sha256::new();
     hash.update(SIDECAR_METADATA_HASH_DOMAIN);
@@ -1475,9 +1477,8 @@ fn build_header(
     let footer_block_index = tail_header_start_block
         .checked_add(shard_index_block_count)
         .ok_or_else(|| sidecar_parse("sidecar footer block index overflows"))?;
-    let sidecar_total_block_count = footer_block_index
-        .checked_add(1)
-        .ok_or_else(|| sidecar_parse("sidecar total block count overflows"))?;
+    let sidecar_total_block_count =
+        checked_sidecar_total_blocks(shard_index_block_count, parity_block_count)?;
     Ok(SidecarHeader {
         magic: derive_sidecar_magic(&descriptor.tape_uuid),
         tape_uuid: descriptor.tape_uuid,
@@ -1763,6 +1764,20 @@ fn sidecar_parse(message: impl Into<String>) -> ParityError {
     ParityError::SidecarParse(message.into())
 }
 
+/// Evaluate total = H + P + H + 1 without a representability assumption.
+pub fn checked_sidecar_total_blocks(h: u64, p: u64) -> Result<u64, ParityError> {
+    h.checked_add(p)
+        .and_then(|v| v.checked_add(h))
+        .and_then(|v| v.checked_add(1))
+        .ok_or_else(|| sidecar_parse("sidecar total block count overflows"))
+}
+/// Evaluate a scheme's stripe count times its shard count before narrowing.
+pub fn checked_sidecar_shard_product(stripes: u64, shards: u64) -> Result<u64, ParityError> {
+    stripes
+        .checked_mul(shards)
+        .ok_or_else(|| sidecar_parse("sidecar shard product overflows"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1846,6 +1861,29 @@ mod tests {
             layout.inline_entry_bytes,
             256 * 1024 - 8 - SIDECAR_HEADER_LEN as u64
         );
+    }
+
+    /// Tape geometry rejects invalid indices and both additions' overflow.
+    #[test]
+    fn parity_locator_checks_bounds_and_overflow() {
+        for (stripe, parity, stripes, shards, h) in [
+            (0, 0, 0, 1, 1),
+            (1, 0, 1, 1, 1),
+            (0, 0, 1, 0, 1),
+            (0, 1, 1, 1, 1),
+            (0, 1, 2, 2, u64::MAX),
+            (1, 0, 2, 2, u64::MAX),
+        ] {
+            assert!(matches!(
+                parity_block_position(stripe, parity, stripes, shards, h),
+                Err(ParityError::SidecarParse(_))
+            ));
+        }
+        assert_eq!(
+            parity_block_position(1, 1, 2, 2, u64::MAX - 3).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(parity_block_position(1, 1, 2, 2, 7).unwrap(), 10);
     }
 
     fn sample_uuid() -> [u8; 16] {
@@ -2034,14 +2072,16 @@ mod tests {
             desc.stripes_per_epoch,
             desc.m,
             encoded.header.shard_index_block_count,
-        ) as usize;
+        )
+        .unwrap() as usize;
         let stripe_zero_parity_one = parity_block_position(
             0,
             1,
             desc.stripes_per_epoch,
             desc.m,
             encoded.header.shard_index_block_count,
-        ) as usize;
+        )
+        .unwrap() as usize;
         assert_eq!(encoded.blocks[stripe_one_parity_zero], parity_shards[2]);
         assert_eq!(encoded.blocks[stripe_zero_parity_one], parity_shards[1]);
         assert_eq!(
@@ -2572,7 +2612,8 @@ mod tests {
             desc.stripes_per_epoch,
             desc.m,
             encoded.header.shard_index_block_count,
-        ) as usize;
+        )
+        .unwrap() as usize;
         encoded.blocks[first_parity_block][0] ^= 0x01;
 
         let err = parse_sidecar_tape_file(&encoded.blocks, &desc.tape_uuid).unwrap_err();

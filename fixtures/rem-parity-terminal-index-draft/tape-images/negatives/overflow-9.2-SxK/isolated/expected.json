@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "a Reader computing S × k from a scheme record (the Section 13.3 pin, the Section 14 bound)"
+  },
+  "every_other_rule_holds": "Image level is impossible: from a sidecar header S × k < 2^48, and from a bootstrap any S with S × k ≥ 2^64 breaks the Section 6.6 bound S × (k + m) ≤ 2^32 − 1 in the same bytes.",
+  "expected": {
+    "outcome": "rejection; no Section 15 name"
+  },
+  "group": "7c",
+  "id": "overflow-9.2-SxK/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "S = 2^63, k = 2"
+  },
+  "parent": "overflow-9.2-SxK",
+  "pin_reason": "Unit level only.",
+  "pinned": false,
+  "quotes": [
+    "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"
+  ],
+  "sections": [
+    "9.2",
+    "6.6",
+    "14"
+  ],
+  "target": "S × k",
+  "violates_only": "Checked evaluation of 2^63 × 2"
+}

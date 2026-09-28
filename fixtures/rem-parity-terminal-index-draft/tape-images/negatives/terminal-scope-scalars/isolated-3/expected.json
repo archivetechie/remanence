@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "new terminal profile 'multi-unprotected-256k', rebuilt from multi-256k's inputs without the second sidecar",
+    "prefix": "rows: 0 Bootstrap (1 blk); 1 Object (2 blk, first 0); 2 ParitySidecar (5 blk, epoch 0, [0,2)); 3 Object (3 blk, first 2); 4 ParityMap (3 blk). Object rows as multi-256k. covered = rows = 5; A at tape file 5, planned start LBA 2+3+6+4+4 = 19; EOD 39; payload_len 64*5 + 256*2 = 832."
+  },
+  "every_other_rule_holds": "T = 5 and W = 2 equal their recomputes (Section 7.4), and W ≤ T. The rows are dense and the first ordinals contiguous. The ParityMap row is last and present because a sidecar row is present. The bijection holds, covered = rows = A's planned tape-file number = 5, and the layout, digests and footers are consistent.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse",
+    "tape_level": "BotStructuralRecoveryRequired"
+  },
+  "group": "7b",
+  "id": "terminal-scope-scalars/isolated-3",
+  "integrity_repair": [
+    "the profile is generated consistently: payload, canonical-map, edition, layout and descriptor digests, CRCs and header hashes in all five components"
+  ],
+  "mutation": {
+    "fields": "total data ordinals = 5 and highest protected ordinal = 2, both equal to their recomputes"
+  },
+  "parent": "terminal-scope-scalars (variants b, c: W = T rule)",
+  "pinned": true,
+  "quotes": [
+    "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+  ],
+  "sections": [
+    "10.6",
+    "7.2",
+    "7.4"
+  ],
+  "target": "replica pre-A relationship 'when sidecars are present, highest_protected_ordinal equals total_data_ordinals' (Section 10.6)",
+  "violates_only": "Section 10.6 W = T when sidecars are present (2 ≠ 5)"
+}

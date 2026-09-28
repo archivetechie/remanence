@@ -1,0 +1,41 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal, rebuilt: the sidecar at tape file 2 becomes 3 blocks",
+    "copy": "both copies, footer, directory entry, terminal suffix regenerated",
+    "tape_file": 2
+  },
+  "caveat": "The ParityMap cannot describe this sidecar truthfully: key 7 = 0 would be DirectoryInvalid. It therefore keeps key 7 = 4, a Writer inaccuracy that no Reader rule detects.",
+  "every_other_rule_holds": "parity_block_count = S*m and logical = S*k hold. real = end - start = 4 lies in 1..=S*k. The Section 9.4 recompute (no parity entries, 4 data-CRC entries) gives H = 1 and inline = 32, as recorded. total, tail and footer locators match the 3-block file, and the file and the map agree on 3 blocks. The copies, footer and directory agree. The parity mismatch with the bootstrap's m = 2 belongs to the Section 13.3 pin, which applies only to an acquired index, and no copy is acquired.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-m-zero/isolated",
+  "integrity_repair": [
+    "R-SC-HASHED in both copies",
+    "footer_crc64",
+    "ISO-REBUILD (ParityMap directory and canonical_map_digest; terminal suffix)"
+  ],
+  "mutation": {
+    "consistent_fields": "parity_block_count (0x50) = S*m = 0; P = 0; index stream = 0 parity entries + 4 data-CRC entries, so inline_index_entry_bytes (0x68) = 32 and H = 1; total (0x70) = 2H + P + 1 = 3; tail_header_start_block (0x80) = H + P = 1; footer_block_index (0x88) = 2H + P = 2; footer H = 1, P = 0, total = 3, tail start = 1",
+    "directory_entry": "key 5 = 3, key 6 = 1, key 8 = new hash. Key 7 stays 4, because the Section 10.1.5 invariant forbids a zero parity_shard_block_count; no Reader rule compares key 7 with the sidecar's P (the Section 13.3 agreement set is tape file, epoch, range and block count).",
+    "field": "m u16 (0x22) = 0 in both copies",
+    "file_layout": "block 0 primary, block 1 tail, block 2 footer; no parity blocks",
+    "prefix_effect": "the replicas' structural row for tape file 2 says block_count 3; later LBAs shift by -4"
+  },
+  "parent": "sidecar-m-zero",
+  "pinned": true,
+  "quotes": [
+    "| 0x22 | 2 | m u16 | ≠ 0 |",
+    "The acquired index MUST then be pinned against the bootstrap's scheme record"
+  ],
+  "sections": [
+    "9.2",
+    "9.4",
+    "13.3",
+    "10.1.5"
+  ],
+  "target": "sidecar header m rule (Section 9.2)",
+  "violates_only": "Section 9.2 'm u16 ≠ 0'. If Section 6.6 validity is also applied to the header triple, '1 ≤ m' is the same condition."
+}

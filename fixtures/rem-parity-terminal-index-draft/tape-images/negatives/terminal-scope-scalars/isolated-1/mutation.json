@@ -1,0 +1,1888 @@
+{
+  "artifact": "terminal profile multi-256k",
+  "authored_mutation": {
+    "change": "tuples (4,1),(5,1),(4,2),(5,2),(4,3) get planned tape-file numbers 7, 8, 9, 10, 11 instead of 6..10; the local planned tape-file fields (replica 0x088, separation 0x040), the separation predecessor/successor file numbers (0x078/0x080) and the footer observed tape-file numbers (0x2D8, 0x1A0) follow. covered_prefix_tape_file_count stays 6 and structural_row_count stays 6. LBAs are unchanged.",
+    "field": "planned tape-file numbers of the terminal suffix"
+  },
+  "case": "terminal-scope-scalars/isolated-1",
+  "commit_record_inputs": null,
+  "edits": [
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 336,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 344,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 368,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 376,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 400,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 408,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 432,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 440,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 464,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 472,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 136,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 144,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 160,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 336,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 344,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 368,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 376,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 400,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 408,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 432,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 440,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 464,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 472,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 136,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 144,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 160,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 264,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 728,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 736,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 752,
+      "new_bytes": "1b00000000000000",
+      "old_bytes": "1b00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 168,
+      "new_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 168,
+      "new_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "e26eaa7ca02b5af900a4853d3df6bc0761443e47780b6bd788548217f2f09bfd",
+      "old_bytes": "c057f822cb90e70f2e90cf161945147dcdf1f3b55a412847303cc203fac6a149",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "e26eaa7ca02b5af900a4853d3df6bc0761443e47780b6bd788548217f2f09bfd",
+      "old_bytes": "c057f822cb90e70f2e90cf161945147dcdf1f3b55a412847303cc203fac6a149",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 1016,
+      "new_bytes": "455ded9aa995aeea",
+      "old_bytes": "b64740fc754c73ac",
+      "repair": "replica header CRC",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 696,
+      "new_bytes": "f2bdcdbe506bcbb3ade76c917276c4bcb7cb585f48dfb17c9da21e8c6222250a",
+      "old_bytes": "d0d7bab9042c5888acd8fcb8b551a9612d721fcd0c30b930bb63fb0a8b48f63c",
+      "repair": "footer header-record SHA-256",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "ad348958ad968807",
+      "old_bytes": "dbb87b606e0df46d",
+      "repair": "replica footer CRC",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 240,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 272,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 304,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 328,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 336,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 360,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 368,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 64,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 72,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 216,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 120,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 128,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 136,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 144,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 240,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 264,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 272,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 304,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 328,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 336,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 360,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 368,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 64,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 72,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 216,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 152,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 120,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 128,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 136,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 144,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 416,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 424,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 440,
+      "new_bytes": "1f00000000000000",
+      "old_bytes": "1f00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 184,
+      "new_bytes": "de0412481d32c20607ef24365ac3a262332e7fe52b6723f1c0815d07063e94c8",
+      "old_bytes": "d7917e7027d6fa3ffad08002d7e27a79f9a35643e4ae29b8a1950e615e47b37d",
+      "repair": "R-SEP descriptor digest",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 184,
+      "new_bytes": "de0412481d32c20607ef24365ac3a262332e7fe52b6723f1c0815d07063e94c8",
+      "old_bytes": "d7917e7027d6fa3ffad08002d7e27a79f9a35643e4ae29b8a1950e615e47b37d",
+      "repair": "R-SEP descriptor digest",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 504,
+      "new_bytes": "b5ff35612bcef77f",
+      "old_bytes": "4d439cdf3d2cb39b",
+      "repair": "R-SEP header CRC",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 384,
+      "new_bytes": "09b2c1cba8612d453348b3fb2b5eb38f20ef6ce3096f9c5696897457b4788691",
+      "old_bytes": "f8bcbea818f6f13f34ef443442d070f902356b2737dadb073f953f29b615cc4d",
+      "repair": "R-SEP footer header SHA-256",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 504,
+      "new_bytes": "3f1c24efe1f92359",
+      "old_bytes": "7776669be7dc6bd4",
+      "repair": "R-SEP footer CRC",
+      "tape_file": 7
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 336,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 344,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 368,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 376,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 400,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 408,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 432,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 440,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 464,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 472,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 136,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 144,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 160,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 336,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 344,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 368,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 376,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 400,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 408,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 432,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 440,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 464,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 472,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 136,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 144,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 160,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 264,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 728,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 736,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 752,
+      "new_bytes": "2300000000000000",
+      "old_bytes": "2300000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 168,
+      "new_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 168,
+      "new_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "0c30a059b64731c46acd6559afebac9ff369b1804503dacdea869f8846be5c25",
+      "old_bytes": "9cf92996428d9dd4f89ba3f8b24634398fe122aefc6bde1d8f2135a5bb62f18a",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "0c30a059b64731c46acd6559afebac9ff369b1804503dacdea869f8846be5c25",
+      "old_bytes": "9cf92996428d9dd4f89ba3f8b24634398fe122aefc6bde1d8f2135a5bb62f18a",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 1016,
+      "new_bytes": "9cd49ad82d793af2",
+      "old_bytes": "9306f0570930e99e",
+      "repair": "replica header CRC",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 696,
+      "new_bytes": "dd83ea2e706119d32268d3e521ce81844b7b551bcfe9406507b212b8cd857a10",
+      "old_bytes": "3f1ac0697bf512b6a3b00463ed2d47567c119d46df8b34d6bc36e0d1d63c66f1",
+      "repair": "footer header-record SHA-256",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "865738310e66e1de",
+      "old_bytes": "9a712f5be16082d7",
+      "repair": "replica footer CRC",
+      "tape_file": 8
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 240,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 272,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 304,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 328,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 336,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 360,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 368,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 64,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 72,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 216,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 120,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 128,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 136,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 144,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 240,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 264,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 272,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 304,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 328,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 336,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 360,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 368,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 64,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 72,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 216,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 152,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 120,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 128,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 136,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 144,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 416,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 424,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 440,
+      "new_bytes": "2700000000000000",
+      "old_bytes": "2700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 184,
+      "new_bytes": "43a594f8e9af0d6144e106734f42600f0e3efd0b8cc0b565b0f59cc034141124",
+      "old_bytes": "0045f35509e4509aca1890c71a58f9798b56021f35a1e975e632e6ab4223f4e7",
+      "repair": "R-SEP descriptor digest",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 184,
+      "new_bytes": "43a594f8e9af0d6144e106734f42600f0e3efd0b8cc0b565b0f59cc034141124",
+      "old_bytes": "0045f35509e4509aca1890c71a58f9798b56021f35a1e975e632e6ab4223f4e7",
+      "repair": "R-SEP descriptor digest",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 504,
+      "new_bytes": "4cd9da30870bc9dc",
+      "old_bytes": "b4cac2874b4b8992",
+      "repair": "R-SEP header CRC",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 384,
+      "new_bytes": "73cd9509e971c2a79b2863a7337fa7290201495239a0bab79193bacefb552404",
+      "old_bytes": "d44f776443c5253c8a7c70657d675c0bdcc5800d466c003353d7f6d4396a141e",
+      "repair": "R-SEP footer header SHA-256",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 504,
+      "new_bytes": "2e6cd5d0ac8931f8",
+      "old_bytes": "940e2d7ae587958e",
+      "repair": "R-SEP footer CRC",
+      "tape_file": 9
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 336,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 344,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 368,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 376,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 400,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 408,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 432,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 440,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 464,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 472,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 136,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 144,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 160,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 336,
+      "new_bytes": "0700000000000000",
+      "old_bytes": "0600000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 344,
+      "new_bytes": "1900000000000000",
+      "old_bytes": "1900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 368,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 376,
+      "new_bytes": "1d00000000000000",
+      "old_bytes": "1d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 400,
+      "new_bytes": "0900000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 408,
+      "new_bytes": "2100000000000000",
+      "old_bytes": "2100000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 432,
+      "new_bytes": "0a00000000000000",
+      "old_bytes": "0900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 440,
+      "new_bytes": "2500000000000000",
+      "old_bytes": "2500000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 464,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 472,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 136,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 144,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 160,
+      "new_bytes": "2d00000000000000",
+      "old_bytes": "2d00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 264,
+      "new_bytes": "4a5a071e17a0309266e6d96bcc0e65f9e291eb97a7ede7818de4b20200af947b",
+      "old_bytes": "1bf82ffe0f048ddcc7b9af3a6b486dc3beb00be24e5cf8f42f54d78a7620d36a",
+      "repair": "regenerated terminal layout digest",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 728,
+      "new_bytes": "0b00000000000000",
+      "old_bytes": "0a00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 736,
+      "new_bytes": "2900000000000000",
+      "old_bytes": "2900000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 752,
+      "new_bytes": "2b00000000000000",
+      "old_bytes": "2b00000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 168,
+      "new_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 168,
+      "new_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "743b6085d196a7e103305f0ac9a94602ffbe14a0a2a29e96ee4cf7be69b35b78",
+      "old_bytes": "a17125fac1209bf3748119eeddee20f0254c88496afab00d9faa83b4cec866b6",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "743b6085d196a7e103305f0ac9a94602ffbe14a0a2a29e96ee4cf7be69b35b78",
+      "old_bytes": "a17125fac1209bf3748119eeddee20f0254c88496afab00d9faa83b4cec866b6",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 1016,
+      "new_bytes": "c5b38acd49c9729e",
+      "old_bytes": "0909b8b89262d82b",
+      "repair": "replica header CRC",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 696,
+      "new_bytes": "0d81d1e905774a309812509fc23e15d4cd4ab92cf0065994706e8c8c3eb076af",
+      "old_bytes": "de325d16e45d85336931cddb3bf184af566dc97fb3305e7de4dfaaa4276b86a5",
+      "repair": "footer header-record SHA-256",
+      "tape_file": 10
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "b74b69a309e608ea",
+      "old_bytes": "bf34382d83b49f04",
+      "repair": "replica footer CRC",
+      "tape_file": 10
+    }
+  ],
+  "entry_points": [
+    "parse_tape_index_replica_header + parse_tape_index_bootstrap_footer + validate_tape_index_replica_payload"
+  ],
+  "faults": [],
+  "unit_inputs": null
+}

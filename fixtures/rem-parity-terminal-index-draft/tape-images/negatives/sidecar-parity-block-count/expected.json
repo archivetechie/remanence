@@ -1,0 +1,40 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "footer 0x40 P = 4 comparison",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-parity-block-count",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "parity_block_count u64",
+    "formula": "MUST = S*m = 4",
+    "from": 4,
+    "offset": "0x50",
+    "to": 3
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x50 | 8 | parity_block_count u64 | MUST = S × m |",
+    "every sidecar carries exactly `P = S × m` parity blocks (Section 9.2) regardless of how many data stripes the epoch actually fills"
+  ],
+  "sections": [
+    "9.1",
+    "9.2",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header parity_block_count rule (Section 9.2)"
+}

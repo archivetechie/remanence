@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "replica footer arithmetic (Section 10.4)"
+  },
+  "every_other_rule_holds": "delta = count − 1 holds. Image level is impossible: the observed start must equal the planned start, and a planned start this large makes the planned start-advance and EOD sums overflow (overflow-8.3-*), and puts the replica beyond any device-reportable position.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.4-footer-delta/isolated-2",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "observed start LBA 2^64 − 1, observed record count 3, delta 2"
+  },
+  "parent": "overflow-10.4-footer-delta (variant b)",
+  "pinned": true,
+  "quotes": [
+    "the observed footer LBA (`0x2F0`) MUST equal the observed start LBA (`0x2E0`) plus that delta"
+  ],
+  "sections": [
+    "10.4",
+    "8.3"
+  ],
+  "target": "observed footer LBA = observed start LBA + delta",
+  "violates_only": "Checked evaluation of (2^64 − 1) + 2"
+}

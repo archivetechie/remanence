@@ -1,0 +1,9 @@
+{
+  "block_within_file": 2,
+  "field": "sequence u64",
+  "from": 0,
+  "offset": "0x20",
+  "rule": "the decoded payload (key 3 sequence = 0) MUST match the header/footer locator fields; header and footer disagree",
+  "to": 1,
+  "variant": "a-footer-sequence"
+}

@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "separation extent geometry (Section 10.5)"
+  },
+  "every_other_rule_holds": "total ≥ 2, footer_offset and interior fit. Image level is impossible: the recorded total record count must equal ceil(E/B) = 2^46, and the extent's measured record count must equal it, which needs 2^64 bytes of medium.",
+  "expected": {
+    "error": "TerminalIndexSeparationParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.5-extent-geometry/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "E = 2^64 − 1, B = 262144"
+  },
+  "parent": "overflow-10.5-extent-geometry",
+  "pinned": true,
+  "quotes": [
+    "actual_bytes     = total_records × B"
+  ],
+  "sections": [
+    "10.5",
+    "10.6"
+  ],
+  "target": "actual_bytes = total_records × B",
+  "violates_only": "Checked evaluation of 2^46 × 2^18 (the exact total_records = 2^46 fits)"
+}

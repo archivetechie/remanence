@@ -1,0 +1,10 @@
+{
+  "field": "reserved u64",
+  "le_bytes": "01 00 00 00 00 00 00 00",
+  "offset": "0xB8",
+  "repair": [
+    "R-SC-UNHASHED"
+  ],
+  "to": 1,
+  "variant": "a-header-0xB8"
+}

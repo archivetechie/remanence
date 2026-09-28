@@ -526,12 +526,14 @@ pub fn checked_bounded_resume_summary(
                 ));
             }
         }
-        append_lba = append_lba
-            .checked_add(entry.block_count)
-            .and_then(|value| value.checked_add(1))
-            .ok_or(ParityError::Invariant(
-                "bounded resume append position overflows",
-            ))?;
+        append_lba = resume_record_result(
+            append_lba
+                .checked_add(entry.block_count)
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    JournalError::Codec("bounded resume append position overflows".into())
+                }),
+        )?;
         expected_file = expected_file.checked_add(1).ok_or(ParityError::Invariant(
             "bounded resume tape-file count overflows",
         ))?;
@@ -2274,7 +2276,7 @@ fn validate_encoded_sidecar_before_write(
             encoded.header.stripes_per_epoch,
             encoded.header.m,
             encoded.header.shard_index_block_count,
-        ))
+        )?)
         .map_err(|_| resume_error("resume sidecar parity block position overflows usize"))?;
         if decoded_shard != &encoded.blocks[block_position] {
             return Err(resume_error(format!(
@@ -4495,6 +4497,62 @@ mod tests {
                 .object_rows_before_object,
             OBJECT_COUNT
         );
+    }
+
+    /// Framed commit-record contents can overflow the append sum without a codec failure.
+    #[test]
+    fn bounded_resume_commit_record_append_overflow_is_resume_append() {
+        let path = terminal_journal_path("append-overflow");
+        let mut journal = crate::journal::FileTapeFileJournal::open(
+            &path,
+            [0x96; 16],
+            RESUME_TEST_BLOCK_SIZE,
+            scheme(),
+        )
+        .unwrap();
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::BotBootstrap,
+                entries: vec![journal_entry(0, TapeFileKind::Bootstrap, 1, None, None)],
+                highest_protected_ordinal: 0,
+                total_committed_ordinals: 0,
+            })
+            .unwrap();
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::Object,
+                entries: vec![
+                    journal_entry(1, TapeFileKind::Object, 1, Some(0), None),
+                    journal_entry(
+                        2,
+                        TapeFileKind::ParitySidecar,
+                        u64::MAX,
+                        None,
+                        Some((0, 0, 1)),
+                    ),
+                ],
+                highest_protected_ordinal: 1,
+                total_committed_ordinals: 1,
+            })
+            .unwrap();
+        journal
+            .commit_bundle(&CommittedBundle {
+                kind: CommittedBundleKind::CheckpointedThrough,
+                entries: Vec::new(),
+                highest_protected_ordinal: 1,
+                total_committed_ordinals: 1,
+            })
+            .unwrap();
+        let snapshot = journal.committed_snapshot_bounded().unwrap();
+        let error = checked_bounded_resume_summary(&snapshot).unwrap_err();
+        assert!(
+            matches!(error, ParityError::ResumeAppend(ref detail)
+            if detail == &JournalError::Codec("bounded resume append position overflows".into()).to_string()),
+            "{error:?}"
+        );
+        drop(snapshot);
+        drop(journal);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

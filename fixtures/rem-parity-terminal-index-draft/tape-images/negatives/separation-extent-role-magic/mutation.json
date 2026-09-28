@@ -1,0 +1,46 @@
+{
+  "artifact": "terminal profile minimal-256k",
+  "case": "separation-extent-role-magic",
+  "edits": [
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 0,
+      "new_bytes": "8f",
+      "old_bytes": "8e",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 504,
+      "new_bytes": "5060e8b3943a893a",
+      "old_bytes": "208c57f61bcb8379",
+      "repair": "R-SEP header CRC",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 384,
+      "new_bytes": "04576ec852020cd29586767af93c31f0ad2fd95059a42a7a176fe211ec9f7eb4",
+      "old_bytes": "61063cea569d4968f3bc6398774ed274ef0f522b9a3ccf00152170ea78ec3e5d",
+      "repair": "R-SEP footer header-record SHA-256",
+      "tape_file": 2
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 504,
+      "new_bytes": "af038fa3e0b4659f",
+      "old_bytes": "59b40d4d2608ed83",
+      "repair": "R-SEP footer CRC",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_index_separation_header + parse_index_separation_footer + validate_index_separation_pair"
+  ],
+  "target_role": "Separation"
+}

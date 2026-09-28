@@ -1,0 +1,35 @@
+{
+  "concurrent_checks": [
+    "footer/tail hash comparison"
+  ],
+  "isolated_violation": "real (3) != end - start (4 - 0)",
+  "mutation": [
+    {
+      "field": "real_data_shard_count",
+      "from": 4,
+      "offset": "0x48",
+      "to": 3
+    },
+    {
+      "field": "data_crc_count",
+      "from": 4,
+      "offset": "0x58",
+      "to": 3,
+      "why": "keeps the 0x58 rule satisfied"
+    },
+    {
+      "field": "inline_index_entry_bytes",
+      "from": 96,
+      "offset": "0x68",
+      "to": 88,
+      "why": "Section 9.4 recomputed with real = 3"
+    },
+    {
+      "field": "fourth data-CRC entry",
+      "offset": "0x120..0x128",
+      "to": "zero",
+      "why": "stream now has 3 data-CRC entries; the freed bytes become fill"
+    }
+  ],
+  "variant": "a-not-end-minus-start"
+}

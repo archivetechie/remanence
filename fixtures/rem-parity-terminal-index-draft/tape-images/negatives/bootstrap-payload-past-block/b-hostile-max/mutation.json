@@ -1,0 +1,28 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "bootstrap-payload-past-block/b-hostile-max",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 44,
+      "new_bytes": "ffffffff",
+      "old_bytes": "8a000000",
+      "repair": "mutation",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "74ee54425104a7c1",
+      "old_bytes": "c0054196e69cbdc8",
+      "repair": "R-BOOT-HDR CRC",
+      "tape_file": 0
+    }
+  ],
+  "entry_points": [
+    "parse_bootstrap_block"
+  ],
+  "target_role": "Bootstrap"
+}

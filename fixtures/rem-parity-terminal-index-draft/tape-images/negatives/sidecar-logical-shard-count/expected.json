@@ -1,0 +1,38 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-logical-shard-count",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "logical_shard_count u64",
+    "formula": "MUST = S*k = 2*2 = 4",
+    "from": 4,
+    "offset": "0x40",
+    "to": 5
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"
+  ],
+  "sections": [
+    "9.2",
+    "6.4",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header logical_shard_count rule (Section 9.2)"
+}

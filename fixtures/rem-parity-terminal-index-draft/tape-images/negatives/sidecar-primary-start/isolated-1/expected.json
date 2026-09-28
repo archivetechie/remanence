@@ -1,0 +1,36 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies; footer presented unreadable",
+    "tape_file": 2
+  },
+  "caveat": "Under the other reading of Section 9.5 (hash computed with 0x78 taken as 0), this variant also breaks the hash rule; use isolated-2 for that reading.",
+  "every_other_rule_holds": "Every other field and the file are unchanged. The copies agree, and the directory hash matches the copies. The footer is unreadable, so its 0x50 = 0 is compared with nothing.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-primary-start/isolated-1",
+  "integrity_repair": [
+    "ISO-BOTH with the hash recomputed over the wire bytes (0x78 = 1): new hash in both copies and directory key 8",
+    "ISO-FAULT-FOOTER (the footer's 0x50 carries its own '= 0' rule and cannot mirror 1)"
+  ],
+  "mutation": {
+    "field": "primary_header_start_block u64",
+    "from": 0,
+    "offset": "0x78",
+    "to": 1
+  },
+  "parent": "sidecar-primary-start (variant a)",
+  "pinned": true,
+  "quotes": [
+    "| 0x78 | 8 | primary_header_start_block u64 | MUST = 0 |"
+  ],
+  "sections": [
+    "9.2",
+    "9.5"
+  ],
+  "target": "primary_header_start_block rule (Section 9.2)",
+  "violates_only": "Section 9.2 'primary_header_start_block MUST = 0', under the reading of Section 9.5 that hashes the wire value"
+}

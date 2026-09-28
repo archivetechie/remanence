@@ -1,0 +1,45 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "evaluation": "A closed-form stream length 16·S·m + 8·real = 64 + 2^64 overflows. The literal loop does not overflow but would iterate 2^61 times, which exhausts resources rather than arithmetic.",
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "formula": "H from Section 9.4 packing over (block_size, S, m, real_data_shard_count)",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-9.4-H",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": [
+    {
+      "name": "real_data_shard_count",
+      "position": "sidecar header 0x48",
+      "value": "2^61"
+    },
+    {
+      "name": "protected_ordinal_end_exclusive",
+      "position": "0x38",
+      "value": "2^61 (so real = end − start holds)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "`H` (`sidecar_header_block_count`) and `inline_index_entry_bytes` are fully determined by `(block_size, S, m, real_data_shard_count)`. Readers MUST recompute both and reject header values that disagree."
+  ],
+  "sections": [
+    "9.4",
+    "9.2",
+    "2.4",
+    "16.2"
+  ],
+  "shadowed": "Not by a different name: 'real ≤ logical_shard_count' (4) also fails, and it is SidecarParse too. The text does not order the two checks.",
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "the Reader's layout recomputation (Section 9.4) during sidecar header validation",
+  "type": "u64"
+}

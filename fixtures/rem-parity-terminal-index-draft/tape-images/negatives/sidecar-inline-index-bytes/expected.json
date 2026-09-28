@@ -1,0 +1,38 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-inline-index-bytes",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "inline_index_entry_bytes u64",
+    "formula": "Section 9.4: inline = offset - 0xC8 after packing 4 parity (16 B) + 4 data-CRC (8 B) entries = 96",
+    "from": 96,
+    "offset": "0x68",
+    "to": 88
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x68 | 8 | inline_index_entry_bytes u64 | MUST equal the recomputed layout (Section 9.4) |"
+  ],
+  "sections": [
+    "9.2",
+    "9.4",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar index layout recomputation (Section 9.4) against inline_index_entry_bytes (Section 9.2)"
+}

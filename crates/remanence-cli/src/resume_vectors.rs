@@ -115,6 +115,9 @@ pub fn adapt(
     let mut lba = 0;
     for row in input["committed_prefix"].as_array().unwrap() {
         let f = row["tape_file_number"].as_u64().unwrap();
+        if let Some(physical) = row["physical_start_override"].as_u64() {
+            lba = physical;
+        }
         let (kind, bundle) = match row["kind"].as_str().unwrap() {
             "Bootstrap" => (2, 1),
             "Object" => (0, 0),
@@ -149,7 +152,11 @@ pub fn adapt(
             (uint(11), Cbor::Null),
         ]);
         frame(&mut file, bundle, vec![entry], w, t)?;
-        lba += row["block_count"].as_u64().unwrap() + 1;
+        // Supplemental hostile commit claims retain measured starts, avoiding
+        // arithmetic on their block counts inside the reference adapter.
+        if row["physical_start_override"].is_null() {
+            lba += row["block_count"].as_u64().unwrap() + 1;
+        }
     }
     frame(
         &mut file,

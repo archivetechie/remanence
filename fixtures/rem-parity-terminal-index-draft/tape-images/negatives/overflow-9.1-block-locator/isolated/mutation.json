@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "H = 2^64 − 1, S = 2, parity_index = 1, stripe = 0"
+  },
+  "case": "overflow-9.1-block-locator/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "parity_block_position"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "H = 2^64 − 1, S = 2, parity_index = 1, stripe = 0"
+  }
+}

@@ -957,7 +957,10 @@ pub(crate) fn encode_sidecar_epoch_directory_cbor(
     ]))
 }
 
-pub(crate) fn decode_sidecar_epoch_directory_cbor(
+/// Decode and validate a directory value using the production CBOR invariants.
+/// Exposed for the review-only negative-vector executor's directory observation.
+#[doc(hidden)]
+pub fn decode_sidecar_epoch_directory_cbor(
     value: CborValue,
 ) -> Result<SidecarEpochDirectory, ParityError> {
     let map = match value {

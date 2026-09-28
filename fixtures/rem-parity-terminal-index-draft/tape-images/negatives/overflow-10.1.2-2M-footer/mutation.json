@@ -1,0 +1,91 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "overflow-10.1.2-2M-footer",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 40,
+      "new_bytes": "02000000",
+      "old_bytes": "00000400",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "37ffffffffffffff",
+      "old_bytes": "c900000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "e9d86be5b6168743",
+      "old_bytes": "9d39a7ae60c7497b",
+      "repair": "ParityMap CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 40,
+      "new_bytes": "02000000",
+      "old_bytes": "00000400",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 48,
+      "new_bytes": "37ffffffffffffff",
+      "old_bytes": "c900000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 192,
+      "new_bytes": "86973ebf54086276",
+      "old_bytes": "f276f2f482d9ac4e",
+      "repair": "ParityMap CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 40,
+      "new_bytes": "02000000",
+      "old_bytes": "00000400",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 48,
+      "new_bytes": "37ffffffffffffff",
+      "old_bytes": "c900000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 192,
+      "new_bytes": "cc1da72c17e3db50",
+      "old_bytes": "b8fc6b67c1321568",
+      "repair": "ParityMap CRC",
+      "tape_file": 3
+    }
+  ],
+  "entry_points": [
+    "parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor"
+  ],
+  "target_role": "ParityMap"
+}

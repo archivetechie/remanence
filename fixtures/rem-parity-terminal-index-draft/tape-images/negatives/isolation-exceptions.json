@@ -1,0 +1,61 @@
+{
+  "description": "Supplement variants that the reference rejects with the expected outcome but before reaching the variant's target check, because of the reference's own evaluation or check order. Written by the supervisor; the variants and their expectations are unchanged. Each entry names the variant and the executor observation (the observation key used by the executor; '*' for every observation of that variant). The executor reports a listed ISOLATION? as ISOLATION-EXCEPTION and passes it; an ISOLATION? that is not listed fails, and a listed entry that no longer occurs fails as stale. Formulas left without a reaching vector are listed in REM-PARITY's TT-2 by the next text revision, as design D6 requires.",
+  "entries": [
+    {
+      "variant": "overflow-10.5-extent-geometry/isolated",
+      "observation": "*",
+      "first_check": "the ceiling division that forms total_records",
+      "target": "actual_bytes = total_records × B",
+      "reason": "The reference evaluates ceil(E / B) as (E + B − 1) / B, which overflows before the product can. An exact ceiling would reach the product; the text does not prescribe the evaluation form.",
+      "tt2": "actual_bytes (§10.5)"
+    },
+    {
+      "variant": "overflow-10.4-record-geometry/isolated",
+      "observation": "*",
+      "first_check": "the ceiling division that forms the record count",
+      "target": "the §10.4 record-geometry product",
+      "reason": "As for the extent geometry: the reference's ceiling division overflows first.",
+      "tt2": "the §10.4 record-geometry product"
+    },
+    {
+      "variant": "overflow-7.2-T/isolated",
+      "observation": "*",
+      "first_check": "Σ(block_count + 1) over the covered prefix",
+      "target": "T = max(first_parity_data_ordinal + block_count)",
+      "reason": "The reference sums the covered prefix's records and filemarks before it forms T, and an overflow of T always implies an overflow of that sum.",
+      "tt2": "T (§7.2)"
+    },
+    {
+      "variant": "paritymap-directory-not-ascending/isolated",
+      "observation": "*",
+      "first_check": "the protected-range contiguity rule, evaluated in array order",
+      "target": "the ascending tape-file-order rule (§10.1.5)",
+      "reason": "The reference checks range contiguity in array order before the ascending rule. The text states the partition rule in ascending tape-file order and gives no check order (GAPS G-6).",
+      "tt2": null
+    },
+    {
+      "variant": "terminal-scope-scalars/isolated-4",
+      "observation": "*",
+      "first_check": "the Section 10.6 W = T rule, evaluated on the recomputed W and T",
+      "target": "the §7.4 W cross-check",
+      "reason": "The variant keeps the recorded fields equal (5 = 5), so §10.6's rule as worded ('highest_protected_ordinal equals total_data_ordinals') holds and only the §7.4 cross-check should fail. The reference evaluates the W = T rule on the recomputed W (2) and T (5), and rejects there first; the second implementation reads it the same way (its BUILD-LOG, sup-32). Whether §10.6 names the recorded or the recomputed values is a text question for D9 (the GAPS G-1 class).",
+      "tt2": null
+    },
+    {
+      "variant": "overflow-13.3-tail-location/isolated-1",
+      "observation": "*",
+      "first_check": "the requirement that 2H + P + 1 equal the map entry's block count",
+      "target": "the §13.3 tail location total − 1 − H",
+      "reason": "The reference never evaluates §13.3's total − 1 − H: it locates the tail copy at H + P (recovery.rs ~1123) and requires 2H + P + 1 to equal the map entry's block count (~1132–1138), a rule the text does not state (the negatives author's NOTES gap 8). For this variant that unstated check fires first. The rescue's specific error is then reported as the epoch-level outcome, which is correct (SidecarMetadataUnavailable{0}).",
+      "tt2": "the §13.3 tail location total − 1 − H"
+    },
+    {
+      "variant": "overflow-13.3-tail-location/isolated-2",
+      "observation": "*",
+      "first_check": "the H + P sum that forms the tail position",
+      "target": "the §13.3 tail location total − 1 − H",
+      "reason": "The reference never evaluates §13.3's total − 1 − H: it locates the tail copy at H + P (recovery.rs ~1123) and requires 2H + P + 1 to equal the map entry's block count (~1132–1138), a rule the text does not state (the negatives author's NOTES gap 8). For this variant the H + P sum overflows first. The rescue's specific error is then reported as the epoch-level outcome, which is correct (SidecarMetadataUnavailable{0}).",
+      "tt2": "the §13.3 tail location total − 1 − H"
+    }
+  ]
+}

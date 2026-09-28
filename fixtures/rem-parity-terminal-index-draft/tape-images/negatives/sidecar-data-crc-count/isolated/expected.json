@@ -1,0 +1,36 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The index stream still holds exactly S*m = 4 parity entries and real_data_shard_count = 4 data-CRC entries, which Section 9.3 counts from real_data_shard_count. The Section 9.4 layout is computed from real_data_shard_count and still matches (H 1, inline 96), and the fill after 0x128 is zero. The 'nonzero unused space' concurrent check in the parent arises only if a Reader delimits the stream by data_crc_count, which no rule directs. The copies, footer and directory agree.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-data-crc-count/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (0x58 is hashed; the footer and directory do not mirror it)"
+  ],
+  "mutation": {
+    "field": "data_crc_count u64",
+    "from": 4,
+    "offset": "0x58",
+    "to": 3
+  },
+  "parent": "sidecar-data-crc-count",
+  "pinned": true,
+  "quotes": [
+    "| 0x58 | 8 | data_crc_count u64 | MUST = real_data_shard_count |",
+    "There are exactly `S × m` parity entries and `real_data_shard_count` data-CRC entries."
+  ],
+  "sections": [
+    "9.2",
+    "9.3",
+    "9.4"
+  ],
+  "target": "data_crc_count rule (Section 9.2)",
+  "violates_only": "Section 9.2 'data_crc_count MUST = real_data_shard_count'"
+}

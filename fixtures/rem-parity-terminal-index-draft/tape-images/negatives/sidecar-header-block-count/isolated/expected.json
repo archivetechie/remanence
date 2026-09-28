@@ -1,0 +1,42 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal, rebuilt: the sidecar at tape file 2 becomes 9 blocks",
+    "copy": "both copies, footer, directory entry, and the terminal suffix regenerated",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "total = 2H+P+1 = 9 = the measured count (Scanner item 5, Section 16.2). The tail start is 6 = H + P and the footer index 8 = 2H + P, and the footer sits in the last block. The parity locator with the recorded H places the shards where they are. inline = 96 matches the recompute, which does not depend on H. Every index block ends with a valid CRC and is zero below it. The footer's H, P, total, tail start and hash agree with both copies, which agree with each other. The directory entry agrees with the map entry in tape file, epoch, range and block count (9). The replicas and the ParityMap are regenerated for the 9-block prefix.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-header-block-count/isolated",
+  "integrity_repair": [
+    "R-SC-HASHED in both copies (hash over the new 0x00..0x8F bytes)",
+    "a trailing CRC in each empty index block (blocks 1 and 7)",
+    "footer_crc64",
+    "ISO-REBUILD for the ParityMap (directory keys 5, 6, 8; canonical_map_digest; payload_sha256; CRCs) and for the whole terminal suffix"
+  ],
+  "mutation": {
+    "file_layout": "block 0: primary header + all 4 parity and 4 data-CRC entries (inline_index_entry_bytes stays 96); block 1: an extra index block with no entries, all zero below its trailing CRC-64/XZ; blocks 2..5: the four parity shards at block(stripe, p) = H + p*S + stripe = 2 + 2p + stripe; block 6: tail header; block 7: its empty index block (zero + CRC); block 8: footer",
+    "locator_repaired": "tail_header_start_block (0x80) = H + P = 6; footer_block_index (0x88) = 2H + P = 8; sidecar_total_block_count (0x70) = 2H + P + 1 = 9; footer tail start (0x58) = 6, footer total (0x48) = 9; directory key 5 = 9",
+    "prefix_effect": "the replicas' structural row for tape file 2 says block_count 9; the ParityMap moves to LBA 17, A to 21, EOD to 41",
+    "recorded_H": "sidecar_header_block_count (0x60) = 2 in both copies; footer H (0x38) = 2; directory key 6 = 2"
+  },
+  "note": "This is the 'H case with its locator repaired' asked for in D6.",
+  "parent": "sidecar-header-block-count",
+  "pinned": true,
+  "quotes": [
+    "| 0x60 | 8 | sidecar_header_block_count u64 (H) | MUST equal the recomputed layout (Section 9.4) |",
+    "Readers MUST recompute both and reject header values that disagree."
+  ],
+  "sections": [
+    "9.1",
+    "9.2",
+    "9.3",
+    "9.4",
+    "13.3"
+  ],
+  "target": "Section 9.4 layout recomputation against the recorded H (Section 9.2)",
+  "violates_only": "Section 9.2 / 9.4 'sidecar_header_block_count MUST equal the recomputed layout'. Section 9.4 over (262144, S 2, m 2, real 4) gives H = 1."
+}

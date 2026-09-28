@@ -1,0 +1,28 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "terminal Object-row validation (Section 10.3)"
+  },
+  "every_other_rule_holds": "The range 0 + 2^46 ≤ stored_block_count 2^46 holds, and the counts and size are positive. Image level would need an Object row with stored_block_count ≥ 2^46. Its structural row can be written (see overflow-7.2-T/isolated for such a prefix), but the image would then carry the same caveat about an unmeasured prefix (NOTES.md gap 10), so the unit form is the clean one.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.3-manifest-range/isolated-2",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "manifest_first_chunk_lba 0, manifest_chunk_count 2^46, manifest_size_bytes 1, stored_block_count 2^46, block_size_bytes 262144"
+  },
+  "parent": "overflow-10.3-manifest-range (variant b)",
+  "pinned": true,
+  "quotes": [
+    "the manifest byte length MUST fit within `manifest_chunk_count × block_size_bytes`"
+  ],
+  "sections": [
+    "10.3"
+  ],
+  "target": "manifest_size_bytes ≤ manifest_chunk_count × block_size_bytes",
+  "violates_only": "Checked evaluation of 2^46 × 2^18"
+}

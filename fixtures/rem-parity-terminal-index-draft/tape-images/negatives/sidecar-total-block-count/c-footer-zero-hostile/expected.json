@@ -1,0 +1,13 @@
+{
+  "block_within_file": 6,
+  "copy": "footer",
+  "from": 7,
+  "offset": "0x48",
+  "repair": [
+    "R-SC-FOOTER"
+  ],
+  "tape_level": "Recoverer: 'a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop'; falls back to the primary (step 2); epoch 0 usable, no error. Scanner item 6: count mismatch is a scoped hard error; item 5 still classifies the file from the valid primary",
+  "target": "sidecar footer locator validation: measured-count comparison (Section 12.3 item 6) and map-entry comparison (Section 13.3 step 1)",
+  "to": 0,
+  "variant": "c-footer-zero-hostile"
+}

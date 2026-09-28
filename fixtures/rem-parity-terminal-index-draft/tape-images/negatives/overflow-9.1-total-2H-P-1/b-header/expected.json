@@ -1,0 +1,12 @@
+{
+  "block_within_file": 0,
+  "concurrent": "the H recompute check (Section 9.4) also fails; same name",
+  "expected": "SidecarParse",
+  "position": "sidecar header 0x60 (H u64)",
+  "repair": [
+    "R-SC-HASHED"
+  ],
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable",
+  "value": "2^63",
+  "variant": "b-header"
+}

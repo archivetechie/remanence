@@ -1,0 +1,30 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "planned-layout validation of Section 8.3, as called during replica eligibility (Section 10.6)"
+  },
+  "every_other_rule_holds": "Order and ordinals are fixed, each tuple has one filemark, the files are dense (1..5), every count is ≥ 2, and the replica and separation counts are equal. No other layout rule involves the overflowing sum. Image level is impossible: when start + count + 1 overflows, the position after A's trailing filemark cannot be represented, so the device-measured filemark position cannot agree with the plan (Section 10.6). A start small enough for the device to report cannot overflow the sum.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-8.3-component-starts/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "partition 0, block_size 262144, tuples (4,1,fm 1, file 1, start 2^64 − 3, count 3), (5,1,1, file 2, start 2, count 3), (4,2,1, 3, 6, 3), (5,2,1, 4, 10, 3), (4,3,1, 5, 14, 3), expected_eod_lba 18"
+  },
+  "parent": "overflow-8.3-component-starts",
+  "pinned": true,
+  "quotes": [
+    "Logical start positions advance by `record_count + 1`, where the `1` is the actual trailing filemark."
+  ],
+  "sections": [
+    "8.3",
+    "10.6",
+    "2.4"
+  ],
+  "target": "the start-advance rule: start(next) = start + record_count + 1",
+  "violates_only": "Checked evaluation of (2^64 − 3) + 3 + 1"
+}

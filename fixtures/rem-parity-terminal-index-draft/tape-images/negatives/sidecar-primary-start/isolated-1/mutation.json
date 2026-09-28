@@ -1,0 +1,198 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "authored_mutation": {
+    "field": "primary_header_start_block u64",
+    "from": 0,
+    "offset": "0x78",
+    "to": 1
+  },
+  "case": "sidecar-primary-start/isolated-1",
+  "commit_record_inputs": null,
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 120,
+      "new_bytes": "0100000000000000",
+      "old_bytes": "0000000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 120,
+      "new_bytes": "0100000000000000",
+      "old_bytes": "0000000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "3d8010a862c423cba5f78b539051b6583e104a4fd683fb63e1a66bc2917a2a58",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "08214001ac02b231",
+      "old_bytes": "5c6785f5e9c5d822",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 262136,
+      "new_bytes": "38c93e826c94fcdc",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 152,
+      "new_bytes": "3d8010a862c423cba5f78b539051b6583e104a4fd683fb63e1a66bc2917a2a58",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 192,
+      "new_bytes": "61ca7aee8d82547d",
+      "old_bytes": "358cbf1ac8453e6e",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 262136,
+      "new_bytes": "38c93e826c94fcdc",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 200,
+      "new_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507060107040858203d8010a862c423cba5f78b539051b6583e104a4fd683fb63e1a66bc2917a2a580906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "old_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507060107040858207bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc20906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "repair": "mutation: directory payload and zero fill",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 200,
+      "new_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507060107040858203d8010a862c423cba5f78b539051b6583e104a4fd683fb63e1a66bc2917a2a580906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "old_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507060107040858207bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc20906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "repair": "mutation: directory payload and zero fill",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "c900000000000000",
+      "old_bytes": "c900000000000000",
+      "repair": "R-PM-PAYLOAD payload length",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "605465aac74743b02de9a44e9057851e16a950043b31f95eca129168de9719f2",
+      "old_bytes": "9dd240864d8a38ab7799004a40014b97aba030d43f1648341375d1dd28b5acd6",
+      "repair": "R-PM-PAYLOAD payload SHA-256",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "4662f1a791cd5438",
+      "old_bytes": "9d39a7ae60c7497b",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 48,
+      "new_bytes": "c900000000000000",
+      "old_bytes": "c900000000000000",
+      "repair": "R-PM-PAYLOAD payload length",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 56,
+      "new_bytes": "605465aac74743b02de9a44e9057851e16a950043b31f95eca129168de9719f2",
+      "old_bytes": "9dd240864d8a38ab7799004a40014b97aba030d43f1648341375d1dd28b5acd6",
+      "repair": "R-PM-PAYLOAD payload SHA-256",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 192,
+      "new_bytes": "292da4fd73d3b10d",
+      "old_bytes": "f276f2f482d9ac4e",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 48,
+      "new_bytes": "c900000000000000",
+      "old_bytes": "c900000000000000",
+      "repair": "R-PM-PAYLOAD payload length",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 56,
+      "new_bytes": "605465aac74743b02de9a44e9057851e16a950043b31f95eca129168de9719f2",
+      "old_bytes": "9dd240864d8a38ab7799004a40014b97aba030d43f1648341375d1dd28b5acd6",
+      "repair": "R-PM-PAYLOAD payload SHA-256",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 192,
+      "new_bytes": "63a73d6e3038082b",
+      "old_bytes": "b8fc6b67c1321568",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 3
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (primary and tail)",
+    "recover_ordinal_from_sidecar (chaos medium faults, rebuilt map)",
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "faults": [
+    {
+      "block": 6,
+      "byte_changes": false,
+      "kind": "medium error",
+      "tape_file": 2
+    }
+  ],
+  "unit_inputs": null
+}

@@ -1,0 +1,35 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies; footer presented unreadable",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The tail copy is physically at block 5. The directory-assisted rescue locates it at total - 1 - H = 5 from the entry's counts, not from 0x80. Every other field is unchanged, and the copies agree with each other and with the directory hash.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-tail-start/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (new hash in both copies and directory key 8)",
+    "ISO-FAULT-FOOTER (the footer's 0x58 carries its own '= H + P' rule)"
+  ],
+  "mutation": {
+    "field": "tail_header_start_block u64",
+    "from": 5,
+    "offset": "0x80",
+    "to": 6
+  },
+  "parent": "sidecar-tail-start",
+  "pinned": true,
+  "quotes": [
+    "| 0x80 | 8 | tail_header_start_block u64 | MUST = H + P |"
+  ],
+  "sections": [
+    "9.2",
+    "13.3"
+  ],
+  "target": "tail_header_start_block rule (Section 9.2)",
+  "violates_only": "Section 9.2 'tail_header_start_block MUST = H + P'"
+}

@@ -1,0 +1,6 @@
+{
+  "key_10": "2^64 − 1 (CBOR 1b ff ff ff ff ff ff ff ff)",
+  "key_12": 1,
+  "overflow": "(2^64 − 1) + 1 = 2^64",
+  "variant": "a-range-sum"
+}

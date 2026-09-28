@@ -1,0 +1,8 @@
+{
+  "field": "total data ordinals",
+  "from": 5,
+  "must_match": "T recomputed over the prefix (Sections 7.2, 7.4) = 5; and highest_protected_ordinal (5), because sidecars are present (Section 10.6)",
+  "offset": "0x050",
+  "to": 6,
+  "variant": "b-total-data-ordinals"
+}

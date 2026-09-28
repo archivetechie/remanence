@@ -1,0 +1,7 @@
+{
+  "key_10": 0,
+  "key_12": "2^46",
+  "overflow": "2^46 × 262144 = 2^64",
+  "shadowed_by": "range check 0 + 2^46 > stored_block_count 2 also fails (same name); isolating the product would need stored_block_count >= 2^46 and a forged prefix",
+  "variant": "b-byte-product"
+}

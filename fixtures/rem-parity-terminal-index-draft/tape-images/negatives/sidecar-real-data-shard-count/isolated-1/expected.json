@@ -1,0 +1,32 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "real = 3 is in 1..=S*k and ≤ logical. data_crc_count = real, and the stream has 3 data-CRC entries. The Section 9.4 recompute with real = 3 gives inline 88 and H 1. The fill is zero. The range [0,4) is unchanged and agrees with the footer, directory and map entry. The copies agree.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-real-data-shard-count/isolated-1",
+  "integrity_repair": [
+    "ISO-BOTH (new hash in both copies, the footer and the directory; real is not mirrored)"
+  ],
+  "mutation": {
+    "fields": "in both copies: 0x48 = 3, 0x58 = 3, 0x68 = 88, fourth data-CRC entry (0x120..0x128) zeroed"
+  },
+  "parent": "sidecar-real-data-shard-count (variant a)",
+  "pinned": true,
+  "quotes": [
+    "`real_data_shard_count` MUST equal `protected_ordinal_end_exclusive − protected_ordinal_start`"
+  ],
+  "sections": [
+    "9.2",
+    "9.3",
+    "9.4"
+  ],
+  "target": "real_data_shard_count = end − start (Section 9.2)",
+  "violates_only": "Section 9.2 'real_data_shard_count MUST equal protected_ordinal_end_exclusive − protected_ordinal_start' (3 ≠ 4)"
+}

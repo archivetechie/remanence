@@ -1,0 +1,46 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "sidecar-total-block-count/b-header-zero-hostile",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 112,
+      "new_bytes": "0000000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "e96c2a5a7dc6c5d0853d78af53a797c99f2aaee14194677c490680244568521a",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "ce72f23a4a0b94c1",
+      "old_bytes": "5c6785f5e9c5d822",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 262136,
+      "new_bytes": "38c93e826c94fcdc",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "target_role": "SidecarCopy"
+}

@@ -1,0 +1,52 @@
+{
+  "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "replica-a.bin header and footer"
+  },
+  "concurrent_checks": [
+    "recorded 0x070/0x078/0x080 vs recomputed",
+    "device-measured record count (3)",
+    "covered_prefix = structural_row_count"
+  ],
+  "evaluation": "payload_len = 2^64 − 64 (fits); ceil = 2^46 (the form (L + B − 1)/B already overflows); count × B = 2^64 overflows in the padding formula. footer_block_offset and replica_record_count cannot overflow: payload_len <= 2^64 − 64, so count <= 2^64 − 64 even at B = 1, and 2 + count fits. No vector exists for those two.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "formula": "payload_record_count = ceil(payload_len / B); payload_padding_bytes = payload_record_count × B − payload_len; footer_block_offset = 1 + count; replica_record_count = 2 + count",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-10.4-record-geometry",
+  "integrity_repair": [
+    "R-TR-COMMON"
+  ],
+  "mutation": [
+    {
+      "name": "structural_row_count",
+      "position": "0x060",
+      "value": "2^58 − 1"
+    },
+    {
+      "name": "object_row_count",
+      "position": "0x068",
+      "value": 0
+    },
+    {
+      "name": "B",
+      "position": "0x040",
+      "value": "262144 (unchanged)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "payload_padding_bytes  = payload_record_count × B − payload_len"
+  ],
+  "sections": [
+    "10.4",
+    "10.6",
+    "2.4"
+  ],
+  "shadowed": false,
+  "target": "replica record-geometry validation (Sections 10.4, 10.6)",
+  "type": "u64"
+}

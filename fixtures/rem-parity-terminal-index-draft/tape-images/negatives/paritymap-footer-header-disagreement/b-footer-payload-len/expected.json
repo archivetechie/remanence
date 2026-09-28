@@ -1,0 +1,9 @@
+{
+  "block_within_file": 2,
+  "field": "payload_len u64",
+  "from": "L (the header's payload_len)",
+  "offset": "0x30",
+  "rule": "footer locator input disagrees with both headers while its own M = ceil((0xC8 + L + 1)/B) is still 1, so the footer is self-consistent and only the header/footer comparison fails",
+  "to": "L + 1",
+  "variant": "b-footer-payload-len"
+}

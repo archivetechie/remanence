@@ -1,0 +1,39 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "evaluation": "block(0, 1) = (2^64 - 1) + 1×2 + 0 overflows. parity_index·S < 2^16 × 2^32, so only a hostile H reaches overflow.",
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "formula": "block(stripe, parity_index) = H + parity_index·S + stripe",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-9.1-block-locator",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": [
+    {
+      "name": "H",
+      "position": "sidecar header 0x60",
+      "value": "2^64 - 1"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "block(stripe, parity_index) = H + parity_index·S + stripe",
+    "A Reader MUST locate a parity shard by computing `block(stripe, parity_index)` from its explicit fields, never by the position of its index entry."
+  ],
+  "sections": [
+    "9.1",
+    "9.4",
+    "2.4"
+  ],
+  "shadowed": "The copy fails first if the Reader runs the Section 9.4 H recompute and 2H + P + 1 before the locator; every path is SidecarParse, and the tail copy (H = 1) is then used.",
+  "target": "the Recoverer locating a parity shard from the acquired index (Sections 9.1, 13.4)",
+  "type": "u64"
+}

@@ -1,0 +1,64 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "overflow-10.1.2-tail-at-M",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "c900000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "010049cf165c72a5",
+      "old_bytes": "9d39a7ae60c7497b",
+      "repair": "ParityMap CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 48,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "c900000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 192,
+      "new_bytes": "6e4f1c95f4429790",
+      "old_bytes": "f276f2f482d9ac4e",
+      "repair": "ParityMap CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 48,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "c900000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 192,
+      "new_bytes": "24c58506b7a92eb6",
+      "old_bytes": "b8fc6b67c1321568",
+      "repair": "ParityMap CRC",
+      "tape_file": 3
+    }
+  ],
+  "entry_points": [
+    "parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor"
+  ],
+  "target_role": "ParityMap"
+}

@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "the five tuples with starts 2^64−20, 2^64−16, 2^64−12, 2^64−8, 2^64−4 and counts 3 (files 1..5), expected_eod_lba any"
+  },
+  "case": "overflow-8.3-eod/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "TerminalTailLayout::validate"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "the five tuples with starts 2^64−20, 2^64−16, 2^64−12, 2^64−8, 2^64−4 and counts 3 (files 1..5), expected_eod_lba any"
+  }
+}

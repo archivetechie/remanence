@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "replica record-geometry computation (Section 10.4), as called in local eligibility (Section 10.6)"
+  },
+  "every_other_rule_holds": "Image level is impossible: the frame's row counts are validated against the payload slots, which must all decode (Section 10.6), and against the device-measured record count. A replica consistent with s = 2^58 would need 2^64 payload bytes, and its covered count would have to equal s. This is why the parent was refused on count and scope grounds first.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.4-slot-product/isolated-1",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "structural_row_count = 2^58, object_row_count = 0"
+  },
+  "parent": "overflow-10.4-slot-product (variant a)",
+  "pinned": true,
+  "quotes": [
+    "payload_len            = 64 × structural_row_count + 256 × object_row_count",
+    "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results."
+  ],
+  "sections": [
+    "10.4",
+    "10.6",
+    "2.4"
+  ],
+  "target": "payload_len = 64 × s + 256 × o",
+  "violates_only": "Checked evaluation of 64 × 2^58"
+}

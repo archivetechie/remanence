@@ -1,0 +1,27 @@
+{
+  "base": {
+    "artifact": "none"
+  },
+  "evaluation": "Only the Writer evaluates this, from its own prefix state, for capacity admission. No input is read from tape bytes, so no vector can reach it. The payload-length part is covered on the Reader side by overflow-10.4-slot-product.",
+  "expected": {
+    "error": "not applicable (no hostile input)"
+  },
+  "formula": "close reserve = parity closeout + (64 × structural_row_count + 256 × object_row_count) in three rounded replica records + both separation extents + five filemark charges",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": false,
+  "id": "overflow-10.3-close-reserve",
+  "integrity_repair": [],
+  "mutation": [],
+  "pinned": true,
+  "quotes": [
+    "A tape's close reserve is the space its finalization needs: parity closeout, the checked terminal payload `64 × structural_row_count + 256 × object_row_count` in three rounded replica records, both separation extents, and five filemark charges."
+  ],
+  "sections": [
+    "10.3",
+    "15"
+  ],
+  "shadowed": false,
+  "target": "Writer capacity admission (Section 10.3; practice in the Guide)",
+  "type": "u64"
+}

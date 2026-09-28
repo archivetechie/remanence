@@ -1,0 +1,39 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "footer 0x58 comparison",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-tail-start",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "tail_header_start_block u64",
+    "formula": "MUST = H + P = 1 + 4 = 5",
+    "from": 5,
+    "offset": "0x80",
+    "to": 6
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x80 | 8 | tail_header_start_block u64 | MUST = H + P |"
+  ],
+  "sections": [
+    "9.1",
+    "9.2",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy (located by the footer, which still says 5); epoch 0 usable.",
+  "target": "sidecar header tail_header_start_block rule (Section 9.2)"
+}

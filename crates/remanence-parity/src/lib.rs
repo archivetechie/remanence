@@ -48,7 +48,8 @@ pub mod object_recovery;
 pub mod parity_map;
 pub mod raw;
 pub mod recovery;
-mod replicated_control;
+#[doc(hidden)]
+pub mod replicated_control;
 pub mod resume;
 pub mod scan;
 pub mod sidecar;

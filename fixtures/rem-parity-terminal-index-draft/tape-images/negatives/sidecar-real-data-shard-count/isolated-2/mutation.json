@@ -1,0 +1,309 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "authored_mutation": {
+    "fields": "in both copies: 0x38 = 5, 0x48 = 5, 0x58 = 5, 0x68 = 104, a fifth data-CRC entry at 0x128 (the CRC of Object block 4); footer range [0,5); directory keys 3-4 = [0,5), scope W = T = 5; replica rows: Object block_count 5, sidecar range [0,5), T = W = 5. Parity bytes are arbitrary (data_index 2 >= k has no generator column); the index records their CRCs."
+  },
+  "case": "sidecar-real-data-shard-count/isolated-2",
+  "commit_record_inputs": null,
+  "edits": [
+    {
+      "block_count": 5,
+      "new_sha256": "2666606ca01d9f0adbbef239ee70373ff3b27c19d976a01d699303d57debcdee",
+      "old_sha256": "0d58595c1aab94f2b1db566a18241acd4418b0ea749f21b54e3f9f5245729eba",
+      "rebuild": "write_tape_image with object(5,0); retain its exact Object bytes",
+      "tape_file": 1
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 48,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 72,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 88,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 104,
+      "new_bytes": "6800000000000000",
+      "old_bytes": "6000000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "4ae8a243caf5b361",
+      "old_bytes": "6813738453d42617",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 272,
+      "new_bytes": "830190723944bbe2",
+      "old_bytes": "830190723944bbe2",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 280,
+      "new_bytes": "830190723944bbe2",
+      "old_bytes": "98e92101f8aa1d79",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 288,
+      "new_bytes": "c6de55679ba5f9c6",
+      "old_bytes": "68a053bc838236d2",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "25ccbbe6df3e54f7",
+      "old_bytes": "0000000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 72,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 88,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 104,
+      "new_bytes": "6800000000000000",
+      "old_bytes": "6000000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 56,
+      "new_bytes": "0500000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 264,
+      "new_bytes": "4ae8a243caf5b361",
+      "old_bytes": "6813738453d42617",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 272,
+      "new_bytes": "830190723944bbe2",
+      "old_bytes": "830190723944bbe2",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 280,
+      "new_bytes": "830190723944bbe2",
+      "old_bytes": "98e92101f8aa1d79",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 288,
+      "new_bytes": "c6de55679ba5f9c6",
+      "old_bytes": "68a053bc838236d2",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 296,
+      "new_bytes": "25ccbbe6df3e54f7",
+      "old_bytes": "0000000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "260e9df505ebdbc92be190dd32fe16bb34d80d37ff3668a6bc1e7457d8d55d7c",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "8fbcd86e1f3cb683",
+      "old_bytes": "5c6785f5e9c5d822",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 262136,
+      "new_bytes": "8baee0e17e7482cb",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 152,
+      "new_bytes": "260e9df505ebdbc92be190dd32fe16bb34d80d37ff3668a6bc1e7457d8d55d7c",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 192,
+      "new_bytes": "e657e2813ebc50cf",
+      "old_bytes": "358cbf1ac8453e6e",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 262136,
+      "new_bytes": "8baee0e17e7482cb",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 96,
+      "new_bytes": "260e9df505ebdbc92be190dd32fe16bb34d80d37ff3668a6bc1e7457d8d55d7c",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "ISO-BOTH footer hash",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 128,
+      "new_bytes": "0dc57800bb96f868",
+      "old_bytes": "d8ed158e3575f1a0",
+      "repair": "R-SC-FOOTER footer_crc64",
+      "tape_file": 2
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "f416059f22fe84abd809abdd618ff2132aaee807d1cc7a778f750c6d8bc08181",
+      "old_sha256": "faff63888d0aa163ac9276352d2134880ef52df88d8a1c50729cabee0cfd1ef5",
+      "rebuild": "encode_parity_map_tape_file with rebuilt directory and FilemarkMap::canonical_digest",
+      "tape_file": 3
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "e2659b6f3ebeab5b19ca404171f6ca36f1ab5996100250bd11499fb1f7214068",
+      "old_sha256": "4aa7bc62103948336300ef3dc2e6190948101429d798b40ab1ff0406e6cd81ed",
+      "rebuild": "assemble_terminal_plan + write_tape_index_replica",
+      "tape_file": 4
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "b292b3cd8081aa26465f9ad0e5cd7e14c3b3eea9542932c3ce9ae225521f1bb2",
+      "old_sha256": "cbebe1fb39dd7d2b912a6042299833b6cca32127c54d39f31d98891a07e9232a",
+      "rebuild": "assemble_terminal_plan + write_tape_index_replica",
+      "tape_file": 6
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "5739a7c643f77d0e2170a0380a629208a2031d30ef59fe00b6390930a8266dfe",
+      "old_sha256": "6ba7f301bf23685e59ebd1041b2d0ec5a7e22abec099e05f8203f932fbd728ba",
+      "rebuild": "assemble_terminal_plan + write_tape_index_replica",
+      "tape_file": 8
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "0db184092347265a71763d9bc9cba199ae60c12f1dec8a2d0d194c307a2346cb",
+      "old_sha256": "fed1eab8921bf96d74230ee9122a0e5a990145c358dfbabe567c40808eb0a286",
+      "rebuild": "assemble_terminal_plan + write_index_separation",
+      "tape_file": 5
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "54fe445ee78b2e64263e56bd8cba941a23b817f1c9d0d8354e25a757831f8e12",
+      "old_sha256": "e36b4bff04bf9f40299f4123a27b5c68c2ff445421a09a15c3a79b9cc249d0ad",
+      "rebuild": "assemble_terminal_plan + write_index_separation",
+      "tape_file": 7
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (primary and tail)",
+    "recover_ordinal_from_sidecar (chaos medium faults, rebuilt map)",
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "faults": [],
+  "unit_inputs": null
+}

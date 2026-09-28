@@ -1,0 +1,8 @@
+{
+  "field": "covered-prefix tape-file count",
+  "from": 6,
+  "must_match": "structural_row_count (6) and replica A's planned tape-file number (6) (Section 10.6); the digest scope of exactly the leading tape_file_count entries (Section 7.4)",
+  "offset": "0x048",
+  "to": 7,
+  "variant": "a-covered-prefix"
+}

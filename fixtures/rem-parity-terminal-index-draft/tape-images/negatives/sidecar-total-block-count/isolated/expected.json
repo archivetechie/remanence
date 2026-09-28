@@ -1,0 +1,38 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal, rebuilt: the sidecar at tape file 2 becomes 8 blocks",
+    "copy": "both copies, footer, directory, map",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The header total equals the measured count, 8 (Scanner item 5, Section 16.2). The tail start 5 = H + P and footer index 6 = 2H + P hold, and the footer is at block 6. The footer's fields agree with both copies, including total 8, which equals the measured count. The copies agree. The directory entry and the map agree on block count 8. Block 7 is the extra block that the declared total implies. It breaks no rule of its own: it does not parse as a footer, and Section 13.3 treats an unparseable last block as a fallback, not a violation.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-total-block-count/isolated",
+  "integrity_repair": [
+    "R-SC-HASHED in both copies",
+    "footer_crc64",
+    "ISO-REBUILD"
+  ],
+  "mutation": {
+    "field": "sidecar_total_block_count (0x70) = 8 in both copies; footer total (0x48) = 8; directory key 5 = 8; replica structural row block_count = 8",
+    "file_layout": "blocks 0 primary, 1..4 parity, 5 tail, 6 footer (at footer_block_index = 2H + P = 6), 7 an all-zero block",
+    "prefix_effect": "later LBAs shift by +1"
+  },
+  "parent": "sidecar-total-block-count (variant a)",
+  "pinned": true,
+  "quotes": [
+    "| 0x70 | 8 | sidecar_total_block_count u64 | = 2H + P + 1 |"
+  ],
+  "sections": [
+    "9.1",
+    "9.2",
+    "12.3",
+    "13.3"
+  ],
+  "tape_level": "The footer-first step reads the last block (7), which is not a footer, and falls back to the primary (step 2), which fails. Step 3 computes the tail at 8 - 1 - 1 = 6, the footer block, whose hash check fails, so no copy validates.",
+  "target": "sidecar total rule (Section 9.2)",
+  "violates_only": "Section 9.2 'sidecar_total_block_count = 2H + P + 1' (8 ≠ 7)"
+}

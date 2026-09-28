@@ -1,0 +1,28 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "sidecar-zero-fill/b-tail-copy-fill",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 131072,
+      "new_bytes": "01",
+      "old_bytes": "00",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 262136,
+      "new_bytes": "997d010773c6c017",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "target_role": "SidecarCopy"
+}

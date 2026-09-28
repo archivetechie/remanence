@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "E = 2^64 − 1, B = 262144"
+  },
+  "case": "overflow-10.5-extent-geometry/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "index_separation::checked_index_separation_bytes"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "E = 2^64 − 1, B = 262144"
+  }
+}

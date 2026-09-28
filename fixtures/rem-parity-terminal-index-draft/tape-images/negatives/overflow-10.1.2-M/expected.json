@@ -1,0 +1,39 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "primary header, tail header and footer (the same value in all three, so they do not disagree)",
+    "tape_file": 3
+  },
+  "evaluation": "0xC8 + L overflows u64.",
+  "expected": {
+    "error": "ParityMapParse"
+  },
+  "formula": "M = ceil((0xC8 + L) / B)",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-10.1.2-M",
+  "integrity_repair": [
+    "CRC at 0xC0 of all three blocks"
+  ],
+  "mutation": [
+    {
+      "name": "payload_len (L)",
+      "position": "ParityMap 0x30 in blocks 0, 1, 2",
+      "value": "0xFFFFFFFFFFFFFFFF"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy",
+    "Readers MUST validate the locator arithmetic (`M` from `payload_len` and `block_size`; total = 2M + 1; the three start indices)"
+  ],
+  "sections": [
+    "10.1.2",
+    "10.1.4",
+    "2.4"
+  ],
+  "shadowed": false,
+  "target": "ParityMap locator validation (Section 10.1.4)",
+  "type": "u64"
+}

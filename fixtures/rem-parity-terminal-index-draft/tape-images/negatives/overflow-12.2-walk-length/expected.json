@@ -1,0 +1,43 @@
+{
+  "base": {
+    "artifact": "any image, under a fault-injecting transport"
+  },
+  "evaluation": "0 − 1 underflows. No byte mutation of an image can produce it; it needs a device model that reports inconsistent positions.",
+  "expected": {
+    "one_of": [
+      "TapeIo",
+      "FilemarkMapReconstruct"
+    ],
+    "permitting_text": "Section 12.2 calls a zero-block file 'structural damage' without naming an error; Section 15's TapeIo covers a 'transport/medium failure' and FilemarkMapReconstruct a walk that 'could not produce a valid map'."
+  },
+  "formula": "block_count = position delta − 1",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": "device-reported positions only; no tape byte feeds the formula",
+  "id": "overflow-12.2-walk-length",
+  "integrity_repair": [
+    "not applicable"
+  ],
+  "mutation": [
+    {
+      "name": "post-space position",
+      "position": "device report after spacing to the next filemark",
+      "value": "equal to the file's start position (delta 0)"
+    }
+  ],
+  "note": "Listed among the formulas with no hostile tape-byte input.",
+  "pin_reason": "Section 2.4 governs 'values read from tape'; whether device-reported positions are included is unstated, and no error is named.",
+  "pinned": false,
+  "quotes": [
+    "measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage"
+  ],
+  "sections": [
+    "12.2",
+    "2.4",
+    "3.5",
+    "15"
+  ],
+  "shadowed": false,
+  "target": "the Scanner walk (Section 12.2)",
+  "type": "u64"
+}
