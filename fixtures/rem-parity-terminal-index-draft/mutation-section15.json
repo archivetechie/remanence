@@ -1,0 +1,1235 @@
+{
+  "description": "Section 15 error names for the 50 terminal-index hostile mutations of MUTATIONS.tsv, written from the REM-PARITY text by an author who did not read the reference or its verifier. They were decided from byte-level descriptions under opaque ids, and are keyed here by the table's case_id.",
+  "source": "specs/in-progress/rem-parity-1-specification.md",
+  "entries": {
+    "filemark-missing": {
+      "component": "replica-a.bin (event: the filemark after replica A is absent; every byte unchanged)",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "BotStructuralRecoveryRequired",
+        "pinned": true,
+        "reason": "No replica validates. A's records sit at their planned LBAs 25-27, but the read after its footer at LBA 28 returns AB's header instead of a Filemark, so A fails the trailing-filemark condition. Every later record moves down by one: AB occupies 28-30 with its filemark at 31, B 32-34 (planned 33), BC 36-38 (planned 37), C 40-42 (planned 41), and EOD is 44 (planned 45). B's header is not at its planned coordinate 33. C's footer, found from EOD at 42, records an observed footer LBA of 43, which the device contradicts. With A, B and C all invalid, Section 12.4 returns BotStructuralRecoveryRequired and the Section 8.4.1 walk."
+      },
+      "sections": [
+        "8.3",
+        "8.4",
+        "10.6",
+        "12.2",
+        "12.3",
+        "12.4",
+        "15"
+      ],
+      "quotes": [
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "validate the header, footer and trailing filemark of every replica that layout plans",
+        "| `0x04` | 4 | trailing filemark count, exactly `1` |",
+        "A valid footer still does not prove its trailing filemark or any host-side commit record.",
+        "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk"
+      ],
+      "pinned": true,
+      "notes": "Decided on the coordinator's clarified reading of the event. A's bytes are intact; the failure is the missing trailing filemark, which Section 8.3 plans as exactly one per component and Section 10.6 requires the device to confirm. In a BOT walk the same damage makes A and AB one tape file of 6 records, which fails the measured-count check of Section 12.3 item 2 ('A malformed frame or count mismatch is reported as a damaged terminal replica'), with the same name; Section 12.2 calls a missing trailing filemark structural damage. B and C also fail with TerminalIndexReplicaParse (displaced positions), and AB with TerminalIndexSeparationParse (its header is at LBA 28, not 29). None of these is a conflict: an invalid replica is degraded evidence (Section 8.5), and here no survivor remains."
+    },
+    "gap-compression-enabled": {
+      "component": "gap-ab.bin header and footer, compression mode 0 -> 1",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexSeparationParse",
+          "DriveCompressionEnabled"
+        ],
+        "permitting_text": "Section 10.6 lists compression mode among the frame fields that must validate (a separation parse failure), while Section 15's DriveCompressionEnabled covers compression 'recorded for a parity tape'. Section 16.3 ties tape rejection to bootstrap key 5 only."
+      },
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6",
+        "15",
+        "16.3"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4",
+        "The on-media compression field is an assertion that compression was disabled, not proof of it.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "DriveCompressionEnabled         compression detected on / recorded for a parity tape",
+        "The recorded `drive_compression` flag (bootstrap key 5) makes a tape written with compression enabled identify itself as nonconformant. A Reader MUST reject such a tape.",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents."
+      ],
+      "pinned": false,
+      "notes": "One rule fails: compression mode is fixed at 0. The CRCs and header hash were recomputed, and compression mode is not in the separation descriptor preimage. The tape-level result stands under either name: no rule makes a terminal frame's compression field reject the tape.",
+      "pin_reason": "Two Section 15 names fit a recorded compression flag in a terminal frame."
+    },
+    "gap-footer-damaged": {
+      "component": "gap-ab.bin footer, reserved 0x1C8",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: reserved not zero, and a stale footer CRC."
+    },
+    "gap-footer-missing": {
+      "component": "gap-ab.bin, footer record removed (2 records remain)",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replica A only, degraded",
+        "pinned": true,
+        "reason": "Removing or adding a whole record of AB moves every later tape file on the medium. B's header is no longer at its planned LBA 33, and C's records, trailing filemark and EOD are displaced. B and C therefore fail the device-measurement condition of Section 10.6. A lies before AB and is unaffected. Reading: the five components are consecutive tape files, each followed by one filemark, as Section 8.3 plans."
+      },
+      "sections": [
+        "8.3",
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once: there is no footer (the last record read is the zero interior, a footer magic miss), and the measured count 2 ≠ planned 3."
+    },
+    "gap-footer-torn": {
+      "component": "gap-ab.bin, last 100 bytes removed (footer record 262044 bytes)",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexSeparationParse",
+          "TapeIo"
+        ],
+        "permitting_text": "The component's byte length is not a whole number of records, so its last record is short. Section 10.6 makes record length a frame validity condition (a format violation). Section 3.5 makes a read of 'other than exactly one block' an I/O-layer error without saying whether it is a medium or a transport error. Section 15 keeps I/O faults distinct from format violations."
+      },
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "3.5",
+        "8.4",
+        "10.5",
+        "10.6",
+        "15"
+      ],
+      "quotes": [
+        "The meaningful frame is `0x200` bytes and the rest of the full record is zero.",
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "TapeIo                          transport/medium failure (not a format violation)",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents."
+      ],
+      "pinned": false,
+      "notes": "One format rule fails: the footer record's length (all of its frame bytes and CRC survive). Reading: 3 records remain, the last one short, so no later position moves.",
+      "pin_reason": "Format violation or I/O error: the text does not classify a short record read."
+    },
+    "gap-header-damaged": {
+      "component": "gap-ab.bin header, reserved 0x1C8",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Three rules fail at once: reserved not zero, stale header CRC, and a stale footer header-record SHA-256."
+    },
+    "gap-header-missing": {
+      "component": "gap-ab.bin, header record removed (2 records remain)",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replica A only, degraded",
+        "pinned": true,
+        "reason": "Removing or adding a whole record of AB moves every later tape file on the medium. B's header is no longer at its planned LBA 33, and C's records, trailing filemark and EOD are displaced. B and C therefore fail the device-measurement condition of Section 10.6. A lies before AB and is unaffected. Reading: the five components are consecutive tape files, each followed by one filemark, as Section 8.3 plans."
+      },
+      "sections": [
+        "8.3",
+        "10.5",
+        "10.6",
+        "8.4"
+      ],
+      "quotes": [
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. At AB's planned start the first record is the zero interior (magic miss), there is no header, and the measured count 2 ≠ planned 3. The tape-level result follows from the displacement of B and C (see tape_level.reason)."
+    },
+    "gap-header-torn": {
+      "component": "gap-ab.bin, first 100 bytes removed (786332 bytes)",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexSeparationParse",
+          "TapeIo"
+        ],
+        "permitting_text": "The component's byte length is not a whole number of records, so its last record is short. Section 10.6 makes record length a frame validity condition (a format violation). Section 3.5 makes a read of 'other than exactly one block' an I/O-layer error without saying whether it is a medium or a transport error. Section 15 keeps I/O faults distinct from format violations. If the header record is read first, its magic misses: 'A magic or CRC miss invalidates that candidate'."
+      },
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "3.5",
+        "8.4",
+        "10.5",
+        "10.6",
+        "15"
+      ],
+      "quotes": [
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**.",
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "TapeIo                          transport/medium failure (not a format violation)",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents."
+      ],
+      "pinned": false,
+      "notes": "Many rules fail at once. The first record is shifted, so the role magic, CRC and every field miss, and the final record is 262044 bytes. Reading: the stream is written as consecutive 262144-byte records with a final short record, so AB still has 3 records and later positions do not move. An inventory Scanner need not read AB, so the tape-level result holds under either component reading.",
+      "pin_reason": "Format violation or I/O error: the text does not classify a short record read."
+    },
+    "gap-interior-damaged": {
+      "component": "gap-ab.bin interior record, first byte 0x01",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C, not degraded; a full-verification Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "An inventory Scanner need not read the separation extents, and the interior check binds full verification."
+      },
+      "sections": [
+        "10.6"
+      ],
+      "quotes": [
+        "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero. An extent whose interior is not entirely zero is invalid for full verification.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete.",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6"
+      ],
+      "pinned": true,
+      "notes": "One rule fails: the interior is not all zero. It is observed only by full verification; no frame field changes."
+    },
+    "gap-misclassified": {
+      "component": "gap-ab.bin header record replaced by replica-a.bin's header record",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexSeparationParse",
+          "TerminalIndexReplicaParse"
+        ],
+        "permitting_text": "At AB's planned coordinate the layout expects a separation header; the record's magic is the replica-header magic, a separation magic miss (TerminalIndexSeparationParse). But Section 10.6 and Section 12.3 item 2 say a matching role magic 'commits the tape file to its control type', which makes the file a malformed terminal replica (TerminalIndexReplicaParse)."
+      },
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded); a Verifier reports the AB file invalid and the terminal suffix not complete",
+        "pinned": true,
+        "reason": "A, B and C keep their base bytes and agree. The AB file is not a replica the layout plans (Section 8.4 step 2 validates the replicas 'that layout plans'), and its footer is a separation footer whose header hash no longer matches, so it is not a fully valid fourth replica and cannot cause a conflict."
+      },
+      "sections": [
+        "8.4",
+        "10.5",
+        "10.6",
+        "12.3"
+      ],
+      "quotes": [
+        "a matching role magic commits the tape file to its control type, so malformed control never falls through to Object (Section 12.3).",
+        "**TapeIndexReplica**: matching terminal-replica header magic commits the tape file to this control type.",
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents."
+      ],
+      "pinned": false,
+      "notes": "Many rules fail at once: role magic, frame layout, footer header-record hash, and header/footer descriptor agreement.",
+      "pin_reason": "Which control type the file belongs to is decided either by the plan or by the magic."
+    },
+    "gap-mixed-header-footer": {
+      "component": "gap-ab.bin footer replaced by gap-bc.bin's footer",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.4",
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor.",
+        "Local observations in a footer MUST equal that plan.",
+        "The header and footer repeat the same descriptor digest. A footer therefore cannot bind another ordinal or location.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. The footer's header-record SHA-256 describes BC's header, not AB's. Header and footer carry different descriptors (ordinal 1 vs 2, local tuple, descriptor digest). The footer observations (file 9, start 37) differ from AB's plan (7, 29). The footer's own CRC verifies."
+    },
+    "gap-wrong-edition": {
+      "component": "gap-ab.bin header and footer, edition ID 0x22.. -> 0x24..",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "Its edition ID MUST equal the replicas'.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: the edition ID must equal the replicas', and the stale separation descriptor digest (edition_id in its preimage) fails."
+    },
+    "gap-wrong-nominal-range": {
+      "component": "gap-ab.bin header and footer, nominal extent bytes 786433",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "The frame records `E`, and Readers derive the geometry from the recorded value",
+        "total_records    = ceil(E / B), required ≥ 2",
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. ceil(786433/262144) = 4 ≠ the recorded total 3; footer offset 3 ≠ 2 and interior 2 ≠ 1; the measured count 3 ≠ 4; and the separation descriptor digest is stale (nominal_extent_bytes in its preimage)."
+    },
+    "gap-wrong-observed-start": {
+      "component": "gap-ab.bin (separation AB) footer",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "8.3",
+        "10.4",
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "Local observations in a footer MUST equal that plan.",
+        "The footer arithmetic of Section 10.4 applies to its footer fields (`0x1A8`, `0x1B0`, `0x1B8`, `0x1C0`).",
+        "In a footer, the backward start delta (`0x2F8`) MUST equal the observed record count (`0x2E8`) minus one, and the observed footer LBA (`0x2F0`) MUST equal the observed start LBA (`0x2E0`) plus that delta. A Reader rejects a footer whose values differ.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once. (1) The observed start LBA 30 differs from AB's planned start 29 (footer observations MUST equal the plan). (2) Footer arithmetic: the observed footer LBA 31 ≠ observed start 30 + delta 2. The footer CRC was recomputed, so it does not fire."
+    },
+    "gap-wrong-ordinal": {
+      "component": "gap-ab.bin header and footer, separation ordinal 1 -> 2",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "8.3",
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Two or more rules fail at once: ordinal 2 does not match AB's planned component (5,1), and the stale separation descriptor digest (separation_ordinal in its preimage) fails."
+    },
+    "gap-wrong-record-count": {
+      "component": "gap-ab.bin header and footer, total record count 3 -> 4",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "The frame records `E`, and Readers derive the geometry from the recorded value",
+        "total_records    = ceil(E / B), required ≥ 2",
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. The recorded total 4 ≠ ceil(786432/262144) = 3 ≠ the measured count 3; the footer offset 2 and interior 1 are inconsistent with 4; and the separation descriptor digest is stale (total_records in its preimage)."
+    },
+    "gap-wrong-tape": {
+      "component": "gap-ab.bin header and footer, tape UUID",
+      "component_error": "TerminalIndexSeparationParse",
+      "tape_level": {
+        "outcome": "inventory from replicas A, B and C (not degraded: Section 12.6 defines degraded by replica siblings); a Verifier reports AB invalid and MUST NOT report the terminal suffix complete",
+        "pinned": true,
+        "reason": "The separation extent's validity does not affect replica acceptance, and all three replicas keep their base bytes and agree."
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4",
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "The validity of a separation extent does not affect whether a replica is accepted for an inventory. A Scanner that reads only the replicas to return an inventory need not read the separation extents.",
+        "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: the frame UUID differs from the tape's, and the stale separation descriptor digest (tape_uuid in its preimage) fails."
+    },
+    "gap-wrong-total-length": {
+      "component": "gap-ab.bin with one 0x00 byte appended (786433 bytes)",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexSeparationParse",
+          "TapeIo"
+        ],
+        "permitting_text": "The component's byte length is not a whole number of records, so its last record is short. Section 10.6 makes record length a frame validity condition (a format violation). Section 3.5 makes a read of 'other than exactly one block' an I/O-layer error without saying whether it is a medium or a transport error. Section 15 keeps I/O faults distinct from format violations."
+      },
+      "tape_level": {
+        "outcome": {
+          "one_of": [
+            "inventory from replica A only, degraded",
+            "inventory from replicas A, B and C"
+          ]
+        },
+        "pinned": false,
+        "reason": "If the extra byte forms a fourth (1-byte) record, AB has 4 records against a planned 3, and every later file moves by one. B and C then fail the device-measurement condition, and only A survives (as in mut-14). If the medium carries no such record, nothing moves. The row does not say how the stray byte is written."
+      },
+      "sections": [
+        "3.5",
+        "8.3",
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple.",
+        "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**.",
+        "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6",
+        "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+      ],
+      "pinned": false,
+      "notes": "The count and length rules fail if the byte forms a record; no frame byte changes.",
+      "pin_reason": "The record mapping of a non-record-multiple stream is not defined."
+    },
+    "replica-compression-enabled": {
+      "component": "replica-a.bin header and footer, compression mode 0 -> 1",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexReplicaParse",
+          "DriveCompressionEnabled"
+        ],
+        "permitting_text": "As mut-06: Section 10.6 frame validity versus Section 15's 'recorded for a parity tape'."
+      },
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "15",
+        "16.3"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "DriveCompressionEnabled         compression detected on / recorded for a parity tape",
+        "The recorded `drive_compression` flag (bootstrap key 5) makes a tape written with compression enabled identify itself as nonconformant. A Reader MUST reject such a tape.",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": false,
+      "notes": "Two rules fail at once: compression mode must be 0, and the stale edition digest (compression_mode is in its preimage) no longer recomputes. Tape level: no rule makes a terminal frame's compression field reject the tape, so B and C decide.",
+      "pin_reason": "Two Section 15 names fit."
+    },
+    "replica-footer-damaged": {
+      "component": "replica-a.bin footer, reserved 0x300",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "16.2"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: reserved bytes not zero, and the footer CRC-64/XZ is stale."
+    },
+    "replica-footer-torn": {
+      "component": "replica-a.bin, last 100 bytes removed (footer record 262044 bytes)",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexReplicaParse",
+          "TapeIo"
+        ],
+        "permitting_text": "The component's byte length is not a whole number of records, so its last record is short. Section 10.6 makes record length a frame validity condition (a format violation). Section 3.5 makes a read of 'other than exactly one block' an I/O-layer error without saying whether it is a medium or a transport error. Section 15 keeps I/O faults distinct from format violations."
+      },
+      "tape_level": {
+        "outcome": {
+          "one_of": [
+            "inventory from replicas B and C, degraded",
+            "discovery aborted (TapeIo)"
+          ]
+        },
+        "pinned": false,
+        "reason": "Section 8.4: 'A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.' Reading A's footer (as step 2 requires for every planned replica) meets the short record. If that is a format failure or a medium error, A alone is invalid. If it is a transport error, discovery aborts."
+      },
+      "sections": [
+        "3.5",
+        "8.4",
+        "10.4",
+        "10.6",
+        "15"
+      ],
+      "quotes": [
+        "The header and footer each occupy one complete tape record. Their meaningful frame is the first `0x400` bytes; bytes from `0x400` through the end of the record are zero.",
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**.",
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "TapeIo                          transport/medium failure (not a format violation)"
+      ],
+      "pinned": false,
+      "notes": "One format rule fails: the footer record's length (frame and CRC intact).",
+      "pin_reason": "The text does not classify a short record read."
+    },
+    "replica-frame-padding": {
+      "component": "replica-a.bin header record byte 0x400 = 0x01",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "The header and footer each occupy one complete tape record. Their meaningful frame is the first `0x400` bytes; bytes from `0x400` through the end of the record are zero.",
+        "the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: record bytes after the 0x400 frame must be zero, and the footer's complete-header-record SHA-256 is stale. The header CRC does not cover the byte."
+    },
+    "replica-header-damaged": {
+      "component": "replica-a.bin header, reserved 0x300",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor.",
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Three rules fail at once: reserved not zero, stale header CRC, and a stale footer header-record SHA-256."
+    },
+    "replica-header-torn": {
+      "component": "replica-a.bin, first 100 bytes removed (786332 bytes)",
+      "component_error": {
+        "one_of": [
+          "TerminalIndexReplicaParse",
+          "TapeIo"
+        ],
+        "permitting_text": "The component's byte length is not a whole number of records, so its last record is short. Section 10.6 makes record length a frame validity condition (a format violation). Section 3.5 makes a read of 'other than exactly one block' an I/O-layer error without saying whether it is a medium or a transport error. Section 15 keeps I/O faults distinct from format violations. The header record read at A's planned start begins at original byte 100, so its role magic misses."
+      },
+      "tape_level": {
+        "outcome": {
+          "one_of": [
+            "inventory from replicas B and C, degraded",
+            "discovery aborted (TapeIo)"
+          ]
+        },
+        "pinned": false,
+        "reason": "As mut-31. The header's magic miss invalidates A, but step 2 also reads A's footer, which is now a short record; a transport-error classification would abort discovery."
+      },
+      "sections": [
+        "3.5",
+        "8.4",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery.",
+        "Fixed-block reads and writes only; a read returning other than exactly one block is an error, with two classified boundary outcomes: **Filemark** and **EndOfData**.",
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "TapeIo                          transport/medium failure (not a format violation)"
+      ],
+      "pinned": false,
+      "notes": "Many rules fail at once: shifted frames (magic, CRC, all fields) and a short final record.",
+      "pin_reason": "The text does not classify a short record read."
+    },
+    "replica-map-row-mismatch": {
+      "component": "replica-a.bin payload, the two Object-row slots swapped",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.3",
+        "10.6"
+      ],
+      "quotes": [
+        "every terminal replica carries exactly `object_row_count` 256-byte fixed slots, one for each kind-0 structural row, in strictly increasing `tape_file_number` order",
+        "The row set is the complete final-prefix Object inventory. Its count MUST equal the number of kind-0 structural slots, and the ordered `(tape_file_number, stored_block_count)` pairs MUST be a bijection with those slots.",
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two or more rules fail at once: the rows are not in strictly increasing tape_file_number order (3, 1), the ordered pairs no longer align with the kind-0 structural rows, and the payload SHA-256 is stale."
+    },
+    "replica-metadata-frame-too-short": {
+      "component": "replica-a.bin payload, second Object row key 21 = 16",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.3",
+        "10.6",
+        "REM-ENCRYPT 5.2"
+      ],
+      "quotes": [
+        "| 21 | uint | encrypted only | REM-ENCRYPT header `metadata_frame_len`; bounds `[17, 16 MiB]` |",
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: metadata_frame_len 16 is below the [17, 16 MiB] bound, and the stale payload SHA-256 fails. The slot framing was re-encoded consistently."
+    },
+    "replica-mixed-header-footer": {
+      "component": "replica-a.bin footer replaced by replica-b.bin's footer",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "8.4"
+      ],
+      "quotes": [
+        "The header and footer repeat the same descriptor digest. A footer therefore cannot bind another ordinal or location.",
+        "the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor.",
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. The footer's descriptor digest and ordinal (2) differ from A's header (1). Its header-record SHA-256 describes B's header. Its observations (file 8, start 33, footer LBA 35) differ from A's planned coordinates and the device's. The copied footer is internally consistent, so its CRC verifies."
+    },
+    "replica-object-overflow": {
+      "component": "replica-a.bin header and footer, object_row_count 2^56",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.3",
+        "10.4",
+        "10.6",
+        "2.4"
+      ],
+      "quotes": [
+        "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results.",
+        "The row set is the complete final-prefix Object inventory. Its count MUST equal the number of kind-0 structural slots, and the ordered `(tape_file_number, stored_block_count)` pairs MUST be a bijection with those slots.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. 256 × 2^56 = 2^64 overflows. The Object-row count exceeds the kind-0 rows (2) and the structural count. The recorded payload geometry disagrees. The edition digest is stale."
+    },
+    "replica-payload-add-overflow": {
+      "component": "replica-a.bin header and footer, structural_row_count 2^58−1, object_row_count 1",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.3",
+        "10.4",
+        "10.6",
+        "2.4"
+      ],
+      "quotes": [
+        "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results.",
+        "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal.",
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. 64 × (2^58 − 1) + 256 × 1 = 2^64 + 192 overflows u64. The recorded payload length 896, record counts and covered count 6 disagree. The payload's slot counts disagree. The edition digest is stale."
+    },
+    "replica-payload-corrupt": {
+      "component": "replica-a.bin payload, first Object row object_id first byte m -> l",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "One rule fails: the stale payload SHA-256. The new object_id ('linimal-plaintext-object') is itself a legal 1-64-byte non-NUL identifier, and no rule checks it against the Object."
+    },
+    "replica-payload-padding": {
+      "component": "replica-a.bin payload padding byte 0x380 = 0x01",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "It runs contiguously across the payload records, and the `payload_padding_bytes` that follow it in the last payload record are zero.",
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "One rule fails: the payload padding must be zero. The payload digest covers the fixed slots only and still verifies."
+    },
+    "replica-reserved-nonzero": {
+      "component": "replica-a.bin header and footer, reserved 0x300",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "16.2"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "One rule fails: reserved bytes not zero in both frames. The CRCs and header hash were recomputed, and the reserved bytes are in no digest preimage."
+    },
+    "replica-slot-truncated": {
+      "component": "replica-a.bin payload record 1, structural slot 0",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.2",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "`encoded_len` is little-endian, nonzero, and at most the slot size minus two; it counts exactly the bytes of the one deterministic CBOR item that follows, and every byte after that item in the slot is zero.",
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two or more rules fail at once. encoded_len 65535 exceeds the slot size minus two (62) and does not count the 8-byte CBOR item that follows. The stale payload SHA-256 (0x0A8) no longer matches the complete fixed slots, whose bytes changed."
+    },
+    "replica-structural-overflow": {
+      "component": "replica-a.bin header and footer, structural_row_count 2^64−1",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "2.4"
+      ],
+      "quotes": [
+        "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results.",
+        "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once: 64 × (2^64 − 1) overflows; the covered count and payload geometry disagree; and the edition digest is stale."
+    },
+    "replica-wrong-block-size": {
+      "component": "replica-a.bin header and footer, block size 262144 -> 131072",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "8.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The planned layout of the terminal suffix validates against Section 8.3, and its layout digest recomputes to the recorded value.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Many rules fail at once. 131072 is not a terminal record size (256 KiB, 512 KiB, 1 MiB) and differs from the actual record size. The stale edition digest and layout digest (block_size in both preimages) fail."
+    },
+    "replica-wrong-count": {
+      "component": "replica-a.bin header and footer, replica count 3 -> 2",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "The fixed field 'replica count 3' fails. The descriptor preimage fixes replica_count:u16=3, so a Reader that recomputes with the constant finds the stale digest still correct (one rule). A Reader that feeds in the frame's value finds a second failure."
+    },
+    "replica-wrong-descriptor-digest": {
+      "component": "replica-a.bin header and footer, descriptor digest -> 0x95 x 32",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "One rule fails: the replica descriptor digest does not recompute. It matches in both frames, so the header/footer agreement holds."
+    },
+    "replica-wrong-edition": {
+      "component": "replica-a.bin header and footer, edition ID 0x22.. -> 0x24..",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "8.5"
+      ],
+      "quotes": [
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "A terminal replica is *fully valid* when it is locally eligible under Section 10.6. A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "The stale edition digest (edition_id is in its preimage) fails; if the descriptor digest is recomputed from the recomputed edition digest, it fails too. Were A otherwise valid, a different edition ID would be TerminalIndexReplicaConflict, but A is not fully valid."
+    },
+    "replica-wrong-edition-digest": {
+      "component": "replica-a.bin header and footer, edition digest -> 0x94 x 32",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "The edition digest does not recompute. If the descriptor digest is recomputed over the stored edition digest, it fails too; over the recomputed one, it holds."
+    },
+    "replica-wrong-header-hash": {
+      "component": "replica-a.bin footer, header-record SHA-256 byte flipped",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.6"
+      ],
+      "quotes": [
+        "the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "One rule fails: the footer's header hash no longer matches the header record. The footer CRC was recomputed."
+    },
+    "replica-wrong-layout-digest": {
+      "component": "replica-a.bin header and footer, terminal-layout digest -> 0x93 x 32",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "8.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "The planned layout of the terminal suffix validates against Section 8.3, and its layout digest recomputes to the recorded value.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: the layout digest does not recompute from the tuples, and the stale descriptor digest (terminal_layout_digest in its preimage) fails. A's footer is not the one discovery starts from (C's is), and B and C carry the true layout."
+    },
+    "replica-wrong-map-digest": {
+      "component": "replica-a.bin header and footer, canonical-map SHA-256 -> 0x92 x 32",
+      "component_error": {
+        "one_of": [
+          "FilemarkMapDigestMismatch",
+          "TerminalIndexReplicaParse"
+        ],
+        "permitting_text": "Two conditions fail and Section 10.6 'does not fix the order in which a Reader checks them'. The canonical-map digest mismatch is Section 15's 'replica structural projection digest mismatch' (FilemarkMapDigestMismatch). The stale edition digest (canonical_map_sha256 in its preimage) is a Section 10.6 digest failure (TerminalIndexReplicaParse)."
+      },
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "7.4",
+        "10.4",
+        "10.6",
+        "15"
+      ],
+      "quotes": [
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "The conditions are a conjunction, and this document does not fix the order in which a Reader checks them",
+        "FilemarkMapDigestMismatch       replica structural projection digest mismatch, or a walked map's projection or scope fields disagree with the final ParityMap",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: canonical-map digest and edition digest."
+    },
+    "replica-wrong-observed-count": {
+      "component": "replica-a.bin footer, observed record count 3 -> 4",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "8.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Local observations in a footer MUST equal that plan.",
+        "In a footer, the backward start delta (`0x2F8`) MUST equal the observed record count (`0x2E8`) minus one, and the observed footer LBA (`0x2F0`) MUST equal the observed start LBA (`0x2E0`) plus that delta. A Reader rejects a footer whose values differ.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: the observation ≠ plan (3), and delta 2 ≠ count − 1 = 3."
+    },
+    "replica-wrong-observed-start": {
+      "component": "replica-a.bin footer, observed start LBA 25 -> 26",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "8.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Local observations in a footer MUST equal that plan.",
+        "In a footer, the backward start delta (`0x2F8`) MUST equal the observed record count (`0x2E8`) minus one, and the observed footer LBA (`0x2F0`) MUST equal the observed start LBA (`0x2E0`) plus that delta. A Reader rejects a footer whose values differ.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: the observation ≠ plan (25), and the footer arithmetic 27 ≠ 26 + 2."
+    },
+    "replica-wrong-ordinal": {
+      "component": "replica-a.bin header and footer, replica ordinal 1 -> 2",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "8.3"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "The header and footer repeat the same descriptor digest. A footer therefore cannot bind another ordinal or location.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two or more rules fail at once. Ordinal 2 does not match A's planned component (4,1) at A's position, and the stale descriptor digest (replica_ordinal in its preimage) fails. The ordinal is replica-local, so this is not a conflict."
+    },
+    "replica-wrong-payload-digest": {
+      "component": "replica-a.bin header and footer, payload SHA-256 -> 0x91 x 32",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once: the payload digest does not recompute, and the stale edition digest (payload_sha256 in its preimage) fails."
+    },
+    "replica-wrong-range": {
+      "component": "replica-a.bin header and footer, total data ordinals 5 -> 6",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "7.4",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars.",
+        "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Three rules fail at once: T ≠ recomputed T (Section 7.4); W (5) ≠ T (6) with sidecars present (Section 10.6); and the stale edition digest. FilemarkMapDigestMismatch is not the name: the canonical-map digest itself still recomputes (see NOTES gap 15 of the earlier set)."
+    },
+    "replica-wrong-scope": {
+      "component": "replica-a.bin header and footer, covered-prefix count 6 -> 7",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "7.4",
+        "10.6"
+      ],
+      "quotes": [
+        "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal.",
+        "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Three rules fail at once: covered ≠ structural_row_count and A's planned tape-file number (6); the Section 7.4 scope of 7 leading entries cannot be formed from 6; and the edition digest is stale. A Reader that treats the Section 7.4 scope failure as a digest mismatch could say FilemarkMapDigestMismatch, but the stale edition digest is a plain Section 10.6 failure."
+    },
+    "replica-wrong-start": {
+      "component": "replica-a.bin header and footer, planned local start LBA 25 -> 26",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "8.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The declared locations, the counts, and the trailing filemark agree with the device's measurements.",
+        "Local observations in a footer MUST equal that plan.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two or more rules fail at once. The local planned start (26) disagrees with A's tuple in the shared plan (25) and with the device-measured start (25). The footer observation (25) no longer matches the local plan field. If the descriptor preimage's 'local 32-byte component tuple' is built from the local fields, the descriptor digest fails too."
+    },
+    "replica-wrong-tape": {
+      "component": "replica-a.bin header and footer, tape UUID",
+      "component_error": "TerminalIndexReplicaParse",
+      "tape_level": {
+        "outcome": "inventory from replicas B and C, degraded",
+        "pinned": true,
+        "reason": "B and C keep their base bytes and validate; A is not locally eligible, so it is degraded evidence and not a conflict, even where its edition-common fields differ (Section 8.5 compares only fully valid replicas)."
+      },
+      "sections": [
+        "5.2",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3.",
+        "The edition digest and the local descriptor digest recompute to the recorded values.",
+        "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6",
+        "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+      ],
+      "pinned": true,
+      "notes": "Two rules fail at once. The frame UUID (0x12 x 16) differs from the tape's UUID (0x11 x 16, the HMAC key the magic still matches), and the stale edition digest no longer recomputes, because tape_uuid is in its preimage. The UUID is edition-common, but A is not fully valid, so this is not a conflict."
+    }
+  },
+  "readings": [
+    "Components are laid out as consecutive tape files, each followed by one filemark, as Section 8.3 plans. A component's records are its bytes taken 262144 at a time; a remainder forms a final short record.",
+    "Tape identity is the profile's tape UUID (0x11 x 16), which is also the HMAC key of every role magic.",
+    "An invalid separation extent never changes the Scanner's inventory; 'degraded' is used only as Section 12.6 uses it, for missing or invalid replicas."
+  ]
+}

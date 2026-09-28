@@ -757,8 +757,7 @@ fn with_integer_field(
 }
 
 fn emit_matrix_manifests(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    fs::write(
-        root.join("MUTATIONS.tsv"),
+    let mutations =
         "case_id\tkind\tbase_profile\ttarget\tmutation\tother_profile\texpected\n\
 replica-header-damaged\treplica\tmulti-256k\treplica-a.bin\tdamage-header\t\tcrc-header\n\
 replica-footer-damaged\treplica\tmulti-256k\treplica-a.bin\tdamage-footer\t\tcrc-footer\n\
@@ -809,8 +808,45 @@ gap-wrong-ordinal\tgap\tmulti-256k\tgap-ab.bin\twrong-ordinal\t\twrong-ordinal\n
 gap-mixed-header-footer\tgap\tmulti-256k\tgap-ab.bin\tmixed-header-footer\tmulti-256k/gap-bc.bin\tmixed-header-footer\n\
 gap-wrong-observed-start\tgap\tmulti-256k\tgap-ab.bin\twrong-observed-start\t\twrong-observation\n\
 gap-interior-damaged\tgap\tmulti-256k\tgap-ab.bin\tinterior-nonzero\t\tdamaged-interior\n\
-filemark-missing\tevent\tmulti-256k\treplica-a.bin\tmissing-filemark\t\tmissing-filemark\n",
-    )?;
+filemark-missing\tevent\tmulti-256k\treplica-a.bin\tmissing-filemark\t\tmissing-filemark\n";
+    // Preserve the independently authored names byte for byte; no parser output
+    // participates in expectations. The digest also detects source-file drift.
+    let names =
+        include_bytes!("../../../fixtures/rem-parity-terminal-index-draft/mutation-section15.json");
+    assert_eq!(
+        hex(&Sha256::digest(names)),
+        "cfee8f27baaec890162a12ab6df450c53c01764f1b492e8ee390bb9bd7875313"
+    );
+    let source: Value = serde_json::from_slice(names)?;
+    let entries = source["entries"]
+        .as_object()
+        .ok_or("missing mutation names")?;
+    let mut seen = BTreeSet::new();
+    let mut table = String::new();
+    for (i, line) in mutations.lines().enumerate() {
+        let name = if i == 0 {
+            "section15".to_owned()
+        } else {
+            let id = line.split('\t').next().unwrap();
+            assert!(seen.insert(id));
+            let value = &entries.get(id).ok_or("missing case_id")?["component_error"];
+            if let Some(name) = value.as_str() {
+                name.to_owned()
+            } else {
+                value["one_of"]
+                    .as_array()
+                    .ok_or("missing name set")?
+                    .iter()
+                    .map(|v| v.as_str().ok_or("non-string name"))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join("|")
+            }
+        };
+        table.push_str(&format!("{line}\t{name}\n"));
+    }
+    assert_eq!(seen.len(), entries.len(), "unused mutation names");
+    fs::write(root.join("MUTATIONS.tsv"), table)?;
+    fs::write(root.join("mutation-section15.json"), names)?;
     fs::write(
         root.join("SELECTION.tsv"),
         "case_id\tbase_profile\ta\tb\tc\texpected\n\
