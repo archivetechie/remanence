@@ -109,14 +109,15 @@ supplement, because the two documents share one archive. The rule below on keepi
 candidate vectors apart from publication artifacts applies to both candidate
 sets.
 
-The terminal bytes of REM-PARITY 1.0.0-draft.5 are review-only candidate vectors
-under `fixtures/rem-parity-terminal-index-draft/`. Candidate vectors MUST NOT be
-copied into or substituted for publication artifacts before independent review
-and freeze.
+The terminal bytes of REM-PARITY 1.0.0-draft.5, and its generation-2 tape
+images and damage-matrix, resume and negative vectors, are review-only
+candidate vectors under `fixtures/rem-parity-terminal-index-draft/`.
+Candidate vectors MUST NOT be copied into or substituted for publication
+artifacts before independent review and freeze.
 
 A candidate set of valid tapes shows that a reader accepts what it should, but
 not that it rejects what it should. The candidate set therefore also holds
-negative vectors, each of which breaks one rule a reader has to enforce.
+negative vectors, each of which breaks a rule a reader has to enforce.
 REM-PARITY 1.0.0-draft.5 set their minimum coverage, and it is carried here
 whole:
 
@@ -190,7 +191,7 @@ tools kept in its repository.
 
 | Criterion | Evidence in the reference implementation | Remarks |
 | --- | --- | --- |
-| 2 | `tools/verify_terminal_index_vectors.py` re-derives the candidate terminal bytes without calling the Rust codec; the generator is `crates/remanence-parity/examples/generate_terminal_index_vectors.rs` | REM-PARITY §17 lists what the verifier re-derives |
+| 2 | `tools/verify_terminal_index_vectors.py` re-derives the candidate terminal bytes without calling the Rust codec. `tools/rem_parity_second_implementation.py`, written from REM-PARITY without reading the reference, re-derives the pinned bytes REM-PARITY §17 lists and decides the damage, portable resume and negative cases §17 describes; what it does not yet re-derive is listed in Appendix D, TT-2. The generators are `crates/remanence-parity/examples/generate_terminal_index_vectors.rs` and `crates/remanence-cli/examples/generate_tape_images.rs` | REM-PARITY §17 describes the candidate set; Appendix D, TT-2, lists what remains open before the criterion is met |
 | 3 | Five coverage-guided targets in `fuzz/fuzz_targets/`: `rem_parity_bootstrap_parse`, `rem_parity_bootstrap_structured`, `rem_parity_map_parse`, `rem_parity_scan_walk` and `rem_parity_sidecar_parse`, run by `tools/run_rem_parity_fuzz_campaign.sh` and `tools/run_rem_parity_fuzz_overnight.sh` | No target yet covers the terminal-replica or separation parsers, so the criterion is open (Appendix D, TT-6) |
 | 4 | `rem-debug tape freeze-drill` ([reference-cli.md](../docs/reference-cli.md)) writes drill objects through a full finalization on a scratch tape, injects a chosen read-side medium-error damage plan, and verifies recovery | One run covers one block size, and the criterion asks for two. The supervised physical-tape runs are open (Appendix D, TT-3) |
 | 5 | A clean-room exercise by an AI system, given the specification and generic libraries but no implementation source | Technical independence only, as the note above says; RP-4 remains open |
