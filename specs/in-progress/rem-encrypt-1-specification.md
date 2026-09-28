@@ -460,9 +460,8 @@ Sealer MUST refuse recipients given in an order whose slot indices are not
 strictly increasing, with `InvalidInput`. A Sealer MUST refuse a recipient
 whose `recipient_epoch_id` is all zero (sixteen zero bytes), with
 `InvalidInput`. Each recipient given to a Sealer carries the slot index its
-slot will have. A
-Sealer MUST NOT report a seal as successful unless the key frame contains a
-slot for every recipient it was asked to seal to.
+slot will have. A Sealer MUST NOT report a seal as successful unless the key
+frame contains a slot for every recipient it was asked to seal to.
 
 Readers accept any canonical frame with one through eight slots. Recommended
 practice for choosing recipients is described in the REM Implementation and
@@ -1288,15 +1287,17 @@ vector.
 
 **Metadata.** Each metadata-profile repertoire violation (float, tag,
 indefinite length, duplicate key, non-shortest encoding, `undefined`); a
-top-level item that is an array rather than a map; a top-level key that is
-text rather than an unsigned integer; a missing required key (0, 1, 2 or 3);
-`metadata_version = 2`; `metadata_version` of text type; `plaintext_size` of
-text type, zero, not a multiple of `chunk_size`, or large enough to overflow
-geometry; `plaintext_digest_alg` a text value other than `sha256` or of bytes
-type; `plaintext_digest` of 31 bytes or of text type; and trailing bytes
-after the top-level item. The candidate supplement that Core §13 describes
-adds a negative integer inside the value of an unknown key, with a valid
-control that differs only in that value.
+top-level item that is an array rather than a map, or a top-level key that is
+text rather than an unsigned integer (each `InvalidCborEncoding`); a missing
+required key, 0, 1, 2 or 3 (`MissingRequiredMetadataField`); a field of the
+wrong type or value, each `InvalidMetadataField`: `metadata_version = 2`,
+`metadata_version` of text type, `plaintext_size` of text type, zero, not a
+multiple of `chunk_size`, or large enough to overflow geometry,
+`plaintext_digest_alg` a text value other than `sha256` or of bytes type, and
+`plaintext_digest` of 31 bytes or of text type; and trailing bytes after the
+top-level item (`InvalidCborEncoding`). The candidate supplement that Core §13
+describes adds a negative integer inside the value of an unknown key, with a
+valid control that differs only in that value.
 
 **Framing.** EOF inside the metadata frame; EOF mid-chunk; payload absent
 after metadata (`MissingFinalChunk`); footer bytes wrong at the correct
@@ -1312,8 +1313,8 @@ header, and inner `REMANENCE.encryption` other than `none`; each produces
 **Sealer inputs.** Sealing input whose size is not a multiple of
 `chunk_size`; an `object_id` longer than 64 bytes; recipient counts zero or
 greater than eight; an all-zero epoch id; duplicate epoch ids; and
-non-canonical slot order. The duplicate epoch-id, non-canonical slot-order
-and all-zero epoch-id cases are in the candidate supplement that Core §13
+non-canonical slot order. The all-zero epoch-id, duplicate epoch-id and
+non-canonical slot-order cases are in the candidate supplement that Core §13
 describes. Entropy failure has no portable input, so no vector covers it.
 Its handling is left to each implementation's own tests.
 
@@ -1662,6 +1663,11 @@ effect on conformance.
     unchanged.
 
   No byte of the format changed, and no valid object or vector changed.
+
+  Wording follow-ups then changed no requirement. Section 13.4 names the error
+  of each metadata case it lists, groups the field cases under
+  `InvalidMetadataField`, and lists the Sealer-input cases of the candidate
+  supplement in one order; a paragraph of Section 5.3 is rewrapped.
 - **2026-09-10 — 1.0.0-draft.3 — review-draft errata.** This revision makes
   three changes.
 
