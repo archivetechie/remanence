@@ -27,10 +27,14 @@ frozen. Generation 2 is implemented in the reference tree. Its review-only
 candidate vectors for the terminal suffix are pinned and independently
 re-derived, and its proof and nonphysical lifecycle/VTL gates have passed.
 Dedicated coverage-guided terminal-replica/separation/parser-walk fuzz
-plateaus and the supervised physical-media gate remain open. So does freeze
-criterion 2: there is not yet a byte-pinned tape image of Appendix A.4's
-minimal tape, nor pinned damage-matrix vectors, and the independent verifier
-does not yet re-derive the bytes before the terminal suffix. Candidate
+plateaus and the supervised physical-media gate remain open. So does
+REM-PARITY freeze criterion 2, recorded in `specs/README.md`. Its evidence is
+gathered as candidates: whole-tape images (among them Appendix A.4's minimal
+tape); damage-matrix, resume and negative vectors, most of them pinned; and a
+second implementation, written from this document, that re-derives the pinned
+bytes Section 17 lists.
+The criterion remains open until the items that Appendix D item TT-2 lists are
+closed and the companion archive carries the fixtures at freeze. Candidate
 vectors are not publication artifacts until the freeze gates close.
 
 **Comments close on 30 April 2027, and the documents freeze on 31 July 2027**,
@@ -2632,22 +2636,86 @@ for A/B/C authority.
 
 The generator is
 `crates/remanence-parity/examples/generate_terminal_index_vectors.rs`. The
-independent verifier `tools/verify_terminal_index_vectors.py` re-derives HMAC
+terminal verifier `tools/verify_terminal_index_vectors.py` re-derives HMAC
 role magics, CRC-64/XZ, full-file SHA-256, header hashes, local observations,
 record formulas, component ordering, dense file numbers, logical positions,
 the zero interiors of the separation extents, and terminal EOD without calling
-the Rust codec. It does not yet re-derive bootstrap, sidecar or ParityMap bytes,
-or Reed–Solomon parity. Candidate bytes remain mutable until the specification
+the Rust codec. Candidate bytes remain mutable until the specification
 freezes; the recorded independent derivation and incremental implementation
 review are pre-freeze evidence rather than publication.
 
-The candidate set does not yet meet REM-PARITY freeze criterion 2, which the
-release record, `specs/README.md`, states. The `minimal-*` profiles above are
-terminal suffixes of a tape that holds only the bootstrap. There is not yet a
-byte-pinned tape image of Appendix A.4's minimal tape, which also holds an
-Object, a sidecar and the ParityMap, and there are no pinned damage-matrix
-vectors. The independent verifier does not yet re-derive the bytes before the
-terminal suffix. Appendix D item TT-2 records how far the set has got.
+The `minimal-*` profiles above are terminal suffixes of a tape that holds only
+the bootstrap. The set's `tape-images/` directory holds whole tapes. One
+tape-image builder makes six images from inputs recorded beside them:
+Appendix A.4's minimal tape, which also holds an Object, a sidecar and the
+ParityMap; a tape with a short epoch (`S = 4`); a tape with two epochs; the
+minimal tape with its replica B taken from a second edition, which differs
+only in edition id and edition sequence; and two unfinalized tapes that stop in
+a torn tail, one after a closed epoch and one with an epoch still open.
+`tape-images/MANIFEST.tsv` pins the size and SHA-256 of every tape file, of
+each torn tail and of the whole stream. The image bytes are regenerated from
+the inputs, not stored.
+
+The damage matrix, `tape-images/cases/`, holds 25 cases. All but one make
+stated records of an image unreadable or remove a filemark; the other reads
+the second-edition image undamaged. Each gives the outcome it expects under
+this document: the inventory a Scanner reports, the result of the walk, or
+each failed address's recovery or error, and in one case what a Verifier
+reports. Three of them (`replicas-all`, `bootstrap-hinted` and
+`bootstrap-wrong-scheme`) expect a Scanner to use a permission that this
+document grants but does not require. The outcomes were written from this
+document before any reader was run on them. Of the 25 cases, 24 are
+pinned. The outcome pinned for `filemark-prefix`
+depends on a reading of Section 12.3 that this document leaves open, and
+`parity-map-and-sidecar` is informative because this document does not decide
+part of it. The outcomes of the burst cases (`burst-m`, `burst-m-plus-one`,
+`short-epoch-burst` and `short-epoch-recoverable`) follow from Sections 3.3,
+9.1, 13.4 and 13.5; Appendix B.2 illustrates them and is informative.
+
+The resume vectors, `tape-images/resume/`, give a committed prefix over an
+image as Section 7.1 entries, with `W` and `T`. Two resumes of unfinalized
+images are accepted, one at `W = T` and one at `W < T`, and the resumed tapes
+are pinned; the second one's sidecar equals the one an uninterrupted session
+writes. Six prefixes, four over the unfinalized images and two over the
+two-epoch image, break a Section 14 rule and are refused. The commit-record
+cases of Section 3.4 depend on an implementation-defined record format and are
+not portable.
+
+The negative vectors, `tape-images/negatives/`, hold 58 cases and a supplement
+of 48 variants. They cover the sidecar, the ParityMap, the bootstrap, the
+terminal replicas and separation extents, and an overflow in each size and
+location formula that a vector can reach. Each gives the mutation at the level
+of this document's tables and the checksums repaired so that the mutation
+reaches its rule, or the formula's inputs where only a test of the formula
+itself reaches it, or the reason no vector can exist. Many cases break more
+than one rule; each variant breaks one, and the supplement records 14 entries
+that cannot be isolated. Each gives the Section 15 error this document
+requires, the set of errors it permits, a required rejection with no named
+error, or an informative outcome. The `section15` column of `MUTATIONS.tsv`
+gives the same for the earlier terminal mutations.
+
+The second implementation, `tools/rem_parity_second_implementation.py`, was
+written from this document by an author who did not read the reference
+implementation. It imports two things. The first is layout-independent
+arithmetic: the Galois-field, Reed–Solomon, CRC-64/XZ and deterministic-CBOR
+functions of `tools/rem_parity_rederive.py`, which was written alongside the
+generation-1 reference and which the second implementation checked against
+this document's worked values. The second is a plaintext REM-OBJECT builder
+written from REM-OBJECT. It re-derives the
+images, the terminal profiles, and the maximum, Object-row extension and
+streaming artifacts from their recorded inputs, among them the bootstraps,
+Objects, sidecars with their Reed–Solomon parity, and ParityMaps, and it
+re-derives the resumed tapes. It decided every damage case, every portable
+resume case and every negative case and variant before seeing the expected
+outcome; one variant was corrected afterwards and not decided again. Its
+records, under `second-implementation/`, show no disagreement with the
+expected outcomes except on questions this document leaves open, and list
+each place where it found this document silent or ambiguous. One expected
+negative outcome was corrected by citation after review, and its decision
+agrees with the correction.
+
+The candidate set holds the candidate evidence for freeze criterion 2.
+Appendix D item TT-2 lists what remains open before the criterion is met.
 
 How candidate vectors are handled until this document is frozen, and what the
 negative candidates must cover by then, are recorded in the release record,
@@ -3204,6 +3272,21 @@ an errata revision of draft.1.
     decided before freeze.
 
   No byte of the format changed, and no valid tape or vector changed.
+
+  The fixture step then changed the text as follows. No byte of the format and
+  no valid tape changed; the candidate set gained the vectors Section 17
+  describes.
+
+  - Section 17 now describes the tape images, the damage matrix, the resume
+    vectors, the negative vectors and the second implementation, and no
+    longer says that they do not exist. It removes the sentence that the
+    verifier does not yet re-derive bootstrap, sidecar or ParityMap bytes, or
+    Reed–Solomon parity, and TT-2 removes the sentence that no vector yet
+    covers append resume. It calls the verifier of the terminal bytes the
+    terminal verifier. The Status section says that the
+    evidence for freeze criterion 2 is gathered and that the criterion remains
+    open until the items of TT-2 close. Appendix D item TT-2 records the
+    evidence and lists the formulas, questions and readings that remain open.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -3433,23 +3516,84 @@ This is the live preparing-copy snapshot for generation 2.
    their 30 component streams without calling the Rust codec. Incremental
    reviews bind later changes to the last recorded clean baseline; an untouched
    byte-contract region does not lose its accepted review status.
-2. **TT-2 — negative and interruption vectors (candidate evidence passed;
-   freeze criterion 2 open).**
-   The review-only set currently verifies 50 hostile mutations, 14 survivor
-   selections, 68 interruption cuts, seven Object-row extension cases, and the
-   million-Object streaming profile. Publication promotion remains gated by
-   TT-5 and the other freeze criteria. Freeze criterion 2 is not yet met.
-   There is not yet a byte-pinned tape image of Appendix A.4's minimal tape.
-   There are no pinned damage-matrix vectors. The independent verifier does
-   not yet re-derive bootstrap, sidecar or ParityMap bytes, or Reed–Solomon
-   parity. No vector yet covers append resume (Section 14); the 68
-   interruption cuts are cuts in finalization. The generation-1 REM-PARITY
-   cases of the pinned archive were read against generation 2. Most of the
-   properties they test are kept, and are covered by the reference
-   implementation's tests rather than by candidate vectors. The sidecar
-   negative cases are the largest group with no generation-2 coverage yet.
-   The walk route cannot find a ParityMap whose block 0 is unreadable; the
-   replica route survives that damage by locating it through structural rows.
+2. **TT-2 — negative and interruption vectors (candidate evidence gathered;
+   REM-PARITY freeze criterion 2, recorded in `specs/README.md`, remains open
+   until the items below close).**
+   The review-only set verifies 50 hostile mutations, 14 survivor selections,
+   68 interruption cuts, seven Object-row extension cases and the
+   million-Object streaming profile; the interruption cuts are cuts in
+   finalization, and Section 17's resume vectors cover append resume. It also
+   holds the tape images, damage matrix, resume vectors and negative vectors
+   that Section 17 describes. A second implementation written from this
+   document re-derives the pinned bytes Section 17 lists and decides the cases
+   Section 17 describes. Publication promotion remains gated by TT-5 and the
+   other freeze criteria. These items remain open:
+   - The second implementation does not yet re-derive or compare the
+     mutated-block digests of the negative vectors
+     (`tape-images/negatives/MANIFEST.tsv`), or the bytes and digests that
+     `MUTATIONS.tsv`, `SELECTION.tsv` and `INTERRUPTIONS.tsv` pin. The terminal
+     verifier checks those, but it is not the second implementation that
+     freeze criterion 2 asks for, so these are criterion-2 gaps until the
+     second implementation re-derives them.
+   - Five formulas block freeze under the release record's minimum coverage
+     for negative candidates, whose last item asks for overflow in every size
+     and location formula, because this document leaves the outcome of their
+     overflow undefined. The first is Section 3.2's `LBA(f, b)`, which no role
+     in this document evaluates over counts read from tape. The second is
+     Section 3.3's inverse mapping, which can be evaluated in two ways that give
+     different outcomes on overflow. The third is the append point of Sections
+     3.2 and 14, whose inputs come from off-tape commit records, while Section
+     2.4 governs values read from tape. The fourth is Section 12.2's walk
+     length, whose inputs are positions the device reports. The fifth is
+     Section 13.3's tail location, whose rejection has no Section 15 name and
+     which the reference computes differently (the third reading below). The
+     `freeze_blocker` flags in `negative-cases.json` predate this
+     classification; where they differ, this item governs.
+   - No vector can exist for four formulas, and they do not block freeze for
+     that reason. No input a Reader reads can make Section 10.1.2's `2M + 1`
+     overflow at a legal block size, and no operation in Section 3.3's forward
+     mapping or in Section 9.4's computation of `H` can overflow. Only a
+     Writer evaluates Section 10.3's close-reserve formula, from its own
+     state.
+   - Three formulas have a pinned overflow vector that the reference rejects
+     at an earlier check, with the outcome the vector expects: Section 7.2's
+     `T`, Section 10.4's record-geometry product and Section 10.5's
+     `actual_bytes`. The vector covers the formula, and the second
+     implementation reaches it.
+   - Four questions this document leaves open are recorded with the vectors
+     that pin or report them. The first is whether a Section 12.3 rung that
+     fails on a count mismatch has recognised the file (`filemark-prefix`).
+     The second is what a Reader rejects when a sidecar's two index copies
+     each validate but disagree, and whether a Verifier checks sidecars
+     (Section 9.1; `sidecar-primary-tail-disagreement`, which the reference
+     does not yet pass). The third is whether a Recoverer may locate a
+     sidecar's tail copy from its structural row when the ParityMap and the
+     sidecar's primary header and footer are all unreadable (Section 13.3;
+     `parity-map-and-sidecar`). The fourth is which
+     bootstraps count as unreadable (TT-7).
+   - Three readings are to be stated. The first is whether a Reader rejects an
+     intermediate overflow when the exact result fits (Section 2.4). The
+     second is whether Section 10.6's `W = T` rule names the recorded or the
+     recomputed values. The third is where a sidecar's tail copy is: the
+     reference locates it at `H + P` and requires a directory entry's total
+     to equal `2H + P + 1`, which Section 13.3 does not state.
+   - Where this document leaves a name open, some vectors give a set of
+     permitted Section 15 errors, or none. The second implementation's
+     `GAPS.md` and the notes in `tape-images/negatives/` list these and the
+     other places where this document is silent or ambiguous. Each is to be
+     decided, or listed here, before freeze.
+   - The walk route cannot find a ParityMap whose block 0 is unreadable; the
+     replica route survives that damage by locating it through structural
+     rows.
+   - A claim in `fixtures/rem-parity-1/vectors.json` still names the
+     authoritative directory overlays that generation 2 removed; nothing reads
+     the file.
+
+   The generation-1 REM-PARITY cases of the pinned archive were read against
+   generation 2. Most of the properties they test are kept. The reference
+   implementation's tests cover them, and the generation-2 candidate vectors
+   now also cover the groups that had no candidate coverage, among them the
+   sidecar negatives.
 3. **TT-3 — media exercise of the default separation extents (VTL passed;
    physical open).** The exact one-GiB layout has passed clean VTL writes and
    independent full verification at all three legal block sizes. The 256 KiB
