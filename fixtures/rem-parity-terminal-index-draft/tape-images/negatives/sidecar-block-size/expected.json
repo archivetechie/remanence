@@ -1,0 +1,47 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "primary-vs-footer canonical_metadata_hash comparison (Section 13.3 step 1)",
+    "primary-vs-tail agreement (Section 9.1)"
+  ],
+  "expected": {
+    "one_of": [
+      "SidecarParse",
+      "SchemeMismatch"
+    ],
+    "permitting_text": "Section 9.2 makes the value a per-copy constraint ('MUST equal the actual block size'), which is a Section 9 violation (SidecarParse); Section 13.3 pins the acquired index against the bootstrap's block size with SchemeMismatch, and Section 15 describes SchemeMismatch as 'sidecar geometry disagrees with the bootstrap or supplied scheme'. The same comparison therefore carries two names and the text orders them only for the Recoverer ('The acquired index MUST then be pinned')."
+  },
+  "group": "7a",
+  "id": "sidecar-block-size",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "block_size u32",
+    "from": 262144,
+    "le_bytes": "00 00 08 00",
+    "offset": "0x28",
+    "to": 524288
+  },
+  "pin_reason": "For the Recoverer the word 'then' puts copy validation (SidecarParse) first, but a Verifier has no such ordering and both Section 15 descriptions fit the same comparison. The informative draft.1 history entry ('Geometry and ordinal-range disagreements raise SchemeMismatch') points the other way.",
+  "pinned": false,
+  "quotes": [
+    "| 0x28 | 4 | block_size u32 | MUST equal the actual block size |",
+    "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`.",
+    "SidecarParse                    sidecar structure violates Section 9",
+    "SchemeMismatch                  sidecar geometry disagrees with the bootstrap or supplied scheme"
+  ],
+  "sections": [
+    "9.2",
+    "13.3",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer: the primary is invalid, the footer and tail are valid, so the tail copy is used and epoch 0 stays usable (no error). Recomputed H and inline bytes at 524288 are still 1 and 96, so no layout check fires incidentally.",
+  "target": "sidecar header/index copy validation, block_size rule (Section 9.2), as run by the Recoverer's index acquisition (Section 13.3) and by a Verifier"
+}

@@ -1,0 +1,36 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 3
+  },
+  "evaluation": "The tail index is M itself; it adds no arithmetic beyond computing M, so its only overflow is overflow-10.1.2-M's.",
+  "expected": {
+    "error": "ParityMapParse"
+  },
+  "formula": "tail copy at block M",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-10.1.2-tail-at-M",
+  "integrity_repair": [
+    "as overflow-10.1.2-M"
+  ],
+  "mutation": [
+    {
+      "name": "payload_len",
+      "position": "0x30",
+      "value": "as overflow-10.1.2-M"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "blocks M .. 2M−1      tail copy      (identical content; copy_kind differs)"
+  ],
+  "sections": [
+    "10.1.2",
+    "10.1.4"
+  ],
+  "shadowed": false,
+  "target": "ParityMap locator validation (Section 10.1.4)",
+  "type": "u64"
+}

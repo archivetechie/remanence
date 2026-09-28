@@ -1,0 +1,47 @@
+{
+  "base": {
+    "artifact": "tape-image two-epoch",
+    "copy": "primary",
+    "note": "epoch 1, [4,8)",
+    "tape_file": 3
+  },
+  "concurrent_checks": [
+    "'end > start' fails"
+  ],
+  "evaluation": "3 − 4 underflows u64.",
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "formula": "real_data_shard_count = end − start",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-9.2-end-minus-start",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": [
+    {
+      "name": "protected_ordinal_end_exclusive",
+      "position": "sidecar header 0x38",
+      "value": 3
+    },
+    {
+      "name": "protected_ordinal_start",
+      "position": "0x30",
+      "value": "4 (unchanged)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "| 0x48 | 8 | real_data_shard_count u64 | = end − start; ≤ logical_shard_count |"
+  ],
+  "sections": [
+    "9.2",
+    "2.4"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 1 usable. Same bytes as sidecar-end-not-after-start variant b-below.",
+  "target": "sidecar header validation (Section 9.2)",
+  "type": "u64"
+}

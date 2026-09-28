@@ -1,0 +1,45 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "footer (block 6)",
+    "tape_file": 2
+  },
+  "evaluation": "1 + (2^64 - 1) overflows; the footer's tail_header_start_block (0x58) = 5 cannot be checked against it.",
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "formula": "tail header start = H + P",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-9.1-tail-start",
+  "integrity_repair": [
+    "R-SC-FOOTER"
+  ],
+  "mutation": [
+    {
+      "name": "P",
+      "position": "sidecar footer 0x40 (u64)",
+      "value": "2^64 - 1"
+    },
+    {
+      "name": "H",
+      "position": "footer 0x38",
+      "value": "1 (unchanged)"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "| 0x58 | 8 | tail_header_start_block u64 = H + P |"
+  ],
+  "sections": [
+    "9.1",
+    "9.6",
+    "13.3",
+    "2.4"
+  ],
+  "shadowed": false,
+  "tape_level": "Footer invalid; Recoverer falls back to the primary; epoch 0 usable.",
+  "target": "sidecar footer locator validation (Section 9.6), when the Scanner probes the footer (Section 12.3 item 6) or the Recoverer reads it first (Section 13.3 step 1)",
+  "type": "u64"
+}

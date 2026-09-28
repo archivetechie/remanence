@@ -1,0 +1,37 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "overflow-9.1-tail-start",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 56,
+      "new_bytes": "0100000000000000",
+      "old_bytes": "0100000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 64,
+      "new_bytes": "ffffffffffffffff",
+      "old_bytes": "0400000000000000",
+      "repair": "mutation",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 128,
+      "new_bytes": "6c2f85bfaae10db8",
+      "old_bytes": "d8ed158e3575f1a0",
+      "repair": "R-SC-FOOTER footer_crc64",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_footer_block"
+  ],
+  "target_role": "SidecarFooter"
+}

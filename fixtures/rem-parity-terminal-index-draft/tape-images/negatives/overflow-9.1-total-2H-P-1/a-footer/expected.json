@@ -1,0 +1,11 @@
+{
+  "block_within_file": 6,
+  "expected": "SidecarParse (footer invalid)",
+  "position": "sidecar footer 0x38 (H u64)",
+  "repair": [
+    "R-SC-FOOTER"
+  ],
+  "tape_level": "Recoverer falls back to the primary (Section 13.3 step 2); epoch 0 usable",
+  "value": "2^63",
+  "variant": "a-footer"
+}

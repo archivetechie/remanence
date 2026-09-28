@@ -1,0 +1,34 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The entry's stripe index, parity index and CRC are unchanged. The copies agree, and the footer and directory carry the new hash. All CRCs, the Section 9.2 fields and the Section 9.4 layout hold.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-header-reserved/isolated-2",
+  "integrity_repair": [
+    "ISO-BOTH (index entry bytes are hashed: new hash in both copies, the footer 0x60 and directory key 8)"
+  ],
+  "mutation": {
+    "field": "reserved u16 of parity entry 0",
+    "from": 0,
+    "offset": "0xCE",
+    "to": 1
+  },
+  "parent": "sidecar-header-reserved (variant b)",
+  "pinned": true,
+  "quotes": [
+    "**Parity entry (16 bytes)**: u32 stripe_index; u16 parity_index; u16 reserved, MUST be 0; u64 parity_shard_crc64."
+  ],
+  "sections": [
+    "9.3",
+    "9.5"
+  ],
+  "target": "parity index entry reserved rule (Section 9.3)",
+  "violates_only": "Section 9.3 'u16 reserved, MUST be 0'"
+}

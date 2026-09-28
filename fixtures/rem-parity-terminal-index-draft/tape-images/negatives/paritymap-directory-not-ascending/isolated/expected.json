@@ -1,0 +1,38 @@
+{
+  "base": {
+    "artifact": "tape-image two-epoch",
+    "copy": "both ParityMap copies",
+    "tape_file": 4
+  },
+  "caveat": "'consecutive starting from 0 (0, 1, …, count−1)' does not state its order. A Reader that reads the epoch ids in array order sees 1, 0, which is also DirectoryInvalid.",
+  "every_other_rule_holds": "The parent's concurrent checks assumed evaluation in array order, which the text does not use. The partition invariant is stated 'taken in ascending tape_file_number order': in that order the ranges are [0,4) and then [4,8), the first start is 0, they are contiguous, and the last end equals scope W = 8. The epoch ids {0, 1} are unique and consecutive from 0, and in tape-file order they read 0, 1. Both tape file numbers are < scope 5. Totals, H and P are non-zero and the flags are known. W 8 ≤ T 8. The copies are identical, and the header/footer locators, payload_sha256 and the scope fields all match.",
+  "expected": {
+    "one_of": [
+      "DirectoryInvalid",
+      "ParityMapParse"
+    ],
+    "permitting_text": "the Section 15 category sentence, as in the parent"
+  },
+  "group": "7b",
+  "id": "paritymap-directory-not-ascending/isolated",
+  "integrity_repair": [
+    "R-PM-PAYLOAD"
+  ],
+  "mutation": {
+    "field": "directory entries array (payload key 4, key 5)",
+    "from": "[e0, e1]",
+    "to": "[e1, e0] (the same bytes as the parent)"
+  },
+  "parent": "paritymap-directory-not-ascending",
+  "pinned": true,
+  "quotes": [
+    "entries strictly ascending by `tape_file_number`, each `< scope_tape_file_count`;",
+    "the protected ranges **partition `[0, scope_highest_protected_ordinal)`**: taken in ascending `tape_file_number` order"
+  ],
+  "sections": [
+    "10.1.5",
+    "15"
+  ],
+  "target": "SidecarEpochDirectory decoder, ascending rule (Section 10.1.5)",
+  "violates_only": "Section 10.1.5 'entries strictly ascending by tape_file_number'"
+}

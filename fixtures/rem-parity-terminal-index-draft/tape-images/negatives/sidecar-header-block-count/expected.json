@@ -1,0 +1,41 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "if a Reader evaluates the dependent rules with the recorded H = 2, total (7 vs 2H+P+1 = 9), tail start (5 vs H+P = 6) and footer index (6 vs 2H+P = 8) also fail",
+    "footer 0x38 H comparison",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-header-block-count",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "sidecar_header_block_count u64 (H)",
+    "formula": "Section 9.4 over (B = 262144, S = 2, m = 2, real = 4): stream 96 bytes, 0xC8 + 96 <= B - 8, so H = 1, inline = 96",
+    "from": 1,
+    "offset": "0x60",
+    "to": 2
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x60 | 8 | sidecar_header_block_count u64 (H) | MUST equal the recomputed layout (Section 9.4) |",
+    "Readers MUST recompute both and reject header values that disagree."
+  ],
+  "sections": [
+    "9.2",
+    "9.4",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar index layout recomputation (Section 9.4) against header H (Section 9.2)"
+}

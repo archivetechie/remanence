@@ -1,0 +1,5 @@
+{
+  "offset": "0x000..0x008",
+  "to": "HMAC-SHA-256(key = tape UUID 11 x 16, 'REM\\0TIREP\\x01F')[0..8]; role field 0x00A left as 1 (header)",
+  "variant": "b-header-carries-footer-magic"
+}

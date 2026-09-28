@@ -1,0 +1,40 @@
+{
+  "concurrent_checks": [
+    "range [0,5) vs footer 0x28/0x30 [0,4)",
+    "footer/tail hash comparison",
+    "range vs map entry (pinned only after acquisition)"
+  ],
+  "isolated_violation": "real (5) > logical_shard_count (S*k = 4), i.e. outside 1..=S*k",
+  "mutation": [
+    {
+      "field": "protected_ordinal_end_exclusive",
+      "from": 4,
+      "offset": "0x38",
+      "to": 5
+    },
+    {
+      "field": "real_data_shard_count",
+      "from": 4,
+      "offset": "0x48",
+      "to": 5
+    },
+    {
+      "field": "data_crc_count",
+      "from": 4,
+      "offset": "0x58",
+      "to": 5
+    },
+    {
+      "field": "inline_index_entry_bytes",
+      "from": 96,
+      "offset": "0x68",
+      "to": 104
+    },
+    {
+      "field": "fifth data-CRC entry",
+      "offset": "0x128..0x130",
+      "to": "any u64 LE, e.g. 0x261BDF3D299838FC (crc64 of a zero block)"
+    }
+  ],
+  "variant": "b-above-logical"
+}

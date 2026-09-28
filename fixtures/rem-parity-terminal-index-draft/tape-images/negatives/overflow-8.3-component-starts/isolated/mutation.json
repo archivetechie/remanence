@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "partition 0, block_size 262144, tuples (4,1,fm 1, file 1, start 2^64 − 3, count 3), (5,1,1, file 2, start 2, count 3), (4,2,1, 3, 6, 3), (5,2,1, 4, 10, 3), (4,3,1, 5, 14, 3), expected_eod_lba 18"
+  },
+  "case": "overflow-8.3-component-starts/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "TerminalTailLayout::validate"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "partition 0, block_size 262144, tuples (4,1,fm 1, file 1, start 2^64 − 3, count 3), (5,1,1, file 2, start 2, count 3), (4,2,1, 3, 6, 3), (5,2,1, 4, 10, 3), (4,3,1, 5, 14, 3), expected_eod_lba 18"
+  }
+}

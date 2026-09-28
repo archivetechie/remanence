@@ -1,0 +1,12 @@
+{
+  "block_within_file": 5,
+  "copy": "tail",
+  "from": "00",
+  "offset": "0x20000",
+  "repair": [
+    "R-SC-FILL"
+  ],
+  "tape_level": "Recoverer uses the primary; epoch 0 usable",
+  "to": "01",
+  "variant": "b-tail-copy-fill"
+}

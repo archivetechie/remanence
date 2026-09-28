@@ -1,0 +1,35 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The parent broke Section 9.1 agreement as well, because only the primary changed. Here both copies carry 1, so they agree. The hash excludes copy_generation, so it still matches the footer and the directory. Every other field is untouched.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-copy-generation/isolated",
+  "integrity_repair": [
+    "ISO-BOTH; copy_generation is hash-excluded, so only the two copies' header_crc64 and block0_crc64 change"
+  ],
+  "mutation": {
+    "field": "copy_generation u32",
+    "from": 0,
+    "offset": "0x94",
+    "to": 1
+  },
+  "parent": "sidecar-copy-generation",
+  "pinned": true,
+  "quotes": [
+    "| 0x94 | 4 | copy_generation u32 | MUST be 0 while sidecar `schema_version` = 2 |"
+  ],
+  "sections": [
+    "9.2",
+    "9.1",
+    "9.5"
+  ],
+  "target": "copy_generation rule (Section 9.2)",
+  "violates_only": "Section 9.2 'copy_generation MUST be 0 while sidecar schema_version = 2'"
+}

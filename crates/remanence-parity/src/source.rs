@@ -1742,7 +1742,8 @@ mod object_source_tests {
                             scheme.stripes_per_neighborhood,
                             scheme.parity_blocks_per_stripe,
                             sidecar_header_blocks,
-                        ),
+                        )
+                        .unwrap(),
                     })
                     .expect("media-scale parity peer has a physical position")
                     .lba;
@@ -2816,7 +2817,8 @@ mod object_source_tests {
                         sidecar.header.stripes_per_epoch,
                         sidecar.header.m,
                         sidecar_header_blocks,
-                    ),
+                    )
+                    .unwrap(),
                 })
                 .expect("parity shard has a physical position")
                 .lba;

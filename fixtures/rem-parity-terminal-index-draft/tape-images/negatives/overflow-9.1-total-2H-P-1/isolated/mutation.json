@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "H = 2^63, P = 4"
+  },
+  "case": "overflow-9.1-total-2H-P-1/isolated",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "sidecar::checked_sidecar_total_blocks"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "H = 2^63, P = 4"
+  }
+}

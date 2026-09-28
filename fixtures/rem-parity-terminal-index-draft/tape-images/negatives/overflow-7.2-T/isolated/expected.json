@@ -1,0 +1,33 @@
+{
+  "base": {
+    "artifact": "new terminal profile 'huge-object-256k'",
+    "prefix": "rows: 0 Bootstrap (1 blk); 1 Object (1 blk, first 0, plaintext, manifest key 10 = 0, key 11 = 32, key 12 = 1); 2 Object (2^64 − 1 blk, first 1, plaintext, manifest as file 1). No sidecar, no ParityMap. covered = rows = 3; A at tape file 3."
+  },
+  "caveat": "No replica rule compares the rows' block counts with the physical prefix (NOTES.md gap 10), so the profile may present A at any LBA the harness chooses. A full Verifier that measures the prefix would also find a count mismatch.",
+  "every_other_rule_holds": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar rows, so the W = T rule and the ParityMap-iff-sidecar rule hold vacuously. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse",
+    "tape_level": "BotStructuralRecoveryRequired"
+  },
+  "group": "7c",
+  "id": "overflow-7.2-T/isolated",
+  "integrity_repair": [
+    "the profile is generated consistently (payload, canonical-map, edition, layout and descriptor digests; CRCs; header hashes)"
+  ],
+  "mutation": {
+    "inputs": "structural rows as above; Object rows' stored_block_count 1 and 2^64 − 1; recorded total data ordinals 0 (any value; its cross-check is the overflowing formula); highest protected 0"
+  },
+  "parent": "overflow-7.2-T (added: the parent's forged count also broke the W = T rule, because sidecars were present)",
+  "pinned": true,
+  "quotes": [
+    "T = max(first_parity_data_ordinal + block_count) over object entries    (0 if none)"
+  ],
+  "sections": [
+    "7.2",
+    "7.4",
+    "10.6",
+    "8.3"
+  ],
+  "target": "replica scope validation, T = max(first + block_count) (Sections 7.2, 7.4, 10.6)",
+  "violates_only": "Checked evaluation of T: 1 + (2^64 − 1) overflows u64"
+}

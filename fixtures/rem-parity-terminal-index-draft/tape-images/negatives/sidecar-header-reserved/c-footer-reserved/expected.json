@@ -1,0 +1,13 @@
+{
+  "block_within_file": 6,
+  "copy": "footer",
+  "field": "reserved (2 + 4 bytes)",
+  "le_bytes": "01 00",
+  "offset": "0x0A",
+  "repair": [
+    "R-SC-FOOTER"
+  ],
+  "tape_level": "footer invalid; Recoverer falls back to the primary (Section 13.3 step 2); epoch 0 usable",
+  "to": 1,
+  "variant": "c-footer-reserved"
+}

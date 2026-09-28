@@ -1,0 +1,167 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "authored_mutation": {
+    "field": "sidecar_total_block_count (0x70) = 8 in both copies; footer total (0x48) = 8; directory key 5 = 8; replica structural row block_count = 8",
+    "file_layout": "blocks 0 primary, 1..4 parity, 5 tail, 6 footer (at footer_block_index = 2H + P = 6), 7 an all-zero block",
+    "prefix_effect": "later LBAs shift by +1"
+  },
+  "case": "sidecar-total-block-count/isolated",
+  "commit_record_inputs": null,
+  "edits": [
+    {
+      "block_count": 8,
+      "new_sha256": "b8094a802e6d934df8c4cf9078f451540409ecd2341ae0b97641e97bcbc0451a",
+      "old_sha256": "c1a8b15af1a996ba91a71dcf4ac714b66fac1f750f8782e880e86cd84888c108",
+      "rebuild": "builder sidecar + all-zero trailing block",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 112,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 112,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 72,
+      "new_bytes": "0800000000000000",
+      "old_bytes": "0700000000000000",
+      "repair": "supplement field / dependent mirror",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "dcdf26f6c718d82be50b2ae079ffc8cf221e55c871f321f520342c40d0efbe03",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "76a81ae75822164f",
+      "old_bytes": "5c6785f5e9c5d822",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 262136,
+      "new_bytes": "38c93e826c94fcdc",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 152,
+      "new_bytes": "dcdf26f6c718d82be50b2ae079ffc8cf221e55c871f321f520342c40d0efbe03",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 192,
+      "new_bytes": "1f43200879a2f003",
+      "old_bytes": "358cbf1ac8453e6e",
+      "repair": "header_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 5,
+      "byte_offset": 262136,
+      "new_bytes": "38c93e826c94fcdc",
+      "old_bytes": "38c93e826c94fcdc",
+      "repair": "block0_crc64",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 96,
+      "new_bytes": "dcdf26f6c718d82be50b2ae079ffc8cf221e55c871f321f520342c40d0efbe03",
+      "old_bytes": "7bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc2",
+      "repair": "ISO-BOTH footer hash",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 128,
+      "new_bytes": "3f41bf8219e2b6fb",
+      "old_bytes": "d8ed158e3575f1a0",
+      "repair": "R-SC-FOOTER footer_crc64",
+      "tape_file": 2
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "bdf2641e18845a068f6d2c8bf6f026e83f2eaac76102714e5cdcbef59a238b48",
+      "old_sha256": "faff63888d0aa163ac9276352d2134880ef52df88d8a1c50729cabee0cfd1ef5",
+      "rebuild": "encode_parity_map_tape_file with rebuilt directory and FilemarkMap::canonical_digest",
+      "tape_file": 3
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "ed63749b76055e85c797277eecadd89a6b3b6c9c7b059ab2f7530d3c6e270135",
+      "old_sha256": "4aa7bc62103948336300ef3dc2e6190948101429d798b40ab1ff0406e6cd81ed",
+      "rebuild": "assemble_terminal_plan + write_tape_index_replica",
+      "tape_file": 4
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "3543a9de21802bfaf877a7e5c40ba4186627a6c10a8027a8974e266d1509eaa4",
+      "old_sha256": "cbebe1fb39dd7d2b912a6042299833b6cca32127c54d39f31d98891a07e9232a",
+      "rebuild": "assemble_terminal_plan + write_tape_index_replica",
+      "tape_file": 6
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "ffb98040197057a1a4563bb3b0cbf6d028629b3d9066270e27c0c13f8d980c48",
+      "old_sha256": "6ba7f301bf23685e59ebd1041b2d0ec5a7e22abec099e05f8203f932fbd728ba",
+      "rebuild": "assemble_terminal_plan + write_tape_index_replica",
+      "tape_file": 8
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "0db184092347265a71763d9bc9cba199ae60c12f1dec8a2d0d194c307a2346cb",
+      "old_sha256": "fed1eab8921bf96d74230ee9122a0e5a990145c358dfbabe567c40808eb0a286",
+      "rebuild": "assemble_terminal_plan + write_index_separation",
+      "tape_file": 5
+    },
+    {
+      "block_count": 3,
+      "new_sha256": "54fe445ee78b2e64263e56bd8cba941a23b817f1c9d0d8354e25a757831f8e12",
+      "old_sha256": "e36b4bff04bf9f40299f4123a27b5c68c2ff445421a09a15c3a79b9cc249d0ad",
+      "rebuild": "assemble_terminal_plan + write_index_separation",
+      "tape_file": 7
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (primary and tail)",
+    "recover_ordinal_from_sidecar (chaos medium faults, rebuilt map)",
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "faults": [],
+  "unit_inputs": null
+}

@@ -1,0 +1,46 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "overflow-9.2-SxK",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "a501a4017272732d6361756368792d67663235362d763102020302041b800000000000000002a50158204844cab0503375f6ec546eb944144f641975cf4a2840de39e8cce23653fab6cf02010300040005f403782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310474323032362d30382d30395430303a30303a30305a05f4",
+      "old_bytes": "a501a4017272732d6361756368792d67663235362d763102020302040202a50158204844cab0503375f6ec546eb944144f641975cf4a2840de39e8cce23653fab6cf02010300040005f403782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310474323032362d30382d30395430303a30303a30305a05f4c7fd539ae984d935",
+      "repair": "mutation: bootstrap S = 2^63",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 44,
+      "new_bytes": "92000000",
+      "old_bytes": "8a000000",
+      "repair": "mutation",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "6508e00adec4f96b",
+      "old_bytes": "c0054196e69cbdc8",
+      "repair": "bootstrap header CRC",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 202,
+      "new_bytes": "e6bb97cd14baf3d2",
+      "old_bytes": "0000000000000000",
+      "repair": "bootstrap payload CRC at new position",
+      "tape_file": 0
+    }
+  ],
+  "entry_points": [
+    "parse_bootstrap_block"
+  ],
+  "target_role": "Bootstrap"
+}

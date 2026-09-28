@@ -1,0 +1,19 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "sidecar-zero-fill/c-footer-fill",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 4096,
+      "new_bytes": "01",
+      "old_bytes": "00",
+      "repair": "mutation",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_footer_block"
+  ],
+  "target_role": "SidecarFooter"
+}

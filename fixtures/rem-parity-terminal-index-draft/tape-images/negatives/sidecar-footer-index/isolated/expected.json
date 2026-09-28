@@ -1,0 +1,33 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The file is still 7 blocks with the footer physically at block 6. H, P, total, the tail start and the primary start are unchanged, and the footer's fields (H, P, total, tail start, hash) still agree with both copies. The copies agree with each other and with the directory entry.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-footer-index/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (hashed; the footer has no footer_block_index field, so only the hash is mirrored)"
+  ],
+  "mutation": {
+    "field": "footer_block_index u64",
+    "from": 6,
+    "offset": "0x88",
+    "to": 7
+  },
+  "parent": "sidecar-footer-index",
+  "pinned": true,
+  "quotes": [
+    "| 0x88 | 8 | footer_block_index u64 | MUST = 2H + P |"
+  ],
+  "sections": [
+    "9.2"
+  ],
+  "target": "footer_block_index rule (Section 9.2)",
+  "violates_only": "Section 9.2 'footer_block_index MUST = 2H + P'"
+}

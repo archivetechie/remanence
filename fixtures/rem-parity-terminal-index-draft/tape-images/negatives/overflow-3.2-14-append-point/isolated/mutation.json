@@ -1,0 +1,60 @@
+{
+  "artifact": "tape-image unfinalized-open",
+  "authored_mutation": {
+    "input": "the commit record for tape file 2 (the sidecar) claims block_count 0xFFFFFFFFFFFFFFFF; object records and ranges are unchanged"
+  },
+  "case": "overflow-3.2-14-append-point/isolated",
+  "commit_record_inputs": {
+    "T": 6,
+    "W": 4,
+    "committed_prefix": [
+      {
+        "block_count": 1,
+        "epoch_id": null,
+        "first_parity_data_ordinal": null,
+        "kind": "Bootstrap",
+        "physical_start_override": 0,
+        "protected_ordinal_end_exclusive": null,
+        "protected_ordinal_start": null,
+        "tape_file_number": 0
+      },
+      {
+        "block_count": 4,
+        "epoch_id": null,
+        "first_parity_data_ordinal": 0,
+        "kind": "Object",
+        "physical_start_override": 2,
+        "protected_ordinal_end_exclusive": null,
+        "protected_ordinal_start": null,
+        "tape_file_number": 1
+      },
+      {
+        "block_count": 18446744073709551615,
+        "epoch_id": 0,
+        "first_parity_data_ordinal": null,
+        "kind": "ParitySidecar",
+        "physical_start_override": 7,
+        "protected_ordinal_end_exclusive": 4,
+        "protected_ordinal_start": 0,
+        "tape_file_number": 2
+      },
+      {
+        "block_count": 2,
+        "epoch_id": null,
+        "first_parity_data_ordinal": 4,
+        "kind": "Object",
+        "physical_start_override": 15,
+        "protected_ordinal_end_exclusive": null,
+        "protected_ordinal_start": null,
+        "tape_file_number": 3
+      }
+    ],
+    "image": "unfinalized-open"
+  },
+  "edits": [],
+  "entry_points": [
+    "resume_record_result(FileTapeFileJournal::committed_snapshot_bounded) -> checked_bounded_resume_summary"
+  ],
+  "faults": [],
+  "unit_inputs": null
+}

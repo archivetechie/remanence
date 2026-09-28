@@ -1,0 +1,44 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "bootstrap",
+    "tape_file": 0
+  },
+  "evaluation": "From the sidecar header: S u32 × k u16 < 2^48, so no overflow and no vector. From the bootstrap: 2^63 × 2 = 2^64 overflows, e.g. in the Recoverer's pin (Section 13.3) or the Resumer's bound T − W < S × k (Section 14).",
+  "expected": {
+    "error": "BootstrapParse"
+  },
+  "formula": "logical_shard_count = S × k",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-9.2-SxK",
+  "integrity_repair": [
+    "as overflow-6.6-scheme-product"
+  ],
+  "mutation": [
+    {
+      "name": "S",
+      "position": "bootstrap key 1 key 4",
+      "value": "2^63"
+    },
+    {
+      "name": "k",
+      "position": "bootstrap key 1 key 2",
+      "value": "2"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"
+  ],
+  "sections": [
+    "9.2",
+    "6.6",
+    "8.2",
+    "14"
+  ],
+  "shadowed": "By Section 6.6 validity at bootstrap parse; the bootstrap is rejected first.",
+  "target": "any Reader using the bootstrap's S and k",
+  "type": "u64"
+}

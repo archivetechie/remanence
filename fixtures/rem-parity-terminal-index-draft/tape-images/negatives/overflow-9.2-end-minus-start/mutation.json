@@ -1,0 +1,55 @@
+{
+  "artifact": "tape-image two-epoch",
+  "case": "overflow-9.2-end-minus-start",
+  "edits": [
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "0400000000000000",
+      "old_bytes": "0400000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "0300000000000000",
+      "old_bytes": "0800000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 152,
+      "new_bytes": "ebc45b4edffc84d55187a4a6442bd5ce2309b647d535fff06b96b3f5322d1668",
+      "old_bytes": "c883b7d7577ddb8843a5e4051b3ec7e51261b48a38c6a9270490899a7d696ca6",
+      "repair": "R-SC-HASHED canonical_metadata_hash (wire fields and actual entries)",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "59ec22ed013f30f5",
+      "old_bytes": "ecba18005feb42e3",
+      "repair": "header_crc64",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image two-epoch",
+      "block_within_file": 0,
+      "byte_offset": 262136,
+      "new_bytes": "32d95c1bd02ae298",
+      "old_bytes": "32d95c1bd02ae298",
+      "repair": "block0_crc64",
+      "tape_file": 3
+    }
+  ],
+  "entry_points": [
+    "parse_sidecar_index_blocks (includes parse_sidecar_header_block)"
+  ],
+  "target_role": "SidecarCopy"
+}

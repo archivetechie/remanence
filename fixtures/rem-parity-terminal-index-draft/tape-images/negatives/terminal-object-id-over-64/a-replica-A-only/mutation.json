@@ -1,0 +1,100 @@
+{
+  "artifact": "terminal profile multi-256k",
+  "case": "terminal-object-id-over-64/a-replica-A-only",
+  "edits": [
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 1,
+      "byte_offset": 384,
+      "new_bytes": "7e00a801010269706c61696e74657874030204584161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161610a000b18200c010d582031313131313131313131313131313131313131313131313131313131313131310000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "old_bytes": "5500a801010269706c61696e7465787403020458186d696e696d616c2d706c61696e746578742d6f626a6563740a000b18200c010d5820313131313131313131313131313131313131313131313131313131313131313100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "repair": "mutation: object_id slot, encoded_len and padding",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 168,
+      "new_bytes": "8c82a0cdb1b341a952e0d4febf7b11a06c810fb51978c60efe82603bee3211ee",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 168,
+      "new_bytes": "8c82a0cdb1b341a952e0d4febf7b11a06c810fb51978c60efe82603bee3211ee",
+      "old_bytes": "2d7dcc3e247fbc4c981391ece8604de200b575661e7c06dc0fb8e7dabe13c3b4",
+      "repair": "R-TR-PAYLOAD payload SHA-256",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "b25feb2127b07e310900ed25f7751021e484db896ed2fb624a26487924d64922",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "b25feb2127b07e310900ed25f7751021e484db896ed2fb624a26487924d64922",
+      "old_bytes": "ce95b70ae580c9124b128c0d18b50ae20f56a8b820f8d7c96cc334284dea60e0",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "1d5e1b76ab7861a1ddebdd854b3f66369642d526e3434342a94e54c7c64b4208",
+      "old_bytes": "c057f822cb90e70f2e90cf161945147dcdf1f3b55a412847303cc203fac6a149",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "1d5e1b76ab7861a1ddebdd854b3f66369642d526e3434342a94e54c7c64b4208",
+      "old_bytes": "c057f822cb90e70f2e90cf161945147dcdf1f3b55a412847303cc203fac6a149",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 0,
+      "byte_offset": 1016,
+      "new_bytes": "2fa0e2be10f31317",
+      "old_bytes": "b64740fc754c73ac",
+      "repair": "replica header CRC",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 696,
+      "new_bytes": "6e342c5154aea0711ba591fed7e166864ea7773207d7887ebbd904bddfaaf545",
+      "old_bytes": "d0d7bab9042c5888acd8fcb8b551a9612d721fcd0c30b930bb63fb0a8b48f63c",
+      "repair": "footer header-record SHA-256",
+      "tape_file": 6
+    },
+    {
+      "artifact": "terminal profile multi-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "a642e1e9cf502054",
+      "old_bytes": "dbb87b606e0df46d",
+      "repair": "replica footer CRC",
+      "tape_file": 6
+    }
+  ],
+  "entry_points": [
+    "parse_tape_index_replica_header + parse_tape_index_bootstrap_footer + validate_tape_index_replica_payload"
+  ],
+  "target_role": "Replica"
+}

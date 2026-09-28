@@ -1,0 +1,11 @@
+{
+  "expected_for_each": "TerminalIndexReplicaParse",
+  "replicas": [
+    "A",
+    "B",
+    "C"
+  ],
+  "tape_level": "no replica validates; Section 12.4 returns BotStructuralRecoveryRequired and the BOT walk",
+  "tape_level_error": "BotStructuralRecoveryRequired",
+  "variant": "b-all-replicas"
+}

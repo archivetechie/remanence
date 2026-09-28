@@ -1,0 +1,9 @@
+{
+  "reaches_target_if": "the hash covers the wire value of 0x78",
+  "repair": [
+    "recompute canonical_metadata_hash over the header wire bytes as mutated (0x78 = 1)",
+    "header_crc64",
+    "block0_crc64"
+  ],
+  "variant": "a-hash-over-wire"
+}

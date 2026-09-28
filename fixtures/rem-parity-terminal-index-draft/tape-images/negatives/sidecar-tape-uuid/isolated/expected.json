@@ -1,0 +1,35 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies; footer presented unreadable",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The magic still matches, so the block is recognised as this tape's sidecar. Every other field is unchanged, and the copies agree with each other and with the directory hash. The directory and replicas carry no UUID for the sidecar.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-tape-uuid/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (new hash in both copies and directory key 8)",
+    "ISO-FAULT-FOOTER (the footer's tape_uuid 0x10 has no stated rule, so whether mirroring ee..ee into it would break one is unknown)"
+  ],
+  "mutation": {
+    "field": "tape_uuid",
+    "keep": "the magic stays derived from the real tape UUID",
+    "offset": "0x08..0x18",
+    "to": "ee x 16"
+  },
+  "parent": "sidecar-tape-uuid",
+  "pinned": true,
+  "quotes": [
+    "| 0x08 | 16 | tape_uuid | MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1 |"
+  ],
+  "sections": [
+    "9.2",
+    "5.2"
+  ],
+  "target": "tape_uuid rule (Section 9.2)",
+  "violates_only": "Section 9.2 'tape_uuid MUST match the bootstrap'"
+}

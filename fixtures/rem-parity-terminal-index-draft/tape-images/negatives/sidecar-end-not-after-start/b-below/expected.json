@@ -1,0 +1,7 @@
+{
+  "from": 8,
+  "note": "end < start; end - start underflows u64 and MUST be rejected, not wrapped (Section 2.4); also listed as 7c overflow-9.2-end-minus-start",
+  "offset": "0x38",
+  "to": 3,
+  "variant": "b-below"
+}

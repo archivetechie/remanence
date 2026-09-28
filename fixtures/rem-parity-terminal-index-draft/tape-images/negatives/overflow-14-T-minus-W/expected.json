@@ -1,0 +1,37 @@
+{
+  "base": {
+    "artifact": "tape-image unfinalized-open",
+    "note": "true prefix: T = 6, W = 4"
+  },
+  "evaluation": "6 − 8 underflows. Step 2 lists 'T − W < S × k' before 'W ≤ T', so a Resumer that evaluates in the listed order meets the underflow first.",
+  "expected": {
+    "error": "ResumeAppend"
+  },
+  "formula": "T − W < S × k",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": "off-tape only: W and T come from the committed prefix given by the commit records (Section 14 step 1)",
+  "id": "overflow-14-T-minus-W",
+  "integrity_repair": [
+    "none on tape"
+  ],
+  "mutation": [
+    {
+      "name": "protected range of the sidecar at tape file 2",
+      "position": "its commit record (abstract, injected by the harness)",
+      "value": "[0, 8), so W = 8 > T = 6"
+    }
+  ],
+  "pinned": true,
+  "quotes": [
+    "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch). `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through `W`; epoch ids MUST be consecutive; and the prefix's final object entry MUST end exactly at `T`. A violation is `ResumeAppend`."
+  ],
+  "sections": [
+    "14",
+    "3.4",
+    "2.4"
+  ],
+  "shadowed": "By 'W ≤ T' if checked first; same name.",
+  "target": "the Resumer (Section 14 step 2)",
+  "type": "u64"
+}

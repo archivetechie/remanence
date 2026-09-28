@@ -1,0 +1,127 @@
+{
+  "artifact": "terminal profile minimal-256k",
+  "case": "overflow-8.3-component-starts",
+  "edits": [
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 344,
+      "new_bytes": "feffffffffffffff",
+      "old_bytes": "0200000000000000",
+      "repair": "mutation",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 144,
+      "new_bytes": "feffffffffffffff",
+      "old_bytes": "0200000000000000",
+      "repair": "mutation",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 344,
+      "new_bytes": "feffffffffffffff",
+      "old_bytes": "0200000000000000",
+      "repair": "mutation",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 144,
+      "new_bytes": "feffffffffffffff",
+      "old_bytes": "0200000000000000",
+      "repair": "mutation",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 264,
+      "new_bytes": "1b45fb967ea7d994c03c5ed4f23870f89bad4897feb989a42e962e7cadd334fd",
+      "old_bytes": "e462823b35a6dd1cc85ebf001cb20329ba96966b98745ca3de986afab2a6876f",
+      "repair": "R-TR-COMMON layout digest",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 264,
+      "new_bytes": "1b45fb967ea7d994c03c5ed4f23870f89bad4897feb989a42e962e7cadd334fd",
+      "old_bytes": "e462823b35a6dd1cc85ebf001cb20329ba96966b98745ca3de986afab2a6876f",
+      "repair": "R-TR-COMMON layout digest",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 232,
+      "new_bytes": "9af88c952564857e23455049043c88e88df51dd94067005454f3ef8bbbac86fe",
+      "old_bytes": "9af88c952564857e23455049043c88e88df51dd94067005454f3ef8bbbac86fe",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 232,
+      "new_bytes": "9af88c952564857e23455049043c88e88df51dd94067005454f3ef8bbbac86fe",
+      "old_bytes": "9af88c952564857e23455049043c88e88df51dd94067005454f3ef8bbbac86fe",
+      "repair": "R-TR-COMMON edition digest",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 296,
+      "new_bytes": "021d3f8efa44160cf937a73818b61a17af91f91df10c1cded8c2a1ff6044003f",
+      "old_bytes": "4bf44ed72c6fe2e5cb23f01797056935ebc17b024051fc92e6d267ee76f6a70c",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 296,
+      "new_bytes": "021d3f8efa44160cf937a73818b61a17af91f91df10c1cded8c2a1ff6044003f",
+      "old_bytes": "4bf44ed72c6fe2e5cb23f01797056935ebc17b024051fc92e6d267ee76f6a70c",
+      "repair": "R-TR-COMMON descriptor digest",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 0,
+      "byte_offset": 1016,
+      "new_bytes": "0c66c983a6bb6166",
+      "old_bytes": "63399b7220e5baba",
+      "repair": "replica header CRC",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 696,
+      "new_bytes": "87c729cfc2b2c3eb30777411d9dbe39166fdb5db22ff54a806027d2455e06a31",
+      "old_bytes": "56c41ca01c6bb08ed844028b760e2aed479ac77bf01c1338cef797194f5a79eb",
+      "repair": "footer header-record SHA-256",
+      "tape_file": 1
+    },
+    {
+      "artifact": "terminal profile minimal-256k",
+      "block_within_file": 2,
+      "byte_offset": 1016,
+      "new_bytes": "fb7eb22c1f1955f8",
+      "old_bytes": "e7de41680ac459d7",
+      "repair": "replica footer CRC",
+      "tape_file": 1
+    }
+  ],
+  "entry_points": [
+    "parse_tape_index_replica_header + parse_tape_index_bootstrap_footer + validate_tape_index_replica_payload"
+  ],
+  "target_role": "Replica"
+}

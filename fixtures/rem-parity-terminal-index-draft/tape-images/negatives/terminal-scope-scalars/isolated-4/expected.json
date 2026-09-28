@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "new terminal profile 'multi-unprotected-256k' as in isolated-3"
+  },
+  "every_other_rule_holds": "W = T (5 = 5), so the Section 10.6 rule holds. T equals its recompute and W ≤ T. The rest is as in isolated-3.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse",
+    "tape_level": "BotStructuralRecoveryRequired"
+  },
+  "group": "7b",
+  "id": "terminal-scope-scalars/isolated-4",
+  "integrity_repair": [
+    "as isolated-3"
+  ],
+  "mutation": {
+    "fields": "total data ordinals = 5, highest protected ordinal = 5 (recomputed W is 2)"
+  },
+  "parent": "terminal-scope-scalars (variant c: W recompute)",
+  "pinned": true,
+  "quotes": [
+    "W = max(protected_ordinal_end_exclusive)         over sidecar entries   (0 if none)"
+  ],
+  "sections": [
+    "7.4",
+    "7.2"
+  ],
+  "target": "the Section 7.4 W cross-check",
+  "violates_only": "Section 7.4 cross-check of highest_protected_ordinal against W recomputed over the prefix (5 ≠ 2)"
+}

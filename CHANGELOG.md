@@ -6,6 +6,24 @@ per-release summaries.
 
 ## Unreleased
 
+- Added review-only negative vectors for REM-PARITY generation 2
+  (`fixtures/rem-parity-terminal-index-draft/tape-images/negatives/`).
+  - **Cases.** There are 58 cases and 48 single-rule variants covering the sidecar, the ParityMap, the
+    bootstrap, the terminal replicas and separation extents, and overflow in each size and location
+    formula. Their expected §15 errors were written from the specification text before any executor
+    existed.
+  - **Pinning and execution.** The image generator resolves each mutation against the real bytes and
+    pins the result by digest. The workspace tests run every case through the production parser,
+    validator or Recoverer.
+  - **Fixes.** The vectors found four reference defects, now fixed:
+    - a sidecar header whose total block count was 0 skipped every layout check;
+    - the parity-block locator could overflow, panicking in debug builds and wrapping in release;
+    - the Recoverer reported an implementation defect (`Invariant`) for a sidecar range longer than
+      S × k recorded on the tape;
+    - an overflowing commit record did the same in the Resumer.
+  - **Behaviour now.** In the Recoverer, a sidecar that has no valid copy makes its epoch
+    metadata-unavailable, and a valid copy that disagrees with the map is a `SchemeMismatch`. The
+    Resumer case is now a `ResumeAppend`.
 - The second implementation of REM-PARITY generation 2 gains a `resume`
   command. It decided the eight portable resume cases under opaque ids, before
   reading the resume expectations or the reference's resumed tapes. All eight

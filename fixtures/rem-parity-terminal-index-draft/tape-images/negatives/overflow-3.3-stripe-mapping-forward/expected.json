@@ -1,0 +1,40 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "evaluation": "d cannot underflow: the descriptor is chosen because start <= o < end. d mod S and d / S are undefined for S = 0 (division, not overflow).",
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "formula": "d = o − start; stripe = d mod S; data_index = d / S",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-3.3-stripe-mapping-forward",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": [
+    {
+      "name": "S",
+      "position": "sidecar header 0x24 (u32)",
+      "value": 0
+    }
+  ],
+  "note": "No overflow vector exists for the forward direction; the only hazard is S = 0, which earlier rules reject.",
+  "pinned": true,
+  "quotes": [
+    "stripe      = d mod S                  (the stripe index varies fastest)",
+    "| 0x24 | 4 | S u32 | ≠ 0 |"
+  ],
+  "sections": [
+    "3.3",
+    "9.2",
+    "6.6"
+  ],
+  "shadowed": "Yes: S = 0 is rejected by the Section 9.2 rule 'S u32 ≠ 0' before the mapping runs, and the bootstrap's S >= 1 by Section 6.6. Outcome as case sidecar-s-zero.",
+  "target": "the Recoverer's ordinal-to-stripe mapping (Section 3.3) after index acquisition (Section 13.3)",
+  "type": "u64"
+}

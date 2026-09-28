@@ -334,7 +334,9 @@ pub(crate) fn validate_object_recovery_row(
     )
 }
 
-pub(crate) fn validate_object_recovery_row_fields(
+/// Validate Object recovery fields, including checked manifest range and capacity.
+#[doc(hidden)]
+pub fn validate_object_recovery_row_fields(
     stored_block_count: u64,
     object_id: Option<&[u8]>,
     representation: &ObjectRecoveryRepresentation,

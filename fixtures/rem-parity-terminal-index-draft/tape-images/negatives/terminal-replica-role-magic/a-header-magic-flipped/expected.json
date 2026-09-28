@@ -1,0 +1,5 @@
+{
+  "change": "XOR 0x01 into byte 0 of replica A's header record",
+  "offset": "0x000",
+  "variant": "a-header-magic-flipped"
+}

@@ -1,0 +1,33 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "real (4) ≤ logical (5) and real is in 1..=S*k (4). The layout, locators and file are unchanged. The copies, footer and directory agree.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-logical-shard-count/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (hashed; not mirrored)"
+  ],
+  "mutation": {
+    "field": "logical_shard_count u64",
+    "from": 4,
+    "offset": "0x40",
+    "to": 5
+  },
+  "parent": "sidecar-logical-shard-count",
+  "pinned": true,
+  "quotes": [
+    "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"
+  ],
+  "sections": [
+    "9.2"
+  ],
+  "target": "logical_shard_count rule (Section 9.2)",
+  "violates_only": "Section 9.2 'logical_shard_count MUST = S × k'"
+}

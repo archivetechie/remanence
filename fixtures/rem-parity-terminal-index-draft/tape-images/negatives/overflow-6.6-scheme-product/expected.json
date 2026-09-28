@@ -1,0 +1,50 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "bootstrap",
+    "tape_file": 0
+  },
+  "evaluation": "2^63 × 4 = 2^65 overflows u64. From the sidecar header the operands are u32 × (u16 + u16) < 2^49, so only the bootstrap route can overflow.",
+  "expected": {
+    "error": "BootstrapParse"
+  },
+  "formula": "S × (k + m) ≤ 2^32 − 1",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": true,
+  "id": "overflow-6.6-scheme-product",
+  "integrity_repair": [
+    "cbor_payload_len (0x2C) += 8",
+    "crc64_header (0x30)",
+    "crc64_payload (u64 LE after the payload) recomputed at its new position; zero fill follows"
+  ],
+  "mutation": [
+    {
+      "name": "S",
+      "position": "bootstrap payload key 1 (scheme record), key 4",
+      "value": "2^63 (CBOR 1b 80 00 00 00 00 00 00 00; the payload grows by 8 bytes)"
+    },
+    {
+      "name": "k, m",
+      "position": "key 1 keys 2, 3",
+      "value": "unchanged (2, 2)"
+    }
+  ],
+  "pin_note": "Pinned at the bootstrap parser. Whether the inequality is evaluated with overflow detection or found false, the result is the same.",
+  "pinned": true,
+  "quotes": [
+    "k ≥ 2      1 ≤ m ≤ k      S ≥ 1      k + m ≤ 255      S × (k + m) ≤ 2³² − 1",
+    "For a parity bootstrap the scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)` MUST satisfy Section 6.6 validity."
+  ],
+  "sections": [
+    "6.6",
+    "8.2",
+    "2.4",
+    "15",
+    "Appendix D TT-7"
+  ],
+  "shadowed": false,
+  "tape_level": "Unpinned at discovery level: whether such a checksum-valid bootstrap counts as unreadable (so supplied values may be used) or yields NoBootstrapFound is open item TT-7.",
+  "target": "the bootstrap payload validation (Section 8.2: '(k, m, S) MUST satisfy Section 6.6 validity') in Scanner discovery (Section 8.4)",
+  "type": "u64 (CBOR uint operands)"
+}

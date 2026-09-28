@@ -1,0 +1,37 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies; footer presented unreadable",
+    "tape_file": 2
+  },
+  "caveat": "Exactly one of isolated-1 and isolated-2 is isolated, depending on the unresolved Section 9.5 reading (NOTES.md gap 5).",
+  "every_other_rule_holds": "As isolated-1, with the original hash valid under this reading.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-primary-start/isolated-2",
+  "integrity_repair": [
+    "the hash is left as it was, which equals the hash computed with 0x78 taken as 0; directory key 8 unchanged",
+    "header_crc64 and block0_crc64 of both copies",
+    "ISO-FAULT-FOOTER"
+  ],
+  "mutation": {
+    "field": "primary_header_start_block u64",
+    "from": 0,
+    "offset": "0x78",
+    "to": 1
+  },
+  "parent": "sidecar-primary-start (variant b)",
+  "pinned": true,
+  "quotes": [
+    "the header's exact wire bytes 0x00 through 0x8F inclusive — magic through `footer_block_index`, with `primary_header_start_block` as 0"
+  ],
+  "sections": [
+    "9.2",
+    "9.5"
+  ],
+  "target": "primary_header_start_block rule (Section 9.2)",
+  "violates_only": "Section 9.2 'primary_header_start_block MUST = 0', under the reading of Section 9.5 that substitutes 0"
+}

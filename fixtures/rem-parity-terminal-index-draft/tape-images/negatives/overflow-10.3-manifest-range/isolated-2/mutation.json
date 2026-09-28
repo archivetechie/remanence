@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "manifest_first_chunk_lba 0, manifest_chunk_count 2^46, manifest_size_bytes 1, stored_block_count 2^46, block_size_bytes 262144"
+  },
+  "case": "overflow-10.3-manifest-range/isolated-2",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "object_recovery::validate_object_recovery_row_fields (replica payload boundary)"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "manifest_first_chunk_lba 0, manifest_chunk_count 2^46, manifest_size_bytes 1, stored_block_count 2^46, block_size_bytes 262144"
+  }
+}

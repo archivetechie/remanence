@@ -1,0 +1,6 @@
+{
+  "le_bytes": "ff ff ff ff",
+  "to": 4294967295,
+  "variant": "b-hostile-max",
+  "why": "0x38 + len + 8 overflows u32 and exceeds B in u64; evaluation MUST be checked (Section 2.4)"
+}

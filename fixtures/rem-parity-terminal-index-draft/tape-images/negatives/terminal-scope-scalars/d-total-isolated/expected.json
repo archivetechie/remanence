@@ -1,0 +1,9 @@
+{
+  "base_override": "terminal profile minimal-256k replica A",
+  "field": "total data ordinals",
+  "from": 0,
+  "must_match": "T recomputed = 0 (no Object rows). No sidecars, so the W = T rule does not apply and only the Section 7.4 cross-check fails; W (0) <= T (1) still holds",
+  "offset": "0x050",
+  "to": 1,
+  "variant": "d-total-isolated"
+}

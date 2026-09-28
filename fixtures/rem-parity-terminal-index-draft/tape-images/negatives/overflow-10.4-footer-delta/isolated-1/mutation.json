@@ -1,0 +1,17 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "observed record count 0"
+  },
+  "case": "overflow-10.4-footer-delta/isolated-1",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "tape_index_replica::checked_replica_footer_position",
+    "index_separation::checked_separation_footer_position"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "observed record count 0"
+  }
+}

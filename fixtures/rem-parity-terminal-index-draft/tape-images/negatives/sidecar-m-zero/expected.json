@@ -1,0 +1,43 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "parity_block_count (4) = S*m (0) violated",
+    "Section 9.4 with S*m = 0 parity entries gives inline 32, not 96",
+    "tail start H+P and footer index 2H+P with P = 0 disagree",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-m-zero",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "m u16",
+    "from": 2,
+    "isolation": "only m changes",
+    "le_bytes": "00 00",
+    "offset": "0x22",
+    "to": 0
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x22 | 2 | m u16 | ≠ 0 |",
+    "Because every sidecar carries at least one parity entry (Section 9.2 requires `S` and `m` to be non-zero)"
+  ],
+  "sections": [
+    "9.2",
+    "9.4",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header m rule (Section 9.2)"
+}

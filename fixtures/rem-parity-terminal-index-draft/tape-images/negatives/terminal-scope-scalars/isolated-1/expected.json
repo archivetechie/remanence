@@ -1,0 +1,35 @@
+{
+  "base": {
+    "artifact": "terminal profile multi-256k, all five components regenerated",
+    "location": "every replica and separation frame"
+  },
+  "caveat": "If a Reader takes the tape-file number from the device (a SCSI position report can give one), the plan (7) also disagrees with that measurement, with the same name.",
+  "every_other_rule_holds": "covered = 6 = rows, and the canonical-map digest over exactly the 6 leading entries matches (Section 7.4). The component file numbers are dense (7..11) in the fixed order, and starts and EOD are unchanged. The footer observations equal the plan. T, W and every digest recompute. The footers' tape-file fields are Writer observations, 'not an independent device tape-file counter', so no device measurement contradicts them.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse",
+    "tape_level": "BotStructuralRecoveryRequired (all three replicas fail alike)"
+  },
+  "group": "7b",
+  "id": "terminal-scope-scalars/isolated-1",
+  "integrity_repair": [
+    "terminal-layout digest, edition digest unchanged, replica and separation descriptor digests, header CRCs, footer header-record hashes and CRCs in all five components"
+  ],
+  "mutation": {
+    "change": "tuples (4,1),(5,1),(4,2),(5,2),(4,3) get planned tape-file numbers 7, 8, 9, 10, 11 instead of 6..10; the local planned tape-file fields (replica 0x088, separation 0x040), the separation predecessor/successor file numbers (0x078/0x080) and the footer observed tape-file numbers (0x2D8, 0x1A0) follow. covered_prefix_tape_file_count stays 6 and structural_row_count stays 6. LBAs are unchanged.",
+    "field": "planned tape-file numbers of the terminal suffix"
+  },
+  "parent": "terminal-scope-scalars (variant a, covered prefix)",
+  "pinned": true,
+  "quotes": [
+    "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal.",
+    "The footer's tape-file, start, and count fields are Writer observations, not an independent device tape-file counter."
+  ],
+  "sections": [
+    "10.6",
+    "8.3",
+    "8.4",
+    "7.4"
+  ],
+  "target": "replica pre-A map equality (Section 10.6)",
+  "violates_only": "Section 10.6 'covered_prefix_tape_file_count, structural_row_count, and replica A's planned tape-file number are equal' (6, 6, 7)"
+}

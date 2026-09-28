@@ -1,0 +1,33 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "as isolated-1"
+  },
+  "every_other_rule_holds": "The Object-row count equals the number of kind-0 structural rows (Section 10.3). Structural row 0 is the kind-2 bootstrap (Section 10.2), so o ≤ s − 1 must hold, and 2^56 ≤ 2^56 holds. The other product fits. No other geometry formula is reached before the overflowing product. s = o = 2^56 would not do: it leaves no structural row for the bootstrap, so o ≤ s − 1 breaks. The choice s = 2^56 + 1 is the smallest that keeps that rule. Image level is still impossible, as in isolated-1: a replica with 2^56 Object rows needs 2^64 payload bytes.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.4-slot-product/isolated-2",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "structural_row_count = 2^56 + 1, object_row_count = 2^56"
+  },
+  "parent": "overflow-10.4-slot-product (variant b)",
+  "pinned": true,
+  "quotes": [
+    "payload_len            = 64 × structural_row_count + 256 × object_row_count",
+    "every terminal replica carries exactly `object_row_count` 256-byte fixed slots, one for each kind-0 structural row",
+    "Structural row 0 MUST be the kind-2 bootstrap that Section 3.1 requires at tape file 0."
+  ],
+  "sections": [
+    "10.2",
+    "10.3",
+    "10.4",
+    "10.6"
+  ],
+  "target": "256 × o",
+  "violates_only": "Checked evaluation of 256 × 2^56 (= 2^64). 64 × (2^56 + 1) = 2^62 + 64 fits, and the sum is never reached."
+}

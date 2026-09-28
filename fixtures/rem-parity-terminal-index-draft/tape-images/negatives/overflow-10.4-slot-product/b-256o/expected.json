@@ -1,0 +1,6 @@
+{
+  "object_row_count": "2^56",
+  "overflow": "256 × 2^56 = 2^64",
+  "structural_row_count": 1,
+  "variant": "b-256o"
+}

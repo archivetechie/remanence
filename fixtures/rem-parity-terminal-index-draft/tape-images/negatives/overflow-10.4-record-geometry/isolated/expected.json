@@ -1,0 +1,29 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "replica record-geometry computation (Section 10.4)"
+  },
+  "every_other_rule_holds": "64s + 256o does not overflow, and footer_block_offset = 1 + 2^46 and replica_record_count = 2 + 2^46 fit. Image level is impossible for the reason of overflow-10.4-slot-product/isolated-1: the counts must match the decoded slots, and the record count must match the device.",
+  "expected": {
+    "error": "TerminalIndexReplicaParse"
+  },
+  "group": "7c",
+  "id": "overflow-10.4-record-geometry/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "structural_row_count = 2^58 − 1, object_row_count = 0, B = 262144"
+  },
+  "parent": "overflow-10.4-record-geometry",
+  "pinned": true,
+  "quotes": [
+    "payload_padding_bytes  = payload_record_count × B − payload_len"
+  ],
+  "sections": [
+    "10.4",
+    "10.6"
+  ],
+  "target": "payload_padding_bytes = payload_record_count × B − payload_len",
+  "violates_only": "Checked evaluation of 2^46 × 2^18. payload_len = 2^64 − 64 fits, and the exact ceil gives 2^46; the (L + B − 1)/B form overflows earlier, with the same outcome."
+}

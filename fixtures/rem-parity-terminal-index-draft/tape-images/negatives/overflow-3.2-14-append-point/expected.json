@@ -1,0 +1,40 @@
+{
+  "base": {
+    "artifact": "tape-image unfinalized-open",
+    "note": "committed prefix files 0..3 (bootstrap 1, Object 4, sidecar 7 [0,4), Object 2); T = 6, W = 4; append point 17"
+  },
+  "evaluation": "(1+1) + (4+1) + (7+1) + (2^64 - 1 + 1) overflows; T = 4 + (2^64 - 1) overflows too.",
+  "expected": {
+    "error": "ResumeAppend"
+  },
+  "formula": "append point = Σ(block_count + 1) over all committed files (Section 3.2; Section 14 step 4)",
+  "freeze_blocker": false,
+  "group": "7c",
+  "hostile_source": "off-tape only: the committed prefix comes from off-tape commit records (Section 3.4, Section 14 step 1), whose format is implementation-defined",
+  "id": "overflow-3.2-14-append-point",
+  "integrity_repair": [
+    "none on tape; the record must be self-consistent in whatever commit-record format the implementation uses"
+  ],
+  "mutation": [
+    {
+      "name": "block_count of tape file 3",
+      "position": "the commit record for tape file 3 (abstract; injected by the harness, not a tape byte)",
+      "value": "0xFFFFFFFFFFFFFFFF"
+    }
+  ],
+  "pin_reason": "Section 2.4 covers 'values read from tape'; commit records are off-tape, so the overflow rule applies only by extension, and an overflowing sum is ResumeAppend only if it counts as an 'incomplete or ambiguous' combination.",
+  "pinned": false,
+  "quotes": [
+    "If a record the Resumer relies on is missing, their claims conflict, or their combination is incomplete or ambiguous, resume MUST fail as `ResumeAppend`.",
+    "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+  ],
+  "sections": [
+    "3.2",
+    "3.4",
+    "14",
+    "2.4"
+  ],
+  "shadowed": "Possibly by step 2 ('the prefix's final object entry MUST end exactly at T', 'T − W < S × k'); every candidate check names ResumeAppend.",
+  "target": "the Resumer (Section 14 steps 1, 2 and 4)",
+  "type": "u64"
+}

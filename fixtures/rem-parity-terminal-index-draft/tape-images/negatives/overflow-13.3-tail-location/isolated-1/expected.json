@@ -1,0 +1,35 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "ParityMap directory entry 0, both copies",
+    "precondition": "blocks 0 and 6 of the sidecar at tape file 2 presented unreadable (medium errors, no byte change) in place of the parent's CRC corruption",
+    "tape_file": 3
+  },
+  "every_other_rule_holds": "The parent broke two sidecar CRCs to reach step 3; here medium errors do that without breaking any format rule. The directory decoder invariants hold (H non-zero, ascending, partition, epochs, flags), and no invariant relates total, H and P. The entry agrees with the map entry in tape file 2, epoch 0, range [0,4) and block count 7, so the Recoverer may place the read. The ParityMap locators, hash and copy agreement hold. The sidecar's bytes are all valid.",
+  "expected": {
+    "error": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7c",
+  "id": "overflow-13.3-tail-location/isolated-1",
+  "integrity_repair": [
+    "R-PM-PAYLOAD"
+  ],
+  "mutation": {
+    "field": "directory entry key 6 (sidecar_header_block_count)",
+    "from": 1,
+    "to": 7
+  },
+  "parent": "overflow-13.3-tail-location (variant a)",
+  "pin_reason": "As the parent: the rejection of the rescue computation is unnamed; SidecarMetadataUnavailable follows only because no copy then validates.",
+  "pinned": false,
+  "quotes": [
+    "locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts"
+  ],
+  "sections": [
+    "13.3",
+    "10.1.5",
+    "12.5"
+  ],
+  "target": "the Recoverer's directory-assisted tail location (Section 13.3 step 3)",
+  "violates_only": "Checked evaluation of 7 − 1 − 7"
+}

@@ -1,5 +1,6 @@
 //! Generate/check review-only full-tape digests and damage descriptors.
 //! Expected outcomes are copied from the frozen specification-authored source.
+use remanence_cli::negative_vectors as negatives;
 use remanence_cli::resume_vectors as resume;
 use remanence_cli::tape_image_vectors::{fault_map, generate, hex, EXPECTATIONS, IMAGE_NAMES};
 use serde_json::Value;
@@ -24,6 +25,16 @@ fn artifact(
             return Err(format!("fixture differs: {relative}").into());
         }
     } else if fs::read(&path).ok().as_deref() != Some(bytes) {
+        if path.exists()
+            && (!relative.starts_with("negatives/")
+                || relative.ends_with("expected.json")
+                || relative.ends_with("negative-cases.json")
+                || relative.ends_with("negative-cases-supplement.json")
+                || relative.ends_with("adjudications.json")
+                || relative.ends_with("isolation-exceptions.json"))
+        {
+            return Err(format!("existing fixture differs; refusing to change {relative}").into());
+        }
         fs::create_dir_all(path.parent().unwrap())?;
         fs::write(path, bytes)?;
     }
@@ -48,17 +59,37 @@ fn files_under(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    let supplement_path = if let Some(i) = args.iter().position(|s| s == "--negative-supplement") {
+        if i + 1 >= args.len() {
+            return Err("--negative-supplement requires a path".into());
+        }
+        let path = PathBuf::from(args.remove(i + 1));
+        args.remove(i);
+        Some(path)
+    } else {
+        None
+    };
     if args.first().is_some_and(|arg| arg == "--export-objects") {
         if args.len() != 2 || args[1].starts_with('-') {
             return Err("usage: generate_tape_images --export-objects <directory>".into());
         }
         return export_objects(Path::new(&args[1]));
     }
-    if args.iter().any(|a| a != "--check") {
-        return Err("usage: generate_tape_images [--check]".into());
-    }
-    let check = args.iter().any(|a| a == "--check");
+    let (check, source_path) = match args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] => (false, None),
+        ["--check"] => (true, None),
+        ["--negative-cases", path] => (false, Some(PathBuf::from(path))),
+        ["--check", "--negative-cases", path] => (true, Some(PathBuf::from(path))),
+        _ => {
+            return Err("usage: generate_tape_images [--check] [--negative-cases <source>] [--negative-supplement <source>]".into())
+        }
+    };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/rem-parity-terminal-index-draft/tape-images");
     let mut emitted = BTreeSet::from([PathBuf::from("expected-cases.json")]);
@@ -218,6 +249,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check,
         &mut emitted,
     )?;
+    let negative_source =
+        fs::read(source_path.unwrap_or_else(|| root.join("negatives/negative-cases.json")))?;
+    let parsed_negatives = negatives::parse_source(&negative_source)?;
+    artifact(
+        &root,
+        "negatives/negative-cases.json",
+        &negative_source,
+        check,
+        &mut emitted,
+    )?;
+    let adjudications = fs::read(root.join("negatives/adjudications.json"))?;
+    negatives::parse_adjudications(&adjudications)?;
+    artifact(
+        &root,
+        "negatives/adjudications.json",
+        &adjudications,
+        check,
+        &mut emitted,
+    )?;
+    let isolation_exceptions = fs::read(root.join("negatives/isolation-exceptions.json"))?;
+    negatives::parse_isolation_exceptions(&isolation_exceptions)?;
+    artifact(
+        &root,
+        "negatives/isolation-exceptions.json",
+        &isolation_exceptions,
+        check,
+        &mut emitted,
+    )?;
+    let negative_source = parsed_negatives;
+    let mut negative_manifest =
+        String::from("case\tartifact\ttape_file\tblock_within_file\tbytes\tsha256\n");
+    let mut unresolved = Vec::new();
+    for (case, variant) in negatives::cases(&negative_source) {
+        let path = negatives::case_path(case, variant);
+        artifact(
+            &root,
+            &format!("negatives/{path}/expected.json"),
+            &serde_json::to_vec_pretty(variant.unwrap_or(case))?,
+            check,
+            &mut emitted,
+        )?;
+        if let Some(reason) = negatives::not_executable(case) {
+            println!("NOT-EXECUTABLE {path}: {reason}");
+            continue;
+        }
+        match negatives::resolve(case, variant) {
+            Ok(vector) => {
+                artifact(
+                    &root,
+                    &format!("negatives/{path}/mutation.json"),
+                    &serde_json::to_vec_pretty(&vector.descriptor)?,
+                    check,
+                    &mut emitted,
+                )?;
+                negative_manifest.push_str(&vector.manifest);
+            }
+            Err(error) => {
+                eprintln!("UNRESOLVED {path}: {error}");
+                unresolved.push(path);
+            }
+        }
+    }
+    let supplement_bytes = fs::read(
+        supplement_path.unwrap_or_else(|| root.join("negatives/negative-cases-supplement.json")),
+    )?;
+    let supplement = negatives::supplement::parse_source(&supplement_bytes)?;
+    artifact(
+        &root,
+        "negatives/negative-cases-supplement.json",
+        &supplement_bytes,
+        check,
+        &mut emitted,
+    )?;
+    for variant in supplement["variants"]
+        .as_array()
+        .ok_or("supplement variants missing")?
+    {
+        let path = variant["id"].as_str().ok_or("supplement id missing")?;
+        artifact(
+            &root,
+            &format!("negatives/{path}/expected.json"),
+            &serde_json::to_vec_pretty(variant)?,
+            check,
+            &mut emitted,
+        )?;
+        match negatives::supplement::resolve(variant) {
+            Ok(vector) => {
+                artifact(
+                    &root,
+                    &format!("negatives/{path}/mutation.json"),
+                    &serde_json::to_vec_pretty(&vector.descriptor)?,
+                    check,
+                    &mut emitted,
+                )?;
+                negative_manifest.push_str(&vector.manifest);
+            }
+            Err(e) => {
+                eprintln!("UNRESOLVED {path}: {e}");
+                unresolved.push(path.to_string());
+            }
+        }
+    }
+    artifact(
+        &root,
+        "negatives/MANIFEST.tsv",
+        negative_manifest.as_bytes(),
+        check,
+        &mut emitted,
+    )?;
+    if !unresolved.is_empty() {
+        return Err(format!("unresolved negative cases: {unresolved:?}").into());
+    }
     if check {
         let mut actual = BTreeSet::new();
         files_under(&root, &root, &mut actual)?;
@@ -230,8 +373,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "{}: all six image digests, 25 damage descriptors and nine resume cases",
-        if check { "CHECK PASS" } else { "GENERATED" }
+        "{}: all six image digests, 25 damage descriptors and nine resume cases; all 7a/7b/7c negative descriptors and {} supplement variants",
+        if check { "CHECK PASS" } else { "GENERATED" },
+        supplement["variants"].as_array().unwrap().len()
     );
     Ok(())
 }

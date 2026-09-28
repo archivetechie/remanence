@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "the Recoverer's parity-shard locator (Sections 9.1, 13.4)"
+  },
+  "every_other_rule_holds": "Image level is impossible: the locator runs on an acquired, validated index, whose H equals the Section 9.4 recompute. That H is small, and parity_index·S + stripe < 2^48, so a validated copy cannot drive the sum past 2^64.",
+  "expected": {
+    "outcome": "rejection; no Section 15 name"
+  },
+  "group": "7c",
+  "id": "overflow-9.1-block-locator/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "H = 2^64 − 1, S = 2, parity_index = 1, stripe = 0"
+  },
+  "parent": "overflow-9.1-block-locator",
+  "pin_reason": "Unit level only; no named error.",
+  "pinned": false,
+  "quotes": [
+    "block(stripe, parity_index) = H + parity_index·S + stripe"
+  ],
+  "sections": [
+    "9.1",
+    "9.4",
+    "13.3"
+  ],
+  "target": "block(stripe, parity_index) = H + parity_index·S + stripe",
+  "violates_only": "Checked evaluation of (2^64 − 1) + 2"
+}

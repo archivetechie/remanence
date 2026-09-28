@@ -1,0 +1,34 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both copies",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "Both copies carry the same value, so they agree. The hash excludes reserved fields, so the footer and directory still match. Nothing else changes.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-copy-kind-reserved/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (hash-excluded: CRCs of both copies only)"
+  ],
+  "mutation": {
+    "field": "reserved u16",
+    "from": 0,
+    "offset": "0x92",
+    "to": 1
+  },
+  "parent": "sidecar-copy-kind-reserved",
+  "pinned": true,
+  "quotes": [
+    "| 0x92 | 2 | reserved | MUST be 0 |"
+  ],
+  "sections": [
+    "9.2",
+    "16.2"
+  ],
+  "target": "reserved field after copy_kind (Section 9.2)",
+  "violates_only": "Section 9.2 'reserved MUST be 0' at 0x92"
+}

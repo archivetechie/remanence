@@ -1,0 +1,36 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "authored_mutation": {
+    "field": "sequence u64",
+    "from": 0,
+    "offset": "0x20",
+    "to": 1
+  },
+  "case": "paritymap-footer-header-disagreement/isolated",
+  "commit_record_inputs": null,
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 32,
+      "new_bytes": "0100000000000000",
+      "old_bytes": "0000000000000000",
+      "repair": "mutation",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 192,
+      "new_bytes": "6c5aacf154e9c9f0",
+      "old_bytes": "b8fc6b67c1321568",
+      "repair": "footer CRC",
+      "tape_file": 3
+    }
+  ],
+  "entry_points": [
+    "parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor"
+  ],
+  "faults": [],
+  "unit_inputs": null
+}

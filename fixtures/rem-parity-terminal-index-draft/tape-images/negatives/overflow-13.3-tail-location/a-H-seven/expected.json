@@ -1,0 +1,7 @@
+{
+  "evaluation": "7 − 1 − 7 underflows",
+  "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+  "key_6": 7,
+  "pinned": false,
+  "variant": "a-H-seven"
+}

@@ -1,0 +1,13 @@
+{
+  "block_within_file": 0,
+  "copy": "primary",
+  "from": "00",
+  "offset": "0x20000",
+  "repair": [
+    "R-SC-FILL"
+  ],
+  "rule": "Section 9.2 'zero fill | MUST be zero up to offset block_size − 8'; Section 9.3 'unused space below the CRC MUST be zero'",
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable",
+  "to": "01",
+  "variant": "a-index-block-fill"
+}

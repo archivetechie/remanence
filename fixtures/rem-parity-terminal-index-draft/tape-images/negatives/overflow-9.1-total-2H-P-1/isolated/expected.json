@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "unit level",
+    "role": "sidecar layout computation (Section 9.1)"
+  },
+  "every_other_rule_holds": "Image level is impossible. In a header, H must equal the Section 9.4 recompute (≤ a few blocks), so a huge H breaks that rule too. In a footer, H is compared with the header copies. With the copies unreadable, no stated footer rule evaluates 2H + P + 1: Section 9.6 constrains only version, reserved, primary start and tail start = H + P, which is overflow-9.1-tail-start's formula.",
+  "expected": {
+    "error": "SidecarParse",
+    "note": "the computation belongs to sidecar validation, whose violations Section 15 names SidecarParse"
+  },
+  "group": "7c",
+  "id": "overflow-9.1-total-2H-P-1/isolated",
+  "integrity_repair": [
+    "not applicable (unit level)"
+  ],
+  "mutation": {
+    "inputs": "H = 2^63, P = 4"
+  },
+  "parent": "overflow-9.1-total-2H-P-1",
+  "pinned": true,
+  "quotes": [
+    "One sidecar is written per parity epoch, in its own tape file of `total = 2H + P + 1` blocks"
+  ],
+  "sections": [
+    "9.1",
+    "9.4",
+    "9.6"
+  ],
+  "target": "total = 2H + P + 1 and footer index 2H + P",
+  "violates_only": "Checked evaluation of 2 × 2^63"
+}

@@ -1,0 +1,13 @@
+{
+  "evaluation": "0 − 1 − 1 would underflow, but a zero total breaks the decoder invariant 'non-zero sidecar_total_block_count', and the Section 13.3 agreement rule forbids the read because the block count differs from the map entry's 7",
+  "expected": {
+    "one_of": [
+      "DirectoryInvalid",
+      "ParityMapParse"
+    ],
+    "permitting_text": "Section 15 category sentence (both copies carry the violation)"
+  },
+  "key_5": 0,
+  "pinned": true,
+  "variant": "c-total-zero"
+}

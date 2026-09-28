@@ -1,0 +1,16 @@
+{
+  "artifact": "unit level",
+  "authored_mutation": {
+    "inputs": "observed start LBA 2^64 − 1, observed record count 3, delta 2"
+  },
+  "case": "overflow-10.4-footer-delta/isolated-2",
+  "commit_record_inputs": null,
+  "edits": [],
+  "entry_points": [
+    "tape_index_replica::checked_replica_footer_position"
+  ],
+  "faults": [],
+  "unit_inputs": {
+    "inputs": "observed start LBA 2^64 − 1, observed record count 3, delta 2"
+  }
+}

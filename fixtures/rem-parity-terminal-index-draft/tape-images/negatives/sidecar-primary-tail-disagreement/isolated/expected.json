@@ -1,0 +1,36 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "tail mutated as in the parent; footer presented unreadable",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "Each copy on its own satisfies Sections 9.2-9.5, with a hash equal to the SHA-256 of its own bytes. The footer is unreadable, so neither copy is compared with a footer hash. The directory's key 8 matches the primary. A directory comparison happens only in the step-3 rescue, which the valid primary makes unnecessary, and no rule compares the directory with a parsed copy otherwise.",
+  "expected": {
+    "per_sidecar_validation": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-primary-tail-disagreement/isolated",
+  "integrity_repair": [
+    "R-SC-HASHED on the tail copy",
+    "ISO-FAULT-FOOTER (the footer holds one hash, so while readable it can match only one copy)"
+  ],
+  "mutation": {
+    "change": "XOR 0x01, with the tail's hash recomputed",
+    "field": "tail copy data-CRC entry 0",
+    "offset": "0x108 of block 5"
+  },
+  "parent": "sidecar-primary-tail-disagreement",
+  "pin_note": "Pinned for the validation outcome only.",
+  "pinned": true,
+  "quotes": [
+    "The tail copy MUST carry metadata and index content identical to the primary; only `copy_kind` and the recomputed CRCs differ. When both copies parse, a Reader MUST verify that they agree and reject divergence."
+  ],
+  "sections": [
+    "9.1",
+    "9.5",
+    "13.3"
+  ],
+  "tape_level": "Unpinned, as in the parent: the Recoverer's step-2 primary fallback may never read the tail, and 'reject divergence' does not say what is rejected.",
+  "target": "primary/tail agreement (Section 9.1), as run by a Verifier or a BOT-walk Scanner that parses both copies",
+  "violates_only": "Section 9.1 'When both copies parse, a Reader MUST verify that they agree and reject divergence'"
+}

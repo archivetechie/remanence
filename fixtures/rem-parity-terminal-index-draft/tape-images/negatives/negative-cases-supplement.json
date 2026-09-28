@@ -1,0 +1,1801 @@
+{
+  "description": "Supplement to negative-cases.json, which stays frozen. For each frozen case whose mutation breaks more than one rule, this file gives an isolated variant, where one can be built, in which the mutated bytes break only the target rule. Where isolation is impossible under the text, not_isolatable gives the reason. Every expectation comes from the specification text alone.",
+  "source": "remanence/specs/in-progress/rem-parity-1-specification.md (REM-PARITY 1.0.0-draft.5)",
+  "supplements": "negative-cases.json",
+  "errata": [
+    {
+      "id": "E1",
+      "variant": "overflow-10.4-slot-product/isolated-2",
+      "change": "inputs changed from s = 1, o = 2^56 to s = 2^56 + 1, o = 2^56; violates_only, every_other_rule_holds, quotes and sections restated",
+      "reason": "Section 10.3 requires one Object row per kind-0 structural row, and Section 10.2 requires structural row 0 to be the bootstrap, so o ≤ s − 1. With s = 1 that rule broke as well as the product. s = o = 2^56 would also break it. s = 2^56 + 1 keeps it and leaves 256 × o as the only overflow, since 64 × s = 2^62 + 64 fits."
+    },
+    {
+      "id": "E2",
+      "variant": "overflow-10.1.2-2M-footer/isolated",
+      "change": "removed from variants; added to not_isolatable as overflow-10.1.2-2M-footer",
+      "reason": "It used B = 2, below the ParityMap minimum block size of 0xC8 (Section 10.1.2). For B ≥ 0xC8, M < 2^57, so 2M + 1 cannot overflow, and no construction that respects the minimum reaches this formula."
+    }
+  ],
+  "conventions": {
+    "ISO-BOTH": "Apply the parent's mutation identically to BOTH header/index copies of the sidecar (primary at block 0, tail at block H+P). Recompute each copy's canonical_metadata_hash; the two hashes are equal, because copy_kind is excluded from the hash. Then recompute each copy's header_crc64 (0xC0) and block0_crc64 (B-8). Write that hash into the footer (0x60) and recompute footer_crc64 (0x80). Write it into the ParityMap directory entry for the sidecar (key 8) and apply R-PM-PAYLOAD from negative-cases.json. Any field the footer or directory entry mirrors (H 0x38/key 6, P 0x40/key 7, total 0x48/key 5, range 0x28/0x30/keys 3-4) gets the new value there too, when that mirror has no rule of its own the value would break. A mutation confined to hash-excluded bytes (copy_kind, the reserved fields, copy_generation) changes neither the footer nor the directory. Result: the Section 9.1 primary/tail agreement, the footer comparison of Section 13.3 step 1 and the directory hash check all hold.",
+    "ISO-FAULT-FOOTER": "Used when the footer mirrors the field under its own rule (primary start = 0, tail start = H + P) or with a rule the text leaves unstated (the footer's tape_uuid). The harness presents the sidecar's footer block (block 2H+P) as unreadable: it returns a medium error for that one block read and changes no byte. With no footer, the footer comparison takes no part. The Recoverer proceeds by Section 13.3 steps 2 and 3, and a Scanner in a BOT walk uses item 5. A medium error is damage, not a format violation (Section 15: 'I/O faults MUST remain distinct from format violations').",
+    "ISO-REBUILD": "Used when the new value changes the sidecar's physical length. Rebuild the image with the sidecar at its new block count, then regenerate everything that depends on the prefix: the replicas' structural row for the sidecar; the ParityMap directory entry (keys 5-8); the ParityMap's canonical_map_digest (header/footer 0x58 and payload key 5), payload_sha256 and CRCs; all three replicas (payload, canonical-map, edition, layout and descriptor digests; the five component tuples; the local planned tape-file and start fields; EOD; footer observations; header-record hashes; CRCs); and both separation extents (tuples, predecessor/successor fields, descriptor digests, header-record hashes, CRCs). Every terminal LBA shifts by the change in the sidecar's block count.",
+    "UNIT": "The rule can be reached only at unit level: the named computation of the named role, called with the listed inputs. The reason field says why no byte image can present these inputs while every other rule of the role holds.",
+    "expected_for_7a_iso": "With both copies carrying the violation, the per-copy validation reports SidecarParse for each copy (a Verifier reports both). The Recoverer finds no valid header/index copy, so its outcome for the epoch is SidecarMetadataUnavailable{epoch_id} (Section 13.3 step 4, Section 12.5).",
+    "erratum_to_frozen_concurrent_checks": "Several frozen 7a cases mutate one copy only: sidecar-copy-generation, sidecar-copy-kind-reserved, sidecar-header-reserved variants a and b, sidecar-data-crc-count, sidecar-footer-index, sidecar-header-block-count, sidecar-inline-index-bytes, sidecar-logical-shard-count, sidecar-parity-block-count, sidecar-primary-start, sidecar-real-data-shard-count, sidecar-tail-start, sidecar-tape-uuid, sidecar-total-block-count a/b, sidecar-k-zero, sidecar-m-zero and sidecar-s-zero. Each of these also breaks the Section 9.1 primary/tail agreement rule ('only copy_kind and the recomputed CRCs differ'), and several frozen concurrent_checks lists do not say so. The three cases whose lists name no other rule at all (sidecar-copy-generation, sidecar-copy-kind-reserved, sidecar-header-reserved variant a) are included below."
+  },
+  "variants": [
+    {
+      "id": "sidecar-block-size/isolated",
+      "parent": "sidecar-block-size",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both header/index copies (blocks 0 and 5)"
+      },
+      "mutation": {
+        "field": "block_size u32",
+        "offset": "0x28",
+        "from": 262144,
+        "to": 524288
+      },
+      "integrity_repair": [
+        "ISO-BOTH (0x28 is hashed; the footer and directory carry no block size, so only the hash is mirrored)"
+      ],
+      "target": "sidecar header/index copy validation, block_size rule (Section 9.2)",
+      "violates_only": "Section 9.2 'block_size MUST equal the actual block size'. The same comparison is the block-size part of the Section 13.3 pin, and the two cannot be separated.",
+      "every_other_rule_holds": "The Section 9.4 recompute at 524288 still gives H = 1 and inline = 96, matching the header. total, tail start and footer index still describe H = 1, P = 4, and the file is 7 blocks. The copies agree with each other, with the footer (hash) and with the directory entry (hash, counts, range). k, m, S, range and counts are unchanged.",
+      "expected": {
+        "per_copy": {
+          "one_of": [
+            "SidecarParse",
+            "SchemeMismatch"
+          ]
+        },
+        "recoverer": {
+          "one_of": [
+            "SidecarMetadataUnavailable{epoch_id: 0}",
+            "SchemeMismatch"
+          ]
+        },
+        "permitting_text": "as in the parent case: the Section 9.2 rule and the Section 13.3 pin name the same comparison differently"
+      },
+      "sections": [
+        "9.2",
+        "13.3",
+        "15"
+      ],
+      "quotes": [
+        "| 0x28 | 4 | block_size u32 | MUST equal the actual block size |",
+        "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size)"
+      ],
+      "pinned": false,
+      "pin_reason": "Same as the parent: two Section 15 names for one comparison."
+    },
+    {
+      "id": "sidecar-canonical-hash/isolated",
+      "parent": "sidecar-canonical-hash",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies, the footer and the directory entry"
+      },
+      "mutation": {
+        "field": "canonical_metadata_hash",
+        "offset": "0x98 in blocks 0 and 5; footer 0x60; directory entry key 8",
+        "change": "the same wrong value everywhere: the correct hash with byte 0 XOR 0x01"
+      },
+      "integrity_repair": [
+        "header_crc64 and block0_crc64 of both copies",
+        "footer_crc64",
+        "R-PM-PAYLOAD for the directory entry"
+      ],
+      "target": "canonical metadata hash verification (Section 9.5)",
+      "violates_only": "Section 9.5 'Readers MUST verify the hash on every index parse'. The stored hash is not the SHA-256 of the domain string, bytes 0x00..0x8F and the entries.",
+      "every_other_rule_holds": "No other byte changes. The copies agree (the hash field is identical in both), the footer's hash equals the copies' and the directory's equals both, all CRCs verify, and every Section 9.2 field rule and the Section 9.4 layout hold.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.5",
+        "13.3",
+        "15"
+      ],
+      "quotes": [
+        "Readers MUST verify the hash on every index parse.",
+        "Only when no header/index copy can be validated is the epoch **metadata-unavailable**"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-copy-generation/isolated",
+      "parent": "sidecar-copy-generation",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "copy_generation u32",
+        "offset": "0x94",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "ISO-BOTH; copy_generation is hash-excluded, so only the two copies' header_crc64 and block0_crc64 change"
+      ],
+      "target": "copy_generation rule (Section 9.2)",
+      "violates_only": "Section 9.2 'copy_generation MUST be 0 while sidecar schema_version = 2'",
+      "every_other_rule_holds": "The parent broke Section 9.1 agreement as well, because only the primary changed. Here both copies carry 1, so they agree. The hash excludes copy_generation, so it still matches the footer and the directory. Every other field is untouched.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.1",
+        "9.5"
+      ],
+      "quotes": [
+        "| 0x94 | 4 | copy_generation u32 | MUST be 0 while sidecar `schema_version` = 2 |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-copy-kind-reserved/isolated",
+      "parent": "sidecar-copy-kind-reserved",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "reserved u16",
+        "offset": "0x92",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "ISO-BOTH (hash-excluded: CRCs of both copies only)"
+      ],
+      "target": "reserved field after copy_kind (Section 9.2)",
+      "violates_only": "Section 9.2 'reserved MUST be 0' at 0x92",
+      "every_other_rule_holds": "Both copies carry the same value, so they agree. The hash excludes reserved fields, so the footer and directory still match. Nothing else changes.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "16.2"
+      ],
+      "quotes": [
+        "| 0x92 | 2 | reserved | MUST be 0 |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-data-crc-count/isolated",
+      "parent": "sidecar-data-crc-count",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "data_crc_count u64",
+        "offset": "0x58",
+        "from": 4,
+        "to": 3
+      },
+      "integrity_repair": [
+        "ISO-BOTH (0x58 is hashed; the footer and directory do not mirror it)"
+      ],
+      "target": "data_crc_count rule (Section 9.2)",
+      "violates_only": "Section 9.2 'data_crc_count MUST = real_data_shard_count'",
+      "every_other_rule_holds": "The index stream still holds exactly S*m = 4 parity entries and real_data_shard_count = 4 data-CRC entries, which Section 9.3 counts from real_data_shard_count. The Section 9.4 layout is computed from real_data_shard_count and still matches (H 1, inline 96), and the fill after 0x128 is zero. The 'nonzero unused space' concurrent check in the parent arises only if a Reader delimits the stream by data_crc_count, which no rule directs. The copies, footer and directory agree.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.3",
+        "9.4"
+      ],
+      "quotes": [
+        "| 0x58 | 8 | data_crc_count u64 | MUST = real_data_shard_count |",
+        "There are exactly `S × m` parity entries and `real_data_shard_count` data-CRC entries."
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-footer-index/isolated",
+      "parent": "sidecar-footer-index",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "footer_block_index u64",
+        "offset": "0x88",
+        "from": 6,
+        "to": 7
+      },
+      "integrity_repair": [
+        "ISO-BOTH (hashed; the footer has no footer_block_index field, so only the hash is mirrored)"
+      ],
+      "target": "footer_block_index rule (Section 9.2)",
+      "violates_only": "Section 9.2 'footer_block_index MUST = 2H + P'",
+      "every_other_rule_holds": "The file is still 7 blocks with the footer physically at block 6. H, P, total, the tail start and the primary start are unchanged, and the footer's fields (H, P, total, tail start, hash) still agree with both copies. The copies agree with each other and with the directory entry.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2"
+      ],
+      "quotes": [
+        "| 0x88 | 8 | footer_block_index u64 | MUST = 2H + P |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-header-block-count/isolated",
+      "parent": "sidecar-header-block-count",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal, rebuilt: the sidecar at tape file 2 becomes 9 blocks",
+        "tape_file": 2,
+        "copy": "both copies, footer, directory entry, and the terminal suffix regenerated"
+      },
+      "mutation": {
+        "recorded_H": "sidecar_header_block_count (0x60) = 2 in both copies; footer H (0x38) = 2; directory key 6 = 2",
+        "locator_repaired": "tail_header_start_block (0x80) = H + P = 6; footer_block_index (0x88) = 2H + P = 8; sidecar_total_block_count (0x70) = 2H + P + 1 = 9; footer tail start (0x58) = 6, footer total (0x48) = 9; directory key 5 = 9",
+        "file_layout": "block 0: primary header + all 4 parity and 4 data-CRC entries (inline_index_entry_bytes stays 96); block 1: an extra index block with no entries, all zero below its trailing CRC-64/XZ; blocks 2..5: the four parity shards at block(stripe, p) = H + p*S + stripe = 2 + 2p + stripe; block 6: tail header; block 7: its empty index block (zero + CRC); block 8: footer",
+        "prefix_effect": "the replicas' structural row for tape file 2 says block_count 9; the ParityMap moves to LBA 17, A to 21, EOD to 41"
+      },
+      "integrity_repair": [
+        "R-SC-HASHED in both copies (hash over the new 0x00..0x8F bytes)",
+        "a trailing CRC in each empty index block (blocks 1 and 7)",
+        "footer_crc64",
+        "ISO-REBUILD for the ParityMap (directory keys 5, 6, 8; canonical_map_digest; payload_sha256; CRCs) and for the whole terminal suffix"
+      ],
+      "target": "Section 9.4 layout recomputation against the recorded H (Section 9.2)",
+      "violates_only": "Section 9.2 / 9.4 'sidecar_header_block_count MUST equal the recomputed layout'. Section 9.4 over (262144, S 2, m 2, real 4) gives H = 1.",
+      "every_other_rule_holds": "total = 2H+P+1 = 9 = the measured count (Scanner item 5, Section 16.2). The tail start is 6 = H + P and the footer index 8 = 2H + P, and the footer sits in the last block. The parity locator with the recorded H places the shards where they are. inline = 96 matches the recompute, which does not depend on H. Every index block ends with a valid CRC and is zero below it. The footer's H, P, total, tail start and hash agree with both copies, which agree with each other. The directory entry agrees with the map entry in tape file, epoch, range and block count (9). The replicas and the ParityMap are regenerated for the 9-block prefix.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.1",
+        "9.2",
+        "9.3",
+        "9.4",
+        "13.3"
+      ],
+      "quotes": [
+        "| 0x60 | 8 | sidecar_header_block_count u64 (H) | MUST equal the recomputed layout (Section 9.4) |",
+        "Readers MUST recompute both and reject header values that disagree."
+      ],
+      "pinned": true,
+      "note": "This is the 'H case with its locator repaired' asked for in D6."
+    },
+    {
+      "id": "sidecar-header-reserved/isolated-1",
+      "parent": "sidecar-header-reserved (variant a)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "reserved u64",
+        "offset": "0xB8",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "ISO-BOTH (hash-excluded: CRCs of both copies only)"
+      ],
+      "target": "reserved field 0xB8 (Section 9.2)",
+      "violates_only": "Section 9.2 'reserved u64 MUST be 0'",
+      "every_other_rule_holds": "Both copies carry the same value, so they agree. The field is excluded from the hash, so the footer and directory still match. Nothing else changes.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "16.2"
+      ],
+      "quotes": [
+        "| 0xB8 | 8 | reserved u64 | MUST be 0 |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-header-reserved/isolated-2",
+      "parent": "sidecar-header-reserved (variant b)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "reserved u16 of parity entry 0",
+        "offset": "0xCE",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "ISO-BOTH (index entry bytes are hashed: new hash in both copies, the footer 0x60 and directory key 8)"
+      ],
+      "target": "parity index entry reserved rule (Section 9.3)",
+      "violates_only": "Section 9.3 'u16 reserved, MUST be 0'",
+      "every_other_rule_holds": "The entry's stripe index, parity index and CRC are unchanged. The copies agree, and the footer and directory carry the new hash. All CRCs, the Section 9.2 fields and the Section 9.4 layout hold.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.3",
+        "9.5"
+      ],
+      "quotes": [
+        "**Parity entry (16 bytes)**: u32 stripe_index; u16 parity_index; u16 reserved, MUST be 0; u64 parity_shard_crc64."
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-inline-index-bytes/isolated",
+      "parent": "sidecar-inline-index-bytes",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "inline_index_entry_bytes u64",
+        "offset": "0x68",
+        "from": 96,
+        "to": 88
+      },
+      "integrity_repair": [
+        "ISO-BOTH (hashed; not mirrored in the footer or directory)"
+      ],
+      "target": "Section 9.4 recompute against inline_index_entry_bytes",
+      "violates_only": "Section 9.2 / 9.4 'inline_index_entry_bytes MUST equal the recomputed layout'",
+      "every_other_rule_holds": "The stream, H, the counts, the locators and the file are unchanged. The copies, footer and directory agree.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.4"
+      ],
+      "quotes": [
+        "| 0x68 | 8 | inline_index_entry_bytes u64 | MUST equal the recomputed layout (Section 9.4) |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-m-zero/isolated",
+      "parent": "sidecar-m-zero",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal, rebuilt: the sidecar at tape file 2 becomes 3 blocks",
+        "tape_file": 2,
+        "copy": "both copies, footer, directory entry, terminal suffix regenerated"
+      },
+      "mutation": {
+        "field": "m u16 (0x22) = 0 in both copies",
+        "consistent_fields": "parity_block_count (0x50) = S*m = 0; P = 0; index stream = 0 parity entries + 4 data-CRC entries, so inline_index_entry_bytes (0x68) = 32 and H = 1; total (0x70) = 2H + P + 1 = 3; tail_header_start_block (0x80) = H + P = 1; footer_block_index (0x88) = 2H + P = 2; footer H = 1, P = 0, total = 3, tail start = 1",
+        "file_layout": "block 0 primary, block 1 tail, block 2 footer; no parity blocks",
+        "directory_entry": "key 5 = 3, key 6 = 1, key 8 = new hash. Key 7 stays 4, because the Section 10.1.5 invariant forbids a zero parity_shard_block_count; no Reader rule compares key 7 with the sidecar's P (the Section 13.3 agreement set is tape file, epoch, range and block count).",
+        "prefix_effect": "the replicas' structural row for tape file 2 says block_count 3; later LBAs shift by -4"
+      },
+      "integrity_repair": [
+        "R-SC-HASHED in both copies",
+        "footer_crc64",
+        "ISO-REBUILD (ParityMap directory and canonical_map_digest; terminal suffix)"
+      ],
+      "target": "sidecar header m rule (Section 9.2)",
+      "violates_only": "Section 9.2 'm u16 ≠ 0'. If Section 6.6 validity is also applied to the header triple, '1 ≤ m' is the same condition.",
+      "every_other_rule_holds": "parity_block_count = S*m and logical = S*k hold. real = end - start = 4 lies in 1..=S*k. The Section 9.4 recompute (no parity entries, 4 data-CRC entries) gives H = 1 and inline = 32, as recorded. total, tail and footer locators match the 3-block file, and the file and the map agree on 3 blocks. The copies, footer and directory agree. The parity mismatch with the bootstrap's m = 2 belongs to the Section 13.3 pin, which applies only to an acquired index, and no copy is acquired.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.4",
+        "13.3",
+        "10.1.5"
+      ],
+      "quotes": [
+        "| 0x22 | 2 | m u16 | ≠ 0 |",
+        "The acquired index MUST then be pinned against the bootstrap's scheme record"
+      ],
+      "pinned": true,
+      "caveat": "The ParityMap cannot describe this sidecar truthfully: key 7 = 0 would be DirectoryInvalid. It therefore keeps key 7 = 4, a Writer inaccuracy that no Reader rule detects."
+    },
+    {
+      "id": "sidecar-logical-shard-count/isolated",
+      "parent": "sidecar-logical-shard-count",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "field": "logical_shard_count u64",
+        "offset": "0x40",
+        "from": 4,
+        "to": 5
+      },
+      "integrity_repair": [
+        "ISO-BOTH (hashed; not mirrored)"
+      ],
+      "target": "logical_shard_count rule (Section 9.2)",
+      "violates_only": "Section 9.2 'logical_shard_count MUST = S × k'",
+      "every_other_rule_holds": "real (4) ≤ logical (5) and real is in 1..=S*k (4). The layout, locators and file are unchanged. The copies, footer and directory agree.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2"
+      ],
+      "quotes": [
+        "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-parity-block-count/isolated",
+      "parent": "sidecar-parity-block-count",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies; footer presented unreadable"
+      },
+      "mutation": {
+        "field": "parity_block_count u64",
+        "offset": "0x50",
+        "from": 4,
+        "to": 3
+      },
+      "integrity_repair": [
+        "ISO-BOTH (new hash in both copies and directory key 8; directory key 7 stays 4)",
+        "ISO-FAULT-FOOTER"
+      ],
+      "target": "parity_block_count rule (Section 9.2)",
+      "violates_only": "Section 9.2 'parity_block_count MUST = S × m'",
+      "every_other_rule_holds": "Section 9.1 defines P = S × m = 4, and with that P the header's tail start 5 = H + P, footer index 6 = 2H + P and total 7 = 2H + P + 1 hold, matching the 7-block file. The index still has S*m = 4 parity entries (Section 9.3). The copies agree with each other. The footer is unreadable, so its P = 4 is compared with nothing. Directory key 7 is not compared with the header (Section 13.3 agreement set).",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.1",
+        "9.2",
+        "13.3"
+      ],
+      "quotes": [
+        "| 0x50 | 8 | parity_block_count u64 | MUST = S × m |",
+        "`P = S × m` is the parity shard block count"
+      ],
+      "pinned": true,
+      "caveat": "Isolated only if the header's own locator rules read P as S × m, as Section 9.1 defines it. A Reader that reads P from 0x50 finds H + P = 4 ≠ 5 as well, with the same name. With a readable footer no isolation is possible: the footer's P either disagrees with 0x50 or, mirrored as 3, breaks the footer's own tail = H + P."
+    },
+    {
+      "id": "sidecar-primary-start/isolated-1",
+      "parent": "sidecar-primary-start (variant a)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies; footer presented unreadable"
+      },
+      "mutation": {
+        "field": "primary_header_start_block u64",
+        "offset": "0x78",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "ISO-BOTH with the hash recomputed over the wire bytes (0x78 = 1): new hash in both copies and directory key 8",
+        "ISO-FAULT-FOOTER (the footer's 0x50 carries its own '= 0' rule and cannot mirror 1)"
+      ],
+      "target": "primary_header_start_block rule (Section 9.2)",
+      "violates_only": "Section 9.2 'primary_header_start_block MUST = 0', under the reading of Section 9.5 that hashes the wire value",
+      "every_other_rule_holds": "Every other field and the file are unchanged. The copies agree, and the directory hash matches the copies. The footer is unreadable, so its 0x50 = 0 is compared with nothing.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.5"
+      ],
+      "quotes": [
+        "| 0x78 | 8 | primary_header_start_block u64 | MUST = 0 |"
+      ],
+      "pinned": true,
+      "caveat": "Under the other reading of Section 9.5 (hash computed with 0x78 taken as 0), this variant also breaks the hash rule; use isolated-2 for that reading."
+    },
+    {
+      "id": "sidecar-primary-start/isolated-2",
+      "parent": "sidecar-primary-start (variant b)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies; footer presented unreadable"
+      },
+      "mutation": {
+        "field": "primary_header_start_block u64",
+        "offset": "0x78",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "the hash is left as it was, which equals the hash computed with 0x78 taken as 0; directory key 8 unchanged",
+        "header_crc64 and block0_crc64 of both copies",
+        "ISO-FAULT-FOOTER"
+      ],
+      "target": "primary_header_start_block rule (Section 9.2)",
+      "violates_only": "Section 9.2 'primary_header_start_block MUST = 0', under the reading of Section 9.5 that substitutes 0",
+      "every_other_rule_holds": "As isolated-1, with the original hash valid under this reading.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.5"
+      ],
+      "quotes": [
+        "the header's exact wire bytes 0x00 through 0x8F inclusive — magic through `footer_block_index`, with `primary_header_start_block` as 0"
+      ],
+      "pinned": true,
+      "caveat": "Exactly one of isolated-1 and isolated-2 is isolated, depending on the unresolved Section 9.5 reading (NOTES.md gap 5)."
+    },
+    {
+      "id": "sidecar-real-data-shard-count/isolated-1",
+      "parent": "sidecar-real-data-shard-count (variant a)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies"
+      },
+      "mutation": {
+        "fields": "in both copies: 0x48 = 3, 0x58 = 3, 0x68 = 88, fourth data-CRC entry (0x120..0x128) zeroed"
+      },
+      "integrity_repair": [
+        "ISO-BOTH (new hash in both copies, the footer and the directory; real is not mirrored)"
+      ],
+      "target": "real_data_shard_count = end − start (Section 9.2)",
+      "violates_only": "Section 9.2 'real_data_shard_count MUST equal protected_ordinal_end_exclusive − protected_ordinal_start' (3 ≠ 4)",
+      "every_other_rule_holds": "real = 3 is in 1..=S*k and ≤ logical. data_crc_count = real, and the stream has 3 data-CRC entries. The Section 9.4 recompute with real = 3 gives inline 88 and H 1. The fill is zero. The range [0,4) is unchanged and agrees with the footer, directory and map entry. The copies agree.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "9.3",
+        "9.4"
+      ],
+      "quotes": [
+        "`real_data_shard_count` MUST equal `protected_ordinal_end_exclusive − protected_ordinal_start`"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-real-data-shard-count/isolated-2",
+      "parent": "sidecar-real-data-shard-count (variant b)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal, rebuilt: the Object at tape file 1 has 5 blocks (ordinals [0,5)), and its one sidecar protects [0,5)",
+        "tape_file": 2,
+        "copy": "both copies, footer, directory, map"
+      },
+      "mutation": {
+        "fields": "in both copies: 0x38 = 5, 0x48 = 5, 0x58 = 5, 0x68 = 104, a fifth data-CRC entry at 0x128 (the CRC of Object block 4); footer range [0,5); directory keys 3-4 = [0,5), scope W = T = 5; replica rows: Object block_count 5, sidecar range [0,5), T = W = 5. Parity bytes are arbitrary (data_index 2 >= k has no generator column); the index records their CRCs."
+      },
+      "integrity_repair": [
+        "R-SC-HASHED in both copies",
+        "footer_crc64",
+        "ISO-REBUILD (ParityMap scope fields and directory; canonical_map_digest; terminal suffix with the Object 1 block longer)"
+      ],
+      "target": "real_data_shard_count ≤ logical_shard_count, i.e. real in 1..=S × k (Section 9.2)",
+      "violates_only": "Section 9.2 'real_data_shard_count ... MUST be in 1..=S × k' (5 > 4)",
+      "every_other_rule_holds": "real = end - start = 5 and data_crc_count = 5. The Section 9.4 recompute (4 parity, 5 data-CRC entries) gives inline 104 and H 1. The locators and the 7-block file match. The copies, footer, directory and map agree on [0,5). T = W = 5, and the directory partition and scope hold.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "2.3",
+        "10.1.5",
+        "10.6"
+      ],
+      "quotes": [
+        "`real_data_shard_count` ... MUST be in `1..=S × k`.",
+        "**Epoch**: one parity protection unit covering a non-empty explicit, half-open range of at most `S × k` data ordinals."
+      ],
+      "pinned": true,
+      "caveat": "The text does not say whether replica validation ('Every structural and ordinal-range invariant is validated') or the directory decoder rejects a sidecar range longer than S × k. If either does, the rebuilt image also breaks a rule of that role, and this variant is isolated only for the sidecar copy validator."
+    },
+    {
+      "id": "sidecar-tail-start/isolated",
+      "parent": "sidecar-tail-start",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies; footer presented unreadable"
+      },
+      "mutation": {
+        "field": "tail_header_start_block u64",
+        "offset": "0x80",
+        "from": 5,
+        "to": 6
+      },
+      "integrity_repair": [
+        "ISO-BOTH (new hash in both copies and directory key 8)",
+        "ISO-FAULT-FOOTER (the footer's 0x58 carries its own '= H + P' rule)"
+      ],
+      "target": "tail_header_start_block rule (Section 9.2)",
+      "violates_only": "Section 9.2 'tail_header_start_block MUST = H + P'",
+      "every_other_rule_holds": "The tail copy is physically at block 5. The directory-assisted rescue locates it at total - 1 - H = 5 from the entry's counts, not from 0x80. Every other field is unchanged, and the copies agree with each other and with the directory hash.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "13.3"
+      ],
+      "quotes": [
+        "| 0x80 | 8 | tail_header_start_block u64 | MUST = H + P |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-tape-uuid/isolated",
+      "parent": "sidecar-tape-uuid",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "both copies; footer presented unreadable"
+      },
+      "mutation": {
+        "field": "tape_uuid",
+        "offset": "0x08..0x18",
+        "to": "ee x 16",
+        "keep": "the magic stays derived from the real tape UUID"
+      },
+      "integrity_repair": [
+        "ISO-BOTH (new hash in both copies and directory key 8)",
+        "ISO-FAULT-FOOTER (the footer's tape_uuid 0x10 has no stated rule, so whether mirroring ee..ee into it would break one is unknown)"
+      ],
+      "target": "tape_uuid rule (Section 9.2)",
+      "violates_only": "Section 9.2 'tape_uuid MUST match the bootstrap'",
+      "every_other_rule_holds": "The magic still matches, so the block is recognised as this tape's sidecar. Every other field is unchanged, and the copies agree with each other and with the directory hash. The directory and replicas carry no UUID for the sidecar.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "9.2",
+        "5.2"
+      ],
+      "quotes": [
+        "| 0x08 | 16 | tape_uuid | MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1 |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-total-block-count/isolated",
+      "parent": "sidecar-total-block-count (variant a)",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal, rebuilt: the sidecar at tape file 2 becomes 8 blocks",
+        "tape_file": 2,
+        "copy": "both copies, footer, directory, map"
+      },
+      "mutation": {
+        "field": "sidecar_total_block_count (0x70) = 8 in both copies; footer total (0x48) = 8; directory key 5 = 8; replica structural row block_count = 8",
+        "file_layout": "blocks 0 primary, 1..4 parity, 5 tail, 6 footer (at footer_block_index = 2H + P = 6), 7 an all-zero block",
+        "prefix_effect": "later LBAs shift by +1"
+      },
+      "integrity_repair": [
+        "R-SC-HASHED in both copies",
+        "footer_crc64",
+        "ISO-REBUILD"
+      ],
+      "target": "sidecar total rule (Section 9.2)",
+      "violates_only": "Section 9.2 'sidecar_total_block_count = 2H + P + 1' (8 ≠ 7)",
+      "every_other_rule_holds": "The header total equals the measured count, 8 (Scanner item 5, Section 16.2). The tail start 5 = H + P and footer index 6 = 2H + P hold, and the footer is at block 6. The footer's fields agree with both copies, including total 8, which equals the measured count. The copies agree. The directory entry and the map agree on block count 8. Block 7 is the extra block that the declared total implies. It breaks no rule of its own: it does not parse as a footer, and Section 13.3 treats an unparseable last block as a fallback, not a violation.",
+      "expected": {
+        "per_copy": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "tape_level": "The footer-first step reads the last block (7), which is not a footer, and falls back to the primary (step 2), which fails. Step 3 computes the tail at 8 - 1 - 1 = 6, the footer block, whose hash check fails, so no copy validates.",
+      "sections": [
+        "9.1",
+        "9.2",
+        "12.3",
+        "13.3"
+      ],
+      "quotes": [
+        "| 0x70 | 8 | sidecar_total_block_count u64 | = 2H + P + 1 |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "sidecar-primary-tail-disagreement/isolated",
+      "parent": "sidecar-primary-tail-disagreement",
+      "group": "7a",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "tail mutated as in the parent; footer presented unreadable"
+      },
+      "mutation": {
+        "field": "tail copy data-CRC entry 0",
+        "offset": "0x108 of block 5",
+        "change": "XOR 0x01, with the tail's hash recomputed"
+      },
+      "integrity_repair": [
+        "R-SC-HASHED on the tail copy",
+        "ISO-FAULT-FOOTER (the footer holds one hash, so while readable it can match only one copy)"
+      ],
+      "target": "primary/tail agreement (Section 9.1), as run by a Verifier or a BOT-walk Scanner that parses both copies",
+      "violates_only": "Section 9.1 'When both copies parse, a Reader MUST verify that they agree and reject divergence'",
+      "every_other_rule_holds": "Each copy on its own satisfies Sections 9.2-9.5, with a hash equal to the SHA-256 of its own bytes. The footer is unreadable, so neither copy is compared with a footer hash. The directory's key 8 matches the primary. A directory comparison happens only in the step-3 rescue, which the valid primary makes unnecessary, and no rule compares the directory with a parsed copy otherwise.",
+      "expected": {
+        "per_sidecar_validation": "SidecarParse"
+      },
+      "tape_level": "Unpinned, as in the parent: the Recoverer's step-2 primary fallback may never read the tail, and 'reject divergence' does not say what is rejected.",
+      "sections": [
+        "9.1",
+        "9.5",
+        "13.3"
+      ],
+      "quotes": [
+        "The tail copy MUST carry metadata and index content identical to the primary; only `copy_kind` and the recomputed CRCs differ. When both copies parse, a Reader MUST verify that they agree and reject divergence."
+      ],
+      "pinned": true,
+      "pin_note": "Pinned for the validation outcome only."
+    },
+    {
+      "id": "paritymap-directory-not-ascending/isolated",
+      "parent": "paritymap-directory-not-ascending",
+      "group": "7b",
+      "base": {
+        "artifact": "tape-image two-epoch",
+        "tape_file": 4,
+        "copy": "both ParityMap copies"
+      },
+      "mutation": {
+        "field": "directory entries array (payload key 4, key 5)",
+        "from": "[e0, e1]",
+        "to": "[e1, e0] (the same bytes as the parent)"
+      },
+      "integrity_repair": [
+        "R-PM-PAYLOAD"
+      ],
+      "target": "SidecarEpochDirectory decoder, ascending rule (Section 10.1.5)",
+      "violates_only": "Section 10.1.5 'entries strictly ascending by tape_file_number'",
+      "every_other_rule_holds": "The parent's concurrent checks assumed evaluation in array order, which the text does not use. The partition invariant is stated 'taken in ascending tape_file_number order': in that order the ranges are [0,4) and then [4,8), the first start is 0, they are contiguous, and the last end equals scope W = 8. The epoch ids {0, 1} are unique and consecutive from 0, and in tape-file order they read 0, 1. Both tape file numbers are < scope 5. Totals, H and P are non-zero and the flags are known. W 8 ≤ T 8. The copies are identical, and the header/footer locators, payload_sha256 and the scope fields all match.",
+      "expected": {
+        "one_of": [
+          "DirectoryInvalid",
+          "ParityMapParse"
+        ],
+        "permitting_text": "the Section 15 category sentence, as in the parent"
+      },
+      "sections": [
+        "10.1.5",
+        "15"
+      ],
+      "quotes": [
+        "entries strictly ascending by `tape_file_number`, each `< scope_tape_file_count`;",
+        "the protected ranges **partition `[0, scope_highest_protected_ordinal)`**: taken in ascending `tape_file_number` order"
+      ],
+      "pinned": true,
+      "caveat": "'consecutive starting from 0 (0, 1, …, count−1)' does not state its order. A Reader that reads the epoch ids in array order sees 1, 0, which is also DirectoryInvalid."
+    },
+    {
+      "id": "paritymap-footer-header-disagreement/isolated",
+      "parent": "paritymap-footer-header-disagreement (variant a)",
+      "group": "7b",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 3,
+        "copy": "footer (block 2)"
+      },
+      "mutation": {
+        "field": "sequence u64",
+        "offset": "0x20",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "R-PM-FOOTER"
+      ],
+      "target": "ParityMap payload-to-locator match (Section 10.1.4)",
+      "violates_only": "Section 10.1.4 'The decoded payload MUST match the header/footer locator fields (UUID, sequence, ...)': payload key 3 = 0 while the footer's sequence = 1",
+      "every_other_rule_holds": "Both headers equal the payload, so the header side of the rule holds. The copies agree. The locator arithmetic is unchanged in all three blocks (M = 1, total 3, starts 0/1/2, measured 3). payload_sha256 matches, the CRCs verify, and the scope fields and is_final_directory match. The header/footer disagreement on sequence is the same inequality, because the headers must equal the payload. The 'reject disagreement' sentence of Section 10.1.4 names the locator arithmetic, which sequence is not part of.",
+      "expected": {
+        "error": "ParityMapParse"
+      },
+      "sections": [
+        "10.1.4",
+        "15"
+      ],
+      "quotes": [
+        "The decoded payload MUST match the header/footer locator fields (UUID, sequence, digest, scope, and `is_final_directory`)"
+      ],
+      "pinned": true,
+      "note": "Parent variant b (footer payload_len L+1) breaks nothing else either, but whether a payload_len difference that leaves M unchanged counts as 'disagreement between header, footer' is unstated, so variant a is the isolated form."
+    },
+    {
+      "id": "terminal-scope-scalars/isolated-1",
+      "parent": "terminal-scope-scalars (variant a, covered prefix)",
+      "group": "7b",
+      "base": {
+        "artifact": "terminal profile multi-256k, all five components regenerated",
+        "location": "every replica and separation frame"
+      },
+      "mutation": {
+        "field": "planned tape-file numbers of the terminal suffix",
+        "change": "tuples (4,1),(5,1),(4,2),(5,2),(4,3) get planned tape-file numbers 7, 8, 9, 10, 11 instead of 6..10; the local planned tape-file fields (replica 0x088, separation 0x040), the separation predecessor/successor file numbers (0x078/0x080) and the footer observed tape-file numbers (0x2D8, 0x1A0) follow. covered_prefix_tape_file_count stays 6 and structural_row_count stays 6. LBAs are unchanged."
+      },
+      "integrity_repair": [
+        "terminal-layout digest, edition digest unchanged, replica and separation descriptor digests, header CRCs, footer header-record hashes and CRCs in all five components"
+      ],
+      "target": "replica pre-A map equality (Section 10.6)",
+      "violates_only": "Section 10.6 'covered_prefix_tape_file_count, structural_row_count, and replica A's planned tape-file number are equal' (6, 6, 7)",
+      "every_other_rule_holds": "covered = 6 = rows, and the canonical-map digest over exactly the 6 leading entries matches (Section 7.4). The component file numbers are dense (7..11) in the fixed order, and starts and EOD are unchanged. The footer observations equal the plan. T, W and every digest recompute. The footers' tape-file fields are Writer observations, 'not an independent device tape-file counter', so no device measurement contradicts them.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse",
+        "tape_level": "BotStructuralRecoveryRequired (all three replicas fail alike)"
+      },
+      "sections": [
+        "10.6",
+        "8.3",
+        "8.4",
+        "7.4"
+      ],
+      "quotes": [
+        "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal.",
+        "The footer's tape-file, start, and count fields are Writer observations, not an independent device tape-file counter."
+      ],
+      "pinned": true,
+      "caveat": "If a Reader takes the tape-file number from the device (a SCSI position report can give one), the plan (7) also disagrees with that measurement, with the same name."
+    },
+    {
+      "id": "terminal-scope-scalars/isolated-2",
+      "parent": "terminal-scope-scalars (variant d)",
+      "group": "7b",
+      "base": {
+        "artifact": "terminal profile minimal-256k",
+        "component": "replica-a.bin header and footer"
+      },
+      "mutation": {
+        "field": "total data ordinals",
+        "offset": "0x050",
+        "from": 0,
+        "to": 1
+      },
+      "integrity_repair": [
+        "R-TR-COMMON"
+      ],
+      "target": "the Section 7.4 T cross-check",
+      "violates_only": "Section 7.4 'cross-check all three scalars': T recomputed over the prefix is 0 (no Object rows), but 1 is recorded",
+      "every_other_rule_holds": "There are no sidecar rows, so the W = T rule of Section 10.6 does not apply. W = 0 ≤ T = 1 (Section 2.3). covered = rows = A's planned file = 1. The digests recompute over the unchanged payload, and the frames agree.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "7.4",
+        "10.6"
+      ],
+      "quotes": [
+        "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars."
+      ],
+      "pinned": true,
+      "caveat": "Section 15 gives this failure no name of its own; see NOTES.md gap 15 (FilemarkMapDigestMismatch reading)."
+    },
+    {
+      "id": "terminal-scope-scalars/isolated-3",
+      "parent": "terminal-scope-scalars (variants b, c: W = T rule)",
+      "group": "7b",
+      "base": {
+        "artifact": "new terminal profile 'multi-unprotected-256k', rebuilt from multi-256k's inputs without the second sidecar",
+        "prefix": "rows: 0 Bootstrap (1 blk); 1 Object (2 blk, first 0); 2 ParitySidecar (5 blk, epoch 0, [0,2)); 3 Object (3 blk, first 2); 4 ParityMap (3 blk). Object rows as multi-256k. covered = rows = 5; A at tape file 5, planned start LBA 2+3+6+4+4 = 19; EOD 39; payload_len 64*5 + 256*2 = 832."
+      },
+      "mutation": {
+        "fields": "total data ordinals = 5 and highest protected ordinal = 2, both equal to their recomputes"
+      },
+      "integrity_repair": [
+        "the profile is generated consistently: payload, canonical-map, edition, layout and descriptor digests, CRCs and header hashes in all five components"
+      ],
+      "target": "replica pre-A relationship 'when sidecars are present, highest_protected_ordinal equals total_data_ordinals' (Section 10.6)",
+      "violates_only": "Section 10.6 W = T when sidecars are present (2 ≠ 5)",
+      "every_other_rule_holds": "T = 5 and W = 2 equal their recomputes (Section 7.4), and W ≤ T. The rows are dense and the first ordinals contiguous. The ParityMap row is last and present because a sidecar row is present. The bijection holds, covered = rows = A's planned tape-file number = 5, and the layout, digests and footers are consistent.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse",
+        "tape_level": "BotStructuralRecoveryRequired"
+      },
+      "sections": [
+        "10.6",
+        "7.2",
+        "7.4"
+      ],
+      "quotes": [
+        "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "terminal-scope-scalars/isolated-4",
+      "parent": "terminal-scope-scalars (variant c: W recompute)",
+      "group": "7b",
+      "base": {
+        "artifact": "new terminal profile 'multi-unprotected-256k' as in isolated-3"
+      },
+      "mutation": {
+        "fields": "total data ordinals = 5, highest protected ordinal = 5 (recomputed W is 2)"
+      },
+      "integrity_repair": [
+        "as isolated-3"
+      ],
+      "target": "the Section 7.4 W cross-check",
+      "violates_only": "Section 7.4 cross-check of highest_protected_ordinal against W recomputed over the prefix (5 ≠ 2)",
+      "every_other_rule_holds": "W = T (5 = 5), so the Section 10.6 rule holds. T equals its recompute and W ≤ T. The rest is as in isolated-3.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse",
+        "tape_level": "BotStructuralRecoveryRequired"
+      },
+      "sections": [
+        "7.4",
+        "7.2"
+      ],
+      "quotes": [
+        "W = max(protected_ordinal_end_exclusive)         over sidecar entries   (0 if none)"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-3.2-14-append-point/isolated",
+      "parent": "overflow-3.2-14-append-point",
+      "group": "7c",
+      "base": {
+        "artifact": "tape-image unfinalized-open",
+        "note": "committed prefix files 0..3; T = 6, W = 4"
+      },
+      "mutation": {
+        "input": "the commit record for tape file 2 (the sidecar) claims block_count 0xFFFFFFFFFFFFFFFF; object records and ranges are unchanged"
+      },
+      "integrity_repair": [
+        "none on tape; the injected record must be well formed in the implementation's commit-record format"
+      ],
+      "target": "the Resumer's Σ(block_count + 1) over the prefix (Section 3.2, used at Section 14 step 4 and by any LBA-based positioning in step 3)",
+      "violates_only": "Checked evaluation of Σ(block_count + 1): (1+1) + (4+1) + (2^64 - 1 + 1) overflows",
+      "every_other_rule_holds": "The huge count sits on a sidecar, so T = 6 and W = 4 are unaffected, unlike the parent, whose huge Object count also overflowed T. Step 2 holds: T − W = 2 < S*k = 4, W ≤ T, the ranges are contiguous from 0 to W, the epoch ids are consecutive, and the final object ends at T. A single record makes no conflicting claim (Section 3.4). The re-read of [4,6) in step 3 finds data where it is expected, when positioning is by filemarks.",
+      "expected": {
+        "error": "ResumeAppend"
+      },
+      "sections": [
+        "3.2",
+        "3.4",
+        "14",
+        "2.4"
+      ],
+      "quotes": [
+        "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**"
+      ],
+      "pinned": false,
+      "pin_reason": "As the parent: commit-record values are off-tape, and Section 2.4 names 'values read from tape'."
+    },
+    {
+      "id": "overflow-7.2-T/isolated",
+      "parent": "overflow-7.2-T (added: the parent's forged count also broke the W = T rule, because sidecars were present)",
+      "group": "7c",
+      "base": {
+        "artifact": "new terminal profile 'huge-object-256k'",
+        "prefix": "rows: 0 Bootstrap (1 blk); 1 Object (1 blk, first 0, plaintext, manifest key 10 = 0, key 11 = 32, key 12 = 1); 2 Object (2^64 − 1 blk, first 1, plaintext, manifest as file 1). No sidecar, no ParityMap. covered = rows = 3; A at tape file 3."
+      },
+      "mutation": {
+        "inputs": "structural rows as above; Object rows' stored_block_count 1 and 2^64 − 1; recorded total data ordinals 0 (any value; its cross-check is the overflowing formula); highest protected 0"
+      },
+      "integrity_repair": [
+        "the profile is generated consistently (payload, canonical-map, edition, layout and descriptor digests; CRCs; header hashes)"
+      ],
+      "target": "replica scope validation, T = max(first + block_count) (Sections 7.2, 7.4, 10.6)",
+      "violates_only": "Checked evaluation of T: 1 + (2^64 − 1) overflows u64",
+      "every_other_rule_holds": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar rows, so the W = T rule and the ParityMap-iff-sidecar rule hold vacuously. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse",
+        "tape_level": "BotStructuralRecoveryRequired"
+      },
+      "sections": [
+        "7.2",
+        "7.4",
+        "10.6",
+        "8.3"
+      ],
+      "quotes": [
+        "T = max(first_parity_data_ordinal + block_count) over object entries    (0 if none)"
+      ],
+      "pinned": true,
+      "caveat": "No replica rule compares the rows' block counts with the physical prefix (NOTES.md gap 10), so the profile may present A at any LBA the harness chooses. A full Verifier that measures the prefix would also find a count mismatch."
+    },
+    {
+      "id": "overflow-8.3-component-starts/isolated",
+      "parent": "overflow-8.3-component-starts",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "planned-layout validation of Section 8.3, as called during replica eligibility (Section 10.6)"
+      },
+      "mutation": {
+        "inputs": "partition 0, block_size 262144, tuples (4,1,fm 1, file 1, start 2^64 − 3, count 3), (5,1,1, file 2, start 2, count 3), (4,2,1, 3, 6, 3), (5,2,1, 4, 10, 3), (4,3,1, 5, 14, 3), expected_eod_lba 18"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "the start-advance rule: start(next) = start + record_count + 1",
+      "violates_only": "Checked evaluation of (2^64 − 3) + 3 + 1",
+      "every_other_rule_holds": "Order and ordinals are fixed, each tuple has one filemark, the files are dense (1..5), every count is ≥ 2, and the replica and separation counts are equal. No other layout rule involves the overflowing sum. Image level is impossible: when start + count + 1 overflows, the position after A's trailing filemark cannot be represented, so the device-measured filemark position cannot agree with the plan (Section 10.6). A start small enough for the device to report cannot overflow the sum.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "8.3",
+        "10.6",
+        "2.4"
+      ],
+      "quotes": [
+        "Logical start positions advance by `record_count + 1`, where the `1` is the actual trailing filemark."
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-8.3-eod/isolated",
+      "parent": "overflow-8.3-eod",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "planned-layout validation of Section 8.3"
+      },
+      "mutation": {
+        "inputs": "the five tuples with starts 2^64−20, 2^64−16, 2^64−12, 2^64−8, 2^64−4 and counts 3 (files 1..5), expected_eod_lba any"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "EOD = start(C) + count(C) + 1",
+      "violates_only": "Checked evaluation of (2^64 − 4) + 3 + 1",
+      "every_other_rule_holds": "Every start advance holds (the starts step by 4 and none overflows), and the order, ordinals, filemark counts, dense files and equal counts hold. Image level is impossible: EOD is the position after C's trailing filemark, and if it overflows that position is unrepresentable, so the trailing-filemark and EOD measurements (Sections 10.6, 12.6) cannot agree with any device report.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "8.3",
+        "10.6"
+      ],
+      "quotes": [
+        "EOD is the start of C plus C's record count plus one filemark."
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-9.1-P/isolated",
+      "parent": "overflow-9.1-P",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "a Reader deriving P = S × m from a scheme record"
+      },
+      "mutation": {
+        "inputs": "S = 2^63, m = 2"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "P = S × m",
+      "violates_only": "Checked evaluation of 2^63 × 2",
+      "every_other_rule_holds": "At unit level nothing else is evaluated. Image level is impossible: from a sidecar header S × m < 2^48, and from the bootstrap any S with S × m ≥ 2^64 also has S × (k + m) > 2^32 − 1, which breaks Section 6.6 validity (required by Section 8.2) in the same bytes.",
+      "expected": {
+        "outcome": "rejection; Section 15 names no error"
+      },
+      "sections": [
+        "9.1",
+        "6.6",
+        "2.4"
+      ],
+      "quotes": [
+        "`P = S × m` is the parity shard block count"
+      ],
+      "pinned": false,
+      "pin_reason": "At unit level there is no structure whose parse error could carry the name."
+    },
+    {
+      "id": "overflow-9.1-total-2H-P-1/isolated",
+      "parent": "overflow-9.1-total-2H-P-1",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "sidecar layout computation (Section 9.1)"
+      },
+      "mutation": {
+        "inputs": "H = 2^63, P = 4"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "total = 2H + P + 1 and footer index 2H + P",
+      "violates_only": "Checked evaluation of 2 × 2^63",
+      "every_other_rule_holds": "Image level is impossible. In a header, H must equal the Section 9.4 recompute (≤ a few blocks), so a huge H breaks that rule too. In a footer, H is compared with the header copies. With the copies unreadable, no stated footer rule evaluates 2H + P + 1: Section 9.6 constrains only version, reserved, primary start and tail start = H + P, which is overflow-9.1-tail-start's formula.",
+      "expected": {
+        "error": "SidecarParse",
+        "note": "the computation belongs to sidecar validation, whose violations Section 15 names SidecarParse"
+      },
+      "sections": [
+        "9.1",
+        "9.4",
+        "9.6"
+      ],
+      "quotes": [
+        "One sidecar is written per parity epoch, in its own tape file of `total = 2H + P + 1` blocks"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-9.1-block-locator/isolated",
+      "parent": "overflow-9.1-block-locator",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "the Recoverer's parity-shard locator (Sections 9.1, 13.4)"
+      },
+      "mutation": {
+        "inputs": "H = 2^64 − 1, S = 2, parity_index = 1, stripe = 0"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "block(stripe, parity_index) = H + parity_index·S + stripe",
+      "violates_only": "Checked evaluation of (2^64 − 1) + 2",
+      "every_other_rule_holds": "Image level is impossible: the locator runs on an acquired, validated index, whose H equals the Section 9.4 recompute. That H is small, and parity_index·S + stripe < 2^48, so a validated copy cannot drive the sum past 2^64.",
+      "expected": {
+        "outcome": "rejection; no Section 15 name"
+      },
+      "sections": [
+        "9.1",
+        "9.4",
+        "13.3"
+      ],
+      "quotes": [
+        "block(stripe, parity_index) = H + parity_index·S + stripe"
+      ],
+      "pinned": false,
+      "pin_reason": "Unit level only; no named error."
+    },
+    {
+      "id": "overflow-9.1-tail-start/isolated",
+      "parent": "overflow-9.1-tail-start (added: in the parent, the footer's P also disagreed with the header copies' parity_block_count)",
+      "group": "7c",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 2,
+        "copy": "footer (block 6) mutated; both header copies (blocks 0 and 5) presented unreadable (medium error, no byte change)"
+      },
+      "mutation": {
+        "field": "footer P u64",
+        "offset": "0x40",
+        "from": 4,
+        "to": "0xFFFFFFFFFFFFFFFF"
+      },
+      "integrity_repair": [
+        "R-SC-FOOTER"
+      ],
+      "target": "sidecar footer locator validation, tail_header_start_block = H + P (Section 9.6), in the Recoverer's footer-first step (Section 13.3 step 1)",
+      "violates_only": "Checked evaluation of H + P = 1 + (2^64 − 1)",
+      "every_other_rule_holds": "The footer's magic, version, reserved bytes, UUID, epoch, range, H = 1, total 7 (= measured count and map entry), primary start 0 and CRC are all valid. Section 9.6 states no rule for P itself. The header copies are unreadable, so they are compared with nothing. The directory entry is unchanged, and its P is not compared with the footer.",
+      "expected": {
+        "footer": "SidecarParse",
+        "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "tape_level": "Footer invalid, then step 2: the primary is unreadable. Step 3: the tail at 7 − 1 − 1 = 5 is unreadable. No copy validates.",
+      "sections": [
+        "9.6",
+        "13.3",
+        "2.4"
+      ],
+      "quotes": [
+        "| 0x58 | 8 | tail_header_start_block u64 = H + P |"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-9.2-SxK/isolated",
+      "parent": "overflow-9.2-SxK",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "a Reader computing S × k from a scheme record (the Section 13.3 pin, the Section 14 bound)"
+      },
+      "mutation": {
+        "inputs": "S = 2^63, k = 2"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "S × k",
+      "violates_only": "Checked evaluation of 2^63 × 2",
+      "every_other_rule_holds": "Image level is impossible: from a sidecar header S × k < 2^48, and from a bootstrap any S with S × k ≥ 2^64 breaks the Section 6.6 bound S × (k + m) ≤ 2^32 − 1 in the same bytes.",
+      "expected": {
+        "outcome": "rejection; no Section 15 name"
+      },
+      "sections": [
+        "9.2",
+        "6.6",
+        "14"
+      ],
+      "quotes": [
+        "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"
+      ],
+      "pinned": false,
+      "pin_reason": "Unit level only."
+    },
+    {
+      "id": "overflow-10.1.2-M/isolated",
+      "parent": "overflow-10.1.2-M (added: a hostile payload_len also contradicts the payload bytes and the measured file length)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "ParityMap locator validation (Section 10.1.4)"
+      },
+      "mutation": {
+        "inputs": "L = 2^64 − 1, B = 262144"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "M = ceil((0xC8 + L) / B)",
+      "violates_only": "Checked evaluation of 0xC8 + (2^64 − 1)",
+      "every_other_rule_holds": "Image level is impossible: a payload_len that makes 0xC8 + L overflow exceeds any readable payload, so the payload hash (Section 10.1.4) and the measured tape file length cannot agree with it.",
+      "expected": {
+        "error": "ParityMapParse"
+      },
+      "sections": [
+        "10.1.2",
+        "10.1.4"
+      ],
+      "quotes": [
+        "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.4-slot-product/isolated-1",
+      "parent": "overflow-10.4-slot-product (variant a)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "replica record-geometry computation (Section 10.4), as called in local eligibility (Section 10.6)"
+      },
+      "mutation": {
+        "inputs": "structural_row_count = 2^58, object_row_count = 0"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "payload_len = 64 × s + 256 × o",
+      "violates_only": "Checked evaluation of 64 × 2^58",
+      "every_other_rule_holds": "Image level is impossible: the frame's row counts are validated against the payload slots, which must all decode (Section 10.6), and against the device-measured record count. A replica consistent with s = 2^58 would need 2^64 payload bytes, and its covered count would have to equal s. This is why the parent was refused on count and scope grounds first.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.4",
+        "10.6",
+        "2.4"
+      ],
+      "quotes": [
+        "payload_len            = 64 × structural_row_count + 256 × object_row_count",
+        "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results."
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.4-slot-product/isolated-2",
+      "parent": "overflow-10.4-slot-product (variant b)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "as isolated-1"
+      },
+      "mutation": {
+        "inputs": "structural_row_count = 2^56 + 1, object_row_count = 2^56"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "256 × o",
+      "violates_only": "Checked evaluation of 256 × 2^56 (= 2^64). 64 × (2^56 + 1) = 2^62 + 64 fits, and the sum is never reached.",
+      "every_other_rule_holds": "The Object-row count equals the number of kind-0 structural rows (Section 10.3). Structural row 0 is the kind-2 bootstrap (Section 10.2), so o ≤ s − 1 must hold, and 2^56 ≤ 2^56 holds. The other product fits. No other geometry formula is reached before the overflowing product. s = o = 2^56 would not do: it leaves no structural row for the bootstrap, so o ≤ s − 1 breaks. The choice s = 2^56 + 1 is the smallest that keeps that rule. Image level is still impossible, as in isolated-1: a replica with 2^56 Object rows needs 2^64 payload bytes.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.2",
+        "10.3",
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "payload_len            = 64 × structural_row_count + 256 × object_row_count",
+        "every terminal replica carries exactly `object_row_count` 256-byte fixed slots, one for each kind-0 structural row",
+        "Structural row 0 MUST be the kind-2 bootstrap that Section 3.1 requires at tape file 0."
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.4-slot-product/isolated-3",
+      "parent": "overflow-10.4-slot-product (variant c)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "as isolated-1"
+      },
+      "mutation": {
+        "inputs": "structural_row_count = 2^57, object_row_count = 2^55"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "the sum 64s + 256o",
+      "violates_only": "Checked evaluation of 2^63 + 2^63 (each product fits)",
+      "every_other_rule_holds": "As isolated-1.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "the checked terminal payload `64 × structural_row_count + 256 × object_row_count`"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.4-record-geometry/isolated",
+      "parent": "overflow-10.4-record-geometry",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "replica record-geometry computation (Section 10.4)"
+      },
+      "mutation": {
+        "inputs": "structural_row_count = 2^58 − 1, object_row_count = 0, B = 262144"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "payload_padding_bytes = payload_record_count × B − payload_len",
+      "violates_only": "Checked evaluation of 2^46 × 2^18. payload_len = 2^64 − 64 fits, and the exact ceil gives 2^46; the (L + B − 1)/B form overflows earlier, with the same outcome.",
+      "every_other_rule_holds": "64s + 256o does not overflow, and footer_block_offset = 1 + 2^46 and replica_record_count = 2 + 2^46 fit. Image level is impossible for the reason of overflow-10.4-slot-product/isolated-1: the counts must match the decoded slots, and the record count must match the device.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.4",
+        "10.6"
+      ],
+      "quotes": [
+        "payload_padding_bytes  = payload_record_count × B − payload_len"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.3-manifest-range/isolated-1",
+      "parent": "overflow-10.3-manifest-range (variant a)",
+      "group": "7c",
+      "base": {
+        "artifact": "terminal profile multi-256k",
+        "component": "replica-a.bin",
+        "location": "Object-row slot 0 (tape file 1, plaintext)"
+      },
+      "mutation": {
+        "field": "Object row key 10 (manifest_first_chunk_lba)",
+        "from": 0,
+        "to": "2^64 − 1; key 12 stays 1"
+      },
+      "integrity_repair": [
+        "R-TR-PAYLOAD"
+      ],
+      "target": "manifest chunk range fit (Section 10.3)",
+      "violates_only": "Checked evaluation of key 10 + key 12 = (2^64 − 1) + 1",
+      "every_other_rule_holds": "Key 10 has no rule other than the range fit, and it decodes as u64. Keys 11 (32) and 12 (1) are positive, and 32 ≤ 1 × 262144. The plaintext row carries keys 10-13 and none of 21-23. stored_block_count 2 matches structural row 1. The bijection, slot framing, digests and frames are consistent. The parent variant a is therefore already isolated at image level; only its variant b was not.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.3",
+        "10.6"
+      ],
+      "quotes": [
+        "the manifest chunk range MUST fit within `stored_block_count`"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.3-manifest-range/isolated-2",
+      "parent": "overflow-10.3-manifest-range (variant b)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "terminal Object-row validation (Section 10.3)"
+      },
+      "mutation": {
+        "inputs": "manifest_first_chunk_lba 0, manifest_chunk_count 2^46, manifest_size_bytes 1, stored_block_count 2^46, block_size_bytes 262144"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "manifest_size_bytes ≤ manifest_chunk_count × block_size_bytes",
+      "violates_only": "Checked evaluation of 2^46 × 2^18",
+      "every_other_rule_holds": "The range 0 + 2^46 ≤ stored_block_count 2^46 holds, and the counts and size are positive. Image level would need an Object row with stored_block_count ≥ 2^46. Its structural row can be written (see overflow-7.2-T/isolated for such a prefix), but the image would then carry the same caveat about an unmeasured prefix (NOTES.md gap 10), so the unit form is the clean one.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.3"
+      ],
+      "quotes": [
+        "the manifest byte length MUST fit within `manifest_chunk_count × block_size_bytes`"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.4-footer-delta/isolated-1",
+      "parent": "overflow-10.4-footer-delta (variants a, c)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "replica footer arithmetic (Section 10.4), applied to separation footers too by Section 10.6"
+      },
+      "mutation": {
+        "inputs": "observed record count 0"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "backward start delta = observed record count − 1",
+      "violates_only": "Checked evaluation of 0 − 1",
+      "every_other_rule_holds": "Image level is impossible: the footer's observations MUST equal the plan (Section 8.3), and every planned component has at least two records (Section 8.3). An observed count of 0 therefore always also breaks the plan-equality rule.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse",
+        "separation_footer": "TerminalIndexSeparationParse"
+      },
+      "sections": [
+        "10.4",
+        "8.3",
+        "10.6"
+      ],
+      "quotes": [
+        "In a footer, the backward start delta (`0x2F8`) MUST equal the observed record count (`0x2E8`) minus one"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.4-footer-delta/isolated-2",
+      "parent": "overflow-10.4-footer-delta (variant b)",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "replica footer arithmetic (Section 10.4)"
+      },
+      "mutation": {
+        "inputs": "observed start LBA 2^64 − 1, observed record count 3, delta 2"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "observed footer LBA = observed start LBA + delta",
+      "violates_only": "Checked evaluation of (2^64 − 1) + 2",
+      "every_other_rule_holds": "delta = count − 1 holds. Image level is impossible: the observed start must equal the planned start, and a planned start this large makes the planned start-advance and EOD sums overflow (overflow-8.3-*), and puts the replica beyond any device-reportable position.",
+      "expected": {
+        "error": "TerminalIndexReplicaParse"
+      },
+      "sections": [
+        "10.4",
+        "8.3"
+      ],
+      "quotes": [
+        "the observed footer LBA (`0x2F0`) MUST equal the observed start LBA (`0x2E0`) plus that delta"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-10.5-extent-geometry/isolated",
+      "parent": "overflow-10.5-extent-geometry",
+      "group": "7c",
+      "base": {
+        "artifact": "unit level",
+        "role": "separation extent geometry (Section 10.5)"
+      },
+      "mutation": {
+        "inputs": "E = 2^64 − 1, B = 262144"
+      },
+      "integrity_repair": [
+        "not applicable (unit level)"
+      ],
+      "target": "actual_bytes = total_records × B",
+      "violates_only": "Checked evaluation of 2^46 × 2^18 (the exact total_records = 2^46 fits)",
+      "every_other_rule_holds": "total ≥ 2, footer_offset and interior fit. Image level is impossible: the recorded total record count must equal ceil(E/B) = 2^46, and the extent's measured record count must equal it, which needs 2^64 bytes of medium.",
+      "expected": {
+        "error": "TerminalIndexSeparationParse"
+      },
+      "sections": [
+        "10.5",
+        "10.6"
+      ],
+      "quotes": [
+        "actual_bytes     = total_records × B"
+      ],
+      "pinned": true
+    },
+    {
+      "id": "overflow-13.3-tail-location/isolated-1",
+      "parent": "overflow-13.3-tail-location (variant a)",
+      "group": "7c",
+      "base": {
+        "artifact": "tape-image a4-minimal",
+        "tape_file": 3,
+        "copy": "ParityMap directory entry 0, both copies",
+        "precondition": "blocks 0 and 6 of the sidecar at tape file 2 presented unreadable (medium errors, no byte change) in place of the parent's CRC corruption"
+      },
+      "mutation": {
+        "field": "directory entry key 6 (sidecar_header_block_count)",
+        "from": 1,
+        "to": 7
+      },
+      "integrity_repair": [
+        "R-PM-PAYLOAD"
+      ],
+      "target": "the Recoverer's directory-assisted tail location (Section 13.3 step 3)",
+      "violates_only": "Checked evaluation of 7 − 1 − 7",
+      "every_other_rule_holds": "The parent broke two sidecar CRCs to reach step 3; here medium errors do that without breaking any format rule. The directory decoder invariants hold (H non-zero, ascending, partition, epochs, flags), and no invariant relates total, H and P. The entry agrees with the map entry in tape file 2, epoch 0, range [0,4) and block count 7, so the Recoverer may place the read. The ParityMap locators, hash and copy agreement hold. The sidecar's bytes are all valid.",
+      "expected": {
+        "error": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "13.3",
+        "10.1.5",
+        "12.5"
+      ],
+      "quotes": [
+        "locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts"
+      ],
+      "pinned": false,
+      "pin_reason": "As the parent: the rejection of the rescue computation is unnamed; SidecarMetadataUnavailable follows only because no copy then validates."
+    },
+    {
+      "id": "overflow-13.3-tail-location/isolated-2",
+      "parent": "overflow-13.3-tail-location (variant b)",
+      "group": "7c",
+      "base": {
+        "artifact": "as isolated-1"
+      },
+      "mutation": {
+        "field": "directory entry key 6",
+        "from": 1,
+        "to": "2^64 − 1 (CBOR 1b ff..ff; the payload grows by 8 bytes and M stays 1)"
+      },
+      "integrity_repair": [
+        "R-PM-PAYLOAD including payload_len"
+      ],
+      "target": "as isolated-1",
+      "violates_only": "Checked evaluation of 7 − 1 − (2^64 − 1)",
+      "every_other_rule_holds": "As isolated-1. The larger payload still fits one block.",
+      "expected": {
+        "error": "SidecarMetadataUnavailable{epoch_id: 0}"
+      },
+      "sections": [
+        "13.3",
+        "10.1.5"
+      ],
+      "quotes": [
+        "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count."
+      ],
+      "pinned": false,
+      "pin_reason": "As isolated-1."
+    }
+  ],
+  "not_isolatable": [
+    {
+      "case": "sidecar-copy-kind",
+      "group": "7a",
+      "reason": "At block 0 the only value that is both in the domain {1, 2} and consistent with the Section 13.3 step-2 copy-kind cross-check is 1; at block H+P it is 2. Any value that is 'neither primary nor tail' therefore also breaks the position cross-check in whichever block it sits. copy_kind is excluded from the hash and the agreement rule, so those are not involved.",
+      "sections": [
+        "9.2",
+        "13.3"
+      ]
+    },
+    {
+      "case": "sidecar-end-not-after-start (variants a and b)",
+      "group": "7a",
+      "reason": "Section 9.2 requires real_data_shard_count = end − start and real in 1..=S×k. Those two rules imply end > start, so any end ≤ start also breaks one of them: end = start forces real = 0, and end < start makes end − start underflow. The underflow is overflow-9.2-end-minus-start. The range is also mirrored in the footer, the directory and the map entry, but that is secondary.",
+      "unit_inputs": {
+        "start": 4,
+        "end": 3
+      },
+      "sections": [
+        "9.2"
+      ]
+    },
+    {
+      "case": "sidecar-k-zero",
+      "group": "7a",
+      "reason": "k = 0 forces logical_shard_count = S×k = 0 if that rule is to hold, and then 'real in 1..=S×k' is an empty range, while real = end − start ≥ 1 because the range is non-empty. So the logical-count rule or the real-count rule must break alongside k ≠ 0.",
+      "sections": [
+        "9.2"
+      ]
+    },
+    {
+      "case": "sidecar-s-zero",
+      "group": "7a",
+      "reason": "As sidecar-k-zero: S = 0 forces S×k = 0 and empties 1..=S×k. (It also forces P = 0, which a rebuild could accommodate as in sidecar-m-zero/isolated, but the real-count rule cannot be satisfied.)",
+      "sections": [
+        "9.2"
+      ]
+    },
+    {
+      "case": "sidecar-total-block-count (variant b, header total 0)",
+      "group": "7a",
+      "reason": "A tape file has at least one block (Section 3.1), and the header total is validated against the measured count (Scanner item 5, Section 16.2). A total of 0 therefore always breaks the measured-count rule as well as 2H+P+1.",
+      "sections": [
+        "3.1",
+        "9.2",
+        "12.3",
+        "16.2"
+      ]
+    },
+    {
+      "case": "sidecar-total-block-count (variant c, footer total 0)",
+      "group": "7a",
+      "reason": "The footer total is compared with the measured count (the target) and with the header copies' total (Section 13.3 step 1). For the headers to agree they would need total 0, which breaks their own 2H+P+1 and measured-count rules. With the headers unreadable, the footer total 0 still disagrees with the map entry's block count 7, which is a third rule.",
+      "sections": [
+        "9.6",
+        "12.3",
+        "13.3"
+      ]
+    },
+    {
+      "case": "overflow-3.3-stripe-mapping-forward",
+      "group": "7c",
+      "reason": "The forward mapping has no operation that can overflow: d = o − start cannot underflow once the covering descriptor is found. Its only hazard, S = 0, is division by zero rather than overflow, and S ≠ 0 is enforced by Section 9.2 (and S ≥ 1 by Section 6.6) in the same bytes.",
+      "unit_inputs": {
+        "o": 0,
+        "start": 0,
+        "S": 0,
+        "effect": "division by zero, not overflow"
+      },
+      "sections": [
+        "3.3",
+        "9.2",
+        "6.6"
+      ]
+    },
+    {
+      "case": "overflow-9.2-end-minus-start",
+      "group": "7c",
+      "reason": "end − start underflows exactly when end < start, which is the Section 9.2 'end > start' rule. The two conditions coincide, even at unit level.",
+      "unit_inputs": {
+        "end": 3,
+        "start": 4
+      },
+      "sections": [
+        "9.2"
+      ]
+    },
+    {
+      "case": "overflow-9.4-H",
+      "group": "7c",
+      "reason": "The normative Section 9.4 algorithm has no operation that can overflow for any u64 inputs: offset stays ≤ block_size, and blocks grows by one per spill, so it stays below 2^64. A value of real_data_shard_count large enough to overflow a closed-form stream length (≥ 2^61) also breaks real ≤ S×k (S×k < 2^48 from the header widths). Only a non-normative closed form can overflow, with inputs B 262144, S 2, m 2, real 2^61.",
+      "unit_inputs": {
+        "block_size": 262144,
+        "S": 2,
+        "m": 2,
+        "real_data_shard_count": "2^61",
+        "note": "closed form 16·S·m + 8·real only"
+      },
+      "sections": [
+        "9.4",
+        "9.2"
+      ]
+    },
+    {
+      "case": "overflow-10.5-footer-offset-interior",
+      "group": "7c",
+      "reason": "total − 1 underflows only when total = 0, and total − 2 only when total ≤ 1. Both are exactly the values that 'required ≥ 2' forbids, so the underflow and that rule coincide.",
+      "unit_inputs": {
+        "total_records": [
+          0,
+          1
+        ]
+      },
+      "sections": [
+        "10.5"
+      ]
+    },
+    {
+      "case": "overflow-13.3-tail-location (variant c, total 0)",
+      "group": "7c",
+      "reason": "A zero sidecar_total_block_count is itself a Section 10.1.5 decoder invariant violation (DirectoryInvalid), and it disagrees with the map entry's block count, so the rescue never reaches the subtraction.",
+      "sections": [
+        "10.1.5",
+        "13.3"
+      ]
+    },
+    {
+      "case": "overflow-14-T-minus-W",
+      "group": "7c",
+      "reason": "T − W underflows exactly when W > T, which is the Section 14 step-2 'W ≤ T' rule. The two coincide, even at unit level.",
+      "unit_inputs": {
+        "T": 6,
+        "W": 8
+      },
+      "sections": [
+        "14"
+      ]
+    },
+    {
+      "case": "terminal-scope-scalars (variants b and c on multi-256k)",
+      "group": "7b",
+      "reason": "On a prefix where sidecars are present and every Object ordinal is protected, the recomputed T equals the recomputed W. Changing either scalar alone breaks both its recompute and W = T, and changing both together breaks both recomputes. Each rule is isolated instead on another prefix: isolated-2 (T recompute, minimal profile), isolated-3 (W = T) and isolated-4 (W recompute), the last two on a rebuilt prefix whose last Object is unprotected.",
+      "sections": [
+        "7.4",
+        "10.6"
+      ]
+    },
+    {
+      "case": "overflow-10.1.2-2M-footer",
+      "group": "7c",
+      "reason": "total = 2M + 1 and footer index 2M cannot overflow once the ParityMap minimum block size of 0xC8 holds. With B ≥ 200 and 0xC8 + L ≤ 2^64 − 1 (larger L overflows M itself, which is overflow-10.1.2-M), M ≤ ceil((2^64 − 1)/200) < 2^57, so 2M + 1 < 2^58. An overflow needs B < 0xC8, and that breaks the minimum block size in the same input. A ceil written as (x + B − 1)/B that overflows belongs to M's evaluation, not to 2M + 1.",
+      "sections": [
+        "10.1.2",
+        "10.1.4"
+      ]
+    }
+  ]
+}

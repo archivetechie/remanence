@@ -1,0 +1,48 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "copy": "both header/index copies (blocks 0 and 5)",
+    "tape_file": 2
+  },
+  "every_other_rule_holds": "The Section 9.4 recompute at 524288 still gives H = 1 and inline = 96, matching the header. total, tail start and footer index still describe H = 1, P = 4, and the file is 7 blocks. The copies agree with each other, with the footer (hash) and with the directory entry (hash, counts, range). k, m, S, range and counts are unchanged.",
+  "expected": {
+    "per_copy": {
+      "one_of": [
+        "SidecarParse",
+        "SchemeMismatch"
+      ]
+    },
+    "permitting_text": "as in the parent case: the Section 9.2 rule and the Section 13.3 pin name the same comparison differently",
+    "recoverer": {
+      "one_of": [
+        "SidecarMetadataUnavailable{epoch_id: 0}",
+        "SchemeMismatch"
+      ]
+    }
+  },
+  "group": "7a",
+  "id": "sidecar-block-size/isolated",
+  "integrity_repair": [
+    "ISO-BOTH (0x28 is hashed; the footer and directory carry no block size, so only the hash is mirrored)"
+  ],
+  "mutation": {
+    "field": "block_size u32",
+    "from": 262144,
+    "offset": "0x28",
+    "to": 524288
+  },
+  "parent": "sidecar-block-size",
+  "pin_reason": "Same as the parent: two Section 15 names for one comparison.",
+  "pinned": false,
+  "quotes": [
+    "| 0x28 | 4 | block_size u32 | MUST equal the actual block size |",
+    "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size)"
+  ],
+  "sections": [
+    "9.2",
+    "13.3",
+    "15"
+  ],
+  "target": "sidecar header/index copy validation, block_size rule (Section 9.2)",
+  "violates_only": "Section 9.2 'block_size MUST equal the actual block size'. The same comparison is the block-size part of the Section 13.3 pin, and the two cannot be separated."
+}

@@ -1,0 +1,6 @@
+{
+  "object_row_count": "2^55",
+  "overflow": "2^63 + 2^63 = 2^64 (each product fits; the sum does not)",
+  "structural_row_count": "2^57",
+  "variant": "c-sum"
+}

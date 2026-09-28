@@ -1,0 +1,37 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal, rebuilt: the Object at tape file 1 has 5 blocks (ordinals [0,5)), and its one sidecar protects [0,5)",
+    "copy": "both copies, footer, directory, map",
+    "tape_file": 2
+  },
+  "caveat": "The text does not say whether replica validation ('Every structural and ordinal-range invariant is validated') or the directory decoder rejects a sidecar range longer than S × k. If either does, the rebuilt image also breaks a rule of that role, and this variant is isolated only for the sidecar copy validator.",
+  "every_other_rule_holds": "real = end - start = 5 and data_crc_count = 5. The Section 9.4 recompute (4 parity, 5 data-CRC entries) gives inline 104 and H 1. The locators and the 7-block file match. The copies, footer, directory and map agree on [0,5). T = W = 5, and the directory partition and scope hold.",
+  "expected": {
+    "per_copy": "SidecarParse",
+    "recoverer": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7a",
+  "id": "sidecar-real-data-shard-count/isolated-2",
+  "integrity_repair": [
+    "R-SC-HASHED in both copies",
+    "footer_crc64",
+    "ISO-REBUILD (ParityMap scope fields and directory; canonical_map_digest; terminal suffix with the Object 1 block longer)"
+  ],
+  "mutation": {
+    "fields": "in both copies: 0x38 = 5, 0x48 = 5, 0x58 = 5, 0x68 = 104, a fifth data-CRC entry at 0x128 (the CRC of Object block 4); footer range [0,5); directory keys 3-4 = [0,5), scope W = T = 5; replica rows: Object block_count 5, sidecar range [0,5), T = W = 5. Parity bytes are arbitrary (data_index 2 >= k has no generator column); the index records their CRCs."
+  },
+  "parent": "sidecar-real-data-shard-count (variant b)",
+  "pinned": true,
+  "quotes": [
+    "`real_data_shard_count` ... MUST be in `1..=S × k`.",
+    "**Epoch**: one parity protection unit covering a non-empty explicit, half-open range of at most `S × k` data ordinals."
+  ],
+  "sections": [
+    "9.2",
+    "2.3",
+    "10.1.5",
+    "10.6"
+  ],
+  "target": "real_data_shard_count ≤ logical_shard_count, i.e. real in 1..=S × k (Section 9.2)",
+  "violates_only": "Section 9.2 'real_data_shard_count ... MUST be in 1..=S × k' (5 > 4)"
+}

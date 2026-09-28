@@ -1,0 +1,39 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "copy": "primary",
+    "tape_file": 2
+  },
+  "concurrent_checks": [
+    "footer 0x10 tape_uuid comparison",
+    "footer/tail hash comparison"
+  ],
+  "expected": {
+    "error": "SidecarParse"
+  },
+  "group": "7a",
+  "id": "sidecar-tape-uuid",
+  "integrity_repair": [
+    "R-SC-HASHED"
+  ],
+  "mutation": {
+    "field": "tape_uuid",
+    "from": "12 34 56 78 12 34 42 34 82 34 12 34 56 78 9a bc",
+    "keep": "magic at 0x00 stays HMAC(real tape UUID, SIDECAR_MAGIC_LABEL)[0..8], so the block is still recognised as this tape's sidecar",
+    "offset": "0x08..0x18",
+    "to": "ee ee ee ee ee ee ee ee ee ee ee ee ee ee ee ee"
+  },
+  "pinned": true,
+  "quotes": [
+    "| 0x08 | 16 | tape_uuid | MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1 |"
+  ],
+  "sections": [
+    "9.2",
+    "5.2",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable.",
+  "target": "sidecar header tape_uuid rule (Section 9.2)"
+}

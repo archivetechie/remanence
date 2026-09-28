@@ -1,0 +1,129 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "overflow-13.3-tail-location/b-H-max",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 200,
+      "new_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507061bffffffffffffffff07040858207bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc20906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "old_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507060107040858207bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc20906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a0000000000000000",
+      "repair": "mutation: directory payload and zero fill",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 200,
+      "new_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507061bffffffffffffffff07040858207bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc20906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a",
+      "old_bytes": "a7017172656d2d7061726974792d6d61702d7631025012345678123442348234123456789abc030004a501040204030404f50581a901020200030004040507060107040858207bff5d29d6d1097f1005bfdc6ed40ffc7326fd683eea4874327761984e88ebc20906055820733d7d07f4d34d2f58f5b7783fb6a72d8a78b7ac1089a4d3931a6f7ed84c45ff06782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310774323032362d30382d30395430303a30303a30305a0000000000000000",
+      "repair": "mutation: directory payload and zero fill",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "d100000000000000",
+      "old_bytes": "c900000000000000",
+      "repair": "R-PM-PAYLOAD payload length",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "b5a06e2e275d67bd967de4ada973bb3e5b35e06195bbff33faff0767e4730e14",
+      "old_bytes": "9dd240864d8a38ab7799004a40014b97aba030d43f1648341375d1dd28b5acd6",
+      "repair": "R-PM-PAYLOAD payload SHA-256",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "a5719f429aa11359",
+      "old_bytes": "9d39a7ae60c7497b",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 48,
+      "new_bytes": "d100000000000000",
+      "old_bytes": "c900000000000000",
+      "repair": "R-PM-PAYLOAD payload length",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 56,
+      "new_bytes": "b5a06e2e275d67bd967de4ada973bb3e5b35e06195bbff33faff0767e4730e14",
+      "old_bytes": "9dd240864d8a38ab7799004a40014b97aba030d43f1648341375d1dd28b5acd6",
+      "repair": "R-PM-PAYLOAD payload SHA-256",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 1,
+      "byte_offset": 192,
+      "new_bytes": "ca3eca1878bff66c",
+      "old_bytes": "f276f2f482d9ac4e",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 48,
+      "new_bytes": "d100000000000000",
+      "old_bytes": "c900000000000000",
+      "repair": "R-PM-PAYLOAD payload length",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 56,
+      "new_bytes": "b5a06e2e275d67bd967de4ada973bb3e5b35e06195bbff33faff0767e4730e14",
+      "old_bytes": "9dd240864d8a38ab7799004a40014b97aba030d43f1648341375d1dd28b5acd6",
+      "repair": "R-PM-PAYLOAD payload SHA-256",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 2,
+      "byte_offset": 192,
+      "new_bytes": "80b4538b3b544f4a",
+      "old_bytes": "b8fc6b67c1321568",
+      "repair": "R-PM-PAYLOAD CRC",
+      "tape_file": 3
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 6,
+      "byte_offset": 128,
+      "new_bytes": "d9",
+      "old_bytes": "d8",
+      "repair": "precondition: corrupt sidecar CRC; no repair",
+      "tape_file": 2
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 192,
+      "new_bytes": "5d",
+      "old_bytes": "5c",
+      "repair": "precondition: corrupt sidecar CRC; no repair",
+      "tape_file": 2
+    }
+  ],
+  "entry_points": [
+    "parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor",
+    "decode_sidecar_epoch_directory_cbor (each copy's payload key 4)",
+    "recover_ordinal_from_sidecar (directory-assisted tail rescue)"
+  ],
+  "target_role": "Recovery"
+}

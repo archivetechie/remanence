@@ -273,6 +273,19 @@ pub fn index_separation_records(
     Ok(records)
 }
 
+/// Calculate the represented extent bytes with the same checked geometry used
+/// during separation planning. The nominal byte target need not be block-aligned.
+pub fn checked_index_separation_bytes(
+    block_size: u32,
+    extent_bytes: u64,
+) -> Result<u64, IndexSeparationError> {
+    index_separation_records(block_size, extent_bytes)?
+        .checked_mul(u64::from(block_size))
+        .ok_or(IndexSeparationError::ArithmeticOverflow {
+            context: "actual extent bytes",
+        })
+}
+
 /// Validate and bind one gap descriptor.
 pub fn plan_index_separation(
     descriptor: IndexSeparationDescriptor,
@@ -295,7 +308,8 @@ pub fn plan_index_separation(
         });
     }
     let expected_records =
-        index_separation_records(descriptor.block_size, descriptor.nominal_extent_bytes)?;
+        checked_index_separation_bytes(descriptor.block_size, descriptor.nominal_extent_bytes)?
+            / u64::from(descriptor.block_size);
     if descriptor.total_records != expected_records {
         return Err(IndexSeparationError::RecordCountMismatch {
             planned: expected_records,
@@ -382,18 +396,8 @@ pub fn encode_index_separation_footer(
         OBSERVED_RECORD_COUNT_OFFSET,
         observation.record_count,
     );
-    let footer_delta =
-        observation
-            .record_count
-            .checked_sub(1)
-            .ok_or(IndexSeparationError::TooShort {
-                records: observation.record_count,
-            })?;
-    let footer_lba = observation.start_lba.checked_add(footer_delta).ok_or(
-        IndexSeparationError::ArithmeticOverflow {
-            context: "observed footer LBA",
-        },
-    )?;
+    let (footer_delta, footer_lba) =
+        checked_separation_footer_position(observation.start_lba, observation.record_count)?;
     write_u64(&mut block, OBSERVED_FOOTER_LBA_OFFSET, footer_lba);
     write_u64(&mut block, BACKWARD_START_DELTA_OFFSET, footer_delta);
     write_crc(&mut block);
@@ -471,7 +475,8 @@ pub fn parse_index_separation_footer(
     validate_observation(&plan, observation)?;
     let observed_footer_lba = read_u64(block, OBSERVED_FOOTER_LBA_OFFSET);
     let backward_start_delta = read_u64(block, BACKWARD_START_DELTA_OFFSET);
-    let expected_delta = observation.record_count - 1;
+    let (expected_delta, expected_footer_lba) =
+        checked_separation_footer_position(observation.start_lba, observation.record_count)?;
     if backward_start_delta != expected_delta {
         return Err(IndexSeparationError::ObservationMismatch {
             field: "backward_start_delta",
@@ -479,11 +484,6 @@ pub fn parse_index_separation_footer(
             actual: backward_start_delta,
         });
     }
-    let expected_footer_lba = observation.start_lba.checked_add(expected_delta).ok_or(
-        IndexSeparationError::ArithmeticOverflow {
-            context: "parsed footer LBA",
-        },
-    )?;
     if observed_footer_lba != expected_footer_lba {
         return Err(IndexSeparationError::ObservationMismatch {
             field: "footer_lba",
@@ -973,6 +973,24 @@ fn read_u32(block: &[u8], offset: usize) -> u32 {
 
 fn read_u64(block: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(block[offset..offset + 8].try_into().expect("bounded frame"))
+}
+
+/// Evaluate the footer backward delta and absolute position with checked arithmetic.
+pub fn checked_separation_footer_position(
+    start: u64,
+    records: u64,
+) -> Result<(u64, u64), IndexSeparationError> {
+    let delta = records
+        .checked_sub(1)
+        .ok_or(IndexSeparationError::ArithmeticOverflow {
+            context: "footer backward delta",
+        })?;
+    let lba = start
+        .checked_add(delta)
+        .ok_or(IndexSeparationError::ArithmeticOverflow {
+            context: "observed footer LBA",
+        })?;
+    Ok((delta, lba))
 }
 
 #[cfg(test)]

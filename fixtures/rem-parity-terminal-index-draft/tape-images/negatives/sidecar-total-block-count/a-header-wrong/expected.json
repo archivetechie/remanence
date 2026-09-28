@@ -1,0 +1,13 @@
+{
+  "block_within_file": 0,
+  "copy": "primary",
+  "from": 7,
+  "offset": "0x70",
+  "repair": [
+    "R-SC-HASHED"
+  ],
+  "tape_level": "Recoverer uses the tail copy; epoch 0 usable. In a BOT walk the item-5 mismatch is a hard error scoped to that rung and file (Section 12.3); the footer probe (item 6) can still classify the file",
+  "target": "Section 9.2 total rule; also Scanner ladder item 5 measured-count comparison when the BOT walk runs",
+  "to": 8,
+  "variant": "a-header-wrong"
+}

@@ -1,0 +1,35 @@
+{
+  "base": {
+    "artifact": "terminal profile minimal-256k",
+    "component": "gap-ab.bin",
+    "location": "header record, file offset 0"
+  },
+  "concurrent_checks": [],
+  "expected": {
+    "error": "TerminalIndexSeparationParse"
+  },
+  "group": "7b",
+  "id": "separation-extent-role-magic",
+  "integrity_repair": [
+    "R-SEP: header CRC (0x1F8); footer 0x180 header-record SHA-256; footer CRC (0x1F8). The magic is in no descriptor preimage."
+  ],
+  "mutation": {
+    "change": "XOR 0x01 into byte 0",
+    "field": "role magic",
+    "offset": "0x000"
+  },
+  "pinned": true,
+  "quotes": [
+    "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4",
+    "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete.",
+    "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6"
+  ],
+  "sections": [
+    "10.5",
+    "10.6",
+    "15"
+  ],
+  "shadowed": false,
+  "tape_level": "An inventory Scanner is unaffected: 'The validity of a separation extent does not affect whether a replica is accepted for an inventory.' A Verifier MUST report AB invalid and MUST NOT report the terminal suffix as complete.",
+  "target": "separation extent validity (Section 10.6 read against Section 10.5), as checked by a Verifier"
+}

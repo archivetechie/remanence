@@ -1,0 +1,31 @@
+{
+  "base": {
+    "artifact": "as isolated-1"
+  },
+  "every_other_rule_holds": "As isolated-1. The larger payload still fits one block.",
+  "expected": {
+    "error": "SidecarMetadataUnavailable{epoch_id: 0}"
+  },
+  "group": "7c",
+  "id": "overflow-13.3-tail-location/isolated-2",
+  "integrity_repair": [
+    "R-PM-PAYLOAD including payload_len"
+  ],
+  "mutation": {
+    "field": "directory entry key 6",
+    "from": 1,
+    "to": "2^64 − 1 (CBOR 1b ff..ff; the payload grows by 8 bytes and M stays 1)"
+  },
+  "parent": "overflow-13.3-tail-location (variant b)",
+  "pin_reason": "As isolated-1.",
+  "pinned": false,
+  "quotes": [
+    "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count."
+  ],
+  "sections": [
+    "13.3",
+    "10.1.5"
+  ],
+  "target": "as isolated-1",
+  "violates_only": "Checked evaluation of 7 − 1 − (2^64 − 1)"
+}

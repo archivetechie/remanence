@@ -1,0 +1,11 @@
+{
+  "field": "reserved u16 of parity entry 0 (stripe 0, parity 0)",
+  "le_bytes": "01 00",
+  "offset": "0xCE",
+  "repair": [
+    "R-SC-HASHED (index entry bytes are hashed, Section 9.5 item 3)"
+  ],
+  "rule": "Section 9.3: 'u16 reserved, MUST be 0'",
+  "to": 1,
+  "variant": "b-parity-entry-reserved"
+}
