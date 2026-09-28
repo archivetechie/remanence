@@ -21,8 +21,7 @@ Usage:
     rem_parity_second_implementation.py build [--out DIR]
     rem_parity_second_implementation.py decide CASE.json [CASE.json ...] [--out FILE]
 
-A case file named ``fault-map.json`` or ``inputs.json`` takes its case id from
-its directory.
+A case file named ``fault-map.json`` takes its case id from its directory.
 """
 
 from __future__ import annotations
@@ -2211,6 +2210,14 @@ class ReadFailure(Exception):
         self.reason = reason
 
 
+U64_MAX = (1 << 64) - 1
+
+
+def overflows(*values: int) -> bool:
+    """Section 2.4: arithmetic on values read from tape is checked; outside u64 is rejection."""
+    return any(value < 0 or value > U64_MAX for value in values)
+
+
 def rd16(data: bytes, offset: int) -> int:
     return struct.unpack_from("<H", data, offset)[0]
 
@@ -2308,6 +2315,8 @@ def check_layout(tuples: list[tuple[int, int, int, int, int, int]], eod: int) ->
             return "component with fewer than two records"
         if index:
             previous = tuples[index - 1]
+            if overflows(previous[3] + 1, previous[4] + previous[5] + 1):
+                return "a start-position formula overflows u64 (checked arithmetic, Section 2.4)"
             if tape_file != previous[3] + 1:
                 return "tape-file numbers not dense"
             if start != previous[4] + previous[5] + 1:
@@ -2316,6 +2325,8 @@ def check_layout(tuples: list[tuple[int, int, int, int, int, int]], eod: int) ->
         return "replica record counts differ"
     if tuples[1][5] != tuples[3][5]:
         return "separation record counts differ"
+    if overflows(tuples[4][4] + tuples[4][5] + 1):
+        return "the EOD formula overflows u64 (checked arithmetic, Section 2.4)"
     if eod != tuples[4][4] + tuples[4][5] + 1:
         return "planned EOD is not C's start plus its records plus one"
     return None
@@ -2378,9 +2389,13 @@ def parse_replica_frame(record: bytes, tape_uuid: bytes, block_size: int, role: 
     structural_rows = rd64(frame, 0x060)
     object_rows = rd64(frame, 0x068)
     payload_len = STRUCTURAL_SLOT * structural_rows + OBJECT_SLOT * object_rows
-    if payload_len > (1 << 64) - 1:
-        problems.append("payload length overflows u64")
+    if overflows(payload_len):
+        problems.append("payload_len formula overflows u64 (Section 10.6: every size formula evaluates without overflow)")
+        raise ReadFailure("TerminalIndexReplicaParse", "; ".join(problems))
     payload_records = ceil_div(payload_len, block_size)
+    if overflows(payload_records * block_size, 2 + payload_records):
+        problems.append("payload_padding_bytes formula overflows u64 (payload_record_count × B)")
+        raise ReadFailure("TerminalIndexReplicaParse", "; ".join(problems))
     if rd64(frame, 0x070) != payload_len or rd64(frame, 0x078) != payload_records:
         problems.append("payload geometry")
     if rd64(frame, 0x080) != 2 + payload_records or rd64(frame, 0x098) != 1 + payload_records:
@@ -2457,6 +2472,8 @@ def parse_separation_frame(record: bytes, tape_uuid: bytes, block_size: int, rol
         problems.append("block size")
     nominal = rd64(frame, 0x050)
     total_records = ceil_div(nominal, block_size)
+    if overflows(total_records * block_size):
+        problems.append("actual_bytes formula overflows u64 (total_records × B)")
     if rd64(frame, 0x058) != total_records or total_records < 2:
         problems.append("total record count")
     if rd64(frame, 0x060) != total_records - 1 or rd64(frame, 0x068) != total_records - 2:
@@ -2862,9 +2879,10 @@ def parse_sidecar_footer(block: bytes, tape_uuid: bytes) -> dict[str, Any]:
     footer = {"epoch_id": rd64(block, 0x20), "start": rd64(block, 0x28), "end": rd64(block, 0x30),
               "H": rd64(block, 0x38), "P": rd64(block, 0x40), "total": rd64(block, 0x48),
               "primary_start": rd64(block, 0x50), "tail_start": rd64(block, 0x58), "hash": block[0x60:0x80]}
-    if footer["total"] != 2 * footer["H"] + footer["P"] + 1 or footer["primary_start"] != 0 or \
-            footer["tail_start"] != footer["H"] + footer["P"]:
-        raise ReadFailure("SidecarParse", "footer locator arithmetic")
+    if overflows(footer["H"] + footer["P"]):
+        raise ReadFailure("SidecarParse", "footer H + P overflows u64 (checked arithmetic, Section 2.4)")
+    if footer["primary_start"] != 0 or footer["tail_start"] != footer["H"] + footer["P"]:
+        raise ReadFailure("SidecarParse", "footer locator: primary start is not 0 or tail start is not H + P")
     return footer
 
 
@@ -3318,6 +3336,11 @@ def acquire_index(ctx: RecoveryContext, sidecar: MapEntry, citations: list) -> t
     else:
         citations.append(cite("entry_agrees"))
         tail_first = entry["total"] - 1 - entry["H"]
+        if overflows(tail_first) or tail_first + entry["H"] > count:
+            notes.append("the directory entry's counts put the tail copy outside the file (checked arithmetic); "
+                         "no read placed")
+            citations.append(cite("metadata_unavailable"))
+            return None, "; ".join(notes)
         try:
             tail = parse_sidecar_copy(read_blocks(tape, start + tail_first, entry["H"]), ctx.tape_uuid, ctx.block_size, 2)
             if tail["hash"] != entry["hash"]:
@@ -3557,11 +3580,23 @@ def resume_case(case: Mapping[str, Any], image: ImageBuild,
     p["citations"].extend([cite("resume_step1"), cite("resume_validated_records"), cite("append_point")])
     refusal = decision["decision"]
 
+    def refuse_now(at: str, reason: str) -> tuple[dict[str, Any], None]:
+        refusal.update(result="refused", error="ResumeAppend", refused_at=at, before_any_tape_read=not reads,
+                       before_any_write=True, records_read=list(reads))
+        refusal["citations"].extend([cite("resume_validated_records"), cite("err_resume")])
+        decision["step2"]["violations"].append(reason)
+        return decision, None
+
     def refuse(at: str, error: str, citations: list[str]) -> tuple[dict[str, Any], None]:
         refusal.update(result="refused", error=error, refused_at=at, before_any_tape_read=not reads,
                        before_any_write=True, records_read=list(reads))
         refusal["citations"].extend(cite(key) for key in citations)
         return decision, None
+
+    ends = [e.first_parity_data_ordinal + e.block_count for e in prefix if e.kind == KIND_OBJECT]
+    if overflows(append_point, total, watermark, *ends):
+        return refuse_now("step 1", "W, T or the append point overflows u64 (checked arithmetic, Section 2.4), so "
+                                    "the records do not determine one committed prefix and append point")
 
     # Step 2, the rules that need no scheme.
     step2 = decision["step2"]
@@ -3767,12 +3802,2408 @@ def resume_summary(decision: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Negative cases (design D6): apply a text-level mutation to my own bytes,
+# then decide the outcome under the text and run the target role.
+# ---------------------------------------------------------------------------
+
+QUOTES.update({
+    "checked": ("2.4", "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."),
+    "hostile_checked": ("16.2", "Every declared count or length is validated against the measured physical extent. All arithmetic on tape-derived values is checked. Reserved fields and declared zero-fill MUST be verified zero."),
+    "validity_6_6": ("6.6", "k ≥ 2      1 ≤ m ≤ k      S ≥ 1      k + m ≤ 255      S × (k + m) ≤ 2³² − 1"),
+    "boot_scheme_valid": ("8.2", "For a parity bootstrap the scheme record's `scheme_id` MUST be `rs-cauchy-gf256-v1` and `(k, m, S)` MUST satisfy Section 6.6 validity."),
+    "boot_parse_order": ("8.1", "Parse order: block length ≥ 0x40 → magic → header CRC → schema_major → payload bounds (checked against the block) → payload CRC → CBOR."),
+    "err_boot_parse": ("15", "BootstrapParse                  bootstrap frame or payload violates Section 8"),
+    "err_boot_large": ("15", "BootstrapPayloadTooLarge        framed BOT payload cannot fit the block"),
+    "err_sidecar": ("15", "SidecarParse                    sidecar structure violates Section 9"),
+    "err_pm": ("15", "ParityMapParse                  final ParityMap violates Section 10.1"),
+    "err_directory": ("15", "DirectoryInvalid                well-formed sidecar epoch directory breaks an invariant of Section 10.1.5"),
+    "err_replica": ("15", "TerminalIndexReplicaParse       replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"),
+    "err_separation": ("15", "TerminalIndexSeparationParse    separation extent violates Section 8.3, 10.5, or 10.6"),
+    "pm_category": ("15", "The name is normative as a category: this document does not specify which of the two a Reader reports once it has failed both ParityMap copies."),
+    "sc_k": ("9.2", "| 0x20 | 2 | k u16 | ≠ 0 |"),
+    "sc_m": ("9.2", "| 0x22 | 2 | m u16 | ≠ 0 |"),
+    "sc_S": ("9.2", "| 0x24 | 4 | S u32 | ≠ 0 |"),
+    "sc_block_size": ("9.2", "| 0x28 | 4 | block_size u32 | MUST equal the actual block size |"),
+    "sc_uuid": ("9.2", "| 0x08 | 16 | tape_uuid | MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1 |"),
+    "sc_end": ("9.2", "| 0x38 | 8 | protected_ordinal_end_exclusive u64 | > start |"),
+    "sc_logical": ("9.2", "| 0x40 | 8 | logical_shard_count u64 | MUST = S × k |"),
+    "sc_real": ("9.2", "| 0x48 | 8 | real_data_shard_count u64 | = end − start; ≤ logical_shard_count |"),
+    "sc_real_text": ("9.2", "`real_data_shard_count` MUST equal `protected_ordinal_end_exclusive − protected_ordinal_start` and MUST be in `1..=S × k`."),
+    "sc_P": ("9.2", "| 0x50 | 8 | parity_block_count u64 | MUST = S × m |"),
+    "sc_crc_count": ("9.2", "| 0x58 | 8 | data_crc_count u64 | MUST = real_data_shard_count |"),
+    "sc_H": ("9.2", "| 0x60 | 8 | sidecar_header_block_count u64 (H) | MUST equal the recomputed layout (Section 9.4) |"),
+    "sc_inline": ("9.2", "| 0x68 | 8 | inline_index_entry_bytes u64 | MUST equal the recomputed layout (Section 9.4) |"),
+    "sc_total": ("9.2", "| 0x70 | 8 | sidecar_total_block_count u64 | = 2H + P + 1 |"),
+    "sc_primary_start": ("9.2", "| 0x78 | 8 | primary_header_start_block u64 | MUST = 0 |"),
+    "sc_tail_start": ("9.2", "| 0x80 | 8 | tail_header_start_block u64 | MUST = H + P |"),
+    "sc_footer_index": ("9.2", "| 0x88 | 8 | footer_block_index u64 | MUST = 2H + P |"),
+    "sc_copy_kind": ("9.2", "| 0x90 | 2 | copy_kind u16 | 1 = primary, 2 = tail |"),
+    "sc_reserved92": ("9.2", "| 0x92 | 2 | reserved | MUST be 0 |"),
+    "sc_generation": ("9.2", "| 0x94 | 4 | copy_generation u32 | MUST be 0 while sidecar `schema_version` = 2 |"),
+    "sc_reservedB8": ("9.2", "| 0xB8 | 8 | reserved u64 | MUST be 0 |"),
+    "sc_fill": ("9.2", "| … | | zero fill | MUST be zero up to offset block_size − 8 |"),
+    "sc_entry_reserved": ("9.3", "**Parity entry (16 bytes)**: u32 stripe_index; u16 parity_index; u16 reserved, MUST be 0; u64 parity_shard_crc64."),
+    "sc_unused_zero": ("9.3", "Every index block — block 0 and each spill block — ends with a u64 LE CRC-64/XZ over its bytes 0..block_size−8, and unused space below the CRC MUST be zero."),
+    "sc_recompute": ("9.4", "Readers MUST recompute both and reject header values that disagree."),
+    "sc_hash_items": ("9.5", "the header's exact wire bytes 0x00 through 0x8F inclusive — magic through `footer_block_index`, with `primary_header_start_block` as 0 — i.e. every field *before* `copy_kind`;"),
+    "sc_hash_verify": ("9.5", "Readers MUST verify the hash on every index parse."),
+    "ft_reserved": ("9.6", "| 0x0A | 2 + 4 | reserved, MUST be 0 |"),
+    "ft_tail": ("9.6", "| 0x58 | 8 | tail_header_start_block u64 = H + P |"),
+    "ft_fill": ("9.6", "| 0x88… | | zero fill, MUST be zero |"),
+    "pin_then": ("13.3", "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."),
+    "geometry_c": ("C", "Geometry and ordinal-range disagreements raise `SchemeMismatch`, as this document specifies, rather than a generic parse error."),
+    "pm_M": ("10.1.2", "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy:"),
+    "pm_min": ("10.1.2", "The minimum block size for ParityMap files is 0xC8."),
+    "pm_locator": ("10.1.4", "Readers MUST validate the locator arithmetic (`M` from `payload_len` and `block_size`; total = 2M + 1; the three start indices) and reject disagreement between header, footer, and the measured tape file length."),
+    "pm_match": ("10.1.4", "The decoded payload MUST match the header/footer locator fields (UUID, sequence, digest, scope, and `is_final_directory`) and the payload bytes MUST hash to `payload_sha256`."),
+    "dir_rule": ("10.1.5", "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15)."),
+    "dir_ascending": ("10.1.5", "entries strictly ascending by `tape_file_number`, each `< scope_tape_file_count`;"),
+    "dir_nonzero": ("10.1.5", "non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and `parity_shard_block_count`;"),
+    "row_manifest": ("10.3", "For plaintext rows, `manifest_chunk_count` and `manifest_size_bytes` MUST be positive, the manifest chunk range MUST fit within `stored_block_count`, and the manifest byte length MUST fit within `manifest_chunk_count × block_size_bytes`."),
+    "row_id": ("10.3", "| 4 | bytes, 1–64 | REQUIRED |"),
+    "close_reserve": ("10.3", "A tape's close reserve is the space its finalization needs: parity closeout, the checked terminal payload `64 × structural_row_count + 256 × object_row_count` in three rounded replica records, both separation extents, and five filemark charges."),
+    "size_formulas": ("10.6", "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results."),
+    "layout_valid": ("10.6", "The planned layout of the terminal suffix validates against Section 8.3, and its layout digest recomputes to the recorded value."),
+    "conjunction": ("10.6", "The conditions are a conjunction, and this document does not fix the order in which a Reader checks them, except that a matching role magic commits the tape file to its control type, so malformed control never falls through to Object (Section 12.3)."),
+    "covered_equal": ("10.6", "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal."),
+    "w_equals_t": ("10.6", "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"),
+    "sep_arith": ("10.6", "The footer arithmetic of Section 10.4 applies to its footer fields (`0x1A8`, `0x1B0`, `0x1B8`, `0x1C0`)."),
+    "sep_valid": ("10.6", "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4, with two exceptions:"),
+    "sep_records": ("10.5", "total_records    = ceil(E / B), required ≥ 2"),
+    "footer_delta": ("10.4", "In a footer, the backward start delta (`0x2F8`) MUST equal the observed record count (`0x2E8`) minus one, and the observed footer LBA (`0x2F0`) MUST equal the observed start LBA (`0x2E0`) plus that delta."),
+    "eod_rule": ("8.3", "Logical start positions advance by `record_count + 1`, where the `1` is the actual trailing filemark. EOD is the start of C plus C's record count plus one filemark."),
+    "digest_scope": ("7.4", "When a Reader validates a terminal digest, it MUST recompute the digest over exactly the leading `tape_file_count` entries and cross-check all three scalars."),
+    "lba_formula": ("3.2", "`LBA(f, b) = Σ_{g<f}(block_count(g) + 1) + b`."),
+    "stripe_inverse": ("3.3", "inverse:  o = start + data_index·S + stripe"),
+    "parity_block_formula": ("9.1", "block(stripe, parity_index) = H + parity_index·S + stripe"),
+    "sep_magic_candidate": ("8.4", "A magic or CRC miss invalidates that candidate."),
+    "item5": ("12.3", "**Sidecar (primary)**: the primary header parses, and the measured block count MUST equal the header's `sidecar_total_block_count`."),
+})
+
+NEG_CASES_DEFAULT = pathlib.Path("/dev/null")
+
+
+class Workspace:
+    """Copy-on-write blocks of one base artifact: an image or a terminal profile."""
+
+    def __init__(self, image: ImageBuild | None = None, profile: str | None = None) -> None:
+        self.image = image
+        self.profile = profile
+        self.blocks: dict[tuple, bytearray] = {}
+        self.touched: list[tuple] = []
+        if profile is not None:
+            self.inputs = load_json(FIXTURE_ROOT / profile / "inputs.json")
+            self.terminal = build_terminal_suffix(terminal_inputs_from_profile(self.inputs))
+            self.tape_uuid = bytes.fromhex(self.inputs["tape_uuid"])
+            self.block_size = self.inputs["block_size"]
+        else:
+            self.tape_uuid = image.tape_uuid
+            self.block_size = image.block_size
+
+    def original(self, key: tuple) -> bytes:
+        if self.profile is not None:
+            component, record = key
+            return self.terminal.components[component][record]
+        tape_file, block = key
+        return self.image.files[tape_file].blocks[block]
+
+    def block(self, key: tuple) -> bytearray:
+        if key not in self.blocks:
+            self.blocks[key] = bytearray(self.original(key))
+        if key not in self.touched:
+            self.touched.append(key)
+        return self.blocks[key]
+
+    def records(self) -> list[Any]:
+        """The whole record stream with the mutated blocks in place (filemarks as None)."""
+        out: list[Any] = []
+        if self.profile is not None:
+            for entry in structural_from_json(self.inputs["structural_entries"]):
+                out.extend([bytes(self.block_size)] * entry.block_count)
+                out.append(None)
+            for component, blocks in enumerate(self.terminal.components):
+                for record in range(len(blocks)):
+                    key = (component, record)
+                    out.append(bytes(self.blocks[key]) if key in self.blocks else blocks[record])
+                out.append(None)
+            return out
+        for tape_file in self.image.files:
+            for block in range(len(tape_file.blocks)):
+                key = (tape_file.tape_file_number, block)
+                out.append(bytes(self.blocks[key]) if key in self.blocks else tape_file.blocks[block])
+            if tape_file.has_filemark:
+                out.append(None)
+        return out
+
+    def describe(self, key: tuple) -> str:
+        if self.profile is not None:
+            return f"{self.profile}/{PROFILE_COMPONENT_FILES[key[0]]} record {key[1]}"
+        return f"{self.image.name} tape file {key[0]} block {key[1]}"
+
+
+class Resolution:
+    def __init__(self) -> None:
+        self.checks: list[dict[str, Any]] = []
+        self.repairs: list[str] = []
+        self.notes: list[str] = []
+
+    @property
+    def resolved(self) -> bool:
+        return all(check["matches"] for check in self.checks)
+
+
+def edit_int(ws: Workspace, res: Resolution, key: tuple, offset: int, width: int, frm: int | None, to: int,
+             field_name: str) -> None:
+    block = ws.block(key)
+    found = int.from_bytes(block[offset : offset + width], "little")
+    res.checks.append({"where": ws.describe(key), "offset": f"0x{offset:X}", "field": field_name,
+                       "expected_from": frm, "found": found, "matches": frm is None or found == frm, "to": to})
+    block[offset : offset + width] = to.to_bytes(width, "little")
+
+
+def edit_bytes(ws: Workspace, res: Resolution, key: tuple, offset: int, frm: bytes | None, to: bytes,
+               field_name: str) -> None:
+    block = ws.block(key)
+    found = bytes(block[offset : offset + len(to)])
+    res.checks.append({"where": ws.describe(key), "offset": f"0x{offset:X}", "field": field_name,
+                       "expected_from": frm.hex() if frm is not None else None, "found": found.hex(),
+                       "matches": frm is None or found == frm, "to": to.hex()})
+    block[offset : offset + len(to)] = to
+
+
+def edit_xor(ws: Workspace, res: Resolution, key: tuple, offset: int, mask: int, field_name: str) -> None:
+    block = ws.block(key)
+    found = block[offset]
+    res.checks.append({"where": ws.describe(key), "offset": f"0x{offset:X}", "field": field_name,
+                       "expected_from": None, "found": found, "matches": True, "to": found ^ mask})
+    block[offset] ^= mask
+
+
+# ----- repairs ---------------------------------------------------------------
+
+
+def repair_sc_hashed(ws: Workspace, res: Resolution, key: tuple, stream_len: int = 96) -> None:
+    block = ws.block(key)
+    block[0x98:0xB8] = digest(SIDECAR_METADATA_DOMAIN + bytes(block[0x00:0x90]) + bytes(block[0xC8 : 0xC8 + stream_len]))
+    block[0xC0:0xC8] = le64(crc64_xz(bytes(block[0x00:0xC0])))
+    block[ws.block_size - 8 :] = le64(crc64_xz(bytes(block[: ws.block_size - 8])))
+    res.repairs.append(f"R-SC-HASHED on {ws.describe(key)} (hash over 0x00..0x8F and {stream_len} entry bytes)")
+
+
+def repair_sc_unhashed(ws: Workspace, res: Resolution, key: tuple, name: str = "R-SC-UNHASHED") -> None:
+    block = ws.block(key)
+    block[0xC0:0xC8] = le64(crc64_xz(bytes(block[0x00:0xC0])))
+    block[ws.block_size - 8 :] = le64(crc64_xz(bytes(block[: ws.block_size - 8])))
+    res.repairs.append(f"{name} on {ws.describe(key)} (header_crc64 and block0_crc64)")
+
+
+def repair_sc_fill(ws: Workspace, res: Resolution, key: tuple) -> None:
+    block = ws.block(key)
+    block[ws.block_size - 8 :] = le64(crc64_xz(bytes(block[: ws.block_size - 8])))
+    res.repairs.append(f"R-SC-FILL on {ws.describe(key)} (block CRC)")
+
+
+def repair_sc_footer(ws: Workspace, res: Resolution, key: tuple) -> None:
+    block = ws.block(key)
+    block[0x80:0x88] = le64(crc64_xz(bytes(block[0x00:0x80])))
+    res.repairs.append(f"R-SC-FOOTER on {ws.describe(key)} (footer_crc64)")
+
+
+def repair_pm_crc(ws: Workspace, res: Resolution, keys: list[tuple], name: str) -> None:
+    for key in keys:
+        block = ws.block(key)
+        block[0xC0:0xC8] = le64(crc64_xz(bytes(block[0x00:0xC0])))
+    res.repairs.append(f"{name}: CRC-64/XZ at 0xC0 of " + ", ".join(ws.describe(k) for k in keys))
+
+
+def repair_pm_payload(ws: Workspace, res: Resolution, tape_file: int, transform: Any) -> None:
+    """R-PM-PAYLOAD: change the payload identically in both copies (M = 1), then fix the locators."""
+    primary = ws.block((tape_file, 0))
+    length = rd64(primary, 0x30)
+    payload = decode_deterministic_cbor(bytes(primary[0xC8 : 0xC8 + length]))
+    transform(payload)
+    encoded = encode_deterministic_cbor(payload)
+    if 0xC8 + len(encoded) > ws.block_size:
+        raise BuildRefusal("payload", "the changed payload does not fit M = 1")
+    for block_index in (0, 1):
+        block = ws.block((tape_file, block_index))
+        block[0xC8:] = encoded + bytes(ws.block_size - 0xC8 - len(encoded))
+    for block_index in (0, 1, 2):
+        block = ws.block((tape_file, block_index))
+        block[0x30:0x38] = le64(len(encoded))
+        block[0x38:0x58] = digest(encoded)
+        block[0xC0:0xC8] = le64(crc64_xz(bytes(block[0x00:0xC0])))
+    res.repairs.append(f"R-PM-PAYLOAD on tape file {tape_file}: payload {length} -> {len(encoded)} bytes, "
+                       "payload_len and payload_sha256 in both headers and the footer, CRC at 0xC0 of all three")
+
+
+def replica_recompute(frame: bytearray, tape_uuid: bytes) -> None:
+    """Recompute the edition, layout and descriptor digests of one replica frame from its own fields."""
+    block_size = rd32(frame, 0x040)
+    version_len, stamp_len = rd16(frame, 0x1F0), rd16(frame, 0x1F2)
+    edition = digest(
+        EDITION_DOMAIN + bytes(frame[0x008:0x00A]) + tape_uuid + bytes(frame[0x020:0x030]) + bytes(frame[0x030:0x038])
+        + bytes(frame[0x03C:0x040]) + bytes(frame[0x040:0x044]) + bytes(frame[0x044:0x048]) + bytes(frame[0x048:0x080])
+        + bytes(frame[0x0A8:0x0C8]) + bytes(frame[0x0C8:0x0E8])
+        + le64(version_len) + bytes(frame[0x1F8 : 0x1F8 + version_len])
+        + le64(stamp_len) + bytes(frame[0x278 : 0x278 + stamp_len]))
+    tuples = bytes(frame[0x148:0x1E8])
+    layout = digest(LAYOUT_DOMAIN + bytes(frame[0x03C:0x040]) + le32(block_size) + le16(5) + tuples + bytes(frame[0x0A0:0x0A8]))
+    ordinal = rd16(frame, 0x038)
+    index = {1: 0, 2: 2, 3: 4}.get(ordinal, 0)
+    descriptor = digest(REPLICA_DESCRIPTOR_DOMAIN + edition + layout + le16(ordinal) + bytes(frame[0x03A:0x03C])
+                        + tuples[32 * index : 32 * (index + 1)] + bytes(frame[0x098:0x0A0]))
+    frame[0x0E8:0x108] = edition
+    frame[0x108:0x128] = layout
+    frame[0x128:0x148] = descriptor
+
+
+def repair_tr_common(ws: Workspace, res: Resolution, component: int, name: str = "R-TR-COMMON") -> None:
+    records = len(ws.terminal.components[component])
+    header = ws.block((component, 0))
+    footer = ws.block((component, records - 1))
+    replica_recompute(header, ws.tape_uuid)
+    header[0x3F8:0x400] = le64(crc64_xz(bytes(header[:0x3F8])))
+    replica_recompute(footer, ws.tape_uuid)
+    footer[0x2B8:0x2D8] = digest(bytes(header))
+    footer[0x3F8:0x400] = le64(crc64_xz(bytes(footer[:0x3F8])))
+    res.repairs.append(f"{name} on {PROFILE_COMPONENT_FILES[component]}: edition, layout and descriptor digests "
+                       "recomputed from the frame fields, header CRC, footer header-record SHA-256, footer CRC")
+
+
+def repair_tr_payload(ws: Workspace, res: Resolution, component: int) -> None:
+    header = ws.block((component, 0))
+    records = len(ws.terminal.components[component])
+    payload_blocks = [bytes(ws.block((component, r))) for r in range(1, records - 1)]
+    payload = b"".join(payload_blocks)
+    length = rd64(header, 0x070)
+    structural = rd64(header, 0x060)
+    payload_sha = digest(PAYLOAD_DOMAIN + payload[:length])
+    rows = []
+    for i in range(structural):
+        slot = payload[64 * i : 64 * (i + 1)]
+        rows.append(decode_deterministic_cbor(slot[2 : 2 + rd16(slot, 0)]))
+    canonical = digest(encode_deterministic_cbor(rows))
+    footer = ws.block((component, records - 1))
+    for frame in (header, footer):
+        frame[0x0A8:0x0C8] = payload_sha
+        frame[0x0C8:0x0E8] = canonical
+    res.repairs.append(f"R-TR-PAYLOAD on {PROFILE_COMPONENT_FILES[component]}: payload SHA-256 and canonical-map "
+                       "SHA-256 recomputed")
+    repair_tr_common(ws, res, component, "then R-TR-COMMON")
+
+
+def repair_tr_footer_local(ws: Workspace, res: Resolution, component: int) -> None:
+    records = len(ws.terminal.components[component])
+    footer = ws.block((component, records - 1))
+    footer[0x3F8:0x400] = le64(crc64_xz(bytes(footer[:0x3F8])))
+    res.repairs.append(f"R-TR-FOOTER-LOCAL on {PROFILE_COMPONENT_FILES[component]}: footer CRC")
+
+
+def separation_recompute(frame: bytearray, tape_uuid: bytes) -> None:
+    ordinal = rd16(frame, 0x030)
+    tuples = bytes(frame[0x0E0:0x180])
+    index = {1: 1, 2: 3}.get(ordinal, 1)
+    descriptor = digest(
+        SEPARATION_DESCRIPTOR_DOMAIN + tape_uuid + bytes(frame[0x020:0x030]) + bytes(frame[0x030:0x032])
+        + bytes(frame[0x032:0x034]) + bytes(frame[0x034:0x038]) + bytes(frame[0x038:0x03C]) + bytes(frame[0x050:0x058])
+        + bytes(frame[0x058:0x060]) + tuples[32 * index : 32 * (index + 1)] + tuples[32 * (index - 1) : 32 * index]
+        + tuples[32 * (index + 1) : 32 * (index + 2)] + bytes(frame[0x098:0x0B8]))
+    frame[0x0B8:0x0D8] = descriptor
+
+
+def repair_sep(ws: Workspace, res: Resolution, component: int, footer_only: bool = False) -> None:
+    records = len(ws.terminal.components[component])
+    header = ws.block((component, 0))
+    footer = ws.block((component, records - 1))
+    if footer_only:
+        footer[0x1F8:0x200] = le64(crc64_xz(bytes(footer[:0x1F8])))
+        res.repairs.append(f"separation footer CRC on {PROFILE_COMPONENT_FILES[component]}")
+        return
+    separation_recompute(header, ws.tape_uuid)
+    header[0x1F8:0x200] = le64(crc64_xz(bytes(header[:0x1F8])))
+    separation_recompute(footer, ws.tape_uuid)
+    footer[0x180:0x1A0] = digest(bytes(header))
+    footer[0x1F8:0x200] = le64(crc64_xz(bytes(footer[:0x1F8])))
+    res.repairs.append(f"R-SEP on {PROFILE_COMPONENT_FILES[component]}: descriptor digest recomputed, header CRC, "
+                       "footer header-record SHA-256, footer CRC")
+
+
+def repair_boot_hdr(ws: Workspace, res: Resolution) -> None:
+    block = ws.block((0, 0))
+    block[0x30:0x38] = le64(crc64_xz(bytes(block[0x00:0x30])))
+    res.repairs.append("R-BOOT-HDR: crc64_header at 0x30")
+
+
+def mutate_boot_scheme(ws: Workspace, res: Resolution, key_in_scheme: int, frm: int, to: int) -> None:
+    block = ws.block((0, 0))
+    length = rd32(block, 0x2C)
+    payload = decode_deterministic_cbor(bytes(block[0x38 : 0x38 + length]))
+    found = payload[1][key_in_scheme]
+    res.checks.append({"where": ws.describe((0, 0)), "offset": f"payload key 1 key {key_in_scheme}", "field": "scheme",
+                       "expected_from": frm, "found": found, "matches": found == frm, "to": to})
+    payload[1][key_in_scheme] = to
+    encoded = encode_deterministic_cbor(payload)
+    tail = encoded + le64(crc64_xz(encoded))
+    block[0x2C:0x30] = le32(len(encoded))
+    block[0x30:0x38] = le64(crc64_xz(bytes(block[0x00:0x30])))
+    block[0x38:] = tail + bytes(ws.block_size - 0x38 - len(tail))
+    res.repairs.append(f"bootstrap payload {length} -> {len(encoded)} bytes: cbor_payload_len, crc64_header, "
+                       "crc64_payload at its new position, zero fill")
+
+
+def set_element(index: Any, frm: Any, to: Any) -> Any:
+    """A slot change: check the element's current value, then replace it."""
+    def change(value: Any) -> tuple[bool, Any]:
+        ok = value[index] == frm
+        value[index] = to
+        return ok, frm
+    return change
+
+
+def edit_slot(ws: Workspace, res: Resolution, component: int, payload_offset: int, slot_size: int,
+              change: Any, label: str) -> None:
+    record = 1 + payload_offset // ws.block_size
+    offset = payload_offset % ws.block_size
+    block = ws.block((component, record))
+    slot = bytes(block[offset : offset + slot_size])
+    value = decode_deterministic_cbor(slot[2 : 2 + rd16(slot, 0)])
+    before = json.loads(json.dumps(value, default=lambda v: v.hex()))
+    ok, detail = change(value)
+    encoded = encode_deterministic_cbor(value)
+    new_slot = encode_slot(encoded, slot_size)
+    block[offset : offset + slot_size] = new_slot
+    res.checks.append({"where": f"{ws.describe((component, record))} payload offset {payload_offset}", "offset": label,
+                       "field": "slot", "expected_from": detail, "found": before, "matches": ok,
+                       "to": f"encoded_len {len(encoded)}"})
+
+
+# ----- the target roles ----------------------------------------------------
+
+
+def image_context(ws: Workspace) -> tuple[DamagedTape, dict[str, Any]]:
+    tape = DamagedTape(ws.records(), set())
+    boot = parse_bootstrap(tape.read_data(0), ws.block_size) if ws.image is not None else None
+    return tape, {"bootstrap": boot}
+
+
+def role_sidecar_copy(ws: Workspace, tape_file: int, block: int, copy_kind: int) -> dict[str, Any]:
+    try:
+        parse_sidecar_copy([bytes(ws.block((tape_file, block)))], ws.tape_uuid, ws.block_size, copy_kind)
+        return {"level": f"{'primary' if copy_kind == 1 else 'tail'} header/index copy", "result": "accepted",
+                "error": None, "reason": "validates under Sections 9.2-9.5"}
+    except ReadFailure as failure:
+        return {"level": f"{'primary' if copy_kind == 1 else 'tail'} header/index copy", "result": "rejected",
+                "error": failure.error, "reason": failure.reason}
+
+
+def role_sidecar_footer(ws: Workspace, tape_file: int, measured: int) -> dict[str, Any]:
+    footer_key = (tape_file, measured - 1)
+    try:
+        footer = parse_sidecar_footer(bytes(ws.block(footer_key)), ws.tape_uuid)
+    except ReadFailure as failure:
+        return {"level": "sidecar footer", "result": "rejected", "error": failure.error, "reason": failure.reason}
+    if footer["total"] != measured:
+        return {"level": "sidecar footer", "result": "rejected", "error": None,
+                "reason": f"parses, but its total {footer['total']} differs from the measured {measured} blocks and "
+                          "the map entry"}
+    return {"level": "sidecar footer", "result": "accepted", "error": None, "reason": "parses and matches"}
+
+
+def role_recoverer(ws: Workspace, address: list[int]) -> dict[str, Any]:
+    tape = DamagedTape(ws.records(), set())
+    boot = parse_bootstrap(tape.read_data(0), ws.block_size)
+    entries = ws.image.prefix_entries
+    directory, note = load_parity_map_directory(tape, entries, ws.tape_uuid, ws.block_size)
+    ctx = RecoveryContext(tape, ws.tape_uuid, ws.block_size, boot["scheme"], entries, len(entries),
+                          derived_watermark(entries), directory, "replica")
+    outcome = recover_address(ctx, list(address))
+    return {"level": f"Recoverer, failed address {address}", "result": outcome["result"], "error": outcome["error"],
+            "epoch": outcome["epoch"], "index_acquisition": outcome.get("index_acquisition"), "directory": note}
+
+
+def role_verifier_copies(ws: Workspace, tape_file: int) -> dict[str, Any]:
+    """A Verifier reading both copies of one sidecar and checking that they agree (Section 9.1)."""
+    try:
+        primary = parse_sidecar_copy([bytes(ws.block((tape_file, 0)))], ws.tape_uuid, ws.block_size, 1)
+        tail = parse_sidecar_copy([bytes(ws.block((tape_file, 5)))], ws.tape_uuid, ws.block_size, 2)
+    except ReadFailure as failure:
+        return {"level": "Verifier, both copies", "result": "rejected", "error": failure.error, "reason": failure.reason}
+    if primary["metadata"] != tail["metadata"] or primary["hash"] != tail["hash"]:
+        return {"level": "Verifier, both copies", "result": "rejected", "error": "SidecarParse",
+                "reason": "both copies parse, and they diverge (index content and canonical_metadata_hash)"}
+    return {"level": "Verifier, both copies", "result": "accepted", "error": None, "reason": "copies agree"}
+
+
+def role_bootstrap(ws: Workspace) -> dict[str, Any]:
+    try:
+        parse_bootstrap(bytes(ws.block((0, 0))), ws.block_size)
+        return {"level": "bootstrap frame parser", "result": "accepted", "error": None, "reason": ""}
+    except ReadFailure as failure:
+        return {"level": "bootstrap frame parser", "result": "rejected", "error": failure.error, "reason": failure.reason}
+
+
+def role_parity_map(ws: Workspace, tape_file: int) -> dict[str, Any]:
+    tape = DamagedTape(ws.records(), set())
+    start = ws.image.file_start_lba(tape_file)
+    count = len(ws.image.files[tape_file].blocks)
+    try:
+        parse_parity_map(tape, start, count, ws.tape_uuid, ws.block_size)
+        return {"level": "ParityMap validation", "result": "accepted", "error": None, "reason": ""}
+    except ReadFailure as failure:
+        return {"level": "ParityMap validation", "result": "rejected", "error": failure.error, "reason": failure.reason}
+
+
+def role_terminal(ws: Workspace) -> dict[str, Any]:
+    tape = DamagedTape(ws.records(), set())
+    layout, note = discover_layout(tape, ws.tape_uuid, ws.block_size)
+    out: dict[str, Any] = {"level": "terminal discovery, replica validation and selection", "layout_source": note}
+    if layout is None:
+        out.update(replicas={}, selection="BotStructuralRecoveryRequired", separations={})
+        return out
+    checks = {LETTERS[o]: check_replica(tape, layout, o, ws.tape_uuid, ws.block_size) for o in (1, 2, 3)}
+    out["replicas"] = {l: {"valid": c.fully_valid, "reason": c.reason} for l, c in checks.items()}
+    valid = [l for l, c in checks.items() if c.fully_valid]
+    if not valid:
+        out["selection"] = "BotStructuralRecoveryRequired"
+    elif len({checks[l].header["common"] for l in valid}) > 1:
+        out["selection"] = "TerminalIndexReplicaConflict"
+    else:
+        out["selection"] = f"Inventory from {'/'.join(valid)}" + (" (degraded)" if len(valid) < 3 else "")
+    out["separations"] = {}
+    for ordinal, name in ((1, "A-B"), (2, "B-C")):
+        status, reason, _ = check_separation(tape, layout, ordinal, ws.tape_uuid, ws.block_size)
+        out["separations"][name] = {"status": status, "reason": reason}
+    return out
+
+
+# ----- the case table --------------------------------------------------------
+#
+# Each entry gives the mutation (apply), the text decision (decide) and what my
+# implementation is expected to report (expect), which the run checks.
+
+P64 = 1 << 64
+
+
+def a4() -> ImageBuild:
+    return _image_cache("a4-minimal")
+
+
+_IMAGES: dict[str, ImageBuild] = {}
+
+
+def _image_cache(name: str) -> ImageBuild:
+    if name not in _IMAGES:
+        _IMAGES[name] = build_image(load_image_inputs(name), name)
+    return _IMAGES[name]
+
+
+def sidecar_field_case(offset: int, width: int, frm: int, to: int, name: str, repair: str, image: str = "a4-minimal",
+                       tape_file: int = 2, block: int = 0, stream_len: int = 96):
+    def apply(ws: Workspace, res: Resolution) -> None:
+        edit_int(ws, res, (tape_file, block), offset, width, frm, to, name)
+        if repair == "hashed":
+            repair_sc_hashed(ws, res, (tape_file, block), stream_len)
+        elif repair == "unhashed":
+            repair_sc_unhashed(ws, res, (tape_file, block))
+        elif repair == "footer":
+            repair_sc_footer(ws, res, (tape_file, block))
+    return image, apply
+
+
+def decision(outcome: str, error: str | None = None, rules: list[str] | None = None, order: str = "",
+             readings: list[str] | None = None, error_set: list[str] | None = None, must_reject: Any = True,
+             formula: dict | None = None, note: str = "") -> dict[str, Any]:
+    return {"outcome": outcome, "error": error, "error_set": error_set, "readings": readings,
+            "rules": [cite(k) for k in (rules or [])], "order": order, "reader_must_reject": must_reject,
+            "formula": formula, "note": note}
+
+
+SIDECAR_ORDER = ("Section 9.2 gives its constraints as a table with no order among them; every failing rule is a "
+                 "Section 9 rule, so the name is SidecarParse whichever a Reader checks first. The Section 13.3 pin "
+                 "(SchemeMismatch) applies only to an acquired index, after validation, so it is not reached for "
+                 "this copy.")
+BOOT_NAME_READINGS = [
+    "BootstrapParse: the frame or payload violates Section 8",
+    "NoBootstrapFound: Section 15 also names an invalid bootstrap 'absent or invalid', and Appendix D TT-7 records "
+    "that which bootstraps count as unreadable is still open",
+]
+
+
+def formula(expression: str, inputs: dict, value: str, overflows: bool, width: str = "u64") -> dict[str, Any]:
+    return {"expression": expression, "inputs": inputs, "value": value, "type": width, "overflows": overflows}
+
+
+def negatives_table() -> dict[str, dict[str, Any]]:
+    t: dict[str, dict[str, Any]] = {}
+
+    def sc(case_id, offset, width, frm, to, name, repair, rules, expect_error="SidecarParse", tape_file=2,
+           image="a4-minimal", address=(1, 0), block=0, extra=None, order=SIDECAR_ORDER, form=None, note=""):
+        img, apply = sidecar_field_case(offset, width, frm, to, name, repair, image, tape_file, block)
+        if extra is not None:
+            base_apply = apply
+
+            def apply(ws, res, base_apply=base_apply):
+                base_apply(ws, res)
+                extra(ws, res)
+        t[case_id] = {"image": img, "apply": apply,
+                      "roles": [("copy", tape_file, block, 1 if block == 0 else 2), ("recoverer", list(address))],
+                      "decide": decision("rejected", "SidecarParse", rules + ["err_sidecar"], order,
+                                         formula=form, note=note),
+                      "expect": {"copy": expect_error}}
+
+    # -- neg-01: replica planned-layout EOD formula overflow
+    def apply01(ws, res):
+        for key in ((0, 0), (0, 2)):
+            for i, (frm, to) in enumerate(zip((2, 6, 10, 14, 18), (P64 - 20, P64 - 16, P64 - 12, P64 - 8, P64 - 4))):
+                edit_int(ws, res, key, 0x158 + 32 * i, 8, frm, to, f"planned_start_lba of tuple {i}")
+            edit_int(ws, res, key, 0x0A0, 8, 22, 0, "planned terminal EOD LBA")
+            edit_int(ws, res, key, 0x090, 8, 2, P64 - 20, "local planned start LBA")
+        repair_tr_common(ws, res, 0)
+    t["neg-01"] = {"profile": "minimal-256k", "apply": apply01, "roles": [("terminal",)],
+                   "decide": decision("rejected", "TerminalIndexReplicaParse",
+                                      ["eod_rule", "checked", "layout_valid", "footer_local", "device_agree", "conjunction", "err_replica"],
+                                      "Several rules fail at once: the EOD formula overflows, the footer's observed start (2) "
+                                      "differs from its planned tuple, and the declared location differs from the device's. "
+                                      "Section 10.6 fixes no order among its conditions, and all are TerminalIndexReplicaParse.",
+                                      formula=formula("EOD = start(C) + record_count(C) + 1", {"start(C)": "2^64 - 4", "record_count(C)": 3},
+                                                      "2^64", True),
+                                      note="Replica A is ineligible; B and C are untouched, so the Scanner accepts an agreeing "
+                                           "survivor and the result is degraded."),
+                   "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    # -- neg-02, neg-30, neg-57: the bootstrap's S = 2^63
+    for case_id, expr, value in (("neg-02", "P = S × m", "2^64"), ("neg-30", "S × (k + m) ≤ 2^32 − 1", "2^65"),
+                                 ("neg-57", "logical_shard_count = S × k", "2^64")):
+        t[case_id] = {"image": "a4-minimal",
+                      "apply": lambda ws, res: mutate_boot_scheme(ws, res, 4, 2, 1 << 63),
+                      "roles": [("bootstrap",)],
+                      "decide": decision("rejected", "undecided", ["boot_scheme_valid", "validity_6_6", "checked", "err_boot_parse", "no_bootstrap"],
+                                         "Section 8.2 requires the recorded scheme to satisfy Section 6.6 before it is used, "
+                                         "so the Reader rejects the bootstrap at payload validation. A Reader that computes "
+                                         f"{expr.split(' ')[0] if case_id != 'neg-30' else 'the product'} first must reject its "
+                                         "overflow instead (Section 2.4). Either way the bootstrap is rejected; the text orders "
+                                         "neither, and both paths give the same outcome.",
+                                         readings=BOOT_NAME_READINGS,
+                                         formula=formula(expr, {"S": "2^63", "k": 2, "m": 2}, value, True),
+                                         note="Without a valid bootstrap and without hints, discovery stops (Section 8.4.1)."),
+                      "expect": {"bootstrap": "BootstrapParse"}}
+
+    # -- neg-03: T overflow in replica scope
+    def apply03(ws, res):
+        edit_slot(ws, res, 0, 192, 64, set_element(2, 3, P64 - 2), "structural slot 3 element 2")
+        edit_slot(ws, res, 0, 640, 256, set_element(3, 3, P64 - 2), "Object-row slot 1 key 3")
+        repair_tr_payload(ws, res, 0)
+    t["neg-03"] = {"profile": "multi-256k", "apply": apply03, "roles": [("terminal",)],
+                   "decide": decision("rejected", "TerminalIndexReplicaParse",
+                                      ["digest_scope", "checked", "payload_valid", "w_equals_t", "err_replica"],
+                                      "T = 2 + (2^64 − 2) overflows (Section 2.4), and the recorded T (5) cannot equal it; "
+                                      "with sidecars present W must equal T. All are replica scope rules with one name.",
+                                      formula=formula("T = max(first_parity_data_ordinal + block_count)", {"first": 2, "block_count": "2^64 - 2"},
+                                                      "2^64", True),
+                                      note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                   "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    # -- neg-04: no tape vector
+    t["neg-04"] = {"none": True,
+                   "decide": decision("no-vector", "undecided", ["walk_file", "hostile_checked", "err_tapeio"],
+                                      "", readings=["structural damage: a file whose position delta gives no blocks is the "
+                                                    "zero-block case of Section 12.2", "TapeIo: an inconsistent device report is a "
+                                                    "transport failure, not a format violation"],
+                                      must_reject=True,
+                                      formula=formula("block_count = position delta − 1", {"delta": 0}, "-1 (underflow)", True),
+                                      note="Section 16.2 makes arithmetic on tape-derived values checked, so the Scanner must not "
+                                           "wrap the value. The text does not say which outcome the walk reports for it.")}
+
+    # -- neg-05: unit-level peer ordinal
+    t["neg-05"] = {"none": True,
+                   "decide": decision("undecided", "undecided", ["stripe_inverse", "implicit", "checked"], "",
+                                      readings=["reject: the Recoverer forms the peer ordinal o = start + data_index·S + stripe "
+                                                "in u64, it overflows, and checked arithmetic makes that a rejection; no Section 15 "
+                                                "name is given for it",
+                                                "recover: the Recoverer classifies the peer as an implicit zero from its position "
+                                                "(data_index·S + stripe ≥ real_data_shard_count) without forming o; Section 13.4 "
+                                                "defines implicit zeros by ordinal but prescribes no computation"],
+                                      must_reject="undecided",
+                                      formula=formula("o = start + data_index·S + stripe", {"start": "2^64 - 2", "data_index": 1, "S": 2, "stripe": 0},
+                                                      "2^64", True),
+                                      note="Not constructible as a byte image: a validated map needs contiguous epochs from 0.")}
+
+    # -- neg-06: primary_header_start_block
+    for variant, keep_hash in (("a-hash-over-wire", False), ("b-hash-with-zero", True)):
+        def apply06(ws, res, keep_hash=keep_hash):
+            edit_int(ws, res, (2, 0), 0x78, 8, 0, 1, "primary_header_start_block")
+            if keep_hash:
+                repair_sc_unhashed(ws, res, (2, 0), "hash kept; header_crc64 and block0_crc64")
+            else:
+                repair_sc_hashed(ws, res, (2, 0))
+        t[f"neg-06/{variant}"] = {"image": "a4-minimal", "apply": apply06,
+                                  "roles": [("copy", 2, 0, 1), ("recoverer", [1, 0])],
+                                  "decide": decision("rejected", "SidecarParse", ["sc_primary_start", "sc_hash_items", "sc_hash_verify", "err_sidecar"],
+                                                     SIDECAR_ORDER + " The hash rule's result depends on how 'with "
+                                                     "primary_header_start_block as 0' is read (GAPS F-1): under the "
+                                                     "wire-bytes reading variant a's hash verifies and b's does not; under "
+                                                     "the substitute-0 reading the reverse. The 0x78 rule fails in both "
+                                                     "variants, so the outcome does not depend on the reading."),
+                                  "expect": {"copy": "SidecarParse"}}
+
+    # -- neg-07: fill bytes
+    def fill(block, offset, repair):
+        def apply(ws, res):
+            edit_int(ws, res, (2, block), offset, 1, 0, 1, "fill byte")
+            if repair:
+                repair_sc_fill(ws, res, (2, block))
+        return apply
+    t["neg-07/a-index-block-fill"] = {"image": "a4-minimal", "apply": fill(0, 0x20000, True),
+                                      "roles": [("copy", 2, 0, 1), ("recoverer", [1, 0])],
+                                      "decide": decision("rejected", "SidecarParse", ["sc_fill", "sc_unused_zero", "hostile_checked", "err_sidecar"]),
+                                      "expect": {"copy": "SidecarParse"}}
+    t["neg-07/b-tail-copy-fill"] = {"image": "a4-minimal", "apply": fill(5, 0x20000, True),
+                                    "roles": [("copy", 2, 5, 2), ("recoverer", [1, 0])],
+                                    "decide": decision("rejected", "SidecarParse", ["sc_fill", "sc_unused_zero", "hostile_checked", "err_sidecar"]),
+                                    "expect": {"copy": "SidecarParse"}}
+    t["neg-07/c-footer-fill"] = {"image": "a4-minimal", "apply": fill(6, 0x1000, False),
+                                 "roles": [("footer", 2, 7), ("recoverer", [1, 0])],
+                                 "decide": decision("rejected", "SidecarParse", ["ft_fill", "hostile_checked", "err_sidecar"],
+                                                    note="The footer is not used; the Recoverer falls back to the primary (Section 13.3 step 2)."),
+                                 "expect": {"footer": "SidecarParse"}}
+
+    sc("neg-08", 0x22, 2, 2, 0, "m u16", "hashed", ["sc_m", "sc_P", "sc_recompute"])
+    sc("neg-09", 0x48, 8, 4, 1 << 61, "real_data_shard_count", "hashed", ["sc_real_text", "sc_crc_count", "sc_recompute", "checked"],
+       extra=lambda ws, res: (edit_int(ws, res, (2, 0), 0x38, 8, 4, 1 << 61, "protected_ordinal_end_exclusive"),
+                              repair_sc_hashed(ws, res, (2, 0))),
+       order="Section 9.2 fixes no order. The range rule (1..=S×k) and data_crc_count reject without the Section 9.4 "
+             "computation; a Reader that computes the layout first must reject its closed-form overflow (Section 2.4) "
+             "or bound the loop. Every path is SidecarParse.",
+       form=formula("16·S·m + 8·real_data_shard_count", {"S": 2, "m": 2, "real": "2^61"}, "2^64 + 64", True))
+    sc("neg-10", 0x38, 8, 8, 3, "protected_ordinal_end_exclusive", "hashed", ["sc_end", "sc_real_text", "checked"],
+       image="two-epoch", tape_file=3, address=(1, 4),
+       form=formula("real_data_shard_count = end − start", {"end": 3, "start": 4}, "-1 (underflow)", True))
+
+    # -- neg-11: tail copy diverges
+    def apply11(ws, res):
+        edit_xor(ws, res, (2, 5), 0x108, 0x01, "data_shard_crc64 of data-CRC entry 0 (tail copy)")
+        repair_sc_hashed(ws, res, (2, 5))
+    t["neg-11"] = {"image": "a4-minimal", "apply": apply11,
+                   "roles": [("copy", 2, 5, 2), ("verifier-copies", 2), ("recoverer", [1, 0])],
+                   "decide": decision("rejected", "SidecarParse", ["sidecar_copy_agree", "err_sidecar"],
+                                      "Each copy validates alone; the agreement rule of Section 9.1 is the one that fails.",
+                                      note="A Verifier reading both copies rejects the divergence. For a Recoverer the text "
+                                           "leaves the consequence open (GAPS F-3): it may use the primary, which matches the "
+                                           "footer's hash, or refuse the epoch because the copies diverge."),
+                   "expect": {"verifier": "SidecarParse", "copy": "accepted"}}
+
+    # -- neg-12: bootstrap payload bounds
+    for variant, value in (("a-one-past", 262081), ("b-hostile-max", 4294967295)):
+        def apply12(ws, res, value=value):
+            recorded = rd32(a4().files[0].blocks[0], 0x2C)
+            edit_int(ws, res, (0, 0), 0x2C, 4, recorded, value, "cbor_payload_len u32 LE")
+            repair_boot_hdr(ws, res)
+        t[f"neg-12/{variant}"] = {"image": "a4-minimal", "apply": apply12, "roles": [("bootstrap",)],
+                                  "decide": decision("rejected", "undecided", ["boot_parse_order", "checked", "err_boot_parse", "err_boot_large", "no_bootstrap"],
+                                                     "Section 8.1 fixes the parse order: the header CRC (repaired) and "
+                                                     "schema_major pass, and the payload-bounds step fails before the payload CRC.",
+                                                     readings=["BootstrapParse: the frame violates Section 8.1's payload bounds",
+                                                               "BootstrapPayloadTooLarge: the framed payload cannot fit the block",
+                                                               "NoBootstrapFound: an invalid bootstrap, in Section 15's words"],
+                                                     formula=formula("0x38 + cbor_payload_len + 8 ≤ B", {"cbor_payload_len": value, "B": 262144},
+                                                                     str(0x38 + value + 8), 0x38 + value + 8 > 0xFFFFFFFF, "u32")),
+                                  "expect": {"bootstrap": "BootstrapParse"}}
+
+    sc("neg-13", 0x40, 8, 4, 5, "logical_shard_count", "hashed", ["sc_logical"])
+
+    # -- neg-14, neg-45, neg-27: ParityMap locator
+    def apply14(ws, res):
+        for block in (0, 1, 2):
+            edit_int(ws, res, (3, block), 0x28, 4, 262144, 2, "block_size u32")
+            edit_int(ws, res, (3, block), 0x30, 8, None, P64 - 0xC9, "payload_len")
+        repair_pm_crc(ws, res, [(3, 0), (3, 1), (3, 2)], "CRC at 0xC0 of all three blocks")
+    t["neg-14"] = {"image": "a4-minimal", "apply": apply14, "roles": [("parity-map", 3), ("recoverer", [1, 0])],
+                   "decide": decision("rejected", "ParityMapParse", ["pm_locator", "pm_M", "pm_min", "checked", "err_pm"],
+                                      "If the Reader takes B from the header field, M = 2^63 and 2M overflows (rejected, Section "
+                                      "2.4). If it takes the tape's block size, M = 2^46 ≠ the recorded copy_block_count 1 "
+                                      "(rejected). The payload cannot fit the measured 3-block file either. Every path is "
+                                      "ParityMapParse; the text does not say which B the locator uses (GAPS F-4).",
+                                      formula=formula("total = 2M + 1, M = ceil((0xC8 + L) / B)", {"L": "2^64 - 0xC9", "B": "2 (header) or 262144 (tape)"},
+                                                      "M = 2^63, 2M = 2^64 with B = 2", True),
+                                      note="The directory is unavailable; the Recoverer still acquires the index by the footer and primary."),
+                   "expect": {"parity-map": "ParityMapParse"}}
+
+    def apply45(ws, res):
+        for block in (0, 1, 2):
+            edit_int(ws, res, (3, block), 0x30, 8, None, P64 - 1, "payload_len")
+        repair_pm_crc(ws, res, [(3, 0), (3, 1), (3, 2)], "CRC at 0xC0 of all three blocks")
+    for case_id in ("neg-45", "neg-27"):
+        t[case_id] = {"image": "a4-minimal", "apply": apply45, "roles": [("parity-map", 3), ("recoverer", [1, 0])],
+                      "decide": decision("rejected", "ParityMapParse", ["pm_locator", "pm_M", "checked", "err_pm"],
+                                         "0xC8 + L overflows before M can be formed; checked arithmetic makes it a rejection.",
+                                         formula=formula("M = ceil((0xC8 + L) / B)" if case_id == "neg-45" else "tail copy at block M",
+                                                         {"L": "2^64 - 1", "B": 262144}, "0xC8 + L = 2^64 + 0xC7", True),
+                                         note="" if case_id == "neg-45" else
+                                         "The case gives its mutation 'as overflow-10.1.2-M'; resolved to neg-45's mutation, "
+                                         "whose formula is M's. The tail index adds no arithmetic of its own."),
+                      "expect": {"parity-map": "ParityMapParse"}}
+
+    # -- neg-15: Object-row manifest range
+    for variant, key10, key12 in (("a-range-sum", P64 - 1, 1), ("b-byte-product", 0, 1 << 46)):
+        def apply15(ws, res, key10=key10, key12=key12):
+            def change(v):
+                ok = v.get(10) == 0 and v.get(12) == 1
+                v[10], v[12] = key10, key12
+                return ok, "key 10 = 0, key 12 = 1"
+            edit_slot(ws, res, 0, 384, 256, change, "Object-row slot 0 keys 10 and 12")
+            repair_tr_payload(ws, res, 0)
+        t[f"neg-15/{variant}"] = {"profile": "multi-256k", "apply": apply15, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexReplicaParse", ["row_manifest", "checked", "payload_valid", "err_replica"],
+                                                     "The chunk-range and byte-length rules of Section 10.3 have no stated order; "
+                                                     "both reject (with checked arithmetic) and share one name.",
+                                                     formula=formula("first + count ≤ stored; size ≤ count × B",
+                                                                     {"first": str(key10), "count": str(key12), "B": 262144},
+                                                                     "2^64", True),
+                                                     note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                                  "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    sc("neg-16", 0x94, 4, 0, 1, "copy_generation", "unhashed", ["sc_generation"])
+
+    # -- neg-17: sidecar footer P
+    def apply17(ws, res):
+        edit_int(ws, res, (2, 6), 0x40, 8, 4, P64 - 1, "footer P")
+        repair_sc_footer(ws, res, (2, 6))
+    t["neg-17"] = {"image": "a4-minimal", "apply": apply17, "roles": [("footer", 2, 7), ("recoverer", [1, 0])],
+                   "decide": decision("rejected", "SidecarParse", ["ft_tail", "checked", "err_sidecar"],
+                                      "H + P overflows, so tail_header_start_block = H + P cannot hold; checked arithmetic "
+                                      "makes it a rejection.",
+                                      formula=formula("tail_header_start_block = H + P", {"H": 1, "P": "2^64 - 1"}, "2^64", True),
+                                      note="The footer is not used: the Recoverer falls back to the primary (Section 13.3 "
+                                           "step 2), and the Scanner's footer probe fails (Section 12.3 item 6)."),
+                   "expect": {"footer": "SidecarParse"}}
+
+    for variant, to in (("a-equal", 4), ("b-below", 3)):
+        sc(f"neg-18/{variant}", 0x38, 8, 8, to, "protected_ordinal_end_exclusive", "hashed", ["sc_end", "sc_real_text", "checked"],
+           image="two-epoch", tape_file=3, address=(1, 4),
+           form=formula("real_data_shard_count = end − start", {"end": to, "start": 4}, str(to - 4) + (" (underflow)" if to < 4 else ""), to < 4))
+    sc("neg-19", 0x24, 4, 2, 0, "S u32", "hashed", ["sc_S", "sc_logical", "sc_P", "stripe_map"],
+       order=SIDECAR_ORDER + " The Section 3.3 division by S is never reached, because the copy is rejected at validation.",
+       form=formula("stripe = d mod S; data_index = d / S", {"S": 0}, "undefined (division by zero)", False))
+    sc("neg-20", 0x20, 2, 2, 0, "k u16", "hashed", ["sc_k", "sc_logical"])
+
+    # -- neg-21: payload_len overflow
+    for variant, s_rows, o_rows in (("a-64s", 1 << 58, 0), ("b-256o", 1, 1 << 56), ("c-sum", 1 << 57, 1 << 55)):
+        def apply21(ws, res, s_rows=s_rows, o_rows=o_rows):
+            for key in ((0, 0), (0, 2)):
+                edit_int(ws, res, key, 0x060, 8, 1, s_rows, "structural_row_count")
+                edit_int(ws, res, key, 0x068, 8, 0, o_rows, "object_row_count")
+            repair_tr_common(ws, res, 0)
+        t[f"neg-21/{variant}"] = {"profile": "minimal-256k", "apply": apply21, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexReplicaParse", ["size_formulas", "checked", "err_replica"],
+                                                     "Section 10.6 names this rule: every Section 10.4 size formula evaluates "
+                                                     "without overflow. Other rules also fail (the recorded payload length 64 is "
+                                                     "not the formula's result), with the same name.",
+                                                     formula=formula("payload_len = 64 × s + 256 × o", {"s": str(s_rows), "o": str(o_rows)}, "2^64", True),
+                                                     note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                                  "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    sc("neg-22", 0x58, 8, 4, 3, "data_crc_count", "hashed", ["sc_crc_count"])
+    sc("neg-23", 0x28, 4, 262144, 524288, "block_size u32", "hashed", ["sc_block_size", "pin_then", "geometry_c"],
+       order="The Section 9.2 block-size rule is a copy-validity rule, and Section 13.3 pins only an acquired index "
+             "('then pinned'), so SidecarParse fires first for this copy. Appendix C (informative) says geometry "
+             "disagreements raise SchemeMismatch; that applies when a copy that validates disagrees with the bootstrap "
+             "(GAPS F-2).")
+    for variant, to in (("a", 3), ("b", 0)):
+        sc(f"neg-24/{variant}", 0x90, 2, 1, to, "copy_kind u16", "unhashed", ["sc_copy_kind", "primary_fallback"])
+
+    # -- neg-25: separation E
+    for variant, value in (("a-E-zero", 0), ("b-E-one-block", 262144)):
+        def apply25(ws, res, value=value):
+            for key in ((1, 0), (1, 2)):
+                edit_int(ws, res, key, 0x050, 8, 786432, value, "nominal total extent bytes")
+            repair_sep(ws, res, 1)
+        t[f"neg-25/{variant}"] = {"profile": "minimal-256k", "apply": apply25, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexSeparationParse", ["sep_records", "sep_valid", "checked", "err_separation"],
+                                                     "total_records ≥ 2 fails, the recorded total (3) is not ceil(E/B), and the "
+                                                     "footer offset and interior count underflow; all are separation rules with one "
+                                                     "name, and Section 10.6 fixes no order.",
+                                                     formula=formula("footer_offset = total_records − 1; interior = total_records − 2",
+                                                                     {"E": value, "B": 262144, "total_records": value // 262144},
+                                                                     "underflow", True),
+                                                     note="The Verifier must not report the suffix complete (Section 10.6); the "
+                                                          "Scanner's inventory is unaffected."),
+                                  "expect": {"separation A-B": "invalid"}}
+
+    t["neg-26"] = {"none": True,
+                   "decide": decision("no-vector", None, ["close_reserve"], "", must_reject=False,
+                                      formula=formula("close reserve", {}, "evaluated only by a Writer", False),
+                                      note="No Reader evaluates this formula. The Writer's capacity admission is practice in "
+                                           "the Guide; Appendix C records that this document no longer requires a tool to "
+                                           "refuse an Object that would leave too little room to finalize. Nothing for a "
+                                           "Reader to reject.")}
+
+    sc("neg-28", 0x80, 8, 5, 6, "tail_header_start_block", "hashed", ["sc_tail_start"])
+    sc("neg-29/a-header-0xB8", 0xB8, 8, 0, 1, "reserved u64", "unhashed", ["sc_reservedB8", "hostile_checked"])
+    sc("neg-29/b-parity-entry-reserved", 0xCE, 2, 0, 1, "reserved u16 of parity entry 0", "hashed", ["sc_entry_reserved", "hostile_checked"])
+
+    def apply29c(ws, res):
+        edit_int(ws, res, (2, 6), 0x0A, 2, 0, 1, "footer reserved")
+        repair_sc_footer(ws, res, (2, 6))
+    t["neg-29/c-footer-reserved"] = {"image": "a4-minimal", "apply": apply29c, "roles": [("footer", 2, 7), ("recoverer", [1, 0])],
+                                     "decide": decision("rejected", "SidecarParse", ["ft_reserved", "hostile_checked", "err_sidecar"],
+                                                        note="The footer is not used; the Recoverer falls back to the primary."),
+                                     "expect": {"footer": "SidecarParse"}}
+    sc("neg-31", 0x92, 2, 0, 1, "reserved u16", "unhashed", ["sc_reserved92"])
+    sc("neg-32", 0x68, 8, 96, 88, "inline_index_entry_bytes", "hashed", ["sc_inline", "sc_recompute"])
+
+    # -- neg-33: directory-assisted rescue with hostile counts
+    def corrupt_sidecar(ws, res):
+        edit_xor(ws, res, (2, 6), 0x80, 0x01, "footer_crc64 byte (precondition)")
+        edit_xor(ws, res, (2, 0), 0xC0, 0x01, "header_crc64 byte (precondition)")
+    for variant, key, value in (("a-H-seven", 6, 7), ("b-H-max", 6, P64 - 1), ("c-total-zero", 5, 0)):
+        def apply33(ws, res, key=key, value=value):
+            def transform(payload, key=key, value=value):
+                entry = payload[4][5][0]
+                expected = {6: 1, 5: 7}[key]
+                res.checks.append({"where": "a4-minimal tape file 3 payload", "offset": f"directory entry 0 key {key}",
+                                   "field": "directory entry", "expected_from": expected, "found": entry[key],
+                                   "matches": entry[key] == expected, "to": value})
+                entry[key] = value
+            repair_pm_payload(ws, res, 3, transform)
+            corrupt_sidecar(ws, res)
+        underflow = {"a-H-seven": "7 − 1 − 7", "b-H-max": "7 − 1 − (2^64 − 1)", "c-total-zero": "0 − 1 − 1"}[variant]
+        t[f"neg-33/{variant}"] = {
+            "image": "a4-minimal", "apply": apply33, "roles": [("parity-map", 3), ("recoverer", [1, 0])],
+            "decide": decision("rejected", "SidecarMetadataUnavailable",
+                               ["tail_rescue", "entry_agrees", "checked", "metadata_unavailable", "err_metadata_unavailable"]
+                               + (["dir_nonzero", "dir_rule", "pm_category"] if variant.startswith("c") else []),
+                               ("The directory entry agrees with the map entry in tape file, epoch, range and block count, "
+                                "so the Recoverer may place a read from it; the tail position underflows, checked arithmetic "
+                                "rejects it, no header/index copy validates, and epoch 0 is metadata-unavailable."
+                                if not variant.startswith("c") else
+                                "The zero total breaks the directory invariant 'non-zero sidecar_total_block_count', so the "
+                                "ParityMap does not validate (DirectoryInvalid or ParityMapParse, the category Section 15 "
+                                "leaves open once both copies fail); no directory entry is available, and epoch 0 is "
+                                "metadata-unavailable. The Section 13.3 agreement rule would also forbid the read."),
+                               formula=formula("tail block = total − 1 − H", {"expression": underflow}, "underflow", True),
+                               note="SidecarMetadataUnavailable{epoch_id: 0} for the failed address (1, 0)."),
+            "expect": {"recoverer": "SidecarMetadataUnavailable"}}
+
+    sc("neg-34", 0x24, 4, 2, 0, "S u32", "hashed", ["sc_S", "sc_logical", "sc_P"])
+
+    # -- neg-35, neg-56: the Resumer
+    def resume_prefix(change):
+        image = _image_cache("unfinalized-open")
+        prefix = [{"block_count": e.block_count, "epoch_id": e.epoch_id,
+                   "first_parity_data_ordinal": e.first_parity_data_ordinal, "kind": KIND_NAMES[e.kind],
+                   "protected_ordinal_end_exclusive": e.protected_ordinal_end_exclusive,
+                   "protected_ordinal_start": e.protected_ordinal_start, "tape_file_number": e.tape_file_number}
+                  for e in image.prefix_entries]
+        change(prefix)
+        return prefix
+    t["neg-35"] = {"resume": lambda: {"image": "unfinalized-open", "W": 8, "T": 6,
+                                      "committed_prefix": resume_prefix(lambda p: p[2].update(protected_ordinal_end_exclusive=8)),
+                                      "append_object": load_image_inputs("unfinalized-open")["objects"][1]},
+                   "decide": decision("rejected", "ResumeAppend", ["resume_step2", "resume_step2_rules", "w_le_t", "checked", "err_resume"],
+                                      "T − W underflows (6 − 8) and W ≤ T fails. A Resumer that evaluates the bound first, as "
+                                      "listed, must reject the underflow (Section 2.4); one that checks W ≤ T first refuses "
+                                      "directly. Both are step-2 violations, and a violation is ResumeAppend.",
+                                      formula=formula("T − W < S × k", {"T": 6, "W": 8, "S": 2, "k": 2}, "-2 (underflow)", True),
+                                      note="Decidable from the prefix alone, before any tape read (GAPS E-2)."),
+                   "expect": {"resume": "ResumeAppend"}}
+    t["neg-56"] = {"resume": lambda: {"image": "unfinalized-open", "W": 4, "T": 6,
+                                      "committed_prefix": resume_prefix(lambda p: p[3].update(block_count=P64 - 1)),
+                                      "append_object": load_image_inputs("unfinalized-open")["objects"][1]},
+                   "decide": decision("rejected", "ResumeAppend", ["resume_step1", "append_point", "checked", "resume_validated_records", "err_resume"],
+                                      "T and the append point overflow in step 1. Checked arithmetic rejects them, so the "
+                                      "records do not determine one committed prefix and append point (Section 3.4), which "
+                                      "is ResumeAppend.",
+                                      formula=formula("append point = Σ(block_count + 1)", {"block_counts": [1, 4, 7, "2^64 - 1"]}, "2^64 + 14", True),
+                                      note="Before any tape read."),
+                   "expect": {"resume": "ResumeAppend"}}
+
+    # -- neg-36: ParityMap footer disagrees
+    def apply36(offset, delta_to):
+        def apply(ws, res):
+            block = ws.block((3, 2))
+            current = rd64(block, offset)
+            edit_int(ws, res, (3, 2), offset, 8, None if offset == 0x30 else 0, delta_to(current), "footer field")
+            repair_pm_crc(ws, res, [(3, 2)], "R-PM-FOOTER")
+        return apply
+    t["neg-36/a-footer-sequence"] = {"image": "a4-minimal", "apply": apply36(0x20, lambda c: 1),
+                                     "roles": [("parity-map", 3)],
+                                     "decide": decision("rejected", "ParityMapParse", ["pm_match", "pm_locator", "err_pm"]),
+                                     "expect": {"parity-map": "ParityMapParse"}}
+    t["neg-36/b-footer-payload-len"] = {"image": "a4-minimal", "apply": apply36(0x30, lambda c: c + 1),
+                                        "roles": [("parity-map", 3)],
+                                        "decide": decision("rejected", "ParityMapParse", ["pm_locator", "err_pm"]),
+                                        "expect": {"parity-map": "ParityMapParse"}}
+
+    # -- neg-37: directory entries out of order
+    def apply37(ws, res):
+        def transform(payload):
+            entries = payload[4][5]
+            res.checks.append({"where": "two-epoch tape file 4 payload", "offset": "directory key 5", "field": "entries",
+                               "expected_from": [2, 3], "found": [e[1] for e in entries],
+                               "matches": [e[1] for e in entries] == [2, 3], "to": [3, 2]})
+            entries.reverse()
+        repair_pm_payload(ws, res, 4, transform)
+    t["neg-37"] = {"image": "two-epoch", "apply": apply37, "roles": [("parity-map", 4)],
+                   "decide": decision("rejected", None, ["dir_rule", "dir_ascending", "pm_category"],
+                                      "The directory is well formed and breaks the ascending-order invariant (and the "
+                                      "partition invariant). Both copies carry it, so both fail; Section 15 leaves the name "
+                                      "open as a category.",
+                                      error_set=["DirectoryInvalid", "ParityMapParse"]),
+                   "expect": {"parity-map": "DirectoryInvalid"}}
+
+    # -- neg-38: separation header magic
+    def apply38(ws, res):
+        edit_xor(ws, res, (1, 0), 0x000, 0x01, "separation header role magic byte 0")
+        repair_sep(ws, res, 1)
+    t["neg-38"] = {"profile": "minimal-256k", "apply": apply38, "roles": [("terminal",)],
+                   "decide": decision("rejected", "TerminalIndexSeparationParse", ["role_magic", "sep_valid", "sep_magic_candidate", "err_separation"],
+                                      note="A Verifier finds AB invalid and must not report the suffix complete; the "
+                                           "Scanner's inventory is unaffected."),
+                   "expect": {"separation A-B": "invalid"}}
+
+    def uuid_edit(ws, res):
+        edit_bytes(ws, res, (2, 0), 0x08, bytes.fromhex("12345678123442348234123456789abc"), b"\xee" * 16, "tape_uuid")
+        repair_sc_hashed(ws, res, (2, 0))
+    t["neg-39"] = {"image": "a4-minimal", "apply": uuid_edit, "roles": [("copy", 2, 0, 1), ("recoverer", [1, 0])],
+                   "decide": decision("rejected", "SidecarParse", ["sc_uuid", "err_sidecar"]),
+                   "expect": {"copy": "SidecarParse"}}
+
+    def apply40a(ws, res):
+        edit_int(ws, res, (2, 6), 0x38, 8, 1, 1 << 63, "footer H")
+        repair_sc_footer(ws, res, (2, 6))
+    t["neg-40/a-footer"] = {"image": "a4-minimal", "apply": apply40a, "roles": [("footer", 2, 7), ("recoverer", [1, 0])],
+                            "decide": decision("rejected", "SidecarParse", ["ft_tail", "err_sidecar"],
+                                               "Section 9.6 gives the footer's total no formula, so 2H + P + 1 is not a footer "
+                                               "rule. The rule that fails is tail_header_start_block = H + P: 5 ≠ 2^63 + 4, "
+                                               "which does not overflow.",
+                                               formula=formula("tail_header_start_block = H + P", {"H": "2^63", "P": 4}, "2^63 + 4", False),
+                                               note="The footer is not used; the Recoverer falls back to the primary."),
+                            "expect": {"footer": "SidecarParse"}}
+    sc("neg-40/b-header", 0x60, 8, 1, 1 << 63, "H", "hashed", ["sc_H", "sc_total", "sc_recompute", "checked"],
+       form=formula("total = 2H + P + 1", {"H": "2^63", "P": 4}, "2^64 + 5", True))
+    sc("neg-41", 0x88, 8, 6, 7, "footer_block_index", "hashed", ["sc_footer_index"])
+
+    def apply42(ws, res):
+        for key in ((0, 0), (0, 2)):
+            edit_int(ws, res, key, 0x158, 8, 2, P64 - 2, "planned_start_lba of (4,1)")
+            edit_int(ws, res, key, 0x090, 8, 2, P64 - 2, "local planned start LBA")
+        repair_tr_common(ws, res, 0)
+    t["neg-42"] = {"profile": "minimal-256k", "apply": apply42, "roles": [("terminal",)],
+                   "decide": decision("rejected", "TerminalIndexReplicaParse", ["eod_rule", "checked", "layout_valid", "footer_local", "conjunction", "err_replica"],
+                                      "The start rule overflows before it can be compared with (5,1)'s start of 6. The footer's "
+                                      "observed start (2) also differs from its tuple, and the declared location from the "
+                                      "device's. No order is fixed; one name.",
+                                      formula=formula("start(next) = start + record_count + 1", {"start": "2^64 - 2", "record_count": 3}, "2^64 + 2", True),
+                                      note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                   "expect": {"replica A": "TerminalIndexReplicaParse"}}
+    sc("neg-43", 0x60, 8, 1, 2, "H", "hashed", ["sc_H", "sc_recompute"])
+
+    def apply44(ws, res):
+        for component in (0, 2, 4):
+            edit_slot(ws, res, component, 256, 64, set_element(2, 5, P64 - 1), "structural slot 4 element 2")
+            repair_tr_payload(ws, res, component)
+    t["neg-44"] = {"profile": "multi-256k", "apply": apply44, "roles": [("terminal",)],
+                   "decide": decision("accepted", None, ["payload_valid", "lba_formula", "checked"],
+                                      "No Section 10.6 condition fails: a sidecar row's block count has no bound beyond being "
+                                      "non-zero, and the text does not require replica A's planned start LBA to equal the "
+                                      "prefix sum. The replicas are eligible and agree.",
+                                      must_reject="undecided",
+                                      formula=formula("LBA(5, 0) = Σ_{g<5}(block_count(g) + 1)", {"block_counts": [1, 2, 5, 3, "2^64 - 1"]},
+                                                      "2^64 + 14", True),
+                                      note="The inventory is accepted. A role that later computes a position from it must reject "
+                                           "the overflow (Section 2.4), for example the Recoverer locating tape file 4's footer "
+                                           "or the ParityMap, but the text names no such role and no error (GAPS F-5)."),
+                   "expect": {"selection": "Inventory from A/B/C"}}
+
+    def apply46(ws, res):
+        for key in ((0, 0), (0, 2)):
+            edit_int(ws, res, key, 0x060, 8, 1, (1 << 58) - 1, "structural_row_count")
+            edit_int(ws, res, key, 0x068, 8, 0, 0, "object_row_count")
+        repair_tr_common(ws, res, 0)
+    t["neg-46"] = {"profile": "minimal-256k", "apply": apply46, "roles": [("terminal",)],
+                   "decide": decision("rejected", "TerminalIndexReplicaParse", ["size_formulas", "checked", "err_replica"],
+                                      "payload_len = 2^64 − 64 fits; payload_padding_bytes needs count × B = 2^64, which "
+                                      "overflows. Section 10.6 requires every size formula to evaluate without overflow. The "
+                                      "recorded geometry also differs, with the same name.",
+                                      formula=formula("payload_padding_bytes = payload_record_count × B − payload_len",
+                                                      {"payload_record_count": "2^46", "B": "2^18"}, "count × B = 2^64", True),
+                                      note="footer_block_offset and replica_record_count cannot overflow here. Replica A is "
+                                           "ineligible; B and C supply the inventory."),
+                   "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    for variant, profile, offset, frm, to, rules in (
+            ("a-covered-prefix", "multi-256k", 0x048, 6, 7, ["covered_equal", "digest_scope"]),
+            ("b-total-data-ordinals", "multi-256k", 0x050, 5, 6, ["digest_scope", "w_equals_t"]),
+            ("c-highest-protected", "multi-256k", 0x058, 5, 4, ["digest_scope", "w_equals_t"]),
+            ("d-total-isolated", "minimal-256k", 0x050, 0, 1, ["digest_scope"])):
+        def apply47(ws, res, offset=offset, frm=frm, to=to):
+            for key in ((0, 0), (0, 2)):
+                edit_int(ws, res, key, offset, 8, frm, to, "scope field")
+            repair_tr_common(ws, res, 0)
+        t[f"neg-47/{variant}"] = {"profile": profile, "apply": apply47, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexReplicaParse", rules + ["err_replica"],
+                                                     "The failing rules are replica scope rules (Sections 7.4 and 10.6), "
+                                                     "with one name. The canonical-map digest still matches its structural "
+                                                     "rows, so FilemarkMapDigestMismatch does not apply.",
+                                                     note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                                  "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    def apply48(ws, res):
+        edit_xor(ws, res, (2, 0), 0x98, 0x01, "canonical_metadata_hash byte 0")
+        repair_sc_unhashed(ws, res, (2, 0), "header_crc64 and block0_crc64 only; hash not recomputed")
+    t["neg-48"] = {"image": "a4-minimal", "apply": apply48, "roles": [("copy", 2, 0, 1), ("recoverer", [1, 0])],
+                   "decide": decision("rejected", "SidecarParse", ["sc_hash_verify", "err_sidecar"]),
+                   "expect": {"copy": "SidecarParse"}}
+    sc("neg-49", 0x60, 8, 1, P64 - 1, "H", "hashed", ["sc_H", "sc_total", "sc_recompute", "parity_block_formula", "checked"],
+       order=SIDECAR_ORDER + " With this H the copy is rejected at validation, so the Section 9.1 parity locator is never "
+             "evaluated with it.",
+       form=formula("block(0, 1) = H + 1·S + 0", {"H": "2^64 - 1", "S": 2}, "2^64 + 1", True))
+
+    def apply50(ws, res):
+        for key in ((1, 0), (1, 2)):
+            edit_int(ws, res, key, 0x050, 8, 786432, P64 - 1, "nominal total extent bytes")
+        repair_sep(ws, res, 1)
+    t["neg-50"] = {"profile": "minimal-256k", "apply": apply50, "roles": [("terminal",)],
+                   "decide": decision("rejected", "TerminalIndexSeparationParse", ["sep_records", "size_formulas", "sep_valid", "checked", "err_separation"],
+                                      "actual_bytes = 2^46 × 2^18 overflows, and the recorded total (3) is not ceil(E/B) = 2^46; "
+                                      "both are separation rules with one name.",
+                                      formula=formula("actual_bytes = ceil(E / B) × B", {"E": "2^64 - 1", "B": "2^18"}, "2^64", True),
+                                      note="A Verifier must not report the suffix complete; the Scanner is unaffected."),
+                   "expect": {"separation A-B": "invalid"}}
+
+    for variant in ("a-header-magic-flipped", "b-header-carries-footer-magic"):
+        def apply51(ws, res, variant=variant):
+            if variant.startswith("a"):
+                edit_xor(ws, res, (0, 0), 0x000, 0x01, "header role magic byte 0")
+            else:
+                edit_bytes(ws, res, (0, 0), 0x000, role_magic(ws.tape_uuid, LABEL_REPLICA_HEADER),
+                           role_magic(ws.tape_uuid, LABEL_REPLICA_FOOTER), "header role magic")
+            repair_tr_common(ws, res, 0, "header CRC, footer 0x2B8, footer CRC (digests unchanged)")
+        t[f"neg-51/{variant}"] = {"profile": "minimal-256k", "apply": apply51, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexReplicaParse", ["role_magic", "sep_magic_candidate", "err_replica"],
+                                                     note="Replica A is ineligible; C's footer supplies the layout, and B and C "
+                                                          "supply the inventory (degraded)."),
+                                  "expect": {"replica A": "TerminalIndexReplicaParse"}}
+    sc("neg-52", 0x50, 8, 4, 3, "parity_block_count", "hashed", ["sc_P"])
+
+    for variant, components in (("a-replica-A-only", (0,)), ("b-all-replicas", (0, 2, 4))):
+        def apply53(ws, res, components=components):
+            for component in components:
+                def change(v):
+                    ok = v.get(4) == b"minimal-plaintext-object"
+                    v[4] = b"a" * 65
+                    return ok, "minimal-plaintext-object"
+                edit_slot(ws, res, component, 384, 256, change, "Object-row slot 0 key 4")
+                repair_tr_payload(ws, res, component)
+        t[f"neg-53/{variant}"] = {"profile": "multi-256k", "apply": apply53, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexReplicaParse" if variant.startswith("a") else "BotStructuralRecoveryRequired",
+                                                     ["row_id", "payload_valid", "err_replica"] + ([] if variant.startswith("a") else ["no_replica_walk", "err_bot"]),
+                                                     note=("Replica A is ineligible; B and C supply the inventory (degraded)."
+                                                           if variant.startswith("a") else
+                                                           "Every replica is ineligible (TerminalIndexReplicaParse each), so the "
+                                                           "tape-level outcome is BotStructuralRecoveryRequired.")),
+                                  "expect": {"replica A": "TerminalIndexReplicaParse"} if variant.startswith("a")
+                                  else {"selection": "BotStructuralRecoveryRequired"}}
+
+    sc("neg-54/a-header-wrong", 0x70, 8, 7, 8, "sidecar_total_block_count", "hashed", ["sc_total", "item5"])
+    sc("neg-54/b-header-zero-hostile", 0x70, 8, 7, 0, "sidecar_total_block_count", "hashed", ["sc_total", "checked"])
+
+    def apply54c(ws, res):
+        edit_int(ws, res, (2, 6), 0x48, 8, 7, 0, "footer sidecar_total_block_count")
+        repair_sc_footer(ws, res, (2, 6))
+    t["neg-54/c-footer-zero-hostile"] = {
+        "image": "a4-minimal", "apply": apply54c, "roles": [("footer", 2, 7), ("recoverer", [1, 0])],
+        "decide": decision("rejected", "undecided", ["footer_probe", "primary_fallback", "hard_error_scope"],
+                           "Section 9.6 gives the footer's total no formula, so the footer is rejected only by comparison: "
+                           "its total (0) differs from the measured length (Section 12.3 item 6) and from the map entry "
+                           "(Section 13.3 step 1).",
+                           readings=["SidecarParse: the footer is a sidecar structure that fails its checks",
+                                     "no Section 15 error: Section 13.3 treats it as an invalid footer and falls back to the "
+                                     "primary, and Section 12.3 reports a failed classification that Section 15 does not name"],
+                           note="The footer is not used; the Recoverer falls back to the primary."),
+        "expect": {"footer": "rejected"}}
+
+    for variant, component, offset, frm, to, footer_only in (
+            ("a-count-zero", 0, 0x2E8, 3, 0, False), ("b-start-max", 0, 0x2E0, 2, P64 - 1, False),
+            ("c-separation-count-zero", 1, 0x1B0, 3, 0, True)):
+        def apply55(ws, res, component=component, offset=offset, frm=frm, to=to, footer_only=footer_only):
+            edit_int(ws, res, (component, 2), offset, 8, frm, to, "footer observation")
+            if footer_only:
+                repair_sep(ws, res, component, footer_only=True)
+            else:
+                repair_tr_footer_local(ws, res, component)
+        sep = variant.startswith("c")
+        t[f"neg-55/{variant}"] = {"profile": "minimal-256k", "apply": apply55, "roles": [("terminal",)],
+                                  "decide": decision("rejected", "TerminalIndexSeparationParse" if sep else "TerminalIndexReplicaParse",
+                                                     ["footer_delta", "checked", "footer_local"] + (["sep_arith", "err_separation"] if sep else ["err_replica"]),
+                                                     "The footer arithmetic underflows or overflows, and the observation also "
+                                                     "differs from the planned tuple; one name.",
+                                                     formula=formula("delta = count − 1; footer LBA = start + delta",
+                                                                     {"count": 0 if "count" in variant else 3, "start": "2^64 - 1" if "start" in variant else 2},
+                                                                     "underflow" if "count" in variant else "2^64 + 1", True),
+                                                     note=("A Verifier finds AB invalid; the Scanner is unaffected." if sep else
+                                                           "Replica A is ineligible; B and C supply the inventory (degraded).")),
+                                  "expect": {"separation A-B": "invalid"} if sep else {"replica A": "TerminalIndexReplicaParse"}}
+
+    # -- neg-58: real_data_shard_count, isolated
+    def apply58a(ws, res):
+        key = (2, 0)
+        edit_int(ws, res, key, 0x48, 8, 4, 3, "real_data_shard_count")
+        edit_int(ws, res, key, 0x58, 8, 4, 3, "data_crc_count")
+        edit_int(ws, res, key, 0x68, 8, 96, 88, "inline_index_entry_bytes")
+        fourth = bytes(a4().files[2].blocks[0][0x120:0x128])
+        edit_bytes(ws, res, key, 0x120, fourth, bytes(8), "fourth data-CRC entry")
+        repair_sc_hashed(ws, res, key, 88)
+
+    def apply58b(ws, res):
+        key = (2, 0)
+        edit_int(ws, res, key, 0x38, 8, 4, 5, "protected_ordinal_end_exclusive")
+        edit_int(ws, res, key, 0x48, 8, 4, 5, "real_data_shard_count")
+        edit_int(ws, res, key, 0x58, 8, 4, 5, "data_crc_count")
+        edit_int(ws, res, key, 0x68, 8, 96, 104, "inline_index_entry_bytes")
+        edit_bytes(ws, res, key, 0x128, bytes(8), le64(0x261BDF3D299838FC), "fifth data-CRC entry")
+        repair_sc_hashed(ws, res, key, 104)
+    t["neg-58/a-not-end-minus-start"] = {"image": "a4-minimal", "apply": apply58a, "roles": [("copy", 2, 0, 1), ("recoverer", [1, 0])],
+                                         "decide": decision("rejected", "SidecarParse", ["sc_real_text", "err_sidecar"],
+                                                            "Exactly one Section 9.2 rule is broken: real (3) ≠ end − start (4)."),
+                                         "expect": {"copy": "SidecarParse"}}
+    t["neg-58/b-above-logical"] = {"image": "a4-minimal", "apply": apply58b, "roles": [("copy", 2, 0, 1), ("recoverer", [1, 0])],
+                                   "decide": decision("rejected", "SidecarParse", ["sc_real_text", "sc_real", "err_sidecar"],
+                                                      "Exactly one Section 9.2 rule is broken: real (5) is outside 1..=S×k (4)."),
+                                   "expect": {"copy": "SidecarParse"}}
+    return t
+
+
+def run_negative(entry_id: str, spec: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
+    case_id, _, variant = entry_id.partition("/")
+    out: dict[str, Any] = {"id": case_id, "variant": variant or None, "target": case.get("target"),
+                           "apply": None, "decision": spec["decide"], "implementation": [], "self_check": None}
+    if spec.get("none"):
+        out["apply"] = {"resolved": None, "vector": "none", "checks": [], "repairs": [], "mutated_blocks": [],
+                        "notes": ["no tape vector: " + (case.get("evaluation") or case.get("base", {}).get("note", ""))]}
+        out["self_check"] = {"agrees": None, "detail": "nothing for the implementation to run"}
+        return out
+    if "resume" in spec:
+        resume_input = spec["resume"]()
+        decision_out, _ = resume_case(resume_input, _image_cache(resume_input["image"]), {"case_id": entry_id})
+        d = decision_out["decision"]
+        out["apply"] = {"resolved": True, "vector": "injected commit record (no tape bytes change)", "checks": [],
+                        "repairs": [], "mutated_blocks": [],
+                        "notes": [f"prefix: derived W {decision_out['prefix']['derived_W']}, T {decision_out['prefix']['derived_T']}"]}
+        out["implementation"].append({"level": "Resumer", "result": d["result"], "error": d["error"],
+                                      "refused_at": d["refused_at"], "records_read": d["records_read"],
+                                      "violations": decision_out["step2"]["violations"]})
+        agrees = d["error"] == spec["expect"]["resume"]
+        out["self_check"] = {"agrees": agrees, "detail": f"Resumer {d['result']} {d['error']} at {d['refused_at']}"}
+        return out
+    ws = Workspace(image=_image_cache(spec["image"])) if "image" in spec else Workspace(profile=spec["profile"])
+    res = Resolution()
+    spec["apply"](ws, res)
+    mutated = [{"where": ws.describe(key), "bytes": len(ws.blocks[key]),
+                "sha256": hashlib.sha256(bytes(ws.blocks[key])).hexdigest()} for key in ws.touched]
+    out["apply"] = {"resolved": res.resolved, "vector": "bytes", "checks": res.checks, "repairs": res.repairs,
+                    "mutated_blocks": mutated, "notes": res.notes}
+    if not res.resolved:
+        out["decision"] = decision("unresolved", None, [], "", note="the description does not resolve against my bytes")
+        return out
+    for role in spec.get("roles", []):
+        kind = role[0]
+        if kind == "copy":
+            out["implementation"].append(role_sidecar_copy(ws, role[1], role[2], role[3]))
+        elif kind == "footer":
+            out["implementation"].append(role_sidecar_footer(ws, role[1], role[2]))
+        elif kind == "recoverer":
+            out["implementation"].append(role_recoverer(ws, role[1]))
+        elif kind == "verifier-copies":
+            out["implementation"].append(role_verifier_copies(ws, role[1]))
+        elif kind == "bootstrap":
+            out["implementation"].append(role_bootstrap(ws))
+        elif kind == "parity-map":
+            out["implementation"].append(role_parity_map(ws, role[1]))
+        elif kind == "terminal":
+            out["implementation"].append(role_terminal(ws))
+    out["self_check"] = self_check(spec["expect"], out["implementation"])
+    return out
+
+
+def self_check(expect: dict[str, str], results: list[dict[str, Any]]) -> dict[str, Any]:
+    details = []
+    agrees = True
+    for key, wanted in expect.items():
+        found = None
+        if key in ("copy", "footer", "bootstrap", "parity-map", "verifier"):
+            level = {"copy": "copy", "footer": "sidecar footer", "bootstrap": "bootstrap", "parity-map": "ParityMap",
+                     "verifier": "Verifier"}[key]
+            match = next((r for r in results if level in r["level"]), None)
+            if match is not None:
+                found = match["error"] if match["result"] == "rejected" and match["error"] else match["result"]
+                if wanted == "rejected":
+                    found = match["result"]
+        elif key == "recoverer":
+            match = next((r for r in results if "Recoverer" in r["level"]), None)
+            found = match and (match["error"] or match["result"])
+        elif key.startswith("replica "):
+            match = next((r for r in results if "replicas" in r), None)
+            if match:
+                replica = match["replicas"].get(key.split()[1], {})
+                reason = replica.get("reason", "")
+                if reason.startswith("payload: "):
+                    reason = reason[len("payload: "):]
+                found = "valid" if replica.get("valid") else reason.split(":")[0]
+        elif key.startswith("separation "):
+            match = next((r for r in results if "separations" in r), None)
+            found = match and match["separations"].get(key.split()[1], {}).get("status")
+        elif key == "selection":
+            match = next((r for r in results if "selection" in r), None)
+            found = match and match["selection"]
+        ok = found == wanted
+        agrees = agrees and ok
+        details.append(f"{key}: expected {wanted}, implementation {found}")
+    return {"agrees": agrees, "detail": "; ".join(details)}
+
+
+def run_negatives(cases_path: pathlib.Path, out_path: pathlib.Path) -> dict[str, Any]:
+    source = load_json(cases_path)
+    by_id = {case["id"]: case for case in source["cases"]}
+    table = negatives_table()
+    entries: dict[str, Any] = {}
+    covered = set()
+    for case in source["cases"]:
+        variants = [v["variant"] for v in case.get("variants", [])] or [None]
+        for variant in variants:
+            entry_id = case["id"] + (f"/{variant}" if variant else "")
+            covered.add(entry_id)
+            if entry_id not in table:
+                entries[entry_id] = {"id": case["id"], "variant": variant, "target": case.get("target"),
+                                     "apply": {"resolved": False, "notes": ["no entry in this implementation's table"]},
+                                     "decision": decision("unresolved", note="not analysed"), "implementation": [],
+                                     "self_check": None}
+                continue
+            entries[entry_id] = run_negative(entry_id, table[entry_id], by_id[case["id"]])
+    extra = sorted(set(table) - covered)
+    output = {"schema": "rem-parity-second-implementation-negatives/1", "entries": entries,
+              "table_entries_without_a_case": extra}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False, default=_json_default) + "\n", encoding="utf-8")
+    return output
+
+
+def negative_summary(entry: dict[str, Any]) -> str:
+    d = entry["decision"]
+    text = d["outcome"]
+    if d["error"] and d["error"] != "undecided":
+        text += f" {d['error']}"
+    if d["error_set"]:
+        text += " {" + " | ".join(d["error_set"]) + "}"
+    if d["error"] == "undecided" and d["readings"]:
+        text += " (name undecided: " + " | ".join(r.split(":")[0] for r in d["readings"]) + ")"
+    elif d["outcome"] in ("undecided", "no-vector") and d["readings"]:
+        text += " (" + " | ".join(r.split(":")[0] for r in d["readings"]) + ")"
+    if entry["apply"] and entry["apply"].get("resolved") is False:
+        text += " [UNRESOLVED]"
+    check = entry["self_check"]
+    if check and check["agrees"] is False:
+        text += f" [SELF-CHECK FAILED: {check['detail']}]"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Supplemental single-violation negatives: apply, check isolation rule by
+# rule, and decide.
+# ---------------------------------------------------------------------------
+
+QUOTES.update({
+    "p_defined": ("9.1", "One sidecar is written per parity epoch, in its own tape file of `total = 2H + P + 1` blocks, where `H` is the header/index copy block count (Section 9.4) and `P = S × m` is the parity shard block count:"),
+    "h_label": ("9.2", "| 0x60 | 8 | sidecar_header_block_count u64 (H) | MUST equal the recomputed layout (Section 9.4) |"),
+    "terminal_u64": ("8.3", "Arithmetic on these fields is checked in `u64` (Section 2.4)."),
+    "sep_formulas": ("10.5", "actual_bytes     = total_records × B"),
+    "size_formula_10_4": ("10.4", "payload_padding_bytes  = payload_record_count × B − payload_len"),
+    "dir_partition": ("10.1.5", "the protected ranges **partition `[0, scope_highest_protected_ordinal)`**: taken in ascending `tape_file_number` order, the first `protected_ordinal_start` is `0`, each entry's `protected_ordinal_start` equals the previous entry's `protected_ordinal_end_exclusive` (contiguous, no gaps and no overlaps), every range is non-empty, and the last `protected_ordinal_end_exclusive` equals `scope_highest_protected_ordinal` (or the directory is empty and `scope_highest_protected_ordinal = 0`);"),
+    "dir_epochs": ("10.1.5", "`epoch_id` values are unique and consecutive starting from `0` (`0, 1, …, count−1`), matching the bare monotonic epoch counter of Section 2.3."),
+    "epoch_at_most": ("2.3", "**Epoch**: one parity protection unit covering a non-empty explicit, half-open range of at most `S × k` data ordinals."),
+    "structural_invariants": ("10.2", "Every structural and ordinal-range invariant is validated."),
+    "scope_in_list": ("10.6", "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate."),
+    "footer_observations": ("8.4", "The footer's tape-file, start, and count fields are Writer observations, not an independent device tape-file counter."),
+    "only_kind_differ": ("9.1", "The tail copy MUST carry metadata and index content identical to the primary; only `copy_kind` and the recomputed CRCs differ."),
+})
+
+
+def pack_sidecar_header(tape_uuid: bytes, v: dict[str, int], copy_kind: int, metadata_hash: bytes) -> bytearray:
+    header = bytearray(0xC8)
+    header[0x00:0x08] = role_magic(tape_uuid, LABEL_SIDECAR)
+    header[0x08:0x18] = v.get("uuid", tape_uuid)
+    fields = [(0x18, 8, "epoch"), (0x20, 2, "k"), (0x22, 2, "m"), (0x24, 4, "S"), (0x28, 4, "block_size"), (0x2C, 4, "schema"),
+              (0x30, 8, "start"), (0x38, 8, "end"), (0x40, 8, "logical"), (0x48, 8, "real"), (0x50, 8, "P"),
+              (0x58, 8, "crc_count"), (0x60, 8, "H"), (0x68, 8, "inline"), (0x70, 8, "total"), (0x78, 8, "primary"),
+              (0x80, 8, "tail"), (0x88, 8, "footer_index")]
+    for offset, width, key in fields:
+        header[offset : offset + width] = v[key].to_bytes(width, "little")
+    header[0x90:0x92] = le16(copy_kind)
+    header[0x98:0xB8] = metadata_hash
+    header[0xC0:0xC8] = le64(crc64_xz(bytes(header[0x00:0xC0])))
+    return header
+
+
+def build_sidecar_explicit(tape_uuid: bytes, block_size: int, v: dict[str, int], entries: list[bytes],
+                           parity: list[bytes], copy_blocks: int, extra_tail_blocks: int = 0) -> tuple[list[bytes], bytes]:
+    """Assemble a sidecar from explicit field values (for the rebuilt-image variants).
+
+    Each copy is `copy_blocks` blocks: block 0 holds the header and every entry,
+    later blocks are empty index blocks (zero below a valid CRC). The parity
+    shards follow the primary copy in the given order, then the tail copy, the
+    footer, and any extra blocks.
+    """
+    stream = b"".join(entries)
+    provisional = pack_sidecar_header(tape_uuid, v, 1, bytes(32))
+    metadata_hash = digest(SIDECAR_METADATA_DOMAIN + bytes(provisional[0x00:0x90]) + stream)
+
+    def copy(kind: int) -> list[bytes]:
+        head = bytearray(block_size)
+        head[0:0xC8] = pack_sidecar_header(tape_uuid, v, kind, metadata_hash)
+        head[0xC8 : 0xC8 + len(stream)] = stream
+        head[block_size - 8 :] = le64(crc64_xz(bytes(head[: block_size - 8])))
+        blocks = [bytes(head)]
+        for _ in range(copy_blocks - 1):
+            empty = bytearray(block_size)
+            empty[block_size - 8 :] = le64(crc64_xz(bytes(empty[: block_size - 8])))
+            blocks.append(bytes(empty))
+        return blocks
+
+    footer = bytearray(block_size)
+    footer[0x00:0x08] = role_magic(tape_uuid, LABEL_SIDECAR_FOOTER)
+    footer[0x08:0x0A] = le16(2)
+    footer[0x10:0x20] = tape_uuid
+    for offset, key in ((0x20, "epoch"), (0x28, "start"), (0x30, "end"), (0x38, "H"), (0x40, "P"), (0x48, "total"),
+                        (0x50, "primary"), (0x58, "tail")):
+        footer[offset : offset + 8] = le64(v[key])
+    footer[0x60:0x80] = metadata_hash
+    footer[0x80:0x88] = le64(crc64_xz(bytes(footer[0x00:0x80])))
+    blocks = copy(1) + list(parity) + copy(2) + [bytes(footer)] + [bytes(block_size)] * extra_tail_blocks
+    return blocks, metadata_hash
+
+
+def rebuild_a4(sidecar_blocks: list[bytes], sidecar_entry: MapEntry, directory_entry: dict[int, Any],
+               object_blocks: list[bytes] | None = None, object_row: dict[int, Any] | None = None,
+               name: str = "a4-minimal (rebuilt)") -> ImageBuild:
+    """ISO-REBUILD: a4-minimal with a new sidecar (and optionally a new Object), everything after regenerated."""
+    base = _image_cache("a4-minimal")
+    inputs = load_image_inputs("a4-minimal")
+    identity = inputs["writer_identity"]
+    object_blocks = object_blocks if object_blocks is not None else base.files[1].blocks
+    object_row = object_row if object_row is not None else base.object_rows[0]
+    entries = [MapEntry(0, KIND_BOOTSTRAP, 1), MapEntry(1, KIND_OBJECT, len(object_blocks), 0), sidecar_entry]
+    parity_map, parity_entry = build_parity_map(base.tape_uuid, base.block_size, 0, 3, [directory_entry], entries,
+                                                identity["writer_version"], identity["write_timestamp"])
+    prefix = entries + [parity_entry]
+    terminal = build_terminal_suffix(TerminalInputs(
+        tape_uuid=base.tape_uuid, block_size=base.block_size, structural=prefix, object_rows=[object_row],
+        edition_id=bytes.fromhex(inputs["edition_id_hex"]), edition_sequence=inputs["edition_sequence"],
+        writer_version=identity["writer_version"].encode(), write_timestamp=identity["write_timestamp"].encode(),
+        nominal_extent_bytes=inputs["nominal_extent_bytes"], start_tape_file=len(prefix),
+        start_lba=sum(e.block_count + 1 for e in prefix), covered_count=len(prefix),
+        total_data_ordinals=derived_total(prefix), highest_protected_ordinal=derived_watermark(prefix)))
+    files = [TapeFile(0, KIND_BOOTSTRAP, base.files[0].blocks, True, {}),
+             TapeFile(1, KIND_OBJECT, list(object_blocks), True, {}),
+             TapeFile(2, KIND_SIDECAR, list(sidecar_blocks), True, {}),
+             TapeFile(3, KIND_PARITY_MAP, parity_map.blocks, True, {})]
+    for index, component in enumerate(terminal.components):
+        files.append(TapeFile(4 + index, terminal.plan[index][0], component, True, {}))
+    return ImageBuild(name, base.block_size, base.tape_uuid, base.scheme, files, prefix, [object_row], terminal, True)
+
+
+def a4_sidecar_values() -> dict[str, int]:
+    head = _image_cache("a4-minimal").files[2].blocks[0]
+    keys = [(0x18, 8, "epoch"), (0x20, 2, "k"), (0x22, 2, "m"), (0x24, 4, "S"), (0x28, 4, "block_size"), (0x2C, 4, "schema"),
+            (0x30, 8, "start"), (0x38, 8, "end"), (0x40, 8, "logical"), (0x48, 8, "real"), (0x50, 8, "P"),
+            (0x58, 8, "crc_count"), (0x60, 8, "H"), (0x68, 8, "inline"), (0x70, 8, "total"), (0x78, 8, "primary"),
+            (0x80, 8, "tail"), (0x88, 8, "footer_index")]
+    return {key: int.from_bytes(head[o : o + w], "little") for o, w, key in keys}
+
+
+class TerminalWorkspace(Workspace):
+    """A Workspace over a terminal suffix built here, with placeholder prefix records."""
+
+    def __init__(self, terminal: TerminalBuild, tape_uuid: bytes, block_size: int, placeholder: list[int], label: str) -> None:
+        self.image = None
+        self.profile = label
+        self.blocks = {}
+        self.touched = []
+        self.terminal = terminal
+        self.tape_uuid = tape_uuid
+        self.block_size = block_size
+        self.placeholder = placeholder
+
+    def records(self) -> list[Any]:
+        out: list[Any] = []
+        for count in self.placeholder:
+            out.extend([bytes(self.block_size)] * count)
+            out.append(None)
+        for component, blocks in enumerate(self.terminal.components):
+            for record in range(len(blocks)):
+                key = (component, record)
+                out.append(bytes(self.blocks[key]) if key in self.blocks else blocks[record])
+            out.append(None)
+        return out
+
+
+def multi_inputs() -> dict[str, Any]:
+    return load_json(FIXTURE_ROOT / "multi-256k" / "inputs.json")
+
+
+def terminal_workspace(structural: list[MapEntry], rows: list[dict], placeholder: list[int], label: str,
+                       total: int, watermark: int, start_tape_file: int | None = None,
+                       start_lba: int | None = None) -> TerminalWorkspace:
+    base = multi_inputs()
+    terminal = build_terminal_suffix(TerminalInputs(
+        tape_uuid=bytes.fromhex(base["tape_uuid"]), block_size=base["block_size"], structural=structural,
+        object_rows=rows, edition_id=bytes.fromhex(base["edition_id"]), edition_sequence=base["edition_sequence"],
+        writer_version=base["diagnostics"]["writer_version"].encode(),
+        write_timestamp=base["diagnostics"]["write_timestamp"].encode(),
+        nominal_extent_bytes=base["separation_extent"]["nominal_extent_bytes"],
+        start_tape_file=len(structural) if start_tape_file is None else start_tape_file,
+        start_lba=(sum(c + 1 for c in placeholder) if start_lba is None else start_lba),
+        covered_count=len(structural), total_data_ordinals=total, highest_protected_ordinal=watermark))
+    return TerminalWorkspace(terminal, bytes.fromhex(base["tape_uuid"]), base["block_size"], placeholder, label)
+
+
+# ----- the rule-by-rule sidecar copy auditor -----------------------------------
+
+
+def audit_sidecar_copy(blocks: list[bytes], tape_uuid: bytes, block_size: int, copy_kind: int) -> dict[str, Any]:
+    """Evaluate every Section 9.2-9.5 rule of one header/index copy on its own.
+
+    The locator formulas (total, tail start, footer index) are evaluated under
+    two readings of their symbols: the text's (H = the field the table labels
+    "(H)", P = S × m as Section 9.1 defines it) and this implementation's
+    parser's (H = the Section 9.4 recompute, P = the 0x50 field). The hash is
+    evaluated under both readings of Section 9.5 (wire bytes; 0x78 taken as 0).
+    """
+    head = blocks[0]
+    g = lambda o, w: int.from_bytes(head[o : o + w], "little")  # noqa: E731
+    k, m, stripes, bs = g(0x20, 2), g(0x22, 2), g(0x24, 4), g(0x28, 4)
+    start, end, logical, real, p_field = g(0x30, 8), g(0x38, 8), g(0x40, 8), g(0x48, 8), g(0x50, 8)
+    crc_count, h_field, inline_field, total = g(0x58, 8), g(0x60, 8), g(0x68, 8), g(0x70, 8)
+    primary, tail, footer_index = g(0x78, 8), g(0x80, 8), g(0x88, 8)
+    common: list[str] = []
+
+    def rule(ok: bool, text: str) -> None:
+        if not ok:
+            common.append(text)
+
+    rule(head[0:8] == role_magic(tape_uuid, LABEL_SIDECAR), "§9.2 magic")
+    rule(head[0x08:0x18] == tape_uuid, "§9.2 tape_uuid MUST match the bootstrap")
+    rule(k != 0, "§9.2 k ≠ 0")
+    rule(m != 0, "§9.2 m ≠ 0")
+    rule(stripes != 0, "§9.2 S ≠ 0")
+    rule(bs == block_size, "§9.2 block_size MUST equal the actual block size")
+    rule(g(0x2C, 4) == 2, "§9.2 schema_version MUST be 2")
+    rule(end > start, "§9.2 end > start")
+    rule(logical == stripes * k, "§9.2 logical_shard_count MUST = S × k")
+    rule(end >= start and real == end - start, "§9.2 real_data_shard_count MUST equal end − start"
+         + (" (end − start underflows)" if end < start else ""))
+    rule(1 <= real <= stripes * k and real <= logical, "§9.2 real_data_shard_count MUST be in 1..=S × k (≤ logical)")
+    rule(p_field == stripes * m, "§9.2 parity_block_count MUST = S × m")
+    rule(crc_count == real, "§9.2 data_crc_count MUST = real_data_shard_count")
+    layout = None
+    if stripes and stripes * m + real <= 4_000_000:
+        try:
+            layout = sidecar_layout(block_size, stripes, m, real)
+        except BuildRefusal:
+            layout = None
+    if layout is None:
+        common.append("§9.4 the layout cannot be recomputed for these counts (so H and inline cannot be checked)")
+    else:
+        rule(h_field == layout[0], "§9.2/§9.4 H MUST equal the recomputed layout")
+        rule(inline_field == layout[1], "§9.2/§9.4 inline_index_entry_bytes MUST equal the recomputed layout")
+    rule(primary == 0, "§9.2 primary_header_start_block MUST = 0")
+    rule(g(0x90, 2) == copy_kind, f"§9.2 copy_kind MUST be {copy_kind} for this copy")
+    rule(g(0x92, 2) == 0, "§9.2 reserved (0x92) MUST be 0")
+    rule(g(0x94, 4) == 0, "§9.2 copy_generation MUST be 0")
+    rule(g(0xB8, 8) == 0, "§9.2 reserved u64 (0xB8) MUST be 0")
+    rule(crc64_xz(head[0:0xC0]) == g(0xC0, 8), "§9.2 header_crc64")
+    rule(crc64_xz(head[: block_size - 8]) == int.from_bytes(head[block_size - 8 :], "little"), "§9.2 block0_crc64")
+    stream = b""
+    if layout is not None:
+        placements = layout[2]
+        parity_entries = stripes * m
+        number = 0
+        used_ok = True
+        entries_ok = True
+        for block_index, offsets in enumerate(placements):
+            if block_index >= len(blocks):
+                break
+            block = blocks[block_index]
+            used = bytearray(block[: block_size - 8])
+            if block_index == 0:
+                used[0:0xC8] = bytes(0xC8)
+            elif crc64_xz(block[: block_size - 8]) != int.from_bytes(block[block_size - 8 :], "little"):
+                common.append(f"§9.3 index block {block_index} CRC")
+            for offset in offsets:
+                length = 16 if number < parity_entries else 8
+                entry = bytes(block[offset : offset + length])
+                stream += entry
+                if number < parity_entries:
+                    s_i, p_i, reserved, _ = struct.unpack("<IHHQ", entry)
+                    if (s_i, p_i) != (number // m, number % m):
+                        entries_ok = False
+                    if reserved:
+                        common.append(f"§9.3 parity entry {number}: u16 reserved MUST be 0")
+                used[offset : offset + length] = bytes(length)
+                number += 1
+            if any(used):
+                used_ok = False
+        for block_index in range(len(placements), len(blocks)):
+            block = blocks[block_index]
+            if crc64_xz(block[: block_size - 8]) != int.from_bytes(block[block_size - 8 :], "little"):
+                common.append(f"§9.3 index block {block_index} CRC")
+            if any(block[: block_size - 8]):
+                used_ok = False
+        if not entries_ok:
+            common.append("§9.3 parity entries in stripe-major order")
+        if not used_ok:
+            common.append("§9.2/§9.3 unused space below the CRC MUST be zero")
+    wire = digest(SIDECAR_METADATA_DOMAIN + bytes(head[0x00:0x90]) + stream)
+    zeroed = bytearray(head[0x00:0x90])
+    zeroed[0x78:0x80] = bytes(8)
+    substituted = digest(SIDECAR_METADATA_DOMAIN + bytes(zeroed) + stream)
+    readings = {}
+    for label, h_value, p_value in (("text (H = 0x60 field, P = S × m)", h_field, stripes * m),
+                                    ("implementation (H = §9.4 recompute, P = 0x50 field)",
+                                     layout[0] if layout else h_field, p_field)):
+        extra = []
+        if overflows(2 * h_value + p_value + 1) or total != 2 * h_value + p_value + 1:
+            extra.append("§9.2 sidecar_total_block_count = 2H + P + 1")
+        if overflows(h_value + p_value) or tail != h_value + p_value:
+            extra.append("§9.2 tail_header_start_block MUST = H + P")
+        if overflows(2 * h_value + p_value) or footer_index != 2 * h_value + p_value:
+            extra.append("§9.2 footer_block_index MUST = 2H + P")
+        readings[label] = extra
+    hash_readings = {"wire bytes": [] if head[0x98:0xB8] == wire else ["§9.5 canonical_metadata_hash does not verify"],
+                     "0x78 taken as 0": [] if head[0x98:0xB8] == substituted else ["§9.5 canonical_metadata_hash does not verify"]}
+    return {"common": common, "locator_readings": readings, "hash_readings": hash_readings, "stream": stream,
+            "hash": bytes(head[0x98:0xB8])}
+
+
+def isolation_summary(audits: dict[str, dict[str, Any]], named: str) -> dict[str, Any]:
+    """Collect the failing rules per copy and reading, and say whether more than the named rule fails."""
+    out: dict[str, Any] = {"by_copy": {}}
+    disputes = []
+    for copy_name, audit in audits.items():
+        view = {}
+        for locator_label, locator in audit["locator_readings"].items():
+            for hash_label, hash_fail in audit["hash_readings"].items():
+                failing = sorted(set(audit["common"] + locator + hash_fail))
+                view[f"{locator_label}; hash over {hash_label}"] = failing
+        out["by_copy"][copy_name] = view
+        impl_key = "implementation (H = §9.4 recompute, P = 0x50 field); hash over wire bytes"
+        text_keys = [key for key in view if key.startswith("text")]
+        if len(view[impl_key]) > 1:
+            disputes.append(f"{copy_name}: this implementation's readings find {len(view[impl_key])} failing rules: "
+                            + "; ".join(view[impl_key]))
+        text_counts = {key: len(view[key]) for key in text_keys}
+        out["by_copy"][copy_name + " (count under the text reading)"] = text_counts
+    out["disputed_by_implementation"] = bool(disputes)
+    out["disputes"] = disputes
+    out["named_rule"] = named
+    return out
+
+
+# ----- ISO-BOTH, footer faults and roles on a Workspace ------------------------
+
+
+def iso_both(ws: Workspace, res: Resolution, edit: Any, hashed: bool, mirror_footer: bool, mirror_directory: bool,
+             tape_file: int = 2, tail_block: int = 5, footer_block: int = 6, stream_len: int = 96) -> None:
+    for block in (0, tail_block):
+        edit(ws, res, (tape_file, block))
+    if hashed:
+        for block in (0, tail_block):
+            b = ws.block((tape_file, block))
+            b[0x98:0xB8] = digest(SIDECAR_METADATA_DOMAIN + bytes(b[0x00:0x90]) + bytes(b[0xC8 : 0xC8 + stream_len]))
+    for block in (0, tail_block):
+        b = ws.block((tape_file, block))
+        b[0xC0:0xC8] = le64(crc64_xz(bytes(b[0x00:0xC0])))
+        b[ws.block_size - 8 :] = le64(crc64_xz(bytes(b[: ws.block_size - 8])))
+    new_hash = bytes(ws.block((tape_file, 0))[0x98:0xB8])
+    res.repairs.append("ISO-BOTH: the edit in both copies" + (", canonical_metadata_hash recomputed in each" if hashed else
+                                                             " (hash-excluded)") + ", header_crc64 and block0_crc64 of both")
+    if hashed and mirror_footer:
+        f = ws.block((tape_file, footer_block))
+        f[0x60:0x80] = new_hash
+        f[0x80:0x88] = le64(crc64_xz(bytes(f[0x00:0x80])))
+        res.repairs.append("ISO-BOTH: the new hash in the footer (0x60), footer_crc64")
+    if hashed and mirror_directory:
+        pm_file = tape_file + 1
+
+        def transform(payload: dict) -> None:
+            payload[4][5][0][8] = new_hash
+        repair_pm_payload(ws, res, pm_file, transform)
+        res.repairs[-1] = "ISO-BOTH: the new hash in directory key 8; " + res.repairs[-1]
+
+
+def lba(ws: Workspace, tape_file: int, block: int) -> int:
+    return ws.image.file_start_lba(tape_file) + block
+
+
+def role_scan_and_recover(ws: Workspace, unreadable: set[int], address: list[int]) -> dict[str, Any]:
+    """The replica-route Scanner followed by the Recoverer, on the tape with its faults."""
+    tape = DamagedTape(ws.records(), unreadable)
+    boot = parse_bootstrap(tape.read_data(0), ws.block_size)
+    layout, _ = discover_layout(tape, ws.tape_uuid, ws.block_size)
+    checks = [check_replica(tape, layout, o, ws.tape_uuid, ws.block_size) for o in (1, 2, 3)] if layout else []
+    valid = [c for c in checks if c.fully_valid]
+    if not valid:
+        return {"level": "Scanner then Recoverer", "result": "error", "error": "BotStructuralRecoveryRequired",
+                "scanner": [c.reason for c in checks]}
+    entries = valid[0].entries
+    directory, directory_note = load_parity_map_directory(tape, entries, ws.tape_uuid, ws.block_size)
+    ctx = RecoveryContext(tape, ws.tape_uuid, ws.block_size, boot["scheme"], entries, valid[0].header["covered"],
+                          valid[0].header["watermark"], directory, "replica")
+    outcome = recover_address(ctx, list(address))
+    return {"level": f"Scanner (Inventory from {'/'.join(c.letter for c in valid)}) then Recoverer {address}",
+            "result": outcome["result"], "error": outcome["error"], "epoch": outcome["epoch"],
+            "index_acquisition": outcome.get("index_acquisition"), "directory": directory_note}
+
+
+def sidecar_audits(ws: Workspace, tape_file: int = 2, tail_block: int = 5, copy_blocks: int = 1) -> dict[str, Any]:
+    primary = [bytes(ws.block((tape_file, i))) for i in range(copy_blocks)]
+    tail = [bytes(ws.block((tape_file, tail_block + i))) for i in range(copy_blocks)]
+    return {"primary": audit_sidecar_copy(primary, ws.tape_uuid, ws.block_size, 1),
+            "tail": audit_sidecar_copy(tail, ws.tape_uuid, ws.block_size, 2)}
+
+
+def cross_checks(ws: Workspace, audits: dict[str, Any], footer_block: int | None, footer_readable: bool,
+                 directory_file: int | None = 3) -> list[str]:
+    """Rules between structures: the Section 9.1 agreement, the footer comparison and the directory hash."""
+    failing = []
+    p, t = audits["primary"], audits["tail"]
+    ph = bytes(ws.block((2, 0))[0x00:0x90])
+    tail_block = footer_block - 1 if footer_block else None
+    if p["stream"] != t["stream"] or p["hash"] != t["hash"]:
+        failing.append("§9.1 the tail copy MUST carry metadata and index content identical to the primary")
+    if footer_readable and footer_block is not None:
+        f = bytes(ws.block((2, footer_block)))
+        if f[0x60:0x80] != p["hash"] or f[0x60:0x80] != t["hash"]:
+            failing.append("§13.3 step 1 footer comparison: the footer's canonical_metadata_hash differs from a copy's")
+    if directory_file is not None:
+        try:
+            tape = DamagedTape(ws.records(), set())
+            entries = ws.image.prefix_entries
+            directory, _ = load_parity_map_directory(tape, entries, ws.tape_uuid, ws.block_size)
+            entry = (directory or {}).get(2)
+            if entry is not None and entry["hash"] != p["hash"]:
+                failing.append("§13.3 step 3 directory hash differs from the copies'")
+        except ReadFailure:
+            pass
+    del ph, tail_block
+    return failing
+
+
+# ----- the ParityMap rule-by-rule auditor ---------------------------------------
+
+
+def audit_parity_map(ws: Workspace, tape_file: int) -> dict[str, Any]:
+    start = ws.image.file_start_lba(tape_file)
+    count = len(ws.image.files[tape_file].blocks)
+    blocks = [bytes(ws.block((tape_file, i))) for i in range(count)]
+    failing: list[str] = []
+    readings: dict[str, list[str]] = {}
+
+    def fields(b: bytes) -> dict[str, Any]:
+        return {"sequence": rd64(b, 0x20), "payload_len": rd64(b, 0x30), "payload_sha": b[0x38:0x58], "digest": b[0x58:0x78],
+                "scope": rd64(b, 0x78), "total": rd64(b, 0x80), "watermark": rd64(b, 0x88), "final": b[0x90],
+                "M": rd64(b, 0x98), "total_blocks": rd64(b, 0xA0), "primary": rd64(b, 0xA8), "tail": rd64(b, 0xB0),
+                "footer": rd64(b, 0xB8), "uuid": b[0x10:0x20]}
+    per = [fields(b) for b in blocks[:1] + blocks[1:2] + blocks[2:3]]
+    for name, b, f in zip(("primary", "tail", "footer"), blocks, per):
+        if crc64_xz(b[0:0xC0]) != rd64(b, 0xC0):
+            failing.append(f"§10.1.3 {name} CRC")
+        m_value = ceil_div(0xC8 + f["payload_len"], ws.block_size)
+        if overflows(0xC8 + f["payload_len"]) or (f["M"], f["total_blocks"], f["primary"], f["tail"], f["footer"]) != (
+                m_value, 2 * m_value + 1, 0, m_value, 2 * m_value):
+            failing.append(f"§10.1.4 {name} locator arithmetic")
+    if per[2]["total_blocks"] != count:
+        failing.append("§10.1.4 measured length")
+    payload = bytes(blocks[0][0xC8 : 0xC8 + per[0]["payload_len"]])
+    decoded = decode_deterministic_cbor(payload)
+    for name, f in zip(("primary", "tail", "footer"), per):
+        mismatches = [key for key, value in (("sequence", decoded[3]), ("digest", decoded[5]), ("uuid", decoded[2]),
+                                             ("scope", decoded[4][1]), ("total", decoded[4][2]),
+                                             ("watermark", decoded[4][3]), ("final", 1 if decoded[4][4] else 0))
+                      if f[key] != value]
+        if mismatches:
+            failing.append(f"§10.1.4 the decoded payload MUST match the {name}'s locator fields ({', '.join(mismatches)})")
+    differing = [key for key in per[0] if key not in ("uuid",) and per[0][key] != per[2][key]]
+    arithmetic_keys = {"payload_len", "M", "total_blocks", "primary", "tail", "footer"}
+    readings["'reject disagreement' covers only the locator arithmetic"] = (
+        [f"§10.1.4 header/footer disagreement in locator arithmetic ({', '.join(sorted(set(differing) & arithmetic_keys))})"]
+        if set(differing) & arithmetic_keys else [])
+    readings["'reject disagreement' covers every header field"] = (
+        [f"§10.1.4 header/footer disagreement ({', '.join(sorted(differing))})"] if differing else [])
+    entries = decoded[4][5]
+    scope, watermark, total_ordinals = decoded[4][1], decoded[4][3], decoded[4][2]
+    tfns = [e[1] for e in entries]
+    if tfns != sorted(tfns) or len(set(tfns)) != len(tfns):
+        failing.append("§10.1.5 entries strictly ascending by tape_file_number")
+    if any(t >= scope for t in tfns):
+        failing.append("§10.1.5 each tape_file_number < scope")
+    if any(0 in (e[5], e[6], e[7]) for e in entries):
+        failing.append("§10.1.5 non-zero total, H and P")
+    if watermark > total_ordinals:
+        failing.append("§10.1.5 W ≤ T")
+    ordered = sorted(entries, key=lambda e: e[1])
+    chain = 0
+    partition_ok = True
+    for e in ordered:
+        if e[3] != chain or e[4] <= e[3]:
+            partition_ok = False
+        chain = e[4]
+    if not partition_ok or chain != watermark:
+        failing.append("§10.1.5 the protected ranges partition [0, W) in ascending tape_file_number order")
+    ids = [e[2] for e in entries]
+    readings["epoch ids as a set"] = [] if sorted(ids) == list(range(len(ids))) else ["§10.1.5 epoch ids unique and consecutive from 0"]
+    readings["epoch ids in array order"] = [] if ids == list(range(len(ids))) else ["§10.1.5 epoch ids consecutive from 0 in array order"]
+    readings["epoch ids in tape-file order"] = [] if [e[2] for e in ordered] == list(range(len(ids))) else \
+        ["§10.1.5 epoch ids consecutive from 0 in tape-file order"]
+    if any(e[9] & ~DIRECTORY_FLAG_MASK for e in entries):
+        failing.append("§10.1.5 unknown flag bits")
+    del start
+    return {"common": failing, "readings": readings}
+
+
+# ----- unit-level evaluators ---------------------------------------------------
+
+
+def unit_eval(expression: str, value: int, inputs: dict[str, Any], note: str = "") -> dict[str, Any]:
+    return {"expression": expression, "inputs": inputs, "value": str(value) if value >= 0 else f"{value} (underflow)",
+            "type": "u64", "overflows": overflows(value), "note": note}
+
+
+# ----- the supplement table ------------------------------------------------------
+
+
+def supplement_table() -> dict[str, dict[str, Any]]:
+    t: dict[str, dict[str, Any]] = {}
+    base_values = a4_sidecar_values()
+
+    def sidecar_rule(sup, parent, offset, width, frm, to, name, hashed, mirror_footer, mirror_directory, fault_footer,
+                     rules, named, extra_note=""):
+        def edit(ws, res, key):
+            edit_int(ws, res, key, offset, width, frm, to, f"{name} ({'primary' if key[1] == 0 else 'tail'})")
+
+        def apply(ws, res):
+            iso_both(ws, res, edit, hashed, mirror_footer, mirror_directory)
+        t[sup] = {"parent": parent, "image": "a4-minimal", "apply": apply,
+                  "unreadable": [(2, 6)] if fault_footer else [],
+                  "roles": ["audit", "copies", "recover"], "named": named,
+                  "decide": decision("rejected", "SidecarParse", rules + ["err_sidecar"],
+                                     "The named rule is a Section 9.2 copy rule; it fails in both copies, so neither "
+                                     "validates. The Section 13.3 pin is not reached.",
+                                     note="Both copies fail, so a Recoverer has no header/index copy for epoch 0: "
+                                          "SidecarMetadataUnavailable{0} (Section 13.3 step 4)." + extra_note),
+                  "expect": {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}}
+
+    # -- unit-level variants
+    units = {
+        "sup-01": ("neg-45", "M = ceil((0xC8 + L) / B)", (1 << 64) - 1 + 0xC8, {"L": "2^64 - 1", "B": 262144},
+                   "undecided", "ParityMapParse",
+                   ["reject: the sum 0xC8 + L is arithmetic on tape values and overflows u64, so checked evaluation "
+                    "rejects it (Section 2.4)",
+                    "no rejection by this formula: M itself, 2^46 + 1, fits in u64, and the text states M, not the order "
+                    "of its operations, so a Reader that forms ceil without the overflowing sum does not reject here"],
+                   ["pm_M", "checked"],
+                   "At image level this payload_len is rejected anyway, by the payload hash and the measured length."),
+        "sup-02": ("neg-42", "start(next) = start + record_count + 1", (1 << 64) - 3 + 3 + 1, {"start": "2^64 - 3", "record_count": 3},
+                   True, "TerminalIndexReplicaParse", None, ["eod_rule", "checked", "layout_valid"],
+                   "The next start is 2^64 + 1, which no u64 start field can equal, so the rule fails however it is evaluated."),
+        "sup-04": ("neg-01", "EOD = start(C) + count(C) + 1", (1 << 64) - 4 + 3 + 1, {"start(C)": "2^64 - 4", "count(C)": 3},
+                   True, "TerminalIndexReplicaParse", None, ["eod_rule", "checked", "layout_valid"],
+                   "EOD would be 2^64, which no u64 EOD field can equal."),
+        "sup-07": ("neg-21", "256 × object_row_count", 256 * (1 << 56), {"s": 1, "o": "2^56"}, True, "TerminalIndexReplicaParse", None,
+                   ["size_formulas", "checked"], "Section 10.6 requires every Section 10.4 size formula to evaluate without overflow."),
+        "sup-08": ("neg-15", "manifest_chunk_count × block_size_bytes", (1 << 46) * 262144,
+                   {"first": 0, "count": "2^46", "size": 1, "stored": "2^46", "B": 262144}, "undecided", "TerminalIndexReplicaParse",
+                   ["reject: Object-row fields are terminal fields, 'checked in u64' (Section 8.3), and the product "
+                    "2^46 × 2^18 overflows u64",
+                    "accept: the rule is the inequality 1 ≤ 2^64, which holds. The overflow-free size rule of Section 10.6 "
+                    "covers the Section 10.4 formulas, not this Section 10.3 rule, so a Reader that compares without "
+                    "forming the product does not reject"],
+                   ["row_manifest", "terminal_u64", "checked", "size_formulas"], ""),
+        "sup-18": ("neg-40", "total = 2H + P + 1; footer index 2H + P", 2 * (1 << 63) + 4 + 1, {"H": "2^63", "P": 4}, True, "SidecarParse",
+                   None, ["sc_total", "sc_footer_index", "checked"], "2^64 + 5 and 2^64 + 4 are values no u64 field can equal."),
+        "sup-19": ("neg-55", "observed footer LBA = observed start LBA + delta", (1 << 64) - 1 + 2,
+                   {"start": "2^64 - 1", "count": 3, "delta": 2}, True, "TerminalIndexReplicaParse", None, ["footer_delta", "checked"],
+                   "The footer LBA would be 2^64 + 1, which no u64 field can equal."),
+        "sup-20": ("neg-21", "payload_len = 64 × s + 256 × o", 64 * (1 << 57) + 256 * (1 << 55), {"s": "2^57", "o": "2^55"}, True,
+                   "TerminalIndexReplicaParse", None, ["size_formulas", "checked"], "Each product fits; the sum 2^64 does not."),
+        "sup-23": ("neg-57", "S × k", (1 << 63) * 2, {"S": "2^63", "k": 2}, True, "undecided", None, ["checked", "validity_6_6", "pin_then"],
+                   "S × k = 2^64 is not representable, so checked evaluation must reject. The §15 name depends on the "
+                   "role: a bootstrap's scheme is rejected by Section 6.6 (BootstrapParse or NoBootstrapFound, GAPS "
+                   "F-6), a Resumer's bound by ResumeAppend. The case names both roles."),
+        "sup-25": ("neg-49", "block(stripe, parity_index) = H + parity_index·S + stripe", (1 << 64) - 1 + 2,
+                   {"H": "2^64 - 1", "S": 2, "parity_index": 1, "stripe": 0}, True, "undecided", None,
+                   ["parity_block_formula", "checked"],
+                   "The block index 2^64 + 1 is not representable, so the Recoverer must reject rather than place the "
+                   "read. The text names no error for an overflow in the Recoverer's locator."),
+        "sup-27": ("neg-02", "P = S × m", (1 << 63) * 2, {"S": "2^63", "m": 2}, True, "undecided", None, ["checked", "validity_6_6", "sc_P"],
+                   "P = 2^64 is not representable, so checked evaluation must reject. The role (a Reader deriving P from "
+                   "a scheme record) fixes no §15 name: from a bootstrap the name is open (GAPS F-6)."),
+        "sup-28": ("neg-14", "total = 2M + 1 with M = ceil((0xC8 + L) / B)", 2 * (1 << 63) + 1, {"L": "2^64 - 0xC9", "B": 2},
+                   True, "ParityMapParse", None, ["pm_locator", "checked"], "M = 2^63 fits; 2M + 1 = 2^64 + 1 does not."),
+        "sup-29": ("neg-21", "payload_len = 64 × s", 64 * (1 << 58), {"s": "2^58", "o": 0}, True, "TerminalIndexReplicaParse", None,
+                   ["size_formulas", "checked"], ""),
+        "sup-31": ("neg-46", "payload_padding_bytes = payload_record_count × B − payload_len", (1 << 46) * 262144,
+                   {"s": "2^58 - 1", "o": 0, "B": 262144, "payload_record_count": "2^46"}, True, "TerminalIndexReplicaParse", None,
+                   ["size_formulas", "size_formula_10_4", "checked"],
+                   "The padding itself (64) would fit, but Section 10.6 requires the formula to evaluate without "
+                   "overflow, and count × B overflows."),
+        "sup-46": ("neg-55", "backward start delta = observed record count − 1", -1, {"count": 0}, True, "TerminalIndexReplicaParse", None,
+                   ["footer_delta", "checked"], "−1 is not a u64; the recorded delta cannot equal it."),
+        "sup-47": ("neg-50", "actual_bytes = total_records × B", (1 << 46) * 262144, {"E": "2^64 - 1", "B": 262144, "total_records": "2^46"},
+                   True, "TerminalIndexSeparationParse", None, ["sep_formulas", "size_formulas", "checked"],
+                   "Section 10.6 applies the overflow-free size rule to separations, read against Section 10.5."),
+    }
+    name_readings = {
+        "sup-23": ["BootstrapParse or NoBootstrapFound: a bootstrap's scheme record with this S fails Section 6.6 (GAPS F-6)",
+                   "ResumeAppend: the product is the Resumer's step-2 bound"],
+        "sup-25": ["no Section 15 name is given for an overflow in the Recoverer's parity locator; Invariant and "
+                   "SidecarParse are the nearest"],
+        "sup-27": ["BootstrapParse or NoBootstrapFound: P derived from a bootstrap's scheme record (GAPS F-6)",
+                   "SidecarParse: P derived from a sidecar header, which this S cannot reach (S u32 × m u16 < 2^48)"],
+    }
+    for sup, (parent, expression, value, inputs, must, name, readings, rules, note) in units.items():
+        if must is True:
+            outcome, error, shown = "rejected", name, name_readings.get(sup)
+        else:
+            outcome, error, shown = "undecided", None, readings
+            note = (note + " " if note else "") + f"If it rejects, the name is {name}."
+        t[sup] = {"parent": parent, "unit": unit_eval(expression, value, inputs, note), "named": "checked evaluation",
+                  "decide": decision(outcome, error, rules, "Unit level: only the named computation is evaluated.",
+                                     readings=shown, must_reject=must, formula=unit_eval(expression, value, inputs),
+                                     note=note)}
+
+    # -- 7a: ISO-BOTH sidecar-copy variants on a4-minimal
+    sidecar_rule("sup-03", "neg-32", 0x68, 8, 96, 88, "inline_index_entry_bytes", True, True, True, False,
+                 ["sc_inline", "sc_recompute"], "§9.2/§9.4 inline")
+    sidecar_rule("sup-05", "neg-22", 0x58, 8, 4, 3, "data_crc_count", True, True, True, False, ["sc_crc_count"], "§9.2 data_crc_count")
+    sidecar_rule("sup-09", "neg-29", 0xB8, 8, 0, 1, "reserved u64", False, False, False, False, ["sc_reservedB8"], "§9.2 reserved 0xB8")
+    sidecar_rule("sup-10", "neg-52", 0x50, 8, 4, 3, "parity_block_count", True, False, True, True, ["sc_P", "p_defined"],
+                 "§9.2 parity_block_count",
+                 " Isolation depends on the reading of P in the locator formulas (GAPS G-1).")
+    sidecar_rule("sup-13", "neg-39", 0x08, 16, int.from_bytes(bytes.fromhex("12345678123442348234123456789abc"), "little"),
+                 int.from_bytes(b"\xee" * 16, "little"), "tape_uuid", True, False, True, True, ["sc_uuid"], "§9.2 tape_uuid")
+    sidecar_rule("sup-22", "neg-06", 0x78, 8, 0, 1, "primary_header_start_block", True, False, True, True,
+                 ["sc_primary_start", "sc_hash_items"], "§9.2 primary start",
+                 " Isolated under the wire-bytes reading of Section 9.5 (GAPS F-1).")
+    sidecar_rule("sup-26", "neg-16", 0x94, 4, 0, 1, "copy_generation", False, False, False, False, ["sc_generation"], "§9.2 copy_generation")
+    sidecar_rule("sup-30", "neg-28", 0x80, 8, 5, 6, "tail_header_start_block", True, False, True, True, ["sc_tail_start"],
+                 "§9.2 tail start")
+    sidecar_rule("sup-36", "neg-29", 0xCE, 2, 0, 1, "reserved u16 of parity entry 0", True, True, True, False,
+                 ["sc_entry_reserved"], "§9.3 parity entry reserved")
+    sidecar_rule("sup-40", "neg-31", 0x92, 2, 0, 1, "reserved u16", False, False, False, False, ["sc_reserved92"], "§9.2 reserved 0x92")
+    sidecar_rule("sup-42", "neg-23", 0x28, 4, 262144, 524288, "block_size", True, True, True, False,
+                 ["sc_block_size", "pin_then", "geometry_c"], "§9.2 block_size",
+                 " Appendix C would call the geometry disagreement SchemeMismatch (GAPS F-2), but no copy is acquired, "
+                 "so the pin is not reached.")
+    sidecar_rule("sup-43", "neg-41", 0x88, 8, 6, 7, "footer_block_index", True, True, True, False, ["sc_footer_index"],
+                 "§9.2 footer index")
+    sidecar_rule("sup-49", "neg-13", 0x40, 8, 4, 5, "logical_shard_count", True, True, True, False, ["sc_logical"], "§9.2 logical")
+
+    # sup-06: 0x78 = 1 with the original hash (substitute-0 reading); footer unreadable
+    def apply06(ws, res):
+        def edit(ws, res, key):
+            edit_int(ws, res, key, 0x78, 8, 0, 1, f"primary_header_start_block ({'primary' if key[1] == 0 else 'tail'})")
+        iso_both(ws, res, edit, hashed=False, mirror_footer=False, mirror_directory=False)
+        res.repairs[-1] = "hash left as it was; header_crc64 and block0_crc64 of both copies"
+    t["sup-06"] = {"parent": "neg-06", "image": "a4-minimal", "apply": apply06, "unreadable": [(2, 6)],
+                   "roles": ["audit", "copies", "recover"], "named": "§9.2 primary start",
+                   "decide": decision("rejected", "SidecarParse", ["sc_primary_start", "sc_hash_items", "sc_hash_verify", "err_sidecar"],
+                                      "Isolated under the substitute-0 reading of Section 9.5; under the wire reading the hash "
+                                      "rule fails too, with the same name (GAPS F-1).",
+                                      note="Both copies fail: SidecarMetadataUnavailable{0} for a Recoverer."),
+                   "expect": {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}}
+
+    # sup-33: the same wrong hash in the copies, the footer and the directory
+    def apply33(ws, res):
+        wrong = bytearray(_image_cache("a4-minimal").files[2].blocks[0][0x98:0xB8])
+        wrong[0] ^= 0x01
+
+        def edit(ws, res, key):
+            edit_bytes(ws, res, key, 0x98, None, bytes(wrong), "canonical_metadata_hash")
+        iso_both(ws, res, edit, hashed=False, mirror_footer=False, mirror_directory=False)
+        f = ws.block((2, 6))
+        edit_bytes(ws, res, (2, 6), 0x60, None, bytes(wrong), "footer canonical_metadata_hash")
+        f[0x80:0x88] = le64(crc64_xz(bytes(f[0x00:0x80])))
+
+        def transform(payload):
+            payload[4][5][0][8] = bytes(wrong)
+        repair_pm_payload(ws, res, 3, transform)
+        res.repairs.append("footer_crc64; the wrong hash in directory key 8")
+    t["sup-33"] = {"parent": "neg-48", "image": "a4-minimal", "apply": apply33, "unreadable": [],
+                   "roles": ["audit", "copies", "recover"], "named": "§9.5 hash",
+                   "decide": decision("rejected", "SidecarParse", ["sc_hash_verify", "sc_hash_items", "err_sidecar"],
+                                      note="Both copies fail: SidecarMetadataUnavailable{0} for a Recoverer."),
+                   "expect": {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}}
+
+    # sup-48: real = 3 in both copies with the companion edits
+    def apply48(ws, res):
+        fourth = bytes(_image_cache("a4-minimal").files[2].blocks[0][0x120:0x128])
+
+        def edit(ws, res, key):
+            for offset, frm, to, name in ((0x48, 4, 3, "real_data_shard_count"), (0x58, 4, 3, "data_crc_count"),
+                                          (0x68, 96, 88, "inline_index_entry_bytes")):
+                edit_int(ws, res, key, offset, 8, frm, to, name)
+            edit_bytes(ws, res, key, 0x120, fourth, bytes(8), "fourth data-CRC entry")
+        iso_both(ws, res, edit, hashed=True, mirror_footer=True, mirror_directory=True, stream_len=88)
+    t["sup-48"] = {"parent": "neg-58", "image": "a4-minimal", "apply": apply48, "unreadable": [],
+                   "roles": ["audit", "copies", "recover"], "named": "§9.2 real = end − start",
+                   "decide": decision("rejected", "SidecarParse", ["sc_real_text", "err_sidecar"],
+                                      note="Both copies fail: SidecarMetadataUnavailable{0} for a Recoverer."),
+                   "expect": {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}}
+
+    # sup-44: tail diverges; footer unreadable
+    def apply44(ws, res):
+        edit_xor(ws, res, (2, 5), 0x108, 0x01, "tail copy data-CRC entry 0")
+        repair_sc_hashed(ws, res, (2, 5))
+    t["sup-44"] = {"parent": "neg-11", "image": "a4-minimal", "apply": apply44, "unreadable": [(2, 6)],
+                   "roles": ["audit", "copies", "verifier", "recover"], "named": "§9.1 agreement",
+                   "decide": decision("rejected", "SidecarParse", ["sidecar_copy_agree", "only_kind_differ", "err_sidecar"],
+                                      "Each copy validates alone; only the agreement rule fails.",
+                                      note="A Verifier or a BOT-walk Scanner parsing both copies rejects the divergence. A "
+                                           "Recoverer with the footer unreadable takes step 2, uses the valid primary and "
+                                           "recovers, never parsing the tail (GAPS F-3)."),
+                   "expect": {"verifier": "SidecarParse", "recoverer": "recovered"}}
+
+    # sup-38: footer P overflow; both header copies unreadable
+    def apply38(ws, res):
+        edit_int(ws, res, (2, 6), 0x40, 8, 4, (1 << 64) - 1, "footer P")
+        repair_sc_footer(ws, res, (2, 6))
+    t["sup-38"] = {"parent": "neg-17", "image": "a4-minimal", "apply": apply38, "unreadable": [(2, 0), (2, 5)],
+                   "roles": ["footer", "recover"], "named": "§9.6 tail = H + P (checked)",
+                   "decide": decision("rejected", "SidecarParse", ["ft_tail", "checked", "err_sidecar"],
+                                      "H + P overflows, so the footer's only P-bearing rule cannot hold.",
+                                      formula=unit_eval("tail_header_start_block = H + P", 1 + (1 << 64) - 1, {"H": 1, "P": "2^64 - 1"}),
+                                      note="The footer is rejected. The primary is unreadable (step 2), and the directory's "
+                                           "tail read meets the unreadable tail (step 3), so a Recoverer reports "
+                                           "SidecarMetadataUnavailable{0}."),
+                   "expect": {"footer": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}}
+
+    # sup-16, sup-17: directory-assisted rescue with medium errors instead of CRC corruption
+    for sup, value in (("sup-17", 7), ("sup-16", (1 << 64) - 1)):
+        def apply_rescue(ws, res, value=value):
+            def transform(payload):
+                entry = payload[4][5][0]
+                res.checks.append({"where": "a4-minimal tape file 3 payload", "offset": "directory entry 0 key 6",
+                                   "field": "sidecar_header_block_count", "expected_from": 1, "found": entry[6],
+                                   "matches": entry[6] == 1, "to": value})
+                entry[6] = value
+            repair_pm_payload(ws, res, 3, transform)
+        t[sup] = {"parent": "neg-33", "image": "a4-minimal", "apply": apply_rescue, "unreadable": [(2, 0), (2, 6)],
+                  "roles": ["pm-audit", "recover"], "named": "checked tail position",
+                  "decide": decision("rejected", "SidecarMetadataUnavailable",
+                                     ["tail_rescue", "entry_agrees", "checked", "metadata_unavailable", "err_metadata_unavailable"],
+                                     "The directory validates and agrees with the map entry, so the Recoverer may place "
+                                     "the read; the tail position underflows and checked arithmetic rejects it.",
+                                     formula=unit_eval("tail block = total − 1 − H", 7 - 1 - value, {"total": 7, "H": str(value)}),
+                                     note="SidecarMetadataUnavailable{0}."
+                                          + (" 'As isolated-1' resolved to sup-17, the variant with the same parent "
+                                             "that states the base and precondition." if sup == "sup-16" else "")),
+                  "expect": {"recoverer": "SidecarMetadataUnavailable"}}
+
+    # -- ISO-REBUILD variants on a4-minimal
+    uuid = _image_cache("a4-minimal").tape_uuid
+    block_size = _image_cache("a4-minimal").block_size
+    a4_obj = _image_cache("a4-minimal").files[1].blocks
+    parity_orig = _image_cache("a4-minimal").files[2].blocks[1:5]
+    entries_orig = _image_cache("a4-minimal").files[2].info["sidecar"]
+
+    def data_crc_entries(blocks):
+        return [le64(crc64_xz(b)) for b in blocks]
+
+    def parity_crc_entries(parity_shards, stripes, m):
+        return [struct.pack("<IHHQ", s, j, 0, crc64_xz(parity_shards[j * stripes + s])) for s in range(stripes) for j in range(m)]
+
+    def rebuild_variant(values, entries, parity, copy_blocks, extra_tail=0, object_blocks=None, object_row=None,
+                        range_end=4, map_count=None):
+        blocks, metadata_hash = build_sidecar_explicit(uuid, block_size, values, entries, parity, copy_blocks, extra_tail)
+        count = len(blocks) if map_count is None else map_count
+        entry = MapEntry(2, KIND_SIDECAR, count, None, 0, range_end, 0)
+        directory = {1: 2, 2: 0, 3: 0, 4: range_end, 5: values["total"], 6: values["H"], 7: values.get("dir_P", values["P"]),
+                     8: metadata_hash, 9: 6}
+        return rebuild_a4(blocks, entry, directory, object_blocks, object_row), blocks
+
+    def rebuild11():
+        v = dict(base_values, m=0, P=0, inline=32, total=3, tail=1, footer_index=2, dir_P=4)
+        entries = data_crc_entries(a4_obj)
+        return rebuild_variant(v, entries, [], 1)
+
+    def rebuild37():
+        v = dict(base_values, H=2, tail=6, footer_index=8, total=9)
+        entries = parity_crc_entries(parity_orig, 2, 2) + data_crc_entries(a4_obj)
+        return rebuild_variant(v, entries, parity_orig, 2)
+
+    def rebuild45():
+        v = dict(base_values, total=8)
+        entries = parity_crc_entries(parity_orig, 2, 2) + data_crc_entries(a4_obj)
+        return rebuild_variant(v, entries, parity_orig, 1, extra_tail=1)
+
+    def rebuild14():
+        options = load_image_inputs("a4-minimal")["objects"][0]["options"]
+        spec = FileSpec(path="payload.bin", file_id="00000000-0000-4000-8000-000000000003", data=bytes([53]) * (2 * block_size))
+        builder_options = {k: options[k] for k in ("caller_object_id", "chunk_size", "metadata_preservation", "object_id",
+                                                   "write_timestamp", "manifest_file_id")}
+        builder_options["extensions"] = {}
+        stored, layout = build_plaintext_with_manifest(builder_options, [spec])
+        obj = [stored[i : i + block_size] for i in range(0, len(stored), block_size)]
+        matrix = cauchy_matrix(2, 2)
+        parity = [bytes(block_size)] * 4
+        for s in range(2):
+            for j, shard in enumerate(encode_parity([obj[s], obj[2 + s]], matrix)):
+                parity[j * 2 + s] = shard
+        v = dict(base_values, end=5, real=5, crc_count=5, inline=104)
+        entries = parity_crc_entries(parity, 2, 2) + data_crc_entries(obj)
+        manifest = layout["manifest"]
+        row = {1: 1, 2: "plaintext", 3: len(obj), 4: options["object_id"].encode(), 10: manifest.first_chunk_lba,
+               11: manifest.size_bytes, 12: manifest.chunk_count, 13: layout["manifest_sha256"]}
+        return rebuild_variant(v, entries, parity, 1, object_blocks=obj, object_row=row, range_end=5)
+
+    rebuilds = {
+        "sup-11": ("neg-08", rebuild11, 1, "§9.2 m ≠ 0", ["sc_m", "validity_6_6", "pin_then"],
+                   "m = 0 in both copies of a 3-block sidecar whose every other field is consistent with m = 0.",
+                   {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}),
+        "sup-14": ("neg-58", rebuild14, 1, "§9.2 real in 1..=S×k", ["sc_real_text", "sc_real", "epoch_at_most", "structural_invariants"],
+                   "The copies break the range rule (5 > S×k = 4).",
+                   {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}),
+        "sup-37": ("neg-43", rebuild37, 2, "§9.2/§9.4 H", ["sc_H", "sc_recompute", "h_label", "p_defined"],
+                   "H = 2 is recorded against a Section 9.4 recompute of 1, with every locator repaired for H = 2.",
+                   {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}),
+        "sup-45": ("neg-54", rebuild45, 1, "§9.2 total = 2H + P + 1", ["sc_total", "footer_probe"],
+                   "total 8 against 2H + P + 1 = 7, in an 8-block file whose last block is zero.",
+                   {"copy": "SidecarParse", "recoverer": "SidecarMetadataUnavailable"}),
+    }
+    for sup, (parent, builder, copy_blocks, named, rules, what, expect) in rebuilds.items():
+        tail_block = {"sup-11": 1, "sup-37": 6}.get(sup, 5)
+        note = {"sup-11": "Both copies fail the m rule. The directory's key 7 (4) is not compared with the sidecar's P, "
+                          "so a Recoverer reaches no valid copy: SidecarMetadataUnavailable{0}.",
+                "sup-14": "The copies fail. The text does not say whether replica validation ('Every structural and "
+                          "ordinal-range invariant is validated') or the directory decoder must reject a range longer "
+                          "than S × k (GAPS G-4). This implementation checks neither, so its Scanner accepts the "
+                          "inventory and its Recoverer reports SidecarMetadataUnavailable{0}.",
+                "sup-37": "Both copies fail the H rule. Under this implementation's reading of the locator formulas "
+                          "(H = the recompute), three more rules fail as well (GAPS G-1). SidecarMetadataUnavailable{0} "
+                          "for a Recoverer.",
+                "sup-45": "Both copies fail. A Recoverer's footer-first step reads the zero last block (not a footer) and "
+                          "falls back. The directory's tail position 8 − 1 − 1 = 6 names the footer block, which is not a "
+                          "tail copy. SidecarMetadataUnavailable{0}."}[sup]
+        t[sup] = {"parent": parent, "rebuild": builder, "copy_blocks": copy_blocks, "tail_block": tail_block,
+                  "unreadable": [], "roles": ["audit", "copies", "recover"], "named": named,
+                  "decide": decision("rejected", "SidecarParse", rules + ["err_sidecar"], what, note=note),
+                  "expect": expect}
+
+    # -- 7b: ParityMap variants
+    def apply12(ws, res):
+        edit_int(ws, res, (3, 2), 0x20, 8, 0, 1, "footer sequence")
+        repair_pm_crc(ws, res, [(3, 2)], "R-PM-FOOTER")
+    t["sup-12"] = {"parent": "neg-36", "image": "a4-minimal", "apply": apply12, "unreadable": [], "roles": ["pm", "pm-audit"],
+                   "named": "§10.1.4 payload/locator match",
+                   "decide": decision("rejected", "ParityMapParse", ["pm_match", "pm_locator", "err_pm"],
+                                      "The payload (sequence 0) does not match the footer's locator fields (1). Whether the "
+                                      "'reject disagreement between header, footer' sentence also fires depends on whether it "
+                                      "covers every field or only the locator arithmetic (GAPS G-5); either way the name is "
+                                      "ParityMapParse."),
+                   "expect": {"parity-map": "ParityMapParse"}}
+
+    def apply35(ws, res):
+        def transform(payload):
+            entries = payload[4][5]
+            res.checks.append({"where": "two-epoch tape file 4 payload", "offset": "directory key 5", "field": "entries",
+                               "expected_from": [2, 3], "found": [e[1] for e in entries],
+                               "matches": [e[1] for e in entries] == [2, 3], "to": [3, 2]})
+            entries.reverse()
+        repair_pm_payload(ws, res, 4, transform)
+    t["sup-35"] = {"parent": "neg-37", "image": "two-epoch", "apply": apply35, "unreadable": [], "roles": ["pm", "pm-audit"],
+                   "named": "§10.1.5 ascending",
+                   "decide": decision("rejected", None, ["dir_ascending", "dir_partition", "dir_epochs", "pm_category"],
+                                      "The ascending rule fails. The partition rule, stated 'taken in ascending "
+                                      "tape_file_number order', holds. Whether the epoch-id rule also fails depends on the "
+                                      "order it is read in, which the text does not state (GAPS G-6). Both copies fail, so "
+                                      "Section 15 leaves the name open as a category.",
+                                      error_set=["DirectoryInvalid", "ParityMapParse"]),
+                   "expect": {"parity-map": "DirectoryInvalid"}}
+
+    # -- 7b/7c: terminal profiles
+    def multi_rows():
+        return [object_row_from_json(r, i) for i, r in enumerate(multi_inputs()["object_rows"])]
+
+    def ws15():
+        rows = [{1: 1, 2: "plaintext", 3: 1, 4: b"huge-object-profile-row-1", 10: 0, 11: 32, 12: 1, 13: b"\x31" * 32},
+                {1: 2, 2: "plaintext", 3: (1 << 64) - 1, 4: b"huge-object-profile-row-2", 10: 0, 11: 32, 12: 1, 13: b"\x31" * 32}]
+        structural = [MapEntry(0, KIND_BOOTSTRAP, 1), MapEntry(1, KIND_OBJECT, 1, 0), MapEntry(2, KIND_OBJECT, (1 << 64) - 1, 1)]
+        return terminal_workspace(structural, rows, [1, 1, 1], "huge-object-256k", total=0, watermark=0)
+
+    def ws_unprotected(watermark):
+        structural = [MapEntry(0, KIND_BOOTSTRAP, 1), MapEntry(1, KIND_OBJECT, 2, 0), MapEntry(2, KIND_SIDECAR, 5, None, 0, 2, 0),
+                      MapEntry(3, KIND_OBJECT, 3, 2), MapEntry(4, KIND_PARITY_MAP, 3)]
+        return terminal_workspace(structural, multi_rows(), [1, 2, 5, 3, 3], "multi-unprotected-256k", total=5, watermark=watermark)
+
+    def ws24():
+        structural = structural_from_json(multi_inputs()["structural_entries"])
+        return terminal_workspace(structural, multi_rows(), [e.block_count for e in structural], "multi-256k (file numbers 7..11)",
+                                  total=5, watermark=5, start_tape_file=7)
+
+    terminal_cases = {
+        "sup-15": ("neg-03", ws15, None, "T overflow", ["digest_scope", "checked", "scope_in_list", "err_replica"],
+                   "T = 1 + (2^64 − 1) overflows; the recorded T (0) cannot equal it.",
+                   "All three replicas carry it, so the Scanner reports BotStructuralRecoveryRequired.",
+                   {"selection": "BotStructuralRecoveryRequired"},
+                   "The profile's unspecified details are mine: the tape UUID, edition, diagnostics and extent of "
+                   "multi-256k, the Object ids 'huge-object-profile-row-1/2', manifest_sha256 = 0x31 x 32, and A "
+                   "placed at LBA 6 over one placeholder block per prefix file (no rule compares the rows with the "
+                   "physical prefix)."),
+        "sup-21": ("neg-47", lambda: ws_unprotected(2), None, "§10.6 W = T", ["w_equals_t", "err_replica"],
+                   "Sidecars are present, and W (2) ≠ T (5).",
+                   "All three replicas carry it: BotStructuralRecoveryRequired at the tape level.",
+                   {"selection": "BotStructuralRecoveryRequired"}, ""),
+        "sup-32": ("neg-47", lambda: ws_unprotected(5), None, "§7.4 W cross-check", ["digest_scope", "scope_in_list", "err_replica"],
+                   "The recorded W (5) differs from its recompute (2). Section 15's TerminalIndexReplicaParse cites "
+                   "Section 10.6, whose list includes 'scope', so the failure has that name.",
+                   "All three replicas carry it: BotStructuralRecoveryRequired.", {"selection": "BotStructuralRecoveryRequired"},
+                   "'As isolated-3' resolved to sup-21, the variant that states the multi-unprotected-256k profile."),
+        "sup-24": ("neg-47", ws24, None, "§10.6 covered = rows = A's tape file", ["covered_equal", "footer_observations", "err_replica"],
+                   "covered 6 = rows 6, but A's planned tape-file number is 7.",
+                   "All three replicas carry it: BotStructuralRecoveryRequired.", {"selection": "BotStructuralRecoveryRequired"}, ""),
+    }
+    for sup, (parent, builder, _, named, rules, what, note, expect, resolution_note) in terminal_cases.items():
+        t[sup] = {"parent": parent, "terminal": builder, "roles": ["terminal"], "named": named,
+                  "decide": decision("rejected", "TerminalIndexReplicaParse", rules, what, note=note), "expect": expect,
+                  "resolution_note": resolution_note}
+
+    def apply34(ws, res):
+        edit_slot(ws, res, 0, 384, 256, set_element(10, 0, (1 << 64) - 1), "Object-row slot 0 key 10")
+        repair_tr_payload(ws, res, 0)
+    t["sup-34"] = {"parent": "neg-15", "profile": "multi-256k", "apply": apply34, "roles": ["terminal"],
+                   "named": "§10.3 manifest range fit",
+                   "decide": decision("rejected", "TerminalIndexReplicaParse", ["row_manifest", "terminal_u64", "checked", "err_replica"],
+                                      "first + count = 2^64 exceeds stored_block_count (2) whatever the evaluation; checked "
+                                      "evaluation also rejects the overflow.",
+                                      formula=unit_eval("manifest_first_chunk_lba + manifest_chunk_count", (1 << 64) - 1 + 1,
+                                                        {"key 10": "2^64 - 1", "key 12": 1}),
+                                      note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                   "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    def apply41(ws, res):
+        for key in ((0, 0), (0, 2)):
+            edit_int(ws, res, key, 0x050, 8, 0, 1, "total data ordinals")
+        repair_tr_common(ws, res, 0)
+    t["sup-41"] = {"parent": "neg-47", "profile": "minimal-256k", "apply": apply41, "roles": ["terminal"],
+                   "named": "§7.4 T cross-check",
+                   "decide": decision("rejected", "TerminalIndexReplicaParse", ["digest_scope", "scope_in_list", "err_replica"],
+                                      "Only the Section 7.4 T cross-check fails. Section 15's TerminalIndexReplicaParse cites "
+                                      "Section 10.6, whose list includes 'scope', so the failure has that name (GAPS G-7).",
+                                      note="Replica A is ineligible; B and C supply the inventory (degraded)."),
+                   "expect": {"replica A": "TerminalIndexReplicaParse"}}
+
+    # -- the Resumer
+    def resume39():
+        image = _image_cache("unfinalized-open")
+        prefix = [{"block_count": e.block_count, "epoch_id": e.epoch_id,
+                   "first_parity_data_ordinal": e.first_parity_data_ordinal, "kind": KIND_NAMES[e.kind],
+                   "protected_ordinal_end_exclusive": e.protected_ordinal_end_exclusive,
+                   "protected_ordinal_start": e.protected_ordinal_start, "tape_file_number": e.tape_file_number}
+                  for e in image.prefix_entries]
+        prefix[2]["block_count"] = (1 << 64) - 1
+        return {"image": "unfinalized-open", "W": 4, "T": 6, "committed_prefix": prefix,
+                "append_object": load_image_inputs("unfinalized-open")["objects"][1]}
+    t["sup-39"] = {"parent": "neg-56", "resume": resume39, "named": "Σ(block_count + 1) (checked)",
+                   "decide": decision("rejected", "ResumeAppend", ["append_point", "resume_step4", "resume_validated_records", "checked", "err_resume"],
+                                      "T and W are unaffected and step 2 holds. The append point overflows, so the records do "
+                                      "not determine one committed prefix and its append point, which Section 3.4 requires "
+                                      "before the Resumer positions or writes: ResumeAppend.",
+                                      formula=unit_eval("append point = Σ(block_count + 1)", 2 + 5 + (1 << 64), {"block_counts": [1, 4, "2^64 - 1", 2]}),
+                                      note="Before any write. Whether before any tape read depends on when a Resumer "
+                                           "computes the append point: this one does so in step 1 and reads nothing "
+                                           "(GAPS E-2)."),
+                   "expect": {"resume": "ResumeAppend"}}
+    return t
+
+
+def run_supplement_entry(sup: str, spec: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"id": sup, "parent": variant.get("parent_blind_id"), "group": variant.get("group"),
+                           "target": variant.get("target"), "violates_only": variant.get("violates_only"),
+                           "apply": None, "isolation": None, "decision": spec["decide"], "implementation": [],
+                           "self_check": None}
+    if "unit" in spec:
+        out["apply"] = {"resolved": True, "vector": "unit", "inputs": variant.get("mutation", {}).get("inputs"),
+                        "checks": [], "repairs": [], "mutated_blocks": [], "notes": []}
+        out["isolation"] = {"claim": "only the named computation", "disputed_by_implementation": False,
+                            "disputes": [], "evaluation": spec["unit"]}
+        out["self_check"] = {"agrees": True, "detail": "unit evaluation with checked u64 arithmetic: "
+                                                       + ("overflows" if spec["unit"]["overflows"] else "fits")}
+        return out
+    if "resume" in spec:
+        resume_input = spec["resume"]()
+        decision_out, _ = resume_case(resume_input, _image_cache(resume_input["image"]), {"case_id": sup})
+        d = decision_out["decision"]
+        out["apply"] = {"resolved": True, "vector": "injected commit record", "checks": [], "repairs": [],
+                        "mutated_blocks": [], "notes": [f"derived W {decision_out['prefix']['derived_W']}, "
+                                                        f"T {decision_out['prefix']['derived_T']}"]}
+        out["isolation"] = {"claim": variant.get("every_other_rule_holds"), "disputed_by_implementation": False,
+                            "disputes": [], "step2": decision_out["step2"]}
+        out["implementation"].append({"level": "Resumer", "result": d["result"], "error": d["error"],
+                                      "refused_at": d["refused_at"], "records_read": d["records_read"],
+                                      "violations": decision_out["step2"]["violations"]})
+        out["self_check"] = {"agrees": d["error"] == spec["expect"]["resume"], "detail": f"{d['result']} {d['error']}"}
+        return out
+    res = Resolution()
+    if "rebuild" in spec:
+        image, _ = spec["rebuild"]()
+        _IMAGES[f"{sup}-rebuilt"] = image
+        ws = Workspace(image=image)
+        for key in [(2, i) for i in range(len(image.files[2].blocks))]:
+            ws.block(key)
+        res.repairs.append("ISO-REBUILD: sidecar, ParityMap and terminal suffix regenerated")
+        rows = image_rows(image)
+        res.notes.append("rebuilt tape files: " + ", ".join(f"{r['tape_file']}@{r['start_record']}×{r['data_records']}"
+                                                            for r in rows[:-1]) + f"; EOD {rows[-1]['eod_record']}")
+        res.notes.append({"rebuilt_tape_files": rows})
+        tape_check = role_terminal_image(image)
+        res.notes.append(f"rebuilt terminal suffix: {tape_check}")
+    elif "terminal" in spec:
+        ws = spec["terminal"]()
+        res.repairs.append("the profile generated consistently: payload, canonical-map, edition, layout and descriptor "
+                           "digests, CRCs and header-record hashes in all five components")
+        res.notes.append({"generated_components": [
+            {"component": PROFILE_COMPONENT_FILES[i], "bytes": len(b"".join(c)),
+             "sha256": hashlib.sha256(b"".join(c)).hexdigest()} for i, c in enumerate(ws.terminal.components)]})
+        if spec.get("resolution_note"):
+            res.notes.append(spec["resolution_note"])
+    elif "profile" in spec:
+        ws = Workspace(profile=spec["profile"])
+        spec["apply"](ws, res)
+    else:
+        ws = Workspace(image=_image_cache(spec["image"]))
+        spec["apply"](ws, res)
+    unreadable = set()
+    if ws.image is not None:
+        unreadable = {lba(ws, tf, b) for tf, b in spec.get("unreadable", [])}
+        if unreadable:
+            res.notes.append("presented unreadable (medium error, no byte changed): LBA " + ", ".join(map(str, sorted(unreadable))))
+    mutated = [{"where": ws.describe(key), "bytes": len(ws.blocks[key]), "sha256": hashlib.sha256(bytes(ws.blocks[key])).hexdigest()}
+               for key in ws.touched]
+    out["apply"] = {"resolved": res.resolved, "vector": "bytes", "checks": res.checks, "repairs": res.repairs,
+                    "mutated_blocks": mutated, "notes": res.notes}
+    if not res.resolved:
+        out["decision"] = decision("unresolved", None, [], "", note="the description does not resolve against my bytes")
+        return out
+    roles = spec.get("roles", [])
+    isolation: dict[str, Any] = {"claim": variant.get("every_other_rule_holds"), "disputed_by_implementation": False, "disputes": []}
+    if "audit" in roles:
+        copy_blocks = spec.get("copy_blocks", 1)
+        tail_block = spec.get("tail_block", 5)
+        audits = sidecar_audits(ws, 2, tail_block, copy_blocks)
+        isolation.update(isolation_summary(audits, spec["named"]))
+        footer_block = len(ws.image.files[2].blocks) - (2 if spec.get("tail_block") == 5 and sup == "sup-45" else 1)
+        footer_readable = (2, footer_block) not in spec.get("unreadable", [])
+        cross = cross_checks(ws, audits, footer_block, footer_readable)
+        isolation["cross_structure_failing"] = cross
+        if cross and sup != "sup-44":
+            isolation["disputed_by_implementation"] = True
+            isolation["disputes"].append("cross-structure: " + "; ".join(cross))
+    if "pm-audit" in roles:
+        pm_file = 4 if spec.get("image") == "two-epoch" else 3
+        audit = audit_parity_map(ws, pm_file)
+        isolation["parity_map_rules_failing"] = audit["common"]
+        isolation["parity_map_readings"] = audit["readings"]
+    for role in roles:
+        if role == "copies":
+            copy_blocks = spec.get("copy_blocks", 1)
+            tail_block = spec.get("tail_block", 5)
+            for label, first, kind in (("primary", 0, 1), ("tail", tail_block, 2)):
+                blocks = [bytes(ws.block((2, first + i))) for i in range(copy_blocks)]
+                try:
+                    parse_sidecar_copy(blocks, ws.tape_uuid, ws.block_size, kind)
+                    out["implementation"].append({"level": f"{label} header/index copy", "result": "accepted", "error": None, "reason": ""})
+                except ReadFailure as failure:
+                    out["implementation"].append({"level": f"{label} header/index copy", "result": "rejected",
+                                                  "error": failure.error, "reason": failure.reason})
+        elif role == "verifier":
+            out["implementation"].append(role_verifier_copies(ws, 2))
+        elif role == "recover":
+            out["implementation"].append(role_scan_and_recover(ws, unreadable, [1, 0]))
+        elif role == "footer":
+            out["implementation"].append(role_sidecar_footer(ws, 2, 7))
+        elif role == "pm":
+            out["implementation"].append(role_parity_map(ws, 4 if spec.get("image") == "two-epoch" else 3))
+        elif role == "terminal":
+            result = role_terminal(ws)
+            out["implementation"].append(result)
+            a = result.get("replicas", {}).get("A", {})
+            isolation["replica_A_rules_failing"] = a.get("reason")
+            reason = (a.get("reason") or "")
+            body = reason.split(": ", 2)[-1] if reason.startswith("payload: ") else reason.split(": ", 1)[-1]
+            if not a.get("valid") and body.count("; ") >= 1:
+                isolation["disputed_by_implementation"] = True
+                isolation["disputes"].append("replica A: this implementation finds " + str(body.count("; ") + 1)
+                                             + " failing rules: " + body)
+    if "pm-audit" in roles and isolation["parity_map_readings"].get("epoch ids in array order"):
+        isolation["disputed_by_implementation"] = True
+        isolation["disputes"].append("this implementation's directory decoder checks the range chain and the epoch ids in "
+                                     "array order, so it also fails those two rules; in tape-file order, and for the "
+                                     "epoch ids as a set, they hold")
+    if "pm-audit" in roles and isolation["parity_map_readings"].get("'reject disagreement' covers every header field") \
+            and not isolation["parity_map_readings"].get("'reject disagreement' covers only the locator arithmetic"):
+        isolation["disputed_by_implementation"] = True
+        isolation["disputes"].append("under the reading that 'reject disagreement between header, footer' covers every "
+                                     "field, a second rule fails; this implementation's ParityMap parser uses that reading "
+                                     "and rejects on the header/footer comparison, not on the payload/footer match")
+    if "pm-audit" in roles and isolation.get("parity_map_rules_failing") and len(isolation["parity_map_rules_failing"]) > 1:
+        isolation["disputed_by_implementation"] = True
+        isolation["disputes"].append("ParityMap: " + "; ".join(isolation["parity_map_rules_failing"]))
+    out["isolation"] = isolation
+    out["self_check"] = self_check(spec["expect"], [r if "level" in r else r for r in out["implementation"]])
+    return out
+
+
+def role_terminal_image(image: ImageBuild) -> str:
+    tape = DamagedTape(image.records(), set())
+    layout, _ = discover_layout(tape, image.tape_uuid, image.block_size)
+    checks = [check_replica(tape, layout, o, image.tape_uuid, image.block_size) for o in (1, 2, 3)]
+    return "replicas " + ", ".join(f"{c.letter} {'valid' if c.fully_valid else 'invalid: ' + c.reason}" for c in checks)
+
+
+def run_supplement(path: pathlib.Path, out_path: pathlib.Path) -> dict[str, Any]:
+    source = load_json(path)
+    table = supplement_table()
+    entries = {}
+    for variant in source["variants"]:
+        sup = variant["id"]
+        if sup not in table:
+            entries[sup] = {"id": sup, "apply": {"resolved": False, "notes": ["not analysed"]},
+                            "decision": decision("unresolved"), "isolation": None, "implementation": [], "self_check": None}
+            continue
+        entries[sup] = run_supplement_entry(sup, table[sup], variant)
+    output = {"schema": "rem-parity-second-implementation-negative-supplement/1", "entries": entries,
+              "table_entries_without_a_variant": sorted(set(table) - {v["id"] for v in source["variants"]})}
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(output, indent=2, ensure_ascii=False, default=_json_default) + "\n", encoding="utf-8")
+    return output
+
+
+def supplement_summary(entry: dict[str, Any]) -> str:
+    text = negative_summary(entry)
+    isolation = entry.get("isolation") or {}
+    if isolation.get("disputed_by_implementation"):
+        text += " [isolation disputed: " + " | ".join(isolation["disputes"]) + "]"
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Deciding one case.
 # ---------------------------------------------------------------------------
 
 
 def case_id_of(path: pathlib.Path) -> str:
-    return path.parent.name if path.name in ("fault-map.json", "inputs.json") else path.stem
+    return path.parent.name if path.name == "fault-map.json" else path.stem
 
 
 def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[DamagedTape, list[str]]:
@@ -4298,6 +6729,12 @@ def main(argv: list[str] | None = None) -> int:
     decide = commands.add_parser("decide", help="decide damage cases as a Reader under the text")
     decide.add_argument("cases", nargs="+", type=pathlib.Path)
     decide.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "decisions.json")
+    negatives = commands.add_parser("negatives", help="apply and decide the generation-2 negative cases")
+    negatives.add_argument("cases", type=pathlib.Path)
+    negatives.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-decisions.json")
+    supplement = commands.add_parser("negatives-supplement", help="apply, isolate and decide the single-rule variants")
+    supplement.add_argument("variants", type=pathlib.Path)
+    supplement.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-supplement-decisions.json")
     resume = commands.add_parser("resume", help="act as a Resumer under Section 14 on resume cases")
     resume.add_argument("cases", nargs="+", type=pathlib.Path)
     resume.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "resume-decisions.json")
@@ -4309,6 +6746,18 @@ def main(argv: list[str] | None = None) -> int:
                 "" if result["result"] == "reproduced" else f"  -- {result['detail']}"))
         print(f"reproduced {report['reproduced']}, mismatched {report['mismatched']}")
         return 0 if report["mismatched"] == 0 else 1
+    if args.command == "negatives-supplement":
+        output = run_supplement(args.variants, args.out)
+        for entry_id, entry in output["entries"].items():
+            print(entry_id, supplement_summary(entry))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
+    if args.command == "negatives":
+        output = run_negatives(args.cases, args.out)
+        for entry_id, entry in output["entries"].items():
+            print(entry_id, negative_summary(entry))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
     if args.command == "resume":
         output = run_resume(args.cases, args.out)
         for case_id, decision in output["cases"].items():

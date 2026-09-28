@@ -350,3 +350,184 @@ against.** No sidecar yet covers `[W, T)`, so a Resumer that re-reads a
 silently corrupted block there cannot detect it, and its new parity would
 protect the corrupted bytes. No case exercises this.
 
+## F. Generation-2 negatives (design D6)
+
+These were found while applying and deciding the 58 negative cases, before
+any expected outcome for them was read.
+
+**F-1. Section 9.5: "with `primary_header_start_block` as 0" can be read two
+ways (neg-06).** It can describe a field that must be 0, in which case the
+hash covers the exact wire bytes. Or it can tell the Reader to substitute 0,
+in which case a nonzero wire value is hashed as 0. The two readings give
+opposite hash results for neg-06's two variants. The outcome does not
+depend on the reading, because the rule "`primary_header_start_block` MUST
+= 0" fails in both.
+
+**F-2. Appendix C's statement about geometry disagreements (neg-08, 19, 20,
+23, 34).** Appendix C (informative) says "Geometry and ordinal-range
+disagreements raise `SchemeMismatch`". The normative text makes `k`, `m`
+and `S` ≠ 0, and the block size equal to the actual one, copy-validity
+rules of Section 9.2 (`SidecarParse`). It pins only an acquired index
+against the scheme ("then pinned", Section 13.3). *Decided:* `SidecarParse`
+for a copy that breaks a Section 9.2 rule. `SchemeMismatch` applies to a
+copy that validates but disagrees with the bootstrap or the supplied
+scheme. An implementation that follows the appendix could report the other
+name.
+
+**F-3. Section 9.1: "reject divergence" does not say what is rejected
+(neg-11).** When both copies parse and disagree, the text does not say
+whether the Reader rejects one copy, both, or the epoch. A Verifier reports
+the divergence (`SidecarParse`). A Recoverer on step 1 finds that only the
+primary matches the footer's hash, and may use it. It may also refuse the
+epoch because the copies diverge. This implementation uses the primary.
+
+**F-4. Section 10.1.4: which block size the ParityMap locator uses
+(neg-14).** "`M` from `payload_len` and `block_size`" may mean the header
+field or the tape's block size, and Section 10.1.3 gives the header's
+`block_size` field no constraint. The sidecar's field, by contrast, "MUST
+equal the actual block size". neg-14 is rejected under either reading.
+This implementation also requires the field to equal the tape's block
+size, which is stricter than the text.
+
+**F-5. No role checks an inventory's counts against positions (neg-44).**
+No Section 10.6 condition bounds a sidecar row's block count beyond
+non-zero. The text does not require replica A's planned start LBA to equal
+`Σ(block_count + 1)` over the structural rows. An inventory can therefore
+claim a 2^64 − 1-block sidecar and still validate. A role that later
+computes a position from it must reject the overflow (Section 2.4), but the
+text names no such role and no error. *Decided:* the replicas are
+accepted. Which role rejects, and with which name, is undecided.
+
+**F-6. Section 15's names overlap for an invalid bootstrap (neg-02, 12, 30,
+57).** `NoBootstrapFound` is "absent or invalid" and `BootstrapParse` is
+"violates Section 8". For a declared length beyond the block,
+`BootstrapPayloadTooLarge` ("cannot fit the block") also fits. No rule
+picks one, and Appendix D TT-7 records that which bootstraps count as
+unreadable is open. *Undecided:* the error name; rejection itself is
+decided.
+
+**F-7. Section 9.6 gives the footer's total no rule of its own (neg-40a,
+54c).** The footer table states `tail_header_start_block = H + P` and
+`primary_header_start_block = 0`, but no formula for
+`sidecar_total_block_count`. A footer whose total is wrong is rejected only
+by comparison: with the measured length (Section 12.3 item 6) or with the
+map entry (Section 13.3 step 1). Neither names an error. *Undecided* for
+neg-54c: `SidecarParse`, or no typed error. Before D6 this implementation
+also checked `total = 2H + P + 1` in the footer, which is stricter than the
+text; that check was removed (BUILD-LOG).
+
+**F-8. Section 13.4 defines implicit zeros by ordinal but prescribes no
+computation (neg-05).** For a descriptor near 2^64, forming the peer
+ordinal overflows, while classifying the peer by position (`data_index·S +
+stripe ≥ real_data_shard_count`) does not. *Undecided:* whether a Recoverer
+must reject. The case is unit-level only.
+
+**F-9. The walk's outcome for an inconsistent device report is unstated
+(neg-04).** Section 16.2 makes arithmetic on tape-derived values checked,
+so a zero position delta must not wrap. The text does not say whether the
+walk reports structural damage or a transport failure. *Undecided.*
+
+**F-10. Fixture notes (no text defect).**
+- neg-02, neg-30 and neg-57 describe the same bytes, the bootstrap with
+  S = 2^63, under three targets.
+- neg-27 gives its mutation as "as overflow-10.1.2-M", and neg-02 and
+  neg-57 give their repairs as "as overflow-6.6-scheme-product". These name
+  other cases by labels that `cases.json` does not define. I resolved them
+  to neg-45 (the formula `M = ceil((0xC8 + L) / B)`) and to neg-30 (the
+  formula `S × (k + m)`). Both resolutions follow the formulas, not a
+  guess about the outcome.
+- R-SC-HASHED recomputes the hash "over the mutated copy's own bytes". Where
+  a mutation changes the entry counts (neg-08, 09, 19, 20, 34, 40b, 43, 49),
+  I hash the entry bytes physically present: 96 bytes, or 88 and 104 for
+  neg-58's variants, whose companion edits change the stream. Every such
+  copy is rejected by a Section 9.2 rule whatever its hash.
+- The neg-33 precondition says "flip a byte". I XOR 0x01 into the CRC byte
+  named.
+
+## G. Supplemental single-rule negatives
+
+These were found while applying, isolating and deciding the 49
+supplemental variants, before any expected outcome for them was read. The
+comparison of the earlier negatives (`NEGATIVES-COMPARISON.md`) was not read
+before these decisions were written.
+
+**G-1. Section 9.2: which H and P the locator formulas use (sup-10,
+sup-37).** The rules `sidecar_total_block_count = 2H + P + 1`,
+`tail_header_start_block MUST = H + P` and `footer_block_index MUST = 2H +
+P` do not say which H and P they mean when a header's fields disagree with
+their definitions. The table labels the 0x60 field "(H)". Section 9.1
+defines "`P = S × m`" and says H is "the header/index copy block count
+(Section 9.4)". Under the reading "H = the 0x60 field, P = S × m", each of
+sup-10 and sup-37 breaks only its named rule. This implementation's parser
+uses the other reading, "H = the Section 9.4 recompute, P = the 0x50
+field", under which each breaks three more rules. The name is
+`SidecarParse` either way.
+
+**G-2. Checked arithmetic when the formula's result is representable
+(sup-01, sup-08).** For sup-01, M = 2^46 + 1 fits in u64 although
+0xC8 + L does not. For sup-08, the inequality 1 ≤ 2^64 holds although
+count × B overflows. For the Section 10.4 formulas, Section 10.6 settles
+the question ("Every size formula of Section 10.4 evaluates without
+overflow"), and Section 10.6 extends it to Section 10.5. For the ParityMap's
+M and the Section 10.3 byte-length rule, the text states the formula but
+not the order of its operations. It does not say whether a Reader must
+evaluate the formula as written, overflowing intermediate included.
+*Undecided:* sup-01 and sup-08.
+
+**G-3. Unit-level rejections without a §15 name (sup-23, sup-25,
+sup-27).**
+- **sup-25:** an overflow in the Recoverer's parity locator has no name.
+- **sup-23 and sup-27:** S × k and S × m take their name from the role
+  that evaluates them. From a bootstrap the name is open (F-6); from a
+  Resumer's bound it is `ResumeAppend`.
+
+Rejection itself is decided for all three: the value is not representable
+in u64.
+
+**G-4. A sidecar range longer than S × k (sup-14).** The copy validator
+rejects it (Section 9.2, "real ... MUST be in 1..=S × k"). The text does not
+say whether replica validation ("Every structural and ordinal-range
+invariant is validated", Section 10.2), with an epoch covering "at most `S ×
+k` data ordinals" (Section 2.3), or the directory decoder must also reject
+it. This implementation checks neither, so its Scanner accepts the
+inventory.
+
+**G-5. Section 10.1.4: the scope of "reject disagreement between header,
+footer, and the measured tape file length" (sup-12).** It may cover only
+the locator arithmetic named in the same sentence, or every header field.
+This implementation's ParityMap parser takes the broad reading, so it
+rejects sup-12 on the header/footer comparison rather than on the
+payload/footer match the variant names. The name is `ParityMapParse` either
+way.
+
+**G-6. Section 10.1.5: the order of the epoch-id rule (sup-35).** "epoch_id
+values are unique and consecutive starting from 0 (0, 1, …, count−1)" does
+not say whether the entries are read in array order or in tape-file order.
+The partition rule does say ("taken in ascending `tape_file_number` order").
+With the entries reversed, the ids hold as a set and in tape-file order, and
+fail in array order. This implementation's decoder checks both the range
+chain and the ids in array order. For the chain that is stricter than the
+text, a known divergence recorded in BUILD-LOG; it changes no decision,
+because the ascending rule fails first.
+
+**G-7. Section 7.4's cross-checks and their §15 name (sup-32, sup-41).**
+Section 15's `TerminalIndexReplicaParse` cites Sections 8.3, 10.2–10.4 and
+10.6, not Section 7.4. Section 10.6's list includes "scope", so a failed
+scope cross-check is read as `TerminalIndexReplicaParse`.
+`FilemarkMapDigestMismatch` does not apply, because the projection digest
+matches. For sup-32 this implementation evaluates "W equals T" on
+recomputed values rather than on the recorded fields, so it also reports
+that rule. The text names the recorded fields
+(`highest_protected_ordinal`, `total_data_ordinals`). This is a known
+divergence in BUILD-LOG.
+
+**G-8. Fixture notes (no text defect).**
+- The variants name one another by labels `supplement.json` does not
+  define. I resolved each to the variant with the same parent that states
+  the base in full: "isolated-1" to sup-17 (for sup-16) and to sup-29 (for
+  sup-07 and sup-20), and "isolated-3" to sup-21 (for sup-32).
+- They also cite a `NOTES.md` that I was not given.
+- sup-14's five-block Object and sup-15's generated profile have details
+  the variants do not specify. My choices are listed in the entries'
+  `apply.notes`, and no decision depends on them.
+
