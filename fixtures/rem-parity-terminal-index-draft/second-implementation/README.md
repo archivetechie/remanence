@@ -84,21 +84,47 @@ the named image, applies the case's faults, and then acts as a Reader.
 
 The fault reader knows these keys and no others: `image`,
 `failed_data_addresses`, `read_data_addresses`, `unreadable_records`,
-`removed_filemark_after_tape_file`, `record_edits`, and exactly one of
-`hints` or `observations`. It checks every level, including each hint,
-observation, record edit and byte edit. An unknown or missing key fails the
-run before anything is written, with the file and the key named, and the
-command exits with status 2. An ignored key would decide a damaged tape as an
-intact one.
+`removed_filemark_after_tape_file`, `record_edits`, `record_insertions`,
+`appended_files`, and exactly one of `hints` or `observations`. It checks
+every level, including each hint, observation, record edit, byte edit,
+insertion, appended file and appended record. An unknown or missing key, or an
+appended record with an unknown `source`, fails the run before anything is
+written, with the file and the key named, and the command exits with status 2.
+An ignored key would decide a damaged tape as an intact one.
+
+The faults are applied in a fixed order: record edits, record insertions, the
+removed filemark, appended files. Every position a case states (an unreadable
+record's LBA, the tape file that loses its filemark, an insertion's tape file
+and record) is a position of the undamaged image.
 
 - `record_edits` replaces a record. The new record is built from the
   original at the stated `length`: the original's own length, its first
-  bytes, or the original followed by zero bytes. The stated `construction`
-  must agree with the two lengths. Every byte edit's `old_bytes` must be
-  what my build holds at that offset, and the edited record's SHA-256 must
-  equal the stated one; otherwise the run fails. An edit whose reason says a
-  CRC was recomputed is also checked against my own CRC, and the result is
-  recorded, though it is not enforced.
+  bytes, or the original followed by zero bytes. The construction "the
+  ParityMap re-encoded with the edited directory entry" states no length of
+  its own: the record keeps its length, and its listed byte edits are the
+  whole change. The stated `construction` must agree with the two lengths.
+  Every byte edit's `old_bytes` must be what my build holds at that offset,
+  and the edited record's SHA-256 must equal the stated one; otherwise the
+  run fails. An edit whose reason says a checksum or hash was recomputed is
+  also checked against mine, on the finished record: a bootstrap's CRCs, a
+  sidecar copy's canonical metadata hash and CRCs (the copy is parsed under
+  Sections 9.2 to 9.5), and a ParityMap's header CRC and payload SHA-256. The
+  result is recorded, though it is not enforced.
+- `record_insertions` puts a record of `length` bytes, each the byte `fill`,
+  into a tape file after the data record `after_record_index`. Its SHA-256
+  must equal the stated one. Every later record, and the filemarks, move up by
+  one position.
+- `appended_files` puts tape files after the tape's last record. Each file
+  lists its records and says whether a trailing filemark follows (`false` ends
+  the tape in the file's last record). A record's `source` says how its bytes
+  are built:
+  - `foreign`: the stated first byte, then zeros (GAPS M-3). Its SHA-256 is
+    checked.
+  - `copy_of`: my build of the stated record of the stated tape file. Its
+    SHA-256 is checked.
+  - `second_edition_replica`: bytes this Reader cannot derive from the file
+    and the text (GAPS M-4). The record is never read: a decision that needs its
+    bytes is `undecided`.
 - `read_data_addresses` lists data addresses the Recoverer is asked to
   read. Each block is read and judged as Section 13.4 judges a stripe
   position. A read that succeeds, with a CRC that matches the sidecar index,
@@ -210,8 +236,9 @@ It writes `mutation-decisions.json`.
 `selection` takes the 14 survivor sets. Each names a status (S0 to S4) for
 replicas A, B and C, and each status is defined in the file by its bytes. For
 each set the command builds the three replicas from my own builds (a byte
-change is applied as `mutations` applies one; the foreign status takes my
-build of the other profile's replica at that position), decides the outcome
+change is applied as `mutations` applies one; the second-edition status takes
+my build of the profile's replica at that position with another edition ID and
+sequence, GAPS M-9), decides the outcome
 from the text, and runs the Scanner as a self-check. Where the text does not
 decide which of several valid, agreeing replicas is selected, every one of
 them is listed as acceptable. It writes `selection-decisions.json`.
@@ -269,15 +296,22 @@ The steps follow the text in order:
    Section 5.3's canonical-form rules, so a payload whose keys are out of
    order still yields its scheme and `drive_compression` (GAPS J-1).
 2. Terminal discovery from EOD (Section 8.4 step 1): the Scanner spaces back
-   over up to five filemarks and reads the record before each. A replica
-   footer supplies the planned layout only when it sits at its recorded
+   over up to five filemarks and reads the record before each. Spacing back
+   crosses the records between one filemark and the next, so a tape that ends
+   in records with no filemark still reaches the last filemark (GAPS M-5). A
+   replica footer supplies the planned layout only when it sits at its recorded
    position and plans an EOD at or after the tape's. Then replica validation
    under Section 10.6 and selection under Section 8.5.
 3. When no replica validates, the BOT walk and its second pass (Sections
    8.4.1, 12.2 and 12.3), and the validation of the walked map against the
    final ParityMap (Section 13.1). A rung that fails a check, its count
    included, does not recognise a file: the failed classification is
-   reported, and the file is an Object candidate.
+   reported, and the file is an Object candidate. An Object candidate that
+   follows the exact terminal suffix (five undamaged files: replica,
+   separation extent, replica, separation extent, replica) is not admitted as
+   an Object (Section 12.6; GAPS M-6). A missing trailing filemark is
+   reported as structural damage (Section 12.2). The decision's `walk.map`
+   says whether the walk produces a map and whether Section 13.1 validates it.
 4. For each failed address, the Recoverer's refusals, index acquisition,
    erasure taxonomy, reconstruction and CRC check (Sections 13.2–13.5). In
    index acquisition (Section 13.3), the footer or an available directory
@@ -289,8 +323,9 @@ The steps follow the text in order:
    - the map entry comes from a validated replica, not a walked map.
 5. The Verifier. Its `result` is the terminal-suffix outcome that Sections
    10.6 and 12.6 define: complete, degraded, recovery required (no valid
-   replica), or an error for a conflict. With no planned layout, a
-   separation extent that the walk finds damaged is reported invalid
+   replica), or an error for a conflict. A separate observation,
+   `verifier-full`, gives what its full verification reports (below). With no
+   planned layout, a separation extent that the walk finds damaged is reported invalid
    (Section 12.3 items 2 and 3). Its `outside_terminal_suffix` lists
    each finding before replica A with the error a Reader reports for that
    component (Section 2.2), after reading every sidecar's two copies and
@@ -305,6 +340,27 @@ The steps follow the text in order:
    data block or parity shard. Each sidecar's tail copy is located as
    Section 13.3 locates it.
 
+   The observation `verifier-full` holds:
+   - `data_blocks_failed` and `parity_shards_failed`: every data block a
+     sidecar protects, and every parity shard, that fails, each by its
+     address, with its reason and, for a medium error, `TapeIo`. A read
+     failure, a record that is not one block long, and a CRC that differs
+     from the index all fail. A shard of an epoch whose index is unavailable
+     is located from the map entry's count (Section 9.1) and read; a failed
+     read is reported, and the shard cannot be checked against a CRC (GAPS
+     M-8);
+   - `coverage`: what was read, and which epochs had no index, so that their
+     blocks and shards were read but could not be checked. When no validated
+     map says which blocks a sidecar protects, or discovery ended in an error,
+     `performed` is false and the two lists are null;
+   - `other_findings`: every other finding, before the terminal suffix and
+     in it (each replica, each separation extent, the planned EOD, an artifact
+     after the suffix, structural damage), each with its Section 15 name;
+   - `terminal_suffix.complete`: whether the terminal suffix is complete.
+     It is true only with three valid agreeing replicas, two valid separation
+     extents and EOD right after C's trailing filemark (Sections 10.6 and
+     12.6).
+
 Where the text leaves an outcome open, the decision says `undecided` and
 lists the readings. Each decision cites the sentences that decide it, and
 the tests check that every quoted sentence occurs in the specification.
@@ -312,6 +368,11 @@ Where the text defines an outcome by what a role reads, the decision records
 the outcome for each case: a Scanner's degraded flag is `per reads`, with
 `degraded_by_reads` giving the flag for a Scanner that reads the damaged
 payload and for one that does not (Section 12.6).
+
+A decision that needs a record whose bytes the case states but the file and the
+text do not determine (`second_edition_replica`) is `undecided`, with the
+readings. Only the observations that read that record are undecided; the walk
+is decided wherever it never reads it (GAPS M-4).
 
 ## How the Resumer works
 

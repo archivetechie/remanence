@@ -372,10 +372,13 @@ pub fn resolve(v: &Value) -> Result<Resolved, String> {
                 e.sidecar_repair(2, tail, "R-SC-HASHED", stream_end);
                 faults.push((2, footer));
                 roles = vec![];
-                entries.push(
+                entries.extend([
                     "scan_reconstruct_filemark_map_with_report (BOT Scanner; footer medium error)"
                         .into(),
-                );
+                    "recover_ordinal_from_sidecar (the footer unreadable; the directory entry decides)"
+                        .into(),
+                    "verify_sidecar (a Verifier's full verification; footer medium error)".into(),
+                ]);
             }
             "sidecar-canonical-hash" => {
                 for b in [0, tail] {
@@ -900,6 +903,26 @@ fn recover(v: &Resolved) -> Result<(), ObservedError> {
     result?;
     Ok(())
 }
+/// A Verifier's full verification of the sidecar, with the same rebuilt map and
+/// the same chaos faults as the Recoverer's observation.
+#[cfg(test)]
+fn verify(v: &Resolved) -> Result<(), ObservedError> {
+    let base = generate("a4-minimal").unwrap();
+    let mut rows = base.written.map.entries().to_vec();
+    rows[2].block_count = v.files[&2].len() as u64;
+    let map = ScopedFilemarkMap::from_catalog(FilemarkMap::new(rows)?, 4);
+    let (mut d, _) = drive(v);
+    let sidecar = map.map.entries()[2].clone();
+    let verification = verify_sidecar(
+        &mut DriveHandleRawSource::new(&mut d),
+        &map,
+        &sidecar,
+        &base.written.inputs.scheme,
+        &v.uuid,
+        BLOCK,
+    )?;
+    super::overflow::finding_as_error(&verification)
+}
 #[cfg(test)]
 fn scanner(v: &Resolved) -> Result<(), ObservedError> {
     let (mut d, engine) = drive(v);
@@ -981,11 +1004,23 @@ fn observations(v: &Resolved) -> Vec<Observation> {
         return out;
     }
     if v.path == "sidecar-primary-tail-disagreement/isolated" {
-        return vec![observation(
-            "BOT Scanner with footer medium error".into(),
-            "per_sidecar_validation",
-            || scanner(v),
-        )];
+        return vec![
+            observation(
+                "BOT Scanner with footer medium error".into(),
+                "per_sidecar_validation",
+                || scanner(v),
+            ),
+            observation(
+                "Recoverer with footer medium error".into(),
+                "recoverer",
+                || recover(v),
+            ),
+            observation(
+                "Verifier with footer medium error".into(),
+                "verifier",
+                || verify(v),
+            ),
+        ];
     }
     if v.path == "overflow-3.2-14-append-point/isolated" {
         return vec![observation(
@@ -1305,7 +1340,8 @@ pub(super) fn expected_matches(expected: &Value, o: &Observation) -> bool {
 /// Map every supplement `violates_only` rule to its specific reference diagnostic.
 /// Full rule messages distinguish formulae and reserved-field sites; numeric values
 /// are fixed by the authored recipes. Wrapper errors may contain these messages.
-/// None records the missing agreement check tracked by the open adjudication.
+/// None records a variant that violates no rule (accepted under an erratum set), or whose
+/// target check the reference never reaches (see isolation-exceptions.json).
 #[cfg(test)]
 const ISOLATION_RULES: &[(&str, Option<&str>)] = &[
     ("sidecar-block-size/isolated", Some("sidecar parse error: sidecar block_size 524288 does not match block0 length 262144")),
@@ -1328,7 +1364,7 @@ const ISOLATION_RULES: &[(&str, Option<&str>)] = &[
     ("sidecar-tail-start/isolated", Some("sidecar parse error: sidecar tail_header_start_block 6 != expected 5")),
     ("sidecar-tape-uuid/isolated", Some("sidecar parse error: sidecar tape UUID mismatch")),
     ("sidecar-total-block-count/isolated", Some("sidecar parse error: sidecar_total_block_count 8 != expected 7")),
-    ("sidecar-primary-tail-disagreement/isolated", None),
+    ("sidecar-primary-tail-disagreement/isolated", Some("the primary and tail copies both validate and differ")),
     ("paritymap-directory-not-ascending/isolated", Some("directory sidecar entries must be in ascending tape-file order")),
     ("paritymap-footer-header-disagreement/isolated", Some("parity-map parse error: both parity-map metadata copies failed: primary=parity-map parse error: parity-map header copy does not match footer locator; tail=parity-map parse error: parity-map header copy does not match footer locator")),
     ("terminal-scope-scalars/isolated-1", Some("terminal index covered_prefix_tape_file_count 6, expected 7")),

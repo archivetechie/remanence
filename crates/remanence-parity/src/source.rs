@@ -1244,7 +1244,9 @@ mod erasure_tests {
 mod object_source_tests {
     use super::*;
     use crate::codec::ReedSolomonCodec;
-    use crate::filemark_map::{FilemarkMap, MapScope, TapeFileMapEntry, TapeFilePosition};
+    use crate::filemark_map::{
+        FilemarkMap, MapScope, MapSource, TapeFileMapEntry, TapeFilePosition,
+    };
     use crate::mapping::ordinal_to_stripe;
     use crate::model::{SchemeId, SidecarMetadataHealth, SidecarMetadataHealthEvent};
     use crate::raw::RawReadOutcome;
@@ -2642,7 +2644,10 @@ mod object_source_tests {
                 SidecarMetadataHealth::PrimaryHeaderLost => {
                     sidecar_blocks[0][0] ^= 0xFF;
                 }
-                SidecarMetadataHealth::BothCopiesUsable => unreachable!("test covers loss cases"),
+                SidecarMetadataHealth::BothCopiesUsable
+                | SidecarMetadataHealth::TailCopyNotRead => {
+                    unreachable!("test covers loss cases")
+                }
             }
             let scoped = scoped_map(sidecar_blocks.len() as u64, object_blocks.len() as u64);
             let mut raw = raw_tape(&object_blocks, &sidecar_blocks);
@@ -3159,6 +3164,7 @@ mod object_source_tests {
                 highest_protected_ordinal: 2,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let mut records = Vec::new();
         records.push(Record::Block(vec![0xB0; BLOCK_SIZE as usize]));

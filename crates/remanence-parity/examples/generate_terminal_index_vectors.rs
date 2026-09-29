@@ -17,12 +17,13 @@ use std::path::{Path, PathBuf};
 use ciborium::value::Value as CborValue;
 use remanence_parity::{
     assemble_terminal_plan, encode_tape_index_bootstrap_footer, encode_tape_index_replica_header,
-    index_separation_records, write_index_separation, write_tape_index_replica,
-    IndexSeparationObservation, ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics,
-    TapeIndexEditionPlan, TapeIndexReplicaCounts, TapeIndexReplicaFileKind,
-    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TapeIndexReplicaObservation,
-    TapeIndexReplicaRecordSource, TapeIndexReplicaScope, TerminalTailLayout,
-    TerminalTripleWritePlan, TERMINAL_INDEX_BLOCK_SIZES,
+    index_separation_records, read_terminal_index_inventory, write_index_separation,
+    write_tape_index_replica, ImageDirectoryRawSource, IndexSeparationObservation,
+    ObjectRecoveryRepresentation, ParityError, ParityMapDiagnostics, TapeIndexEditionPlan,
+    TapeIndexReplicaCounts, TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry,
+    TapeIndexReplicaObjectRow, TapeIndexReplicaObservation, TapeIndexReplicaRecordSource,
+    TapeIndexReplicaScope, TerminalInventoryOutcome, TerminalInventoryReadError,
+    TerminalTailLayout, TerminalTripleWritePlan, TERMINAL_INDEX_BLOCK_SIZES,
 };
 use sha2::{Digest, Sha256};
 
@@ -30,6 +31,31 @@ const COMPACT_GAP_RECORDS: u64 = 3;
 const HIGH_COUNT_OBJECT_ROWS: u64 = 1_000_000;
 const VECTOR_TIMESTAMP: &str = "2026-08-09T00:00:00Z";
 const MAX_TIMESTAMP: &str = "2026-08-09T00:00:00.1111111111111111111111111111111111111111111Z";
+const VECTOR_WRITER: &str = "remanence-terminal-vector-generator/1";
+const VECTOR_TAPE_UUID: [u8; 16] = [0x11; 16];
+/// The two edition-common inputs of the second-edition replicas under
+/// `selection/`; every other input is the `multi-256k` profile's.
+const SECOND_EDITION_ID: [u8; 16] = [0x24; 16];
+const SECOND_EDITION_SEQUENCE: u64 = 3;
+/// The expectations are fixed by REM-PARITY Sections 8.5 and 10.6, never
+/// derived from the reference; the generator only checks the reference
+/// against them. `second-edition` names the replica at the same position
+/// from `selection/`.
+const SELECTION: &str = "case_id\tbase_profile\ta\tb\tc\texpected\n\
+healthy\tmulti-256k\tvalid\tvalid\tvalid\tselect-c\n\
+damage-a\tmulti-256k\tdamaged\tvalid\tvalid\tselect-c\n\
+damage-b\tmulti-256k\tvalid\tdamaged\tvalid\tselect-c\n\
+damage-c\tmulti-256k\tvalid\tvalid\tdamaged\tselect-b\n\
+damage-a-b\tmulti-256k\tdamaged\tdamaged\tvalid\tselect-c\n\
+damage-a-c\tmulti-256k\tdamaged\tvalid\tdamaged\tselect-b\n\
+damage-b-c\tmulti-256k\tvalid\tdamaged\tdamaged\tselect-a\n\
+all-invalid\tmulti-256k\tdamaged\tdamaged\tdamaged\tbot-structural-recovery\n\
+all-torn\tmulti-256k\ttorn\ttorn\ttorn\tbot-structural-recovery\n\
+all-missing\tmulti-256k\tmissing\tmissing\tmissing\tbot-structural-recovery\n\
+all-conflicting\tmulti-256k\tsecond-edition\tvalid\tsecond-edition\tconflict\n\
+conflicting-a\tmulti-256k\tsecond-edition\tvalid\tvalid\tconflict\n\
+conflicting-b\tmulti-256k\tvalid\tsecond-edition\tvalid\tconflict\n\
+conflicting-c\tmulti-256k\tvalid\tvalid\tsecond-edition\tconflict\n";
 
 #[derive(Clone)]
 struct Records {
@@ -146,12 +172,13 @@ fn generate(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
     emit_high_count_evidence(output)?;
     emit_object_row_extension_vectors(output)?;
     emit_matrix_manifests(output)?;
+    emit_selection_vectors(output)?;
     fs::write(
         output.join("README.md"),
-        "# REM-PARITY terminal-index candidate vectors\n\nReview-only generation-2 candidate artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. `inputs.json` files record the inputs of each pinned artifact for independent re-derivation (the streaming recipe is `streaming-inputs.json`). Run `cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check` to compare generated files and the file set. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
+        "# REM-PARITY terminal-index candidate vectors\n\nReview-only generation-2 candidate artifacts; nothing under this directory is a publication artifact. `MANIFEST.tsv` pins the healthy minimal and multi-Object A/gap-AB/B/gap-BC/C byte streams at every legal block size. Filemarks and EOD are structural expectations rather than bytes. `inputs.json` files record the inputs of each pinned artifact for independent re-derivation (the streaming recipe is `streaming-inputs.json`). Run `cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check` to compare generated files and the file set. Compact gaps contain three records (header, one zero interior, footer), while default one-GiB extents remain an integration obligation.\n\n`MAXIMUMS.tsv` pins maximum plaintext/encrypted recovery-row slots and the maximum diagnostic-envelope one-block footer. `STREAMING.tsv` records a million-Object constant-storage source pass and its independently reproducible digests without checking in the conceptual 320 MB payload. `OBJECT_ROW_EXTENSIONS.tsv` pins Rust-generated fixed-slot artifacts under `object-row-extensions/` by encoded length, byte count, and SHA-256. The independent Python verifier consumes those exact bytes to check positive unknown keys (including nested false/true/null values) and fail-closed assigned/noncanonical extensions. `MUTATIONS.tsv` and `SELECTION.tsv` are compact executable hostile matrices. A `second-edition` cell of `SELECTION.tsv` is the replica of that ordinal under `selection/`: it sits at the `multi-256k` position and is locally eligible there, and differs from the profile's replica only in its edition ID and edition sequence, with every digest and CRC recomputed (`selection/inputs.json`). `INTERRUPTIONS.tsv` independently enumerates the 68 live prefix, component, journal, checkpoint, SQLite, and final-projection cut boundaries, including the sealed-checkpoint-to-intent-cleanup window, and pins each exact command-acceptance, media-proof, and durable host-authority state. A field ending in `_accepted` means the command returned successfully; only the corresponding media-barrier proof field (`*_barrier_proved` or `*_barriers_proved`) establishes media durability.\n",
     )?;
     println!(
-        "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, 7 Object-row extension slots, and executable hostile matrices in {}",
+        "generated 6 healthy profiles, 3 maximum artifacts, 1 high-count stream, 7 Object-row extension slots, 3 second-edition replicas, and executable hostile matrices in {}",
         output.display()
     );
     Ok(())
@@ -168,7 +195,7 @@ fn emit_profile(
         name,
         block_size,
         records.clone(),
-        "remanence-terminal-vector-generator/1",
+        VECTOR_WRITER,
         VECTOR_TIMESTAMP,
     )?;
     let edition = &assembled.edition;
@@ -180,45 +207,53 @@ fn emit_profile(
     add_records(&mut inputs, &records);
     write_json(&directory.join("inputs.json"), &inputs)?;
 
-    for (index, plan) in assembled.replicas.iter().enumerate() {
+    let (replicas, separations) = terminal_components(&assembled, &records)?;
+    for (bytes, component) in
+        replicas
+            .iter()
+            .zip(["replica-a.bin", "replica-b.bin", "replica-c.bin"])
+    {
+        write_component(&directory, component, bytes, name, edition, manifest)?;
+    }
+    for (bytes, component) in separations.iter().zip(["gap-ab.bin", "gap-bc.bin"]) {
+        write_component(&directory, component, bytes, name, edition, manifest)?;
+    }
+    Ok(())
+}
+
+type TerminalComponents = ([Vec<u8>; 3], [Vec<u8>; 2]);
+
+/// Encode A/B/C and gaps AB/BC, each observed at its planned position.
+fn terminal_components(
+    assembled: &TerminalTripleWritePlan,
+    records: &Records,
+) -> Result<TerminalComponents, Box<dyn std::error::Error>> {
+    let mut replicas: [Vec<u8>; 3] = Default::default();
+    for (bytes, plan) in replicas.iter_mut().zip(&assembled.replicas) {
         let observation = TapeIndexReplicaObservation {
             tape_file_number: plan.component.planned_tape_file_number,
             start_lba: plan.component.planned_start_lba,
             record_count: plan.component.record_count,
         };
         let mut source = records.clone();
-        let mut bytes = Vec::new();
         write_tape_index_replica(plan, observation, &mut source, |block| {
             bytes.extend_from_slice(block);
             Ok(())
         })?;
-        let component = match index {
-            0 => "replica-a.bin",
-            1 => "replica-b.bin",
-            _ => "replica-c.bin",
-        };
-        write_component(&directory, component, &bytes, name, edition, manifest)?;
     }
-
-    for (index, plan) in assembled.separations.iter().enumerate() {
+    let mut separations: [Vec<u8>; 2] = Default::default();
+    for (bytes, plan) in separations.iter_mut().zip(&assembled.separations) {
         let observation = IndexSeparationObservation {
             tape_file_number: plan.component.planned_tape_file_number,
             start_lba: plan.component.planned_start_lba,
             record_count: plan.component.record_count,
         };
-        let mut bytes = Vec::new();
         write_index_separation(plan, observation, |block| {
             bytes.extend_from_slice(block);
             Ok(())
         })?;
-        let component = if index == 0 {
-            "gap-ab.bin"
-        } else {
-            "gap-bc.bin"
-        };
-        write_component(&directory, component, &bytes, name, edition, manifest)?;
     }
-    Ok(())
+    Ok((replicas, separations))
 }
 
 fn plan_records_edition(
@@ -227,6 +262,29 @@ fn plan_records_edition(
     records: Records,
     writer_version: &str,
     write_timestamp: &str,
+) -> Result<TerminalTripleWritePlan, Box<dyn std::error::Error>> {
+    let (edition_sequence, edition_id) = match name {
+        "minimal" => (1, [0x21; 16]),
+        "multi" => (2, [0x22; 16]),
+        _ => (3, [0x23; 16]),
+    };
+    plan_records_edition_with_identity(
+        block_size,
+        records,
+        writer_version,
+        write_timestamp,
+        edition_sequence,
+        edition_id,
+    )
+}
+
+fn plan_records_edition_with_identity(
+    block_size: u32,
+    records: Records,
+    writer_version: &str,
+    write_timestamp: &str,
+    edition_sequence: u64,
+    edition_id: [u8; 16],
 ) -> Result<TerminalTripleWritePlan, Box<dyn std::error::Error>> {
     let counts = TapeIndexReplicaCounts {
         structural_entry_count: records.entries.len() as u64,
@@ -252,14 +310,10 @@ fn plan_records_edition(
         gap_records,
     )?;
     Ok(assemble_terminal_plan(
-        [0x11; 16],
+        VECTOR_TAPE_UUID,
         block_size,
         false,
-        match name {
-            "minimal" => 1,
-            "multi" => 2,
-            _ => 3,
-        },
+        edition_sequence,
         scope,
         counts,
         &mut records.clone(),
@@ -268,11 +322,7 @@ fn plan_records_edition(
             writer_version: writer_version.into(),
             write_timestamp: write_timestamp.into(),
         },
-        match name {
-            "minimal" => [0x21; 16],
-            "multi" => [0x22; 16],
-            _ => [0x23; 16],
-        },
+        edition_id,
         COMPACT_GAP_RECORDS * u64::from(block_size),
     )?)
 }
@@ -508,7 +558,9 @@ fn emit_high_count_evidence(root: &Path) -> Result<(), Box<dyn std::error::Error
     )?
     .edition;
     let mut inputs = plan_inputs(&edition)?;
-    inputs["description"] = json!("Records the million-row stream's plan and zero-based row templates without materializing the stream.");
+    inputs["description"] = json!(
+        "Records the million-row stream's plan and zero-based row templates without materializing the stream."
+    );
     inputs["parameters"] = json!({"object_rows": HIGH_COUNT_OBJECT_ROWS});
     inputs["structural_entries"] = json!({
         "initial": [entry_input(&control_entry(0, TapeIndexReplicaFileKind::Bootstrap, 1))],
@@ -757,8 +809,7 @@ fn with_integer_field(
 }
 
 fn emit_matrix_manifests(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mutations =
-        "case_id\tkind\tbase_profile\ttarget\tmutation\tother_profile\texpected\n\
+    let mutations = "case_id\tkind\tbase_profile\ttarget\tmutation\tother_profile\texpected\n\
 replica-header-damaged\treplica\tmulti-256k\treplica-a.bin\tdamage-header\t\tcrc-header\n\
 replica-footer-damaged\treplica\tmulti-256k\treplica-a.bin\tdamage-footer\t\tcrc-footer\n\
 replica-header-torn\treplica\tmulti-256k\treplica-a.bin\ttorn-header\t\twrong-length\n\
@@ -847,25 +898,177 @@ filemark-missing\tevent\tmulti-256k\treplica-a.bin\tmissing-filemark\t\tmissing-
     assert_eq!(seen.len(), entries.len(), "unused mutation names");
     fs::write(root.join("MUTATIONS.tsv"), table)?;
     fs::write(root.join("mutation-section15.json"), names)?;
-    fs::write(
-        root.join("SELECTION.tsv"),
-        "case_id\tbase_profile\ta\tb\tc\texpected\n\
-healthy\tmulti-256k\tvalid\tvalid\tvalid\tselect-c\n\
-damage-a\tmulti-256k\tdamaged\tvalid\tvalid\tselect-c\n\
-damage-b\tmulti-256k\tvalid\tdamaged\tvalid\tselect-c\n\
-damage-c\tmulti-256k\tvalid\tvalid\tdamaged\tselect-b\n\
-damage-a-b\tmulti-256k\tdamaged\tdamaged\tvalid\tselect-c\n\
-damage-a-c\tmulti-256k\tdamaged\tvalid\tdamaged\tselect-b\n\
-damage-b-c\tmulti-256k\tvalid\tdamaged\tdamaged\tselect-a\n\
-all-invalid\tmulti-256k\tdamaged\tdamaged\tdamaged\tbot-structural-recovery\n\
-all-torn\tmulti-256k\ttorn\ttorn\ttorn\tbot-structural-recovery\n\
-all-missing\tmulti-256k\tmissing\tmissing\tmissing\tbot-structural-recovery\n\
-all-conflicting\tmulti-256k\tconflict-minimal\tvalid\tconflict-minimal\tconflict\n\
-conflicting-a\tmulti-256k\tconflict-minimal\tvalid\tvalid\tconflict\n\
-conflicting-b\tmulti-256k\tvalid\tconflict-minimal\tvalid\tconflict\n\
-conflicting-c\tmulti-256k\tvalid\tvalid\tconflict-minimal\tconflict\n",
-    )?;
+    fs::write(root.join("SELECTION.tsv"), SELECTION)?;
     emit_interruption_matrix(root)?;
+    Ok(())
+}
+
+/// Emit the second-edition replicas and check the reference against the
+/// fixed `SELECTION.tsv` expectations on every row built only from locally
+/// eligible replicas.
+///
+/// A second-edition replica is planned from the `multi-256k` inputs with only
+/// the edition ID and edition sequence changed, so it sits at the profile's own
+/// positions, validates there on its own, and differs from the profile's
+/// replica in edition-common fields (REM-PARITY Sections 8.5 and 10.6).
+fn emit_selection_vectors(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let block_size = TERMINAL_INDEX_BLOCK_SIZES[0];
+    if block_size != 256 * 1024 {
+        return Err("selection base profile multi-256k needs the 256 KiB block size".into());
+    }
+    let records = multi_records();
+    let base = plan_records_edition(
+        "multi",
+        block_size,
+        records.clone(),
+        VECTOR_WRITER,
+        VECTOR_TIMESTAMP,
+    )?;
+    let second = plan_records_edition_with_identity(
+        block_size,
+        records.clone(),
+        VECTOR_WRITER,
+        VECTOR_TIMESTAMP,
+        SECOND_EDITION_SEQUENCE,
+        SECOND_EDITION_ID,
+    )?;
+    let (base_edition, second_edition) = (&base.edition, &second.edition);
+    if second_edition.descriptor.edition_id == base_edition.descriptor.edition_id
+        || second_edition.descriptor.edition_sequence == base_edition.descriptor.edition_sequence
+        || second_edition.edition_digest == base_edition.edition_digest
+    {
+        return Err("second edition does not differ in its edition identity".into());
+    }
+    if second_edition.descriptor.terminal_layout != base_edition.descriptor.terminal_layout
+        || second_edition.layout_digest != base_edition.layout_digest
+        || second_edition.payload_sha256 != base_edition.payload_sha256
+        || second_edition.canonical_map_sha256 != base_edition.canonical_map_sha256
+        || second_edition.replica_layout.replica_record_count
+            != base_edition.replica_layout.replica_record_count
+    {
+        return Err("second edition moved a position or changed a non-identity digest".into());
+    }
+    for (base_plan, second_plan) in base.replicas.iter().zip(&second.replicas) {
+        let (b, s) = (&base_plan.component, &second_plan.component);
+        if (
+            b.planned_tape_file_number,
+            b.planned_start_lba,
+            b.record_count,
+        ) != (
+            s.planned_tape_file_number,
+            s.planned_start_lba,
+            s.record_count,
+        ) || base_plan.replica_ordinal != second_plan.replica_ordinal
+        {
+            return Err("second-edition replica is not at the base profile's position".into());
+        }
+    }
+    let (base_replicas, separations) = terminal_components(&base, &records)?;
+    let (second_replicas, _) = terminal_components(&second, &records)?;
+
+    let directory = root.join("selection");
+    fs::create_dir_all(&directory)?;
+    let mut artifacts = Vec::new();
+    for ((bytes, base_bytes), (letter, plan)) in second_replicas
+        .iter()
+        .zip(&base_replicas)
+        .zip(["a", "b", "c"].into_iter().zip(&second.replicas))
+    {
+        if bytes.len() != base_bytes.len() {
+            return Err("second-edition replica length differs from the profile's".into());
+        }
+        let artifact = format!("second-edition-replica-{letter}.bin");
+        fs::write(directory.join(&artifact), bytes)?;
+        artifacts.push(json!({
+            "artifact": format!("selection/{artifact}"),
+            "replica_ordinal": plan.replica_ordinal,
+            "replaces": format!("multi-256k/replica-{letter}.bin"),
+            "tape_file_number": plan.component.planned_tape_file_number,
+            "start_lba": plan.component.planned_start_lba,
+            "record_count": plan.component.record_count,
+            "bytes": bytes.len(),
+            "sha256": hex(&Sha256::digest(bytes)),
+        }));
+    }
+    write_json(
+        &directory.join("inputs.json"),
+        &json!({
+            "description": "Records the second-edition replicas that SELECTION.tsv names `second-edition`: each is planned and written from the multi-256k inputs with only the edition ID and edition sequence changed, at the multi-256k replica's own position.",
+            "base_profile": "multi-256k",
+            "edition_id": hex(&SECOND_EDITION_ID),
+            "edition_sequence": SECOND_EDITION_SEQUENCE,
+            "edition_digest": hex(&second_edition.edition_digest),
+            "other_inputs": "identical to multi-256k/inputs.json",
+            "artifacts": artifacts,
+        }),
+    )?;
+
+    // The prefix bytes are never read by fast inventory; only the tape-file
+    // and record geometry the terminal layout plans must be real.
+    let mut prefix = Vec::with_capacity(records.entries.len());
+    for entry in &records.entries {
+        let len = usize::try_from(entry.block_count)?
+            .checked_mul(usize::try_from(block_size)?)
+            .ok_or("prefix tape-file length overflow")?;
+        prefix.push(vec![0u8; len]);
+    }
+    for line in SELECTION.lines().skip(1) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [case_id, base_profile, a, b, c, expected] = fields[..] else {
+            return Err(format!("malformed SELECTION row {line}").into());
+        };
+        if base_profile != "multi-256k" {
+            return Err(format!("{case_id}: unexpected base profile {base_profile}").into());
+        }
+        let states = [a, b, c];
+        if !states
+            .iter()
+            .all(|state| matches!(*state, "valid" | "second-edition"))
+        {
+            continue;
+        }
+        let mut tape_files = prefix.clone();
+        for (index, state) in states.iter().enumerate() {
+            tape_files.push(if *state == "second-edition" {
+                second_replicas[index].clone()
+            } else {
+                base_replicas[index].clone()
+            });
+            if let Some(separation) = separations.get(index) {
+                tape_files.push(separation.clone());
+            }
+        }
+        let mut source = ImageDirectoryRawSource::from_tape_files(tape_files, block_size)?;
+        let observed = match read_terminal_index_inventory(
+            &mut source,
+            &VECTOR_TAPE_UUID,
+            block_size,
+            |_| Ok(()),
+            |_| Ok(()),
+        ) {
+            Ok(TerminalInventoryOutcome::Inventory(selection)) => {
+                match selection.selected_replica_ordinal {
+                    1 => "select-a".to_owned(),
+                    2 => "select-b".to_owned(),
+                    3 => "select-c".to_owned(),
+                    other => format!("select-ordinal-{other}"),
+                }
+            }
+            Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)) => {
+                "bot-structural-recovery".to_owned()
+            }
+            Err(TerminalInventoryReadError::TerminalIndexReplicaConflict { .. }) => {
+                "conflict".to_owned()
+            }
+            Err(error) => format!("error ({error})"),
+        };
+        if observed != expected {
+            return Err(format!(
+                "reference disagrees with SELECTION.tsv {case_id}: expected {expected}, observed {observed}"
+            )
+            .into());
+        }
+    }
     Ok(())
 }
 

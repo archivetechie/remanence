@@ -13,9 +13,10 @@ import argparse
 import csv
 import hashlib
 import hmac
+import json
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1153,6 +1154,111 @@ def verify_object_row_extensions(root: Path, contexts: dict[str, ProfileContext]
     return len(rows)
 
 
+def derive_second_edition(
+    data: bytes,
+    block_size: int,
+    tuples: tuple[tuple[int, int, int, int, int], ...],
+    ordinal: int,
+    edition_id: bytes,
+    edition_sequence: int,
+) -> bytes:
+    """Re-derive this replica as another edition's, at this replica's position.
+
+    Only the two edition-common identity fields change. The edition digest,
+    the local descriptor digest, both frame CRCs and the footer's header hash
+    are recomputed from them; positions, counts, payload and every other
+    digest stay the base profile's.
+    """
+    out = bytearray(data)
+    frames = (0, len(out) - block_size)
+    for base in frames:
+        out[base + 0x20 : base + 0x30] = edition_id
+        put_u64(out, base + 0x30, edition_sequence)
+    digest = edition_digest(bytes(out[:0x400]))
+    for base in frames:
+        out[base + 0xE8 : base + 0x108] = digest
+    descriptor = replica_descriptor_digest(bytes(out[:0x400]), tuples, ordinal)
+    for base in frames:
+        out[base + 0x128 : base + 0x148] = descriptor
+    finalize_replica_pair(out, block_size)
+    return bytes(out)
+
+
+def load_second_edition(
+    root: Path, contexts: dict[str, ProfileContext]
+) -> tuple[ProfileContext, dict[str, bytes]]:
+    """Check the pinned second-edition replicas at the base profile's positions."""
+    inputs = json.loads((root / "selection" / "inputs.json").read_text())
+    require(inputs["base_profile"] == "multi-256k", "manifest", "second-edition base profile")
+    base = contexts[inputs["base_profile"]]
+    edition_id = bytes.fromhex(inputs["edition_id"])
+    edition_sequence = inputs["edition_sequence"]
+    require(
+        len(edition_id) == 16
+        and any(edition_id)
+        and is_unsigned_integer(edition_sequence)
+        and 0 < edition_sequence <= MASK64,
+        "manifest",
+        "second-edition identity",
+    )
+    require(
+        edition_id != base.edition_id and edition_sequence != base.edition_sequence,
+        "manifest",
+        "second edition repeats the base identity",
+    )
+    artifacts = inputs["artifacts"]
+    require(len(artifacts) == 3, "manifest", "second-edition replica set")
+    replicas: dict[str, bytes] = {}
+    context = None
+    for ordinal, (artifact, (filename, _, _)) in enumerate(zip(artifacts, COMPONENTS[::2]), 1):
+        local = base.tuples[(ordinal - 1) * 2]
+        require(
+            artifact["artifact"] == f"selection/second-edition-{filename}"
+            and artifact["replaces"] == f"{base.name}/{filename}"
+            and artifact["replica_ordinal"] == ordinal
+            and (artifact["tape_file_number"], artifact["start_lba"], artifact["record_count"])
+            == (local[2], local[3], local[4]),
+            "manifest",
+            f"second-edition {filename}: not at the base profile's position",
+        )
+        pinned = (root / artifact["artifact"]).read_bytes()
+        require(
+            len(pinned) == artifact["bytes"]
+            and hashlib.sha256(pinned).hexdigest() == artifact["sha256"],
+            "manifest",
+            f"second-edition {filename}: artifact digest",
+        )
+        derived = derive_second_edition(
+            (base.directory / filename).read_bytes(),
+            base.block_size,
+            base.tuples,
+            ordinal,
+            edition_id,
+            edition_sequence,
+        )
+        require(pinned == derived, "manifest", f"second-edition {filename}: independent re-derivation")
+        digest = derived[0xE8:0x108]
+        require(digest.hex() == inputs["edition_digest"], "manifest", "second-edition digest")
+        context = replace(
+            base,
+            name=f"{base.name}-second-edition",
+            edition_id=edition_id,
+            edition_sequence=edition_sequence,
+            edition_digest=digest,
+        )
+        # Locally eligible on its own at the base profile's coordinates.
+        summary = verify_replica(pinned, context, ordinal)
+        require(
+            (summary.payload_digest, summary.map_digest, summary.layout_digest)
+            == (base.payload_digest, base.map_digest, base.layout_digest),
+            "manifest",
+            f"second-edition {filename}: non-identity digests changed",
+        )
+        replicas[filename] = pinned
+    assert context is not None
+    return context, replicas
+
+
 def verify_selection(root: Path, contexts: dict[str, ProfileContext]) -> int:
     rows = read_tsv(root / "SELECTION.tsv")
     expected_cases = {
@@ -1161,16 +1267,25 @@ def verify_selection(root: Path, contexts: dict[str, ProfileContext]) -> int:
         "conflicting-a", "conflicting-b", "conflicting-c",
     }
     require({row["case_id"] for row in rows} == expected_cases, "matrix", "selection coverage")
+    second_context, second_replicas = load_second_edition(root, contexts)
     filenames = ("replica-a.bin", "replica-b.bin", "replica-c.bin")
     for row in rows:
         base = contexts[row["base_profile"]]
+        require(base.name == second_context.name.removesuffix("-second-edition"), "matrix", f"{row['case_id']}: base profile")
         survivors: list[ReplicaSummary] = []
         for ordinal, (column, filename) in enumerate(zip(("a", "b", "c"), filenames), 1):
             state = row[column]
+            require(
+                state in ("valid", "damaged", "torn", "missing", "second-edition"),
+                "matrix",
+                f"{row['case_id']}: replica state {state}",
+            )
             if state == "missing":
                 continue
-            artifact_context = contexts[f"minimal-{base.block_size // 1024}k"] if state == "conflict-minimal" else base
-            data = (artifact_context.directory / filename).read_bytes()
+            if state == "second-edition":
+                artifact_context, data = second_context, second_replicas[filename]
+            else:
+                artifact_context, data = base, (base.directory / filename).read_bytes()
             if state == "damaged":
                 data = mutate_replica(data, "damage-header", base.block_size, None)
             elif state == "torn":

@@ -9,7 +9,7 @@ damage-b-c	multi-256k	valid	damaged	damaged	select-a
 all-invalid	multi-256k	damaged	damaged	damaged	bot-structural-recovery
 all-torn	multi-256k	torn	torn	torn	bot-structural-recovery
 all-missing	multi-256k	missing	missing	missing	bot-structural-recovery
-all-conflicting	multi-256k	conflict-minimal	valid	conflict-minimal	conflict
-conflicting-a	multi-256k	conflict-minimal	valid	valid	conflict
-conflicting-b	multi-256k	valid	conflict-minimal	valid	conflict
-conflicting-c	multi-256k	valid	valid	conflict-minimal	conflict
+all-conflicting	multi-256k	second-edition	valid	second-edition	conflict
+conflicting-a	multi-256k	second-edition	valid	valid	conflict
+conflicting-b	multi-256k	valid	second-edition	valid	conflict
+conflicting-c	multi-256k	valid	valid	second-edition	conflict

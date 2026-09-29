@@ -319,6 +319,8 @@ pub enum Layer3cSidecarMetadataHealthTag {
     TailCopyLost,
     /// The primary header copy was lost.
     PrimaryHeaderLost,
+    /// The tail copy was not read (the primary was vouched for).
+    TailCopyNotRead,
 }
 
 impl Layer3cSidecarMetadataHealthTag {
@@ -328,6 +330,7 @@ impl Layer3cSidecarMetadataHealthTag {
             Self::BothCopiesUsable => "both_copies_usable",
             Self::TailCopyLost => "tail_copy_lost",
             Self::PrimaryHeaderLost => "primary_header_lost",
+            Self::TailCopyNotRead => "tail_copy_not_read",
         }
     }
 
@@ -337,6 +340,7 @@ impl Layer3cSidecarMetadataHealthTag {
             SidecarMetadataHealth::BothCopiesUsable => Self::BothCopiesUsable,
             SidecarMetadataHealth::TailCopyLost => Self::TailCopyLost,
             SidecarMetadataHealth::PrimaryHeaderLost => Self::PrimaryHeaderLost,
+            SidecarMetadataHealth::TailCopyNotRead => Self::TailCopyNotRead,
         }
     }
 }

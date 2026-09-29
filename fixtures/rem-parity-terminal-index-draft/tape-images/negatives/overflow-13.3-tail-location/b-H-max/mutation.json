@@ -123,7 +123,7 @@
   "entry_points": [
     "parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor",
     "decode_sidecar_epoch_directory_cbor (each copy's payload key 4)",
-    "recover_ordinal_from_sidecar (directory-assisted tail rescue)"
+    "recover_ordinal_from_sidecar (the map from the validated terminal replicas' structural rows)"
   ],
   "target_role": "Recovery"
 }

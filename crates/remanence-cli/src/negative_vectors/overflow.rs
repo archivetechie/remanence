@@ -402,13 +402,55 @@ pub(super) fn mutate(
     }
 }
 
+/// The map a Scanner with no off-tape state gives the Recoverer and the
+/// Verifier: the structural rows of a validated terminal replica, at the
+/// replicas' recorded scope (REM-PARITY 8.4, 13.1). The map's source is marked
+/// as a terminal replica's, which is what 13.3's tail rescue from the terminal
+/// index applies to.
+fn replica_scoped_map(
+    raw: &mut ImageDirectoryRawSource,
+    uuid: &[u8; 16],
+) -> Result<ScopedFilemarkMap, ObservedError> {
+    let mut raw_rows = Vec::new();
+    let mut attempt = None;
+    let outcome = read_terminal_index_inventory_streamed(raw, uuid, BLOCK, |event| {
+        match event {
+            TerminalInventoryStreamEvent::ReplicaAttemptStarted { attempt_id, .. } => {
+                raw_rows.clear();
+                attempt = Some(attempt_id);
+            }
+            TerminalInventoryStreamEvent::StructuralEntry {
+                attempt_id, entry, ..
+            } => {
+                assert_eq!(attempt, Some(attempt_id));
+                raw_rows.push(entry);
+            }
+            TerminalInventoryStreamEvent::ObjectRow { .. } => {}
+            TerminalInventoryStreamEvent::ReplicaAttemptRejected { .. } => raw_rows.clear(),
+        }
+        Ok(())
+    });
+    match outcome {
+        Ok(TerminalInventoryOutcome::Inventory(selection)) => Ok(scoped_map_from_terminal_replica(
+            &selection.edition,
+            &raw_rows,
+        )?),
+        Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)) => {
+            Err(ObservedError::BotStructuralRecoveryRequired)
+        }
+        Err(error) => Err(ObservedError::TerminalInventory(format!("{error:?}"))),
+    }
+}
+
+/// The Recoverer, asked for ordinal 0 (epoch 0), over the case's tape with the
+/// map from the validated terminal replicas.
 pub(super) fn recover(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
     let base = generate("a4-minimal").expect("base image");
-    let map = ScopedFilemarkMap::from_catalog(base.written.map, 4);
     let mut raw = ImageDirectoryRawSource::from_tape_files(
         v.files.values().map(|b| b.concat()).collect(),
         BLOCK,
     )?;
+    let map = replica_scoped_map(&mut raw, &v.uuid)?;
     recover_ordinal_from_sidecar(
         &mut raw,
         &map,
@@ -418,6 +460,66 @@ pub(super) fn recover(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedEr
         0,
     )?;
     Ok(())
+}
+
+/// A Verifier's full verification of epoch 0's sidecar over the case's tape,
+/// with the map from the validated terminal replicas. Its first finding is the
+/// observed error, a `SidecarParse` before any other.
+pub(super) fn verifier(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
+    let base = generate("a4-minimal").expect("base image");
+    let mut raw = ImageDirectoryRawSource::from_tape_files(
+        v.files.values().map(|b| b.concat()).collect(),
+        BLOCK,
+    )?;
+    let map = replica_scoped_map(&mut raw, &v.uuid)?;
+    let sidecar = map
+        .map
+        .entries()
+        .iter()
+        .find(|e| e.kind == TapeFileKind::ParitySidecar)
+        .expect("the image's sidecar")
+        .clone();
+    let verification = verify_sidecar(
+        &mut raw,
+        &map,
+        &sidecar,
+        &base.written.inputs.scheme,
+        &v.uuid,
+        BLOCK,
+    )?;
+    finding_as_error(&verification)
+}
+
+/// The Section 15 error a Verifier reports for a sidecar's findings: the
+/// first `SidecarParse`, else the first finding, else none.
+pub(super) fn finding_as_error(verification: &SidecarVerification) -> Result<(), ObservedError> {
+    // Copy-health findings carry no Section 15 name and are not observed here.
+    let named = || {
+        verification
+            .findings
+            .iter()
+            .filter(|f| f.kind != SidecarFindingKind::CopyHealth)
+    };
+    let finding = named()
+        .find(|f| f.kind == SidecarFindingKind::SidecarParse)
+        .or_else(|| named().next());
+    match finding {
+        None => Ok(()),
+        Some(finding) => Err(ObservedError::Parity(match finding.kind {
+            SidecarFindingKind::SidecarParse | SidecarFindingKind::CopyHealth => {
+                ParityError::SidecarParse(finding.detail.clone())
+            }
+            SidecarFindingKind::SidecarMetadataUnavailable => {
+                ParityError::SidecarMetadataUnavailable {
+                    epoch_id: verification.epoch_id,
+                }
+            }
+            SidecarFindingKind::SchemeMismatch => ParityError::SchemeMismatch {
+                tape: finding.detail.clone(),
+                expected: "the bootstrap's scheme".into(),
+            },
+        })),
+    }
 }
 /// The Section 3.3 inverse at unit level, through the one helper every
 /// Recoverer caller uses: start = 2^64 − 2, end = 2^64 − 1, S = k = 2. Each
@@ -488,19 +590,26 @@ fn hostile_append_point_inputs() -> Result<Value, String> {
 /// at their planned positions. The prefix files are present with their
 /// planned record counts, as zero-filled records: discovery reads none of them.
 pub(super) fn terminal_scanner(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
-    let profile = v.descriptor["artifact"]
-        .as_str()
-        .and_then(|a| a.strip_prefix("terminal profile "))
-        .expect("a terminal profile case");
-    let prefix = super::profiles::prefix_block_counts(profile).expect("profile prefix");
-    let mut tape_files: Vec<Vec<u8>> = prefix.iter().map(|&n| vec![0; n as usize * B]).collect();
-    for (&file, blocks) in &v.files {
-        assert_eq!(
-            file,
-            tape_files.len(),
-            "terminal files follow the prefix densely"
-        );
-        tape_files.push(blocks.concat());
+    let artifact = v.descriptor["artifact"].as_str().expect("artifact");
+    let mut tape_files: Vec<Vec<u8>> = Vec::new();
+    if artifact.starts_with("tape-image ") {
+        // A whole image: every tape file is present, discovery reads only the
+        // terminal suffix.
+        tape_files.extend(v.files.values().map(|blocks| blocks.concat()));
+    } else {
+        let profile = artifact
+            .strip_prefix("terminal profile ")
+            .expect("a terminal profile case");
+        let prefix = super::profiles::prefix_block_counts(profile).expect("profile prefix");
+        tape_files = prefix.iter().map(|&n| vec![0; n as usize * B]).collect();
+        for (&file, blocks) in &v.files {
+            assert_eq!(
+                file,
+                tape_files.len(),
+                "terminal files follow the prefix densely"
+            );
+            tape_files.push(blocks.concat());
+        }
     }
     let mut raw = ImageDirectoryRawSource::from_tape_files(tape_files, BLOCK)?;
     match read_terminal_index_inventory(&mut raw, &v.uuid, BLOCK, |_| Ok(()), |_| Ok(())) {
@@ -566,7 +675,8 @@ pub(super) fn walk_scanner(v: &Resolved, _: usize, _: usize) -> Result<(), Obser
             v.files.values().map(|b| b.concat()).collect(),
             BLOCK,
         )?,
-        stall_lba: v.injected.then_some(WALK_STALL_LBA),
+        stall_lba: (v.injected && v.descriptor.get("injection").is_some())
+            .then_some(WALK_STALL_LBA),
     };
     scan_reconstruct_filemark_map_with_report(&mut raw, &v.uuid, BLOCK)?;
     Ok(())

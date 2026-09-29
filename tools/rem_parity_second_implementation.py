@@ -2225,6 +2225,9 @@ QUOTES.update({
     'opaque_bytes': ('2.2', 'It reads those blocks as opaque bytes and does not interpret Object content (Section 1.1, goal 2).'),
     'structure_not_full': ('2.2', 'A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification.'),
     'full_verification_d': ('D', "A full verification reads every data block and parity shard (Section 2.2), and the reference's verification is to be brought into line before freeze."),
+    'artifact_after_suffix': ('12.6', 'A structural artifact after the exact terminal suffix is nonconformant and MUST NOT be admitted as an Object.'),
+    'normal_suffix_eod': ('12.6', "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."),
+    'structural_damage_walk': ('12.2', 'a zero-block file or a missing trailing filemark is structural damage;'),
     'map_rescue': ('13.3', "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates."),
     'map_rescue_position': ('13.3', "With `total` the map entry's block count and `P = S × m`, the tail copy starts at block `H + P`, where `H = (total − 1 − P) / 2`."),
     'map_rescue_requires': ('13.3', 'This rescue requires that `total − 1 − P` is even and that `H` is greater than zero.'),
@@ -2248,12 +2251,20 @@ FILEMARK = "filemark"
 END_OF_DATA = "end of data"
 
 
+ARTIFACT_CLASS = "nonconformant artifact after the terminal suffix (not admitted as an Object)"
+
+
+class Underivable(Exception):
+    """A READ met a record whose bytes the case states but this Reader cannot derive (GAPS.md)."""
+
+
 class DamagedTape:
     """The case's fault model applied to a record stream (bytes or None for a filemark)."""
 
-    def __init__(self, records: list[Any], unreadable: set[int]) -> None:
+    def __init__(self, records: list[Any], unreadable: set[int], underivable: set[int] | None = None) -> None:
         self._records = records
         self._unreadable = set(unreadable)
+        self.underivable = set(underivable or ())
 
     def eod(self) -> int:
         return len(self._records)
@@ -2263,6 +2274,8 @@ class DamagedTape:
             return END_OF_DATA
         if lba in self._unreadable:
             raise MediumError(lba)
+        if lba in self.underivable:
+            raise Underivable(lba)
         record = self._records[lba]
         return FILEMARK if record is None else record
 
@@ -2875,12 +2888,13 @@ def discover_layout(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tup
     no layout and no replica validates.
     """
     eod = tape.eod()
-    position = eod  # the position just after the next filemark to space back over
+    limit = eod  # spacing back from here crosses records freely, and stops at the nearest filemark before it
     rejected = []
     for _ in range(5):
-        filemark = position - 1
-        if filemark < 0 or not tape.is_filemark(filemark):
+        marks = tape.filemark_positions_before(limit)
+        if not marks:
             break
+        filemark = marks[0]
         record_lba = filemark - 1
         if record_lba < 0 or tape.is_filemark(record_lba):
             break
@@ -2896,10 +2910,7 @@ def discover_layout(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tup
                 rejected.append(f"footer at LBA {record_lba} plans EOD {footer['eod']}, before the tape's EOD {eod}")
             else:
                 return footer["tuples"], f"replica footer at LBA {record_lba} (replica ordinal {footer['ordinal']})"
-        previous = tape.filemark_positions_before(record_lba)
-        if not previous:
-            break
-        position = previous[0] + 1
+        limit = record_lba
     note = "no terminal-replica footer supplies a layout from EOD"
     return None, note + (" (" + "; ".join(rejected) + ")" if rejected else "")
 
@@ -3145,10 +3156,22 @@ class WalkedFile:
     start_ordinal: int | None = None
     end_ordinal: int | None = None
     failed_classification: str | None = None
+    artifact: bool = False
+    undecidable: bool = False
 
 
 def classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, tape_uuid: bytes,
                   block_size: int) -> WalkedFile:
+    """The ladder for one file; undecidable when it must read a record whose bytes are not derivable (GAPS.md)."""
+    try:
+        return _classify_file(tape, tape_file, start, count, tape_uuid, block_size)
+    except Underivable as failure:
+        return WalkedFile(tape_file, start, count, None, f"undecidable: the record at LBA {failure.args[0]} is not "
+                          "derivable", undecidable=True)
+
+
+def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, tape_uuid: bytes,
+                   block_size: int) -> WalkedFile:
     """Section 12.3's ladder for one measured tape file.
 
     Items 2 and 3 commit a file to its control type as soon as its magic
@@ -3304,7 +3327,27 @@ def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list
             break
         position = filemark + 1
         tape_file += 1
+    mark_artifacts(files)
     return files, damage
+
+
+def mark_artifacts(files: list[WalkedFile]) -> None:
+    """Section 12.6: a structural artifact after the exact terminal suffix is not admitted as an Object.
+
+    The exact terminal suffix is five consecutive tape files the ladder
+    recognises, undamaged, as replica, separation extent, replica, separation
+    extent, replica. Every Object candidate that follows them is such an
+    artifact. When the five are not exact, item 7 applies unchanged.
+    """
+    kinds = [KIND_REPLICA, KIND_SEPARATION, KIND_REPLICA, KIND_SEPARATION, KIND_REPLICA]
+    for first in range(len(files) - 4):
+        window = files[first:first + 5]
+        if all(walked.kind == kind and not walked.note.startswith("damaged") for walked, kind in zip(window, kinds)):
+            for walked in files[first + 5:]:
+                if walked.kind == KIND_OBJECT:
+                    walked.artifact = True
+                    walked.note += "; follows the exact terminal suffix, so not admitted as an Object (Section 12.6)"
+            return
 
 
 def second_pass_and_map(files: list[WalkedFile]) -> dict[str, Any]:
@@ -3331,8 +3374,13 @@ def second_pass_and_map(files: list[WalkedFile]) -> dict[str, Any]:
     entries: list[MapEntry] = []
     ordinal = 0
     failed = [walked for walked in files if walked.kind is None]
+    if any(walked.undecidable for walked in files):
+        result["reason"] = "tape file(s) " + ", ".join(str(w.tape_file_number) for w in files if w.undecidable) + \
+            " cannot be classified from the case's derivable bytes"
+        result["error"] = "undecided"
+        return result
     for walked in files:
-        if walked.kind is None:
+        if walked.kind is None or walked.artifact:
             break
         if walked.kind == KIND_OBJECT:
             entries.append(MapEntry(walked.tape_file_number, KIND_OBJECT, walked.count, ordinal))
@@ -6653,8 +6701,8 @@ class FaultMapError(Exception):
 
 # Every key a damage case's fault map may carry, at every level. Any other key
 # fails the run: an ignored key would decide a damaged tape as an intact one.
-FAULT_MAP_KEYS = {"failed_data_addresses", "hints", "image", "observations", "read_data_addresses", "record_edits",
-                  "removed_filemark_after_tape_file", "unreadable_records"}
+FAULT_MAP_KEYS = {"appended_files", "failed_data_addresses", "hints", "image", "observations", "read_data_addresses",
+                  "record_edits", "record_insertions", "removed_filemark_after_tape_file", "unreadable_records"}
 FAULT_MAP_REQUIRED = {"failed_data_addresses", "image", "removed_filemark_after_tape_file", "unreadable_records"}
 HINT_KEYS = {"block_size", "scheme", "tape_uuid"}
 SCHEME_HINT_KEYS = {"S", "k", "m"}
@@ -6662,6 +6710,19 @@ OBSERVATION_KEYS = {"hints", "id"}
 RECORD_EDIT_KEYS = {"construction", "edits", "lba", "length", "original_length", "record_index", "sha256", "tape_file"}
 BYTE_EDIT_KEYS = {"new_bytes", "offset", "old_bytes", "reason"}
 UNREADABLE_KEYS = {"filemark", "lba", "record_index", "tape_file"}
+INSERTION_KEYS = {"after_record_index", "fill", "length", "sha256", "tape_file"}
+APPENDED_FILE_KEYS = {"records", "trailing_filemark"}
+# The keys of an appended record, by its source. A source this Reader does not
+# know fails the run, as an unknown key does.
+APPENDED_RECORD_KEYS = {
+    "foreign": {"first_byte", "length", "sha256", "source"},
+    "copy_of": {"length", "record_index", "sha256", "source", "tape_file"},
+    "second_edition_replica": {"length", "planned_start_lba", "planned_tape_file_number", "record_index", "sha256",
+                               "source"},
+}
+
+
+HEX_DIGITS = set("0123456789abcdefABCDEF")
 
 
 def _exact_keys(value: Any, allowed: set[str], required: set[str], where: str) -> None:
@@ -6709,6 +6770,48 @@ def validate_fault_map(case: Any, where: str) -> None:
             if not (isinstance(address, list) and len(address) == 2 and all(is_uint(v) for v in address)):
                 raise FaultMapError(f"{where}.{key}[{index}]: expected a [tape_file, block] pair")
     _check_record_edits(case.get("record_edits", []), where + ".record_edits")
+    _check_record_insertions(case.get("record_insertions", []), where + ".record_insertions")
+    _check_appended_files(case.get("appended_files", []), where + ".appended_files")
+
+
+def _check_record_insertions(insertions: Any, where: str) -> None:
+    if not isinstance(insertions, list):
+        raise FaultMapError(f"{where}: expected a list")
+    for index, item in enumerate(insertions):
+        _exact_keys(item, INSERTION_KEYS, INSERTION_KEYS, f"{where}[{index}]")
+        if not (is_uint(item["tape_file"]) and is_uint(item["after_record_index"]) and is_uint(item["length"])
+                and item["length"] > 0):
+            raise FaultMapError(f"{where}[{index}]: tape_file, after_record_index and length must be integers "
+                                f"(the length positive)")
+        if not (isinstance(item["fill"], str) and len(item["fill"]) == 2 and set(item["fill"]) <= HEX_DIGITS):
+            raise FaultMapError(f"{where}[{index}].fill: expected one byte as two hex digits")
+        if not (isinstance(item["sha256"], str) and len(item["sha256"]) == 64 and set(item["sha256"]) <= HEX_DIGITS):
+            raise FaultMapError(f"{where}[{index}].sha256: expected 64 hex digits")
+
+
+def _check_appended_files(files: Any, where: str) -> None:
+    if not isinstance(files, list):
+        raise FaultMapError(f"{where}: expected a list")
+    for index, item in enumerate(files):
+        _exact_keys(item, APPENDED_FILE_KEYS, APPENDED_FILE_KEYS, f"{where}[{index}]")
+        if not isinstance(item["trailing_filemark"], bool):
+            raise FaultMapError(f"{where}[{index}].trailing_filemark: expected true or false")
+        if not isinstance(item["records"], list) or not item["records"]:
+            raise FaultMapError(f"{where}[{index}].records: expected a non-empty list")
+        for position, record in enumerate(item["records"]):
+            here = f"{where}[{index}].records[{position}]"
+            if not isinstance(record, dict) or record.get("source") not in APPENDED_RECORD_KEYS:
+                raise FaultMapError(f"{here}: unknown source {record.get('source') if isinstance(record, dict) else record!r}; "
+                                    f"this Reader knows {', '.join(sorted(APPENDED_RECORD_KEYS))}")
+            _exact_keys(record, APPENDED_RECORD_KEYS[record["source"]], APPENDED_RECORD_KEYS[record["source"]], here)
+            if not (is_uint(record["length"]) and record["length"] > 0):
+                raise FaultMapError(f"{here}.length: expected a positive integer")
+            if not (isinstance(record["sha256"], str) and len(record["sha256"]) == 64 and set(record["sha256"]) <= HEX_DIGITS):
+                raise FaultMapError(f"{here}.sha256: expected 64 hex digits")
+            if record["source"] == "foreign" and not (
+                    isinstance(record["first_byte"], str) and len(record["first_byte"]) == 2
+                    and set(record["first_byte"]) <= HEX_DIGITS):
+                raise FaultMapError(f"{here}.first_byte: expected one byte as two hex digits")
 
 
 def _check_record_edits(edits: Any, where: str) -> None:
@@ -6775,9 +6878,17 @@ def observations_of(case: Mapping[str, Any]) -> list[tuple[str | None, dict[str,
     return [(observation["id"], dict(base, hints=observation["hints"])) for observation in case["observations"]]
 
 
+PARITY_MAP_RECONSTRUCTION = "the ParityMap re-encoded with the edited directory entry"
+
+
 def _construction_matches(construction: str, length: int, original_length: int) -> bool:
-    """The three constructions a record edit may state, each checked against its lengths."""
-    if construction == "the original record's length":
+    """The constructions a record edit may state, each checked against its lengths.
+
+    "the ParityMap re-encoded with the edited directory entry" states no length
+    of its own: the record keeps its length, and the byte edits it lists (each
+    old byte checked, the result's SHA-256 checked) are the whole change.
+    """
+    if construction in ("the original record's length", PARITY_MAP_RECONSTRUCTION):
         return length == original_length
     match = re.fullmatch(r"the first (\d+) bytes of the original record", construction)
     if match:
@@ -6788,16 +6899,44 @@ def _construction_matches(construction: str, length: int, original_length: int) 
     return False
 
 
-def _recomputed_check(record: bytes, offset: int, new: bytes) -> str | None:
-    """Whether an edit that says it recomputes a bootstrap CRC holds the CRC I compute (reported, not enforced)."""
-    if offset == 0x30 and len(new) == 8 and len(record) >= 0x38:
+def _recomputed_check(record: bytes, offset: int, new: bytes, image: "ImageBuild | None" = None) -> str | None:
+    """Whether an edit that says it recomputes a checksum or hash holds the value I compute (reported, not enforced).
+
+    The bootstrap's two CRCs are checked from Section 8.1. A sidecar
+    header/index copy that fits one block is parsed under Sections 9.2 to 9.5,
+    which checks its canonical metadata hash and both CRCs together. A
+    ParityMap header or footer is checked from Section 10.1.3: the CRC at 0xC0
+    and, for a header whose payload sits in the record, the payload SHA-256
+    at 0x38.
+    """
+    if offset == 0x30 and len(new) == 8 and len(record) >= 0x38 and record[0:8] == BOOTSTRAP_MAGIC_BYTES:
         return "header CRC agrees with mine" if crc64_xz(record[0:0x30]) == int.from_bytes(new, "little") else \
             "header CRC differs from mine"
-    if len(record) >= 0x38:
+    if len(record) >= 0x38 and record[0:8] == BOOTSTRAP_MAGIC_BYTES:
         payload_len = rd32(record, 0x2C)
         if offset == 0x38 + payload_len and len(new) == 8 and 0x38 + payload_len + 8 <= len(record):
             return "payload CRC agrees with mine" if crc64_xz(record[0x38:0x38 + payload_len]) == int.from_bytes(new, "little") \
                 else "payload CRC differs from mine"
+        return None
+    if image is None:
+        return None
+    if record[0:8] == role_magic(image.tape_uuid, LABEL_SIDECAR):
+        try:
+            copy = parse_sidecar_copy([record], image.tape_uuid, image.block_size, rd16(record, 0x90))
+        except ReadFailure as failure:
+            return f"the edited sidecar copy does not parse under Sections 9.2 to 9.5 ({failure.reason})"
+        return "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)" \
+            if copy is not None else None
+    if record[0:8] == role_magic(image.tape_uuid, LABEL_PARITY_MAP):
+        parts = []
+        if len(record) >= 0xC8:
+            parts.append("CRC at 0xC0 agrees with mine" if crc64_xz(record[0:0xC0]) == rd64(record, 0xC0)
+                         else "CRC at 0xC0 differs from mine")
+            payload_len = rd64(record, 0x30)
+            if rd16(record, 0x0A) in (1, 2) and 0xC8 + payload_len <= len(record):
+                same = hashlib.sha256(record[0xC8:0xC8 + payload_len]).digest() == record[0x38:0x58]
+                parts.append("payload SHA-256 at 0x38 agrees with mine" if same else "payload SHA-256 at 0x38 differs from mine")
+        return "; ".join(parts) or None
     return None
 
 
@@ -6831,34 +6970,119 @@ def apply_record_edits(image: ImageBuild, records: list[Any], case: Mapping[str,
                                     f"offset {offset}, mine are {bytes(record[offset:offset + len(old)]).hex()}")
             record[offset : offset + len(new)] = new
             check = {"offset": offset, "bytes": len(new), "reason": edit["reason"], "old_bytes_agree": True}
-            if "recomputed" in edit["reason"]:
-                check["recomputation"] = _recomputed_check(bytes(record), offset, new)
-            checks.append(check)
+            checks.append((check, edit, offset, new))
         digest = hashlib.sha256(bytes(record)).hexdigest()
         if digest != item["sha256"]:
             raise FaultMapError(f"{where}: the edited record's SHA-256 is {digest}, the case states {item['sha256']}")
+        # A recomputed checksum or hash is compared with mine on the finished
+        # record, once every edit is in place; it is reported, not enforced.
+        for check, edit, offset, new in checks:
+            if "recomputed" in edit["reason"]:
+                check["recomputation"] = _recomputed_check(bytes(record), offset, new, image)
         records[lba] = bytes(record)
         applied.append({"tape_file": tape_file, "record_index": record_index, "lba": lba, "length": item["length"],
-                        "construction": item["construction"], "edits": checks, "sha256_agrees": True})
+                        "construction": item["construction"], "edits": [entry[0] for entry in checks],
+                        "sha256_agrees": True})
     return applied
 
 
+def _appended_record(image: ImageBuild, record: Mapping[str, Any], records: list[Any], where: str) -> tuple[bytes | None, str]:
+    """The bytes of one appended record, from its stated source, and how they were obtained.
+
+    Returns (bytes, note). A record whose bytes this Reader cannot derive from
+    the file and the text has bytes None; the case's decisions that depend on
+    it are then undecidable (GAPS.md).
+    """
+    source, length = record["source"], record["length"]
+    if source == "foreign":
+        # The file states only the first byte; the rest is taken as zeros, the
+        # simplest reading, and the stated SHA-256 is checked against it.
+        data = bytes.fromhex(record["first_byte"]) + bytes(length - 1)
+        note = "first byte as stated, the rest zeros"
+    elif source == "copy_of":
+        tape_file, record_index = record["tape_file"], record["record_index"]
+        if not (0 <= tape_file < len(image.files)) or not (0 <= record_index < len(image.files[tape_file].blocks)):
+            raise FaultMapError(f"{where}: tape file {tape_file} has no data record {record_index} to copy")
+        data = image.files[tape_file].blocks[record_index]
+        note = f"a copy of my build's tape file {tape_file} record {record_index}"
+        if len(data) != length:
+            raise FaultMapError(f"{where}: the copied record is {len(data)} bytes, the case states {length}")
+    else:
+        # A replica "of a second edition" planned at the stated file and LBA.
+        # Its ordinal, planned layout and digests are not stated, so its
+        # bytes cannot be derived; the stated SHA-256 is all there is.
+        return None, "bytes not derivable from the file and the text (GAPS.md)"
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != record["sha256"]:
+        raise FaultMapError(f"{where}: my {source} record's SHA-256 is {digest}, the case states {record['sha256']}")
+    return data, note
+
+
 def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[DamagedTape, list[str]]:
-    """Apply the case's faults to my undamaged build (the fault model is given, not derived)."""
+    """Apply the case's faults to my undamaged build (the fault model is given, not derived).
+
+    The order is fixed: record edits, record insertions, the removed filemark,
+    appended files; every position the case states (an unreadable record's LBA, a
+    removed filemark's tape file) is one of the undamaged image.
+    """
     records = image.records()
     notes = []
     for applied in apply_record_edits(image, records, case):
         notes.append(f"record at LBA {applied['lba']} (tape file {applied['tape_file']} record "
                      f"{applied['record_index']}) replaced: {applied['construction']}, {applied['length']} bytes, "
                      f"{len(applied['edits'])} byte edit(s); every stated old byte and the SHA-256 agree")
+    # origin[i] is the undamaged image's LBA of the record now at position i,
+    # or None for a record the case inserted or appended.
+    origin: list[int | None] = list(range(len(records)))
+    insertions = case.get("record_insertions", [])
+    positions = []
+    for index, item in enumerate(insertions):
+        where = f"record_insertions[{index}]"
+        tape_file, after = item["tape_file"], item["after_record_index"]
+        if not (0 <= tape_file < len(image.files)) or not (0 <= after < len(image.files[tape_file].blocks)):
+            raise FaultMapError(f"{where}: tape file {tape_file} has no data record {after} to insert after")
+        data = bytes.fromhex(item["fill"]) * item["length"]
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != item["sha256"]:
+            raise FaultMapError(f"{where}: my inserted record's SHA-256 is {digest}, the case states {item['sha256']}")
+        position = image.file_start_lba(tape_file) + after + 1
+        if position in [p for p, _ in positions]:
+            raise FaultMapError(f"{where}: two insertions at the same position")
+        positions.append((position, data))
+        notes.append(f"a {item['length']}-byte record of 0x{item['fill']} inserted after record {after} of tape file "
+                     f"{tape_file} (before the record now at LBA {position}); every later record moves up by one")
+    for position, data in sorted(positions, reverse=True):
+        records.insert(position, data)
+        origin.insert(position, None)
     removed = case.get("removed_filemark_after_tape_file")
-    removed_lba = None
     if removed is not None:
         removed_lba = image.file_start_lba(removed) + len(image.files[removed].blocks)
-        if records[removed_lba] is not None:
+        if removed_lba not in origin or records[origin.index(removed_lba)] is not None:
             raise ValueError(f"no filemark after tape file {removed}")
-        del records[removed_lba]
+        at = origin.index(removed_lba)
+        del records[at]
+        del origin[at]
         notes.append(f"filemark at LBA {removed_lba} removed; later records move down by one")
+    underivable: set[int] = set()
+    for index, item in enumerate(case.get("appended_files", [])):
+        where = f"appended_files[{index}]"
+        first = len(records)
+        for position, record in enumerate(item["records"]):
+            data, note = _appended_record(image, record, records, f"{where}.records[{position}]")
+            if data is None:
+                underivable.add(len(records))
+                data = bytes(record["length"])  # never read: the position is underivable
+            records.append(data)
+            origin.append(None)
+            notes.append(f"appended file {index} record {position} at LBA {len(records) - 1}: {record['source']}, "
+                         f"{record['length']} bytes, {note}")
+        if item["trailing_filemark"]:
+            records.append(None)
+            origin.append(None)
+            notes.append(f"appended file {index}: trailing filemark at LBA {len(records) - 1}")
+        else:
+            notes.append(f"appended file {index}: no trailing filemark; the tape ends after LBA {len(records) - 1}")
+        assert first < len(records)
     unreadable = set()
     for item in case.get("unreadable_records", []):
         lba = item["lba"]
@@ -6867,13 +7091,9 @@ def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[Damage
         expected_filemark = item["record_index"] == len(tape_file.blocks)
         if start + item["record_index"] != lba or bool(item["filemark"]) != expected_filemark:
             raise ValueError(f"case record {item} does not match the image layout")
-        if removed_lba is not None:
-            if lba == removed_lba:
-                continue
-            if lba > removed_lba:
-                lba -= 1
-        unreadable.add(lba)
-    return DamagedTape(records, unreadable), notes
+        if lba in origin:
+            unreadable.add(origin.index(lba))
+    return DamagedTape(records, unreadable, underivable), notes
 
 
 def empty_decision(image_name: str) -> dict[str, Any]:
@@ -7115,7 +7335,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                              block_size: int, scheme: tuple[int, int, int], bootstrap: dict[str, Any] | None,
                              directory: dict[int, dict] | None,
                              bootstrap_unreadable: tuple[str, str] | None = None,
-                             route: str = "verifier") -> list[dict[str, Any]]:
+                             route: str = "verifier", stats: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """What a Verifier finds before replica A, each with the error a Reader reports for that component (Section 2.2).
 
     Every sidecar's primary copy, tail copy and footer are read (Section 9.1).
@@ -7124,6 +7344,10 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
     the latter is open (Appendix D TT-2).
     """
     findings: list[dict[str, Any]] = []
+    if stats is None:
+        stats = {}
+    stats.update({"data_blocks_read": 0, "data_blocks_unchecked": 0, "parity_shards_read": 0,
+                  "parity_shards_unchecked": 0, "parity_shards_unlocated": 0, "epochs_without_index": []})
 
     def add(component: str, finding: str, error: str | None, scope_kind: str = "structure",
             address: dict[str, int] | None = None) -> None:
@@ -7206,6 +7430,32 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
             index, note = acquire_index(ctx, entry, [])
             if index is None:
                 add(name, f"no header/index copy validates ({note})", "SidecarMetadataUnavailable")
+                stats["epochs_without_index"].append(entry.epoch_id)
+                # Section 9.1 fixes the layout of every sidecar (`total = 2H + P + 1`,
+                # `P = S x m`), so the parity region is located from the map
+                # entry's count alone. Each shard is read, and a read that fails
+                # is reported by its address; with no index it cannot be checked
+                # against a CRC.
+                rest = entry.block_count - 1 - stripes * m
+                if rest > 0 and rest % 2 == 0:
+                    h_map = rest // 2
+                    for shard_number in range(stripes * m):
+                        block = h_map + shard_number
+                        address = {"epoch": entry.epoch_id, "stripe": shard_number % stripes,
+                                   "parity_index": shard_number // stripes}
+                        component = (f"parity shard epoch {entry.epoch_id} stripe {address['stripe']} parity index "
+                                     f"{address['parity_index']} (LBA {start + block})")
+                        stats["parity_shards_read"] += 1
+                        stats["parity_shards_unchecked"] += 1
+                        try:
+                            shard = tape.read_data(start + block)
+                            if len(shard) != block_size:
+                                add(component, f"a {len(shard)}-byte record, not one block (a read failure, Sections "
+                                    "3.5 and 13.4)", None, "data", address)
+                        except MediumError:
+                            add(component, "unreadable (medium error)", "TapeIo", "data", address)
+                else:
+                    stats["parity_shards_unlocated"] += stripes * m
                 continue
             k, m_index, s_index = scheme
             if (index["k"], index["m"], index["S"], index["block_size"]) != (k, m_index, s_index, block_size):
@@ -7218,6 +7468,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                     address = {"epoch": index["epoch_id"], "stripe": key[0], "parity_index": key[1]}
                     component = (f"parity shard epoch {index['epoch_id']} stripe {key[0]} parity index {key[1]} "
                                  f"(LBA {start + block})")
+                    stats["parity_shards_read"] += 1
                     try:
                         shard = tape.read_data(start + block)
                         if len(shard) != block_size:
@@ -7251,6 +7502,9 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                 continue
             component = f"Object tape file {entry.tape_file_number} block {block} (LBA {start + block})"
             address = {"tape_file": entry.tape_file_number, "block": block}
+            stats["data_blocks_read"] += 1
+            if covering[0].tape_file_number not in indexes:
+                stats["data_blocks_unchecked"] += 1
             try:
                 data = tape.read_data(start + block)
             except MediumError:
@@ -7267,10 +7521,125 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
     return findings
 
 
+def build_verifier_full(findings: list[dict[str, Any]] | None, stats: dict[str, Any], layout: list[tuple] | None,
+                        checks: Mapping[str, "ReplicaCheck"], fully_valid: list[str],
+                        separations: Mapping[str, tuple[str, str, Any]], separation_status: Mapping[str, str],
+                        conflict: bool, eod_ok: bool, walk_files: list[WalkedFile], walk_damage: list[str],
+                        undecided_scan: bool, tape: DamagedTape, bootstrap_note: str | None) -> dict[str, Any]:
+    """What a Verifier's full verification reports (Section 2.2), from the decisions already made.
+
+    * `data_blocks_failed` and `parity_shards_failed`: every data block a
+      sidecar protects and every parity shard that fails, each by its address,
+      with its reason (a read failure, a record that is not one block long, or
+      a CRC that differs from its sidecar's index);
+    * `other_findings`: every other finding, before and inside the terminal
+      suffix, each with the error a Reader reports for that component;
+    * `terminal_suffix`: whether the suffix is complete. A Verifier that finds
+      a separation extent invalid must not report it complete (Section 10.6),
+      and a normal finalized tape ends with EOD right after C's trailing
+      filemark (Section 12.6).
+    """
+    out: dict[str, Any] = {"citations": [cite("verifier_role"), cite("full_verification"), cite("report_by_address")]}
+    if findings is None:
+        why = ("no validated map says which blocks a sidecar protects: neither a replica validates nor does the "
+               "walked map validate against a final ParityMap (Sections 12.1 and 13.1)")
+        if conflict:
+            why = ("the Scanner's result is TerminalIndexReplicaConflict, which accepts no replica (Section 8.5) and "
+                   "offers no walk, so there is no validated map to say which blocks a sidecar protects (Section 13.1)")
+        out.update(data_blocks_failed=None, parity_shards_failed=None, coverage={"performed": False, "why": why})
+        other = []
+    else:
+        data = [f for f in findings if f["checks"] == "data" and "tape_file" in f["address"]]
+        parity = [f for f in findings if f["checks"] == "data" and "epoch" in f["address"]]
+        out["data_blocks_failed"] = [{"address": f["address"], "reason": f["finding"], "error": f["error"]} for f in data]
+        out["parity_shards_failed"] = [{"address": f["address"], "reason": f["finding"], "error": f["error"]} for f in parity]
+        out["coverage"] = {"performed": True, "data_blocks_read": stats["data_blocks_read"],
+                           "parity_shards_read": stats["parity_shards_read"],
+                           "epochs_without_index": stats["epochs_without_index"],
+                           "data_blocks_read_but_not_checkable": stats["data_blocks_unchecked"],
+                           "parity_shards_read_but_not_checkable": stats["parity_shards_unchecked"],
+                           "parity_shards_not_locatable": stats["parity_shards_unlocated"]}
+        if stats["epochs_without_index"]:
+            out["citations"].extend([cite("metadata_unavailable"), cite("verifier_role")])
+        other = [{"component": f["component"], "finding": f["finding"], "error": f["error"]}
+                 for f in findings if f["checks"] != "data"]
+    # ----- the terminal suffix -----
+    terminal: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    if undecided_scan:
+        complete: Any = "undecided"
+        reasons.append("the Scanner's terminal discovery is undecided, so the Verifier's terminal checks are")
+    elif layout is None:
+        complete = False
+        terminal.append({"component": "terminal replicas", "error": "BotStructuralRecoveryRequired",
+                         "finding": "no footer supplies a planned layout, so no replica validates"})
+        reasons.append("no replica validates: the Verifier reports the tape as recovery-required")
+        out["citations"].extend([cite("walk_evidence"), cite("err_bot")])
+        for walked in walk_files:
+            if walked.artifact:
+                terminal.append({"component": f"tape file {walked.tape_file_number}", "error": None,
+                                 "finding": "a structural artifact after the exact terminal suffix: nonconformant, and not "
+                                            "admitted as an Object"})
+                reasons.append(f"tape file {walked.tape_file_number} follows the exact terminal suffix")
+                out["citations"].extend([cite("artifact_after_suffix"), cite("normal_suffix_eod")])
+            elif walked.note.startswith("damaged"):
+                error = "TerminalIndexReplicaParse" if walked.kind == KIND_REPLICA else "TerminalIndexSeparationParse"
+                terminal.append({"component": f"tape file {walked.tape_file_number} "
+                                              f"({'terminal replica' if walked.kind == KIND_REPLICA else 'separation extent'})",
+                                 "error": error, "finding": walked.note})
+        for line in walk_damage:
+            terminal.append({"component": "tape", "error": None, "finding": f"structural damage: {line}"})
+    else:
+        problems = []
+        for letter in "ABC":
+            check = checks[letter]
+            if not check.fully_valid:
+                problems.append(f"replica {letter} is not valid")
+                terminal.append({"component": f"terminal replica {letter}",
+                                 "error": _component_error(check.reason, "TerminalIndexReplicaParse"),
+                                 "finding": check.reason})
+        if conflict:
+            problems.append("the valid replicas disagree")
+            terminal.append({"component": "terminal replicas", "error": "TerminalIndexReplicaConflict",
+                             "finding": "independently valid replicas differ in an edition-common field"})
+        for name in ("A-B", "B-C"):
+            status = separation_status.get(name)
+            if status != "valid":
+                problems.append(f"separation extent {name} is {status}")
+                _, reason, _ = separations.get(name, (status, "", None))
+                if status == "undecided":
+                    terminal.append({"component": f"separation extent {name}", "error": "undecided",
+                                     "finding": "its header, footer, zero interior and trailing filemark validate; whether its "
+                                                "edition ID equals 'the replicas'' is undecided, because the valid replicas "
+                                                "carry different edition IDs (Section 10.6)"})
+                    continue
+                terminal.append({"component": f"separation extent {name}",
+                                 "error": "TapeIo" if status == "unreadable" else "TerminalIndexSeparationParse",
+                                 "finding": reason})
+        if not eod_ok:
+            problems.append("EOD is not where the plan puts it")
+            terminal.append({"component": "tape", "error": None,
+                             "finding": f"EOD at LBA {tape.eod()} is not the planned EOD immediately after C's trailing filemark"})
+            out["citations"].append(cite("normal_suffix_eod"))
+        complete = not problems
+        reasons.extend(problems or ["three valid agreeing replicas, two valid separation extents, EOD after C"])
+        if any(name for name in ("A-B", "B-C") if separation_status.get(name) != "valid"):
+            out["citations"].append(cite("verifier_separation"))
+    out["other_findings"] = other + terminal
+    out["terminal_suffix"] = {"complete": complete, "reasons": reasons,
+                              "replicas_valid": sorted(fully_valid) if not undecided_scan else "undecided"}
+    return out
+
+
 def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any]) -> dict[str, Any]:
     decision = empty_decision(case["image"])
     tape, notes = damaged_tape_for(image, case)
     trace["fault_notes"] = notes
+    if case.get("record_edits") and "observations" not in case:
+        # The edit checks (every stated old byte, the SHA-256, and my own
+        # checksums and hashes where an edit says it recomputes one). A case
+        # with observations carries them in its decision.
+        trace["record_edit_checks"] = apply_record_edits(image, image.records(), case)
     hints = None
     if case.get("hints"):
         raw = case["hints"]
@@ -7301,6 +7670,16 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         verifier["citations"].extend([cite("verifier_role")] + [cite(key) for key in error_cites])
         if recovery_requests(case):
             decision["recoverer"]["addresses"] = not_run_outcomes(recovery_requests(case))
+        decision["verifier-full"] = {
+            "data_blocks_failed": None, "parity_shards_failed": None,
+            "coverage": {"performed": False,
+                         "why": f"discovery ends in {error}: without the tape's identity and geometry no record can be "
+                                "read as a data block, a parity shard or a control structure"},
+            "other_findings": [{"component": "bootstrap", "finding": decision["discovery"]["result"], "error": error}],
+            "terminal_suffix": {"complete": False, "reasons": [f"the Verifier stops at discovery with {error}"],
+                                "replicas_valid": []},
+            "citations": [cite("verifier_role"), cite("full_verification")] + [cite(key) for key in error_cites],
+        }
         return decision
 
     # ----- Scanner: terminal discovery and authoritative selection -----
@@ -7308,7 +7687,14 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
     if boot is None:
         scanner["citations"].extend([cite("hint_discovery"), cite("hint_uuid")])
     scanner["citations"].extend([cite("locate_footer"), cite("validate_every")])
-    layout, layout_note = discover_layout(tape, tape_uuid, block_size)
+    underivable_read: int | None = None
+    try:
+        layout, layout_note = discover_layout(tape, tape_uuid, block_size)
+    except Underivable as failure:
+        # The Scanner reads a record whose bytes the case states but cannot be
+        # derived (GAPS.md): whether it supplies a layout is not decidable.
+        underivable_read = failure.args[0]
+        layout, layout_note = None, f"undecidable: the record at LBA {underivable_read} is not derivable"
     trace["layout_source"] = layout_note
     checks: dict[str, ReplicaCheck] = {}
     if layout is not None:
@@ -7361,6 +7747,30 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
                 scanner["degraded"] = False
             scanner["inventory_equals_true_prefix"] = None  # filled after the decision
 
+    if underivable_read is not None:
+        scanner.update(result="undecided", error=None, acceptable_selections=[], degraded=None)
+        for letter in "ABC":
+            scanner["replicas"][letter] = {"valid": "undecided",
+                                           "reason": f"the record at LBA {underivable_read}, which the Scanner reads first "
+                                                     "when it spaces back from EOD, is not derivable"}
+        eod = tape.eod()
+        decision["undecided"].append({
+            "aspect": "scanner",
+            "readings": [
+                f"the record at LBA {underivable_read} parses as a replica footer, records its own position (LBA "
+                f"{underivable_read}) and plans an EOD at or after the tape's EOD ({eod}): it supplies the layout, and the "
+                "Scanner validates the replicas that layout plans; the outcome then depends on the rest of that "
+                "footer, which the case does not state",
+                f"the record at LBA {underivable_read} does not parse, records another position, or plans an EOD before "
+                f"{eod}: the footers of the tape's own replicas plan an EOD before {eod}, so no footer supplies a "
+                "layout, no replica validates, and the Scanner returns BotStructuralRecoveryRequired",
+            ],
+            "citations": [cite("step1_spacing"), cite("footer_supplies"), cite("layout_before_eod"), cite("no_replica_walk")],
+        })
+        # The walk is offered only if no replica validates; its classification
+        # is a function of the tape and is decided either way.
+        walk_needed = True
+
     # ----- BOT structural walk -----
     walk = decision["walk"]
     walk_map: dict[str, Any] | None = None
@@ -7375,8 +7785,18 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         trace["walk"] = [dataclasses.asdict(f) | {"parity_map": None} for f in files]
         trace["walk_damage"] = damage
         trace["walk_map"] = walk_map["reason"]
-        walk["classes"] = {str(f.tape_file_number): (KIND_NAMES[f.kind] if f.kind is not None else "classification failed")
-                           for f in files}
+        walk["classes"] = {str(f.tape_file_number): (
+            ARTIFACT_CLASS if f.artifact else "undecided" if f.undecidable else
+            KIND_NAMES[f.kind] if f.kind is not None else "classification failed")
+            for f in files}
+        if any(f.artifact for f in files):
+            walk["citations"].extend([cite("artifact_after_suffix"), cite("normal_suffix_eod")])
+        if damage:
+            walk["structural_damage"] = damage
+            walk["citations"].append(cite("structural_damage_walk"))
+        if underivable_read is not None:
+            walk["note"] = ("performed only if no replica validates, which the Scanner's undecided outcome leaves open; "
+                            "the classification below is a function of the tape and holds either way")
         failed = {str(f.tape_file_number): f.failed_classification for f in files if f.failed_classification}
         if failed:
             walk["failed_classifications"] = failed
@@ -7397,12 +7817,21 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
                 walk["citations"].append(cite("footer_probe"))
         if any(f.kind is None for f in files):
             walk["citations"].append(cite("walk_file"))
-        if any(f.kind == KIND_OBJECT for f in files):
+        if any(f.kind == KIND_OBJECT and not f.artifact for f in files):
             walk["object_identity"] = "unknown"
             walk["citations"].append(cite("identity_unknown"))
         walk["terminal_authority_recovered"] = False
         walk["citations"].append(cite("authority_not_recovered"))
-        if walk_map.get("error"):
+        # Whether the walk produces a map, and whether Section 13.1 validates it.
+        if walk_map.get("error") == "undecided":
+            walk["map"] = {"produced": "undecided", "validated": "undecided"}
+        elif walk_map.get("error") == "FilemarkMapReconstruct":
+            walk["map"] = {"produced": False, "validated": False}
+        else:
+            walk["map"] = {"produced": True, "validated": bool(walk_map["validated"])}
+        if walk_map.get("error") == "undecided":
+            walk.update(result="undecided", error=None)
+        elif walk_map.get("error"):
             walk.update(result="error", error=walk_map["error"])
             walk["citations"].append(cite("reconstruct_error" if walk_map["error"] == "FilemarkMapReconstruct"
                                           else "walk_no_map"))
@@ -7432,7 +7861,10 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         context = RecoveryContext(tape, tape_uuid, block_size, scheme, walk_map["entries"], parity_map["scope"],
                                   parity_map["watermark"], directory, "walk")
     requests = recovery_requests(case)
-    if requests:
+    if requests and underivable_read is not None:
+        recoverer["result"] = "undecided"
+        recoverer["addresses"] = [dict(o, result="undecided") for o in not_run_outcomes(requests)]
+    elif requests:
         if context is None:
             recoverer["result"] = "not_run"
             recoverer["addresses"] = not_run_outcomes(requests)
@@ -7508,9 +7940,19 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
                 trace.setdefault("separations", {})[name] = "walk: " + f.note
         if any(status == "invalid" for status in verifier["separations"].values()):
             verifier["citations"].extend([cite("not_recognised_item7"), cite("verifier_separation")])
+    if underivable_read is not None:
+        verifier["separations"] = {"A-B": "undecided", "B-C": "undecided"}
     separations_ok = all(verifier["separations"].get(n) == "valid" for n in ("A-B", "B-C"))
     eod_ok = layout is not None and tape.eod() == layout[4][4] + layout[4][5] + 1
-    if scanner["result"] == "error" and scanner["error"] == "TerminalIndexReplicaConflict":
+    if underivable_read is not None:
+        verifier["result"] = "undecided"
+        decision["undecided"].append({
+            "aspect": "verifier",
+            "readings": ["the terminal suffix is complete, degraded, an error or recovery-required as the Scanner's "
+                         "outcome (undecided above) falls: the Verifier's terminal checks begin with the Scanner's"],
+            "citations": [cite("verifier_role"), cite("fully_valid")],
+        })
+    elif scanner["result"] == "error" and scanner["error"] == "TerminalIndexReplicaConflict":
         verifier.update(result="error", error="TerminalIndexReplicaConflict")
         verifier["citations"].append(cite("degraded_result"))
     elif not fully_valid:
@@ -7536,10 +7978,12 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
     else:
         verifier["result"] = "complete"
         verifier["citations"].append(cite("normal_finalized"))
+    stats: dict[str, Any] = {}
+    findings = None
     if context is not None:
         findings = verifier_prefix_findings(tape, context.entries, context.scope, tape_uuid, block_size, scheme,
                                             boot, directory, bootstrap_unreadable,
-                                            "walk" if context.route == "walk" else "verifier")
+                                            "walk" if context.route == "walk" else "verifier", stats)
         trace["verifier_prefix_findings"] = findings
         if findings:
             # Section 2.2: the Verifier reports each finding before the
@@ -7555,6 +7999,11 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
                 # parity shard and reports each failure by address.
                 verifier["citations"].extend([cite("full_verification"), cite("report_by_address"),
                                               cite("structure_not_full")])
+    decision["verifier-full"] = build_verifier_full(
+        findings, stats, layout, checks, fully_valid,
+        {name: value for name, value in separations.items()}, verifier["separations"],
+        scanner["result"] == "error" and scanner["error"] == "TerminalIndexReplicaConflict", eod_ok, walk_files,
+        list(trace.get("walk_damage", [])), underivable_read is not None, tape, None)
     return decision
 
 
@@ -7570,7 +8019,9 @@ def reporting_only(decision: dict[str, Any], image: ImageBuild, trace: dict[str,
     scanner = decision["scanner"]
     inventory = trace.pop("_inventory", None)
     walked = trace.pop("_walk_entries", None)
-    if inventory is not None:
+    if scanner["result"] == "undecided":
+        scanner["inventory_equals_true_prefix"] = None
+    elif inventory is not None:
         entries, rows = inventory
         scanner["inventory_equals_true_prefix"] = entries == image.prefix_entries and rows == image.object_rows
     elif walked is not None:
@@ -7944,6 +8395,22 @@ def profile_build(name: str) -> tuple[dict[str, Any], TerminalBuild]:
         inputs = load_json(FIXTURE_ROOT / name / "inputs.json")
         _PROFILE_BUILDS[name] = (inputs, build_terminal_suffix(terminal_inputs_from_profile(inputs)))
     return _PROFILE_BUILDS[name]
+
+
+def second_edition_stream(profile: str, filename: str) -> bytes:
+    """The profile's component rebuilt as a second edition: only the edition ID and sequence differ.
+
+    The text fixes no particular values; any nonzero ID and sequence that differ
+    from the profile's serve, and no decision depends on which. Here every byte
+    of the ID is complemented and the sequence is raised by one. The edition
+    digest and the replica descriptor digest follow from them (Section 10.4);
+    the planned layout, positions and counts are the profile's.
+    """
+    inputs, _ = profile_build(profile)
+    edition_id = bytes(b ^ 0xFF for b in bytes.fromhex(inputs["edition_id"]))
+    altered = dict(inputs, edition_id=edition_id.hex(), edition_sequence=inputs["edition_sequence"] + 1)
+    terminal = build_terminal_suffix(terminal_inputs_from_profile(altered))
+    return b"".join(terminal.components[PROFILE_COMPONENT_FILES.index(filename)])
 
 
 def component_stream(profile: str, filename: str) -> bytes:
@@ -8707,9 +9174,8 @@ def parse_status(text: str) -> dict[str, Any]:
         return {"class": "byte-change", "change": change, "repairs": repairs}
     if text.startswith("no replica at this position"):
         return {"class": "absent"}
-    match = re.match(r"at this position, the replica of the same position taken from the (\w+) profile at the same block size", text)
-    if match:
-        return {"class": "foreign", "profile_family": match.group(1)}
+    if text.startswith("at this position, a second-edition replica:"):
+        return {"class": "second-edition"}
     return {"class": "unknown", "text": text}
 
 
@@ -8720,12 +9186,10 @@ def _status_text_decision(position: str, status: dict[str, Any], base_letter_val
         return "valid", ["fully_valid"], "the profile's replica, which is locally eligible"
     if cls == "absent":
         return "missing", ["degraded_evidence", "walk_offer"], "no records at the planned coordinate"
-    if cls == "foreign":
-        return "invalid", ["device_agree", "locate_planned", "backward_delta", "footer_supplies", "degraded_evidence"], (
-            "a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's "
-            "recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and "
-            "start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the "
-            "conflict rule")
+    if cls == "second-edition":
+        return "valid", ["fully_valid"], (
+            "a replica that is locally eligible at this position and differs from the profile's replica only in its "
+            "edition ID and edition sequence, both edition-common fields: fully valid, with an edition of its own")
     change = status["change"]
     edits = change.get("edits", [])
     description = change.get("description", "")
@@ -8749,10 +9213,15 @@ def selection_decision(row: dict[str, Any], statuses: dict[str, dict[str, Any]])
     if any(v[0] == "unknown" for v in per.values()):
         return {"outcome": "unresolved", "replicas": replicas, "rules": [], "undecided": []}
     valid = [letter for letter in "ABC" if per[letter][0] == "valid"]
+    # Every fully valid replica of the profile shares one edition; a second-edition
+    # replica has another (Section 8.5).
+    editions = {statuses[row[letter]]["class"] == "second-edition" for letter in valid}
 
     def inventory(selected: list[str]) -> dict[str, Any]:
         if not selected:
             return {"outcome": "BotStructuralRecoveryRequired", "acceptable_selections": [], "degraded": None}
+        if len(editions) > 1:
+            return {"outcome": "TerminalIndexReplicaConflict", "acceptable_selections": [], "degraded": None}
         return {"outcome": "inventory", "acceptable_selections": selected, "degraded": len(selected) < 3}
 
     # Section 8.4 step 1: spacing back from EOD, the first replica footer
@@ -8770,6 +9239,8 @@ def selection_decision(row: dict[str, Any], statuses: dict[str, dict[str, Any]])
     readings = None
     if decided["outcome"] == "BotStructuralRecoveryRequired":
         rules += ["no_replica_walk", "select_walk", "bot_required", "err_bot"]
+    elif decided["outcome"] == "TerminalIndexReplicaConflict":
+        rules += ["conflict_error", "err_conflict"]
     elif decided["outcome"] == "inventory":
         rules += ["survivor"] + (["degraded_result"] if decided["degraded"] else []) + \
                  (["selection_guide"] if len(decided["acceptable_selections"]) > 1 else [])
@@ -8782,9 +9253,12 @@ def _status_supplies_layout(status: dict[str, Any]) -> bool:
     cls = status["class"]
     if cls == "unchanged":
         return True
-    if cls in ("absent", "foreign"):
-        # An absent replica has no footer; a foreign one records another position.
-        return False
+    if cls == "absent":
+        return False  # an absent replica has no footer
+    if cls == "second-edition":
+        # Locally eligible at its position: its footer records that position and
+        # plans the tape's EOD, as the profile's own footer does.
+        return True
     change = status["change"]
     if re.match(r"Remove \d+ bytes from the end", change.get("description", "")):
         return False  # a short footer record is invalid content (Section 3.5)
@@ -8799,10 +9273,10 @@ def build_status_stream(status: dict[str, Any], position: str, profile: str, blo
         return component_stream(profile, filename)
     if cls == "absent":
         return None
-    if cls == "foreign":
-        other = f"{status['profile_family']}-{profile.split('-', 1)[1]}"
-        res.notes.append(f"position {position}: my {other}/{filename}")
-        return component_stream(other, filename)
+    if cls == "second-edition":
+        stream = second_edition_stream(profile, filename)
+        res.notes.append(f"position {position}: my {profile}/{filename} rebuilt with another edition ID and sequence")
+        return stream
     if cls == "byte-change":
         return apply_byte_change(component_stream(profile, filename), status["change"], status["repairs"], block_size,
                                  f"{profile}/{filename} (position {position})", res, KIND_REPLICA, profile,

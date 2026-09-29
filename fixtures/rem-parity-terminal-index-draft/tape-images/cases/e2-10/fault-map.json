@@ -1,0 +1,62 @@
+{
+  "failed_data_addresses": [
+    [
+      1,
+      0
+    ]
+  ],
+  "hints": null,
+  "image": "two-epoch",
+  "record_edits": [
+    {
+      "construction": "the original record's length",
+      "edits": [
+        {
+          "new_bytes": "ad",
+          "offset": 264,
+          "old_bytes": "ac",
+          "reason": "data CRC entry 0 of the tail copy: xor 01"
+        },
+        {
+          "new_bytes": "b6163e717c9e94cbae432d2aab839512ea1e2116cb1e2ab6e3ed4dd1470d6217",
+          "offset": 152,
+          "old_bytes": "10b29de5f8fadb57ba39a437c1e7d506c85c8f2f4b0a7a5d503b21e2068898ce",
+          "reason": "canonical_metadata_hash recomputed"
+        },
+        {
+          "new_bytes": "a647a331531fb22f",
+          "offset": 192,
+          "old_bytes": "1d6c27bee9f8c83f",
+          "reason": "header_crc64 recomputed"
+        },
+        {
+          "new_bytes": "377afcc77b60dae4",
+          "offset": 262136,
+          "old_bytes": "0e2798a3fa1c0afc",
+          "reason": "block0_crc64 recomputed"
+        }
+      ],
+      "lba": 16,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 5,
+      "sha256": "749c9e1327e4fca464401131db36651912439647847bc8e6a5568eee8cc977b7",
+      "tape_file": 2
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 2,
+      "record_index": 0,
+      "tape_file": 1
+    },
+    {
+      "filemark": false,
+      "lba": 17,
+      "record_index": 6,
+      "tape_file": 2
+    }
+  ]
+}

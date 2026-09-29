@@ -1135,6 +1135,9 @@ fn inspect_source<S: RawTapeSource>(
         }
         let outcome = verify_terminal_index_full(&mut source, &tape_uuid, block_size)
             .map_err(|error| format!("full terminal-index verification: {error}"))?;
+        // Complete means the whole tape verified: the terminal suffix and every
+        // protected block and shard, never the outcome variant alone.
+        let tape_complete = outcome.is_complete_tape();
         let (verified, outcome_name, complete) = match outcome {
             remanence_parity::TerminalIndexVerificationOutcome::VerifiedComplete(verified) => {
                 if damage_plan.separation_damage().is_some() {
@@ -1143,7 +1146,13 @@ fn inspect_source<S: RawTapeSource>(
                         damage_plan
                     ));
                 }
-                (verified, "verified_complete", true)
+                if !tape_complete {
+                    expectation_failures.push(format!(
+                        "drill {:?} verified a complete suffix but not a complete tape",
+                        damage_plan
+                    ));
+                }
+                (verified, "verified_complete", tape_complete)
             }
             remanence_parity::TerminalIndexVerificationOutcome::VerifiedDegraded(verified) => {
                 if damage_plan.separation_damage().is_none() {

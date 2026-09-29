@@ -274,7 +274,11 @@ impl Editor {
 enum Role {
     SidecarCopy,
     SidecarFooter,
-    SidecarAgreement,
+    /// Each of a sidecar's two header/index copies, on its own (Sections 9.2
+    /// to 9.5).
+    SidecarCopies,
+    /// A Verifier's full verification of the sidecar (Sections 2.2, 9.1).
+    Verifier,
     ParityMap,
     Directory,
     Bootstrap,
@@ -356,7 +360,8 @@ pub fn observe(v: &Resolved) -> Vec<Observation> {
                     Role::ParityLocator | Role::InverseMapping => "unit",
                     Role::SidecarCopy => "header",
                     Role::SidecarFooter => "footer",
-                    Role::SidecarAgreement => "agreement",
+                    Role::SidecarCopies => "copies",
+                    Role::Verifier => "verifier",
                     Role::Bootstrap => "bootstrap",
                     Role::Replica => "replica",
                     Role::Separation => "separation",
@@ -438,7 +443,7 @@ impl IndexSeparationInteriorBlockSource for Payload<'_> {
 }
 // The dispatch table is the single target-role to production-entry-point map.
 const ROLES: &[RoleEntry] = &[
-    RoleEntry {role:Role::Recovery, entry:"recover_ordinal_from_sidecar (directory-assisted tail rescue)", run:overflow::recover},
+    RoleEntry {role:Role::Recovery, entry:"recover_ordinal_from_sidecar (the map from the validated terminal replicas' structural rows)", run:overflow::recover},
     RoleEntry {role:Role::InverseMapping, entry:"mapping::stripe_data_shard_in_epoch (unit level; the one inverse every Recoverer caller uses)", run:overflow::inverse},
     RoleEntry {role:Role::TerminalScanner, entry:"read_terminal_index_inventory (no off-tape state; prefix records present, their bytes unread)", run:overflow::terminal_scanner},
     RoleEntry {role:Role::WalkScanner, entry:"scan_reconstruct_filemark_map_with_report (device report injected by the raw source)", run:overflow::walk_scanner},
@@ -446,7 +451,12 @@ const ROLES: &[RoleEntry] = &[
     RoleEntry {role:Role::ParityLocator, entry:"parity_block_position (unit-level formula probe after header rejection)", run:overflow::locator},
     RoleEntry {role:Role::SidecarCopy, entry:"parse_sidecar_index_blocks (includes parse_sidecar_header_block)", run:|v,f,b| { parse_sidecar_index_blocks(&v.files[&f][b..b+1],&v.uuid)?; Ok(()) }},
     RoleEntry {role:Role::SidecarFooter, entry:"parse_sidecar_footer_block", run:|v,f,b| { parse_sidecar_footer_block(&v.files[&f][b],&v.uuid)?; Ok(()) }},
-    RoleEntry {role:Role::SidecarAgreement, entry:"parse_sidecar_tape_file (copy agreement after footer validation)", run:|v,f,_| { parse_sidecar_tape_file(&v.files[&f],&v.uuid)?; Ok(()) }},
+    RoleEntry {role:Role::SidecarCopies, entry:"parse_sidecar_index_blocks (the primary copy, then the tail copy, each on its own)", run:|v,f,_| {
+        let blocks=&v.files[&f];let h=u64_at(&blocks[0],0x60) as usize;
+        parse_sidecar_index_blocks(&blocks[..h],&v.uuid)?;
+        parse_sidecar_index_blocks(&blocks[blocks.len()-1-h..blocks.len()-1],&v.uuid)?; Ok(())
+    }},
+    RoleEntry {role:Role::Verifier, entry:"verify_sidecar (a Verifier's full verification: footer, both copies, the acquired index, every data block and parity shard)", run:overflow::verifier},
     RoleEntry {role:Role::ParityMap, entry:"parse_parity_map_tape_file -> parse_copy_at -> decode_copy -> decode_parity_map_payload -> decode_sidecar_epoch_directory_cbor", run:|v,f,_| { parse_parity_map_tape_file(&v.files[&f],&v.uuid)?; Ok(()) }},
     RoleEntry {role:Role::Directory, entry:"decode_sidecar_epoch_directory_cbor (each copy's payload key 4)", run:|v,f,b| {
         let block=&v.files[&f][b]; let len=u64_at(block,0x30) as usize;
@@ -588,6 +598,8 @@ impl IsolationExceptions {
 /// Supervisor records: open cases and corrections scoped to one observation.
 #[derive(Debug)]
 pub struct Adjudications {
+    /// Settled by the text as a permitted set: any one of the outcomes passes.
+    pub pinned_sets: BTreeMap<(String, String, String), BTreeSet<String>>,
     pub open: BTreeMap<(String, String, String), BTreeSet<String>>,
     pub settled: BTreeMap<(String, String, String), String>,
 }
@@ -610,6 +622,7 @@ pub fn parse_adjudications(bytes: &[u8]) -> Result<Adjudications, String> {
     let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let mut open = BTreeMap::new();
     let mut settled = BTreeMap::new();
+    let mut pinned_sets = BTreeMap::new();
     for kind in ["open", "settled"] {
         for entry in value[kind]
             .as_array()
@@ -631,7 +644,10 @@ pub fn parse_adjudications(bytes: &[u8]) -> Result<Adjudications, String> {
                 .filter(|s| !s.is_empty())
                 .ok_or("match observation missing or empty")?;
             let key = (id.to_string(), variant.to_string(), observation.to_string());
-            if open.contains_key(&key) || settled.contains_key(&key) {
+            if open.contains_key(&key)
+                || settled.contains_key(&key)
+                || pinned_sets.contains_key(&key)
+            {
                 return Err(format!(
                     "overlapping or duplicate adjudication: {id}/{variant} [{observation}]"
                 ));
@@ -656,11 +672,32 @@ pub fn parse_adjudications(bytes: &[u8]) -> Result<Adjudications, String> {
                 if entry.get("disputed_outcomes").is_some() {
                     return Err(format!("settled entry has disputed outcomes: {id}"));
                 }
-                settled.insert(key, adjudication_outcome(&entry["corrected"])?.to_string());
+                if let Some(permitted) = entry.get("permitted_outcomes") {
+                    // The text names a category and leaves the choice among its
+                    // names to the Reader: the set is pinned, and any member passes.
+                    if entry.get("corrected").is_some() {
+                        return Err(format!("settled entry with both forms: {id}"));
+                    }
+                    let mut allowed = BTreeSet::new();
+                    for outcome in permitted
+                        .as_array()
+                        .filter(|a| a.len() >= 2)
+                        .ok_or("permitted_outcomes needs at least two outcomes")?
+                    {
+                        allowed.insert(adjudication_outcome(outcome)?.to_string());
+                    }
+                    pinned_sets.insert(key, allowed);
+                } else {
+                    settled.insert(key, adjudication_outcome(&entry["corrected"])?.to_string());
+                }
             }
         }
     }
-    Ok(Adjudications { open, settled })
+    Ok(Adjudications {
+        pinned_sets,
+        open,
+        settled,
+    })
 }
 
 /// Accept only outcomes the executor can identify, never panic/unmapped waivers.
@@ -714,7 +751,8 @@ impl Adjudications {
     ) -> bool {
         let corrected = self.settled.get(&key);
         let disputed = self.open.get(&key);
-        if corrected.is_some() || disputed.is_some() {
+        let pinned = self.pinned_sets.get(&key);
+        if corrected.is_some() || disputed.is_some() || pinned.is_some() {
             seen.insert(key.clone());
         }
         let (status, failed, expected) = if matches!(observation.name, "PANIC" | "Invariant")
@@ -731,6 +769,13 @@ impl Adjudications {
                 if failed { "DISAGREEMENT" } else { "SETTLED" },
                 failed,
                 corrected.clone(),
+            )
+        } else if let Some(pinned) = pinned {
+            let failed = !pinned.contains(&observation.outcome);
+            (
+                if failed { "DISAGREEMENT" } else { "PINNED-SET" },
+                failed,
+                format!("{pinned:?}"),
             )
         } else if let Some(disputed) = disputed {
             let failed = !self.allows_open(&key, &observation.outcome);
@@ -770,7 +815,12 @@ impl Adjudications {
 
     /// An unknown case, variant or observation cannot become a silent waiver.
     fn ensure_all_observed(&self, seen: &BTreeSet<(String, String, String)>) -> Result<(), String> {
-        for key in self.open.keys().chain(self.settled.keys()) {
+        for key in self
+            .open
+            .keys()
+            .chain(self.settled.keys())
+            .chain(self.pinned_sets.keys())
+        {
             if !seen.contains(key) {
                 return Err(format!("unknown or unexecuted adjudication match: {key:?}"));
             }
@@ -940,7 +990,7 @@ pub fn resolve(case: &Value, variant: Option<&Value>) -> Result<Resolved, String
         }
         editor.sidecar_repair(file, block, &repairs, stream_end);
         if id == "sidecar-primary-tail-disagreement" {
-            Role::SidecarAgreement
+            Role::SidecarCopies
         } else if block == 6 {
             Role::SidecarFooter
         } else {
@@ -1172,6 +1222,21 @@ pub fn resolve(case: &Value, variant: Option<&Value>) -> Result<Resolved, String
         vec![role, Role::ParityLocator]
     } else if id == "overflow-3.2-lba" {
         vec![role, Role::TerminalScanner]
+    } else if matches!(
+        id,
+        "sidecar-total-block-count" | "sidecar-primary-tail-disagreement"
+    ) {
+        // The observations of the sidecar-acquisition cases: the component
+        // parser, the Recoverer, a Verifier, the Scanner with intact replicas,
+        // and the BOT walk (had the replicas failed).
+        let mut roles = vec![role, Role::Recovery, Role::Verifier];
+        // The footer variant's author states no observation of the Scanner
+        // with intact replicas.
+        if !(id == "sidecar-total-block-count" && block == 6) {
+            roles.push(Role::TerminalScanner);
+        }
+        roles.push(Role::WalkScanner);
+        roles
     } else {
         vec![role]
     };
@@ -1305,6 +1370,53 @@ mod tests {
     }
 
     /// Open adjudications signal agreement; Invariant cannot pass even informatively.
+    /// A permitted set is pinned: either member passes, anything else fails,
+    /// and a set of fewer than two outcomes or a mixed entry is refused.
+    #[test]
+    fn a_pinned_permitted_set_passes_either_member_only() {
+        let entry = |extra: Value| {
+            let mut e = json!({"id": "c", "match": {"variant": "v", "observation": "o"},
+                "permitted_outcomes": ["DirectoryInvalid", "ParityMapParse"]});
+            for (k, v) in extra.as_object().unwrap() {
+                e[k] = v.clone();
+            }
+            serde_json::to_vec(&json!({"open": [], "settled": [e]})).unwrap()
+        };
+        let adjudications = parse_adjudications(&entry(json!({}))).unwrap();
+        let key = ("c".to_string(), "v".to_string(), "o".to_string());
+        assert!(adjudications.pinned_sets[&key].contains("ParityMapParse"));
+        for bad in [
+            json!({"permitted_outcomes": ["DirectoryInvalid"]}),
+            json!({"corrected": "ACCEPTED"}),
+            json!({"permitted_outcomes": ["DirectoryInvalid", "PANIC"]}),
+        ] {
+            assert!(parse_adjudications(&entry(bad)).is_err());
+        }
+        let observation = |outcome: &str| Observation {
+            location: "test".into(),
+            key: "o",
+            name: "x",
+            detail: String::new(),
+            outcome: outcome.into(),
+        };
+        for (outcome, fails) in [
+            ("DirectoryInvalid", false),
+            ("ParityMapParse", false),
+            ("ACCEPTED", true),
+        ] {
+            let (mut seen, mut failures) = (BTreeSet::new(), Vec::new());
+            adjudications.check_observation(
+                key.clone(),
+                "c/v",
+                &observation(outcome),
+                &Value::Null,
+                &mut seen,
+                &mut failures,
+            );
+            assert_eq!(!failures.is_empty(), fails, "{outcome}");
+        }
+    }
+
     #[test]
     fn adjudication_reports_now_agrees_and_rejects_invariant() {
         let adjudications = parse_adjudications(&serde_json::to_vec(&json!({
@@ -1353,21 +1465,38 @@ mod tests {
             &fs::read(fixture_root().join("tape-images/negatives/adjudications.json")).unwrap(),
         )
         .unwrap();
-        let key = (
-            "sidecar-primary-tail-disagreement".into(),
+        // The two entries that were open are settled: the Recoverer's outcome
+        // for each is ACCEPTED, observed through recover_ordinal_from_sidecar,
+        // and nothing else is open.
+        // Nothing is open; the c-total-zero parser name is a pinned set.
+        assert!(adjudications.open.is_empty());
+        assert_eq!(adjudications.pinned_sets.len(), 1);
+        let parent = (
+            "sidecar-primary-tail-disagreement".to_string(),
             String::new(),
-            "agreement".into(),
+            "recovery".to_string(),
         );
-        assert!(adjudications.allows_open(&key, "ACCEPTED"));
-        assert!(adjudications.allows_open(&key, "SidecarParse"));
-        for outcome in ["PANIC", "Invariant", "TapeIo"] {
-            assert!(!adjudications.allows_open(&key, outcome));
+        let isolated = (
+            "sidecar-primary-tail-disagreement".to_string(),
+            "isolated".to_string(),
+            "recoverer".to_string(),
+        );
+        assert_eq!(
+            adjudications.settled.get(&parent).map(String::as_str),
+            Some("ACCEPTED")
+        );
+        assert_eq!(
+            adjudications.settled.get(&isolated).map(String::as_str),
+            Some("ACCEPTED")
+        );
+        for outcome in ["PANIC", "Invariant", "TapeIo", "ACCEPTED", "SidecarParse"] {
+            assert!(!adjudications.allows_open(&parent, outcome));
         }
-        assert!(!adjudications
-            .allows_open(&(key.0.clone(), String::new(), "header".into()), "ACCEPTED"));
-        assert!(
-            !adjudications.allows_open(&(key.0, "isolated".into(), "agreement".into()), "ACCEPTED")
-        );
+        assert!(!adjudications.settled.contains_key(&(
+            parent.0.clone(),
+            String::new(),
+            "agreement".to_string()
+        )));
         assert_eq!(
             section15(&ObservedError::Replica(
                 TapeIndexReplicaError::DigestMismatch {

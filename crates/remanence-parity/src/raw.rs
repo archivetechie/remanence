@@ -590,9 +590,21 @@ impl RawTapeSource for ImageDirectoryRawSource {
                 hint.partition
             )));
         }
-        self.cursor = usize::try_from(hint.lba)
-            .map_err(|_| image_source_error("image LBA does not fit usize"))?
-            .min(self.records.len());
+        let requested = usize::try_from(hint.lba)
+            .map_err(|_| image_source_error("image LBA does not fit usize"))?;
+        if requested > self.records.len() {
+            // A drive that is asked to LOCATE past its last record reports
+            // end-of-data (BLANK CHECK, 08/00/05) and stays at end-of-data.
+            self.cursor = self.records.len();
+            return Err(TapeIoError::CheckCondition(
+                remanence_library::scsi::ScsiError::CheckCondition {
+                    sense: vec![0x72, 0x08, 0x00, 0x05],
+                    bytes_transferred: 0,
+                },
+            )
+            .into());
+        }
+        self.cursor = requested;
         validate_locate_position(
             hint,
             PhysicalPositionHint::new(
@@ -1335,16 +1347,29 @@ mod compat_tests {
     }
 
     #[test]
-    fn image_source_rejects_a_successful_out_of_range_locate() {
+    fn image_source_reports_a_locate_past_the_last_record_as_end_of_data() {
         let mut source = ImageDirectoryRawSource::from_tape_files(vec![vec![0; 4]], 4)
             .expect("construct image source");
         source
             .configure_fixed_block_size(4)
             .expect("configure image source");
+        // One block, then its filemark: records 0..2. A LOCATE to the position
+        // after the last record is end-of-data itself, and succeeds.
+        source
+            .locate_physical(PhysicalPositionHint::new(2))
+            .expect("LOCATE to end-of-data");
+        assert_eq!(source.position().unwrap(), PhysicalPositionHint::new(2));
+        // A LOCATE past the last record is reported as a drive reports it,
+        // end-of-data (BLANK CHECK), never clamped and then failed as a wrong
+        // position; the source stays at end-of-data.
         let error = source
             .locate_physical(PhysicalPositionHint::new(3))
-            .expect_err("clamped image position must not impersonate requested LBA");
-        assert!(error.to_string().contains("expected partition 0 lba 3"));
+            .expect_err("a LOCATE past the last record is end-of-data");
+        assert!(
+            matches!(&error, ParityError::TapeIo(e) if tape_error_is_end_of_data(e)),
+            "{error:?}"
+        );
+        assert_eq!(source.position().unwrap(), PhysicalPositionHint::new(2));
     }
 
     #[test]

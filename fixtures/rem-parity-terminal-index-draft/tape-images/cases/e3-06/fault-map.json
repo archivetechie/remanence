@@ -1,0 +1,26 @@
+{
+  "appended_files": [
+    {
+      "records": [
+        {
+          "first_byte": "58",
+          "length": 262144,
+          "sha256": "2c6afa39a4b3a0643a0da0b1ceb30be5cbea7b59d078ab0f3d74f1a4ab0f9337",
+          "source": "foreign"
+        },
+        {
+          "first_byte": "58",
+          "length": 262144,
+          "sha256": "2c6afa39a4b3a0643a0da0b1ceb30be5cbea7b59d078ab0f3d74f1a4ab0f9337",
+          "source": "foreign"
+        }
+      ],
+      "trailing_filemark": true
+    }
+  ],
+  "failed_data_addresses": [],
+  "hints": null,
+  "image": "a4-minimal",
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": []
+}

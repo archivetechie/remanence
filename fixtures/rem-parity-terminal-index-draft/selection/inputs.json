@@ -1,0 +1,40 @@
+{
+  "artifacts": [
+    {
+      "artifact": "selection/second-edition-replica-a.bin",
+      "bytes": 786432,
+      "record_count": 3,
+      "replaces": "multi-256k/replica-a.bin",
+      "replica_ordinal": 1,
+      "sha256": "448816d2cda3c5898ff73d98ad34bb2325f2bdd2db7907ea263eae93398bcb63",
+      "start_lba": 25,
+      "tape_file_number": 6
+    },
+    {
+      "artifact": "selection/second-edition-replica-b.bin",
+      "bytes": 786432,
+      "record_count": 3,
+      "replaces": "multi-256k/replica-b.bin",
+      "replica_ordinal": 2,
+      "sha256": "1376c844f9b1b304aec186efa6f198e60c3047dc49755a52ffd40157a20e742a",
+      "start_lba": 33,
+      "tape_file_number": 8
+    },
+    {
+      "artifact": "selection/second-edition-replica-c.bin",
+      "bytes": 786432,
+      "record_count": 3,
+      "replaces": "multi-256k/replica-c.bin",
+      "replica_ordinal": 3,
+      "sha256": "89e7d73b13bc5955f3e6b186ab3135274a2a099503a3731c790a6572e4573df2",
+      "start_lba": 41,
+      "tape_file_number": 10
+    }
+  ],
+  "base_profile": "multi-256k",
+  "description": "Records the second-edition replicas that SELECTION.tsv names `second-edition`: each is planned and written from the multi-256k inputs with only the edition ID and edition sequence changed, at the multi-256k replica's own position.",
+  "edition_digest": "091bac47760bfaa04629d44febbfd527c836f780d94076efe407d67e7ffe850b",
+  "edition_id": "24242424242424242424242424242424",
+  "edition_sequence": 3,
+  "other_inputs": "identical to multi-256k/inputs.json"
+}

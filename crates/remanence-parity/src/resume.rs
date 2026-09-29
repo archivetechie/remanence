@@ -2425,6 +2425,41 @@ mod tests {
         }
     }
 
+    /// The image raw source reports a LOCATE past its last record as a drive
+    /// does, end-of-data, so the Resumer gives `ResumeAppend` there, as it
+    /// would on a real drive, rather than a device fault from a clamped and
+    /// then mismatched position.
+    #[test]
+    fn image_source_locate_past_the_last_record_is_resume_append() {
+        // Records: bootstrap block (LBA 0), filemark, two object blocks
+        // (LBA 2 and 3), filemark (LBA 4); end-of-data is at LBA 5.
+        let mut image = crate::raw::ImageDirectoryRawSource::from_tape_files(
+            vec![vec![0xB0; 256], vec![0x42; 512]],
+            256,
+        )
+        .unwrap();
+        image.configure_fixed_block_size(256).unwrap();
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 6, 0),
+        ])
+        .unwrap();
+        // The commit record places ordinal 5 at LBA 7, past the image's last
+        // record.
+        let error = read_committed_object_block(&mut image, &map, 5, 256).unwrap_err();
+        assert!(
+            matches!(&error, ParityError::ResumeAppend(m) if m.contains("past end-of-data")),
+            "{error:?}"
+        );
+        // An append position past end-of-data likewise contradicts the record.
+        let error =
+            locate_resume_append_position(&mut image, PhysicalPositionHint::new(99)).unwrap_err();
+        assert!(matches!(error, ParityError::ResumeAppend(_)), "{error:?}");
+        // The append position at end-of-data itself is fine.
+        let eod = image.locate_end_of_data().unwrap();
+        locate_resume_append_position(&mut image, eod).unwrap();
+    }
+
     /// REM-PARITY 14 step 3 and E-1: a filemark, EOD or a record shorter or
     /// longer than one block where the committed prefix places data
     /// contradicts the commit record (`ResumeAppend`); a medium or transport

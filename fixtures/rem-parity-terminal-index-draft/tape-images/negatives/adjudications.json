@@ -1,62 +1,75 @@
 {
-  "description": "Supervisor adjudications of negative cases where the pinned expectation and the reference disagree (design D4). The expectations' author's file, negative-cases.json, is never edited. 'open' entries are questions the specification text does not decide (class (c)); the executor reports them as DISPUTED and they stay open until the text decides them. 'settled' entries are disagreements the text decides against the expectation (class (a)); each gives the corrected outcome and the sentence that decides it, and the executor asserts the corrected outcome for the named observation only. Each entry's `match` names the case variant ('' for none) and the executor observation it applies to; open entries list the outcomes that are disputed (either is reported as DISPUTED, any other outcome fails); settled entries give the corrected outcome.",
-  "open": [
+  "description": "Supervisor adjudications of negative cases where the pinned expectation and the reference disagree (design D4). The expectations' author's file, negative-cases.json, is never edited. 'open' entries are questions the specification text does not decide (class (c)); the executor reports them as DISPUTED and they stay open until the text decides them. 'settled' entries are disagreements the text decides against the expectation (class (a)), each with one corrected outcome, or with a pinned permitted set (`permitted_outcomes`) where the text leaves the choice among its names to the Reader; each gives the corrected outcome and the sentence that decides it, and the executor asserts the corrected outcome for the named observation only. Each entry's `match` names the case variant ('' for none) and the executor observation it applies to; open entries list the outcomes that are disputed (either is reported as DISPUTED, any other outcome fails); settled entries give the corrected outcome. The two entries that were open (sidecar-primary-tail-disagreement, and its isolated variant) are settled by REM-PARITY's rewritten Section 9.1 and 13.3 (design D2): they were observed through the Writer-side parser and a BOT-walk Scanner, and are now observed through the Recoverer's public entry, recover_ordinal_from_sidecar (Role::Recovery), with the outcomes that a text-only author wrote for those cases (erratum set E2).",
+  "open": [],
+  "settled": [
     {
       "id": "sidecar-primary-tail-disagreement",
+      "variant": "",
+      "observation": "recovery",
       "expected": "SidecarParse, for a Verifier reading both copies (the case's target)",
-      "reference": "The reference implements no Verifier role for sidecars; its Verifier checks the terminal index only. The executor therefore observes the Recoverer's parser, which validates both copies against the footer first; the divergent tail fails that check, the primary is valid, and the file is accepted.",
-      "readings": [
-        "For a Verifier the text decides it: Section 9.1 says the copies MUST be identical and that a Reader MUST reject divergence, so a Verifier reports this sidecar as non-conformant (SidecarParse). The reference lacks that Verifier check, which is a reference gap, not a disagreement about the text.",
-        "For a Recoverer the text does not decide it: 'when both copies parse' either means each copy satisfies Sections 9.2-9.5 on its own, so divergence is rejected and the epoch's metadata is lost; or it includes agreement with the footer locator (Section 13.3 step 1), so the copy the footer contradicts is invalid and the primary is used."
+      "corrected": "ACCEPTED",
+      "reason": "The Recoverer's outcome is decided by Section 13.3, and by the copy the footer vouches for: recovered, using the primary copy. The footer is valid (its total matches the map), and it carries the primary's hash. The tail copy is contradicted by it and is damaged, with copy health tail-lost. The directory entry agrees with the footer, so the footer decides.",
+      "author": {
+        "author_observation": "Recoverer",
+        "result": "recovered, using the primary copy. The footer is valid (its total matches the map), and it carries the primary's hash. The tail copy is contradicted by it and is damaged, with copy health tail-lost. The directory entry agrees with the footer, so the footer decides.",
+        "error": null,
+        "sections": [
+          "13.3",
+          "9.1"
+        ]
+      },
+      "sentences": [
+        "**Footer first.** Read the file's last block. If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost).",
+        "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used.",
+        "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
       ],
-      "sentence": "Section 9.1: \"When both copies parse, a Reader MUST verify that they agree and reject divergence.\"",
-      "status": "open: (1) the reference gains a Verifier-level sidecar agreement check, or the Verifier's scope is stated to exclude sidecars (D9); (2) the Recoverer's consequence is an owner question in the next text revision (D9). Until then the observation is DISPUTED, never a pass; a PANIC or any other outcome fails.",
-      "observation": "the Recoverer's sidecar tape-file parser (parse_sidecar_tape_file); the reference has no Verifier-level sidecar check",
       "match": {
         "variant": "",
-        "observation": "agreement"
-      },
-      "disputed_outcomes": [
-        "SidecarParse",
-        "ACCEPTED"
-      ]
+        "observation": "recovery"
+      }
     },
     {
       "id": "sidecar-primary-tail-disagreement",
       "variant": "isolated",
-      "observation": "per_sidecar_validation",
+      "observation": "recoverer",
       "expected": "SidecarParse, for a role that parses both copies (the footer is unreadable, so both copies parse on their own and diverge)",
-      "reference": "The reference has no role that parses both copies when the footer is unreadable: it has no Verifier for sidecars, and its BOT Scanner classifies from the primary header (Section 12.3 item 5) without reading the tail copy. The executor observes that Scanner, which accepts.",
-      "readings": [
-        "The same question as the parent entry: the text requires a Reader that parses both copies to reject divergence, and the reference implements no such Reader for sidecars. Whether the Verifier's scope includes sidecars is to be stated (D9)."
+      "corrected": "ACCEPTED",
+      "reason": "The Recoverer's outcome is decided by rule 2 of Section 13.3: recovered, using the primary copy. The footer is unreadable, so the Recoverer falls back to the primary. The available directory entry decides: its key 8 equals the primary's hash, so the primary is used. The tail need not be read, and if read it is contradicted by the entry.",
+      "author": {
+        "author_observation": "Recoverer",
+        "result": "recovered, using the primary copy. The footer is unreadable, so the Recoverer falls back to the primary. The available directory entry decides: its key 8 equals the primary's hash, so the primary is used. The tail need not be read, and if read it is contradicted by the entry.",
+        "error": null,
+        "sections": [
+          "13.3",
+          "9.1"
+        ]
+      },
+      "sentences": [
+        "**Primary fallback.** If the footer is unreadable, unparseable, **or inconsistent with the map entry** — a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop — fall back to the primary header at block 0 (copy-kind and map-entry block-count cross-checks apply).",
+        "When a sidecar epoch directory entry is available (step 3), it decides as the footer would: a copy is used only if its `canonical_metadata_hash` equals the entry's. The primary is used if it does; otherwise step 3 applies.",
+        "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
       ],
-      "sentence": "Section 9.1: \"When both copies parse, a Reader MUST verify that they agree and reject divergence.\"",
-      "status": "open, with the parent entry. The observation is DISPUTED, never a pass; a PANIC or any other outcome fails.",
       "match": {
         "variant": "isolated",
-        "observation": "per_sidecar_validation"
-      },
-      "disputed_outcomes": [
-        "SidecarParse",
-        "ACCEPTED"
-      ]
-    }
-  ],
-  "settled": [
+        "observation": "recoverer"
+      }
+    },
     {
       "id": "overflow-13.3-tail-location",
       "variant": "c-total-zero",
-      "observation": "recovery",
-      "expected": "{DirectoryInvalid, ParityMapParse} at the Recoverer",
-      "corrected": "SidecarMetadataUnavailable{epoch_id: 0}",
-      "reason": "A zero total breaks a Section 10.1.5 invariant, so the final ParityMap does not validate. The directory is then not a Recoverer input, and with the sidecar's primary and footer corrupted (the case's precondition) no header/index copy can be validated, so the epoch is metadata-unavailable. The ParityMap's own failure is the decoder's outcome, which the case's decoder observations keep ({DirectoryInvalid, ParityMapParse}); it is not the Recoverer's.",
+      "observation": "ParityMap",
+      "expected": "DirectoryInvalid (erratum set E4's author)",
+      "permitted_outcomes": [
+        "DirectoryInvalid",
+        "ParityMapParse"
+      ],
+      "reason": "Section 15 leaves the choice between the two names to the Reader once both ParityMap copies have failed. The whole-file parser reports ParityMapParse and wraps each copy's DirectoryInvalid; the per-copy directory decoders report DirectoryInvalid. Either is conformant, so the set is pinned and either passes.",
       "sentences": [
-        "Section 13.1: \"The sidecar epoch directory of the tape's final ParityMap is also an input whenever that ParityMap validates and is marked `is_final_directory`.\"",
-        "Section 13.3: \"Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5).\""
+        "Section 15: \"The name is normative as a category: this document does not specify which of the two a Reader reports once it has failed both ParityMap copies.\""
       ],
       "match": {
         "variant": "c-total-zero",
-        "observation": "recovery"
+        "observation": "ParityMap"
       }
     }
   ]

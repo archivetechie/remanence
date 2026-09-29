@@ -456,6 +456,12 @@ pub enum ScanDamageKind {
     /// classification rung was abandoned and the file fell through to the next
     /// rung (REM-PARITY 12.3). The walk continues; the failure is reported.
     ClassificationCountMismatch,
+    /// A tape file whose last block parsed as a sidecar footer with the
+    /// measured count carried a tail header copy that read but did not parse,
+    /// or that parsed but disagreed with the footer's locator in some field, so the file is not recognised
+    /// as a sidecar (REM-PARITY 12.3 item 6) and fell through to the next
+    /// rung. The walk continues; the failure is reported.
+    ClassificationTailMismatch,
     /// A terminal-control magic was present but its frame or measured count
     /// was invalid. It remains a control file and never consumes Object
     /// ordinals or participates in Object-based overlays.
@@ -503,6 +509,15 @@ pub struct FilemarkMapScanResult {
     pub overlay_source: ScanOverlaySource,
     /// Physical damage encountered by the underlying structural scan.
     pub damaged_regions: Vec<ScanDamagedRegion>,
+}
+
+impl ScanWalkResult {
+    /// The final ParityMap the walk read, when it validates and is marked
+    /// `is_final_directory` (REM-PARITY 13.1). It scopes a walked map without
+    /// any bootstrap.
+    pub(crate) fn final_parity_map(&self) -> Option<&DecodedParityMapTapeFile> {
+        self.final_parity_map.as_deref()
+    }
 }
 
 impl FilemarkMapScanResult {
@@ -1507,9 +1522,34 @@ fn classify_sidecar_from_footer_tail(
     }
 
     match read_tail_sidecar_header(source, file_start, tape_uuid, block_size, &footer)? {
-        Some(header) => Ok(Some(SidecarScanClassification::from(&header))),
-        None => Ok(Some(SidecarScanClassification::from(&footer))),
+        SidecarTailProbe::Matches(header) => Ok(Some(SidecarScanClassification::from(&header))),
+        // REM-PARITY 12.3 item 6: the Scanner MAY classify from the footer
+        // fields alone if the tail copy is unreadable.
+        SidecarTailProbe::Unreadable => Ok(Some(SidecarScanClassification::from(&footer))),
+        // Item 6: a tail copy that disagrees with the footer, field for field,
+        // means the file is not recognised. Report it and fall through to the
+        // next rung, as the count mismatch above does, rather than abandoning
+        // the whole walk over one tape file's disagreement.
+        SidecarTailProbe::Disagrees => {
+            damaged_regions.push(ScanDamagedRegion {
+                start: file_start,
+                block_count,
+                kind: ScanDamageKind::ClassificationTailMismatch,
+            });
+            Ok(None)
+        }
     }
+}
+
+/// What the footer/tail probe of REM-PARITY 12.3 item 6 found in the tail copy.
+enum SidecarTailProbe {
+    /// A readable tail copy that agrees with the footer's locator.
+    Matches(SidecarHeader),
+    /// A block of the tail copy could not be read (or lies outside the file).
+    Unreadable,
+    /// A tail copy that reads but is invalid, or that parses and disagrees
+    /// with the footer in some field.
+    Disagrees,
 }
 
 fn read_tail_sidecar_header(
@@ -1518,7 +1558,7 @@ fn read_tail_sidecar_header(
     tape_uuid: &[u8; 16],
     block_size: u32,
     footer: &SidecarFooter,
-) -> Result<Option<SidecarHeader>, ParityError> {
+) -> Result<SidecarTailProbe, ParityError> {
     let mut blocks = Vec::with_capacity(
         usize::try_from(footer.sidecar_header_block_count)
             .ok()
@@ -1535,21 +1575,21 @@ fn read_tail_sidecar_header(
             block_size,
         )?
         else {
-            return Ok(None);
+            return Ok(SidecarTailProbe::Unreadable);
         };
         blocks.push(block);
     }
+    // A tail copy that reads but fails to parse (a CRC or hash failure) is an
+    // invalid copy, not an unreadable one: it cannot be verified against the
+    // footer field for field, so the file is not recognised (12.3 item 6).
     let decoded = match parse_sidecar_index_blocks(&blocks, tape_uuid) {
         Ok(decoded) => decoded,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(SidecarTailProbe::Disagrees),
     };
     if !sidecar_header_matches_footer(&decoded.header, footer) {
-        return Err(filemark_scan_error(format!(
-            "sidecar tail header for epoch {} does not match footer locator",
-            footer.epoch_id
-        )));
+        return Ok(SidecarTailProbe::Disagrees);
     }
-    Ok(Some(decoded.header))
+    Ok(SidecarTailProbe::Matches(decoded.header))
 }
 
 fn read_optional_fixed_block_at(
@@ -2066,6 +2106,93 @@ mod tests {
         walked.map
     }
 
+    /// REM-PARITY 12.3 item 6: a tail header copy that parses but disagrees
+    /// with the footer, field for field, means the file is not recognised. The
+    /// Scanner reports it and falls through to the next rung, so the file is an
+    /// Object candidate for the first pass and the walk is not abandoned; the
+    /// final ParityMap's entry then identifies it in the second pass.
+    #[test]
+    fn sidecar_tail_copy_disagreeing_with_the_footer_falls_through() {
+        use crate::sidecar::{encode_sidecar_tape_file, SidecarDescriptor};
+        let (mut source, expected, _) = directory_scan_source();
+        let other = encode_sidecar_tape_file(
+            &SidecarDescriptor {
+                tape_uuid: TAPE_UUID,
+                epoch_id: 0,
+                k: 2,
+                m: 1,
+                stripes_per_epoch: 1,
+                block_size: BLOCK_SIZE,
+                protected_ordinal_start: 0,
+                protected_ordinal_end_exclusive: 2,
+            },
+            &[block(0x44)],
+            vec![1, 1],
+        )
+        .unwrap();
+        // The sidecar's records follow the bootstrap, the Object and their
+        // two filemarks. The other sidecar's tail copy is valid on its own
+        // and differs from this one's footer in the canonical hash.
+        let sidecar_start = 5;
+        let tail = usize::try_from(other.header.tail_header_start_block).unwrap();
+        let h = usize::try_from(other.header.shard_index_block_count).unwrap();
+        // Item 6 is reached only when the primary's head block is unreadable
+        // (item 5 recognises a file whose primary header parses).
+        source.records[sidecar_start] = Record::ReadFault(TestReadFault::Medium);
+        for i in 0..h {
+            source.records[sidecar_start + tail + i] =
+                Record::Block(other.blocks[tail + i].clone());
+        }
+        let walked = scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+            .expect("one tape file's disagreement does not abandon the walk");
+        assert_eq!(
+            walked
+                .damaged_regions
+                .iter()
+                .map(|region| region.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                ScanDamageKind::UnreadableTapeFileHead,
+                ScanDamageKind::ClassificationTailMismatch
+            ]
+        );
+        // The first pass falls through to an Object candidate (item 7) ...
+        let mut first = directory_scan_source().0;
+        first.records[sidecar_start] = Record::ReadFault(TestReadFault::Medium);
+        for i in 0..h {
+            first.records[sidecar_start + tail + i] = Record::Block(other.blocks[tail + i].clone());
+        }
+        let first_pass_map = first_pass(&mut first);
+        assert_eq!(first_pass_map.entries()[2].kind, TapeFileKind::Object);
+        // ... and the second pass restores the sidecar from the directory.
+        assert_eq!(walked.map, expected);
+        // A tail copy that reads but is invalid is not unreadable either: the
+        // file is not recognised from the footer alone.
+        let (mut invalid, _, _) = directory_scan_source();
+        invalid.records[sidecar_start] = Record::ReadFault(TestReadFault::Medium);
+        if let Record::Block(block) = &mut invalid.records[sidecar_start + tail] {
+            block[0xd0] ^= 0x01;
+        }
+        let first = first_pass(&mut invalid);
+        assert_eq!(first.entries()[2].kind, TapeFileKind::Object);
+        // An unreadable tail copy is not a disagreement: the footer classifies.
+        let (mut unreadable, _, _) = directory_scan_source();
+        unreadable.records[sidecar_start] = Record::ReadFault(TestReadFault::Medium);
+        unreadable.records[sidecar_start + tail] = Record::ReadFault(TestReadFault::Medium);
+        let walked =
+            scan_reconstruct_filemark_map_with_report(&mut unreadable, &TAPE_UUID, BLOCK_SIZE)
+                .unwrap();
+        assert_eq!(
+            walked
+                .damaged_regions
+                .iter()
+                .map(|region| region.kind)
+                .collect::<Vec<_>>(),
+            vec![ScanDamageKind::UnreadableTapeFileHead]
+        );
+        assert_eq!(walked.map, expected);
+    }
+
     /// Build a parsed authority with a pending ordinal and a later unvalidated
     /// Object. No media reads are needed to exercise the Recoverer's fences.
     fn walked_scope_authority() -> (FilemarkMap, crate::DecodedParityMapTapeFile) {
@@ -2479,7 +2606,8 @@ mod tests {
                 &walked.map.entries()[2],
                 &directory.entries[0],
                 &TAPE_UUID,
-                BLOCK_SIZE
+                BLOCK_SIZE,
+                crate::recovery::scheme_parity_blocks(&sample_scheme())
             ),
             Err(ParityError::SidecarMetadataUnavailable { .. })
         ));
@@ -2554,6 +2682,7 @@ mod tests {
                 entry,
                 &TAPE_UUID,
                 BLOCK_SIZE,
+                crate::recovery::scheme_parity_blocks(&sample_scheme()),
             )
             .unwrap();
             assert_eq!(
@@ -2575,13 +2704,7 @@ mod tests {
 
     #[test]
     fn directory_probes_degrade_only_current_medium_reads() {
-        for probe in [
-            "directory",
-            "tail",
-            "rescue-directory",
-            "rescue-tail",
-            "rescue-tail-footer",
-        ] {
+        for probe in ["directory", "tail", "rescue-directory", "rescue-tail"] {
             let loader = probe.ends_with("directory");
             let rescue = probe.starts_with("rescue-");
             for locate in [false, true] {
@@ -2611,11 +2734,11 @@ mod tests {
                     };
                     if rescue {
                         // Force the public recovery call through its directory rescue.
+                        // The footer is unreadable too: after a valid footer the
+                        // directory is not used to rescue (REM-PARITY 13.3).
                         source.records[5] = Record::ReadFault(TestReadFault::Medium);
-                        if !probe.ends_with("footer") {
-                            source.records[5 + map.entries()[2].block_count as usize - 1] =
-                                Record::ReadFault(TestReadFault::Medium);
-                        }
+                        source.records[5 + map.entries()[2].block_count as usize - 1] =
+                            Record::ReadFault(TestReadFault::Medium);
                     }
                     if locate {
                         source.locate_fault = Some((target, fault));
@@ -2650,6 +2773,7 @@ mod tests {
                             entry,
                             &TAPE_UUID,
                             BLOCK_SIZE,
+                            crate::recovery::scheme_parity_blocks(&sample_scheme()),
                         )
                         .map(|_| ())
                     };

@@ -1,0 +1,803 @@
+{
+ "source": "Expected outcomes of erratum set E4 for the damage cases below were written from the REM-PARITY in-progress text (SHA-256 149543719094644275beea17c2ef4f728a4b92f8a536e2ab8d08fc177e95ed47) by an author who saw only the text and the constructions, never the reference's outcomes, and are transcribed without change. `rescue` gives the outcome for each failed data address of the existing case `parity-map-and-sidecar` (Section 13.3's tail rescue from the terminal index); `full_verification` gives, for each of the fourteen damage cases, what a Verifier's full verification reports (Section 2.2). The executor compares the structured parts (the failed data blocks and parity shards by address and reason, the terminal suffix, and the route by which the map was obtained); the author's other findings, open questions and derivations are informative.",
+ "rescue": {
+  "Recoverer asked for (1,0), given the validated terminal inventory": {
+   "outcome": "recovered",
+   "error": null,
+   "derivation": "(1,0) is ordinal 0: epoch 0 (sidecar at tape file 2), stripe 0, data_index 0. Step 1: the footer (block 6, LBA 17) is unreadable. Step 2: the primary copy (block 0, LBA 11) is unreadable. The final ParityMap (tape file 4) has both copies unreadable (LBA 27, 28), so it does not validate and no directory entry is available; the directory-assisted rescue of step 3 does not run. The map entry comes from the validated terminal replicas, so the tail rescue from the terminal index applies: total = 7, P = S x m = 4, total - 1 - P = 2 (even), H = 1 > 0, tail copy at block H + P = 5 (LBA 16), readable. It satisfies Sections 9.2 to 9.5 on its own, its copy_kind is 2, its sidecar_total_block_count 7 matches the map entry, its recorded H is 1, and its epoch 0 and range [0,4) agree with the map entry: the tail copy is used. The index pins to the bootstrap scheme (k=2, m=2, S=2, 256 KiB) and to the map entry's range. Stripe 0 peers: ordinal 2 = (1,2) at LBA 4, parity (0,0,0) at LBA 12 and (0,0,1) at LBA 14, all readable and CRC-matching; one erasure, at most m = 2. Reconstruction from ordinal 2 and parity 0, verified against ordinal 0's data CRC, releases the block.",
+   "sections": [
+    "13.1",
+    "13.3",
+    "13.4",
+    "13.5",
+    "3.3",
+    "9.1",
+    "10.1.3",
+    "6.5",
+    "17"
+   ],
+   "quotes": [
+    "The sidecar epoch directory of the tape's final ParityMap is also an input whenever that ParityMap validates and is marked `is_final_directory`.",
+    "A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the footer, and MUST NOT rely on a block whose CRC does not verify.",
+    "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates.",
+    "With `total` the map entry's block count and `P = S × m`, the tail copy starts at block `H + P`, where `H = (total − 1 − P) / 2`. This rescue requires that `total − 1 − P` is even and that `H` is greater than zero.",
+    "The tail copy is used only if it is valid on its own (step 2's sense), its recorded `sidecar_header_block_count` equals `H`, and its epoch and protected range agree with the map entry.",
+    "The tail copy is valid when it satisfies Sections 9.2 to 9.5 on its own, its `copy_kind` is 2, and it passes the cross-checks of this step.",
+    "Every reconstructed data block MUST be verified against its sidecar data CRC before release.",
+    "`parity-map-and-sidecar` is informative because this document did not decide part of it when its outcome was written; Section 13.3's tail rescue from the map entry now decides it, and the case is to be pinned to that outcome."
+   ]
+  },
+  "Recoverer asked for (1,4), given the validated terminal inventory": {
+   "outcome": "recovered",
+   "error": null,
+   "derivation": "(1,4) is ordinal 4: epoch 1 (sidecar at tape file 3, undamaged), stripe 0, data_index 0. Step 1: the footer (LBA 25) parses and its total 7 matches the map entry; both copies (LBA 19, LBA 24) verify against it. No directory entry is available (the ParityMap does not validate), so the footer decides and the primary is used. Stripe 0 of epoch 1: ordinal 6 = (1,6) at LBA 8, parity (1,0,0) at LBA 20 and (1,0,1) at LBA 22, readable and CRC-matching; one erasure. Reconstructed and CRC-verified. Epoch 0's metadata damage does not reach epoch 1.",
+   "sections": [
+    "13.3",
+    "12.5",
+    "13.4",
+    "13.5",
+    "3.3"
+   ],
+   "quotes": [
+    "Read the file's last block. If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost).",
+    "Damage confined to one sidecar's metadata — any or all of its header copies, its footer, its directory entry's health flags — MUST NOT degrade classification, mapping, digest validation, or recovery of any other epoch.",
+    "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
+   ]
+  }
+ },
+ "full_verification": {
+  "bootstrap-wrong-scheme": {
+   "image": "a4-minimal",
+   "map_route": "bootstrap unreadable; discovery on the supplied values (tape UUID, 262144, k=2 m=1 S=2); replicas A, B, C validate and agree",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Bootstrap (tape file 0, LBA 0) unreadable (medium error): treated as unreadable and discovery continues on the supplied values; its trailing fill cannot be verified",
+    "Epoch 0 sidecar (tape file 2): footer valid (total 7 matches), primary and tail valid and equal (both-usable); the acquired index records k=2 m=2 S=2, which disagrees with the supplied m=1: SchemeMismatch for epoch 0",
+    "ParityMap (tape file 3) validates and is final. Under the supplied scheme its entry for tape file 2 fails the rescue precondition (P = S x m = 2, so 2H + P + 1 = 5, not 7), so the entry is not available for a rescue. This is not a directory invariant, so there is no DirectoryInvalid",
+    "Terminal replicas A, B, C locally eligible and agreeing; separation extents AB and BC valid with zero interiors; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete and Complete final-prefix map; the text defines no whole-tape 'complete' verdict beyond this",
+   "open": [
+    "Whether a Verifier still checks (1,1), (1,2), (1,3) and the parity shards against an index that failed the SchemeMismatch pin. If it does, none fails",
+    "Which parity shards 'every parity shard' names: the sidecar records P = 4, but the supplied scheme implies S x m = 2",
+    "Whether the directory entry's recorded P = 4 against the supplied scheme is itself reported (SchemeMismatch or nothing)",
+    "What a Verifier reports for a bootstrap fill it cannot read"
+   ],
+   "sections": [
+    "2.2",
+    "8.4",
+    "8.4.1",
+    "6.6",
+    "13.3",
+    "9.1",
+    "8.1",
+    "10.6",
+    "12.6"
+   ],
+   "quotes": [
+    "treats the bootstrap as unreadable and continues on the supplied values",
+    "Readers MUST use the recorded values or, when the bootstrap is unreadable, the values supplied under Section 8.4.1, never defaults.",
+    "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`.",
+    "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4).",
+    "Verifiers MUST verify it and report a nonzero fill as a nonconformity."
+   ]
+  },
+  "burst-m": {
+   "image": "a4-minimal",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      2
+     ],
+     "lba": 4,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      3
+     ],
+     "lba": 5,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 0,
+     "sidecar_block": 1,
+     "lba": 8,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 1,
+     "parity_index": 0,
+     "sidecar_block": 2,
+     "lba": 9,
+     "reason": "unreadable"
+    }
+   ],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (block 0, LBA 7) unreadable. The footer (LBA 13) and tail copy (LBA 12) are valid, and the directory entry agrees (hash and 7 = 2*1 + 4 + 1). The index comes from the tail (copy health primary-lost). No divergence can be reported, since one copy is unreadable",
+    "ParityMap valid; bootstrap valid with zero fill",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid with zero interiors; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "The fault map marks the filemark position after tape file 1 (LBA 6) unreadable but not removed. The text gives no outcome for a medium error at a filemark position; the filemark is taken as present",
+    "Whether a Verifier also reports recoverability. Here each stripe has 2 erasures = m, so both are recoverable"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "3.3",
+    "10.6",
+    "12.6"
+   ],
+   "quotes": [
+    "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index.",
+    "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it.",
+    "a read failure, a CRC mismatch, or a position outside the durable boundary.",
+    "block(stripe, parity_index) = H + parity_index·S + stripe",
+    "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+   ]
+  },
+  "burst-m-plus-one": {
+   "image": "a4-minimal",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      2
+     ],
+     "lba": 4,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      3
+     ],
+     "lba": 5,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 0,
+     "sidecar_block": 1,
+     "lba": 8,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 1,
+     "parity_index": 0,
+     "sidecar_block": 2,
+     "lba": 9,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 1,
+     "sidecar_block": 3,
+     "lba": 10,
+     "reason": "unreadable"
+    }
+   ],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (block 0, LBA 7) unreadable; footer and tail valid, directory entry agrees; index from the tail (primary-lost)",
+    "ParityMap valid; bootstrap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "Filemark position LBA 6 is marked unreadable but not removed; the text is silent (the filemark is taken as present)",
+    "Whether a Verifier reports that stripe 0 of epoch 0 (ordinal 2, (0,0,0), (0,0,1): 3 erasures > m) is unrecoverable; the text says a Verifier does not recover payload"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "3.3",
+    "10.6"
+   ],
+   "quotes": [
+    "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index.",
+    "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it.",
+    "block(stripe, parity_index) = H + parity_index·S + stripe"
+   ]
+  },
+  "object-head": {
+   "image": "a4-minimal",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Epoch 0 sidecar: footer, primary and tail valid and equal; directory entry agrees",
+    "ParityMap valid; bootstrap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [],
+   "sections": [
+    "2.2",
+    "13.4",
+    "9.1",
+    "10.6"
+   ],
+   "quotes": [
+    "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index.",
+    "a read failure, a CRC mismatch, or a position outside the durable boundary."
+   ]
+  },
+  "parity-and-data": {
+   "image": "a4-minimal",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      2
+     ],
+     "lba": 4,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 0,
+     "sidecar_block": 1,
+     "lba": 8,
+     "reason": "unreadable"
+    }
+   ],
+   "other_findings": [
+    "Epoch 0 sidecar: footer, primary and tail valid and equal; directory entry agrees",
+    "ParityMap valid; bootstrap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [],
+   "sections": [
+    "2.2",
+    "13.4",
+    "3.3",
+    "9.1",
+    "10.6"
+   ],
+   "quotes": [
+    "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index.",
+    "block(stripe, parity_index) = H + parity_index·S + stripe"
+   ]
+  },
+  "parity-map-and-sidecar": {
+   "image": "two-epoch",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      4
+     ],
+     "lba": 6,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (block 0, LBA 11) and footer (block 6, LBA 17) unreadable. The tail copy (block 5, LBA 16) is valid and is reached by the tail rescue from the terminal index (H = (7 - 1 - 4)/2 = 1). Its recorded H, epoch and range agree, and the index comes from it",
+    "Epoch 1 sidecar (tape file 3): footer, primary and tail valid and equal",
+    "ParityMap (tape file 4): primary (LBA 27) and tail (LBA 28) copies unreadable, footer (LBA 29) valid. The ParityMap does not validate, so there is no sidecar epoch directory",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "The Section 15 name, if any, for a ParityMap whose two copies are unreadable. ParityMapParse is for violations of Section 10.1, TapeIo for medium failures, and a Reader with valid replicas raises neither",
+    "The name for unreadable sidecar copies and footer when a Reader recovers the index anyway: a Reader reports no error, only copy health"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "10.1.3",
+    "13.4",
+    "12.5",
+    "10.6"
+   ],
+   "quotes": [
+    "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it.",
+    "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates.",
+    "A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the footer, and MUST NOT rely on a block whose CRC does not verify.",
+    "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+   ]
+  },
+  "parity-map-both": {
+   "image": "a4-minimal",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "ParityMap (tape file 3): primary (LBA 15) and tail (LBA 16) copies unreadable, footer (LBA 17) valid. The ParityMap does not validate, so there is no directory",
+    "Epoch 0 sidecar: footer, primary and tail valid and equal; with no directory entry available, the footer decides",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "The Section 15 name, if any, for a ParityMap with both copies unreadable (see notes)"
+   ],
+   "sections": [
+    "2.2",
+    "10.1.3",
+    "13.3",
+    "9.1",
+    "10.6"
+   ],
+   "quotes": [
+    "A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the footer, and MUST NOT rely on a block whose CRC does not verify.",
+    "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+   ]
+  },
+  "short-epoch-burst": {
+   "image": "short-epoch",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      1
+     ],
+     "lba": 3,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 0,
+     "sidecar_block": 1,
+     "lba": 6,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 1,
+     "parity_index": 0,
+     "sidecar_block": 2,
+     "lba": 7,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 2,
+     "parity_index": 0,
+     "sidecar_block": 3,
+     "lba": 8,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 3,
+     "parity_index": 0,
+     "sidecar_block": 4,
+     "lba": 9,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 1,
+     "sidecar_block": 5,
+     "lba": 10,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 1,
+     "parity_index": 1,
+     "sidecar_block": 6,
+     "lba": 11,
+     "reason": "unreadable"
+    }
+   ],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (block 0, LBA 5) unreadable. The footer (block 10, LBA 15) and tail (block 9, LBA 14) are valid, and the directory entry agrees (11 = 2*1 + 8 + 1). The index comes from the tail (primary-lost)",
+    "ParityMap valid; bootstrap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "Filemark position LBA 4 is marked unreadable but not removed; the text is silent (the filemark is taken as present)",
+    "Whether a Verifier reports recoverability. Stripe 1 has 3 erasures (ordinal 1, (0,1,0), (0,1,1)) and one implicit zero, so it is unrecoverable"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "3.3",
+    "6.4",
+    "10.6"
+   ],
+   "quotes": [
+    "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index.",
+    "block(stripe, parity_index) = H + parity_index·S + stripe",
+    "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+   ]
+  },
+  "short-epoch-recoverable": {
+   "image": "short-epoch",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      1
+     ],
+     "lba": 3,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 0,
+     "sidecar_block": 1,
+     "lba": 6,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 1,
+     "parity_index": 0,
+     "sidecar_block": 2,
+     "lba": 7,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 2,
+     "parity_index": 0,
+     "sidecar_block": 3,
+     "lba": 8,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 3,
+     "parity_index": 0,
+     "sidecar_block": 4,
+     "lba": 9,
+     "reason": "unreadable"
+    },
+    {
+     "epoch": 0,
+     "stripe": 0,
+     "parity_index": 1,
+     "sidecar_block": 5,
+     "lba": 10,
+     "reason": "unreadable"
+    }
+   ],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (block 0, LBA 5) unreadable; footer (LBA 15) and tail (LBA 14) valid, directory entry agrees; index from the tail (primary-lost)",
+    "ParityMap valid; bootstrap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "Filemark position LBA 4 is marked unreadable but not removed; the text is silent (the filemark is taken as present)"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "3.3",
+    "10.6"
+   ],
+   "quotes": [
+    "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index.",
+    "block(stripe, parity_index) = H + parity_index·S + stripe"
+   ]
+  },
+  "sidecar-footer": {
+   "image": "two-epoch",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      4
+     ],
+     "lba": 6,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): footer (block 6, LBA 17) unreadable. The primary is valid and its hash equals the directory entry's, so it is used. The tail was read and is valid and equal to the primary, so there is no divergence",
+    "Epoch 1 sidecar valid",
+    "ParityMap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "The name for an unreadable sidecar footer when the index is acquired anyway (a Reader reports none)"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "10.6"
+   ],
+   "quotes": [
+    "When a sidecar epoch directory entry is available (step 3), it decides as the footer would: a copy is used only if its `canonical_metadata_hash` equals the entry's.",
+    "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+   ]
+  },
+  "sidecar-primary": {
+   "image": "two-epoch",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      4
+     ],
+     "lba": 6,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (block 0, LBA 11) unreadable; footer (LBA 17) valid, tail (LBA 16) valid, directory entry agrees; index from the tail (primary-lost)",
+    "Epoch 1 sidecar valid",
+    "ParityMap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [
+    "The name for an unreadable sidecar primary copy when the tail serves (a Reader records copy health only)"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "10.6"
+   ],
+   "quotes": [
+    "Read the file's last block. If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost).",
+    "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+   ]
+  },
+  "sidecar-primary-and-footer": {
+   "image": "two-epoch",
+   "map_route": "validated terminal replicas",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      4
+     ],
+     "lba": 6,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary copy (LBA 11) and footer (LBA 17) unreadable. The directory-assisted rescue applies: the entry is available, agrees with the map entry, and 7 = 2*1 + 4 + 1. The tail at block 7 - 1 - 1 = 5 (LBA 16) is valid, its hash equals the entry's, and the index comes from it",
+    "Epoch 1 sidecar valid",
+    "ParityMap valid",
+    "Terminal replicas A, B, C valid and agreeing; AB and BC valid; EOD after C"
+   ],
+   "terminal_suffix_complete": true,
+   "tape_complete": "terminal suffix complete; no whole-tape verdict is defined",
+   "open": [],
+   "sections": [
+    "2.2",
+    "9.1",
+    "13.3",
+    "13.4",
+    "10.1.5",
+    "10.6"
+   ],
+   "quotes": [
+    "If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+    "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+   ]
+  },
+  "walk-directory-rescue": {
+   "image": "a4-minimal",
+   "map_route": "no replica validates; BOT walk; the second pass identifies tape file 2 as the epoch 0 sidecar; the walked map is validated against the final ParityMap (scope tape files 0..3, T = W = 4)",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "other_findings": [
+    "Terminal replicas A (tape file 4, header LBA 19), B (tape file 6, header LBA 27) and C (tape file 8, header LBA 35): each header unreadable, so none is locally eligible. Each is typed a damaged terminal replica by its footer after its measured count is checked. BotStructuralRecoveryRequired; terminal authority not recovered; the Object's identity is unknown",
+    "Separation extents AB (tape file 5) and BC (tape file 7) valid with zero interiors",
+    "Epoch 0 sidecar (tape file 2): primary (LBA 7) and footer (LBA 13) unreadable. The first walk pass takes it as an Object candidate, and the second pass identifies it from the directory entry (measured 7 = total 7). The digest and scope checks pass. The directory-assisted rescue gives the tail at block 5 (LBA 12), whose hash matches, and the index comes from it",
+    "ParityMap (tape file 3) valid and final; bootstrap valid"
+   ],
+   "terminal_suffix_complete": false,
+   "tape_complete": "not complete: no valid replica, terminal authority not recovered (derived; the text states only the separation-extent rule explicitly)",
+   "open": [
+    "The Section 15 name for a replica whose header record is unreadable. TerminalIndexReplicaParse names framing violations, and a medium error is not one",
+    "Whether 'complete' may be withheld for invalid replicas when both extents are valid. The only explicit MUST NOT concerns an invalid separation extent"
+   ],
+   "sections": [
+    "2.2",
+    "8.4",
+    "8.4.1",
+    "12.3",
+    "12.4",
+    "12.6",
+    "13.1",
+    "13.3",
+    "10.6"
+   ],
+   "quotes": [
+    "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk;",
+    "The Scanner MUST report that terminal authority was not recovered.",
+    "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked.",
+    "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate.",
+    "After the walk, when the tape's final ParityMap validates and is marked `is_final_directory`, the Scanner MUST perform a second pass that identifies as a sidecar each Object candidate at a tape file a directory entry names whose measured length equals the entry's `sidecar_total_block_count`.",
+    "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`.",
+    "a Verifier's full check reports every replica.",
+    "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+   ]
+  },
+  "walk-sidecar-isolation": {
+   "image": "two-epoch",
+   "map_route": "no replica validates; BOT walk; the second pass identifies tape file 2 as the epoch 0 sidecar; the walked map is validated against the final ParityMap (scope tape files 0..4, T = W = 8)",
+   "failed_data_blocks": [
+    {
+     "tape_file_position": [
+      1,
+      0
+     ],
+     "lba": 2,
+     "reason": "unreadable"
+    },
+    {
+     "tape_file_position": [
+      1,
+      4
+     ],
+     "lba": 6,
+     "reason": "unreadable"
+    }
+   ],
+   "failed_parity_shards": [],
+   "unchecked": [
+    "Epoch 0 data blocks (1,1), (1,2), (1,3) (LBA 3..5) and parity shards (0,0,0), (0,1,0), (0,0,1), (0,1,1) (sidecar blocks 1..4, LBA 12..15) are readable, but no index validates, so they cannot be checked against CRCs. The text leaves open how a Verifier reports them"
+   ],
+   "other_findings": [
+    "Epoch 0 sidecar (tape file 2): primary (LBA 11), tail (LBA 16) and footer (LBA 17) unreadable. The directory-assisted rescue fails because the tail is unreadable, and the terminal-index rescue is excluded (the ParityMap validates, and a walked map does not qualify): SidecarMetadataUnavailable{epoch_id: 0}",
+    "Epoch 1 sidecar (tape file 3): footer, primary and tail valid; its data (1,5), (1,6), (1,7) and parity pass, so epoch 1 is unaffected",
+    "Terminal replicas A (tape file 5, LBA 31), B (tape file 7, LBA 39) and C (tape file 9, LBA 47) headers unreadable, so none is eligible: BotStructuralRecoveryRequired; terminal authority not recovered",
+    "Separation extents AB and BC valid with zero interiors; ParityMap (tape file 4) valid and final"
+   ],
+   "terminal_suffix_complete": false,
+   "tape_complete": "not complete: no valid replica (derived, as walk-directory-rescue)",
+   "open": [
+    "How a Verifier reports blocks and shards of a metadata-unavailable epoch that it reads but cannot check",
+    "The Section 15 name for a replica whose header is unreadable"
+   ],
+   "sections": [
+    "2.2",
+    "9.1",
+    "12.3",
+    "12.4",
+    "12.5",
+    "13.1",
+    "13.3",
+    "10.6",
+    "12.6"
+   ],
+   "quotes": [
+    "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5).",
+    "A walked map does not qualify: it gains a validated scope only through a final ParityMap (Section 13.1), which this case lacks.",
+    "Damage confined to one sidecar's metadata — any or all of its header copies, its footer, its directory entry's health flags — MUST NOT degrade classification, mapping, digest validation, or recovery of any other epoch.",
+    "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4).",
+    "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk;"
+   ]
+  }
+ }
+}

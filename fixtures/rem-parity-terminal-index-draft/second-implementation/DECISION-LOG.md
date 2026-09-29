@@ -145,3 +145,43 @@ existing decision changed. Every earlier entry and trace is identical to its
 predecessor, and the other decision files are byte-identical.
 `negative-block-digests.json` changes only because the manifest now pins the
 nine overflow-3.2-lba blocks, which match.
+
+## The e2-08 to e2-13 and e3 cases, the full verification and S4 (F3)
+
+F3 adds decisions for thirteen damage cases (e2-08 to e2-13, e3-01 to e3-07),
+adds one observation, `verifier-full`, to every damage case, adds `walk.map`
+to every case whose walk runs, and re-decides the four survivor sets that use
+S4, whose definition changed. A leaf-by-leaf comparison of `decisions.json` and
+`decisions-real-ids.json` with their predecessors finds no changed value: every
+earlier leaf is identical, and the differences are the new cases and the two
+new keys. `decisions-trace.json` and `decisions-real-ids-trace.json` gain a
+`record_edit_checks` entry for every case, and every observation, that has
+record edits (the e1 cases, e2-01 to e2-04 and the new cases), and the fields
+`artifact` and `undecidable` in each walked-file record; no existing trace
+value changed.
+`resume-decisions.json`, `resume-decisions-real-ids.json`,
+`negative-decisions.json`, `negative-e1-decisions.json`,
+`negative-supplement-decisions.json`, `negative-block-digests.json` and
+`mutation-decisions.json` are byte-identical to their predecessors. No row
+follows an expected outcome.
+
+| Case | Aspect | Old value | New value | Sentence |
+| --- | --- | --- | --- | --- |
+| Every damage case (the 57 real ids, and the same by opaque id) | new observation `verifier-full` | absent | `data_blocks_failed`, `parity_shards_failed` (each failure by address, with its reason), `other_findings`, `terminal_suffix.complete` and `coverage`. It restates what the Verifier's `outside_terminal_suffix` findings already held, with the terminal suffix's findings added, and no earlier finding changed | 2.2: "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4). It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index." 10.6: "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete." 12.6: "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark." |
+| replicas-all (case-05), walk-sidecar-isolation (case-10), walk-directory-rescue (case-11), filemark-prefix (case-20), e2-04 | new key `walk.map` | absent | `{"produced": true, "validated": true}`; filemark-prefix `{"produced": true, "validated": false}` | 8.4.1: "The walk reconstructs tape-file boundaries, validates recognisable ParitySidecar and control structure, and measures complete Object candidates by elimination." 13.1: "A walked map whose projection does not hash to a validated final ParityMap's `canonical_map_digest`, or whose prefix disagrees with those scope fields, is not validated and gives the Recoverer no map, with no fallback to the bootstrap's scope." |
+| sel-08 (S4, S0, S4) | `decision.outcome`, `acceptable_selections`, `degraded` | inventory from B, degraded (S4 was another profile's replica, which supplied no layout and was never eligible) | `TerminalIndexReplicaConflict`, no selection. S4 is now a replica that is locally eligible and differs from the profile's only in its edition ID and sequence, so A and C are one edition, B another, and all three are fully valid | 8.5: "A Scanner MUST NOT accept a replica while another fully valid replica differs from it in any edition-common field: any row of kind *common* in the replica frame of Section 10.4, which together are the replicas' *edition* (Section 2.3)." "A disagreement in any edition-common field is `TerminalIndexReplicaConflict` and is never resolved by ordinal preference; a Scanner MUST NOT choose one side of a conflict merely because it is newer in the terminal suffix." 15: "TerminalIndexReplicaConflict independently valid survivors disagree" |
+| sel-10 (S0, S0, S4) | the same | inventory from A and B, degraded | `TerminalIndexReplicaConflict` | The same |
+| sel-11 (S4, S0, S0) | the same | inventory from B and C, degraded | `TerminalIndexReplicaConflict` | The same |
+| sel-13 (S0, S4, S0) | the same | inventory from A and C, degraded | `TerminalIndexReplicaConflict` | The same |
+
+Checked and unchanged:
+- The class of S4 in `selection-decisions.json` (`statuses`) changes from
+  `foreign` to `second-edition`; the other four statuses and the other ten rows
+  are identical.
+- `verifier_prefix_findings` now reads the parity region of an epoch whose index
+  is unavailable and reports a failed read by address (GAPS M-8). No earlier
+  case has both an unavailable index and an unreadable parity shard, so no
+  earlier finding changed.
+- Section 8.4 step 1's spacing back now crosses records to the nearest filemark
+  (GAPS M-5). Every earlier tape ends in a filemark, so no earlier layout
+  discovery changed.

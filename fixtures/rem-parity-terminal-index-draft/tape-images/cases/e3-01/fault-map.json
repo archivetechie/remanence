@@ -1,0 +1,16 @@
+{
+  "failed_data_addresses": [],
+  "hints": null,
+  "image": "a4-minimal",
+  "record_insertions": [
+    {
+      "after_record_index": 2,
+      "fill": "00",
+      "length": 1,
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "tape_file": 5
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": []
+}

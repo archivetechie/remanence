@@ -27,11 +27,14 @@ No change to the builder may follow a failed comparison without a row here.
 | 17 | everything, after the changes for the owner's rulings (F-T1b, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
 | 18 | everything, after the narrowed rescue and the revised Section 2.2 (F-T1c, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
 | 19 | the e2 cases and the R2 manifest (F2): the record edits of e2-01 to e2-05 against my builds (every stated length and the SHA-256 of each result); the nine overflow-3.2-lba blocks against `tape-images/negatives/MANIFEST.tsv`; then every decision file regenerated, byte-identical (`negatives`, `negative-e1`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide` and `resume`, blind and real ids, and the traces; `negative-block-digests.json`) | 5 records, 9 blocks | 0 |
+| 20 | the e2-08 to e2-13 and e3-01 to e3-07 damage cases, the full verification and S4 (F3): the record edits of e2-08 to e2-13 against my builds (10 records, 28 byte edits: every stated old byte and the SHA-256 of each result), the 24 edits that say they recompute a hash or CRC against mine (all 24 agree), the inserted record of e3-01, and the 10 derivable appended records of e3-02 to e3-06 (the 3 `second_edition_replica` records of e3-07 cannot be checked); then every decision file regenerated: `build`, `resume` (blind and real ids), `negatives`, `negative-e1`, `negatives-supplement`, `negative-blocks` and `mutations` byte-identical; `decide` (blind and real ids, and the traces) with every earlier leaf unchanged and the new cases, `verifier-full` and `walk.map` added; `selection` re-decided for sel-08, sel-10, sel-11 and sel-13 only; the blind `decisions.json` equals the real-id file under the mapping (57 cases); every self-check agrees | 10 records, 28 edits, 24 recomputations, 11 record digests | 1 (the foreign record's digest, below) |
 
 ## Failed comparisons
 
 | Artifact | First differing byte and field | Section consulted | Resolution |
 | --- | --- | --- | --- |
+| e2-08 and e2-12, record edits of tape file 4 (F3, first run) | Not a comparison of bytes: the fault reader refused the construction "the ParityMap re-encoded with the edited directory entry" as one it does not know | None; the file states each byte edit, each old byte and the result's SHA-256 | Fixed: the construction is read as "the record keeps its length, and the listed edits are the whole change", checked by the old bytes, the SHA-256 and, for the edits that say they recompute, my own CRC and payload SHA-256 (all agree). GAPS M-1. |
+| e3-02 to e3-06, the `foreign` appended record (SHA-256 2c6afa39...) | My first reading, every byte the stated first byte (0x58), gives ce025caf... A further reading, the first byte then 0xFF, and a ramp from 1, also differ. The first byte then zeros reproduces the stated digest | None: the text does not say what a foreign Object's bytes are | The file states only `first_byte`, `length` and the digest. Zero fill is taken as the reading, checked by the digest but not derived. Four fills were tried, and the one that matches was kept. No decision depends on the bytes after the first (the ladder never reads Object content, and 0x58 begins none of the tape's role magics). GAPS M-3. |
 | The quote `terminal_u64`, checked by the test that every quoted sentence occurs in the text | The quote read "checked in u64"; the text has "checked in `u64`" | 8.3 | A fix that reads the text correctly: the sentence is "Arithmetic on these fields is checked in `u64` (Section 2.4)." Only `negative-supplement-decisions.json` cites this quote, and it was regenerated. |
 | The quote `resume_step1`, checked by the test that every quoted sentence occurs in the text (found in run 13; it failed on the tool as it was before this change too) | The quote read "dropping any torn tail"; the text now reads "dropping the tape's torn tail, if any" | 14 | A fix that reads the current text: the sentence is "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it." The text was reworded after the resume and negative decisions were written (Appendix C records the wording follow-up). In run 14, `resume-decisions.json`, `resume-decisions-real-ids.json` and `negative-decisions.json` were regenerated; each differs from its predecessor only in this string (9, 9 and 1 occurrences). DECISION-LOG.md has the row. |
 | Run 11, mut-06, mut-14, mut-23, mut-25 and mut-39: the retained-value checks of 32-byte digest fields | My applier compared 8 bytes, because it took a default width instead of the width of the stated value (for example "0x94 repeated 32 times") | None; an applier defect, not a reading of the text | Fixed: the width now comes from the stated value. The rows had not yet been decided. |
@@ -305,6 +308,49 @@ run 19 confirms that.
   themselves.
 - `test_unpinned_and_unit_cases` expects the nine overflow-3.2-lba rows to
   match, now that the manifest pins them. No decision changed.
+
+## Changes for the e2-08 to e2-13 and e3 cases (F3)
+
+These changes add inputs, one observation and one redefined status. They
+change no earlier decision except the four selection rows below, and run 20
+confirms that.
+
+- The fault reader knows `record_insertions` and `appended_files`, and checks
+  every level of each. An appended record has a `source`: `foreign` (the stated
+  first byte, then zeros), `copy_of` (my build of a record) or
+  `second_edition_replica` (not derivable; never read). A source it does not
+  know fails the run. Faults are applied in one order: record edits,
+  insertions, the removed filemark, appended files.
+- `record_edits` accepts the construction "the ParityMap re-encoded with the
+  edited directory entry". Hash and CRC recomputations are compared with mine
+  on the finished record: a sidecar copy is parsed under Sections 9.2 to 9.5, a
+  ParityMap's header CRC and payload SHA-256 are recomputed.
+- Terminal discovery: spacing back from EOD now crosses records to the nearest
+  filemark (GAPS M-5). A tape whose last file has no filemark no longer ends the
+  search at once.
+- The walk: an Object candidate after the exact terminal suffix is a
+  nonconformant artifact and not admitted as an Object (Section 12.6; GAPS
+  M-6); a missing trailing filemark is reported as structural damage (Section
+  12.2; GAPS M-7); a file whose head or last block is not derivable is
+  undecidable, and the decision says whether the walk produces a map
+  (`walk.map`).
+- A record the Scanner must read and cannot derive makes its decisions
+  `undecided`: the Scanner, the Verifier, and any Recoverer address (GAPS M-4).
+- The new observation `verifier-full` (Section 2.2): each failing data block and
+  parity shard by address, every other finding, whether the terminal suffix is
+  complete, and the coverage. `verifier_prefix_findings` now reads the parity
+  region of an epoch whose index is unavailable (GAPS M-8).
+- Quotes. Three sentences are added to the cited set: Section 12.6's artifact
+  and normal-suffix sentences and Section 12.2's structural-damage sentence.
+- Selection. The status S4 is now a second-edition replica. Its `foreign` class
+  and the code that built another profile's replica are gone; the new class
+  rebuilds the profile's replica with another edition ID and sequence (GAPS
+  M-9). A decision among fully valid replicas of two editions is
+  `TerminalIndexReplicaConflict`.
+- `blind-mapping.json` maps the e2-08 to e2-13 and e3 ids to themselves.
+- The unit tests replace the foreign-replica test with second-edition tests and
+  add the new fault keys, the artifact and torn-tail decisions, the undecidable
+  records and the full verification (95 tests).
 
 ## Known divergences, not changed
 

@@ -909,3 +909,161 @@ wherever no footer supplies a layout.
 blocks.** R2's manifest pins the nine replica blocks of neg-44. My blocks
 match all nine in size and SHA-256. That comparison was run long after the
 neg-44 decision was written (F0).
+
+## M. The e2-08 to e2-13 and e3 cases, and the full verification (F3)
+
+These were found while deciding thirteen more damage cases (e2-08 to e2-13
+and e3-01 to e3-07), the Verifier's full verification of every damage case,
+and the survivor sets that use the redefined status S4. Each was decided from
+the text, and none has been compared with an expected outcome. The fault
+reader now also reads `record_insertions` and `appended_files`.
+
+**M-1. Fixture note: the fault keys the F3 brief names are not the keys the
+files carry.** The brief names `extra_records`, `appended_files`,
+`second_edition_replica`, `parity_map_edits`, and `sidecar_hash` and
+`sidecar_crcs` on record faults, and says each file describes what its key
+does. In the files as they stood at the end of the batch:
+- `appended_files` and the source `second_edition_replica` occur as named;
+- `extra_records` occurs in no file. The file that adds a record inside a
+  tape file (e3-01) uses `record_insertions`;
+- `parity_map_edits`, `sidecar_hash` and `sidecar_crcs` occur in no file. The
+  ParityMap and sidecar changes (e2-08 to e2-13) are `record_edits` with
+  explicit byte edits. Their reasons say the hash or CRC was recomputed, and
+  the ParityMap edits carry a new `construction`, "the ParityMap re-encoded
+  with the edited directory entry";
+- no file carries a description. Each key's meaning is read from its name,
+  its values and each stated SHA-256.
+
+A file that carried one of the brief's other keys would fail the run as an
+unknown key. Every stated old byte and every stated SHA-256 is checked; all 28
+byte edits, 10 edited records, and the SHA-256 of each inserted and each
+derivable appended record agree with my bytes. Of the 24 edits that say they
+recompute a hash or CRC, all 24 agree with mine (a sidecar copy is parsed
+under Sections 9.2 to 9.5; a ParityMap's header CRC and payload SHA-256 are
+recomputed). The recomputation is reported, not enforced.
+
+**M-2. `record_insertions`: where the record goes (e3-01).** The file names a
+tape file and `after_record_index`. *Decided:* the record goes into that tape
+file after that data record and before the next record or the filemark, so
+e3-01's one-byte record follows the footer of separation extent A-B (its last
+record, index 2). Every later record and filemark moves up by one LBA. The
+file's `unreadable_records` and `removed_filemark_after_tape_file` are read as
+positions of the undamaged image; no case combines them with an insertion.
+
+**M-3. `foreign` records state only their first byte (e3-02 to e3-06).** The
+file gives `first_byte`, `length` and a SHA-256. It does not say what the
+other bytes are. *Decided:* zeros. Four fills were tried against the stated
+digest (every byte the first byte; the first byte then 0xFF; a ramp from 1; the
+first byte then zeros), and only the last reproduces it (BUILD-LOG). The
+reading is therefore checked by the digest but not derived from the text. No
+decision depends on the bytes after the first: the ladder never reads Object
+content (Section 12.3 item 7), and the first byte 0x58 begins none of the tape's
+role magics (bootstrap `52 45 4D 00...`; the HMAC-derived magics are 8 bytes
+that the case's tape UUID fixes, and none begins with 0x58 for these tapes).
+
+**M-4. `second_edition_replica` records cannot be derived (e3-07). *Undecided.***
+The file states each record's length, SHA-256, `planned_tape_file_number` (9)
+and `planned_start_lba` (38). It does not state the replica ordinal, the
+planned layout its five tuples carry, its planned EOD or any digest. Sections
+8.3 and 10.4 need all of them to build the header and footer, and a replica
+planned at file 9 is not one of the tape's own five components, so the text
+gives no way to derive its bytes. The record is never read. In e3-07, C's
+trailing filemark is removed and the three records follow C's own three, so the
+last record before EOD is the undeclared one.
+- Scanner and Verifier (`undecided`): the Scanner reads that record first,
+  when it spaces back from EOD. If it is a footer that records LBA 40 and plans an
+  EOD at or after the tape's EOD (42), it supplies the layout and the outcome
+  depends on the rest of the replica. Otherwise no footer supplies a layout
+  (every other footer plans EOD 39), no replica validates, and the Scanner
+  returns `BotStructuralRecoveryRequired`.
+- The Recoverer has no address in e3-07. Were there one, its result would be
+  `undecided` too, because the route (replica or walk) decides whether the
+  tail rescue applies.
+- The walk is decided: its head reads are C's own header, whose count (6)
+  differs from the plan (3), so file 8 keeps its control type, damaged (Section
+  12.3 item 2), and the walk produces a map that Section 13.1 validates.
+
+**M-5. Section 8.4 step 1: spacing back over a filemark when records follow it
+(e3-02).** The Scanner "spaces back over up to five filemarks from EOD and reads
+the record before each, stopping early when a backspace does not cross exactly
+one filemark". For a tape that ends in records with no filemark, the text does
+not say whether the first backspace, from EOD, crosses those records. *Decided:*
+it does, as a drive's space-back-one-filemark does, and stops at the nearest
+filemark before EOD; a backspace that crosses no filemark, or reaches a filemark
+whose preceding record is itself a filemark, stops the search. The previous
+reading, which stopped at once when the last record was not a filemark, is
+replaced. It changes no earlier decision: every earlier tape ends in a filemark.
+In e3-02 the first footer read is C's, which plans EOD 39 before the tape's EOD
+41, so the outcome is `BotStructuralRecoveryRequired` on either reading.
+
+**M-6. Section 12.6: an artifact after the exact terminal suffix (e3-02,
+e3-06; and e3-03 to e3-05).** "A structural artifact after the exact terminal
+suffix is nonconformant and MUST NOT be admitted as an Object." The ladder has no
+class for it, and Section 12.3 item 7 would call an unrecognised complete file an
+Object candidate.
+- *Decided (name):* the walk's class is "nonconformant artifact after the
+  terminal suffix (not admitted as an Object)". No Section 15 name applies.
+- *Decided (exactness):* the suffix is exact when the walk recognises five
+  consecutive tape files, undamaged, as replica, separation extent, replica,
+  separation extent, replica. Where it is not (e3-03 to e3-05 merge or shift
+  suffix files), the sentence does not apply, and item 7 makes the appended file
+  an Object candidate, its identity unknown (Section 8.4.1).
+- The artifact is not a map entry, and the walked map through the final
+  ParityMap is unaffected.
+An Object candidate that item 7 admits beyond the validated scope is a forensic
+finding only (Section 3.4), which this decision file does not distinguish.
+
+**M-7. Section 12.2: a missing trailing filemark (e3-02).** "A missing trailing
+filemark is structural damage." The text does not say how the ladder classifies
+the file. *Decided:* the walk measures it to EOD, reports `structural_damage`
+("tape file 9: missing trailing filemark before EOD"), and, after the exact
+suffix, classes it as the artifact of M-6.
+
+**M-8. Section 2.2: an epoch whose index is unavailable.** A full verification
+"checks each [block or shard] against its sidecar's index". When no header/index
+copy validates (Section 13.3 step 4), there is no index. *Decided:*
+- every data block the map says the sidecar protects is still read, and a read
+  failure is reported (`TapeIo` for a medium error, none for a record that is not
+  one block long);
+- the parity region is located from the map entry alone. Section 9.1 fixes
+  `total = 2H + P + 1` with `P = S × m`, so `H = (total − 1 − P) / 2`, and each
+  shard is read and a failed read reported by its `(epoch, stripe, parity index)`
+  address. When `total − 1 − P` is not a positive even number, the shards are
+  not locatable and are counted as such;
+- neither can be checked against a CRC, and `coverage` says so (`epochs_without_index`,
+  `data_blocks_read_but_not_checkable`, `parity_shards_read_but_not_checkable`).
+Before F3 this Verifier skipped the parity region of such an epoch. No earlier
+decision changes, because no earlier case has both an unavailable index and an
+unreadable parity shard. The text does not say whether a block that can be read
+but not checked is a failure; it is not reported as one.
+
+**M-9. S4, the second-edition replica (sel-08, sel-10, sel-11, sel-13).** The
+status is "locally eligible at this position ... and differs from the profile's
+replica at this position only in its edition id and edition sequence". The file
+fixes no values. *Decided:* every byte of the profile's edition ID is
+complemented and the sequence is raised by one; the edition digest and the
+replica descriptor digest follow (Section 10.4). Any other nonzero, different
+pair gives the same decision. The status supplies a layout, is fully valid, and
+disagrees with the profile's replicas in edition-common fields, so each of the
+four sets is `TerminalIndexReplicaConflict`. A set of second-edition replicas
+only, with no first-edition replica, would agree.
+
+**M-10. The Verifier's full verification with no validated map.** A full
+verification reads "every data block that a sidecar protects". With no replica
+accepted and no walked map that Section 13.1 validates (filemark-prefix), or with
+a replica conflict (editions-conflict), no map says which blocks a sidecar
+protects. *Decided:* `verifier-full.coverage.performed` is false and both lists are
+null, with the reason. A Verifier could read the sidecars' own headers, which the
+text does not forbid. It gives no rule for a range taken from an unvalidated
+header, so this Reader does not.
+
+**M-11. Section 13.3 step 1: a directory entry that differs from the footer
+only in its hash (e2-12).** The entry agrees with the map entry in tape file,
+epoch, protected range and block count, so a read may be placed from it; it is
+available whenever the final ParityMap validates. It disagrees with the valid
+footer "on the canonical metadata hash", so "neither decides: a copy that either
+contradicts is not used". Both header copies carry the hash the footer records,
+which the directory contradicts, so no copy remains and the epoch is
+metadata-unavailable. The text says nothing about an entry whose hash is wrong
+because of a Writer or media fault rather than a copy's; the decision follows the
+sentence as written.

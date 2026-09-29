@@ -1081,6 +1081,37 @@ message TapeIndexVerification {
   // Present only for RECOVERY_REQUIRED. This is a real BOT scan summary, not
   // a zero-count placeholder or fast terminal inventory.
   TapeInventory recovery_inventory = 16;
+  // REM-PARITY 2.2: what a Verifier's full verification found in the protected
+  // content: each failed data block by its tape-file position, each failed
+  // parity shard by its epoch, stripe and parity index, each sidecar finding,
+  // and damage the walk found inside the pre-tail prefix. Empty when the
+  // protected content verified clean. A non-empty list is never
+  // VERIFIED_COMPLETE.
+  repeated ProtectedContentFinding protected_content_findings = 17;
+}
+
+enum ProtectedContentFindingKind {
+  PROTECTED_CONTENT_FINDING_KIND_UNSPECIFIED = 0;
+  // A data block a sidecar protects that failed; address = tape-file position.
+  PROTECTED_CONTENT_FINDING_KIND_DATA_BLOCK = 1;
+  // A parity shard that failed; address = epoch, stripe and parity index.
+  PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD = 2;
+  // A finding about a sidecar's metadata (a copy, the footer, the index).
+  PROTECTED_CONTENT_FINDING_KIND_SIDECAR = 3;
+  // Physical damage the walk found inside the pre-tail prefix.
+  PROTECTED_CONTENT_FINDING_KIND_PREFIX_DAMAGE = 4;
+  // The protected-content pass could not be performed.
+  PROTECTED_CONTENT_FINDING_KIND_NOT_PERFORMED = 5;
+}
+
+message ProtectedContentFinding {
+  ProtectedContentFindingKind kind = 1;
+  // The address: "tape_file 1 block 2"; "epoch 0 stripe 1 parity 0"; "tape_file 2
+  // epoch 0". Absent for prefix damage and for a pass not performed, which
+  // have no address.
+  optional string address = 2;
+  // The reason or finding; always present.
+  optional string detail = 3;
 }
 
 message TapeFinalization {
