@@ -613,6 +613,17 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                       tests; no real device behind it",
             },
         ),
+        (
+            "remanence-cli/src/damage_vectors.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "the damage-vector executor's over-length read \
+                      wrapper, which forwards every other command unchanged \
+                      to the in-memory chaos model; it initiates nothing and \
+                      has no real device behind it",
+            },
+        ),
     ];
 
     let mut rust_files = Vec::new();
