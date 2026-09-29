@@ -471,6 +471,9 @@ pub fn discover_bootstrap_with_recovery_hints(
     Err(ParityError::NoBootstrapFound)
 }
 
+/// Only an unreadable or ruled-out candidate lets discovery try the next one.
+/// [`ParityError::BootstrapRefused`] never does: supplied values never replace a
+/// readable bootstrap that contradicts them (REM-PARITY 8.4).
 fn bootstrap_probe_can_continue(err: &ParityError) -> bool {
     matches!(
         err,
@@ -498,7 +501,14 @@ fn try_read_bootstrap_at(
     source.locate_physical(PhysicalPositionHint::new(target_lba))?;
     let mut buf = vec![0u8; block_size];
     for _ in 0..1 {
-        match source.read_record(&mut buf) {
+        let read = source.read_record(&mut buf);
+        if let Some(hints) = hints {
+            // The measured length is judged against the supplied size before
+            // anything else. A record of the supplied length read at another
+            // candidate size passes here and only rules out this candidate.
+            hints.check_bootstrap_read_length(&read, block_size)?;
+        }
+        match read {
             Ok(RawReadOutcome::Block { bytes, .. }) if bytes != block_size => {
                 return Err(ParityError::BootstrapParse(format!(
                     "short fixed-block bootstrap read: got {bytes} bytes, expected {block_size}"
@@ -1863,6 +1873,7 @@ mod tests {
         assert!(matches!(err, ParityError::Invariant(_)));
     }
 
+    use crate::error::BootstrapRefusedField;
     use crate::raw::{
         BlockSourceRawTapeSource, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
         SpaceFilemarksOutcome,
@@ -2284,6 +2295,195 @@ mod tests {
                 if message.contains(expected)),
                 "{case}: unexpected error: {error:?}"
             );
+        }
+    }
+
+    fn payload_with_block_size(block_size: u32) -> BootstrapPayload {
+        let mut payload = sample_payload();
+        payload.block_size_bytes = block_size;
+        payload
+    }
+
+    fn written_block(payload: &BootstrapPayload) -> Vec<u8> {
+        let mut block = vec![0u8; test_block_size(payload.block_size_bytes)];
+        write_bootstrap_block(payload, &mut block).expect("write ok");
+        block
+    }
+
+    fn hints_for(payload: &BootstrapPayload) -> crate::ScanRecoveryHints {
+        let record = payload.scheme.as_ref().expect("parity bootstrap");
+        crate::ScanRecoveryHints {
+            tape_uuid: payload.tape_uuid,
+            block_size: payload.block_size_bytes,
+            scheme: crate::ParityConfig::Scheme(crate::ParityScheme {
+                id: crate::SchemeId::new_owned(record.id.clone()),
+                data_blocks_per_stripe: record.data_blocks_per_stripe,
+                parity_blocks_per_stripe: record.parity_blocks_per_stripe,
+                stripes_per_neighborhood: record.stripes_per_neighborhood,
+            }),
+        }
+    }
+
+    fn reads(calls: &[RecordingRawSourceCall]) -> Vec<(usize, usize)> {
+        calls
+            .iter()
+            .filter_map(|call| match call {
+                RecordingRawSourceCall::ReadRecord {
+                    requested,
+                    returned,
+                    ..
+                } => Some((*requested, *returned)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A candidate size whose read measures the supplied size only rules that
+    /// candidate out; discovery goes on to the supplied size.
+    #[test]
+    fn hinted_discovery_continues_past_a_candidate_size_mismatch() {
+        let payload = payload_with_block_size(512 * 1024);
+        let hints = hints_for(&payload);
+        let mut source = RecordingRawSource::new(vec![written_block(&payload)]);
+        let found = discover_bootstrap_with_recovery_hints(
+            &mut source,
+            &[256 * 1024, 1024 * 1024, 512 * 1024],
+            Some(&hints),
+        )
+        .expect("the supplied size reads the bootstrap");
+        assert_eq!(found, payload);
+        assert_eq!(
+            reads(&source.calls),
+            vec![
+                (256 * 1024, 0),
+                (1024 * 1024, 512 * 1024),
+                (512 * 1024, 512 * 1024)
+            ]
+        );
+    }
+
+    /// A refusal is never a reason to try the next candidate size.
+    #[test]
+    fn hinted_discovery_never_continues_past_a_refusal() {
+        let payload = payload_with_block_size(256 * 1024);
+        let valid = written_block(&payload);
+        let hints = hints_for(&payload);
+        let mut foreign = hints.clone();
+        foreign.tape_uuid[0] ^= 1;
+        let mut longer = valid.clone();
+        longer.resize(512 * 1024, 0);
+        let mut compressed = payload.clone();
+        compressed.drive_compression = true;
+        for (supplied, record, candidates, field) in [
+            (
+                &foreign,
+                valid.clone(),
+                vec![256 * 1024, 512 * 1024],
+                Some(BootstrapRefusedField::TapeUuid),
+            ),
+            // A record of another length met at a candidate other than the supplied size.
+            (
+                &hints,
+                valid[..1000].to_vec(),
+                vec![512 * 1024, 256 * 1024],
+                Some(BootstrapRefusedField::BlockSize),
+            ),
+            (
+                &hints,
+                longer,
+                vec![256 * 1024, 512 * 1024],
+                Some(BootstrapRefusedField::BlockSize),
+            ),
+            (
+                &hints,
+                encode_bootstrap_block_unchecked_for_test(&compressed),
+                vec![256 * 1024, 512 * 1024],
+                None,
+            ),
+        ] {
+            let mut source = RecordingRawSource::new(vec![record]);
+            let error =
+                discover_bootstrap_with_recovery_hints(&mut source, &candidates, Some(supplied))
+                    .expect_err("refused");
+            assert!(!bootstrap_probe_can_continue(&error), "{error:?}");
+            match (field, &error) {
+                (Some(field), ParityError::BootstrapRefused { field: actual, .. }) => {
+                    assert_eq!(*actual, field)
+                }
+                (None, ParityError::DriveCompressionEnabled) => {}
+                _ => panic!("unexpected refusal {error:?}"),
+            }
+            assert_eq!(reads(&source.calls).len(), 1, "one probe only: {error}");
+        }
+    }
+
+    /// Fixed-size discovery (REM-PARITY 15): a record of another length, or a
+    /// bootstrap recording another block size, is `BootstrapParse`; any other
+    /// unusable correctly sized bootstrap is `NoBootstrapFound`.
+    #[test]
+    fn fixed_size_discovery_names_only_length_and_size_mismatches() {
+        let size = 256 * 1024;
+        let payload = payload_with_block_size(size);
+        let valid = written_block(&payload);
+        let discover = |records: Vec<Vec<u8>>| {
+            discover_bootstrap_with_block_size(&mut RecordingRawSource::new(records), None, size)
+        };
+        discover(vec![valid.clone()]).expect("valid bootstrap");
+        let with_header_crc = |mut block: Vec<u8>| {
+            let crc = crc64_xz(&block[..BOOTSTRAP_HEADER_CRC_OFFSET]);
+            block[BOOTSTRAP_HEADER_CRC_OFFSET..BOOTSTRAP_HEADER_LEN]
+                .copy_from_slice(&crc.to_le_bytes());
+            block
+        };
+        let mut longer = valid.clone();
+        longer.resize(2 * test_block_size(size), 0);
+        let mut other_size = valid.clone();
+        other_size[32..36].copy_from_slice(&(2 * size).to_be_bytes());
+        for record in [
+            valid[..valid.len() - 1].to_vec(),
+            valid[..1000].to_vec(),
+            longer,
+            with_header_crc(other_size),
+        ] {
+            let error = discover(vec![record]).expect_err("length or size mismatch");
+            assert!(matches!(error, ParityError::BootstrapParse(_)), "{error:?}");
+        }
+        let edited = |offset: usize, bytes: &[u8], header_crc: bool| {
+            let mut block = valid.clone();
+            block[offset..offset + bytes.len()].copy_from_slice(bytes);
+            if header_crc {
+                with_header_crc(block)
+            } else {
+                block
+            }
+        };
+        let len = usize::try_from(u32::from_le_bytes(valid[44..48].try_into().unwrap())).unwrap();
+        let mut noncanonical = valid.clone();
+        let CborValue::Map(mut entries) =
+            ciborium::from_reader(&valid[BOOTSTRAP_HEADER_LEN..BOOTSTRAP_HEADER_LEN + len])
+                .expect("payload")
+        else {
+            panic!("map")
+        };
+        entries.swap(0, 1);
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&CborValue::Map(entries), &mut bytes).expect("encode");
+        assert_eq!(bytes.len(), len);
+        noncanonical[BOOTSTRAP_HEADER_LEN..BOOTSTRAP_HEADER_LEN + len].copy_from_slice(&bytes);
+        noncanonical[BOOTSTRAP_HEADER_LEN + len..BOOTSTRAP_HEADER_LEN + len + 8]
+            .copy_from_slice(&crc64_xz(&bytes).to_le_bytes());
+        for records in [
+            vec![edited(0, b"X", false)],
+            vec![edited(BOOTSTRAP_HEADER_CRC_OFFSET, &[0xff], false)],
+            vec![edited(80, &[0xff], false)],
+            vec![edited(8, &3u16.to_be_bytes(), true)],
+            vec![edited(36, &1u64.to_be_bytes(), true)],
+            vec![noncanonical],
+            vec![vec![0u8; test_block_size(size)]],
+            Vec::new(),
+        ] {
+            let error = discover(records).expect_err("unusable bootstrap");
+            assert!(matches!(error, ParityError::NoBootstrapFound), "{error:?}");
         }
     }
 }

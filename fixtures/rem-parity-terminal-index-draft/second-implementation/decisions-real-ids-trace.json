@@ -233,6 +233,282 @@
       }
     ]
   },
+  "e1-01": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the header's tape UUID is impossible or disagrees with the supplied values"
+        ]
+      },
+      "no supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "read size 262144: NoBootstrapFound: payload CRC does not verify",
+          "read size 524288: the record is 262144 bytes, which only rules out this candidate",
+          "read size 1048576: the record is 262144 bytes, which only rules out this candidate"
+        ]
+      }
+    }
+  },
+  "e1-02": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the header's block size is impossible or disagrees with the supplied values"
+        ]
+      },
+      "no supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "read size 262144: NoBootstrapFound: block_size_bytes differs from the configured read size",
+          "read size 524288: the record is 262144 bytes, which only rules out this candidate",
+          "read size 1048576: the record is 262144 bytes, which only rules out this candidate"
+        ]
+      }
+    }
+  },
+  "e1-03": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the header's format major is impossible or disagrees with the supplied values"
+        ]
+      },
+      "no supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "read size 262144: BootstrapParse: schema_major 3",
+          "read size 524288: the record is 262144 bytes, which only rules out this candidate",
+          "read size 1048576: the record is 262144 bytes, which only rules out this candidate"
+        ]
+      }
+    }
+  },
+  "e1-04": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the header's sequence is impossible or disagrees with the supplied values"
+        ]
+      }
+    }
+  },
+  "e1-05": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the header's no-parity flag is impossible or disagrees with the supplied values"
+        ]
+      }
+    }
+  },
+  "e1-06": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the parity scheme disagrees with the supplied scheme"
+        ]
+      }
+    }
+  },
+  "e1-07": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: a decodable parity scheme disagrees with the supplied scheme",
+          "the payload breaks a later rule of Section 8 (bootstrap payload: CBOR map keys are duplicate or not in deterministic order)"
+        ]
+      }
+    }
+  },
+  "e1-08": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: a decodable drive_compression is true on a parity tape",
+          "the payload breaks a later rule of Section 8 (drive_compression true on a parity bootstrap)"
+        ]
+      },
+      "no supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "read size 262144: DriveCompressionEnabled: drive_compression true on a parity bootstrap"
+        ]
+      }
+    }
+  },
+  "e1-09": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the first 1000 bytes of the original record, 1000 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the record is 1000 bytes, not the supplied block size 262144"
+        ]
+      }
+    }
+  },
+  "e1-10": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the record is 524288 bytes, not the supplied block size 262144"
+        ]
+      }
+    }
+  },
+  "e1-11": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the first 40 bytes of the original record, 40 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the record is 40 bytes, not the supplied block size 262144"
+        ]
+      }
+    }
+  },
+  "e1-12": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the magic is missing or the header CRC fails"
+        ],
+        "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+        "directory": "final ParityMap validates",
+        "separations": {
+          "A-B": "header, footer, zero interior and trailing filemark validate",
+          "B-C": "header, footer, zero interior and trailing filemark validate"
+        },
+        "verifier_prefix_findings": [
+          {
+            "component": "bootstrap",
+            "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+            "error": "BootstrapParse",
+            "checks": "structure"
+          }
+        ]
+      }
+    }
+  },
+  "e1-13": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the magic is missing or the header CRC fails"
+        ],
+        "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+        "directory": "final ParityMap validates",
+        "separations": {
+          "A-B": "header, footer, zero interior and trailing filemark validate",
+          "B-C": "header, footer, zero interior and trailing filemark validate"
+        },
+        "verifier_prefix_findings": [
+          {
+            "component": "bootstrap",
+            "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+            "error": "BootstrapParse",
+            "checks": "structure"
+          }
+        ]
+      }
+    }
+  },
+  "e1-14": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the payload CRC fails or the payload runs past the block"
+        ],
+        "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+        "directory": "final ParityMap validates",
+        "separations": {
+          "A-B": "header, footer, zero interior and trailing filemark validate",
+          "B-C": "header, footer, zero interior and trailing filemark validate"
+        },
+        "verifier_prefix_findings": [
+          {
+            "component": "bootstrap",
+            "finding": "the payload CRC fails or the payload runs past the block, so with supplied values it is treated as unreadable",
+            "error": "BootstrapParse",
+            "checks": "structure"
+          }
+        ]
+      }
+    }
+  },
+  "e1-15": {
+    "observations": {
+      "supplied values": {
+        "fault_notes": [
+          "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "bootstrap_attempts": [
+          "supplied block size 262144: the payload breaks a later rule of Section 8 (bootstrap payload: CBOR map keys are duplicate or not in deterministic order)"
+        ],
+        "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+        "directory": "final ParityMap validates",
+        "separations": {
+          "A-B": "header, footer, zero interior and trailing filemark validate",
+          "B-C": "header, footer, zero interior and trailing filemark validate"
+        },
+        "verifier_prefix_findings": [
+          {
+            "component": "bootstrap",
+            "finding": "the payload breaks a later rule of Section 8 (bootstrap payload: CBOR map keys are duplicate or not in deterministic order), so with supplied values it is treated as unreadable",
+            "error": "BootstrapParse",
+            "checks": "structure"
+          }
+        ]
+      }
+    }
+  },
   "editions-conflict": {
     "fault_notes": [],
     "bootstrap_attempts": [

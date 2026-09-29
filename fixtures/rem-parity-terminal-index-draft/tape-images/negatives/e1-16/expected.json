@@ -1,0 +1,43 @@
+{
+  "base": {
+    "artifact": "tape-image a4-minimal",
+    "block_within_file": 0,
+    "tape_file": 0
+  },
+  "construction": "a no-parity bootstrap (`flags` bit 0 set, payload with no parity scheme, conformant) whose payload key 5 (`drive_compression`) is true; CRCs valid",
+  "expected": {
+    "bootstrap role": {
+      "accepts": true,
+      "error": "none",
+      "quotes": [
+        "`drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4)",
+        "A **no-parity bootstrap** (flag bit 0 set) marks a tape written without parity protection. It MAY omit the scheme record (key 1) and the digest record (key 2). A Reader MUST NOT require those records on it.",
+        "A parity bootstrap recording `true` MUST be rejected by Readers and Writers alike (Section 16.3).",
+        "A Reader MUST reject such a tape. Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression.",
+        "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3).",
+        "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+      ],
+      "sections": [
+        "8.2",
+        "8.4",
+        "11.4",
+        "16.3",
+        "15"
+      ]
+    }
+  },
+  "group": "e1",
+  "id": "e1-16",
+  "integrity_repair": [
+    "cbor_payload_len",
+    "zero fill after the shorter payload",
+    "payload CRC",
+    "header CRC"
+  ],
+  "mutation": {
+    "flags": "bit 0 (no-parity) set",
+    "payload": "key 1 (the parity scheme) removed and key 5 (drive_compression) set to true; keys 2, 3 and 4 unchanged; deterministic encoding"
+  },
+  "pinned": true,
+  "role": "bootstrap (a parser given one block as the bootstrap)"
+}

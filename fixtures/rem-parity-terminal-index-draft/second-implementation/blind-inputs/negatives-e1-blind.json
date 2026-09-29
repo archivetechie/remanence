@@ -1,0 +1,25 @@
+{
+ "description": "Blind input for the second implementation: the E1 negative case's construction, with every outcome field removed.",
+ "cases": [
+  {
+   "id": "e1-16",
+   "base": {
+    "artifact": "tape-image a4-minimal",
+    "tape_file": 0,
+    "block_within_file": 0
+   },
+   "role": "bootstrap (a parser given one block as the bootstrap)",
+   "construction": "a no-parity bootstrap (`flags` bit 0 set, payload with no parity scheme, conformant) whose payload key 5 (`drive_compression`) is true; CRCs valid",
+   "mutation": {
+    "flags": "bit 0 (no-parity) set",
+    "payload": "key 1 (the parity scheme) removed and key 5 (drive_compression) set to true; keys 2, 3 and 4 unchanged; deterministic encoding"
+   },
+   "integrity_repair": [
+    "cbor_payload_len",
+    "zero fill after the shorter payload",
+    "payload CRC",
+    "header CRC"
+   ]
+  }
+ ]
+}

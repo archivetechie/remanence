@@ -3,15 +3,16 @@
   "sources": {
     "negatives": "negative-cases-blind.json",
     "supplement": "supplement-blind.json",
+    "negatives_e1": "negatives-e1-blind.json",
     "manifest": "tape-images/negatives/MANIFEST.tsv"
   },
   "counts": {
-    "matched": 340,
+    "matched": 341,
     "mismatched": 19,
     "missing_from_mine": 28,
     "missing_from_manifest": 13,
-    "manifest_rows": 387,
-    "emitted_blocks": 372
+    "manifest_rows": 388,
+    "emitted_blocks": 373
   },
   "entries": {
     "neg-01": {
@@ -811,6 +812,12 @@
       "vector": "bytes",
       "blocks": 6,
       "failed_from_checks": []
+    },
+    "e1-16": {
+      "real_id": "e1-16",
+      "vector": "bytes",
+      "blocks": 1,
+      "failed_from_checks": []
     }
   },
   "rows": [
@@ -837,6 +844,18 @@
       "sha256": "369b5597bf1e7014468ee4611415b6ac647805c7d8562ceeadf9a3a42aa791ef",
       "pinned_bytes": 262144,
       "pinned_sha256": "369b5597bf1e7014468ee4611415b6ac647805c7d8562ceeadf9a3a42aa791ef"
+    },
+    {
+      "case": "e1-16",
+      "artifact": "tape-image a4-minimal",
+      "tape_file": 0,
+      "block_within_file": 0,
+      "entry": "e1-16",
+      "result": "matched",
+      "bytes": 262144,
+      "sha256": "94e9d0acef2f97cf3c6bdd49bf9571bb0f135e1ff7772f15e87555170f77da1e",
+      "pinned_bytes": 262144,
+      "pinned_sha256": "94e9d0acef2f97cf3c6bdd49bf9571bb0f135e1ff7772f15e87555170f77da1e"
     },
     {
       "case": "overflow-10.1.2-2M-footer",

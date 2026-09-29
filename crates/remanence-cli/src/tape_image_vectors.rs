@@ -262,6 +262,49 @@ fn check_layout(
 /// Resolve prose fault descriptions once, in the generator. The executor reads
 /// only this concrete map; no expected outcome influences fault resolution.
 pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
+    // No key of a case may be ignored silently. `sections`, `construction` and
+    // `note` describe the case and are not read; `object_authority` names the
+    // one authority the executor supplies, which is none.
+    for key in case.as_object().expect("case object").keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "id" | "image"
+                    | "fault"
+                    | "failed_data_addresses"
+                    | "hints"
+                    | "observations"
+                    | "expected"
+                    | "pinned"
+                    | "sections"
+                    | "construction"
+                    | "note"
+                    | "object_authority"
+            ),
+            "{}: unknown case key {key}",
+            case["id"]
+        );
+    }
+    if let Some(authority) = case.get("object_authority") {
+        assert_eq!(
+            authority, "none supplied",
+            "{}: object authority",
+            case["id"]
+        );
+    }
+    for key in case["fault"].as_object().expect("fault object").keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "unreadable_lbas"
+                    | "unreadable"
+                    | "removed_filemark_after_tape_file"
+                    | "record_faults"
+            ),
+            "{}: unknown fault key {key}",
+            case["id"]
+        );
+    }
     let mut lbas: Vec<u64> = case["fault"]["unreadable_lbas"]
         .as_array()
         .map(|v| v.iter().map(|n| n.as_u64().unwrap()).collect())
@@ -320,5 +363,411 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
         assert!(*lba < image.eod_record as u64);
         json!({"lba": lba, "tape_file": f, "record_index": lba - file.start_record as u64, "filemark": file.filemark_record == Some(*lba as usize)})
     }).collect();
-    json!({"image": case["image"], "unreadable_records": records, "removed_filemark_after_tape_file": case["fault"]["removed_filemark_after_tape_file"], "failed_data_addresses": addresses, "hints": case["hints"]})
+    let mut map = json!({"image": case["image"], "unreadable_records": records, "removed_filemark_after_tape_file": case["fault"]["removed_filemark_after_tape_file"], "failed_data_addresses": addresses});
+    if let Some(faults) = case["fault"].get("record_faults") {
+        assert!(faults.is_array(), "{}: record_faults is a list", case["id"]);
+        map["record_edits"] = record_edits(case, image);
+    }
+    if let Some(observations) = case.get("observations") {
+        // Each observation runs the reader separately, with its own supplied values.
+        assert!(
+            case.get("hints").is_none(),
+            "a case gives hints or observations, not both"
+        );
+        check_observations(observations);
+        map["observations"] = observations.clone();
+    } else {
+        check_hints(&case["hints"]);
+        map["hints"] = case["hints"].clone();
+    }
+    map
+}
+
+/// Supplied values, or none (null). The executor always supplies the image's
+/// own tape UUID, so that is the only UUID a case may name.
+pub(crate) fn check_hints(hints: &Value) {
+    if hints.is_null() {
+        return;
+    }
+    let keys = hints.as_object().expect("hints are an object or null");
+    assert_eq!(
+        keys.keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["block_size", "scheme", "tape_uuid"].into(),
+        "hints name the tape UUID, the block size and the scheme, and nothing else"
+    );
+    assert_eq!(hints["tape_uuid"], "the image's", "supplied tape UUID");
+    assert!(hints["block_size"].is_u64(), "supplied block size");
+    check_scheme(&hints["scheme"], true);
+}
+
+/// A scheme's k, m and S; every one is required in supplied values, and a
+/// replacement payload names at least one. No other key is allowed.
+fn check_scheme(scheme: &Value, complete: bool) {
+    let keys = scheme.as_object().expect("a scheme is an object");
+    for (key, value) in keys {
+        assert!(
+            matches!(key.as_str(), "k" | "m" | "S"),
+            "unknown scheme key {key}"
+        );
+        assert!(value.is_u64(), "scheme {key} is an unsigned integer");
+    }
+    assert!(
+        if complete {
+            keys.len() == 3
+        } else {
+            !keys.is_empty()
+        },
+        "scheme keys {scheme}"
+    );
+}
+
+/// Observations are `{id, hints}` with distinct ids.
+pub(crate) fn check_observations(observations: &Value) {
+    let observations = observations.as_array().expect("observations are a list");
+    assert!(!observations.is_empty(), "at least one observation");
+    let mut ids = std::collections::BTreeSet::new();
+    for observation in observations {
+        let keys = observation
+            .as_object()
+            .expect("an observation is an object");
+        assert_eq!(
+            keys.keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["hints", "id"].into(),
+            "an observation names its id and its hints, and nothing else"
+        );
+        let id = observation["id"].as_str().expect("observation id");
+        assert!(ids.insert(id), "duplicate observation {id}");
+        check_hints(&observation["hints"]);
+    }
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    assert!(text.len().is_multiple_of(2), "odd hex string {text}");
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex bytes"))
+        .collect()
+}
+
+/// The bootstrap frame of REM-PARITY 8.1, the only record whose CRCs and
+/// payload the record-fault vocabulary knows how to rebuild.
+const BOOTSTRAP_PAYLOAD_LEN_FIELD: usize = 0x2c;
+const BOOTSTRAP_HEADER_CRC_FIELD: usize = 0x30;
+const BOOTSTRAP_PAYLOAD_START: usize = 0x38;
+
+/// Resolve the two record fault kinds into concrete ordered edits:
+/// - a record length: the record is replaced by one of the stated length, the
+///   original's leading bytes when shorter, the original followed by zero bytes
+///   when longer;
+/// - byte edits: bytes set, or XORed with a mask, at offsets within the record;
+///   a replacement bootstrap payload built from the original payload; then the
+///   bootstrap's header CRC and payload CRC recomputed or left stale as stated.
+///
+/// The executor applies only the resolved edits, checking each edit's old bytes.
+fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
+    const KEYS: [&str; 7] = [
+        "tape_file",
+        "record_index",
+        "length",
+        "byte_edits",
+        "payload",
+        "header_crc",
+        "payload_crc",
+    ];
+    let faults = case["fault"]["record_faults"].as_array().unwrap();
+    json!(faults
+        .iter()
+        .map(|fault| {
+            for key in fault.as_object().expect("record fault object").keys() {
+                assert!(KEYS.contains(&key.as_str()), "unknown record fault key {key}");
+            }
+            let tape_file = fault["tape_file"].as_u64().unwrap() as usize;
+            let record_index = fault["record_index"].as_u64().unwrap() as usize;
+            let file = &image.files[tape_file];
+            let start = file.record_offsets[record_index];
+            let end = file
+                .record_offsets
+                .get(record_index + 1)
+                .copied()
+                .unwrap_or(file.bytes.len());
+            let original = &file.bytes[start..end];
+            let length = fault.get("length").map_or(original.len(), |n| {
+                n.as_u64().expect("a record length is an unsigned integer") as usize
+            });
+            let construction = match length.cmp(&original.len()) {
+                std::cmp::Ordering::Less => format!("the first {length} bytes of the original record"),
+                std::cmp::Ordering::Equal => "the original record's length".to_string(),
+                std::cmp::Ordering::Greater => format!(
+                    "the original record followed by {} zero bytes",
+                    length - original.len()
+                ),
+            };
+            let mut record = original[..length.min(original.len())].to_vec();
+            record.resize(length, 0);
+            let mut edits = Vec::new();
+            let mut write = |record: &mut Vec<u8>, offset: usize, new: &[u8], reason: &str| {
+                let old = record[offset..offset + new.len()].to_vec();
+                if old != new {
+                    edits.push(json!({"offset": offset, "old_bytes": hex(&old), "new_bytes": hex(new), "reason": reason}));
+                    record[offset..offset + new.len()].copy_from_slice(new);
+                }
+            };
+            let byte_edits = fault.get("byte_edits").map(|edits| {
+                edits.as_array().expect("byte_edits is a list")
+            });
+            for edit in byte_edits.into_iter().flatten() {
+                for key in edit.as_object().expect("byte edit object").keys() {
+                    assert!(
+                        matches!(key.as_str(), "offset" | "field" | "set" | "xor" | "from"),
+                        "unknown byte edit key {key}"
+                    );
+                }
+                let offset = usize::from_str_radix(
+                    edit["offset"].as_str().unwrap().trim_start_matches("0x"),
+                    16,
+                )
+                .expect("hex offset");
+                let field = edit["field"].as_str().expect("byte edit field label");
+                let width = match (edit["set"].as_str(), edit["xor"].as_str()) {
+                    (Some(set), None) => unhex(set).len(),
+                    (None, Some(mask)) => unhex(mask).len(),
+                    _ => panic!("byte edit needs exactly one of set and xor: {edit}"),
+                };
+                if let Some(from) = edit.get("from") {
+                    let from = from.as_str().expect("from is hex bytes");
+                    assert_eq!(
+                        hex(&record[offset..offset + width]),
+                        from.to_ascii_lowercase(),
+                        "{field}: the original bytes differ from the case's"
+                    );
+                }
+                let (new, reason) = if let Some(set) = edit["set"].as_str() {
+                    (unhex(set), format!("{field}: set"))
+                } else {
+                    let mask = unhex(edit["xor"].as_str().unwrap());
+                    let new = record[offset..offset + width]
+                        .iter()
+                        .zip(&mask)
+                        .map(|(byte, mask)| byte ^ mask)
+                        .collect();
+                    (new, format!("{field}: xor {}", hex(&mask)))
+                };
+                write(&mut record, offset, &new, &reason);
+            }
+            let bootstrap_frame = tape_file == 0 && record_index == 0;
+            let old_len = |record: &[u8]| {
+                u32::from_le_bytes(
+                    record[BOOTSTRAP_PAYLOAD_LEN_FIELD..BOOTSTRAP_PAYLOAD_LEN_FIELD + 4]
+                        .try_into()
+                        .unwrap(),
+                ) as usize
+            };
+            let mut length_changed = false;
+            if let Some(changes) = fault.get("payload") {
+                let changes = changes.as_object().expect("a payload change is an object");
+                assert!(bootstrap_frame, "a replacement payload is defined for the bootstrap only");
+                assert_eq!(
+                    fault["payload_crc"], "recomputed",
+                    "a replacement payload needs its CRC recomputed"
+                );
+                let len = old_len(&record);
+                let payload_end = BOOTSTRAP_PAYLOAD_START + len;
+                let mut payload: ciborium::value::Value =
+                    ciborium::from_reader(&record[BOOTSTRAP_PAYLOAD_START..payload_end])
+                        .expect("original bootstrap payload decodes");
+                let entries = payload.as_map_mut().expect("bootstrap payload is a map");
+                let key_is = |key: &ciborium::value::Value, n: i128| {
+                    key.as_integer().map(i128::from) == Some(n)
+                };
+                for (change, value) in changes {
+                    match change.as_str() {
+                        "scheme" => {
+                            check_scheme(value, false);
+                            let scheme = entries
+                                .iter_mut()
+                                .find(|(key, _)| key_is(key, 1))
+                                .and_then(|(_, scheme)| scheme.as_map_mut())
+                                .expect("payload key 1 is the scheme map");
+                            for (key, name) in [(2, "k"), (3, "m"), (4, "S")] {
+                                let Some(n) = value.get(name) else { continue };
+                                let n = n.as_u64().expect("checked scheme value");
+                                scheme
+                                    .iter_mut()
+                                    .find(|(k, _)| key_is(k, key))
+                                    .expect("scheme field")
+                                    .1 = ciborium::value::Value::Integer(n.into());
+                            }
+                        }
+                        "drive_compression" => {
+                            entries
+                                .iter_mut()
+                                .find(|(key, _)| key_is(key, 5))
+                                .expect("payload key 5")
+                                .1 = ciborium::value::Value::Bool(value.as_bool().unwrap());
+                        }
+                        "key_order" => {
+                            let order: Vec<i128> = value
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|n| i128::from(n.as_u64().unwrap()))
+                                .collect();
+                            assert_eq!(order.len(), entries.len(), "key_order lists every key once");
+                            let mut reordered = Vec::with_capacity(entries.len());
+                            for key in order {
+                                let index = entries
+                                    .iter()
+                                    .position(|(k, _)| key_is(k, key))
+                                    .expect("key_order names a payload key");
+                                reordered.push(entries.remove(index));
+                            }
+                            *entries = reordered;
+                        }
+                        other => panic!("unknown payload change {other}"),
+                    }
+                }
+                let mut new = Vec::new();
+                ciborium::into_writer(&payload, &mut new).expect("payload encodes");
+                let changes: Vec<_> = changes.keys().map(String::as_str).collect();
+                assert!(
+                    BOOTSTRAP_PAYLOAD_START + new.len() + 8 <= record.len(),
+                    "replacement payload fits the record"
+                );
+                let reason = format!("replacement payload ({})", changes.join(", "));
+                write(&mut record, BOOTSTRAP_PAYLOAD_START, &new, &reason);
+                // A shorter payload leaves old bytes past its new CRC: zero them,
+                // so the fill after the new framing is conformant.
+                let new_framed_end = BOOTSTRAP_PAYLOAD_START + new.len() + 8;
+                let old_framed_end = BOOTSTRAP_PAYLOAD_START + len + 8;
+                if new_framed_end < old_framed_end {
+                    let zeros = vec![0; old_framed_end - new_framed_end];
+                    write(&mut record, new_framed_end, &zeros, "zero fill after the shorter payload");
+                }
+                if new.len() != len {
+                    length_changed = true;
+                    write(
+                        &mut record,
+                        BOOTSTRAP_PAYLOAD_LEN_FIELD,
+                        &(new.len() as u32).to_le_bytes(),
+                        "cbor_payload_len updated",
+                    );
+                }
+            }
+            let treatment = |key: &str| {
+                fault
+                    .get(key)
+                    .map(|value| value.as_str().expect("a CRC treatment is a string"))
+            };
+            match treatment("header_crc") {
+                None | Some("stale") => {}
+                Some(treatment @ ("recomputed" | "recomputed if the length changes")) => {
+                    assert!(bootstrap_frame, "header CRC treatment is defined for the bootstrap only");
+                    if treatment == "recomputed" || length_changed {
+                        let crc = remanence_parity::crc64_xz(&record[..BOOTSTRAP_HEADER_CRC_FIELD]);
+                        write(&mut record, BOOTSTRAP_HEADER_CRC_FIELD, &crc.to_le_bytes(), "header CRC recomputed");
+                    }
+                }
+                Some(other) => panic!("unknown header CRC treatment {other}"),
+            }
+            match treatment("payload_crc") {
+                None | Some("stale") => {}
+                Some("recomputed") => {
+                    assert!(bootstrap_frame, "payload CRC treatment is defined for the bootstrap only");
+                    let end = BOOTSTRAP_PAYLOAD_START + old_len(&record);
+                    let crc = remanence_parity::crc64_xz(&record[BOOTSTRAP_PAYLOAD_START..end]);
+                    write(&mut record, end, &crc.to_le_bytes(), "payload CRC recomputed");
+                }
+                Some(other) => panic!("unknown payload CRC treatment {other}"),
+            }
+            json!({"lba": file.start_record + record_index, "tape_file": tape_file, "record_index": record_index,
+                "original_length": original.len(), "length": length, "construction": construction,
+                "edits": edits, "sha256": hex(&Sha256::digest(&record))})
+        })
+        .collect::<Vec<_>>())
+}
+
+/// Whether an expectation's quote occurs verbatim in the in-progress
+/// REM-PARITY text, whitespace aside. A leading bracketed locator, such as
+/// `[Section 5.2, excerpt]`, names the excerpt's place and is not quoted text.
+#[cfg(test)]
+pub(crate) fn specification_quote_holds(quote: &str) -> bool {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let normalise = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = TEXT.get_or_init(|| {
+        normalise(
+            &std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../specs/in-progress/rem-parity-1-specification.md"),
+            )
+            .expect("REM-PARITY text"),
+        )
+    });
+    let quote = match quote
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+    {
+        Some((_, quoted)) => quoted,
+        None => quote,
+    };
+    !quote.trim().is_empty() && text.contains(&normalise(quote))
+}
+
+/// Apply resolved record edits to one record, checking every old byte. The
+/// damage executor uses this; it never rebuilds a record from the case text.
+pub fn apply_record_edits(original: &[u8], resolved: &Value) -> Vec<u8> {
+    for key in resolved.as_object().expect("record edit object").keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "lba"
+                    | "tape_file"
+                    | "record_index"
+                    | "original_length"
+                    | "length"
+                    | "construction"
+                    | "edits"
+                    | "sha256"
+            ),
+            "unknown record edit key {key}"
+        );
+    }
+    for edit in resolved["edits"].as_array().expect("edits list") {
+        for key in edit.as_object().expect("edit object").keys() {
+            assert!(
+                matches!(
+                    key.as_str(),
+                    "offset" | "old_bytes" | "new_bytes" | "reason"
+                ),
+                "unknown resolved edit key {key}"
+            );
+        }
+    }
+    let length = resolved["length"].as_u64().unwrap() as usize;
+    assert_eq!(
+        resolved["original_length"].as_u64().unwrap() as usize,
+        original.len()
+    );
+    let mut record = original[..length.min(original.len())].to_vec();
+    record.resize(length, 0);
+    for edit in resolved["edits"].as_array().unwrap() {
+        let offset = edit["offset"].as_u64().unwrap() as usize;
+        let old = unhex(edit["old_bytes"].as_str().unwrap());
+        let new = unhex(edit["new_bytes"].as_str().unwrap());
+        assert_eq!(
+            record[offset..offset + old.len()],
+            old[..],
+            "stale record edit at {offset}"
+        );
+        record[offset..offset + new.len()].copy_from_slice(&new);
+    }
+    assert_eq!(
+        hex(&Sha256::digest(&record)),
+        resolved["sha256"].as_str().unwrap(),
+        "resolved record digest"
+    );
+    record
 }

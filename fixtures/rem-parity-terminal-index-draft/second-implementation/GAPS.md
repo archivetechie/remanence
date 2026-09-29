@@ -744,3 +744,76 @@ the vectors, not the text.
 the tape UUID supplied under Section 8.4.1, as each header copy's
 `tape_uuid` must (Section 9.2)." This parser already rejected a footer whose
 `tape_uuid` differs from the tape's identity, so no decision changes.
+
+## J. The e1 bootstrap cases (F1)
+
+These were found while deciding the fifteen e1 damage cases, 19 observations
+in all, and the E1 negative case (e1-16). Each was decided from the text
+before any expected outcome was read, and none has been compared with one.
+The fault reader now refuses any key it does not know. Before F1 an unknown
+key was ignored without a word, so these cases would have been decided on
+intact tapes.
+
+**J-1. Section 8.4: "a value that can still be decoded" is not defined
+(e1-07, e1-15).** The fourth row of the content table says the Scanner
+"treats the bootstrap as unreadable, unless a value that can still be decoded
+disagrees, as in the next two rows". A payload that breaks Section 5.3 is one
+that "breaks a later rule of Section 8", since Section 8.2 makes the payload a
+Section 5.3 map. If "decoded" meant decoded under Section 5.3, no value of
+such a payload could disagree, and the word "still" would do no work.
+*Decided:* a value is decodable when the payload is well-formed CBOR from
+which the value can be read without the canonical-form rules (key order,
+shortest form).
+- e1-07's keys are out of order and its scheme is (3, 2, 2), so it is
+  refused: `BootstrapParse`, naming the scheme.
+- e1-15's keys are out of order and its values agree, so the bootstrap is
+  treated as unreadable and discovery continues on the supplied values.
+
+Under the other reading e1-07 would also continue, to an inventory.
+
+Some limits of this reading have no vector. A key that occurs twice has no
+decodable value, because the text cannot say which occurrence counts.
+Indefinite lengths, tags and floats are not decoded.
+
+**J-2. Section 2.2: the Verifier's name for a bootstrap that supplied
+values make unreadable (e1-12 to e1-15).** With supplied values, the Scanner
+treats a bootstrap whose magic, header CRC or payload CRC fails, or whose
+payload breaks a later rule, as unreadable, and reports no error. The
+Verifier "reports damage it finds before the terminal suffix with the error a
+Reader reports for that component". For damaged content, this Verifier gives
+the parser's name, `BootstrapParse`: "A parser given one block as the
+bootstrap reports a breach of Section 8 as `BootstrapParse`, including a
+missing magic and a failed CRC". A medium error stays `TapeIo`. For a
+filemark or EOD at LBA 0, which no case has, it reports `NoBootstrapFound`,
+the name for a bootstrap that "is absent or invalid". The terminal-suffix
+result is unaffected.
+
+**J-3. Section 8.4: a damaged payload's disagreeing scheme is never
+consulted (e1-14).** e1-14 changes a payload byte so that the scheme reads
+(3, 2, 2), and leaves the payload CRC stale. For a record of the right
+length "the first matching row applies", and the row for a failed payload
+CRC comes before the rows for decodable values. The bootstrap is treated as unreadable, and "A bootstrap
+that is treated as unreadable is not trusted for any value." Discovery
+continues on the supplied values. This is decided; it is recorded because
+e1-07 and e1-14 carry the same wrong scheme and end differently.
+
+**J-4. e1-16: the level of the name.** The case's role is "a parser given
+one block as the bootstrap", and the parser accepts the bootstrap. Section 16.3: "Both
+sentences concern a parity tape (Section 11.4): a no-parity bootstrap may
+record compression." Discovery without supplied values finds a usable
+no-parity bootstrap. With supplied values the outcome depends on them. Values
+supplied without parity agree. Values supplied with a parity scheme disagree
+with the no-parity flag, which is refused as `BootstrapParse`, naming the
+no-parity flag. `by_level` records all three.
+
+**J-5. Fixture note: the stated record edits agree with my bytes.** Every
+stated old byte of the 15 cases' record edits matched my build of a4-minimal,
+and every edited record's SHA-256 matched the stated one. Nine edits say a
+CRC was recomputed; each holds the CRC I compute. e1-16's mutated bootstrap,
+built from its construction, has the size and SHA-256 that
+`tape-images/negatives/MANIFEST.tsv` pins (`negative-block-digests.json`).
+That comparison was run after the decision was written.
+
+**J-6. The resume inputs are not checked for unknown keys.** The F1 brief
+asks this of the fault reader, and `decide` applies it. `resume` still reads
+only the keys it uses.

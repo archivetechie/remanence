@@ -53,6 +53,7 @@ python3 tools/rem_parity_second_implementation.py build
 python3 tools/rem_parity_second_implementation.py decide <case.json> [<case.json> ...]
 python3 tools/rem_parity_second_implementation.py resume <resume-case.json> [<resume-case.json> ...]
 python3 tools/rem_parity_second_implementation.py negatives <negative-cases.json>
+python3 tools/rem_parity_second_implementation.py negative-e1 <negatives-e1.json>
 python3 tools/rem_parity_second_implementation.py negatives-supplement <supplement.json>
 python3 tools/rem_parity_second_implementation.py negative-blocks
 python3 tools/rem_parity_second_implementation.py mutations <mutations.json>
@@ -79,8 +80,32 @@ refused input stops the build, the refusal names that input field.
 `decide` takes damage-case files. A case's id is its file's stem, or, for a
 file named `fault-map.json` (a damage case) or `inputs.json` (a resume case,
 as the repository lays them out), its directory's name. For each case it builds
-the named image, applies the case's faults, and then acts as a Reader. It
-writes two files here:
+the named image, applies the case's faults, and then acts as a Reader.
+
+The fault reader knows these keys and no others: `image`,
+`failed_data_addresses`, `unreadable_records`,
+`removed_filemark_after_tape_file`, `record_edits`, and exactly one of
+`hints` or `observations`. It checks every level, including each hint,
+observation, record edit and byte edit. An unknown or missing key fails the
+run before anything is written, with the file and the key named, and the
+command exits with status 2. An ignored key would decide a damaged tape as an
+intact one.
+
+- `record_edits` replaces a record. The new record is built from the
+  original at the stated `length`: the original's own length, its first
+  bytes, or the original followed by zero bytes. The stated `construction`
+  must agree with the two lengths. Every byte edit's `old_bytes` must be
+  what my build holds at that offset, and the edited record's SHA-256 must
+  equal the stated one; otherwise the run fails. An edit whose reason says a
+  CRC was recomputed is also checked against my own CRC, and the result is
+  recorded, though it is not enforced.
+- `observations` lists separate decisions on the same damaged tape, each
+  with its own `hints` (or `null` for none). The case's entry in the
+  decision file then holds `image`, `record_edits` (the checks, per record)
+  and `observations`, which maps each observation's id to a decision of the
+  usual form. The trace has the same shape.
+
+It writes two files here:
 
 - `decisions.json`, in the `rem-parity-second-implementation-decisions/1`
   schema;
@@ -105,6 +130,12 @@ name, a set where Section 15 permits one, acceptance, or `undecided` with
 the readings. The implementation's result is recorded beside it as a
 self-check. The command writes `negative-decisions.json`; see "The
 negatives schema" below.
+
+`negative-e1` does the same for the E1 negative case
+(`blind-inputs/negatives-e1-blind.json`, a bootstrap-role case), from a
+table of its own. It writes `negative-e1-decisions.json` in the same schema.
+The case names a `role` where the others name a `target`, so its entry's
+`target` is that role.
 
 `negatives-supplement` takes the supplemental single-rule variants. For each
 variant it does three things:
@@ -132,7 +163,9 @@ negative case and supplement variant in `blind-inputs/`, on my own builds,
 and emits every block whose bytes the mutation and its repairs change, with
 its size and SHA-256. A block counts as changed when its bytes differ from the
 base artifact's block at the same tape file and block, or when the base has no
-block there. It relates the opaque ids to the real case ids through the two
+block there. It also covers the E1 negative (`--negatives-e1`, default
+`blind-inputs/negatives-e1-blind.json`), whose id is already the case name.
+It relates the opaque ids to the real case ids through the two
 mapping files, compares each block with `tape-images/negatives/MANIFEST.tsv`,
 and reports every row as matched, mismatched or missing from one side. The
 manifest pins only sizes and digests, so a mismatch can be located only
@@ -201,12 +234,13 @@ The tests accept seven optional environment variables:
 The Reader sees only three things:
 
 - the damaged record stream, with its filemarks and EOD;
-- the case's hints;
+- the case's hints, or each observation's;
 - the case's failed data addresses.
 
 The fault model comes with the cases and is taken as given. An unreadable
 record fails every READ that begins at it, positioning is unaffected, and a
-removed filemark merges its two tape files. A hint of `"the image's"` for
+removed filemark merges its two tape files. A record edit replaces a
+record's bytes before the other faults are applied. A hint of `"the image's"` for
 the tape UUID is replaced by the image's UUID. Nothing else from the inputs
 reaches the Reader. `bytes_match` and `inventory_equals_true_prefix` are
 computed only after every decision in the case is fixed.
@@ -218,7 +252,10 @@ The steps follow the text in order:
    `NoBootstrapFound`. With supplied values, which a Scanner that cannot read
    the bootstrap must use, the first record is judged in Section 8.4's two
    stages: the physical read, then the content of a record of the right
-   length.
+   length. A refusal records the value it names (`discovery.refusal_names`).
+   A value "that can still be decoded" is read from the payload without
+   Section 5.3's canonical-form rules, so a payload whose keys are out of
+   order still yields its scheme and `drive_compression` (GAPS J-1).
 2. Terminal discovery from EOD (Section 8.4 step 1): the Scanner spaces back
    over up to five filemarks and reads the record before each. A replica
    footer supplies the planned layout only when it sits at its recorded
@@ -240,7 +277,9 @@ The steps follow the text in order:
    (Section 12.3 items 2 and 3). Its `outside_terminal_suffix` lists
    each finding before replica A with the error a Reader reports for that
    component (Section 2.2), after reading every sidecar's two copies and
-   footer (Section 9.1). Whether a full verification checks every data block
+   footer (Section 9.1). A bootstrap that the supplied values made the
+   Scanner treat as unreadable is reported as `TapeIo` for a medium error,
+   and as `BootstrapParse`, the parser's name, for damaged content (GAPS J-2). Whether a full verification checks every data block
    and parity shard is still open (Appendix D TT-2), so findings on those are
    listed in an `undecided` entry.
 
@@ -368,11 +407,13 @@ whether the filemark remains.
 | `decisions-real-ids-trace.json` | Its trace |
 | `COMPARISON.md` | The comparison of the blind decisions with each case's `expected.json` |
 | `comparison.json` | The same comparison in machine-readable form, with the interpretation used for each expected key |
-| `DECISION-LOG.md` | Every decision changed after the comparison (none) |
+| `DECISION-LOG.md` | Every decision changed after the blind decisions were written, with the sentence that decides it |
 | `resume-decisions.json` | The Resumer's decisions on the resume cases |
 | `negative-decisions.json` | The decisions on the generation-2 negative cases |
+| `negative-e1-decisions.json` | The decision on the E1 negative case (e1-16) |
 | `negative-supplement-decisions.json` | The decisions and isolation audits for the supplemental single-rule variants |
 | `negative-block-digests.json` | Every block the negatives change, compared with `tape-images/negatives/MANIFEST.tsv` |
 | `mutation-decisions.json` | The decisions on the 50 terminal-index mutations |
 | `selection-decisions.json` | The decisions on the 14 terminal survivor sets |
 | `blind-inputs/mutations-blind.json`, `blind-inputs/selection-blind.json` | The mutation and survivor-set descriptions this implementation decided from, exactly as it received them |
+| `blind-inputs/negatives-e1-blind.json` | The E1 negative case's construction, as received |

@@ -2212,6 +2212,11 @@ QUOTES.update({
     'w_t_recorded': ('10.6', 'both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map;'),
     'pm_block_size': ('10.1.3', "`block_size` MUST equal the tape's block size, which is the length of every block read, as the sidecar header's `block_size` must (Section 9.2)."),
     'pm_agreement_all': ('10.1.4', 'The agreement between a header copy and the footer covers every field that both carry, other than `copy_kind` and the CRC, not only the locator fields.'),
+    "err_drive_compression": ("15", "DriveCompressionEnabled         compression detected on / recorded for a parity tape"),
+    "compression_rejects": ("8.4", "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."),
+    "no_parity_may_omit": ("8.2", "It MAY omit the scheme record (key 1) and the digest record (key 2). A Reader MUST NOT require those records on it."),
+    "compression_key_rule": ("8.2", "`true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4)"),
+    "canonical_reject": ("5.3", "When a Reader decodes any CBOR item of this format, it MUST reject duplicate keys and non-canonical encoding, and MUST ignore unknown integer keys at every map level."),
     'footer_uuid': ('9.6', "The footer's `tape_uuid` MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1, as each header copy's `tape_uuid` must (Section 9.2)."),
     'short_read_failure': ('13.4', 'A record shorter or longer than one block is a read failure (Section 3.5).'),
     'compression_parity_only': ('16.3', 'Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression.'),
@@ -4432,7 +4437,7 @@ def role_bootstrap_discovery(ws: Workspace) -> dict[str, Any]:
                                                 "citations": []}}
     boot = discover_bootstrap(tape, None, unsupplied, {})
     hints = {"tape_uuid": ws.tape_uuid, "block_size": ws.block_size, "scheme": ws.image.scheme}
-    outcome, error, reason, _, _ = judge_supplied_bootstrap(tape, hints)
+    outcome, error, reason, _, _, _ = judge_supplied_bootstrap(tape, hints)
     return {"level": "bootstrap discovery", "result": "found" if boot is not None else "rejected",
             "error": unsupplied["discovery"]["error"],
             "with_supplied_values": {"outcome": outcome, "error": error, "reason": reason}}
@@ -5204,7 +5209,7 @@ def negatives_table() -> dict[str, dict[str, Any]]:
 
 def run_negative(entry_id: str, spec: dict[str, Any], case: dict[str, Any]) -> dict[str, Any]:
     case_id, _, variant = entry_id.partition("/")
-    out: dict[str, Any] = {"id": case_id, "variant": variant or None, "target": case.get("target"),
+    out: dict[str, Any] = {"id": case_id, "variant": variant or None, "target": case.get("target", case.get("role")),
                            "apply": None, "decision": spec["decide"], "implementation": [], "self_check": None}
     if spec.get("none"):
         out["apply"] = {"resolved": None, "vector": "none", "checks": [], "repairs": [], "mutated_blocks": [],
@@ -5293,10 +5298,69 @@ def self_check(expect: dict[str, str], results: list[dict[str, Any]]) -> dict[st
     return {"agrees": agrees, "detail": "; ".join(details)}
 
 
-def run_negatives(cases_path: pathlib.Path, out_path: pathlib.Path) -> dict[str, Any]:
+def mutate_boot_no_parity_compression(ws: Workspace, res: Resolution) -> None:
+    """e1-16: set the no-parity flag, drop the scheme record and record compression; repair lengths, fill and CRCs."""
+    block = ws.block((0, 0))
+    flags = struct.unpack_from(">I", block, 0x0C)[0]
+    res.checks.append({"where": ws.describe((0, 0)), "offset": "0x0C", "field": "flags bit 0 (no-parity)",
+                       "expected_from": 0, "found": flags & 1, "matches": flags & 1 == 0, "to": 1})
+    length = rd32(block, 0x2C)
+    payload = decode_deterministic_cbor(bytes(block[0x38 : 0x38 + length]))
+    res.checks.append({"where": ws.describe((0, 0)), "offset": "payload key 1", "field": "scheme record present",
+                       "expected_from": True, "found": 1 in payload, "matches": 1 in payload, "to": "removed"})
+    res.checks.append({"where": ws.describe((0, 0)), "offset": "payload key 5", "field": "drive_compression",
+                       "expected_from": False, "found": payload.get(5), "matches": payload.get(5) is False, "to": True})
+    kept = {key: payload[key] for key in (2, 3, 4)}
+    payload.pop(1, None)
+    payload[5] = True
+    res.checks.append({"where": ws.describe((0, 0)), "offset": "payload keys 2, 3, 4", "field": "unchanged",
+                       "expected_from": "unchanged", "found": "unchanged" if all(payload[k] == v for k, v in kept.items())
+                       else "changed", "matches": all(payload[k] == v for k, v in kept.items()), "to": "unchanged"})
+    encoded = encode_deterministic_cbor(payload)
+    tail = encoded + le64(crc64_xz(encoded))
+    block[0x0C:0x10] = struct.pack(">I", flags | 1)
+    block[0x2C:0x30] = le32(len(encoded))
+    block[0x30:0x38] = le64(crc64_xz(bytes(block[0x00:0x30])))
+    block[0x38:] = tail + bytes(ws.block_size - 0x38 - len(tail))
+    res.repairs.append(f"bootstrap payload {length} -> {len(encoded)} bytes: cbor_payload_len, zero fill after the "
+                       "shorter payload, crc64_payload at its new position, crc64_header")
+
+
+BOOT_LEVELS_NO_PARITY_COMPRESSION = {
+    "a parser given the block": "accepted: a no-parity bootstrap may record compression (Sections 8.2 and 16.3)",
+    "discovery over the candidate sizes, without supplied values": "found: a usable no-parity bootstrap; "
+        "DriveCompressionEnabled concerns only a parity bootstrap (Section 15)",
+    "discovery with supplied values": "depends on the values: supplied without parity, accepted; supplied with a "
+        "parity scheme, the no-parity flag disagrees, so it is refused (BootstrapParse, naming the no-parity flag, "
+        "Section 8.4)",
+}
+
+
+def e1_negatives_table() -> dict[str, dict[str, Any]]:
+    """The E1 negative case (a bootstrap-role case), decided from the text."""
+    return {"e1-16": {
+        "image": "a4-minimal",
+        "apply": mutate_boot_no_parity_compression,
+        "roles": [("bootstrap",), ("bootstrap-discovery",)],
+        "decide": with_levels(decision(
+            "accepted", None, ["compression_key_rule", "compression_parity_only", "no_parity_may_omit",
+                               "boot_parser_name"],
+            "No rule of Section 8 fails. Key 5 is rejected only on a parity bootstrap, and this one sets the no-parity "
+            "flag. A no-parity bootstrap may omit the scheme record, and a Reader must not require it. Its digest "
+            "record (key 2) may be kept. The parser's one exception for recorded compression names a parity bootstrap.",
+            must_reject=False,
+            note="The tape identifies itself as written without parity and with compression; Section 16.3's rejection "
+                 "concerns a parity tape."),
+            BOOT_LEVELS_NO_PARITY_COMPRESSION),
+        "expect": {"bootstrap": "accepted", "bootstrap-discovery": "found"},
+    }}
+
+
+def run_negatives(cases_path: pathlib.Path, out_path: pathlib.Path,
+                  table: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
     source = load_json(cases_path)
     by_id = {case["id"]: case for case in source["cases"]}
-    table = negatives_table()
+    table = negatives_table() if table is None else table
     entries: dict[str, Any] = {}
     covered = set()
     for case in source["cases"]:
@@ -6441,10 +6505,159 @@ def case_id_of(path: pathlib.Path) -> str:
     return path.parent.name if path.name in ("fault-map.json", "inputs.json") else path.stem
 
 
+class FaultMapError(Exception):
+    """A fault map this Reader cannot apply exactly: an unknown or missing key, or a check that fails."""
+
+
+# Every key a damage case's fault map may carry, at every level. Any other key
+# fails the run: an ignored key would decide a damaged tape as an intact one.
+FAULT_MAP_KEYS = {"failed_data_addresses", "hints", "image", "observations", "record_edits",
+                  "removed_filemark_after_tape_file", "unreadable_records"}
+FAULT_MAP_REQUIRED = {"failed_data_addresses", "image", "removed_filemark_after_tape_file", "unreadable_records"}
+HINT_KEYS = {"block_size", "scheme", "tape_uuid"}
+SCHEME_HINT_KEYS = {"S", "k", "m"}
+OBSERVATION_KEYS = {"hints", "id"}
+RECORD_EDIT_KEYS = {"construction", "edits", "lba", "length", "original_length", "record_index", "sha256", "tape_file"}
+BYTE_EDIT_KEYS = {"new_bytes", "offset", "old_bytes", "reason"}
+UNREADABLE_KEYS = {"filemark", "lba", "record_index", "tape_file"}
+
+
+def _exact_keys(value: Any, allowed: set[str], required: set[str], where: str) -> None:
+    if not isinstance(value, dict):
+        raise FaultMapError(f"{where}: expected an object, found {type(value).__name__}")
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise FaultMapError(f"{where}: unknown key(s) {', '.join(map(repr, unknown))}; this Reader refuses keys it "
+                            f"does not know")
+    missing = sorted(required - set(value))
+    if missing:
+        raise FaultMapError(f"{where}: missing key(s) {', '.join(map(repr, missing))}")
+
+
+def _check_hints(hints: Any, where: str) -> None:
+    if hints is None:
+        return
+    _exact_keys(hints, HINT_KEYS, HINT_KEYS, where)
+    if hints["scheme"] is not None:
+        _exact_keys(hints["scheme"], SCHEME_HINT_KEYS, SCHEME_HINT_KEYS, where + ".scheme")
+
+
+def validate_fault_map(case: Any, where: str) -> None:
+    """Refuse a fault map with any key this Reader does not know, at any level."""
+    _exact_keys(case, FAULT_MAP_KEYS, FAULT_MAP_REQUIRED, where)
+    if ("hints" in case) == ("observations" in case):
+        raise FaultMapError(f"{where}: exactly one of 'hints' and 'observations' must be present")
+    if "hints" in case:
+        _check_hints(case["hints"], where + ".hints")
+    else:
+        observations = case["observations"]
+        if not isinstance(observations, list) or not observations:
+            raise FaultMapError(f"{where}.observations: expected a non-empty list")
+        seen = set()
+        for index, observation in enumerate(observations):
+            _exact_keys(observation, OBSERVATION_KEYS, OBSERVATION_KEYS, f"{where}.observations[{index}]")
+            if not isinstance(observation["id"], str) or observation["id"] in seen:
+                raise FaultMapError(f"{where}.observations[{index}]: the id must be a string, and unique")
+            seen.add(observation["id"])
+            _check_hints(observation["hints"], f"{where}.observations[{index}].hints")
+    for index, item in enumerate(case["unreadable_records"]):
+        _exact_keys(item, UNREADABLE_KEYS, UNREADABLE_KEYS, f"{where}.unreadable_records[{index}]")
+    for index, item in enumerate(case.get("record_edits", [])):
+        _exact_keys(item, RECORD_EDIT_KEYS, RECORD_EDIT_KEYS, f"{where}.record_edits[{index}]")
+        for position, edit in enumerate(item["edits"]):
+            _exact_keys(edit, BYTE_EDIT_KEYS, BYTE_EDIT_KEYS, f"{where}.record_edits[{index}].edits[{position}]")
+
+
+def load_fault_map(path: pathlib.Path) -> dict[str, Any]:
+    case = load_json(path)
+    validate_fault_map(case, str(path))
+    return case
+
+
+def observations_of(case: Mapping[str, Any]) -> list[tuple[str | None, dict[str, Any]]]:
+    """Each observation as a case of its own (id, case with its hints); a case without observations is one."""
+    if "observations" not in case:
+        return [(None, dict(case))]
+    base = {key: value for key, value in case.items() if key != "observations"}
+    return [(observation["id"], dict(base, hints=observation["hints"])) for observation in case["observations"]]
+
+
+def _construction_matches(construction: str, length: int, original_length: int) -> bool:
+    """The three constructions a record edit may state, each checked against its lengths."""
+    if construction == "the original record's length":
+        return length == original_length
+    match = re.fullmatch(r"the first (\d+) bytes of the original record", construction)
+    if match:
+        return int(match.group(1)) == length < original_length
+    match = re.fullmatch(r"the original record followed by (\d+) zero bytes", construction)
+    if match:
+        return original_length + int(match.group(1)) == length
+    return False
+
+
+def _recomputed_check(record: bytes, offset: int, new: bytes) -> str | None:
+    """Whether an edit that says it recomputes a bootstrap CRC holds the CRC I compute (reported, not enforced)."""
+    if offset == 0x30 and len(new) == 8 and len(record) >= 0x38:
+        return "header CRC agrees with mine" if crc64_xz(record[0:0x30]) == int.from_bytes(new, "little") else \
+            "header CRC differs from mine"
+    if len(record) >= 0x38:
+        payload_len = rd32(record, 0x2C)
+        if offset == 0x38 + payload_len and len(new) == 8 and 0x38 + payload_len + 8 <= len(record):
+            return "payload CRC agrees with mine" if crc64_xz(record[0x38:0x38 + payload_len]) == int.from_bytes(new, "little") \
+                else "payload CRC differs from mine"
+    return None
+
+
+def apply_record_edits(image: ImageBuild, records: list[Any], case: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Replace each named record exactly as the case states, checking every stated old byte and the SHA-256."""
+    applied = []
+    for index, item in enumerate(case.get("record_edits", [])):
+        where = f"record_edits[{index}]"
+        tape_file, record_index = item["tape_file"], item["record_index"]
+        if not (0 <= tape_file < len(image.files)) or not (0 <= record_index < len(image.files[tape_file].blocks)):
+            raise FaultMapError(f"{where}: tape file {tape_file} has no data record {record_index}")
+        lba = image.file_start_lba(tape_file) + record_index
+        if item["lba"] != lba:
+            raise FaultMapError(f"{where}: stated LBA {item['lba']}, but tape file {tape_file} record {record_index} "
+                                f"is at LBA {lba}")
+        original = records[lba]
+        if not isinstance(original, bytes) or len(original) != item["original_length"]:
+            raise FaultMapError(f"{where}: stated original length {item['original_length']}, mine is "
+                                f"{len(original) if isinstance(original, bytes) else 'a filemark'}")
+        if not _construction_matches(item["construction"], item["length"], item["original_length"]):
+            raise FaultMapError(f"{where}: construction {item['construction']!r} is not one this Reader knows, or "
+                                f"does not match length {item['length']}")
+        record = bytearray(original[: item["length"]] + bytes(max(0, item["length"] - len(original))))
+        checks = []
+        for position, edit in enumerate(item["edits"]):
+            old, new, offset = bytes.fromhex(edit["old_bytes"]), bytes.fromhex(edit["new_bytes"]), edit["offset"]
+            if len(old) != len(new) or offset < 0 or offset + len(old) > len(record):
+                raise FaultMapError(f"{where}.edits[{position}]: old and new bytes must be equally long and fit")
+            if bytes(record[offset : offset + len(old)]) != old:
+                raise FaultMapError(f"{where}.edits[{position}] ({edit['reason']}): stated old bytes {old.hex()} at "
+                                    f"offset {offset}, mine are {bytes(record[offset:offset + len(old)]).hex()}")
+            record[offset : offset + len(new)] = new
+            check = {"offset": offset, "bytes": len(new), "reason": edit["reason"], "old_bytes_agree": True}
+            if "recomputed" in edit["reason"]:
+                check["recomputation"] = _recomputed_check(bytes(record), offset, new)
+            checks.append(check)
+        digest = hashlib.sha256(bytes(record)).hexdigest()
+        if digest != item["sha256"]:
+            raise FaultMapError(f"{where}: the edited record's SHA-256 is {digest}, the case states {item['sha256']}")
+        records[lba] = bytes(record)
+        applied.append({"tape_file": tape_file, "record_index": record_index, "lba": lba, "length": item["length"],
+                        "construction": item["construction"], "edits": checks, "sha256_agrees": True})
+    return applied
+
+
 def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[DamagedTape, list[str]]:
     """Apply the case's faults to my undamaged build (the fault model is given, not derived)."""
     records = image.records()
     notes = []
+    for applied in apply_record_edits(image, records, case):
+        notes.append(f"record at LBA {applied['lba']} (tape file {applied['tape_file']} record "
+                     f"{applied['record_index']}) replaced: {applied['construction']}, {applied['length']} bytes, "
+                     f"{len(applied['edits'])} byte edit(s); every stated old byte and the SHA-256 agree")
     removed = case.get("removed_filemark_after_tape_file")
     removed_lba = None
     if removed is not None:
@@ -6489,26 +6702,96 @@ def empty_decision(image_name: str) -> dict[str, Any]:
     }
 
 
-def judge_supplied_bootstrap(tape: DamagedTape, hints: dict[str, Any]) -> tuple[str, str | None, str, str, dict | None]:
+class _Ambiguous:
+    """A map value this Reader cannot decode, because its key occurs more than once."""
+
+
+AMBIGUOUS = _Ambiguous()
+
+
+def decode_cbor_lenient(data: bytes) -> Any:
+    """Decode well-formed CBOR without the Section 5.3 encoding rules, for Section 8.4's 'decodable' values.
+
+    The canonical-form rules (key order, shortest form) are not applied, so a
+    value in a payload that breaks only them can still be decoded. A
+    definite-length item of major types 0 to 5, or false, true or null, is
+    decoded; anything else is not decodable. A key that occurs twice has no
+    decodable value (AMBIGUOUS). Bytes after the first item are left unread.
+    """
+    def item(offset: int, depth: int) -> tuple[Any, int]:
+        if depth > 16 or offset >= len(data):
+            raise ValueError("truncated or too deep")
+        initial = data[offset]
+        major, info = initial >> 5, initial & 0x1F
+        offset += 1
+        if major == 7:
+            simple = {20: False, 21: True, 22: None}
+            if info in simple:
+                return simple[info], offset
+            raise ValueError("float or other simple value")
+        if info < 24:
+            argument = info
+        elif info in (24, 25, 26, 27):
+            width = 1 << (info - 24)
+            if offset + width > len(data):
+                raise ValueError("truncated argument")
+            argument = int.from_bytes(data[offset : offset + width], "big")
+            offset += width
+        else:
+            raise ValueError("indefinite length or reserved")
+        if major == 0:
+            return argument, offset
+        if major == 1:
+            return -1 - argument, offset
+        if major in (2, 3):
+            if offset + argument > len(data):
+                raise ValueError("truncated string")
+            raw = data[offset : offset + argument]
+            return (raw if major == 2 else raw.decode("utf-8")), offset + argument
+        if major == 4:
+            values = []
+            for _ in range(argument):
+                value, offset = item(offset, depth + 1)
+                values.append(value)
+            return values, offset
+        if major == 5:
+            mapping: dict[Any, Any] = {}
+            for _ in range(argument):
+                key, offset = item(offset, depth + 1)
+                value, offset = item(offset, depth + 1)
+                if isinstance(key, (list, dict)):
+                    raise ValueError("unhashable key")
+                mapping[key] = AMBIGUOUS if key in mapping else value
+            return mapping, offset
+        raise ValueError("tag")
+    try:
+        return item(0, 0)[0]
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def judge_supplied_bootstrap(tape: DamagedTape, hints: dict[str, Any]) -> tuple[str, str | None, str, str, dict | None, str | None]:
     """Section 8.4's two-stage judgement of the first record with supplied values.
 
-    Returns (outcome, error, reason, quote key, bootstrap). The outcome is
-    "use", "unreadable" (the Scanner continues on the supplied values) or
-    "refused" (with the error the table names).
+    Returns (outcome, error, reason, quote key, bootstrap, named). The outcome
+    is "use", "unreadable" (the Scanner continues on the supplied values) or
+    "refused" (with the error the table names, and `named` the value the
+    refusal names: the block size, the first failing header field, or the
+    scheme).
     """
     size = hints["block_size"]
     try:
         value = tape.read(0)
     except MediumError as error:
-        return "unreadable", None, f"medium error at LBA {error.args[0]}", "first_record_unreadable", None
+        return "unreadable", None, f"medium error at LBA {error.args[0]}", "first_record_unreadable", None, None
     if not isinstance(value, bytes):
-        return "unreadable", None, f"{value} where the record should be", "first_record_unreadable", None
+        return "unreadable", None, f"{value} where the record should be", "first_record_unreadable", None, None
     if len(value) != size:
         return ("refused", "BootstrapParse", f"the record is {len(value)} bytes, not the supplied block size {size}",
-                "first_record_length", None)
+                "first_record_length", None, "block size")
     block = value
     if len(block) < 0x40 or block[0:8] != BOOTSTRAP_MAGIC_BYTES or crc64_xz(block[0:0x30]) != rd64(block, 0x30):
-        return "unreadable", None, "the magic is missing or the header CRC fails", "first_record_magic", None
+        return "unreadable", None, "the magic is missing or the header CRC fails", "first_record_magic", None, None
     major, _minor, flags = struct.unpack_from(">HHI", block, 0x08)
     no_parity = bool(flags & 1)
     for name, ok in (("format major", major == BOOTSTRAP_SCHEMA_MAJOR_VALUE),
@@ -6518,33 +6801,32 @@ def judge_supplied_bootstrap(tape: DamagedTape, hints: dict[str, Any]) -> tuple[
                      ("no-parity flag", no_parity == (hints["scheme"] is None))):
         if not ok:
             return ("refused", "BootstrapParse", f"the header's {name} is impossible or disagrees with the supplied values",
-                    "first_record_fields", None)
+                    "first_record_fields", None, name)
     payload_len = rd32(block, 0x2C)
     if 0x38 + payload_len + 8 > len(block) or crc64_xz(block[0x38 : 0x38 + payload_len]) != rd64(block, 0x38 + payload_len):
-        return "unreadable", None, "the payload CRC fails or the payload runs past the block", "first_record_payload", None
+        return "unreadable", None, "the payload CRC fails or the payload runs past the block", "first_record_payload", None, None
     try:
         boot = parse_bootstrap(block, size)
     except ReadFailure as failure:
-        try:
-            values = decode_deterministic_cbor(block[0x38 : 0x38 + payload_len])
-        except (RederivationError, AssertionError, TypeError):
-            values = None
+        # "a value that can still be decoded": decoded without Section 5.3's
+        # encoding rules, which the payload may be what breaks.
+        values = decode_cbor_lenient(block[0x38 : 0x38 + payload_len])
         if isinstance(values, dict):
             if values.get(5) is True and not no_parity:
                 return ("refused", "DriveCompressionEnabled", "a decodable drive_compression is true on a parity tape",
-                        "first_record_compression", None)
+                        "first_record_compression", None, None)
             record = values.get(1)
             if isinstance(record, dict) and hints["scheme"] is not None:
                 decoded = (record.get(2), record.get(3), record.get(4))
                 if all(is_uint(v) for v in decoded) and decoded != tuple(hints["scheme"]):
                     return ("refused", "BootstrapParse", "a decodable parity scheme disagrees with the supplied scheme",
-                            "first_record_scheme", None)
+                            "first_record_scheme", None, "scheme")
         return ("unreadable", None, f"the payload breaks a later rule of Section 8 ({failure.reason})",
-                "first_record_later_rule", None)
+                "first_record_later_rule", None, None)
     if boot["scheme"] != hints["scheme"]:
         return ("refused", "BootstrapParse", "the parity scheme disagrees with the supplied scheme",
-                "first_record_scheme", None)
-    return "use", None, "the bootstrap agrees with the supplied values", "bootstrap_supplied_refused", boot
+                "first_record_scheme", None, "scheme")
+    return "use", None, "the bootstrap agrees with the supplied values", "bootstrap_supplied_refused", boot, None
 
 
 def discover_bootstrap(tape: DamagedTape, hints: dict[str, Any] | None, decision: dict[str, Any],
@@ -6554,16 +6836,32 @@ def discover_bootstrap(tape: DamagedTape, hints: dict[str, Any] | None, decision
     if hints:
         discovery["used_hints"] = True
         discovery["citations"].extend([cite("hint_size"), cite("first_record_stages")])
-        outcome, error, reason, key, boot = judge_supplied_bootstrap(tape, hints)
+        outcome, error, reason, key, boot, named = judge_supplied_bootstrap(tape, hints)
         trace["bootstrap_attempts"] = [f"supplied block size {hints['block_size']}: {reason}"]
+        if boot is None and key in ("first_record_scheme", "first_record_compression", "first_record_later_rule"):
+            # Name the later rule the payload breaks, which the judgement's
+            # reason leaves out when a decodable value decides.
+            try:
+                parse_bootstrap(tape.read_data(0), hints["block_size"])
+            except (MediumError, ReadFailure) as failure:
+                later = failure.reason if isinstance(failure, ReadFailure) else "medium error"
+                if key != "first_record_later_rule":
+                    trace["bootstrap_attempts"].append(f"the payload breaks a later rule of Section 8 ({later})")
+                    discovery["citations"].append(cite("first_record_later_rule"))
+                if "deterministic" in later:
+                    discovery["citations"].append(cite("canonical_reject"))
         if outcome == "use":
             discovery.update(result="found", block_size=boot["block_size"])
             discovery["citations"].append(cite("accept_size"))
             return boot
         if outcome == "refused":
             discovery.update(result="error", error=error)
-            discovery["citations"].extend([cite(key), cite("bootstrap_supplied_refused")])
+            if named is not None:
+                discovery["refusal_names"] = named
+            discovery["citations"].extend([cite(key), cite("bootstrap_supplied_refused" if error == "BootstrapParse"
+                                                           else "compression_rejects")])
             return None
+        trace["_bootstrap_unreadable"] = (key, reason)
         discovery.update(result="not_found", block_size=hints["block_size"])
         discovery["citations"].extend([cite(key), cite("unreadable_untrusted"), cite("hint_discovery"), cite("hint_uuid"),
                                        cite("identity_12_1")])
@@ -6622,7 +6920,8 @@ def load_parity_map_directory(tape: DamagedTape, entries: list[MapEntry], tape_u
 
 def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: int, tape_uuid: bytes,
                              block_size: int, scheme: tuple[int, int, int], bootstrap: dict[str, Any] | None,
-                             directory: dict[int, dict] | None) -> list[dict[str, Any]]:
+                             directory: dict[int, dict] | None,
+                             bootstrap_unreadable: tuple[str, str] | None = None) -> list[dict[str, Any]]:
     """What a Verifier finds before replica A, each with the error a Reader reports for that component (Section 2.2).
 
     Every sidecar's primary copy, tail copy and footer are read (Section 9.1).
@@ -6636,7 +6935,17 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
         findings.append({"component": component, "finding": finding, "error": error, "checks": scope_kind})
 
     if bootstrap is None:
-        add("bootstrap", "unreadable (medium error)", "TapeIo")
+        # With supplied values the Scanner treats the bootstrap as unreadable
+        # (Section 8.4). The Verifier reports why, with the error a Reader
+        # reports for it: a medium error is TapeIo; damaged content is what a
+        # parser given the block reports, BootstrapParse (Section 15).
+        key, reason = bootstrap_unreadable or ("first_record_unreadable", "medium error")
+        if key == "first_record_unreadable" and reason.startswith("medium error"):
+            add("bootstrap", "unreadable (medium error)", "TapeIo")
+        elif key == "first_record_unreadable":
+            add("bootstrap", f"absent ({reason})", "NoBootstrapFound")
+        else:
+            add("bootstrap", f"{reason}, so with supplied values it is treated as unreadable", "BootstrapParse")
     elif not bootstrap["fill_zero"]:
         add("bootstrap", "trailing fill nonzero (a nonconformity; Section 8.1)", None)
     indexes: dict[int, dict] = {}
@@ -6741,19 +7050,26 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         hints = {"tape_uuid": supplied_uuid, "block_size": raw["block_size"],
                  "scheme": (scheme["k"], scheme["m"], scheme["S"]) if scheme else None}
     boot = discover_bootstrap(tape, hints, decision, trace)
+    bootstrap_unreadable = trace.pop("_bootstrap_unreadable", None)
     if boot is not None:
         tape_uuid, block_size, scheme = boot["tape_uuid"], boot["block_size"], boot["scheme"]
     elif hints is not None and decision["discovery"]["result"] == "not_found":
         tape_uuid, block_size, scheme = hints["tape_uuid"], hints["block_size"], hints["scheme"]
     else:
         error = decision["discovery"]["error"]
+        # NoBootstrapFound stops discovery for want of values; a refusal stops
+        # it because the bootstrap contradicts the supplied values or records
+        # compression on a parity tape (Section 8.4).
+        error_cites = {"NoBootstrapFound": ["no_bootstrap"],
+                       "BootstrapParse": ["bootstrap_supplied_refused", "err_boot_parse"],
+                       "DriveCompressionEnabled": ["compression_rejects", "err_drive_compression"]}[error]
         scanner = decision["scanner"]
         scanner.update(result="error", error=error)
-        scanner["citations"].extend([cite("boot_first"), cite("no_bootstrap")])
+        scanner["citations"].extend([cite("boot_first")] + [cite(key) for key in error_cites])
         decision["walk"]["citations"].append(cite("hints_required"))
         verifier = decision["verifier"]
         verifier.update(result="error", error=error)
-        verifier["citations"].extend([cite("verifier_role"), cite("no_bootstrap")])
+        verifier["citations"].extend([cite("verifier_role")] + [cite(key) for key in error_cites])
         if case.get("failed_data_addresses"):
             decision["recoverer"]["addresses"] = [
                 {"address": list(a), "epoch": None, "result": "not_run", "error": None, "stripe": None,
@@ -6998,13 +7314,15 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         verifier["citations"].append(cite("normal_finalized"))
     if context is not None:
         findings = verifier_prefix_findings(tape, context.entries, context.scope, tape_uuid, block_size, scheme,
-                                            boot, directory)
+                                            boot, directory, bootstrap_unreadable)
         trace["verifier_prefix_findings"] = findings
         if findings:
             # Section 2.2: the Verifier reports each finding before the
             # terminal suffix with the error a Reader reports for it.
             verifier["outside_terminal_suffix"] = findings
             verifier["citations"].append(cite("verifier_reports"))
+            if any(f["component"] == "bootstrap" and f["error"] == "BootstrapParse" for f in findings):
+                verifier["citations"].append(cite("boot_parser_name"))
             if any(f["component"].startswith("sidecar") for f in findings):
                 verifier["citations"].append(cite("verifier_divergence"))
             data = [f for f in findings if f["checks"] == "data"]
@@ -7048,8 +7366,11 @@ def run_decide(case_paths: list[pathlib.Path], out_path: pathlib.Path) -> dict[s
     traces: dict[str, Any] = {}
     manifest_rows = read_tsv(FIXTURE_ROOT / "tape-images" / "MANIFEST.tsv")
     unreproduced_by_image: dict[str, list[str]] = {}
+    # Every fault map is checked before any is decided, so an unknown key fails
+    # the run before it writes anything.
+    cases = {path: load_fault_map(path) for path in case_paths}
     for path in sorted(case_paths, key=lambda p: case_id_of(p)):
-        case = load_json(path)
+        case = cases[path]
         name = case["image"]
         if name not in images:
             images[name] = build_image(load_image_inputs(name), name)
@@ -7057,12 +7378,26 @@ def run_decide(case_paths: list[pathlib.Path], out_path: pathlib.Path) -> dict[s
                 result.artifact.split(" tape file ")[1] if " tape file " in result.artifact else result.artifact
                 for result in compare_image(images[name], manifest_rows) if not result.reproduced]
         image = images[name]
-        trace: dict[str, Any] = {}
-        decision = decide_case(case, image, trace)
-        reporting_only(decision, image, trace)
-        decision["image_unreproduced"] = [f"tape file {item}" for item in unreproduced_by_image[name]]
-        decisions[case_id_of(path)] = decision
-        traces[case_id_of(path)] = trace
+        per_observation: dict[str, Any] = {}
+        per_observation_trace: dict[str, Any] = {}
+        for observation_id, observed in observations_of(case):
+            trace: dict[str, Any] = {}
+            decision = decide_case(observed, image, trace)
+            reporting_only(decision, image, trace)
+            decision["image_unreproduced"] = [f"tape file {item}" for item in unreproduced_by_image[name]]
+            per_observation[observation_id] = decision
+            per_observation_trace[observation_id] = trace
+        if "observations" not in case:
+            decisions[case_id_of(path)] = per_observation[None]
+            traces[case_id_of(path)] = per_observation_trace[None]
+        else:
+            # Each observation is a separate decision on the same damaged tape.
+            decisions[case_id_of(path)] = {
+                "image": name,
+                "record_edits": apply_record_edits(image, image.records(), case),
+                "observations": per_observation,
+            }
+            traces[case_id_of(path)] = {"observations": per_observation_trace}
     output = {"schema": "rem-parity-second-implementation-decisions/1", "cases": decisions}
     text = json.dumps(output, indent=2, sort_keys=False, ensure_ascii=False) + "\n"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7226,7 +7561,7 @@ def negative_entry_blocks(spec: dict[str, Any]) -> tuple[str, list[dict[str, Any
 
 
 def run_negative_blocks(negatives_path: pathlib.Path, supplement_path: pathlib.Path, manifest_path: pathlib.Path,
-                        out_path: pathlib.Path) -> dict[str, Any]:
+                        out_path: pathlib.Path, negatives_e1_path: pathlib.Path | None = None) -> dict[str, Any]:
     negatives_mapping = load_json(OUTPUT_ROOT / "blind-negatives-mapping.json")["mapping"]
     supplement_mapping = load_json(OUTPUT_ROOT / "blind-supplement-mapping.json")["mapping"]
     entries: dict[str, Any] = {}
@@ -7239,6 +7574,11 @@ def run_negative_blocks(negatives_path: pathlib.Path, supplement_path: pathlib.P
     supplement = supplement_table()
     for variant in load_json(supplement_path)["variants"]:
         entries[variant["id"]] = {"real_id": supplement_mapping[variant["id"]], "spec": supplement.get(variant["id"])}
+    if negatives_e1_path is not None:
+        # The E1 negative's id is already the repository's case name.
+        e1_table = e1_negatives_table()
+        for case in load_json(negatives_e1_path)["cases"]:
+            entries[case["id"]] = {"real_id": case["id"], "spec": e1_table.get(case["id"])}
     mine: dict[tuple, dict[str, Any]] = {}
     mutated_by_case: dict[str, Any] = {}
     per_entry: dict[str, Any] = {}
@@ -7316,8 +7656,9 @@ def run_negative_blocks(negatives_path: pathlib.Path, supplement_path: pathlib.P
         counts[out["result"]] += 1
         rows_out.append(out)
     output = {"schema": "rem-parity-second-implementation-negative-blocks/1",
-              "sources": {"negatives": negatives_path.name, "supplement": supplement_path.name,
-                          "manifest": "tape-images/negatives/MANIFEST.tsv"},
+              "sources": dict({"negatives": negatives_path.name, "supplement": supplement_path.name},
+                              **({"negatives_e1": negatives_e1_path.name} if negatives_e1_path is not None else {}),
+                              manifest="tape-images/negatives/MANIFEST.tsv"),
               "counts": dict(counts, manifest_rows=len(manifest), emitted_blocks=len(mine)),
               "entries": per_entry, "rows": rows_out}
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -8329,6 +8670,9 @@ def main(argv: list[str] | None = None) -> int:
     negatives = commands.add_parser("negatives", help="apply and decide the generation-2 negative cases")
     negatives.add_argument("cases", type=pathlib.Path)
     negatives.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-decisions.json")
+    negatives_e1 = commands.add_parser("negative-e1", help="apply and decide the E1 negative case (a bootstrap-role case)")
+    negatives_e1.add_argument("cases", type=pathlib.Path)
+    negatives_e1.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-e1-decisions.json")
     supplement = commands.add_parser("negatives-supplement", help="apply, isolate and decide the single-rule variants")
     supplement.add_argument("variants", type=pathlib.Path)
     supplement.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-supplement-decisions.json")
@@ -8339,6 +8683,7 @@ def main(argv: list[str] | None = None) -> int:
                                  help="emit every block the negatives change and compare with tape-images/negatives/MANIFEST.tsv")
     blocks.add_argument("--negatives", type=pathlib.Path, default=BLIND_INPUTS / "negative-cases-blind.json")
     blocks.add_argument("--supplement", type=pathlib.Path, default=BLIND_INPUTS / "supplement-blind.json")
+    blocks.add_argument("--negatives-e1", type=pathlib.Path, default=BLIND_INPUTS / "negatives-e1-blind.json")
     blocks.add_argument("--manifest", type=pathlib.Path, default=NEGATIVES_ROOT / "MANIFEST.tsv")
     blocks.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "negative-block-digests.json")
     mutations_cmd = commands.add_parser("mutations", help="apply and decide the terminal-index mutations")
@@ -8349,7 +8694,7 @@ def main(argv: list[str] | None = None) -> int:
     selection_cmd.add_argument("--out", type=pathlib.Path, default=OUTPUT_ROOT / "selection-decisions.json")
     args = parser.parse_args(argv)
     if args.command == "negative-blocks":
-        output = run_negative_blocks(args.negatives, args.supplement, args.manifest, args.out)
+        output = run_negative_blocks(args.negatives, args.supplement, args.manifest, args.out, args.negatives_e1)
         for row in output["rows"]:
             if row["result"] != "matched":
                 print(f"{row['result']:22} {row['case']} {row['artifact']} tape file {row['tape_file']} block "
@@ -8382,6 +8727,12 @@ def main(argv: list[str] | None = None) -> int:
             print(entry_id, supplement_summary(entry))
         print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
         return 0
+    if args.command == "negative-e1":
+        output = run_negatives(args.cases, args.out, e1_negatives_table())
+        for entry_id, entry in output["entries"].items():
+            print(entry_id, negative_summary(entry))
+        print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
+        return 0
     if args.command == "negatives":
         output = run_negatives(args.cases, args.out)
         for entry_id, entry in output["entries"].items():
@@ -8394,9 +8745,17 @@ def main(argv: list[str] | None = None) -> int:
             print(case_id, resume_summary(decision))
         print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
         return 0
-    output = run_decide(args.cases, args.out)
+    try:
+        output = run_decide(args.cases, args.out)
+    except FaultMapError as error:
+        print(f"error: fault map refused: {error}", file=sys.stderr)
+        return 2
     for case_id, decision in output["cases"].items():
-        print(case_id, one_line_summary(decision))
+        if "observations" in decision:
+            for observation_id, observed in decision["observations"].items():
+                print(f"{case_id} [{observation_id}]", one_line_summary(observed))
+        else:
+            print(case_id, one_line_summary(decision))
     print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
     return 0
 

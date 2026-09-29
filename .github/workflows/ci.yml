@@ -127,6 +127,11 @@ jobs:
             --out "$RUNNER_TEMP/second-supplement-decisions.json"
           cmp "$RUNNER_TEMP/second-supplement-decisions.json" \
             fixtures/rem-parity-terminal-index-draft/second-implementation/negative-supplement-decisions.json
+          python3 tools/rem_parity_second_implementation.py negative-e1 \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/negatives-e1-blind.json \
+            --out "$RUNNER_TEMP/second-negative-e1-decisions.json"
+          cmp "$RUNNER_TEMP/second-negative-e1-decisions.json" \
+            fixtures/rem-parity-terminal-index-draft/second-implementation/negative-e1-decisions.json
           python3 tools/rem_parity_second_implementation.py negative-blocks \
             --negatives fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/negative-cases-blind.json \
             --supplement fixtures/rem-parity-terminal-index-draft/second-implementation/blind-inputs/supplement-blind.json \

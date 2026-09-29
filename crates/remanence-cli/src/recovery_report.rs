@@ -1394,8 +1394,21 @@ mod tests {
         };
         let mut out = Vec::new();
         let mut err = Vec::new();
+        // The record's measured length is judged first (REM-PARITY 8.4): with
+        // every supplied value wrong, the refusal names the block size.
         assert_eq!(
             run_image_recovery_report(temp.path(), Some(hints.clone()), true, &mut out, &mut err),
+            ExitCode::from(1)
+        );
+        assert!(String::from_utf8_lossy(&err).contains("block size"));
+        assert!(out.is_empty());
+        err.clear();
+        let foreign = RecoveryHints {
+            block_size_bytes: BLOCK_SIZE,
+            ..hints.clone()
+        };
+        assert_eq!(
+            run_image_recovery_report(temp.path(), Some(foreign), true, &mut out, &mut err),
             ExitCode::from(1)
         );
         assert!(String::from_utf8_lossy(&err).contains("tape identity mismatch"));
@@ -1648,6 +1661,128 @@ mod tests {
             "{error}"
         );
         assert!(error.starts_with("discover bootstrap:"), "{error}");
+    }
+
+    /// Report BOT reads at candidate sizes other than the image's own as a drive
+    /// would measure a record of `record_len` bytes: a short read, or a record
+    /// longer than the buffer. Reads at the image's size pass through.
+    struct CandidateProbes {
+        inner: ImageDirectoryRawSource,
+        configured: u32,
+        record_len: usize,
+        configured_sizes: Vec<u32>,
+        reads: usize,
+    }
+    impl RawTapeSource for CandidateProbes {
+        fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+            self.configured = size;
+            self.configured_sizes.push(size);
+            if size == BLOCK_SIZE {
+                self.inner.configure_fixed_block_size(size)?;
+            }
+            Ok(())
+        }
+        fn locate_physical(
+            &mut self,
+            hint: remanence_parity::PhysicalPositionHint,
+        ) -> Result<(), ParityError> {
+            self.inner.locate_physical(hint)
+        }
+        fn locate_end_of_data(
+            &mut self,
+        ) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+            self.inner.locate_end_of_data()
+        }
+        fn space_filemarks(
+            &mut self,
+            count: i64,
+        ) -> Result<remanence_parity::SpaceFilemarksOutcome, ParityError> {
+            self.inner.space_filemarks(count)
+        }
+        fn position(&mut self) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+            self.inner.position()
+        }
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            self.reads += 1;
+            if self.configured == BLOCK_SIZE {
+                return self.inner.read_record(buf);
+            }
+            if self.record_len > buf.len() {
+                return Err(remanence_library::TapeIoError::ReadBufferTooSmall {
+                    actual: self.record_len as u32,
+                    provided: buf.len() as u32,
+                }
+                .into());
+            }
+            Ok(RawReadOutcome::Block {
+                bytes: self.record_len,
+                position_after: remanence_parity::PhysicalPositionHint::new(1),
+            })
+        }
+    }
+
+    fn candidate_probes(record_len: usize) -> (TempDir, CandidateProbes) {
+        let temp = write_image_directory(&plaintext_image(false));
+        let inner = ImageDirectoryRawSource::open(temp.path()).expect("image");
+        (
+            temp,
+            CandidateProbes {
+                inner,
+                configured: 0,
+                record_len,
+                configured_sizes: Vec::new(),
+                reads: 0,
+            },
+        )
+    }
+
+    fn supplied_hints() -> RecoveryHints {
+        RecoveryHints {
+            tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+            block_size_bytes: BLOCK_SIZE,
+            scheme: "none".to_string(),
+        }
+    }
+
+    /// A candidate size whose read measures the supplied size is only ruled out.
+    #[test]
+    fn recovery_report_continues_past_candidate_size_mismatches() {
+        let (_temp, mut source) = candidate_probes(BLOCK_SIZE as usize);
+        let report = build_recovery_report(
+            &mut source,
+            &[BLOCK_SIZE * 2, BLOCK_SIZE / 2],
+            Some(supplied_hints()),
+        )
+        .expect("the supplied size reads the valid bootstrap");
+        assert!(report.success);
+        assert_eq!(
+            &source.configured_sizes[..3],
+            &[BLOCK_SIZE * 2, BLOCK_SIZE / 2, BLOCK_SIZE]
+        );
+        assert!(!report.scan.bootstrap_treated_as_unreadable);
+        assert_eq!(report.tape_uuid.as_deref(), Some(hex(&TAPE_UUID).as_str()));
+    }
+
+    /// A refusal is returned at once, even at a candidate size other than the
+    /// supplied one: supplied values never replace a contradicting bootstrap.
+    #[test]
+    fn recovery_report_returns_refusals_at_once() {
+        for record_len in [1000, BLOCK_SIZE as usize * 4] {
+            let (_temp, mut source) = candidate_probes(record_len);
+            let error =
+                build_recovery_report(&mut source, &[BLOCK_SIZE * 2], Some(supplied_hints()))
+                    .expect_err("a record of another length than the supplied size");
+            assert!(error.starts_with("discover bootstrap:"), "{error}");
+            assert!(
+                error.contains(&format!("got {record_len} bytes")),
+                "{error}"
+            );
+            assert_eq!(source.configured_sizes, vec![BLOCK_SIZE * 2]);
+            assert_eq!(
+                source.reads, 1,
+                "neither another candidate nor the walk runs"
+            );
+        }
     }
 
     /// Partial authority and invalid geometry must fail before touching the source.

@@ -7,7 +7,7 @@
 //! scanner's completeness decision.
 
 use crate::bootstrap::parse_bootstrap_block;
-use crate::error::ParityError;
+use crate::error::{BootstrapRefusedField, ParityError};
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::raw::{
     tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
@@ -349,7 +349,10 @@ where
         |progress| visit_control(&BotStructuralRecoveryEvent::Progress(*progress)),
     )
     .map_err(|error| match error {
-        ParityError::TapeIdentityMismatch(_) => BotStructuralRecoveryError::TapeIdentityMismatch,
+        ParityError::BootstrapRefused {
+            field: BootstrapRefusedField::TapeUuid,
+            ..
+        } => BotStructuralRecoveryError::TapeIdentityMismatch,
         error => BotStructuralRecoveryError::Scan {
             message: error.to_string(),
         },

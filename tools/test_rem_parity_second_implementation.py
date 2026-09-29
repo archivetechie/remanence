@@ -24,9 +24,11 @@ Two environment variables are optional:
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -825,9 +827,9 @@ class RevisedTextTests(unittest.TestCase):
         self.assertEqual(impl.judge_supplied_bootstrap(self.tape(), self.hints())[0], "use")
         records = self.image.records()
         records[0] = records[0][:100]
-        outcome, error, _, key, _ = impl.judge_supplied_bootstrap(self.tape(records), self.hints())
-        self.assertEqual((outcome, error, key), ("refused", "BootstrapParse", "first_record_length"))
-        outcome, error, _, key, _ = impl.judge_supplied_bootstrap(self.tape(unreadable=[0]), self.hints())
+        outcome, error, _, key, _, named = impl.judge_supplied_bootstrap(self.tape(records), self.hints())
+        self.assertEqual((outcome, error, key, named), ("refused", "BootstrapParse", "first_record_length", "block size"))
+        outcome, error, _, key, _, _ = impl.judge_supplied_bootstrap(self.tape(unreadable=[0]), self.hints())
         self.assertEqual((outcome, error, key), ("unreadable", None, "first_record_unreadable"))
 
     def test_a_boundary_read_in_step_3_is_resume_append(self) -> None:
@@ -883,6 +885,137 @@ class RevisedTextTests(unittest.TestCase):
         self.assertIsNotNone(index)
         self.assertIn("its hash equals the directory entry's", note)
         self.assertEqual(impl.recover_address(ctx, [1, 0])["result"], "recovered")
+
+
+# ---------------------------------------------------------------------------
+# F1: observations, record edits, strict fault maps and the E1 negative.
+# ---------------------------------------------------------------------------
+
+
+def boot_edit_case(image, edits, hints_list, length=None):
+    """A fault map that edits the bootstrap record, as the e1 cases state their edits."""
+    original = image.files[0].blocks[0]
+    record = bytearray(original if length is None else (original[:length] + bytes(max(0, length - len(original)))))
+    stated = []
+    for offset, new in edits:
+        stated.append({"offset": offset, "old_bytes": bytes(record[offset:offset + len(new)]).hex(),
+                       "new_bytes": new.hex(), "reason": "test edit"})
+        record[offset:offset + len(new)] = new
+    construction = ("the original record's length" if length in (None, len(original)) else
+                    f"the first {length} bytes of the original record" if length < len(original) else
+                    f"the original record followed by {length - len(original)} zero bytes")
+    return {"failed_data_addresses": [], "image": "a4-minimal", "removed_filemark_after_tape_file": None,
+            "unreadable_records": [],
+            "observations": [{"id": name, "hints": hints} for name, hints in hints_list],
+            "record_edits": [{"construction": construction, "edits": stated, "lba": 0,
+                              "length": len(record), "original_length": len(original), "record_index": 0,
+                              "sha256": hashlib.sha256(bytes(record)).hexdigest(), "tape_file": 0}]}
+
+
+SUPPLIED = {"block_size": 262144, "scheme": {"S": 2, "k": 2, "m": 2}, "tape_uuid": "the image's"}
+
+
+class FaultMapTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+        cls.dir = SCRATCH / "fault-maps"
+        cls.dir.mkdir(parents=True, exist_ok=True)
+
+    def write(self, name, case):
+        path = self.dir / f"{name}.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        return path
+
+    def test_an_unknown_key_fails_the_run(self) -> None:
+        base = dict(SYNTHETIC_CASES["synthetic-replica-headers"])
+        for name, case in (("top", dict(base, surprise=1)),
+                           ("nested", dict(base, unreadable_records=[dict(base["unreadable_records"][0], why="x")])),
+                           ("hint", dict(base, hints={"block_size": 262144, "scheme": None, "tape_uuid": "the image's",
+                                                      "extra": 1}))):
+            with self.subTest(case=name):
+                path = self.write(f"unknown-{name}", case)
+                with self.assertRaises(impl.FaultMapError):
+                    impl.run_decide([path], SCRATCH / "unknown.json")
+                with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(impl.main(["decide", str(path), "--out", str(SCRATCH / "unknown.json")]), 2)
+                self.assertIn("unknown key", stderr.getvalue())
+
+    def test_hints_and_observations_are_exclusive(self) -> None:
+        case = dict(boot_edit_case(self.image, [], [("a", None)]), hints=None)
+        with self.assertRaises(impl.FaultMapError):
+            impl.validate_fault_map(case, "test")
+
+    def test_a_stated_old_byte_or_digest_that_differs_is_refused(self) -> None:
+        case = boot_edit_case(self.image, [(0, b"\x53")], [("a", SUPPLIED)])
+        wrong_old = copy.deepcopy(case)
+        wrong_old["record_edits"][0]["edits"][0]["old_bytes"] = "00"
+        wrong_digest = copy.deepcopy(case)
+        wrong_digest["record_edits"][0]["sha256"] = "00" * 32
+        wrong_construction = copy.deepcopy(case)
+        wrong_construction["record_edits"][0]["construction"] = "the first 40 bytes of the original record"
+        for name, bad in (("old", wrong_old), ("digest", wrong_digest), ("construction", wrong_construction)):
+            with self.subTest(case=name):
+                with self.assertRaises(impl.FaultMapError):
+                    impl.apply_record_edits(self.image, self.image.records(), bad)
+
+    def test_each_observation_is_a_separate_decision(self) -> None:
+        # The magic is missing: with supplied values the bootstrap is unreadable and discovery continues (8.4);
+        # without them no candidate gives a usable bootstrap (NoBootstrapFound, Section 15).
+        case = boot_edit_case(self.image, [(0, b"\x53")], [("supplied values", SUPPLIED), ("no supplied values", None)])
+        out = impl.run_decide([self.write("magic", case)], SCRATCH / "observations.json")
+        entry = out["cases"]["magic"]
+        self.assertEqual(list(entry["observations"]), ["supplied values", "no supplied values"])
+        supplied, unsupplied = entry["observations"]["supplied values"], entry["observations"]["no supplied values"]
+        self.assertEqual((supplied["scanner"]["result"], supplied["scanner"]["acceptable_selections"]),
+                         ("Inventory", ["A", "B", "C"]))
+        self.assertEqual(supplied["verifier"]["outside_terminal_suffix"][0]["error"], "BootstrapParse")
+        self.assertEqual(unsupplied["scanner"]["error"], "NoBootstrapFound")
+        self.assertTrue(entry["record_edits"][0]["sha256_agrees"])
+
+    def test_a_decodable_scheme_decides_even_in_a_non_canonical_payload(self) -> None:
+        # 8.4: "treats the bootstrap as unreadable, unless a value that can still be decoded disagrees".
+        block = self.image.files[0].blocks[0]
+        length = impl.rd32(block, 0x2C)
+        payload = impl.decode_deterministic_cbor(block[0x38:0x38 + length])
+        def reordered(scheme_k):
+            items = dict(payload)
+            items[1] = {**items[1], 2: scheme_k}
+            body = bytearray(b"\xa5")
+            for key in (2, 1, 3, 4, 5):  # key 2 before key 1: not in deterministic order
+                body += impl.encode_deterministic_cbor(key) + impl.encode_deterministic_cbor(items[key])
+            return bytes(body)
+        hints = {"tape_uuid": self.image.tape_uuid, "block_size": self.image.block_size, "scheme": self.image.scheme}
+        for k, expected in ((2, ("unreadable", None, None)), (3, ("refused", "BootstrapParse", "scheme"))):
+            with self.subTest(k=k):
+                body = reordered(k)
+                self.assertEqual(len(body), length)
+                self.assertEqual(impl.decode_cbor_lenient(body)[1][2], k)
+                record = bytearray(block)
+                record[0x38:0x38 + length] = body
+                record[0x38 + length:0x38 + length + 8] = impl.le64(impl.crc64_xz(body))
+                outcome, error, _, _, _, named = impl.judge_supplied_bootstrap(
+                    impl.DamagedTape([bytes(record)] + self.image.records()[1:], set()), hints)
+                self.assertEqual((outcome, error, named), expected)
+
+    def test_a_duplicated_key_has_no_decodable_value(self) -> None:
+        value = impl.decode_cbor_lenient(bytes([0xa2, 0x01, 0x02, 0x01, 0x03]))
+        self.assertIs(value[1], impl.AMBIGUOUS)
+
+
+class NegativeE1Tests(unittest.TestCase):
+    def test_a_no_parity_bootstrap_may_record_compression(self) -> None:
+        # 16.3: "Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression."
+        path = impl.BLIND_INPUTS / "negatives-e1-blind.json"
+        first, second = SCRATCH / "negative-e1-first.json", SCRATCH / "negative-e1-second.json"
+        out = impl.run_negatives(path, first, impl.e1_negatives_table())
+        impl.run_negatives(path, second, impl.e1_negatives_table())
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        entry = out["entries"]["e1-16"]
+        self.assertTrue(entry["apply"]["resolved"])
+        self.assertEqual((entry["decision"]["outcome"], entry["decision"]["error"]), ("accepted", None))
+        self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
+        self.assertEqual(out["table_entries_without_a_case"], [])
 
 
 if __name__ == "__main__":

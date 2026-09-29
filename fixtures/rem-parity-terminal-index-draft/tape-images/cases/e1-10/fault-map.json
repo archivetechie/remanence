@@ -1,0 +1,32 @@
+{
+  "failed_data_addresses": [],
+  "image": "a4-minimal",
+  "observations": [
+    {
+      "hints": {
+        "block_size": 262144,
+        "scheme": {
+          "S": 2,
+          "k": 2,
+          "m": 2
+        },
+        "tape_uuid": "the image's"
+      },
+      "id": "supplied values"
+    }
+  ],
+  "record_edits": [
+    {
+      "construction": "the original record followed by 262144 zero bytes",
+      "edits": [],
+      "lba": 0,
+      "length": 524288,
+      "original_length": 262144,
+      "record_index": 0,
+      "sha256": "b63c87ad701f7aeb3f26bfa8fdf2135551ba3c7ed6caa5e21a20266967f03f82",
+      "tape_file": 0
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": []
+}

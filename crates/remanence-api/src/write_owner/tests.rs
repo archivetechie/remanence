@@ -7174,6 +7174,37 @@ fn with_catalog_recovery_tape_options(
     short_reads: bool,
     test: impl FnOnce(&mut CatalogIndex, &WriteOwnerConfig, &mut DriveHandle),
 ) {
+    with_catalog_recovery_tape_faults(
+        parity,
+        bootstrap,
+        edit_tape,
+        RecoveryReadFaults {
+            medium_error,
+            short_reads,
+            overlength_reads: false,
+        },
+        test,
+    );
+}
+
+/// Physical READ faults the recovery tests inject below the drive handle.
+#[derive(Clone, Copy, Default)]
+struct RecoveryReadFaults {
+    /// The first READ reports a medium error.
+    medium_error: bool,
+    /// Every READ returns one byte less than the record.
+    short_reads: bool,
+    /// Every READ reports a record one byte longer than the host buffer.
+    overlength_reads: bool,
+}
+
+fn with_catalog_recovery_tape_faults(
+    parity: ParityConfig,
+    bootstrap: Option<BootstrapPayload>,
+    edit_tape: impl FnOnce(&mut VirtualTape),
+    faults: RecoveryReadFaults,
+    test: impl FnOnce(&mut CatalogIndex, &WriteOwnerConfig, &mut DriveHandle),
+) {
     const BLOCK_SIZE: u32 = 512 * 1024;
     let temp = tempfile::tempdir().expect("recovery test directory");
     let index_path = temp.path().join("catalog.sqlite");
@@ -7216,8 +7247,9 @@ fn with_catalog_recovery_tape_options(
                 .expect("model path");
             Ok(Box::new(RecoveryReadFaultTransport {
                 inner: ModelTransport::new(Arc::clone(&world), role),
-                medium_error,
-                short_reads,
+                medium_error: faults.medium_error,
+                short_reads: faults.short_reads,
+                overlength_reads: faults.overlength_reads,
             }))
         })
         .expect("model library");
@@ -7436,6 +7468,7 @@ struct RecoveryReadFaultTransport {
     inner: ModelTransport,
     medium_error: bool,
     short_reads: bool,
+    overlength_reads: bool,
 }
 
 impl SgTransport for RecoveryReadFaultTransport {
@@ -7452,6 +7485,18 @@ impl SgTransport for RecoveryReadFaultTransport {
             });
         }
         let mut outcome = self.inner.execute_in(cdb, buf)?;
+        if self.overlength_reads && cdb.first() == Some(&0x08) {
+            // Variable-block READ with SILI clear: ILI, VALID and a negative
+            // INFORMATION field report a record longer than the host buffer.
+            let mut sense = readiness_fixed_sense(0x00, 0x00, 0x00);
+            sense[0] |= 0x80;
+            sense[2] |= 0x20;
+            sense[3..7].copy_from_slice(&(-1i32).to_be_bytes());
+            return Err(remanence_library::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: outcome.bytes_transferred,
+            });
+        }
         if self.short_reads && cdb.first() == Some(&0x08) {
             assert!(
                 outcome.bytes_transferred > 1,
@@ -7908,6 +7953,40 @@ fn catalog_recovery_paths_refuse_checked_format_fields_and_short_bot() {
             );
         }
     }
+}
+
+/// A first record longer than the catalog's block size is refused for its
+/// length before its content, like a short one (REM-PARITY 8.4).
+#[test]
+fn catalog_recovery_paths_refuse_an_overlength_bot_record() {
+    let bootstrap = BootstrapPayload {
+        scheme: None,
+        no_parity_flag: true,
+        filemark_map_digest: None,
+        tape_uuid: RANGE_TAPE_UUID,
+        written_by_version: "recovery-test".to_string(),
+        written_at: "2026-09-27T00:00:00Z".to_string(),
+        sequence: 0,
+        block_size_bytes: 512 * 1024,
+        drive_compression: false,
+    };
+    with_catalog_recovery_tape_faults(
+        ParityConfig::None,
+        Some(bootstrap),
+        |_| {},
+        RecoveryReadFaults {
+            overlength_reads: true,
+            ..RecoveryReadFaults::default()
+        },
+        |index, cfg, drive| {
+            assert_catalog_recovery_refusal(
+                index,
+                cfg,
+                drive,
+                "bootstrap block larger than supplied block size",
+            )
+        },
+    );
 }
 
 /// D5 closed resume goes through the private Layer-5 session opener, then the
