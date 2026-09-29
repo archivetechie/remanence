@@ -74,14 +74,14 @@
           },
           {
             "section": "8.2",
-            "quote": "It MAY omit the scheme record (key 1) and the digest record (key 2). A Reader MUST NOT require those records on it."
+            "quote": "It MUST omit the scheme record (key 1) and MAY omit the digest record (key 2). A Reader MUST NOT require those records on it. A no-parity bootstrap's payload carries no parity scheme; one that does is `BootstrapParse`."
           },
           {
             "section": "15",
             "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
           }
         ],
-        "order": "No rule of Section 8 fails. Key 5 is rejected only on a parity bootstrap, and this one sets the no-parity flag. A no-parity bootstrap may omit the scheme record, and a Reader must not require it. Its digest record (key 2) may be kept. The parser's one exception for recorded compression names a parity bootstrap.",
+        "order": "No rule of Section 8 fails. Key 5 is rejected only on a parity bootstrap, and this one sets the no-parity flag. A no-parity bootstrap must omit the scheme record, and this one does (key 1 is removed), so it is not BootstrapParse. Its digest record (key 2) may be kept, and a Reader must not require either. The parser's one exception for recorded compression names a parity bootstrap.",
         "reader_must_reject": false,
         "formula": null,
         "note": "The tape identifies itself as written without parity and with compression; Section 16.3's rejection concerns a parity tape.",

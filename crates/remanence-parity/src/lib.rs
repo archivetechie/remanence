@@ -215,8 +215,8 @@ pub use terminal_writer::{
 };
 pub use verify_protected::{
     verify_protected_content, verify_sidecar, BlockFailureReason, FailedDataBlock,
-    FailedParityShard, ProtectedContentVerification, SidecarComponentState, SidecarFinding,
-    SidecarFindingKind, SidecarVerification,
+    FailedParityShard, ParityMapFinding, ProtectedContentVerification, SidecarComponentState,
+    SidecarFinding, SidecarFindingKind, SidecarVerification,
 };
 
 // ====================================================================

@@ -1286,6 +1286,8 @@ fn verification_projection(outcome: &TerminalIndexVerificationOutcome) -> Value 
         "terminal_suffix_complete": outcome.is_terminal_suffix_complete(),
         "tape_complete": outcome.is_complete_tape(),
         "not_performed": protected.not_performed,
+        "parity_map_findings": protected.parity_map_findings.iter().map(|f| json!({
+            "tape_file": f.tape_file_number, "detail": f.detail})).collect::<Vec<_>>(),
         "failed_data_blocks": protected.failed_data_blocks().map(|b| json!({
             "tape_file_position": [b.position.tape_file_number, b.position.block_within_file],
             "lba": b.physical.lba, "reason": reason(&b.reason)})).collect::<Vec<_>>(),
@@ -1433,6 +1435,12 @@ fn compare_verification(id: &str, entry: &Value, observed: &Value) -> Vec<String
             .is_empty();
     if any_failure && observed["tape_complete"] != false {
         failures.push("a tape with a failed block or shard was reported complete".into());
+    }
+    // A ParityMap copy that could not be used is reported, and the tape is not
+    // complete (Section 2.2).
+    let map_findings = observed["parity_map_findings"].as_array().unwrap();
+    if !map_findings.is_empty() && observed["tape_complete"] != false {
+        failures.push("a tape with an unusable ParityMap copy was reported complete".into());
     }
     failures
 }
@@ -2206,6 +2214,49 @@ fn verifier_protected_pass_runs_in_strict_and_degraded_verification() {
     assert!(divergent.is_terminal_suffix_complete());
     assert!(divergent.protected().sidecars[0].copies_diverge);
     assert!(!divergent.is_complete_tape());
+}
+
+/// REM-PARITY 2.2: one unreadable ParityMap copy is used around silently by a
+/// Reader, and a full verification reports it and does not call the tape
+/// complete, although no data block or shard failed.
+#[test]
+fn one_unreadable_parity_map_copy_is_a_finding_and_the_tape_is_not_complete() {
+    let vector = generate("a4-minimal").unwrap();
+    let uuid = vector.written.inputs.tape_uuid;
+    let verify = |fault: Value| {
+        let case = json!({"id": "verification", "image": "a4-minimal", "fault": fault,
+            "hints": null, "expected": {}, "pinned": false});
+        let faults = fault_map_of(&case, &vector);
+        let (mut drive, _) = source(&vector, &faults);
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        verify_terminal_index_full(&mut raw, &uuid, BLOCK).expect("verification")
+    };
+    assert!(verify(json!({})).is_complete_tape());
+    // LBA 15 is the primary ParityMap copy's header, LBA 16 the tail's, and
+    // LBA 17 the footer.
+    for (lba, copy) in [
+        (15, "the primary"),
+        (16, "the tail"),
+        (17, "the ParityMap footer"),
+    ] {
+        let outcome = verify(json!({ "unreadable_lbas": [lba] }));
+        let protected = outcome.protected();
+        assert_eq!(protected.parity_map_findings.len(), 1, "{protected:?}");
+        assert_eq!(protected.parity_map_findings[0].tape_file_number, 3);
+        assert!(
+            protected.parity_map_findings[0].detail.starts_with(copy),
+            "{protected:?}"
+        );
+        assert_eq!(protected.failed_data_blocks().count(), 0);
+        assert!(!outcome.is_complete_tape());
+        if lba != 15 {
+            // Nothing else is wrong: the finding alone blocks completeness.
+            assert!(protected.prefix_damage.is_empty(), "{protected:?}");
+            assert_eq!(protected.failed_parity_shards().count(), 0);
+            assert!(protected.sidecars.iter().all(|s| s.is_clean()));
+            assert!(outcome.is_terminal_suffix_complete());
+        }
+    }
 }
 
 /// Damage inside the pre-tail prefix does not by itself abandon the terminal

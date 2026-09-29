@@ -310,10 +310,9 @@ The steps follow the text in order:
    8.4.1, 12.2 and 12.3), and the validation of the walked map against the
    final ParityMap (Section 13.1). A rung that fails a check, its count
    included, does not recognise a file: the failed classification is
-   reported, and the file is an Object candidate. An Object candidate that
+   reported, and the file is an Object candidate. Any tape file that
    follows the exact terminal suffix (five undamaged files: replica,
-   separation extent, replica, separation extent, replica) is not admitted as
-   an Object (Section 12.6; GAPS M-6). A missing trailing filemark is
+   separation extent, replica, separation extent, replica) is an artifact, in no inventory, and is listed in `walk.artifacts` (Section 12.6; GAPS M-6). A missing trailing filemark is
    reported as structural damage (Section 12.2). The decision's `walk.map`
    says whether the walk produces a map and whether Section 13.1 validates it.
 4. For each failed address, the Recoverer's refusals, index acquisition,
@@ -360,6 +359,8 @@ The steps follow the text in order:
    - `other_findings`: every other finding, before the terminal suffix and
      in it (each replica, each separation extent, the planned EOD, an artifact
      after the suffix, structural damage), each with its Section 15 name;
+   - `tape_complete`: true when the suffix is complete, the full verification was
+     performed and there is no failed block or shard and no finding (Section 2.2);
    - `terminal_suffix.complete`: whether the terminal suffix is complete.
      It is true only with three valid agreeing replicas, two valid separation
      extents and EOD right after C's trailing filemark (Sections 10.6 and

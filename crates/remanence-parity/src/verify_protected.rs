@@ -201,11 +201,27 @@ impl SidecarVerification {
     }
 }
 
+/// A ParityMap copy that could not be used, found by a full verification
+/// (REM-PARITY 2.2). A copy or footer that is not used has no Section 15
+/// name: a Reader that uses the other copy reports no error, and the Verifier
+/// still reports the damage. When no copy is usable the detail carries the
+/// name the Reader reports (`ParityMapParse` or `DirectoryInvalid`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParityMapFinding {
+    /// The ParityMap's tape-file number.
+    pub tape_file_number: u64,
+    /// What was found.
+    pub detail: String,
+}
+
 /// The full verification of every sidecar's protected content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProtectedContentVerification {
     /// One entry per sidecar, in tape-file order.
     pub sidecars: Vec<SidecarVerification>,
+    /// ParityMap copies that were unreadable or invalid, reported even when
+    /// the other copy is used; a tape with one is not complete.
+    pub parity_map_findings: Vec<ParityMapFinding>,
     /// Why the pass could not be performed, when it was not. A pass that was
     /// not performed is never clean.
     pub not_performed: Option<String>,
@@ -219,6 +235,7 @@ impl ProtectedContentVerification {
     pub fn none_protected() -> Self {
         Self {
             sidecars: Vec::new(),
+            parity_map_findings: Vec::new(),
             not_performed: None,
             prefix_damage: Vec::new(),
         }
@@ -228,6 +245,7 @@ impl ProtectedContentVerification {
     pub fn not_performed(reason: impl Into<String>) -> Self {
         Self {
             sidecars: Vec::new(),
+            parity_map_findings: Vec::new(),
             not_performed: Some(reason.into()),
             prefix_damage: Vec::new(),
         }
@@ -237,6 +255,7 @@ impl ProtectedContentVerification {
     pub fn is_clean(&self) -> bool {
         self.not_performed.is_none()
             && self.prefix_damage.is_empty()
+            && self.parity_map_findings.is_empty()
             && self.sidecars.iter().all(SidecarVerification::is_clean)
     }
 
@@ -789,7 +808,26 @@ pub fn verify_protected_content(
     block_size: u32,
 ) -> Result<ProtectedContentVerification, ParityError> {
     let mut sidecars = Vec::new();
+    let mut parity_map_findings = Vec::new();
     for entry in scoped_map.map.entries() {
+        if entry.kind == TapeFileKind::ParityMap && scoped_map.is_validated(entry.tape_file_number)
+        {
+            // Both copies of every ParityMap are read, and one that cannot be
+            // used is reported even when the other is (REM-PARITY 2.2).
+            let blocks = crate::parity_map::read_parity_map_blocks(
+                source,
+                &scoped_map.map,
+                entry,
+                block_size,
+            )?;
+            for detail in crate::parity_map::parity_map_damage(&blocks, tape_uuid) {
+                parity_map_findings.push(ParityMapFinding {
+                    tape_file_number: entry.tape_file_number,
+                    detail,
+                });
+            }
+            continue;
+        }
         if entry.kind != TapeFileKind::ParitySidecar
             || !scoped_map.is_validated(entry.tape_file_number)
         {
@@ -801,6 +839,7 @@ pub fn verify_protected_content(
     }
     Ok(ProtectedContentVerification {
         sidecars,
+        parity_map_findings,
         not_performed: None,
         prefix_damage: Vec::new(),
     })

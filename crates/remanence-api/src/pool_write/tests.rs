@@ -5155,3 +5155,23 @@ fn no_parity_bootstrap_records_fixed_writer_identity() {
     assert_eq!(bootstrap.written_by_version, identity.software());
     assert_eq!(bootstrap.written_at, "1970-01-01T00:00:00Z");
 }
+
+/// REM-PARITY 8.2: the Writer's no-parity bootstrap carries no scheme record,
+/// and its frame parses back as a no-parity bootstrap without one.
+#[test]
+fn no_parity_tape_bootstrap_carries_no_scheme_record() {
+    let payload = build_tape_bootstrap(
+        [7u8; 16],
+        4096,
+        ParityConfig::None,
+        "2026-09-30T00:00:00Z",
+        "0.1.0",
+    );
+    assert!(payload.no_parity_flag);
+    assert!(payload.scheme.is_none());
+    let mut block = vec![0u8; 4096];
+    write_bootstrap_block(&payload, &mut block).expect("no-parity bootstrap writes");
+    let parsed = remanence_parity::bootstrap::parse_bootstrap_block(&block).expect("parses");
+    assert!(parsed.no_parity_flag);
+    assert!(parsed.scheme.is_none());
+}

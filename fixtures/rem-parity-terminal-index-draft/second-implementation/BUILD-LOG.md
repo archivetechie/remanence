@@ -29,6 +29,7 @@ No change to the builder may follow a failed comparison without a row here.
 | 19 | the e2 cases and the R2 manifest (F2): the record edits of e2-01 to e2-05 against my builds (every stated length and the SHA-256 of each result); the nine overflow-3.2-lba blocks against `tape-images/negatives/MANIFEST.tsv`; then every decision file regenerated, byte-identical (`negatives`, `negative-e1`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide` and `resume`, blind and real ids, and the traces; `negative-block-digests.json`) | 5 records, 9 blocks | 0 |
 | 20 | the e2-08 to e2-13 and e3-01 to e3-07 damage cases, the full verification and S4 (F3): the record edits of e2-08 to e2-13 against my builds (10 records, 28 byte edits: every stated old byte and the SHA-256 of each result), the 24 edits that say they recompute a hash or CRC against mine (all 24 agree), the inserted record of e3-01, and the 10 derivable appended records of e3-02 to e3-06 (the 3 `second_edition_replica` records of e3-07 cannot be checked); then every decision file regenerated: `build`, `resume` (blind and real ids), `negatives`, `negative-e1`, `negatives-supplement`, `negative-blocks` and `mutations` byte-identical; `decide` (blind and real ids, and the traces) with every earlier leaf unchanged and the new cases, `verifier-full` and `walk.map` added; `selection` re-decided for sel-08, sel-10, sel-11 and sel-13 only; the blind `decisions.json` equals the real-id file under the mapping (57 cases); every self-check agrees | 10 records, 28 edits, 24 recomputations, 11 record digests | 1 (the foreign record's digest, below) |
 | 21 | the fixtures' answers to GAPS M-3 and M-4 (F3b): the foreign `fill` (5 files, 9 records), and e3-07's three second-edition records built from `base` and `fields`, each SHA-256 checked (all 3 agree, and the 5 e3 files' other records are unchanged), the `replica` key's layout tuples, edition, planned position and EOD against the built header and footer (agree), my frame CRCs and the footer's header hash (agree); then every decision file regenerated: only `decisions.json`, `decisions-real-ids.json` and their traces change, and only in e3-07 | 12 records | 0 |
+| 22 | the text after T2 (F4): the two quotes that changed (all quotes now occur in the text); every decision file regenerated, with `build`, `resume` (blind and real ids) and `negative-blocks` byte-identical and the others changed as DECISION-LOG (F4) lists; the blind `decisions.json` equals the real-id file under the mapping (57 cases); every self-check agrees | 146 + 12 files | 0 |
 
 ## Failed comparisons
 
@@ -365,6 +366,23 @@ confirms that.
   and the footer's header hash are reported.
 - e3-07 is decided. The undecidable-record mechanism stays, and no case uses it.
   The unit tests replace the three undecidable-record tests.
+
+## Changes for the text after T2 (F4)
+
+- Quotes: `no_parity_may_omit` (Section 8.2) and `full_verification_d` (Appendix D TT-2)
+  follow the new text; three sentences are added (`artifact_scope`, `torn_file`,
+  `tape_complete`). The parser refuses a no-parity bootstrap that carries a scheme.
+- The walk (Sections 12.2, 12.3): items 2 and 3 compare only the count with the plan; a
+  footer whose magic matches establishes the type when the head is readable and foreign;
+  a torn file is an incomplete candidate and no map entry; an artifact after the exact
+  suffix is listed as a candidate and named in `walk.artifacts`. The artifact class is gone.
+- Terminal discovery collects every layout a replica footer supplies (Section 8.4), and a
+  replica whose header breaks the covered-count relationship is refused without reading its
+  payload; replica A's planned start LBA must equal the end of the covered prefix (Section 10.6).
+- The Verifier (Section 2.2): an unreadable sidecar copy or footer, ParityMap copy, terminal
+  replica or bootstrap has no Section 15 name; an index that fails the pin is not used for
+  CRC checks; the prefix's tape files are measured; `tape_complete` is reported.
+- The unit tests follow (the quote test passes), and gain tests for the new sentences.
 
 ## Known divergences, not changed
 

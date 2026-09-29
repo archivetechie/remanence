@@ -645,6 +645,13 @@ fn protected_content_findings(
     for damage in &protected.prefix_damage {
         out.push(finding(Kind::PrefixDamage, None, damage.clone()));
     }
+    for found in &protected.parity_map_findings {
+        out.push(finding(
+            Kind::ParityMap,
+            Some(format!("tape_file {}", found.tape_file_number)),
+            found.detail.clone(),
+        ));
+    }
     for sidecar in &protected.sidecars {
         for f in &sidecar.findings {
             out.push(finding(
@@ -697,7 +704,7 @@ pub(crate) fn terminal_verified_to_proto(
             "physical prefix, A/B/C, AB/BC, terminal EOD, and every protected data block and parity shard validated".to_string()
         } else if !verified.protected.is_clean() {
             format!(
-                "protected content failed verification: {} data block(s), {} parity shard(s), {} sidecar finding(s){}",
+                "protected content failed verification: {} data block(s), {} parity shard(s), {} sidecar finding(s), {} ParityMap finding(s){}",
                 verified.protected.failed_data_blocks().count(),
                 verified.protected.failed_parity_shards().count(),
                 verified
@@ -706,6 +713,7 @@ pub(crate) fn terminal_verified_to_proto(
                     .iter()
                     .map(|sidecar| sidecar.findings.len())
                     .sum::<usize>(),
+                verified.protected.parity_map_findings.len(),
                 verified
                     .protected
                     .not_performed

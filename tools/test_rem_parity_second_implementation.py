@@ -839,7 +839,8 @@ class RevisedTextTests(unittest.TestCase):
         self.assertIn("differs from the measured 11 blocks", walk["failed_classifications"]["1"])
         self.assertEqual(walk["error"], "FilemarkMapDigestMismatch")
         self.assertEqual(walk["object_identity"], "unknown")
-        self.assertEqual(decision["verifier"]["separations"], {"A-B": "invalid", "B-C": "invalid"})
+        # 12.3 item 2: the walk compares only the count; 10.6 checks positions when a replica is validated.
+        self.assertEqual(decision["verifier"]["separations"], {"A-B": "not_run", "B-C": "not_run"})
         self.assertEqual(decision["undecided"], [])
 
     def test_the_first_record_with_supplied_values(self) -> None:
@@ -1270,7 +1271,9 @@ class InsertionAndAppendTests(unittest.TestCase):
         case = self.base(appended_files=[{"records": [self.foreign(), self.foreign()], "trailing_filemark": True}])
         decision = self.run_case("artifact", case)
         self.assertEqual(decision["scanner"]["result"], "BotStructuralRecoveryRequired")
-        self.assertEqual(decision["walk"]["classes"]["9"], impl.ARTIFACT_CLASS)
+        # 12.6: an artifact is in no inventory; the walk still lists it as an Object candidate.
+        self.assertEqual(decision["walk"]["classes"]["9"], "Object")
+        self.assertEqual(decision["walk"]["artifacts"], ["9"])
         self.assertEqual(decision["walk"]["classes"]["1"], "Object")
         full = decision["verifier-full"]
         self.assertIs(full["terminal_suffix"]["complete"], False)
@@ -1281,6 +1284,9 @@ class InsertionAndAppendTests(unittest.TestCase):
         case = self.base(appended_files=[{"records": [self.foreign()], "trailing_filemark": False}])
         decision = self.run_case("torn", case)
         self.assertEqual(decision["walk"]["structural_damage"], ["tape file 9: missing trailing filemark before EOD"])
+        # 12.2, 12.6: a torn file is an incomplete candidate; after the exact suffix it is an artifact.
+        self.assertEqual(decision["walk"]["classes"]["9"], "Object (incomplete candidate)")
+        self.assertEqual(decision["walk"]["artifacts"], ["9"])
 
     def test_an_object_after_a_broken_suffix_is_an_object_candidate(self) -> None:
         # 12.3 item 7 applies when the five terminal files are not exact.
@@ -1411,7 +1417,8 @@ class FullVerificationTests(unittest.TestCase):
         path.write_text(json.dumps(case), encoding="utf-8")
         entry = impl.run_decide([path], self.dir / "synthetic-out.json")["cases"]["synthetic"]
         self.assertEqual(set(entry["verifier-full"]), {"data_blocks_failed", "parity_shards_failed", "coverage",
-                                                       "other_findings", "terminal_suffix", "citations"})
+                                                       "other_findings", "terminal_suffix", "tape_complete",
+                                                       "citations"})
 
 
 class ParityMapConstructionTests(unittest.TestCase):
@@ -1427,6 +1434,55 @@ class ParityMapConstructionTests(unittest.TestCase):
         broken = bytearray(record)
         broken[0x38] ^= 1
         self.assertIn("differs from mine", impl._recomputed_check(bytes(broken), 0x38, bytes(broken[0x38:0x58]), image))
+
+
+class F4TextTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+
+    def test_a_no_parity_bootstrap_that_carries_a_scheme_is_bootstrap_parse(self) -> None:
+        # 8.2: "A no-parity bootstrap's payload carries no parity scheme; one that does is `BootstrapParse`."
+        block = bytearray(self.image.files[0].blocks[0])
+        block[0x0C:0x10] = (1).to_bytes(4, "big")
+        block[0x30:0x38] = impl.le64(impl.crc64_xz(bytes(block[0:0x30])))
+        with self.assertRaises(impl.ReadFailure) as caught:
+            impl.parse_bootstrap(bytes(block), self.image.block_size)
+        self.assertEqual(caught.exception.error, "BootstrapParse")
+        self.assertIn("carries a parity scheme", caught.exception.reason)
+
+    def test_a_footer_establishes_the_type_when_the_head_is_readable_and_foreign(self) -> None:
+        # 12.3 item 2: a footer whose magic matches establishes the type also when the head is readable; the
+        # count disagrees, so the file keeps its control type, damaged.
+        records = self.image.records()
+        footer = self.image.files[8].blocks[2]
+        tape = impl.DamagedTape(records + [b"X" * 262144, footer, None], set())
+        walked = impl.classify_file(tape, 9, len(records), 2, self.image.tape_uuid, self.image.block_size)
+        self.assertEqual(walked.kind, impl.KIND_REPLICA)
+        self.assertTrue(walked.note.startswith("damaged terminal replica"))
+
+    def test_the_walk_compares_only_the_count_with_the_plan(self) -> None:
+        # 12.3 item 2: "It does not compare the planned tape-file number or start position with the file's measured ...".
+        tape = impl.DamagedTape(self.image.records()[:1] + [None] + self.image.records(), set())
+        head = self.image.files[4]
+        start = self.image.file_start_lba(4) + 2
+        walked = impl.classify_file(tape, 5, start, len(head.blocks), self.image.tape_uuid, self.image.block_size)
+        self.assertEqual(walked.note, "terminal replica header matches the plan")
+
+    def test_a_medium_error_on_a_sidecar_copy_is_an_unreadable_component_without_a_name(self) -> None:
+        # 2.2: "A medium error on such a component is reported as an unreadable component."
+        case = {"failed_data_addresses": [], "hints": None, "image": "a4-minimal",
+                "removed_filemark_after_tape_file": None,
+                "unreadable_records": [{"filemark": False, "lba": 7, "record_index": 0, "tape_file": 2}]}
+        decision = impl.decide_case(case, self.image, {})
+        finding = decision["verifier"]["outside_terminal_suffix"][0]
+        self.assertEqual((finding["finding"], finding["error"]), ("primary copy unreadable (medium error)", None))
+        self.assertIs(decision["verifier-full"]["tape_complete"], False)
+
+    def test_a_healthy_tape_is_complete(self) -> None:
+        case = {"failed_data_addresses": [], "hints": None, "image": "a4-minimal",
+                "removed_filemark_after_tape_file": None, "unreadable_records": []}
+        self.assertIs(impl.decide_case(case, self.image, {})["verifier-full"]["tape_complete"], True)
 
 
 if __name__ == "__main__":

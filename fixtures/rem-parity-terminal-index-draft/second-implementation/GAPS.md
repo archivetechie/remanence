@@ -992,6 +992,8 @@ last record before EOD is the undeclared one.
   differs from the plan (3), so file 8 keeps its control type, damaged (Section
   12.3 item 2), and the walk produces a map that Section 13.1 validates.
 
+> *F4:* closed. Section 8.4 now says it: "The first backspace from EOD crosses any records that follow the last filemark, as each later backspace crosses the records of a file, and stops at the nearest filemark before the current position." It also says the Scanner "does not stop at the first" footer that supplies a layout, that only a terminal replica's footer supplies one, and that a footer supplying none proposes nothing; `discover_layouts` now collects every layout and compares the valid replicas of all of them under Section 8.5. No case has two layouts.
+
 **M-5. Section 8.4 step 1: spacing back over a filemark when records follow it
 (e3-02).** The Scanner "spaces back over up to five filemarks from EOD and reads
 the record before each, stopping early when a backspace does not cross exactly
@@ -1004,6 +1006,8 @@ reading, which stopped at once when the last record was not a filemark, is
 replaced. It changes no earlier decision: every earlier tape ends in a filemark.
 In e3-02 the first footer read is C's, which plans EOD 39 before the tape's EOD
 41, so the outcome is `BotStructuralRecoveryRequired` on either reading.
+
+> *F4:* closed. Section 12.6 now defines the artifact by scope: any tape file, complete or torn, after the last of the five suffix files, whatever it contains, is "not an Object of any inventory", and the walk "may report it ... as an Object candidate of unknown identity or, when torn, as an incomplete candidate". The class "nonconformant artifact ... (not admitted as an Object)" is withdrawn: the walk's class for e3-06's file 9 is `Object`, and `walk.artifacts` lists it as in no inventory. The exactness rule (five undamaged files) is now in the text; e3-03 to e3-05 stay non-exact. Section 12.3 also changes e3-05: the appended file's last record is a footer whose magic matches, which "establishes the type also when the head is readable", so file 8 is a damaged `TapeIndexReplica` (2 blocks against 3 planned), not an Object candidate.
 
 **M-6. Section 12.6: an artifact after the exact terminal suffix (e3-02,
 e3-06; and e3-03 to e3-05).** "A structural artifact after the exact terminal
@@ -1022,11 +1026,15 @@ Object candidate.
 An Object candidate that item 7 admits beyond the validated scope is a forensic
 finding only (Section 3.4), which this decision file does not distinguish.
 
+> *F4:* closed. Section 12.2 now says: "A file whose trailing filemark is missing before EOD is not a tape file of the map. The walk reports structural damage, classifies the file by its head ... as a torn candidate (an incomplete Object candidate when nothing else fits ...), and ends there." e3-02's file 9 is `Object (incomplete candidate)`, structural damage is reported, and it is an artifact (M-6). It is no map entry.
+
 **M-7. Section 12.2: a missing trailing filemark (e3-02).** "A missing trailing
 filemark is structural damage." The text does not say how the ladder classifies
 the file. *Decided:* the walk measures it to EOD, reports `structural_damage`
 ("tape file 9: missing trailing filemark before EOD"), and, after the exact
 suffix, classes it as the artifact of M-6.
+
+> *F4:* closed. Section 2.2 now states the decision: with no index the Verifier "still reads every data block that the map says the sidecar protects and every parity shard that the map entry locates (`H = (total − 1 − P) / 2`)", reports each read failure, states that what it read "could not be checked against a CRC", and does not report a block failed for lack of a CRC. It also says an index that fails the Section 13.3 pin is not used for CRC checks: the Verifier reports the pin's error and the read failures and takes the parity shards from the acquired index. bootstrap-wrong-scheme now checks no CRC (`epochs_index_failing_the_pin`).
 
 **M-8. Section 2.2: an epoch whose index is unavailable.** A full verification
 "checks each [block or shard] against its sidecar's index". When no header/index
@@ -1077,6 +1085,8 @@ metadata-unavailable. The text says nothing about an entry whose hash is wrong
 because of a Writer or media fault rather than a copy's; the decision follows the
 sentence as written.
 
+> *F4:* closed. Section 10.6 now says: "A replica whose header breaks the covered-count relationship is not eligible, and a Reader need not read its payload." e3-07's replica A fails it from its header (covered 4, structural rows 4, A's planned tape-file number 9); the payload is not read. It also adds "replica A's planned start LBA equals the end of the covered prefix", which A fails too (38 against 19).
+
 **M-12. e3-07's replica is planned at tape file 9 (F3b).** Its footer records its
 own position (LBA 40) and plans EOD 58, so it supplies a layout (Section 8.4
 step 1). The layout plans replicas at files 9, 11 and 13 and extents at 10 and 12,
@@ -1088,3 +1098,33 @@ eligible, and B and C are absent (the device reports EOD where their records
 should be). The name a missing component gets is the one this implementation
 gives every such case, `TerminalIndexReplicaParse` (a filemark or EOD where the plan puts a
 data record is a validity failure, Section 10.6).
+
+## N. The text after T2 (F4)
+
+**N-1. Section 12.3 items 2 and 3: the walk checks the count, not the position.**
+"It does not compare the planned tape-file number or start position with the
+file's measured tape-file number or start position; Section 10.6 checks those
+when a replica is validated." The walk's earlier "header plan differs from the
+measured file" damage is gone. Only a malformed frame or a count that differs from
+the planned record count damages a control file. The kinds in `walk.classes` do
+not change. A Verifier with no layout no longer calls an extent whose count is right
+invalid: its status is `not_run`, since nothing validates it.
+
+**N-2. Section 2.2: which failures carry a Section 15 name.** A sidecar copy or
+footer, a ParityMap copy, a terminal replica or a bootstrap (with supplied values)
+that cannot be read is reported "without a Section 15 name", as "an unreadable
+component"; "a non-medium fault of the transport stays `TapeIo`". The
+Verifier's findings for those components change `TapeIo` to none. The text does not
+extend this to a data block, a parity shard or a separation extent, so they keep
+`TapeIo` for a medium error. *Decided:* as written.
+
+**N-3. Section 2.2: the tape is complete.** New `verifier-full.tape_complete`:
+true when the terminal suffix is complete, the full verification was performed, and
+there is no failed data block, no failed parity shard and no finding about a sidecar
+or the prefix. The Verifier also "measures and classifies every tape file of the
+prefix, including when the replicas validate": a file whose measured length differs
+from its map row is reported, without a name. No case has one.
+
+**N-4. Section 8.2: a no-parity bootstrap with a scheme.** The parser now returns
+`BootstrapParse` for a no-parity bootstrap whose payload has key 1. No decision
+file changes; e1-16 removes key 1 and stays accepted.

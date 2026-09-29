@@ -2214,7 +2214,7 @@ QUOTES.update({
     'pm_agreement_all': ('10.1.4', 'The agreement between a header copy and the footer covers every field that both carry, other than `copy_kind` and the CRC, not only the locator fields.'),
     "err_drive_compression": ("15", "DriveCompressionEnabled         compression detected on / recorded for a parity tape"),
     "compression_rejects": ("8.4", "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."),
-    "no_parity_may_omit": ("8.2", "It MAY omit the scheme record (key 1) and the digest record (key 2). A Reader MUST NOT require those records on it."),
+    "no_parity_may_omit": ("8.2", "It MUST omit the scheme record (key 1) and MAY omit the digest record (key 2). A Reader MUST NOT require those records on it. A no-parity bootstrap's payload carries no parity scheme; one that does is `BootstrapParse`."),
     "compression_key_rule": ("8.2", "`true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4)"),
     "canonical_reject": ("5.3", "When a Reader decodes any CBOR item of this format, it MUST reject duplicate keys and non-canonical encoding, and MUST ignore unknown integer keys at every map level."),
     'footer_uuid': ('9.6', "The footer's `tape_uuid` MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1, as each header copy's `tape_uuid` must (Section 9.2)."),
@@ -2224,7 +2224,10 @@ QUOTES.update({
     'report_by_address': ('2.2', "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."),
     'opaque_bytes': ('2.2', 'It reads those blocks as opaque bytes and does not interpret Object content (Section 1.1, goal 2).'),
     'structure_not_full': ('2.2', 'A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification.'),
-    'full_verification_d': ('D', "A full verification reads every data block and parity shard (Section 2.2), and the reference's verification is to be brought into line before freeze."),
+    'full_verification_d': ('D', "A full verification reads every data block and parity shard (Section 2.2), and the reference's verification does so."),
+    'tape_complete': ('2.2', 'It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix.'),
+    'artifact_scope': ('12.6', 'A structural artifact is any tape file, complete or torn, that follows the last of the five files of the terminal suffix, whatever it contains. The suffix is exact when the walk recognises, in order, replica, separation extent, replica, separation extent and replica, none of them damaged. The rule is one of scope: an artifact is not an Object of any inventory. The walk may report it as it reports any file beyond the validated scope, as an Object candidate of unknown identity or, when torn, as an incomplete candidate (Section 8.4.1), so that an operator sees it.'),
+    'torn_file': ('12.2', 'A file whose trailing filemark is missing before EOD is not a tape file of the map. The walk reports structural damage, classifies the file by its head, when the head can be read, as a torn candidate (an incomplete Object candidate when nothing else fits, Section 8.4.1), and ends there.'),
     'artifact_after_suffix': ('12.6', 'A structural artifact after the exact terminal suffix is nonconformant and MUST NOT be admitted as an Object.'),
     'normal_suffix_eod': ('12.6', "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."),
     'structural_damage_walk': ('12.2', 'a zero-block file or a missing trailing filemark is structural damage;'),
@@ -2249,9 +2252,6 @@ class MediumError(Exception):
 
 FILEMARK = "filemark"
 END_OF_DATA = "end of data"
-
-
-ARTIFACT_CLASS = "nonconformant artifact after the terminal suffix (not admitted as an Object)"
 
 
 class Underivable(Exception):
@@ -2375,6 +2375,9 @@ def parse_bootstrap(block: bytes, read_size: int) -> dict[str, Any]:
             raise ReadFailure("BootstrapParse", f"reserved key {reserved} present")
     no_parity = bool(flags & 1)
     scheme = None
+    if no_parity and 1 in values:
+        # Section 8.2: a no-parity bootstrap's payload carries no parity scheme; one that does is BootstrapParse.
+        raise ReadFailure("BootstrapParse", "a no-parity bootstrap's payload carries a parity scheme (key 1)")
     if not no_parity:
         record = values.get(1)
         if not isinstance(record, dict) or record.get(1) != SCHEME_IDENTIFIER:
@@ -2710,6 +2713,8 @@ def validate_structural_rows(rows: list[Any], frame: dict[str, Any], replica_a_t
                             f"{position + entry.block_count}, which does not fit in u64 (Section 7.2)")
             break
         position += entry.block_count + 1
+    if sum(entry.block_count + 1 for entry in entries) != frame["tuples"][0][4]:
+        problems.append("replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)")
     if problems:
         raise ReadFailure("TerminalIndexReplicaParse", "; ".join(problems))
     return entries
@@ -2833,6 +2838,13 @@ def check_replica(tape: DamagedTape, layout: list[tuple], ordinal: int, tape_uui
         problems.append("trailing filemark not measured at the planned position")
     if problems:
         return ReplicaCheck(letter, False, None, "; ".join(problems), header)
+    if not (header["covered"] == header["structural_rows"] == header["tuples"][0][3]):
+        # Section 10.6: a replica whose header breaks the covered-count relationship is not eligible, and a Reader
+        # need not read its payload.
+        return ReplicaCheck(letter, False, None,
+                            f"TerminalIndexReplicaParse: header: covered_prefix_tape_file_count {header['covered']}, "
+                            f"structural_row_count {header['structural_rows']} and replica A's planned tape-file number "
+                            f"{header['tuples'][0][3]} are not equal (the payload is not read)", header)
     try:
         payload_blocks = [tape.read_data(start + 1 + i) for i in range(header["payload_records"])]
         entries, object_rows = validate_payload(payload_blocks, header, block_size)
@@ -2875,21 +2887,24 @@ def check_separation(tape: DamagedTape, layout: list[tuple], ordinal: int, tape_
     return "valid", "header, footer, zero interior and trailing filemark validate", header["edition_id"]
 
 
-def discover_layout(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list[tuple] | None, str]:
-    """Section 8.4 step 1: find, from EOD, a replica footer and read its planned layout.
+def discover_layouts(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list[tuple[list[tuple], str]], list[str]]:
+    """Section 8.4 step 1: every planned layout a replica footer supplies, from EOD; and each footer passed over.
 
     The Scanner spaces back over up to five filemarks from EOD and reads the
-    record before each. It stops early when a backspace does not cross
-    exactly one filemark (the record before a filemark is itself a filemark,
-    or no filemark is where one is spaced over) or leaves the partition. A
-    replica footer that parses supplies the layout only when its recorded
-    footer position equals the position at which it was read and its planned
-    EOD is at or after the tape's EOD; when no footer supplies one, there is
-    no layout and no replica validates.
+    footer before every one of them; it does not stop at the first that
+    supplies a layout. The first backspace crosses any records that follow the
+    last filemark, and each later one crosses the records of a file, stopping at
+    the nearest filemark before the current position. It stops early when the
+    record before a filemark is itself a filemark, or no filemark is left. Only
+    the footer of a terminal replica supplies a layout, and only when its
+    recorded footer position equals the position at which it was read and its
+    planned EOD is at or after the tape's EOD. A footer that supplies none
+    proposes nothing. Layouts equal to one already found are one layout.
     """
     eod = tape.eod()
-    limit = eod  # spacing back from here crosses records freely, and stops at the nearest filemark before it
+    limit = eod
     rejected = []
+    layouts: list[tuple[list[tuple], str]] = []
     for _ in range(5):
         marks = tape.filemark_positions_before(limit)
         if not marks:
@@ -2908,9 +2923,17 @@ def discover_layout(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tup
                 rejected.append(f"footer at LBA {record_lba} records its position as {footer['observed_footer_lba']}")
             elif footer["eod"] < eod:
                 rejected.append(f"footer at LBA {record_lba} plans EOD {footer['eod']}, before the tape's EOD {eod}")
-            else:
-                return footer["tuples"], f"replica footer at LBA {record_lba} (replica ordinal {footer['ordinal']})"
+            elif all(footer["tuples"] != known for known, _ in layouts):
+                layouts.append((footer["tuples"], f"replica footer at LBA {record_lba} (replica ordinal {footer['ordinal']})"))
         limit = record_lba
+    return layouts, rejected
+
+
+def discover_layout(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list[tuple] | None, str]:
+    """The first layout of `discover_layouts` (the footer nearest EOD that supplies one), or None with the reasons."""
+    layouts, rejected = discover_layouts(tape, tape_uuid, block_size)
+    if layouts:
+        return layouts[0]
     note = "no terminal-replica footer supplies a layout from EOD"
     return None, note + (" (" + "; ".join(rejected) + ")" if rejected else "")
 
@@ -3158,6 +3181,7 @@ class WalkedFile:
     failed_classification: str | None = None
     artifact: bool = False
     undecidable: bool = False
+    torn: bool = False
 
 
 def classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, tape_uuid: bytes,
@@ -3229,9 +3253,10 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
             try:
                 header = parse_replica_frame(head, tape_uuid, block_size, 1)
                 local = header["tuples"][{1: 0, 2: 2, 3: 4}[header["ordinal"]]]
-                if (local[3], local[4], local[5]) != (tape_file, start, count):
+                if local[5] != count:
                     return WalkedFile(tape_file, start, count, KIND_REPLICA,
-                                      "damaged terminal replica: header plan differs from the measured file")
+                                      f"damaged terminal replica: measured {count} blocks, the planned component has "
+                                      f"{local[5]}")
                 return WalkedFile(tape_file, start, count, KIND_REPLICA, "terminal replica header matches the plan")
             except ReadFailure as failure:
                 return WalkedFile(tape_file, start, count, KIND_REPLICA, f"damaged terminal replica: {failure.reason}")
@@ -3239,9 +3264,10 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
             try:
                 header = parse_separation_frame(head, tape_uuid, block_size, 1)
                 local = header["tuples"][{1: 1, 2: 3}[header["ordinal"]]]
-                if (local[3], local[4], local[5]) != (tape_file, start, count):
+                if local[5] != count:
                     return WalkedFile(tape_file, start, count, KIND_SEPARATION,
-                                      "damaged separation extent: header plan differs from the measured file")
+                                      f"damaged separation extent: measured {count} blocks, the planned component has "
+                                      f"{local[5]}")
                 return WalkedFile(tape_file, start, count, KIND_SEPARATION, "separation header matches the plan")
             except ReadFailure as failure:
                 return WalkedFile(tape_file, start, count, KIND_SEPARATION, f"damaged separation extent: {failure.reason}")
@@ -3269,6 +3295,31 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
                                       primary["epoch_id"], primary["start"], primary["end"])
             except (MediumError, ReadFailure):
                 pass
+        # Items 2 and 3: a footer whose magic matches establishes the type also when the head is readable,
+        # is not a header of that type, and no rung of items 1, 4 or 5 parses it. If the footer does not
+        # parse or the count disagrees, the file keeps its control type, damaged.
+        try:
+            last_block = tape.read_data(start + count - 1)
+        except (MediumError, ReadFailure):
+            last_block = None
+        for label, kind, role_label, parse_footer, index_map, name in (
+                (LABEL_REPLICA_FOOTER, KIND_REPLICA, "terminal replica", parse_replica_frame, {1: 0, 2: 2, 3: 4}, "replica"),
+                (LABEL_SEPARATION_FOOTER, KIND_SEPARATION, "separation extent", parse_separation_frame, {1: 1, 2: 3},
+                 "separation")):
+            if last_block is not None and last_block[0:8] == role_magic(tape_uuid, label):
+                try:
+                    footer = parse_footer(last_block, tape_uuid, block_size, 2)
+                except ReadFailure as failure:
+                    return WalkedFile(tape_file, start, count, kind,
+                                      f"damaged {role_label}: the head is not its header; its footer does not parse "
+                                      f"({failure.reason})")
+                planned = footer["tuples"][index_map[footer["ordinal"]]][5]
+                if planned != count:
+                    return WalkedFile(tape_file, start, count, kind,
+                                      f"damaged {role_label}: type established by its footer, measured {count} blocks, "
+                                      f"the planned component has {planned}")
+                return WalkedFile(tape_file, start, count, kind,
+                                  f"{role_label} established by its footer (the head is not its header)")
         probe = sidecar_footer_probe()
         if probe is not None:
             return probe
@@ -3286,7 +3337,7 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
         try:
             footer = parse_replica_frame(last, tape_uuid, block_size, 2)
             local = footer["tuples"][{1: 0, 2: 2, 3: 4}[footer["ordinal"]]]
-            if (local[3], local[4], local[5]) == (tape_file, start, count):
+            if local[5] == count:
                 return WalkedFile(tape_file, start, count, KIND_REPLICA,
                                   f"damaged terminal replica: {head_error}; type established by its footer")
         except ReadFailure:
@@ -3295,7 +3346,7 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
         try:
             footer = parse_separation_frame(last, tape_uuid, block_size, 2)
             local = footer["tuples"][{1: 1, 2: 3}[footer["ordinal"]]]
-            if (local[3], local[4], local[5]) == (tape_file, start, count):
+            if local[5] == count:
                 return WalkedFile(tape_file, start, count, KIND_SEPARATION,
                                   f"damaged separation extent: {head_error}; type established by its footer")
         except ReadFailure:
@@ -3322,7 +3373,16 @@ def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list
             damage.append(f"tape file {tape_file}: zero-block file")
             files.append(WalkedFile(tape_file, position, 0, None, "structural damage: zero-block file"))
         else:
-            files.append(classify_file(tape, tape_file, position, count, tape_uuid, block_size))
+            walked = classify_file(tape, tape_file, position, count, tape_uuid, block_size)
+            if filemark is None:
+                # Section 12.2: a file whose trailing filemark is missing before EOD is not a tape file of the
+                # map; the walk classifies it by its head, as a torn candidate, and ends there.
+                walked.torn = True
+                if walked.kind == KIND_OBJECT:
+                    walked.note = "incomplete Object candidate (torn: no trailing filemark before EOD)"
+                else:
+                    walked.note += "; torn: no trailing filemark before EOD"
+            files.append(walked)
         if filemark is None:
             break
         position = filemark + 1
@@ -3332,21 +3392,20 @@ def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list
 
 
 def mark_artifacts(files: list[WalkedFile]) -> None:
-    """Section 12.6: a structural artifact after the exact terminal suffix is not admitted as an Object.
+    """Section 12.6: a structural artifact is any tape file, complete or torn, that follows the exact suffix.
 
-    The exact terminal suffix is five consecutive tape files the ladder
+    The exact terminal suffix is five consecutive tape files the walk
     recognises, undamaged, as replica, separation extent, replica, separation
-    extent, replica. Every Object candidate that follows them is such an
-    artifact. When the five are not exact, item 7 applies unchanged.
+    extent, replica. An artifact is not an Object of any inventory; the walk
+    still lists it as a candidate, so that an operator sees it.
     """
     kinds = [KIND_REPLICA, KIND_SEPARATION, KIND_REPLICA, KIND_SEPARATION, KIND_REPLICA]
     for first in range(len(files) - 4):
         window = files[first:first + 5]
         if all(walked.kind == kind and not walked.note.startswith("damaged") for walked, kind in zip(window, kinds)):
             for walked in files[first + 5:]:
-                if walked.kind == KIND_OBJECT:
-                    walked.artifact = True
-                    walked.note += "; follows the exact terminal suffix, so not admitted as an Object (Section 12.6)"
+                walked.artifact = True
+                walked.note += "; follows the exact terminal suffix: an artifact, in no inventory (Section 12.6)"
             return
 
 
@@ -3380,7 +3439,7 @@ def second_pass_and_map(files: list[WalkedFile]) -> dict[str, Any]:
         result["error"] = "undecided"
         return result
     for walked in files:
-        if walked.kind is None or walked.artifact:
+        if walked.kind is None or walked.artifact or walked.torn:
             break
         if walked.kind == KIND_OBJECT:
             entries.append(MapEntry(walked.tape_file_number, KIND_OBJECT, walked.count, ordinal))
@@ -5534,8 +5593,8 @@ def e1_negatives_table() -> dict[str, dict[str, Any]]:
             "accepted", None, ["compression_key_rule", "compression_parity_only", "no_parity_may_omit",
                                "boot_parser_name"],
             "No rule of Section 8 fails. Key 5 is rejected only on a parity bootstrap, and this one sets the no-parity "
-            "flag. A no-parity bootstrap may omit the scheme record, and a Reader must not require it. Its digest "
-            "record (key 2) may be kept. The parser's one exception for recorded compression names a parity bootstrap.",
+            "flag. A no-parity bootstrap must omit the scheme record, and this one does (key 1 is removed), so it is not "
+            "BootstrapParse. Its digest record (key 2) may be kept, and a Reader must not require either. The parser's one exception for recorded compression names a parity bootstrap.",
             must_reject=False,
             note="The tape identifies itself as written without parity and with compression; Section 16.3's rejection "
                  "concerns a parity tape."),
@@ -7453,7 +7512,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
         # parser given the block reports, BootstrapParse (Section 15).
         key, reason = bootstrap_unreadable or ("first_record_unreadable", "medium error")
         if key == "first_record_unreadable" and reason.startswith("medium error"):
-            add("bootstrap", "unreadable (medium error)", "TapeIo")
+            add("bootstrap", "unreadable (medium error)", None)
         elif key == "first_record_unreadable":
             add("bootstrap", f"absent ({reason})", "NoBootstrapFound")
         else:
@@ -7471,7 +7530,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
             try:
                 footer = parse_sidecar_footer(tape.read_data(start + entry.block_count - 1), tape_uuid)
             except MediumError:
-                add(name, "footer unreadable (medium error)", "TapeIo")
+                add(name, "footer unreadable (medium error)", None)
             except ReadFailure as failure:
                 add(name, f"footer invalid ({failure.reason})", "SidecarParse")
             header_blocks = footer["H"] if footer is not None else None
@@ -7484,7 +7543,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                                                        block_size, 1)
                 header_blocks = copies["primary"]["H"]
             except MediumError:
-                add(name, "primary copy unreadable (medium error)", "TapeIo")
+                add(name, "primary copy unreadable (medium error)", None)
             except ReadFailure as failure:
                 add(name, f"primary copy invalid ({failure.reason})", "SidecarParse")
             if header_blocks is None:
@@ -7509,7 +7568,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                     copies["tail"] = parse_sidecar_copy(read_blocks(tape, start + tail_first, header_blocks), tape_uuid,
                                                         block_size, 2)
                 except MediumError:
-                    add(name, "tail copy unreadable (medium error)", "TapeIo")
+                    add(name, "tail copy unreadable (medium error)", None)
                 except ReadFailure as failure:
                     add(name, f"tail copy invalid ({failure.reason})", "SidecarParse")
             if len(copies) == 2 and copies["primary"]["hash"] != copies["tail"]["hash"]:
@@ -7546,9 +7605,14 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                     stats["parity_shards_unlocated"] += stripes * m
                 continue
             k, m_index, s_index = scheme
-            if (index["k"], index["m"], index["S"], index["block_size"]) != (k, m_index, s_index, block_size):
+            pin_failed = (index["k"], index["m"], index["S"], index["block_size"]) != (k, m_index, s_index, block_size)
+            if pin_failed:
+                # Section 2.2: an index that fails the pin of Section 13.3 is not used for CRC checks; the Verifier
+                # reports the pin's error and the read failures, and takes the parity shards from the acquired index.
                 add(name, "the acquired index disagrees with the bootstrap or supplied scheme", "SchemeMismatch")
-            indexes[entry.tape_file_number] = index
+                stats.setdefault("epochs_failing_pin", []).append(entry.epoch_id)
+            else:
+                indexes[entry.tape_file_number] = index
             for block in range(entry.block_count):
                 if index["H"] <= block < index["H"] + index["P"]:
                     shard = block - index["H"]
@@ -7557,12 +7621,14 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                     component = (f"parity shard epoch {index['epoch_id']} stripe {key[0]} parity index {key[1]} "
                                  f"(LBA {start + block})")
                     stats["parity_shards_read"] += 1
+                    if pin_failed:
+                        stats["parity_shards_unchecked"] += 1
                     try:
                         shard = tape.read_data(start + block)
                         if len(shard) != block_size:
                             add(component, f"a {len(shard)}-byte record, not one block (a read failure, Sections 3.5 "
                                 "and 13.4)", None, "data", address)
-                        elif crc64_xz(shard) != index["parity_crcs"][key]:
+                        elif not pin_failed and crc64_xz(shard) != index["parity_crcs"][key]:
                             add(component, "CRC mismatch (an erasure, Section 13.4)", None, "data", address)
                     except MediumError:
                         add(component, "unreadable (medium error)", "TapeIo", "data", address)
@@ -7571,9 +7637,9 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
             try:
                 parity_map = parse_parity_map(tape, start, entry.block_count, tape_uuid, block_size)
                 for copy_name, reason in parity_map["copy_failures"].items():
-                    add(name, f"{copy_name} copy: {reason}", "TapeIo" if reason.startswith("medium error") else "ParityMapParse")
+                    add(name, f"{copy_name} copy: {reason}", None if reason.startswith("medium error") else "ParityMapParse")
                 if not parity_map["footer_readable"]:
-                    add(name, "footer unreadable (medium error)", "TapeIo")
+                    add(name, "footer unreadable (medium error)", None)
             except ReadFailure as failure:
                 add(name, f"{failure.reason}", failure.error)
     for entry in entries[:scope]:
@@ -7606,6 +7672,15 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                 index = indexes[covering[0].tape_file_number]
                 if crc64_xz(data) != index["data_crcs"][ordinal - index["start"]]:
                     add(component, "CRC mismatch (an erasure, Section 13.4)", None, "data", address)
+    # Section 2.2: the Verifier measures and classifies every tape file of the prefix, including when the replicas
+    # validate, and reports the damage it finds there. A file whose measured length differs from its map row is damage.
+    for entry in entries[:scope]:
+        first = lba_of_file(entries, entry.tape_file_number)
+        filemark = tape.next_filemark(first)
+        measured = (filemark - first) if filemark is not None else tape.eod() - first
+        if measured != entry.block_count:
+            add(f"tape file {entry.tape_file_number} ({KIND_NAMES[entry.kind]})",
+                f"measured {measured} blocks by filemark spacing, the map says {entry.block_count}", None)
     return findings
 
 
@@ -7647,6 +7722,8 @@ def build_verifier_full(findings: list[dict[str, Any]] | None, stats: dict[str, 
                            "data_blocks_read_but_not_checkable": stats["data_blocks_unchecked"],
                            "parity_shards_read_but_not_checkable": stats["parity_shards_unchecked"],
                            "parity_shards_not_locatable": stats["parity_shards_unlocated"]}
+        if stats.get("epochs_failing_pin"):
+            out["coverage"]["epochs_index_failing_the_pin"] = stats["epochs_failing_pin"]
         if stats["epochs_without_index"]:
             out["citations"].extend([cite("metadata_unavailable"), cite("verifier_role")])
         other = [{"component": f["component"], "finding": f["finding"], "error": f["error"]}
@@ -7666,8 +7743,8 @@ def build_verifier_full(findings: list[dict[str, Any]] | None, stats: dict[str, 
         for walked in walk_files:
             if walked.artifact:
                 terminal.append({"component": f"tape file {walked.tape_file_number}", "error": None,
-                                 "finding": "a structural artifact after the exact terminal suffix: nonconformant, and not "
-                                            "admitted as an Object"})
+                                 "finding": "a structural artifact after the exact terminal suffix: nonconformant, in no "
+                                            "inventory (the walk lists it as a candidate)"})
                 reasons.append(f"tape file {walked.tape_file_number} follows the exact terminal suffix")
                 out["citations"].extend([cite("artifact_after_suffix"), cite("normal_suffix_eod")])
             elif walked.note.startswith("damaged"):
@@ -7683,8 +7760,11 @@ def build_verifier_full(findings: list[dict[str, Any]] | None, stats: dict[str, 
             check = checks[letter]
             if not check.fully_valid:
                 problems.append(f"replica {letter} is not valid")
+                error = _component_error(check.reason, "TerminalIndexReplicaParse")
+                # Section 2.2: a terminal replica whose records cannot be read is reported without a Section 15
+                # name (an unreadable component); a non-medium fault stays TapeIo.
                 terminal.append({"component": f"terminal replica {letter}",
-                                 "error": _component_error(check.reason, "TerminalIndexReplicaParse"),
+                                 "error": None if error == "TapeIo" and "medium error" in check.reason else error,
                                  "finding": check.reason})
         if conflict:
             problems.append("the valid replicas disagree")
@@ -7714,6 +7794,11 @@ def build_verifier_full(findings: list[dict[str, Any]] | None, stats: dict[str, 
         if any(name for name in ("A-B", "B-C") if separation_status.get(name) != "valid"):
             out["citations"].append(cite("verifier_separation"))
     out["other_findings"] = other + terminal
+    # Section 2.2: the tape is complete when the terminal suffix is complete, the full verification was performed,
+    # and there is no failed data block, no failed parity shard and no finding about a sidecar or the prefix.
+    out["tape_complete"] = ("undecided" if complete == "undecided" else
+                            bool(complete is True and findings is not None and not findings))
+    out["citations"].append(cite("tape_complete"))
     out["terminal_suffix"] = {"complete": complete, "reasons": reasons,
                               "replicas_valid": sorted(fully_valid) if not undecided_scan else "undecided"}
     return out
@@ -7766,6 +7851,7 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
             "other_findings": [{"component": "bootstrap", "finding": decision["discovery"]["result"], "error": error}],
             "terminal_suffix": {"complete": False, "reasons": [f"the Verifier stops at discovery with {error}"],
                                 "replicas_valid": []},
+            "tape_complete": False,
             "citations": [cite("verifier_role"), cite("full_verification")] + [cite(key) for key in error_cites],
         }
         return decision
@@ -7776,8 +7862,28 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         scanner["citations"].extend([cite("hint_discovery"), cite("hint_uuid")])
     scanner["citations"].extend([cite("locate_footer"), cite("validate_every")])
     underivable_read: int | None = None
+    other_commons: set[bytes] = set()
     try:
-        layout, layout_note = discover_layout(tape, tape_uuid, block_size)
+        layouts, rejected_footers = discover_layouts(tape, tape_uuid, block_size)
+        if layouts:
+            # Each supplied layout's replicas are validated; a replica is fully valid only in a layout step 1
+            # supplies, and the valid replicas of every layout are compared under Section 8.5.
+            evaluated = []
+            for candidate, note in layouts:
+                found = {}
+                for ordinal in (1, 2, 3):
+                    check = check_replica(tape, candidate, ordinal, tape_uuid, block_size)
+                    found[check.letter] = check
+                evaluated.append((candidate, note, found))
+            main = next((e for e in evaluated if any(c.fully_valid for c in e[2].values())), evaluated[0])
+            layout, layout_note = main[0], "; ".join(n for _, n, _ in evaluated)
+            for e in evaluated:
+                if e is not main:
+                    other_commons |= {c.header["common"] for c in e[2].values() if c.fully_valid}
+        else:
+            layout = None
+            layout_note = "no terminal-replica footer supplies a layout from EOD" + (
+                " (" + "; ".join(rejected_footers) + ")" if rejected_footers else "")
     except Underivable as failure:
         # The Scanner reads a record whose bytes the case states but cannot be
         # derived (GAPS.md): whether it supplies a layout is not decidable.
@@ -7807,7 +7913,7 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         scanner["citations"].extend([cite("no_replica_walk"), cite("select_walk"), cite("bot_required")])
         walk_needed = True
     else:
-        commons = {checks[letter].header["common"] for letter in fully_valid}
+        commons = {checks[letter].header["common"] for letter in fully_valid} | other_commons
         scanner["citations"].extend([cite("consider_conflict"), cite("fully_valid")])
         if len(commons) > 1:
             scanner.update(result="error", error="TerminalIndexReplicaConflict", acceptable_selections=[])
@@ -7874,14 +7980,16 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         trace["walk_damage"] = damage
         trace["walk_map"] = walk_map["reason"]
         walk["classes"] = {str(f.tape_file_number): (
-            ARTIFACT_CLASS if f.artifact else "undecided" if f.undecidable else
+            "undecided" if f.undecidable else
+            "Object (incomplete candidate)" if f.torn and f.kind == KIND_OBJECT else
             KIND_NAMES[f.kind] if f.kind is not None else "classification failed")
             for f in files}
         if any(f.artifact for f in files):
-            walk["citations"].extend([cite("artifact_after_suffix"), cite("normal_suffix_eod")])
+            walk["artifacts"] = [str(f.tape_file_number) for f in files if f.artifact]
+            walk["citations"].extend([cite("artifact_after_suffix"), cite("artifact_scope"), cite("normal_suffix_eod")])
         if damage:
             walk["structural_damage"] = damage
-            walk["citations"].append(cite("structural_damage_walk"))
+            walk["citations"].extend([cite("structural_damage_walk"), cite("torn_file")])
         if underivable_read is not None:
             walk["note"] = ("performed only if no replica validates, which the Scanner's undecided outcome leaves open; "
                             "the classification below is a function of the tape and holds either way")
@@ -7905,7 +8013,7 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
                 walk["citations"].append(cite("footer_probe"))
         if any(f.kind is None for f in files):
             walk["citations"].append(cite("walk_file"))
-        if any(f.kind == KIND_OBJECT and not f.artifact for f in files):
+        if any(f.kind == KIND_OBJECT for f in files):
             walk["object_identity"] = "unknown"
             walk["citations"].append(cite("identity_unknown"))
         walk["terminal_authority_recovered"] = False

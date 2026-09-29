@@ -34,7 +34,7 @@
           ],
           "quotes": [
             "`drive_compression` — effective hardware compression at session open. `true` on a parity bootstrap MUST be rejected (Sections 8.4, 11.4)",
-            "A **no-parity bootstrap** (flag bit 0 set) marks a tape written without parity protection. It MAY omit the scheme record (key 1) and the digest record (key 2). A Reader MUST NOT require those records on it.",
+            "A **no-parity bootstrap** (flag bit 0 set) marks a tape written without parity protection. It MUST omit the scheme record (key 1) and MAY omit the digest record (key 2). A Reader MUST NOT require those records on it.",
             "A parity bootstrap recording `true` MUST be rejected by Readers and Writers alike (Section 16.3).",
             "A Reader MUST reject such a tape. Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression.",
             "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3).",
