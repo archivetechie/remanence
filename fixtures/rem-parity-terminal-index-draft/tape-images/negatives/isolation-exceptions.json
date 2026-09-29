@@ -2,27 +2,11 @@
   "description": "Supplement variants that the reference rejects with the expected outcome but before reaching the variant's target check, because of the reference's own evaluation or check order. Written by the supervisor; the variants and their expectations are unchanged. Each entry names the variant and the executor observation (the observation key used by the executor; '*' for every observation of that variant). The executor reports a listed ISOLATION? as ISOLATION-EXCEPTION and passes it; an ISOLATION? that is not listed fails, and a listed entry that no longer occurs fails as stale. Formulas left without a reaching vector are listed in REM-PARITY's TT-2 by the next text revision, as design D6 requires.",
   "entries": [
     {
-      "variant": "overflow-10.5-extent-geometry/isolated",
-      "observation": "*",
-      "first_check": "the ceiling division that forms total_records",
-      "target": "actual_bytes = total_records × B",
-      "reason": "The reference evaluates ceil(E / B) as (E + B − 1) / B, which overflows before the product can. An exact ceiling would reach the product; the text does not prescribe the evaluation form.",
-      "tt2": "actual_bytes (§10.5)"
-    },
-    {
-      "variant": "overflow-10.4-record-geometry/isolated",
-      "observation": "*",
-      "first_check": "the ceiling division that forms the record count",
-      "target": "the §10.4 record-geometry product",
-      "reason": "As for the extent geometry: the reference's ceiling division overflows first.",
-      "tt2": "the §10.4 record-geometry product"
-    },
-    {
       "variant": "overflow-7.2-T/isolated",
       "observation": "*",
-      "first_check": "Σ(block_count + 1) over the covered prefix",
+      "first_check": "Section 7.2's rule that every record and trailing filemark position the map describes fits in u64",
       "target": "T = max(first_parity_data_ordinal + block_count)",
-      "reason": "The reference sums the covered prefix's records and filemarks before it forms T, and an overflow of T always implies an overflow of that sum.",
+      "reason": "The reference validates the covered prefix's positions, Σ(block_count + 1), before it forms T, and an Object whose T does not fit also describes positions that do not fit. Section 7.2 now states the position rule, so the map is invalid there first; T itself is never reached.",
       "tt2": "T (§7.2)"
     },
     {
@@ -44,18 +28,18 @@
     {
       "variant": "overflow-13.3-tail-location/isolated-1",
       "observation": "*",
-      "first_check": "the requirement that 2H + P + 1 equal the map entry's block count",
-      "target": "the §13.3 tail location total − 1 − H",
-      "reason": "The reference never evaluates §13.3's total − 1 − H: it locates the tail copy at H + P (recovery.rs ~1123) and requires 2H + P + 1 to equal the map entry's block count (~1132–1138), a rule the text does not state (the negatives author's NOTES gap 8). For this variant that unstated check fires first. The rescue's specific error is then reported as the epoch-level outcome, which is correct (SidecarMetadataUnavailable{0}).",
-      "tt2": "the §13.3 tail location total − 1 − H"
+      "first_check": "the rescue precondition total = 2H + P + 1 with H > 0 (Section 13.3 step 3)",
+      "target": "the §13.3 tail location (total − 1 − H in the variant's construction; H + P in the current text)",
+      "reason": "Section 13.3 now locates the tail copy at H + P and requires the entry's total to equal 2H + P + 1 with H > 0; an entry that fails is not available. Here 7 ≠ 2·7 + 4 + 1, so the precondition fails first, no read is placed, and the construction's formula total − 1 − H is never evaluated. The rescue's specific failure is then reported only as the epoch-level outcome, SidecarMetadataUnavailable{0}, whose detail cannot show which check fired; the acquisition boundary keeps the primary's error (commit R3 decides that boundary).",
+      "tt2": null
     },
     {
       "variant": "overflow-13.3-tail-location/isolated-2",
       "observation": "*",
-      "first_check": "the H + P sum that forms the tail position",
-      "target": "the §13.3 tail location total − 1 − H",
-      "reason": "The reference never evaluates §13.3's total − 1 − H: it locates the tail copy at H + P (recovery.rs ~1123) and requires 2H + P + 1 to equal the map entry's block count (~1132–1138), a rule the text does not state (the negatives author's NOTES gap 8). For this variant the H + P sum overflows first. The rescue's specific error is then reported as the epoch-level outcome, which is correct (SidecarMetadataUnavailable{0}).",
-      "tt2": "the §13.3 tail location total − 1 − H"
+      "first_check": "the rescue precondition total = 2H + P + 1 with H > 0 (Section 13.3 step 3)",
+      "target": "the §13.3 tail location (total − 1 − H in the variant's construction; H + P in the current text)",
+      "reason": "As isolated-1, with H = 2^64 − 1: the precondition compares 7 exactly with 2(2^64 − 1) + 4 + 1, fails without overflow, and no read is placed; total − 1 − H is never evaluated. The epoch-level outcome, SidecarMetadataUnavailable{0}, cannot show which check fired.",
+      "tt2": null
     }
   ]
 }

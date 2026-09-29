@@ -338,6 +338,32 @@ pub(super) fn mutate(
             e.separation_repair(f + 1);
             Ok(Role::Separation)
         }
+        "overflow-3.2-lba" => {
+            // block_count(4) = 2^64 − 1 in structural slot 4 of A, B and C, so
+            // the three agree; R-TR-PAYLOAD repairs each, the canonical-map
+            // SHA-256 included.
+            *targets = vec![f, f + 2, f + 4];
+            for &file in targets.iter() {
+                e.slot(file, 4 * 64, 64, |row| {
+                    let a = row.as_array_mut().ok_or("structural row not array")?;
+                    replace(&mut a[2], 5, u64::MAX)
+                })?;
+                e.replica_payload(file, true)?;
+            }
+            Ok(Role::Replica)
+        }
+        // A unit-level descriptor: no bytes change (see `inverse`).
+        "overflow-3.3-stripe-mapping-inverse" => Ok(Role::InverseMapping),
+        // Device and commit-record claims: no tape byte changes (see
+        // `injection`, `walk_scanner` and `resumer`).
+        "overflow-12.2-walk-length" => {
+            *targets = vec![1];
+            Ok(Role::WalkScanner)
+        }
+        "overflow-3.2-14-append-point" => {
+            *targets = vec![3];
+            Ok(Role::Resumer)
+        }
         "overflow-13.3-tail-location" => {
             let len = u64_at(&e.files[&f][0], 0x30) as usize;
             if e.files[&f][0][0xc8..0xc8 + len] != e.files[&f][1][0xc8..0xc8 + len] {
@@ -393,37 +419,200 @@ pub(super) fn recover(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedEr
     )?;
     Ok(())
 }
+/// The Section 3.3 inverse at unit level, through the one helper every
+/// Recoverer caller uses: start = 2^64 − 2, end = 2^64 − 1, S = k = 2. Each
+/// peer position named by the case is classified; a real shard at any of them
+/// would be a wrapped ordinal, and an error a rejection.
 pub(super) fn inverse(_: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
     let scheme = crate::tape_image_vectors::inputs("a4-minimal").scheme;
-    remanence_parity::mapping::stripe_data_to_ordinal_in_epoch(
-        &StripeAddress {
-            neighborhood: 0,
-            stripe_index: 0,
-            position: StripePosition::Data { index: 1 },
-        },
-        u64::MAX - 1,
-        &scheme,
-    )?;
+    for (stripe_index, index) in [(0, 1), (1, 0), (1, 1)] {
+        match remanence_parity::mapping::stripe_data_shard_in_epoch(
+            &StripeAddress {
+                neighborhood: 0,
+                stripe_index,
+                position: StripePosition::Data { index },
+            },
+            u64::MAX - 1,
+            u64::MAX,
+            &scheme,
+        )? {
+            remanence_parity::mapping::EpochDataShard::ImplicitZero => {}
+            remanence_parity::mapping::EpochDataShard::Real { ordinal } => {
+                return Err(ObservedError::FormulaValue(ordinal));
+            }
+        }
+    }
     Ok(())
 }
+
+/// What a device-report or commit-record case injects, for its descriptor.
+pub(super) fn injection(id: &str) -> Result<Option<Value>, String> {
+    Ok(match id {
+        "overflow-12.2-walk-length" => Some(json!({
+            "device_report": "the SPACE over one filemark that measures tape file 1 (issued after its head record, at LBA 3) reports one filemark spaced and a post-space position equal to the file's start, LBA 2: a position delta of 0; no tape byte changes",
+            "tape_file": 1,
+            "file_start_lba": WALK_STALL_LBA,
+            "space_issued_at_lba": WALK_STALL_LBA + 1,
+            "reported_position_after_lba": WALK_STALL_LBA,
+        })),
+        "overflow-3.2-14-append-point" => Some(json!({
+            "commit_record_inputs": hostile_append_point_inputs()?,
+            "framing": "the claimed T = 4 + (2^64 − 1) does not fit the reference journal's u64 watermark field, so the watermarks keep the last claims that fit (T = W = 4, the end of every claim before tape file 3); tape file 3's record keeps its claimed block count, and every row keeps its measured start, so the adapter does no arithmetic on the claimed count. The §14 step-2 bound T − W < S × k therefore passes, and the refusal is the commit record's own",
+        })),
+        _ => None,
+    })
+}
+
+/// The start of tape file 1 in every finalized image.
+const WALK_STALL_LBA: u64 = 2;
+
+/// The committed prefix of unfinalized-open (files 0..3) whose record for
+/// tape file 3, the second Object, claims block_count 2^64 − 1.
+fn hostile_append_point_inputs() -> Result<Value, String> {
+    let base = generate("unfinalized-open")?;
+    let mut input = crate::resume_vectors::portable_input("resume-open", &base);
+    for row in input["committed_prefix"].as_array_mut().unwrap() {
+        let f = row["tape_file_number"].as_u64().unwrap() as usize;
+        row["physical_start_override"] = json!(base.image.files[f].start_record);
+    }
+    if input["committed_prefix"][3]["kind"] != "Object" {
+        return Err("tape file 3 of unfinalized-open is not an Object".into());
+    }
+    input["committed_prefix"][3]["block_count"] = json!(u64::MAX);
+    input["T"] = json!(4);
+    input.as_object_mut().unwrap().remove("append_object");
+    Ok(input)
+}
+
+/// Terminal discovery with no off-tape state over the three mutated replicas
+/// at their planned positions. The prefix files are present with their
+/// planned record counts, as zero-filled records: discovery reads none of them.
+pub(super) fn terminal_scanner(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
+    let profile = v.descriptor["artifact"]
+        .as_str()
+        .and_then(|a| a.strip_prefix("terminal profile "))
+        .expect("a terminal profile case");
+    let prefix = super::profiles::prefix_block_counts(profile).expect("profile prefix");
+    let mut tape_files: Vec<Vec<u8>> = prefix.iter().map(|&n| vec![0; n as usize * B]).collect();
+    for (&file, blocks) in &v.files {
+        assert_eq!(
+            file,
+            tape_files.len(),
+            "terminal files follow the prefix densely"
+        );
+        tape_files.push(blocks.concat());
+    }
+    let mut raw = ImageDirectoryRawSource::from_tape_files(tape_files, BLOCK)?;
+    match read_terminal_index_inventory(&mut raw, &v.uuid, BLOCK, |_| Ok(()), |_| Ok(())) {
+        Ok(TerminalInventoryOutcome::Inventory(_)) => Ok(()),
+        Ok(TerminalInventoryOutcome::BotStructuralRecoveryRequired(_)) => {
+            Err(ObservedError::BotStructuralRecoveryRequired)
+        }
+        Err(TerminalInventoryReadError::TerminalIndexReplicaConflict { .. }) => Err(
+            ObservedError::TerminalInventory("TerminalIndexReplicaConflict".into()),
+        ),
+        Err(error) => Err(ObservedError::TerminalInventory(format!("{error:?}"))),
+    }
+}
+
+/// A raw source whose SPACE over one filemark, issued just after the head
+/// record of the file starting at `stall_lba`, reports the file's start as the
+/// post-space position: a position delta of 0 (REM-PARITY 12.2).
+struct StalledSpace {
+    inner: ImageDirectoryRawSource,
+    stall_lba: Option<u64>,
+}
+impl RawTapeSource for StalledSpace {
+    fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+        self.inner.configure_fixed_block_size(size)
+    }
+    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        self.inner.locate_physical(hint)
+    }
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.locate_end_of_data()
+    }
+    fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+        let before = self.inner.position()?;
+        let outcome = self.inner.space_filemarks(count)?;
+        if let Some(start) = self
+            .stall_lba
+            .filter(|start| count == 1 && before.lba == start + 1)
+        {
+            return Ok(SpaceFilemarksOutcome {
+                filemarks_spaced: 1,
+                position_after: PhysicalPositionHint {
+                    lba: start,
+                    partition: before.partition,
+                },
+                hit_end_of_data: outcome.hit_end_of_data,
+            });
+        }
+        Ok(outcome)
+    }
+    fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+        self.inner.read_record(buf)
+    }
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.inner.position()
+    }
+}
+
+/// The BOT walk of Section 12.2 over the unchanged image, with the device
+/// report injected when the case's claim is present.
+pub(super) fn walk_scanner(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
+    let mut raw = StalledSpace {
+        inner: ImageDirectoryRawSource::from_tape_files(
+            v.files.values().map(|b| b.concat()).collect(),
+            BLOCK,
+        )?,
+        stall_lba: v.injected.then_some(WALK_STALL_LBA),
+    };
+    scan_reconstruct_filemark_map_with_report(&mut raw, &v.uuid, BLOCK)?;
+    Ok(())
+}
+
+/// The Resumer from commit records: journal replay, the bounded summary and
+/// the open-epoch re-read over the unchanged tape. With the claim present the
+/// Resumer must refuse before any read; the healthy prefix resumes.
+pub(super) fn resumer(v: &Resolved, _: usize, _: usize) -> Result<(), ObservedError> {
+    let base = generate("unfinalized-open").expect("base image");
+    let input = if v.injected {
+        v.descriptor["injection"]["commit_record_inputs"].clone()
+    } else {
+        let mut healthy = crate::resume_vectors::portable_input("resume-open", &base);
+        healthy.as_object_mut().unwrap().remove("append_object");
+        healthy
+    };
+    let temp = tempfile::tempdir().expect("journal temp directory");
+    let (mut drive, world, _) = crate::resume_vectors::model(&base, &input);
+    let result = (|| -> Result<(), ParityError> {
+        let journal = crate::resume_vectors::adapt(&input, &base, &temp.path().join("claims"))?;
+        let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
+        let summary = checked_bounded_resume_summary(&snapshot)?;
+        rebuild_open_epoch_from_bounded_summary(
+            &mut DriveHandleRawSource::new(&mut drive),
+            &summary,
+            &base.written.inputs.scheme,
+            base.written.inputs.tape_uuid,
+            BLOCK,
+        )?;
+        Ok(())
+    })();
+    if result.is_err() && v.injected {
+        assert!(
+            world.lock().unwrap().command_log.is_empty(),
+            "a refused commit-record claim positioned, read or wrote tape"
+        );
+    }
+    result?;
+    Ok(())
+}
+
 pub(super) fn locator(v: &Resolved, f: usize, b: usize) -> Result<(), ObservedError> {
     let result = parity_block_position(0, 1, 2, 2, u64_at(&v.files[&f][b], 0x60))?;
     if u64_at(&v.files[&f][b], 0x60) == u64::MAX {
         return Err(ObservedError::FormulaValue(result));
     }
     Ok(())
-}
-#[cfg(test)]
-pub(super) fn inverse_vector(case: &Value) -> Resolved {
-    Resolved {
-        path: case["id"].as_str().unwrap().into(),
-        expected: case.clone(),
-        descriptor: Value::Null,
-        manifest: String::new(),
-        files: BTreeMap::new(),
-        uuid: [0; 16],
-        roles: vec![Role::InverseMapping],
-        targets: vec![0],
-        block: 0,
-    }
 }

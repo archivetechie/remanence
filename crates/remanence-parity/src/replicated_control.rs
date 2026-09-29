@@ -35,10 +35,13 @@ pub fn checked_replicated_control_layout(
             "fixed header does not fit in one tape block",
         ));
     }
-    let copy_bytes = header_len
-        .checked_add(payload_len)
-        .ok_or_else(|| layout_error(structure, "header plus payload length overflows u64"))?;
-    let copy_block_count = copy_bytes.div_ceil(block_size);
+    // M = ceil((header + payload) / B) denotes its exact value (REM-PARITY
+    // 2.4): the sum is an intermediate, so it is formed without overflow and
+    // only M, a recorded count, must fit.
+    let copy_block_count = u64::try_from(
+        (u128::from(header_len) + u128::from(payload_len)).div_ceil(u128::from(block_size)),
+    )
+    .map_err(|_| layout_error(structure, "copy block count overflows u64"))?;
     let tail_copy_start_block = copy_block_count;
     let footer_block_index = copy_block_count
         .checked_mul(2)
@@ -116,14 +119,28 @@ mod tests {
         assert_eq!(crossed.total_block_count, 5);
     }
 
+    /// REM-PARITY 2.4: only values that are recorded must fit. The sum
+    /// `header + payload` may exceed u64 while M, 2M and 2M + 1 fit; M itself,
+    /// or 2M + 1, not fitting is rejected, never wrapped.
     #[test]
-    fn layout_rejects_every_overflow_boundary() {
-        let header_add = checked_replicated_control_layout(512, 512, u64::MAX, "test")
-            .expect_err("header plus payload must not wrap");
-        assert!(header_add.to_string().contains("overflows u64"));
+    fn layout_is_exact_and_rejects_only_values_that_do_not_fit() {
+        // (512 + 2^64 − 1) / 512 rounded up is 2^55 + 1: the sum overflows
+        // u64, the count does not.
+        let wide =
+            checked_replicated_control_layout(512, 512, u64::MAX, "test").expect("exact M fits");
+        assert_eq!(wide.copy_block_count, (1 << 55) + 1);
+        assert_eq!(wide.total_block_count, (1 << 56) + 3);
+        // overflow-10.1.2-M/isolated: B = 2^18, header 0xC8, L = 2^64 − 1.
+        let parity_map =
+            checked_replicated_control_layout(1 << 18, 0xc8, u64::MAX, "parity-map").unwrap();
+        assert_eq!(parity_map.copy_block_count, (1 << 46) + 1);
+        assert_eq!(parity_map.total_block_count, (1 << 47) + 3);
 
+        let copy = checked_replicated_control_layout(1, 1, u64::MAX, "test")
+            .expect_err("M = 2^64 does not fit");
+        assert!(copy.to_string().contains("copy block count"));
         let doubled = checked_replicated_control_layout(1, 1, u64::MAX - 1, "test")
-            .expect_err("replicated copy count must not wrap");
+            .expect_err("2M does not fit");
         assert!(doubled.to_string().contains("footer block index"));
     }
 }

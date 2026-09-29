@@ -13,7 +13,7 @@ use crate::model::{
     ParityScheme, RecoveryEvent, RecoveryOutcome, SidecarMetadataHealth,
     SidecarMetadataHealthEvent, StripeAddress, StripePosition,
 };
-use crate::raw::{PhysicalPositionHint, RawReadOutcome, RawTapeSource};
+use crate::raw::{classify_fixed_record, FixedRecordRead, PhysicalPositionHint, RawTapeSource};
 use crate::recovery::{
     recover_object_block_from_sidecar, recover_object_region_from_sidecar, SidecarRecoveryResult,
 };
@@ -390,30 +390,28 @@ impl<'a> ObjectParitySource<'a> {
         block_count: u64,
         policy: BulkRecoveryPolicy,
     ) -> Result<BulkRecoveryPlan, ParityError> {
-        let output_bytes = checked_mul(
-            block_count,
-            u64::from(self.block_size),
-            "bulk recovery output bytes",
-        )?;
-        if output_bytes > policy.max_recovery_cache_bytes {
+        // Every estimate is an exact value that is only compared with the cap,
+        // so it is computed in u128 and never fails for its size (REM-PARITY
+        // 2.4): block_count < 2^64 and B < 2^32 bound the output below 2^96,
+        // and affected stripes (< 2^64) times the per-stripe cache (< 2^49,
+        // below) bound the cache below 2^113.
+        let cap = u128::from(policy.max_recovery_cache_bytes);
+        let output_estimate = u128::from(block_count) * u128::from(self.block_size);
+        if output_estimate > cap {
             return Err(ParityError::RecoveryPlanExceedsMemoryBudget {
-                needed_bytes: output_bytes,
+                needed_bytes: output_estimate,
                 max_recovery_cache_bytes: policy.max_recovery_cache_bytes,
                 allow_windowed_recovery: policy.allow_windowed_recovery,
             });
         }
+        // Now output_estimate <= cap <= u64::MAX, so it fits.
+        let output_bytes = u64::try_from(output_estimate)
+            .map_err(|_| ParityError::Invariant("bulk recovery output bytes exceed the cap"))?;
         let affected_stripes = self.affected_stripe_count(start_body_lba, end_body_lba)?;
         let stripe_cache_bytes = self.stripe_recovery_cache_bytes()?;
-        let full_plan_bytes = checked_add(
-            output_bytes,
-            checked_mul(
-                affected_stripes,
-                stripe_cache_bytes,
-                "bulk recovery full-plan cache bytes",
-            )?,
-            "bulk recovery full-plan bytes",
-        )?;
-        if full_plan_bytes <= policy.max_recovery_cache_bytes {
+        let full_plan_bytes =
+            output_estimate + u128::from(affected_stripes) * u128::from(stripe_cache_bytes);
+        if full_plan_bytes <= cap {
             return Ok(BulkRecoveryPlan {
                 max_stripes_per_window: affected_stripes.max(1),
             });
@@ -426,21 +424,20 @@ impl<'a> ObjectParitySource<'a> {
             });
         }
 
-        let available_cache_bytes = policy.max_recovery_cache_bytes.saturating_sub(output_bytes);
+        let available_cache_bytes = policy.max_recovery_cache_bytes - output_bytes;
         let budget_stripes = available_cache_bytes / stripe_cache_bytes;
         if budget_stripes == 0 {
-            let needed_bytes = checked_add(
-                output_bytes,
-                stripe_cache_bytes,
-                "bulk recovery minimum window bytes",
-            )?;
             return Err(ParityError::RecoveryPlanExceedsMemoryBudget {
-                needed_bytes,
+                needed_bytes: output_estimate + u128::from(stripe_cache_bytes),
                 max_recovery_cache_bytes: policy.max_recovery_cache_bytes,
                 allow_windowed_recovery: true,
             });
         }
 
+        // The window cannot overflow, and cannot exceed the cap: window_stripes
+        // <= budget_stripes = available / stripe_cache_bytes, so window_stripes
+        // x stripe_cache_bytes <= available = cap - output_bytes. The checked
+        // operations below are therefore unreachable failures, kept as guards.
         let window_stripes = affected_stripes
             .min(u64::from(policy.max_stripes_per_window))
             .min(budget_stripes)
@@ -456,7 +453,7 @@ impl<'a> ObjectParitySource<'a> {
         )?;
         if window_plan_bytes > policy.max_recovery_cache_bytes {
             return Err(ParityError::RecoveryPlanExceedsMemoryBudget {
-                needed_bytes: window_plan_bytes,
+                needed_bytes: u128::from(window_plan_bytes),
                 max_recovery_cache_bytes: policy.max_recovery_cache_bytes,
                 allow_windowed_recovery: true,
             });
@@ -545,6 +542,8 @@ impl<'a> ObjectParitySource<'a> {
         )))
     }
 
+    /// Bounded width: k and m are u16 and B is u32, so (k + m) x B < 2^49 and
+    /// neither checked operation below can fail; they are kept as guards.
     fn stripe_recovery_cache_bytes(&self) -> Result<u64, ParityError> {
         let shard_count = u64::from(self.scheme.data_blocks_per_stripe)
             .checked_add(u64::from(self.scheme.parity_blocks_per_stripe))
@@ -660,6 +659,9 @@ impl<'a> ObjectParitySource<'a> {
             tape_file_number: self.tape_file_number,
             block_within_file: last,
         })?;
+        // Map-derived, not a device report: a validated map's trailing
+        // filemark position fits in u64 (REM-PARITY 7.2, `validate_entries`),
+        // and it is exactly last + 1, so this addition never saturates.
         Ok(PhysicalPositionHint {
             lba: last_physical.lba.saturating_add(1),
             partition: last_physical.partition,
@@ -756,21 +758,25 @@ impl<'a> ObjectParitySource<'a> {
         });
     }
 
+    /// Read one object record and classify its length against the session's
+    /// fixed block size (REM-PARITY 3.5). The caller's buffer may be larger
+    /// than one block; a record is one block only when it is exactly
+    /// `block_size` bytes.
     fn read_record_with_transport_retry(
         &mut self,
         buf: &mut [u8],
         body_lba: u64,
-    ) -> Result<RawReadOutcome, TapeIoError> {
-        match self.inner.read_record(buf) {
+    ) -> Result<FixedRecordRead, TapeIoError> {
+        let block_len = self.block_size as usize;
+        let read = match self.inner.read_record(buf) {
             Err(ParityError::TapeIo(TapeIoError::Transport(_))) => {
                 self.locate_body_lba(body_lba)
                     .map_err(parity_error_to_tape_io_error)?;
-                self.inner
-                    .read_record(buf)
-                    .map_err(parity_error_to_tape_io_error)
+                self.inner.read_record(buf)
             }
-            other => other.map_err(parity_error_to_tape_io_error),
-        }
+            other => other,
+        };
+        classify_fixed_record(read, block_len).map_err(parity_error_to_tape_io_error)
     }
 
     fn adjacent_erasure_triggers_bulk_recovery(&self, body_lba: u64) -> bool {
@@ -787,14 +793,13 @@ impl<'a> ObjectParitySource<'a> {
         self.locate_body_lba(body_lba)?;
         let mut scratch = vec![0u8; self.block_size as usize];
         match self.read_record_with_transport_retry(&mut scratch, body_lba) {
-            Ok(RawReadOutcome::Block { bytes, .. }) if bytes == self.block_size as usize => {
-                Ok(NextBodyLbaProbe::CleanBlock {
-                    body_lba,
-                    data: scratch,
-                })
-            }
-            Ok(RawReadOutcome::Block { .. }) => Ok(NextBodyLbaProbe::Erasure),
-            Ok(RawReadOutcome::Filemark { .. }) | Ok(RawReadOutcome::EndOfData { .. }) => {
+            Ok(FixedRecordRead::Block { .. }) => Ok(NextBodyLbaProbe::CleanBlock {
+                body_lba,
+                data: scratch,
+            }),
+            // A record of the wrong length, shorter or longer, is an erasure.
+            Ok(FixedRecordRead::WrongLength { .. }) => Ok(NextBodyLbaProbe::Erasure),
+            Ok(FixedRecordRead::Filemark { .. }) | Ok(FixedRecordRead::EndOfData { .. }) => {
                 Ok(NextBodyLbaProbe::NoErasure)
             }
             Err(err) if is_erasure(&err) => Ok(NextBodyLbaProbe::Erasure),
@@ -802,6 +807,9 @@ impl<'a> ObjectParitySource<'a> {
         }
     }
 
+    /// Bounded width: the two products are window × m and S × m, each a u32
+    /// times a u16 and so below 2^48; neither checked product below can fail,
+    /// and both are kept as guards.
     fn auto_bulk_probe_block_limit(&self, policy: BulkRecoveryPolicy) -> Result<u64, ParityError> {
         let by_output_budget = policy.max_recovery_cache_bytes / u64::from(self.block_size);
         let parity_blocks = u64::from(self.scheme.parity_blocks_per_stripe);
@@ -970,26 +978,47 @@ impl<'a> remanence_library::BlockRead for ObjectParitySource<'a> {
             self.last_read_erasure_body_lba = buffered.was_recovered.then_some(body_lba);
             return self.copy_recovered_block_to_read_buffer(buf, body_lba, &buffered.data);
         }
+        // A caller buffer smaller than one block is the caller's error, not a
+        // record of the wrong length: refuse it before touching tape, so it can
+        // never start a parity recovery.
+        if buf.len() < self.block_size as usize {
+            return Err(TapeIoError::ReadBufferTooSmall {
+                actual: self.block_size,
+                provided: u32::try_from(buf.len()).unwrap_or(u32::MAX),
+            });
+        }
 
         match self.read_record_with_transport_retry(buf, body_lba) {
-            Ok(RawReadOutcome::Block { bytes, .. }) => {
-                if bytes != self.block_size as usize {
-                    return Err(TapeIoError::OperationFailed(format!(
-                        "short fixed-block object read at body LBA {body_lba}: got {bytes}, expected {}",
-                        self.block_size
-                    )));
-                }
+            Ok(FixedRecordRead::Block { .. }) => {
                 self.cursor_body_lba = self.cursor_body_lba.checked_add(1).ok_or_else(|| {
                     TapeIoError::OperationFailed("object source cursor overflow".to_string())
                 })?;
                 self.last_read_erasure_body_lba = None;
-                Ok(bytes)
+                Ok(self.block_size as usize)
             }
-            Ok(RawReadOutcome::Filemark { .. }) => Err(TapeIoError::OperationFailed(format!(
+            // REM-PARITY 3.5 and 13.4: a record shorter or longer than one
+            // block is a read failure of this data block, an erasure that parity
+            // rebuilds, never a trusted block and never TapeIo. Its leading
+            // bytes are not used.
+            Ok(FixedRecordRead::WrongLength { .. }) if !self.tar_only_unverified => {
+                let recovered = self
+                    .recover_read_erasure(body_lba)
+                    .map_err(parity_error_to_tape_io_error)?;
+                self.copy_recovered_block_to_read_buffer(buf, body_lba, &recovered)
+            }
+            // `BlockRead` can only return a `TapeIoError`; the label says what
+            // the failure is: invalid content, not a device fault.
+            Ok(FixedRecordRead::WrongLength { measured_bytes }) => {
+                Err(TapeIoError::OperationFailed(format!(
+                    "invalid object content: the record at body LBA {body_lba} is {measured_bytes} bytes, not one {}-byte block (REM-PARITY 3.5), and recovery is disabled outside the validated prefix",
+                    self.block_size
+                )))
+            }
+            Ok(FixedRecordRead::Filemark { .. }) => Err(TapeIoError::OperationFailed(format!(
                 "unexpected filemark inside object tape file {} at body LBA {body_lba}",
                 self.tape_file_number
             ))),
-            Ok(RawReadOutcome::EndOfData { .. }) => Err(TapeIoError::OperationFailed(format!(
+            Ok(FixedRecordRead::EndOfData { .. }) => Err(TapeIoError::OperationFailed(format!(
                 "unexpected EOD inside object tape file {} at body LBA {body_lba}",
                 self.tape_file_number
             ))),
@@ -1218,6 +1247,7 @@ mod object_source_tests {
     use crate::filemark_map::{FilemarkMap, MapScope, TapeFileMapEntry, TapeFilePosition};
     use crate::mapping::ordinal_to_stripe;
     use crate::model::{SchemeId, SidecarMetadataHealth, SidecarMetadataHealthEvent};
+    use crate::raw::RawReadOutcome;
     use crate::sidecar::{data_shard_crc64, encode_sidecar_tape_file, SidecarDescriptor};
     use remanence_library::BlockRead;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1315,6 +1345,15 @@ mod object_source_tests {
                 });
             };
             match record {
+                // A record longer than the buffer is consumed and reported as
+                // a drive reports it (ILI with a negative residual).
+                Record::Block(block) if block.len() > buf.len() => {
+                    self.cursor += 1;
+                    Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
+                        actual: block.len() as u32,
+                        provided: buf.len() as u32,
+                    }))
+                }
                 Record::Block(block) => {
                     let bytes = block.len();
                     buf[..bytes].copy_from_slice(block);
@@ -1837,6 +1876,178 @@ mod object_source_tests {
         drop(source);
         assert_eq!(raw.configured_block_size, Some(BLOCK_SIZE));
         assert_eq!(raw.position().unwrap(), PhysicalPositionHint::new(4));
+    }
+
+    /// REM-PARITY 3.5 and 13.4: an Object record shorter or longer than one
+    /// block is a read failure of that data block, an erasure that parity
+    /// rebuilds, never a trusted block (its leading bytes are not used) and
+    /// never TapeIo. Outside the validated prefix recovery is disabled, and the
+    /// read fails without reporting a device fault.
+    #[test]
+    fn object_source_wrong_length_records_are_erasures() {
+        struct Collector(Mutex<Vec<RecoveryEvent>>);
+        impl ParityAuditHook for Collector {
+            fn on_recovery(&self, event: &RecoveryEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+        let clean_scheme = scheme();
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_object(&clean_scheme, &object_blocks);
+        for length in [
+            BLOCK_SIZE as usize / 2,
+            BLOCK_SIZE as usize + 1,
+            2 * BLOCK_SIZE as usize,
+        ] {
+            let mut records = object_blocks.clone();
+            // A longer record keeps the original block as its leading bytes.
+            records[2].resize(length, 0);
+            let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+            let mut raw = raw_tape(&records, &sidecar.blocks);
+            let collector = Arc::new(Collector(Mutex::new(Vec::new())));
+            let mut source = ObjectParitySource::open(
+                &mut raw,
+                clean_scheme.clone(),
+                TAPE_UUID,
+                scoped,
+                BLOCK_SIZE,
+                1,
+                OpenTrust::RequireValidated,
+            )
+            .expect("object source opens");
+            source.set_audit_hook(Some(collector.clone() as Arc<dyn ParityAuditHook>));
+            source.locate(2).expect("locate the damaged block");
+            let mut buf = vec![0u8; BLOCK_SIZE as usize];
+            let bytes = source
+                .read_block(&mut buf)
+                .unwrap_or_else(|e| panic!("length {length}: {e:?}"));
+            assert_eq!(bytes, BLOCK_SIZE as usize);
+            assert_eq!(buf, object_blocks[2], "length {length}");
+            drop(source);
+            let events = collector.0.lock().unwrap();
+            assert_eq!(events.len(), 1, "length {length}: rebuilt from parity");
+            assert!(matches!(events[0].outcome, RecoveryOutcome::Recovered));
+            assert_eq!(events[0].at_requested, (1, 2));
+        }
+        // With recovery disabled (an unvalidated suffix), the read fails. The
+        // `BlockRead` contract forces a `TapeIoError`, so the failure is labelled
+        // as invalid content, distinct from a device-position fault.
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 4, 0),
+        ])
+        .unwrap();
+        let mut records = object_blocks.clone();
+        records[2].truncate(BLOCK_SIZE as usize / 2);
+        let prefix_digest = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .unwrap()
+            .digest(false)
+            .unwrap();
+        let scoped = ScopedFilemarkMap::validate_against_digest(map, &prefix_digest).unwrap();
+        let mut raw = raw_tape(&records, &[]);
+        let mut source = ObjectParitySource::open(
+            &mut raw,
+            clean_scheme,
+            TAPE_UUID,
+            scoped,
+            BLOCK_SIZE,
+            1,
+            OpenTrust::AllowTarOnlyUnverified,
+        )
+        .expect("an unvalidated suffix opens for tar-only reads");
+        source.locate(2).unwrap();
+        let error = source
+            .read_block(&mut vec![0u8; BLOCK_SIZE as usize])
+            .expect_err("no recovery outside the validated prefix");
+        assert!(
+            matches!(&error, TapeIoError::OperationFailed(m)
+                if m.starts_with("invalid object content") && !m.contains("device-reported position")),
+            "{error:?}"
+        );
+    }
+
+    /// A caller buffer smaller than one block is the caller's error: the read
+    /// is refused before touching tape and never starts a parity recovery.
+    #[test]
+    fn object_source_small_caller_buffer_is_not_a_wrong_length_record() {
+        struct Collector(Mutex<Vec<RecoveryEvent>>);
+        impl ParityAuditHook for Collector {
+            fn on_recovery(&self, event: &RecoveryEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+        let clean_scheme = scheme();
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_object(&clean_scheme, &object_blocks);
+        let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+        let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+        let collector = Arc::new(Collector(Mutex::new(Vec::new())));
+        let mut source = ObjectParitySource::open(
+            &mut raw,
+            clean_scheme,
+            TAPE_UUID,
+            scoped,
+            BLOCK_SIZE,
+            1,
+            OpenTrust::RequireValidated,
+        )
+        .unwrap();
+        source.set_audit_hook(Some(collector.clone() as Arc<dyn ParityAuditHook>));
+        source.locate(2).unwrap();
+        let error = source
+            .read_block(&mut vec![0u8; BLOCK_SIZE as usize - 1])
+            .expect_err("a buffer below one block is refused");
+        assert!(
+            matches!(error, TapeIoError::ReadBufferTooSmall { .. }),
+            "{error:?}"
+        );
+        drop(source);
+        assert!(
+            collector.0.lock().unwrap().is_empty(),
+            "no recovery was started"
+        );
+        assert!(raw.read_lbas.is_empty(), "no record was read");
+    }
+
+    /// REM-PARITY 2.4: the bulk budget's estimates are exact values that are
+    /// only compared with the cap, so one beyond u64 is reported as its value,
+    /// never as an arithmetic failure.
+    #[test]
+    fn bulk_budget_reports_an_exact_estimate_beyond_u64() {
+        let clean_scheme = scheme();
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_object(&clean_scheme, &object_blocks);
+        let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+        let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+        let source = ObjectParitySource::open(
+            &mut raw,
+            clean_scheme,
+            TAPE_UUID,
+            scoped,
+            BLOCK_SIZE,
+            1,
+            OpenTrust::RequireValidated,
+        )
+        .unwrap();
+        let error = source
+            .plan_bulk_recovery_budget(
+                0,
+                4,
+                u64::MAX,
+                BulkRecoveryPolicy {
+                    max_recovery_cache_bytes: u64::MAX,
+                    allow_windowed_recovery: true,
+                    max_stripes_per_window: 1,
+                },
+            )
+            .unwrap_err();
+        match error {
+            ParityError::RecoveryPlanExceedsMemoryBudget { needed_bytes, .. } => {
+                assert_eq!(needed_bytes, u128::from(u64::MAX) * u128::from(BLOCK_SIZE));
+                assert!(needed_bytes > u128::from(u64::MAX));
+            }
+            other => panic!("expected the exact over-budget estimate, got {other:?}"),
+        }
     }
 
     #[test]

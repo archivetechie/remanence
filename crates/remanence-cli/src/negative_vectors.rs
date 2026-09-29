@@ -13,6 +13,7 @@ use std::{
     fs,
     path::PathBuf,
 };
+pub mod erratum;
 #[cfg(test)]
 mod mutations;
 mod overflow;
@@ -113,6 +114,10 @@ pub struct Resolved {
     roles: Vec<Role>,
     targets: Vec<usize>,
     block: usize,
+    /// Whether the case's off-tape or device-report claim is injected. The
+    /// healthy-base check clears it with the files, so every observation point
+    /// must accept the base with no claim.
+    injected: bool,
 }
 struct Editor {
     artifact: String,
@@ -278,6 +283,12 @@ enum Role {
     Recovery,
     InverseMapping,
     ParityLocator,
+    /// Terminal discovery with no off-tape state (REM-PARITY 8.4), run once.
+    TerminalScanner,
+    /// The Section 12.2 BOT walk, run once.
+    WalkScanner,
+    /// The Resumer from commit records (Section 14), run once.
+    Resumer,
 }
 struct RoleEntry {
     role: Role,
@@ -288,6 +299,10 @@ struct RoleEntry {
 enum ObservedError {
     Parity(ParityError),
     FormulaValue(u64),
+    /// The Scanner's explicit outcome when no replica validates (REM-PARITY 8.4).
+    BotStructuralRecoveryRequired,
+    /// A terminal inventory read failed outside Section 15's replica names.
+    TerminalInventory(String),
     Replica(TapeIndexReplicaError),
     Separation(IndexSeparationError),
     #[cfg(test)]
@@ -297,6 +312,8 @@ impl std::fmt::Display for ObservedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FormulaValue(n) => write!(f, "formula returned {n} instead of rejecting"),
+            Self::BotStructuralRecoveryRequired => write!(f, "BotStructuralRecoveryRequired"),
+            Self::TerminalInventory(e) => write!(f, "{e}"),
             Self::Parity(e) => write!(f, "{e}"),
             Self::Replica(e) => write!(f, "{e}"),
             Self::Separation(e) => write!(f, "{e}"),
@@ -319,7 +336,11 @@ pub fn observe(v: &Resolved) -> Vec<Observation> {
     let mut observations = Vec::new();
     for role in &v.roles {
         let entry = ROLES.iter().find(|r| r.role == *role).unwrap();
-        for &file in &v.targets {
+        let once = matches!(
+            role,
+            Role::TerminalScanner | Role::WalkScanner | Role::Resumer
+        );
+        for &file in v.targets.iter().take(if once { 1 } else { usize::MAX }) {
             let blocks = if *role == Role::Directory {
                 vec![0, 1]
             } else {
@@ -339,6 +360,9 @@ pub fn observe(v: &Resolved) -> Vec<Observation> {
                     Role::Bootstrap => "bootstrap",
                     Role::Replica => "replica",
                     Role::Separation => "separation",
+                    Role::TerminalScanner => "scanner",
+                    Role::WalkScanner => "walk",
+                    Role::Resumer => "resumer",
                 };
                 let (name, detail, outcome) =
                     match std::panic::catch_unwind(|| (entry.run)(v, file, block)) {
@@ -415,7 +439,10 @@ impl IndexSeparationInteriorBlockSource for Payload<'_> {
 // The dispatch table is the single target-role to production-entry-point map.
 const ROLES: &[RoleEntry] = &[
     RoleEntry {role:Role::Recovery, entry:"recover_ordinal_from_sidecar (directory-assisted tail rescue)", run:overflow::recover},
-    RoleEntry {role:Role::InverseMapping, entry:"stripe_data_to_ordinal_in_epoch (unit-level, freeze blocker)", run:overflow::inverse},
+    RoleEntry {role:Role::InverseMapping, entry:"mapping::stripe_data_shard_in_epoch (unit level; the one inverse every Recoverer caller uses)", run:overflow::inverse},
+    RoleEntry {role:Role::TerminalScanner, entry:"read_terminal_index_inventory (no off-tape state; prefix records present, their bytes unread)", run:overflow::terminal_scanner},
+    RoleEntry {role:Role::WalkScanner, entry:"scan_reconstruct_filemark_map_with_report (device report injected by the raw source)", run:overflow::walk_scanner},
+    RoleEntry {role:Role::Resumer, entry:"FileTapeFileJournal replay -> checked_bounded_resume_summary -> rebuild_open_epoch_from_bounded_summary", run:overflow::resumer},
     RoleEntry {role:Role::ParityLocator, entry:"parity_block_position (unit-level formula probe after header rejection)", run:overflow::locator},
     RoleEntry {role:Role::SidecarCopy, entry:"parse_sidecar_index_blocks (includes parse_sidecar_header_block)", run:|v,f,b| { parse_sidecar_index_blocks(&v.files[&f][b..b+1],&v.uuid)?; Ok(()) }},
     RoleEntry {role:Role::SidecarFooter, entry:"parse_sidecar_footer_block", run:|v,f,b| { parse_sidecar_footer_block(&v.files[&f][b],&v.uuid)?; Ok(()) }},
@@ -453,6 +480,9 @@ fn section15(error: &ObservedError) -> &'static str {
             "BootstrapPayloadTooLarge"
         }
         ObservedError::FormulaValue(_) => "RETURNED",
+        ObservedError::BotStructuralRecoveryRequired => "BotStructuralRecoveryRequired",
+        ObservedError::TerminalInventory(_) => "UNMAPPED",
+        ObservedError::Parity(ParityError::TapeIo(_)) => "TapeIo",
         ObservedError::Parity(ParityError::Invariant(_)) => "Invariant",
         ObservedError::Parity(ParityError::SidecarMetadataUnavailable { .. }) => {
             "SidecarMetadataUnavailable"
@@ -839,9 +869,20 @@ pub fn resolve(case: &Value, variant: Option<&Value>) -> Result<Resolved, String
     let artifact = if v["base_override"].is_string() {
         "terminal profile minimal-256k"
     } else {
-        case["base"]["artifact"].as_str().unwrap()
+        match id {
+            // A unit-level descriptor: no image holds it (see the case's note).
+            "overflow-3.3-stripe-mapping-inverse" => "unit level",
+            // "Any image, under a fault-injecting transport": the device report
+            // is injected over the smallest finalized image.
+            "overflow-12.2-walk-length" => "tape-image a4-minimal",
+            _ => case["base"]["artifact"].as_str().unwrap(),
+        }
     };
-    let (files, uuid) = base_artifact(artifact)?;
+    let (files, uuid) = if artifact == "unit level" {
+        (BTreeMap::new(), [0; 16])
+    } else {
+        base_artifact(artifact)?
+    };
     let mut editor = Editor {
         artifact: artifact.into(),
         files,
@@ -1129,10 +1170,15 @@ pub fn resolve(case: &Value, variant: Option<&Value>) -> Result<Resolved, String
         vec![Role::ParityMap, Role::Directory, role]
     } else if id == "overflow-9.1-block-locator" {
         vec![role, Role::ParityLocator]
+    } else if id == "overflow-3.2-lba" {
+        vec![role, Role::TerminalScanner]
     } else {
         vec![role]
     };
-    let descriptor = json!({"case":path,"artifact":artifact,"target_role":format!("{role:?}"),"entry_points":roles.iter().map(|role|ROLES.iter().find(|r|r.role==*role).unwrap().entry).collect::<Vec<_>>(),"edits":editor.edits});
+    let mut descriptor = json!({"case":path,"artifact":artifact,"target_role":format!("{role:?}"),"entry_points":roles.iter().map(|role|ROLES.iter().find(|r|r.role==*role).unwrap().entry).collect::<Vec<_>>(),"edits":editor.edits});
+    if let Some(injection) = overflow::injection(id)? {
+        descriptor["injection"] = injection;
+    }
     Ok(Resolved {
         path,
         expected: variant.unwrap_or(case).clone(),
@@ -1143,6 +1189,7 @@ pub fn resolve(case: &Value, variant: Option<&Value>) -> Result<Resolved, String
         roles,
         targets,
         block,
+        injected: true,
     })
 }
 
@@ -1372,14 +1419,22 @@ mod tests {
     #[test]
     fn healthy_roles_and_repairs() {
         let source = source().expect("frozen source");
+        let errata = erratum::load().expect("erratum set E2");
         for (case, variant) in cases(&source) {
-            if not_executable(case).is_some() {
+            if errata.not_executable(case).is_some() {
                 continue;
             }
             let mut v = resolve(case, variant).expect("case resolution");
-            let (files, _) = base_artifact(v.descriptor["artifact"].as_str().unwrap()).unwrap();
-            // Each observation point must accept the exact unmutated base.
+            let artifact = v.descriptor["artifact"].as_str().unwrap();
+            let files = if artifact == "unit level" {
+                BTreeMap::new()
+            } else {
+                base_artifact(artifact).unwrap().0
+            };
+            // Each observation point must accept the exact unmutated base, with
+            // no device report or commit-record claim injected.
             v.files = files;
+            v.injected = false;
             for observation in observe(&v) {
                 assert_eq!(
                     observation.name, "ACCEPTED",
@@ -1535,6 +1590,32 @@ mod tests {
     fn negative_vectors() {
         let source = source().expect("frozen negative source");
         let root = fixture_root().join("tape-images/negatives");
+        let errata = erratum::load().expect("erratum set E2");
+        errata
+            .check_against_sources(&source, &supplement::source().expect("supplement source"))
+            .expect("every erratum entry replaces the frozen expectation it names");
+        let mut seen_errata = BTreeSet::new();
+        for entry in &errata.entries {
+            if entry.clear_freeze_blocker {
+                println!(
+                    "ERRATUM {}: freeze_blocker cleared (was true); {}",
+                    entry.case,
+                    json!({"replaces": entry.replaces})
+                );
+            }
+            if let Some(reason) = &entry.executes {
+                println!("ERRATUM {}: executes; {reason}", entry.case);
+            }
+            for unobserved in &entry.unobserved {
+                println!(
+                    "ERRATUM-UNOBSERVED {} [{}]: {}; author outcome {}",
+                    entry.case,
+                    unobserved["author_observation"],
+                    unobserved["reason"],
+                    unobserved["expected"]
+                );
+            }
+        }
         for entry in ROLES {
             println!("ROLE {:?}: {}", entry.role, entry.entry);
         }
@@ -1548,7 +1629,7 @@ mod tests {
             String::from("case\tartifact\ttape_file\tblock_within_file\tbytes\tsha256\n");
         for (case, variant) in cases(&source) {
             let path = case_path(case, variant);
-            if let Some(reason) = not_executable(case) {
+            if let Some(reason) = errata.not_executable(case) {
                 let actual: Value = serde_json::from_slice(
                     &fs::read(root.join(&path).join("expected.json"))
                         .expect("generated expectation"),
@@ -1556,21 +1637,6 @@ mod tests {
                 .unwrap();
                 assert_eq!(&actual, variant.unwrap_or(case));
                 println!("NOT-EXECUTABLE {path}: {reason}");
-                if path == "overflow-3.3-stripe-mapping-inverse" {
-                    for Observation {
-                        location,
-                        name,
-                        detail,
-                        ..
-                    } in observe(&overflow::inverse_vector(case))
-                    {
-                        println!("INFORMATIVE {path} {location}: {name}; observed={detail:?}");
-                        if name == "PANIC" || name == "ACCEPTED" {
-                            println!("DISAGREEMENT {path}: mapping.rs::stripe_data_to_ordinal_in_epoch did not reject: {name}");
-                            failures.push(path.clone());
-                        }
-                    }
-                }
                 continue;
             }
             let resolved = match resolve(case, variant) {
@@ -1600,12 +1666,31 @@ mod tests {
                 .or(case["pinned"].as_bool())
                 .expect("pinned flag");
             for observation in observe(&resolved) {
+                let variant_name = variant
+                    .map(|v| v["variant"].as_str().expect("variant name"))
+                    .unwrap_or("");
+                if let Some((entry, override_)) = errata.observation(
+                    "negative-cases.json",
+                    case["id"].as_str().unwrap(),
+                    variant_name,
+                    observation.key,
+                ) {
+                    seen_errata.insert((
+                        entry.source.clone(),
+                        entry.case.clone(),
+                        entry.variant.clone(),
+                        observation.key.to_string(),
+                    ));
+                    if !erratum::report(&path, entry, override_, &observation)
+                        || matches!(observation.name, "PANIC" | "Invariant")
+                    {
+                        failures.push(format!("{path} {} (erratum)", observation.location));
+                    }
+                    continue;
+                }
                 let adjudication_key = (
                     case["id"].as_str().unwrap().to_string(),
-                    variant
-                        .map(|v| v["variant"].as_str().expect("variant name"))
-                        .unwrap_or("")
-                        .to_string(),
+                    variant_name.to_string(),
                     observation.key.to_string(),
                 );
                 if adjudications.check_observation(
@@ -1667,11 +1752,16 @@ mod tests {
             &mut failures,
             &adjudications,
             &mut seen_adjudications,
+            &errata,
+            &mut seen_errata,
         );
         execute_erratum(&root, &mut manifest, &mut failures);
         adjudications
             .ensure_all_observed(&seen_adjudications)
             .expect("every adjudication observation must execute");
+        errata
+            .ensure_all_observed(&seen_errata)
+            .expect("every erratum override must execute");
         assert_eq!(
             fs::read_to_string(root.join("MANIFEST.tsv")).expect("negative manifest"),
             manifest

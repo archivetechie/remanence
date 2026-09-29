@@ -1151,9 +1151,10 @@ fn validate_shard_counts(counts: HeaderCounts) -> Result<(), ParityError> {
     if range_len == 0 {
         return Err(sidecar_parse("sidecar protects zero real ordinals"));
     }
-    let expected_logical =
-        checked_sidecar_shard_product(u64::from(stripes_per_epoch), u64::from(k))?;
-    if logical_shard_count != expected_logical {
+    // logical_shard_count MUST = S x k (Section 9.2): the product is only
+    // compared, so it is compared exactly (Section 2.4).
+    let expected_logical = u128::from(stripes_per_epoch) * u128::from(k);
+    if u128::from(logical_shard_count) != expected_logical {
         return Err(sidecar_parse(format!(
             "sidecar logical_shard_count {logical_shard_count} != S*k {expected_logical}"
         )));
@@ -1771,7 +1772,9 @@ pub fn checked_sidecar_total_blocks(h: u64, p: u64) -> Result<u64, ParityError> 
         .and_then(|v| v.checked_add(1))
         .ok_or_else(|| sidecar_parse("sidecar total block count overflows"))
 }
-/// Evaluate a scheme's stripe count times its shard count before narrowing.
+/// Evaluate a scheme's stripe count times its parity shard count, `P = S × m`,
+/// a count that must fit in u64 (REM-PARITY 2.4, 9.1). A product that is only
+/// compared, such as `S × k`, is compared exactly instead.
 pub fn checked_sidecar_shard_product(stripes: u64, shards: u64) -> Result<u64, ParityError> {
     stripes
         .checked_mul(shards)

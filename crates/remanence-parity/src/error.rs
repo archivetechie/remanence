@@ -83,6 +83,17 @@ pub enum ParityError {
     #[error("invariant violation: {0}")]
     Invariant(&'static str),
 
+    /// A limit of this host, such as an allocation or a conversion to the
+    /// host's address width, prevents the operation. It is an implementation
+    /// limit, not a format violation (REM-PARITY 2.4): the tape may be valid.
+    #[error("implementation limit: {context} ({detail})")]
+    ImplementationLimit {
+        /// What the host could not hold or address.
+        context: &'static str,
+        /// The value that exceeded the limit.
+        detail: String,
+    },
+
     /// No bootstrap block could be found anywhere on the tape.
     /// The tape is effectively unreadable as a parity-protected
     /// volume — Layer 5 may opt to treat it as no-parity with
@@ -247,8 +258,10 @@ pub enum ParityError {
         "bulk recovery plan needs {needed_bytes} bytes but the cap is {max_recovery_cache_bytes} bytes; allow_windowed_recovery={allow_windowed_recovery} (§9.3 -- enable windowed recovery or raise the cap)"
     )]
     RecoveryPlanExceedsMemoryBudget {
-        /// Estimated peak bytes needed by the recovery plan.
-        needed_bytes: u64,
+        /// Estimated peak bytes needed by the recovery plan. The estimate is
+        /// exact, so it is carried in u128: an estimate beyond u64 is reported
+        /// as its value, never as an arithmetic failure (REM-PARITY 2.4).
+        needed_bytes: u128,
         /// Operator-configured hard cache budget.
         max_recovery_cache_bytes: u64,
         /// Whether the caller allowed multi-window recovery.
@@ -277,4 +290,25 @@ pub enum ParityError {
     /// Layer 3a could not read back the drive's effective compression mode.
     #[error("could not verify the drive's effective compression mode")]
     DriveCompressionModeUnknown,
+}
+
+impl ParityError {
+    /// A host limit, reported distinctly from every REM-PARITY Section 15
+    /// format error (Section 2.4).
+    pub(crate) fn implementation_limit(
+        context: &'static str,
+        detail: impl std::fmt::Display,
+    ) -> Self {
+        Self::ImplementationLimit {
+            context,
+            detail: detail.to_string(),
+        }
+    }
+
+    /// Convert a tape-derived count to the host's `usize`. A value that does
+    /// not fit is a host limit, not a format error.
+    pub(crate) fn host_usize(value: u64, context: &'static str) -> Result<usize, Self> {
+        usize::try_from(value)
+            .map_err(|_| Self::implementation_limit(context, format_args!("{value} exceeds usize")))
+    }
 }

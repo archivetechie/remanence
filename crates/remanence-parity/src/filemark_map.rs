@@ -893,6 +893,47 @@ impl MapScope {
     }
 }
 
+/// Section 3.2's physical prefix over dense tape files: `LBA(f, 0)` of the
+/// next file is `Σ_{g<f}(block_count(g) + 1)`. A recorded map is valid only if
+/// every record position and every trailing filemark position it describes
+/// fits in u64 (REM-PARITY 7.2); the append position after the last filemark
+/// need not (a Writer and Resumer concern, Sections 3.4 and 14). Every map
+/// validation path accumulates positions through this one type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PhysicalPrefix {
+    /// Position of the next file's first record; `None` is 2^64.
+    next_start: Option<u64>,
+}
+
+/// A map describes a record or filemark position that does not fit in u64.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PositionBeyondU64;
+
+impl PhysicalPrefix {
+    pub(crate) const fn new() -> Self {
+        Self {
+            next_start: Some(0),
+        }
+    }
+
+    /// Add one tape file of `block_count` records and its trailing filemark,
+    /// at the next position. Fails when its trailing filemark, the file's last
+    /// position, does not fit in u64.
+    pub(crate) fn push(&mut self, block_count: u64) -> Result<(), PositionBeyondU64> {
+        let filemark = self
+            .next_start
+            .and_then(|start| start.checked_add(block_count))
+            .ok_or(PositionBeyondU64)?;
+        self.next_start = filemark.checked_add(1);
+        Ok(())
+    }
+
+    /// The position after the last trailing filemark, when it fits.
+    pub(crate) fn end(self) -> Option<u64> {
+        self.next_start
+    }
+}
+
 fn validate_entries(entries: &[TapeFileMapEntry]) -> Result<(), ParityError> {
     let Some(bot) = entries.first() else {
         return Err(filemark_map_error(
@@ -905,6 +946,7 @@ fn validate_entries(entries: &[TapeFileMapEntry]) -> Result<(), ParityError> {
         ));
     }
     let mut next_object_ordinal = 0u64;
+    let mut physical = PhysicalPrefix::new();
     for (index, entry) in entries.iter().enumerate() {
         let expected_file_number = u64::try_from(index)
             .map_err(|_| filemark_map_error("tape file count exceeds u64::MAX"))?;
@@ -916,6 +958,12 @@ fn validate_entries(entries: &[TapeFileMapEntry]) -> Result<(), ParityError> {
         }
 
         entry.validate()?;
+        physical.push(entry.block_count).map_err(|_| {
+            filemark_map_error(format!(
+                "tape file {} describes a record or filemark position beyond u64 (REM-PARITY 7.2)",
+                entry.tape_file_number
+            ))
+        })?;
         if index != 0 && entry.kind == TapeFileKind::Bootstrap {
             return Err(filemark_map_error(
                 "schema-major 2 filemark maps forbid Bootstrap outside tape file 0",
@@ -1456,5 +1504,41 @@ mod tests {
             block_size_bytes: 512,
             drive_compression: false,
         }
+    }
+
+    /// REM-PARITY 7.2: every record position and every trailing filemark
+    /// position the map describes must fit in u64; the append position after
+    /// the last filemark need not. The replica payload path shares the rule.
+    #[test]
+    fn map_positions_must_fit_but_the_append_position_need_not() {
+        // LBA 0 bootstrap, 1 filemark, records 2..=u64::MAX − 1, filemark at
+        // u64::MAX: every described position fits.
+        let edge = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, u64::MAX - 2, 0),
+        ])
+        .expect("the last filemark at u64::MAX fits");
+        assert!(edge.append_position_after_prefix().is_err());
+        for entries in [
+            // The trailing filemark would lie at 2^64.
+            vec![
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, u64::MAX - 1, 0),
+            ],
+            // A further file would start at 2^64.
+            vec![
+                TapeFileMapEntry::bootstrap(0, 1),
+                TapeFileMapEntry::object(1, u64::MAX - 2, 0),
+                TapeFileMapEntry::parity_map(2, 1),
+            ],
+        ] {
+            let error = FilemarkMap::new(entries).expect_err("a position beyond u64 is invalid");
+            assert!(error.to_string().contains("position beyond u64"), "{error}");
+        }
+        let mut prefix = PhysicalPrefix::new();
+        prefix.push(1).unwrap();
+        prefix.push(u64::MAX - 2).unwrap();
+        assert_eq!(prefix.end(), None);
+        assert_eq!(prefix.push(0), Err(PositionBeyondU64));
     }
 }

@@ -1,0 +1,16 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "overflow-12.2-walk-length",
+  "edits": [],
+  "entry_points": [
+    "scan_reconstruct_filemark_map_with_report (device report injected by the raw source)"
+  ],
+  "injection": {
+    "device_report": "the SPACE over one filemark that measures tape file 1 (issued after its head record, at LBA 3) reports one filemark spaced and a post-space position equal to the file's start, LBA 2: a position delta of 0; no tape byte changes",
+    "file_start_lba": 2,
+    "reported_position_after_lba": 2,
+    "space_issued_at_lba": 3,
+    "tape_file": 1
+  },
+  "target_role": "WalkScanner"
+}

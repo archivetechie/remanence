@@ -373,10 +373,10 @@ pub fn validate_object_recovery_row_fields(
                 ));
             }
             if let Some(block_size_bytes) = block_size_bytes {
-                let capacity = manifest_chunk_count
-                    .checked_mul(u64::from(block_size_bytes))
-                    .ok_or_else(|| row_error("plaintext manifest byte capacity overflows"))?;
-                if *manifest_size_bytes > capacity {
+                // The capacity `count x B` is only compared, so it is compared
+                // exactly and is never too large (REM-PARITY 2.4, 10.3).
+                let capacity = u128::from(*manifest_chunk_count) * u128::from(block_size_bytes);
+                if u128::from(*manifest_size_bytes) > capacity {
                     return Err(row_error(
                         "plaintext manifest size exceeds manifest chunk capacity",
                     ));
@@ -427,4 +427,52 @@ fn int_to_u32(value: Integer, field: &str) -> Result<u32, ParityError> {
 
 fn row_error(message: impl Into<String>) -> ParityError {
     ParityError::TapeIndexReplica(message.into())
+}
+
+#[cfg(test)]
+mod exact_capacity_tests {
+    use super::*;
+
+    fn plaintext(count: u64, size: u64) -> ObjectRecoveryRepresentation {
+        ObjectRecoveryRepresentation::Plaintext {
+            manifest_first_chunk_lba: 0,
+            manifest_size_bytes: size,
+            manifest_chunk_count: count,
+            manifest_sha256: [1; 32],
+        }
+    }
+
+    /// REM-PARITY 2.4 and 10.3: the manifest capacity `count × B` is only
+    /// compared, so it is compared exactly and never rejected for its size.
+    #[test]
+    fn manifest_capacity_is_compared_exactly() {
+        let block = 256 * 1024;
+        validate_object_recovery_row_fields(
+            1 << 46,
+            Some(b"unit"),
+            &plaintext(1 << 46, 1),
+            Some(block),
+        )
+        .expect("1 <= 2^46 x 2^18 = 2^64");
+        validate_object_recovery_row_fields(
+            1 << 46,
+            Some(b"unit"),
+            &plaintext(1 << 46, u64::MAX),
+            Some(block),
+        )
+        .expect("2^64 − 1 <= 2^64");
+        let error = validate_object_recovery_row_fields(
+            1,
+            Some(b"unit"),
+            &plaintext(1, u64::from(block) + 1),
+            Some(block),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds manifest chunk capacity"),
+            "{error}"
+        );
+    }
 }

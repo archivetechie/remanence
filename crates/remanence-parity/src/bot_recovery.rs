@@ -10,7 +10,8 @@ use crate::bootstrap::parse_bootstrap_block;
 use crate::error::{BootstrapRefusedField, ParityError};
 use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
 use crate::raw::{
-    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
+    RawTapeSource,
 };
 use crate::scan::{
     scan_reconstruct_filemark_map_with_control_mode, ControlledScanWalkOutcome, ScanMode,
@@ -763,14 +764,18 @@ pub(crate) fn reject_readable_foreign_bot_bootstrap(
         }
     })?;
     let mut block = vec![0; block_size];
-    let bytes = match source.read_record(&mut block) {
-        Ok(RawReadOutcome::Block { bytes, .. }) => bytes,
-        Ok(RawReadOutcome::Filemark { .. } | RawReadOutcome::EndOfData { .. }) => return Ok(()),
+    // Only a readable one-block bootstrap can show a foreign identity. A record
+    // of the wrong length (REM-PARITY 3.5), shorter or longer, carries none;
+    // the walk judges it.
+    match read_fixed_record(source, &mut block) {
+        Ok(FixedRecordRead::Block { .. }) => {}
+        Ok(
+            FixedRecordRead::WrongLength { .. }
+            | FixedRecordRead::Filemark { .. }
+            | FixedRecordRead::EndOfData { .. },
+        ) => return Ok(()),
         Err(error) if bot_source_error_is_medium_damage(&error) => return Ok(()),
         Err(error) => return Err(bot_bootstrap_source_error("read BOT Bootstrap", error)),
-    };
-    if bytes != block_size {
-        return Ok(());
     }
     if let Ok(payload) = parse_bootstrap_block(&block) {
         if payload.tape_uuid != *tape_uuid {

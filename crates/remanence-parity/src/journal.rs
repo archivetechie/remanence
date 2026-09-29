@@ -970,7 +970,7 @@ impl FileTapeFileJournal {
         if journal_count == checkpoint_count && !sink_checkpoint_missing {
             return Ok(TerminalComponentAuthorityRelation::Aligned);
         }
-        if journal_count == checkpoint_count.saturating_add(1) {
+        if checkpoint_count.checked_add(1) == Some(journal_count) {
             return Ok(
                 TerminalComponentAuthorityRelation::SinkJournalOneTransitionAhead {
                     sink_checkpoint_missing,

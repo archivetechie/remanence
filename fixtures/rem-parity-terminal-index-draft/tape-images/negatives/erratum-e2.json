@@ -1,0 +1,633 @@
+{
+  "description": "Erratum set E2 for the frozen negative vectors (negative-cases.json) and their supplement (negative-cases-supplement.json), neither of which is edited. Each entry names a case, its variant ('' for none) and the executor observations it overrides, gives the pinned expectation it replaces, and the outcome a text-only author wrote for that observation. The executor applies each override, pins it, and reports it as ERRATUM with both the old and the new expectation. clear_freeze_blocker clears the case's freeze_blocker flag; executes makes an off-tape or device-report case executable, stating the injection. An unobserved author outcome names an observation the executor has no run for, with the reason.",
+  "source": "Outcomes of erratum set E2, written from the REM-PARITY in-progress text (SHA-256 acbc31385e39af233f45769387d7bf33e9a41c38b152a9f8b1cc601c7aa85491) by an author who saw only the text and the constructions, never the reference's outcomes. Each author entry (result, error, sections, quotes and open notes) is transcribed without change. The compared outcome is the author's error: a Section 15 name, SidecarMetadataUnavailable{epoch_id: n}, or null for an input that is accepted with no error.",
+  "entries": [
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-3.2-lba",
+      "variant": "",
+      "clear_freeze_blocker": true,
+      "replaces": {
+        "expected": {
+          "one_of": [
+            "TerminalIndexReplicaParse",
+            "no error"
+          ],
+          "permitting_text": "Sections 2.4 and 8.3 require checked u64 arithmetic, but no validity condition of Section 10.6 evaluates Section 3.2 over structural rows, and no rule ties a sidecar row's block_count to 2H+P+1 or A's planned start to Σ(block_count + 1). A Reader that positions by filemark spacing never evaluates the sum and accepts the replicas."
+        },
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "replica",
+          "author_observation": "component parser (terminal replica payload validation, each of A, B, C)",
+          "expected": {
+            "result": "rejected. With block_count(4) = 2^64 − 1 the recorded structural map describes positions that do not fit in u64: tape file 4 starts at LBA(4, 0) = 15, so its last record lies at LBA(4, 2^64 − 2) = 2^64 + 13 and its trailing filemark at 2^64 + 14. A recorded map that describes such a position is invalid, so each replica's payload fails Section 10.6 and the replica is not locally eligible. Replica A's planned start LBA is not compared with the prefix sum; no rule requires that, and the fit rule decides without it.",
+            "error": "TerminalIndexReplicaParse",
+            "sections": [
+              "7.2",
+              "3.2",
+              "2.4",
+              "10.6",
+              "15"
+            ],
+            "quotes": [
+              "Every record position and every trailing filemark position that the map describes, by Section 3.2's `LBA(f, b)`, MUST fit in u64; a recorded map that breaks this is invalid.",
+              "`TerminalIndexReplicaParse` includes a replica map that describes a position that does not fit (Section 7.2). `ResumeAppend` includes a commit record whose values do not fit, and `TapeIo` a device-reported position that does not fit or goes backwards (Section 2.4).",
+              "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate.",
+              "A Reader rejects a value that is recorded, or used as a position, a count or an ordinal, when its exact value does not fit the field or the u64 that holds it; the error is the one named for the structure that carries the value."
+            ]
+          }
+        },
+        {
+          "observation": "scanner",
+          "author_observation": "Scanner (no off-tape state)",
+          "expected": {
+            "result": "no replica validates. A, B and C carry the same invalid map, and their agreement does not rescue them; this is not TerminalIndexReplicaConflict. The Scanner returns the explicit BotStructuralRecoveryRequired outcome, offers the Section 8.4.1 walk and returns no inventory. The terminal profile holds no prefix image, so the walk itself is not observable here.",
+            "error": "BotStructuralRecoveryRequired",
+            "sections": [
+              "8.4",
+              "8.5",
+              "12.4",
+              "8.4.1"
+            ],
+            "quotes": [
+              "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;",
+              "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1.",
+              "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary.",
+              "It MUST NOT convert missing terminal authority into an empty inventory or infer the existence of a planned future component from A or B."
+            ]
+          }
+        }
+      ],
+      "unobserved": [
+        {
+          "author_observation": "Recoverer",
+          "reason": "The Recoverer runs on a validated terminal inventory, and this tape yields none, so there is no Recoverer run to observe.",
+          "expected": {
+            "result": "no validated terminal inventory exists, so the Recoverer receives no map from the replicas. Resolving the map entry of tape file 4 to a position never occurs; the map is rejected before any Reader uses it.",
+            "error": null,
+            "sections": [
+              "7.2",
+              "13.1"
+            ],
+            "quotes": [
+              "Every record position and every trailing filemark position that the map describes, by Section 3.2's `LBA(f, b)`, MUST fit in u64; a recorded map that breaks this is invalid."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-3.2-14-append-point",
+      "variant": "",
+      "executes": "REM-PARITY 2.4 and 3.4 now decide a commit record whose values do not fit: ResumeAppend. The claims are framed as the reference implementation's off-tape commit records and replayed by the production Resumer.",
+      "replaces": {
+        "expected": {
+          "error": "ResumeAppend"
+        },
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "resumer",
+          "author_observation": "Resumer",
+          "expected": {
+            "result": "refused before any re-read, positioning or write. Step 1 computes T from the commit records as first_parity_data_ordinal(3) + block_count(3) = 4 + (2^64 − 1) = 2^64 + 3, which does not fit in u64. The append point (1+1)+(4+1)+(7+1)+(2^64 − 1 + 1) = 2^64 + 15 does not fit either. Commit-record values that do not fit are ResumeAppend. The exact-value bound T − W < S × k also fails. Nothing on tape is read for [W, T) and no block is written.",
+            "error": "ResumeAppend",
+            "sections": [
+              "2.4",
+              "3.2",
+              "3.4",
+              "14",
+              "15",
+              "7.2"
+            ],
+            "quotes": [
+              "The same rule applies to values from off-tape commit records, which are `ResumeAppend` when they do not fit (Sections 3.4 and 14), and to positions a device reports, which are `TapeIo` when they do not fit or when they go backwards: the device, not the tape, is then at fault.",
+              "`TerminalIndexReplicaParse` includes a replica map that describes a position that does not fit (Section 7.2). `ResumeAppend` includes a commit record whose values do not fit, and `TapeIo` a device-reported position that does not fit or goes backwards (Section 2.4).",
+              "Derive the committed prefix from the off-tape commit records (Section 3.4), dropping the tape's torn tail, if any, and compute `W` and `T` from it.",
+              "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).",
+              "**Position to the append point (`Σ(block_count + 1)` over the prefix) before writing anything.**",
+              "Before a Resumer positions to an append point or writes, the validated combination of the records it relies on MUST determine exactly one committed prefix and its append point.",
+              "The append position after the last filemark is not a validity rule of the map; it is a Writer and Resumer concern (Sections 3.4 and 14).",
+              "The append point's inputs come from commit records, so its overflow is `ResumeAppend`, and the walk length's inputs are device reports, so its overflow is `TapeIo` (Section 2.4)."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-3.3-stripe-mapping-inverse",
+      "variant": "",
+      "clear_freeze_blocker": true,
+      "replaces": {
+        "expected": {
+          "one_of": [
+            "rejection (no Section 15 name)",
+            "successful reconstruction"
+          ],
+          "permitting_text": "Section 2.4 makes the overflow a rejection, but a Recoverer that tests data_index·S + stripe >= real_data_shard_count in epoch-relative space never overflows and recovers the block. Section 13.4 states the implicit-zero test as 'an ordinal ≥ protected_ordinal_end_exclusive'."
+        },
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "unit",
+          "author_observation": "Recoverer (peer classification, unit level)",
+          "expected": {
+            "result": "not rejected. The stripe-0 peer at data_index 1 has exact o = (2^64 − 2) + 1·2 + 0 = 2^64. The Recoverer compares it exactly with protected_ordinal_end_exclusive = 2^64 − 1 and classifies it as an implicit zero: an all-zero shard supplied without tape I/O, not an erasure. No error is raised and no wrapped ordinal (0) is used. Stripe 1's two data positions, o = 2^64 − 1 and 2^64 + 1, are implicit zeros in the same way.",
+            "error": null,
+            "sections": [
+              "3.3",
+              "2.4",
+              "13.4",
+              "6.4"
+            ],
+            "quotes": [
+              "That decision compares the exact value of `o` with the protected end, as Section 2.4 requires, so a position whose `o` would not fit in u64 is an implicit zero, and is not rejected.",
+              "A value that is only compared is compared exactly, and is never too large.",
+              "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4).",
+              "Implicit-zero positions are never erasures: the Recoverer supplies an all-zero block for them during reconstruction (Section 13.4).",
+              "Section 3.2's `LBA(f, b)` must fit for a map to be valid (Section 7.2). Section 3.3's inverse compares the exact ordinal, so an ordinal that would not fit is an implicit zero (Sections 2.4 and 3.3)."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-12.2-walk-length",
+      "variant": "",
+      "executes": "REM-PARITY 2.4 now decides a device-reported position that does not fit or goes backwards: TapeIo. The device report is injected under a4-minimal by a raw source that reports the file start as its post-space position, a position delta of 0; no tape byte changes.",
+      "replaces": {
+        "expected": {
+          "one_of": [
+            "TapeIo",
+            "FilemarkMapReconstruct"
+          ],
+          "permitting_text": "Section 12.2 calls a zero-block file 'structural damage' without naming an error; Section 15's TapeIo covers a 'transport/medium failure' and FilemarkMapReconstruct a walk that 'could not produce a valid map'."
+        },
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "walk",
+          "author_observation": "Scanner (Section 12.2 walk)",
+          "expected": {
+            "result": "TapeIo. The file's block count is the position delta minus one, 0 − 1 = −1, whose exact value does not fit in u64. It comes only from device-reported positions, so the device is at fault, not the tape. The Scanner must not report a wrapped count of 2^64 − 1, and must not classify the file as a zero-block file or as structural damage.",
+            "error": "TapeIo",
+            "sections": [
+              "12.2",
+              "2.4",
+              "7.2",
+              "3.5",
+              "15"
+            ],
+            "quotes": [
+              "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk.",
+              "The same rule applies to values from off-tape commit records, which are `ResumeAppend` when they do not fit (Sections 3.4 and 14), and to positions a device reports, which are `TapeIo` when they do not fit or when they go backwards: the device, not the tape, is then at fault.",
+              "A walked map's positions are device reports, so for it Section 2.4's `TapeIo` applies.",
+              "`TerminalIndexReplicaParse` includes a replica map that describes a position that does not fit (Section 7.2). `ResumeAppend` includes a commit record whose values do not fit, and `TapeIo` a device-reported position that does not fit or goes backwards (Section 2.4).",
+              "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations.",
+              "The append point's inputs come from commit records, so its overflow is `ResumeAppend`, and the walk length's inputs are device reports, so its overflow is `TapeIo` (Section 2.4)."
+            ],
+            "open": {
+              "permitted": [
+                "TapeIo"
+              ],
+              "silent": [
+                "The same rule applies to values from off-tape commit records, which are `ResumeAppend` when they do not fit (Sections 3.4 and 14), and to positions a device reports, which are `TapeIo` when they do not fit or when they go backwards: the device, not the tape, is then at fault.",
+                "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk.",
+                "A magic or CRC miss invalidates that candidate. A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+              ],
+              "note": "Section 2.4 names positions that do not fit or go backwards. A post-space position equal to the start position does neither; the derived count is what fails to fit. TapeIo is still the only name the text allows, and TT-2 states it. The text does not say whether the walk stops at this TapeIo or goes on to the next file: Section 8.4's abort rule covers discovery, not the walk."
+            }
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "a-H-seven",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "ParityMap",
+          "author_observation": "ParityMap parser / directory decoder",
+          "expected": {
+            "result": "valid. The directory's invariants hold: counts non-zero, entries ascending, the ranges partition [0, W), epoch ids consecutive. No invariant relates total, H and P. The ParityMap validates and is marked final, and the terminal replicas are unaffected, since they carry no ParityMap payload bytes.",
+            "error": null,
+            "sections": [
+              "10.1.5",
+              "13.3"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "directory primary",
+          "author_observation": "ParityMap parser / directory decoder",
+          "expected": {
+            "result": "valid. The directory's invariants hold: counts non-zero, entries ascending, the ranges partition [0, W), epoch ids consecutive. No invariant relates total, H and P. The ParityMap validates and is marked final, and the terminal replicas are unaffected, since they carry no ParityMap payload bytes.",
+            "error": null,
+            "sections": [
+              "10.1.5",
+              "13.3"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "directory tail",
+          "author_observation": "ParityMap parser / directory decoder",
+          "expected": {
+            "result": "valid. The directory's invariants hold: counts non-zero, entries ascending, the ranges partition [0, W), epoch ids consecutive. No invariant relates total, H and P. The ParityMap validates and is marked final, and the terminal replicas are unaffected, since they carry no ParityMap payload bytes.",
+            "error": null,
+            "sections": [
+              "10.1.5",
+              "13.3"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "recovery",
+          "author_observation": "Recoverer",
+          "expected": {
+            "result": "SidecarMetadataUnavailable for epoch 0. The footer (footer_crc64 broken) and the primary (header_crc64 broken) are invalid. The entry agrees with the map entry (tape file 2, epoch 0, [0, 4), 7 blocks), but it fails the rescue precondition total = 2H + P + 1, since 7 ≠ 2·7 + 4 + 1 = 19. It is therefore not available, and step 3 places no read. The formula 7 − 1 − 7 is never evaluated, so there is no underflow and no rejection of the ParityMap. No copy is validated, and the failure is scoped to epoch 0.",
+            "error": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "sections": [
+              "13.3",
+              "2.4",
+              "10.1.5",
+              "12.5",
+              "15"
+            ],
+            "quotes": [
+              "**Primary fallback.** If the footer is unreadable, unparseable, **or inconsistent with the map entry** — a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop — fall back to the primary header at block 0 (copy-kind and map-entry block-count cross-checks apply).",
+              "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+              "An entry is available whenever the tape's final ParityMap validates and is marked `is_final_directory`, reached through a validated replica's structural rows or found by the Section 8.4.1 walk.",
+              "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch.",
+              "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+              "Section 13.3's tail location is `H + P`, with the precondition `total = 2H + P + 1` and `H > 0`."
+            ],
+            "open": {
+              "permitted": [
+                "SidecarMetadataUnavailable{epoch_id: 0} (the Section 13.3 procedure as written: no step reaches the tail copy)",
+                "recovered, only on the reading that a Recoverer may find the intact tail copy by a route the text does not name (the map entry's block count with H recomputed by Section 9.4, or a parsed primary header's tail_header_start_block); Appendix D TT-2 leaves the neighbouring question open"
+              ],
+              "silent": [
+                "When no entry is available, a Recoverer whose primary copy validates MUST also read the tail copy at block `H + P`, where `H` is the primary's `sidecar_header_block_count` and `P = S × m`.",
+                "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+                "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+                "This is the **recovery-usable rule**: at least one valid header/index copy plus CRC-passing needed shards ⇒ the epoch is usable.",
+                "One stays open: whether a Recoverer may locate a sidecar's tail copy from its structural row when the ParityMap and the sidecar's primary header and footer are all unreadable (Section 13.3; `parity-map-and-sidecar`).",
+                "Contiguous damage at either end of the sidecar file leaves a survivable copy at the other; the footer makes the tail copy findable without trusting block arithmetic; and the sidecar epoch directory makes it findable even with the footer gone (Section 13.3)."
+              ],
+              "note": "Step 2 reads the tail only when the primary validates, and step 3 only through an available entry. Step 4's 'Only when' is a necessary condition, and the recovery-usable rule speaks of any valid copy, so the text does not in terms forbid another route. The expected outcome follows the procedure."
+            }
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "b-H-max",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "ParityMap",
+          "author_observation": "ParityMap parser / directory decoder",
+          "expected": {
+            "result": "valid. Key 6 = 2^64 − 1 is a canonical CBOR uint that fits u64 and is non-zero. The payload grows by 8 bytes with payload_len repaired, M stays 1, and no directory invariant is broken. The ParityMap validates.",
+            "error": null,
+            "sections": [
+              "10.1.5",
+              "10.1.2",
+              "13.3"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "directory primary",
+          "author_observation": "ParityMap parser / directory decoder",
+          "expected": {
+            "result": "valid. Key 6 = 2^64 − 1 is a canonical CBOR uint that fits u64 and is non-zero. The payload grows by 8 bytes with payload_len repaired, M stays 1, and no directory invariant is broken. The ParityMap validates.",
+            "error": null,
+            "sections": [
+              "10.1.5",
+              "10.1.2",
+              "13.3"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "directory tail",
+          "author_observation": "ParityMap parser / directory decoder",
+          "expected": {
+            "result": "valid. Key 6 = 2^64 − 1 is a canonical CBOR uint that fits u64 and is non-zero. The payload grows by 8 bytes with payload_len repaired, M stays 1, and no directory invariant is broken. The ParityMap validates.",
+            "error": null,
+            "sections": [
+              "10.1.5",
+              "10.1.2",
+              "13.3"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "recovery",
+          "author_observation": "Recoverer",
+          "expected": {
+            "result": "SidecarMetadataUnavailable for epoch 0. The precondition compares 7 exactly with 2(2^64 − 1) + 4 + 1 = 2^65 + 3; the comparison fails and is not an overflow. The entry is not available, no read is placed, and 7 − 1 − (2^64 − 1) is never evaluated. The footer and primary are invalid as in variant a, so no copy is validated.",
+            "error": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "sections": [
+              "13.3",
+              "2.4",
+              "10.1.5",
+              "12.5"
+            ],
+            "quotes": [
+              "**Primary fallback.** If the footer is unreadable, unparseable, **or inconsistent with the map entry** — a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop — fall back to the primary header at block 0 (copy-kind and map-entry block-count cross-checks apply).",
+              "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+              "An entry is available whenever the tape's final ParityMap validates and is marked `is_final_directory`, reached through a validated replica's structural rows or found by the Section 8.4.1 walk.",
+              "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch.",
+              "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+              "A value that is only compared is compared exactly, and is never too large."
+            ],
+            "open": {
+              "permitted": [
+                "SidecarMetadataUnavailable{epoch_id: 0} (the Section 13.3 procedure as written: no step reaches the tail copy)",
+                "recovered, only on the reading that a Recoverer may find the intact tail copy by a route the text does not name (the map entry's block count with H recomputed by Section 9.4, or a parsed primary header's tail_header_start_block); Appendix D TT-2 leaves the neighbouring question open"
+              ],
+              "silent": [
+                "When no entry is available, a Recoverer whose primary copy validates MUST also read the tail copy at block `H + P`, where `H` is the primary's `sidecar_header_block_count` and `P = S × m`.",
+                "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+                "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+                "This is the **recovery-usable rule**: at least one valid header/index copy plus CRC-passing needed shards ⇒ the epoch is usable.",
+                "One stays open: whether a Recoverer may locate a sidecar's tail copy from its structural row when the ParityMap and the sidecar's primary header and footer are all unreadable (Section 13.3; `parity-map-and-sidecar`).",
+                "Contiguous damage at either end of the sidecar file leaves a survivable copy at the other; the footer makes the tail copy findable without trusting block arithmetic; and the sidecar epoch directory makes it findable even with the footer gone (Section 13.3)."
+              ],
+              "note": "Step 2 reads the tail only when the primary validates, and step 3 only through an available entry. Step 4's 'Only when' is a necessary condition, and the recovery-usable rule speaks of any valid copy, so the text does not in terms forbid another route. The expected outcome follows the procedure."
+            }
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-10.1.2-M",
+      "variant": "isolated",
+      "replaces": {
+        "expected": "ParityMapParse",
+        "pinned": true
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "result": "accepted. M's exact value is ceil((0xC8 + (2^64 − 1)) / 2^18) = ceil((2^64 + 199) / 2^18) = 2^46 + 1, which fits in u64, and 2M + 1 = 2^47 + 3 fits too. The overflow of the intermediate sum 0xC8 + L is not a format violation, so the Reader must not reject for it. On an image, the locator would then fail on its disagreement with the measured file length (ParityMapParse); at unit level only the formula is evaluated.",
+            "error": null,
+            "sections": [
+              "2.4",
+              "10.1.2",
+              "10.1.4"
+            ],
+            "quotes": [
+              "Every formula in this document denotes its exact integer value.",
+              "An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it.",
+              "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy:",
+              "Under Section 2.4's exact-value rule, three pinned vectors describe inputs whose exact values fit, and are accepted: `overflow-10.1.2-M/isolated`, `overflow-10.4-record-geometry/isolated` and `overflow-10.3-manifest-range/isolated-2`."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-10.3-manifest-range",
+      "variant": "isolated-2",
+      "replaces": {
+        "expected": "TerminalIndexReplicaParse",
+        "pinned": true
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "result": "accepted. The product manifest_chunk_count × block_size_bytes = 2^46 × 2^18 = 2^64 is only compared, so it is compared exactly and is never too large: 1 ≤ 2^64 holds. The range 0 + 2^46 ≤ 2^46 holds, and the counts and size are positive. No rejection.",
+            "error": null,
+            "sections": [
+              "2.4",
+              "10.3"
+            ],
+            "quotes": [
+              "For plaintext rows, `manifest_chunk_count` and `manifest_size_bytes` MUST be positive, the manifest chunk range MUST fit within `stored_block_count`, and the manifest byte length MUST fit within `manifest_chunk_count × block_size_bytes`.",
+              "A value that is only compared is compared exactly, and is never too large.",
+              "Under Section 2.4's exact-value rule, three pinned vectors describe inputs whose exact values fit, and are accepted: `overflow-10.1.2-M/isolated`, `overflow-10.4-record-geometry/isolated` and `overflow-10.3-manifest-range/isolated-2`."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-9.2-SxK",
+      "variant": "isolated",
+      "replaces": {
+        "expected": {
+          "outcome": "rejection; no Section 15 name"
+        },
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "result": "no rejection. S × k = 2^63 × 2 = 2^64 is only compared in the named roles. The Section 13.3 pin compares k, m and S individually and the ordinal range, and Section 14's bound is T − W < S × k. So the product is compared exactly and never too large: for any u64 T − W the bound holds. No wrapped product (0) may be used; with a wrapped product the bound would wrongly fail.",
+            "error": null,
+            "sections": [
+              "2.4",
+              "9.2",
+              "13.3",
+              "14"
+            ],
+            "quotes": [
+              "A value that is only compared is compared exactly, and is never too large.",
+              "Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).",
+              "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-10.4-record-geometry",
+      "variant": "isolated",
+      "replaces": {
+        "expected": "TerminalIndexReplicaParse",
+        "pinned": true
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "result": "accepted. payload_len = 64 × (2^58 − 1) = 2^64 − 64; payload_record_count = ceil((2^64 − 64) / 2^18) = 2^46; payload_padding_bytes = 2^46 × 2^18 − (2^64 − 64) = 64; footer_block_offset = 2^46 + 1; replica_record_count = 2^46 + 2. Every exact value fits. The 2^64 product is an intermediate of one way of writing the formula, so the Reader must not reject for it.",
+            "error": null,
+            "sections": [
+              "10.4",
+              "10.6",
+              "2.4"
+            ],
+            "quotes": [
+              "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results. As Section 2.4 defines it, a formula evaluates without overflow when its exact value fits in u64.",
+              "An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it.",
+              "Every formula in this document denotes its exact integer value.",
+              "Under Section 2.4's exact-value rule, three pinned vectors describe inputs whose exact values fit, and are accepted: `overflow-10.1.2-M/isolated`, `overflow-10.4-record-geometry/isolated` and `overflow-10.3-manifest-range/isolated-2`."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "isolated-1",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "result": "SidecarMetadataUnavailable for epoch 0. Blocks 0 and 6 give medium errors, so the footer and primary are unreadable. The ParityMap validates (no invariant relates total, H and P), and the entry agrees with the map entry in tape file 2, epoch 0, [0, 4) and block count 7. It fails the second precondition, 7 ≠ 2·7 + 4 + 1, so it is not available and no read is placed. 7 − 1 − 7 is never evaluated, so there is no underflow, and neither DirectoryInvalid nor ParityMapParse applies.",
+            "error": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "sections": [
+              "13.3",
+              "10.1.5",
+              "12.5",
+              "2.4"
+            ],
+            "quotes": [
+              "**Primary fallback.** If the footer is unreadable, unparseable, **or inconsistent with the map entry** — a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop — fall back to the primary header at block 0 (copy-kind and map-entry block-count cross-checks apply).",
+              "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+              "An entry is available whenever the tape's final ParityMap validates and is marked `is_final_directory`, reached through a validated replica's structural rows or found by the Section 8.4.1 walk.",
+              "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch.",
+              "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+              "Section 13.3's tail location is `H + P`, with the precondition `total = 2H + P + 1` and `H > 0`."
+            ],
+            "open": {
+              "permitted": [
+                "SidecarMetadataUnavailable{epoch_id: 0} (the Section 13.3 procedure as written: no step reaches the tail copy)",
+                "recovered, only on the reading that a Recoverer may find the intact tail copy by a route the text does not name (the map entry's block count with H recomputed by Section 9.4, or a parsed primary header's tail_header_start_block); Appendix D TT-2 leaves the neighbouring question open"
+              ],
+              "silent": [
+                "When no entry is available, a Recoverer whose primary copy validates MUST also read the tail copy at block `H + P`, where `H` is the primary's `sidecar_header_block_count` and `P = S × m`.",
+                "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+                "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+                "This is the **recovery-usable rule**: at least one valid header/index copy plus CRC-passing needed shards ⇒ the epoch is usable.",
+                "One stays open: whether a Recoverer may locate a sidecar's tail copy from its structural row when the ParityMap and the sidecar's primary header and footer are all unreadable (Section 13.3; `parity-map-and-sidecar`).",
+                "Contiguous damage at either end of the sidecar file leaves a survivable copy at the other; the footer makes the tail copy findable without trusting block arithmetic; and the sidecar epoch directory makes it findable even with the footer gone (Section 13.3)."
+              ],
+              "note": "Step 2 reads the tail only when the primary validates, and step 3 only through an available entry. Step 4's 'Only when' is a necessary condition, and the recovery-usable rule speaks of any valid copy, so the text does not in terms forbid another route. The expected outcome follows the procedure."
+            }
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "isolated-2",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "result": "SidecarMetadataUnavailable for epoch 0. The precondition compares 7 exactly with 2(2^64 − 1) + 4 + 1 = 2^65 + 3; the comparison fails and is not an overflow, so the entry is not available. 7 − 1 − (2^64 − 1) is never evaluated. The ParityMap validates, with payload_len repaired and M still 1.",
+            "error": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "sections": [
+              "13.3",
+              "2.4",
+              "10.1.5",
+              "12.5"
+            ],
+            "quotes": [
+              "**Primary fallback.** If the footer is unreadable, unparseable, **or inconsistent with the map entry** — a footer that parses but contradicts the map is treated as an invalid footer, not as a hard stop — fall back to the primary header at block 0 (copy-kind and map-entry block-count cross-checks apply).",
+              "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+              "An entry is available whenever the tape's final ParityMap validates and is marked `is_final_directory`, reached through a validated replica's structural rows or found by the Section 8.4.1 walk.",
+              "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch.",
+              "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+              "A value that is only compared is compared exactly, and is never too large."
+            ],
+            "open": {
+              "permitted": [
+                "SidecarMetadataUnavailable{epoch_id: 0} (the Section 13.3 procedure as written: no step reaches the tail copy)",
+                "recovered, only on the reading that a Recoverer may find the intact tail copy by a route the text does not name (the map entry's block count with H recomputed by Section 9.4, or a parsed primary header's tail_header_start_block); Appendix D TT-2 leaves the neighbouring question open"
+              ],
+              "silent": [
+                "When no entry is available, a Recoverer whose primary copy validates MUST also read the tail copy at block `H + P`, where `H` is the primary's `sidecar_header_block_count` and `P = S × m`.",
+                "**Directory-assisted tail rescue.** If the primary also fails and a sidecar epoch directory entry is available: locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts, and verify its `canonical_metadata_hash` against the entry.",
+                "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5). A copy that the footer or the directory contradicts, or that step 2 leaves undecided, is not validated. The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+                "This is the **recovery-usable rule**: at least one valid header/index copy plus CRC-passing needed shards ⇒ the epoch is usable.",
+                "One stays open: whether a Recoverer may locate a sidecar's tail copy from its structural row when the ParityMap and the sidecar's primary header and footer are all unreadable (Section 13.3; `parity-map-and-sidecar`).",
+                "Contiguous damage at either end of the sidecar file leaves a survivable copy at the other; the footer makes the tail copy findable without trusting block arithmetic; and the sidecar epoch directory makes it findable even with the footer gone (Section 13.3)."
+              ],
+              "note": "Step 2 reads the tail only when the primary validates, and step 3 only through an available entry. Step 4's 'Only when' is a necessary condition, and the recovery-usable rule speaks of any valid copy, so the text does not in terms forbid another route. The expected outcome follows the procedure."
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

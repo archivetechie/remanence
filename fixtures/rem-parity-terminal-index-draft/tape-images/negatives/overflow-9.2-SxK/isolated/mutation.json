@@ -7,7 +7,7 @@
   "commit_record_inputs": null,
   "edits": [],
   "entry_points": [
-    "sidecar::checked_sidecar_shard_product"
+    "mapping::unprotected_ordinals_within_one_epoch (the Section 14 bound T − W < S × k)"
   ],
   "faults": [],
   "unit_inputs": {

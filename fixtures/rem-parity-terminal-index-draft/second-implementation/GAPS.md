@@ -863,3 +863,49 @@ rescue. Section 10.1.5 requires the entries' protected ranges to "partition
 `[0, scope_highest_protected_ordinal)`" with no gaps, so a validated
 directory omits no sidecar whose range lies in that span. No vector has such
 a directory.
+
+## L. The e2 cases (R2, F2)
+
+These were found while deciding the damage cases e2-01 to e2-04 and the
+resume cases e2-05 to e2-07. Each was decided from the text before any
+expected outcome was read, and none has been compared with one. The fault
+reader now also reads `read_data_addresses`. The resume inputs are now
+checked for unknown keys at every level, which settles J-6.
+
+**L-1. Section 13.1 gives the Recoverer failed addresses, not addresses to
+read (e2-01, e2-02).** The Recoverer's inputs include "the failed addresses —
+`(tape_file_number, object_block_index)` pairs or ordinals". The cases give
+addresses to read. *Decided:* each block is read and judged as Section 13.4
+judges a stripe position.
+- A read that succeeds, with a CRC that matches the index, returns the block.
+- "A record shorter or longer than one block is a read failure (Section
+  3.5)." So is a medium error. Either, or a CRC mismatch, makes the block a
+  failed block, which is then recovered.
+
+e2-01 (a 1000-byte record at (1, 0)) and e2-02 (a 524288-byte record at
+(1, 1)) are both recovered, from three trusted peers, and the rebuilt bytes
+equal the original.
+
+The text does not say whether a read that succeeds is checked against the
+index. No case exercises it, so no decision depends on it.
+
+**L-2. Fixture note: the e2 resume inputs carry `tape_faults`, not
+`append_object`.** The F2 brief names `append_object` as the new field, but
+none of e2-05 to e2-07 has it. What they add is `tape_faults`, with
+`record_edits` and `unreadable_records`. `append_object` is already optional
+in the older cases, and none of the three reaches step 4: e2-05 and e2-06
+refuse at step 3, and e2-07 at step 2. A case that reached step 4 without it
+would fail the run.
+
+**L-3. e2-04: the walk's classes when every record of each replica is
+unreadable.** Files 4, 6 and 8 have unreadable heads and footers, so no
+footer can establish their type, and the unreadable-head rule makes each an
+Object candidate. The walk validates against the final ParityMap, whose scope
+ends at tape file 3. The two separation extents are readable and undamaged,
+but with no planned layout the Verifier reports them `not_run`, as it does
+wherever no footer supplies a layout.
+
+**L-4. Fixture note: the manifest now pins the nine overflow-3.2-lba
+blocks.** R2's manifest pins the nine replica blocks of neg-44. My blocks
+match all nine in size and SHA-256. That comparison was run long after the
+neg-44 decision was written (F0).

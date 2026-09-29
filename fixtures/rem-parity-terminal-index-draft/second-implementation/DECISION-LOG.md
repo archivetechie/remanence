@@ -136,3 +136,12 @@ Checked and unchanged from F-T1b:
 - **neg-33/c-total-zero:** stays recovered through the rescue. Its footer and primary fail, its ParityMap does not validate (`DirectoryInvalid` at my level), and its replicas validate. The ParityMap's name stays the category {`DirectoryInvalid`, `ParityMapParse`}.
 - **sup-45:** stays `SidecarMetadataUnavailable`. The final ParityMap validates, so the rescue does not apply; before, it failed on an odd remainder. Only its note changed.
 - **The walk cases:** "A walked map does not qualify: it gains a validated scope only through a final ParityMap (Section 13.1), which this case lacks."
+
+## The e2 cases (F2)
+
+F2 adds decisions: e2-01 to e2-04 in `decisions.json` and
+`decisions-real-ids.json`, and e2-05 to e2-07 in the two resume files. No
+existing decision changed. Every earlier entry and trace is identical to its
+predecessor, and the other decision files are byte-identical.
+`negative-block-digests.json` changes only because the manifest now pins the
+nine overflow-3.2-lba blocks, which match.

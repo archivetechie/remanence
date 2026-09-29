@@ -1,0 +1,58 @@
+{
+  "T": 6,
+  "W": 4,
+  "committed_prefix": [
+    {
+      "block_count": 1,
+      "epoch_id": null,
+      "first_parity_data_ordinal": null,
+      "kind": "Bootstrap",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 0
+    },
+    {
+      "block_count": 4,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 0,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 1
+    },
+    {
+      "block_count": 7,
+      "epoch_id": 0,
+      "first_parity_data_ordinal": null,
+      "kind": "ParitySidecar",
+      "protected_ordinal_end_exclusive": 4,
+      "protected_ordinal_start": 0,
+      "tape_file_number": 2
+    },
+    {
+      "block_count": 2,
+      "epoch_id": null,
+      "first_parity_data_ordinal": 4,
+      "kind": "Object",
+      "protected_ordinal_end_exclusive": null,
+      "protected_ordinal_start": null,
+      "tape_file_number": 3
+    }
+  ],
+  "image": "unfinalized-open",
+  "tape_faults": {
+    "record_edits": [
+      {
+        "construction": "the first 1000 bytes of the original record",
+        "edits": [],
+        "lba": 15,
+        "length": 1000,
+        "original_length": 262144,
+        "record_index": 0,
+        "sha256": "a5fc6e13b0ab95f9250ea8e2af195459a55be9d62270cec6d4d216c9a3d626ce",
+        "tape_file": 3
+      }
+    ],
+    "unreadable_records": []
+  }
+}

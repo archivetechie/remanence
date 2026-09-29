@@ -508,12 +508,22 @@ fn try_read_bootstrap_at(
             // candidate size passes here and only rules out this candidate.
             hints.check_bootstrap_read_length(&read, block_size)?;
         }
+        // A record of another length rules this candidate out, judged by the
+        // raw layer's one length rule (REM-PARITY 3.5, 8.4).
+        if let Some(measured) = crate::raw::wrong_record_length(&read, block_size) {
+            return Err(ParityError::BootstrapParse(
+                if measured < block_size as u64 {
+                    format!(
+                        "short fixed-block bootstrap read: got {measured} bytes, expected {block_size}"
+                    )
+                } else {
+                    format!(
+                        "bootstrap block larger than candidate read size: actual {measured}, provided {block_size}"
+                    )
+                },
+            ));
+        }
         match read {
-            Ok(RawReadOutcome::Block { bytes, .. }) if bytes != block_size => {
-                return Err(ParityError::BootstrapParse(format!(
-                    "short fixed-block bootstrap read: got {bytes} bytes, expected {block_size}"
-                )));
-            }
             Ok(RawReadOutcome::Block { .. }) => {
                 if let Some(hints) = hints {
                     return match hints.classify_bootstrap(&buf)? {
@@ -557,14 +567,6 @@ fn try_read_bootstrap_at(
             Ok(RawReadOutcome::Filemark { .. }) => continue,
             Ok(RawReadOutcome::EndOfData { .. }) => {
                 return Err(ParityError::NoBootstrapAtPosition(target_lba));
-            }
-            Err(ParityError::TapeIo(remanence_library::TapeIoError::ReadBufferTooSmall {
-                actual,
-                provided,
-            })) => {
-                return Err(ParityError::BootstrapParse(format!(
-                    "bootstrap block larger than candidate read size: actual {actual}, provided {provided}"
-                )));
             }
             // Medium-error reads skip past the bad block and keep scanning.
             // Transport and other drive-state errors propagate; they do not

@@ -20,7 +20,8 @@ use crate::index_separation::{
     validate_index_separation_pair, IndexSeparationError, IndexSeparationInteriorBlockSource,
 };
 use crate::raw::{
-    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
+    RawTapeSource,
 };
 use crate::scan::{scan_reconstruct_filemark_map_with_report_mode, ScanDamageKind, ScanMode};
 use crate::tape_index_replica::{
@@ -1948,19 +1949,15 @@ fn expect_filemark(
             )
         })?
     ];
-    match source.read_record(&mut buffer) {
-        Ok(RawReadOutcome::Filemark { position_after })
+    match read_fixed_record(source, &mut buffer) {
+        Ok(FixedRecordRead::Filemark { position_after })
             if position_after.partition == position.partition
-                && position_after.lba
-                    == position.lba.checked_add(1).ok_or_else(|| {
-                        invalid_member(
-                            TerminalReplicaFailureKind::TrailingFilemark,
-                            "position after filemark overflows u64",
-                        )
-                    })? =>
+                && position.lba.checked_add(1) == Some(position_after.lba) =>
         {
             Ok(())
         }
+        // A record of any length where the filemark should be, including one
+        // of the wrong length (REM-PARITY 3.5), invalidates the member.
         Ok(outcome) => Err(invalid_member(
             TerminalReplicaFailureKind::TrailingFilemark,
             format!(
@@ -1985,18 +1982,21 @@ fn read_fixed_block(
     let expected = usize::try_from(block_size)
         .map_err(|_| ParityError::Invariant("terminal inventory block size does not fit usize"))?;
     let mut block = vec![0; expected];
-    match source.read_record(&mut block)? {
-        RawReadOutcome::Block {
-            bytes,
-            position_after,
-        } if bytes == expected
-            && position_after.partition == position.partition
-            && position_after.lba
-                == position.lba.checked_add(1).ok_or(ParityError::Invariant(
-                    "terminal inventory post-read LBA overflows u64",
-                ))? =>
+    // REM-PARITY 3.5: a record shorter or longer than one block is invalid
+    // content of its control component, so it invalidates this candidate and
+    // is never TapeIo. The post-read position is compared exactly.
+    match read_fixed_record(source, &mut block)? {
+        FixedRecordRead::Block { position_after }
+            if position_after.partition == position.partition
+                && position.lba.checked_add(1) == Some(position_after.lba) =>
         {
             Ok(block)
+        }
+        FixedRecordRead::WrongLength { measured_bytes } => {
+            Err(ParityError::TapeIndexReplica(format!(
+                "record at partition {} LBA {} is {measured_bytes} bytes, not one {expected}-byte block",
+                position.partition, position.lba
+            )))
         }
         outcome => Err(ParityError::TapeIndexReplica(format!(
             "expected {expected}-byte block at partition {} LBA {}, observed {outcome:?}",
@@ -2158,6 +2158,7 @@ fn inventory_error_to_verification(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raw::RawReadOutcome;
     use crate::tape_index_replica::{
         checked_tape_index_replica_layout, plan_tape_index_edition, plan_tape_index_replica,
         write_tape_index_replica, TapeIndexEditionDescriptor, TapeIndexReplicaObservation,
@@ -2418,11 +2419,16 @@ mod tests {
                     .ok_or(ParityError::Invariant("test post-read LBA overflows"))?,
             );
             match record {
+                // A longer record is consumed and reported as a drive reports
+                // it; a shorter one delivers its measured length.
+                Record::Block(block) if block.len() > buf.len() => {
+                    Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
+                        actual: block.len() as u32,
+                        provided: buf.len() as u32,
+                    }))
+                }
                 Record::Block(block) => {
-                    if block.len() != buf.len() {
-                        return Err(ParityError::Invariant("test record has wrong size"));
-                    }
-                    buf.copy_from_slice(block);
+                    buf[..block.len()].copy_from_slice(block);
                     Ok(RawReadOutcome::Block {
                         bytes: block.len(),
                         position_after,
@@ -3415,6 +3421,21 @@ mod tests {
         for source in &mut sources {
             reject_readable_foreign_bot_bootstrap(source, &TAPE_UUID, BLOCK_SIZE)
                 .expect("absence or medium damage does not prove a foreign Bootstrap");
+        }
+    }
+
+    /// REM-PARITY 3.5: a first record shorter or longer than one block shows
+    /// no foreign identity, so the probe leaves it to the walk; it is never a
+    /// device failure that aborts BOT recovery.
+    #[test]
+    fn bot_bootstrap_probe_leaves_a_record_of_the_wrong_length_to_the_walk() {
+        let mut bootstrap = bot_bootstrap();
+        for length in [bootstrap.len() / 2, 2 * bootstrap.len()] {
+            bootstrap.resize(length, 0);
+            let mut source =
+                RecordingSource::new(vec![Record::Block(bootstrap.clone()), Record::Filemark]);
+            reject_readable_foreign_bot_bootstrap(&mut source, &[0x99; 16], BLOCK_SIZE)
+                .unwrap_or_else(|e| panic!("length {length}: {e:?}"));
         }
     }
 

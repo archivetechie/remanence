@@ -181,3 +181,18 @@ pub(super) fn build(profile: &str) -> Result<BTreeMap<usize, Vec<Vec<u8>>>, Stri
     }
     Ok(files)
 }
+
+/// The recorded prefix's record counts, one per tape file before replica A,
+/// from the profile's writer inputs.
+pub(super) fn prefix_block_counts(profile: &str) -> Result<Vec<u64>, String> {
+    let input: Value = serde_json::from_slice(
+        &fs::read(fixture_root().join(profile).join("inputs.json")).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(input["structural_entries"]
+        .as_array()
+        .ok_or("structural entries")?
+        .iter()
+        .map(|e| n(e, "block_count"))
+        .collect())
+}

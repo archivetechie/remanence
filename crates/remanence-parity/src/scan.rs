@@ -25,7 +25,9 @@ use crate::parity_map::{
     classify_parity_map_header_block, read_final_parity_map, DecodedParityMapTapeFile,
 };
 use crate::raw::{
-    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    classify_fixed_record, device_position_error, read_fixed_record,
+    tape_error_is_current_medium_damage, wrong_record_length, FixedRecordRead,
+    PhysicalPositionHint, RawReadOutcome, RawTapeSource,
 };
 #[cfg(test)]
 use crate::recovery::read_directory_tail_index;
@@ -37,6 +39,7 @@ use crate::tape_index_replica::{
     derive_tape_index_replica_footer_magic, derive_tape_index_replica_header_magic,
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
 };
+#[cfg(test)]
 use remanence_library::TapeIoError;
 use std::time::{Duration, Instant};
 
@@ -127,7 +130,7 @@ impl ScanRecoveryHints {
 
     /// Judge the measured length of a first-record read that did not fill its
     /// read size exactly: a short read's `bytes`, or the `actual` of
-    /// [`TapeIoError::ReadBufferTooSmall`]. The comparison is always with the
+    /// [`remanence_library::TapeIoError::ReadBufferTooSmall`]. The comparison is always with the
     /// supplied block size (REM-PARITY 8.4), so at a candidate read size other
     /// than the supplied one, a record of the supplied length passes and only
     /// that candidate is ruled out by the caller. A read that fills its read
@@ -138,25 +141,25 @@ impl ScanRecoveryHints {
         read: &Result<RawReadOutcome, ParityError>,
         read_size: usize,
     ) -> Result<(), ParityError> {
-        match read {
-            Ok(RawReadOutcome::Block { bytes, .. }) if *bytes != read_size => self
-                .refuse_record_length(*bytes, || {
-                    format!(
-                        "short fixed-block bootstrap read: got {bytes} bytes, expected {}",
-                        self.block_size
-                    )
-                }),
-            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { actual, .. })) => {
-                let measured = usize::try_from(*actual).unwrap_or(usize::MAX);
-                self.refuse_record_length(measured, || {
-                    format!(
-                        "bootstrap block larger than supplied block size: got {actual} bytes, expected {}",
-                        self.block_size
-                    )
-                })
+        // The raw layer's one length judgement measures the record; the
+        // comparison here is with the supplied size.
+        let Some(measured) = wrong_record_length(read, read_size) else {
+            return Ok(());
+        };
+        let measured_usize = usize::try_from(measured).unwrap_or(usize::MAX);
+        self.refuse_record_length(measured_usize, || {
+            if measured_usize < read_size {
+                format!(
+                    "short fixed-block bootstrap read: got {measured} bytes, expected {}",
+                    self.block_size
+                )
+            } else {
+                format!(
+                    "bootstrap block larger than supplied block size: got {measured} bytes, expected {}",
+                    self.block_size
+                )
             }
-            _ => Ok(()),
-        }
+        })
     }
 
     /// Classify a recovery BOT block, refusing validated disagreements before
@@ -457,6 +460,10 @@ pub enum ScanDamageKind {
     /// was invalid. It remains a control file and never consumes Object
     /// ordinals or participates in Object-based overlays.
     InvalidTerminalControl,
+    /// The first record of a tape file after BOT was shorter or longer than
+    /// one block (REM-PARITY 3.5). It is invalid content, not a device failure:
+    /// the file is classified as for an unreadable head.
+    WrongLengthTapeFileHead,
 }
 
 /// One contiguous damaged region encountered by the structural scanner.
@@ -917,12 +924,37 @@ where
             // The measured length is judged before anything else.
             hints.check_bootstrap_read_length(&read, block_size_usize)?;
         }
-        match read {
+        // REM-PARITY 3.5: a head record shorter or longer than one block is a
+        // fact about the tape, never TapeIo.
+        let head = match classify_fixed_record(read, block_size_usize) {
+            Ok(FixedRecordRead::EndOfData { .. }) => ScanHeadRead::EndOfData,
+            Ok(FixedRecordRead::Filemark { .. }) => ScanHeadRead::Filemark,
+            Ok(FixedRecordRead::Block { .. }) => ScanHeadRead::Block,
+            Ok(FixedRecordRead::WrongLength { measured_bytes }) if at_bot => {
+                // The first record with a known block size (Sections 3.5, 8.4
+                // and 15): a record of another length is `BootstrapParse`.
+                return Err(ParityError::BootstrapParse(format!(
+                    "first record is {measured_bytes} bytes, not the known block size {block_size}"
+                )));
+            }
+            // Elsewhere it is an invalid candidate for every control rung that
+            // reads the head: the file is classified as for an unreadable head,
+            // by filemark spacing, the footer probes, and otherwise as an Object
+            // candidate. Its bytes are never read as a head.
+            Ok(FixedRecordRead::WrongLength { .. }) => {
+                ScanHeadRead::Invalid(ScanDamageKind::WrongLengthTapeFileHead)
+            }
+            Err(error) if scan_read_error_is_medium_damage(&error) => {
+                ScanHeadRead::Invalid(ScanDamageKind::UnreadableTapeFileHead)
+            }
+            Err(error) => return Err(error),
+        };
+        match head {
             // A filemark or EOD where the first record should be is an unreadable
             // bootstrap, never a refusal (REM-PARITY 8.4): the walk continues on
             // the supplied values, and ends here with no tape file 0 to map.
-            Ok(RawReadOutcome::EndOfData { .. }) => break,
-            Ok(RawReadOutcome::Filemark { .. }) => {
+            ScanHeadRead::EndOfData => break,
+            ScanHeadRead::Filemark => {
                 truncation = Some(ScanTailTruncation {
                     tape_file_number: builder.next_tape_file_number()?,
                     position: file_start,
@@ -930,13 +962,7 @@ where
                 });
                 break;
             }
-            Ok(RawReadOutcome::Block { bytes, .. }) if bytes != block_size_usize => {
-                return Err(filemark_scan_error(format!(
-                    "short fixed-block scan read at physical LBA {}: got {bytes}, expected {block_size_usize}",
-                    file_start.lba
-                )));
-            }
-            Ok(RawReadOutcome::Block { .. }) => {
+            ScanHeadRead::Block => {
                 let first_block = buf.clone();
                 let mut invalid_bootstrap = false;
                 if let Some(hints) = bot_hints {
@@ -1000,11 +1026,11 @@ where
                     return Ok(ScanReconstructionOutcome::Aborted(aborted));
                 }
             }
-            Err(error) if scan_read_error_is_medium_damage(&error) => {
+            ScanHeadRead::Invalid(kind) => {
                 damaged_regions.push(ScanDamagedRegion {
                     start: file_start,
                     block_count: 1,
-                    kind: ScanDamageKind::UnreadableTapeFileHead,
+                    kind,
                 });
                 if let Some(hints) = bot_hints {
                     bootstrap_recovery_hints = Some(hints.clone());
@@ -1038,7 +1064,6 @@ where
                     return Ok(ScanReconstructionOutcome::Aborted(aborted));
                 }
             }
-            Err(error) => return Err(error),
         }
     }
 
@@ -1082,6 +1107,16 @@ where
             elapsed: progress.elapsed,
         }),
     )
+}
+
+/// The walk's head read of one tape file, after REM-PARITY 3.5's length rule.
+enum ScanHeadRead {
+    EndOfData,
+    Filemark,
+    /// One block; its bytes are in the walk's buffer.
+    Block,
+    /// Unreadable, or a record of the wrong length: no head bytes to classify.
+    Invalid(ScanDamageKind),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1134,14 +1169,26 @@ fn measure_current_file(
         ));
     }
 
+    // Both positions are device reports (REM-PARITY 12.2 measures the file by
+    // filemark spacing), so a delta that goes backwards, or a count that does
+    // not fit, faults the device: `TapeIo`, never a wrapped count and never a
+    // zero-block file (Section 2.4).
     let consumed = outcome
         .position_after
         .lba
         .checked_sub(file_start.lba)
-        .ok_or_else(|| filemark_scan_error("scan position moved before file start"))?;
-    let block_count = consumed
-        .checked_sub(1)
-        .ok_or_else(|| filemark_scan_error("scan filemark position underflow"))?;
+        .ok_or_else(|| {
+            device_position_error(format_args!(
+                "went backwards: spacing from LBA {} over one filemark reported LBA {}",
+                file_start.lba, outcome.position_after.lba
+            ))
+        })?;
+    let block_count = consumed.checked_sub(1).ok_or_else(|| {
+        device_position_error(format_args!(
+            "did not advance past the filemark: spacing from LBA {} reported LBA {}, so the block count is -1",
+            file_start.lba, outcome.position_after.lba
+        ))
+    })?;
     if block_count == 0 {
         return Ok(MeasureCurrentFileOutcome::Truncated(
             ScanTailTruncationKind::ZeroBlockFile,
@@ -1511,6 +1558,12 @@ fn read_optional_fixed_block_at(
     block_within_file: u64,
     block_size: u32,
 ) -> Result<Option<Vec<u8>>, ParityError> {
+    // Every offset passed here is below the file's measured block count (the
+    // last block, or a tail copy that a footer whose total equals the measured
+    // count places inside the file), so the sum lies before the device's
+    // post-space position and cannot overflow. Were it to, the offset would be
+    // a recorded value outside the file, a format fact rather than a device
+    // report, so the distinction is kept and this stays a map error.
     let lba = file_start
         .lba
         .checked_add(block_within_file)
@@ -1522,11 +1575,15 @@ fn read_optional_fixed_block_at(
     let block_size_usize = usize::try_from(block_size)
         .map_err(|_| ParityError::Invariant("scan block size does not fit usize"))?;
     let mut buf = vec![0u8; block_size_usize];
-    match source.read_record(&mut buf) {
-        Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block_size_usize => Ok(Some(buf)),
-        Ok(RawReadOutcome::Block { .. })
-        | Ok(RawReadOutcome::Filemark { .. })
-        | Ok(RawReadOutcome::EndOfData { .. }) => Ok(None),
+    // A probed record of the wrong length (REM-PARITY 3.5), like a boundary or
+    // a medium error, is no candidate for the probed control structure.
+    match read_fixed_record(source, &mut buf) {
+        Ok(FixedRecordRead::Block { .. }) => Ok(Some(buf)),
+        Ok(
+            FixedRecordRead::WrongLength { .. }
+            | FixedRecordRead::Filemark { .. }
+            | FixedRecordRead::EndOfData { .. },
+        ) => Ok(None),
         Err(error) if scan_read_error_is_medium_damage(&error) => Ok(None),
         Err(error) => Err(error),
     }
@@ -2779,6 +2836,87 @@ mod tests {
                 kind: ScanTailTruncationKind::EmptyFile,
             })
         );
+    }
+
+    /// REM-PARITY 2.4 and 12.2: the walk's count comes from device-reported
+    /// positions, so a post-space position before the file's start, or equal
+    /// to it, faults the device: `TapeIo`, never a wrapped count, never a
+    /// zero-block file and never a map error.
+    #[test]
+    fn walk_measurement_faults_the_device_for_positions_that_go_nowhere() {
+        for start in [5, 1] {
+            let mut source = RecordingRawSource::new(vec![Record::Filemark]);
+            let error = measure_current_file(&mut source, PhysicalPositionHint::new(start))
+                .expect_err("a delta that does not fit is refused");
+            assert!(
+                matches!(error, ParityError::TapeIo(TapeIoError::OperationFailed(ref m)) if m.starts_with("device-reported position")),
+                "start {start}: {error:?}"
+            );
+        }
+    }
+
+    /// REM-PARITY 3.5: a head record shorter or longer than one block is a fact
+    /// about the tape. After BOT it is an invalid candidate for every control
+    /// rung: the walk classifies the file as for an unreadable head, notes the
+    /// damage, and continues. At BOT, with the block size known, it is
+    /// `BootstrapParse`. A probed last record of the wrong length is no
+    /// candidate either. None of these is `TapeIo`.
+    #[test]
+    fn walk_treats_records_of_the_wrong_length_as_invalid_content() {
+        let bot_map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)])
+            .expect("BOT-only map validates");
+        let bot = bootstrap_block(bot_map.digest(false).expect("BOT digest"), 0);
+        let size = BLOCK_SIZE as usize;
+        for head in [size - 1, 40, size + 1, 2 * size] {
+            let mut source = RecordingRawSource::new(vec![
+                Record::Block(bot.clone()),
+                Record::Filemark,
+                Record::Block(vec![0x5a; head]),
+                Record::Block(block(7)),
+                Record::Filemark,
+            ]);
+            let walked =
+                scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                    .unwrap_or_else(|e| panic!("head of {head} bytes aborted the walk: {e:?}"));
+            assert_eq!(walked.map.entries()[1].kind, TapeFileKind::Object, "{head}");
+            assert_eq!(walked.map.entries()[1].block_count, 2, "{head}");
+            assert!(
+                walked
+                    .damaged_regions
+                    .iter()
+                    .any(|region| region.start.lba == 2
+                        && region.kind == ScanDamageKind::WrongLengthTapeFileHead),
+                "{head}: {:?}",
+                walked.damaged_regions
+            );
+        }
+        for first in [size - 1, 2 * size] {
+            let mut source =
+                RecordingRawSource::new(vec![Record::Block(vec![0; first]), Record::Filemark]);
+            let error =
+                scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                    .expect_err("a first record of another length is refused");
+            assert!(
+                matches!(error, ParityError::BootstrapParse(_)),
+                "{first}: {error:?}"
+            );
+        }
+        // An unreadable head sends the walk to the footer probes; a last record
+        // of the wrong length there is no candidate, so the file stays an
+        // Object candidate.
+        for last in [size - 1, 2 * size] {
+            let mut source = RecordingRawSource::new(vec![
+                Record::Block(bot.clone()),
+                Record::Filemark,
+                Record::ReadFault(TestReadFault::Medium),
+                Record::Block(vec![0x5a; last]),
+                Record::Filemark,
+            ]);
+            let walked =
+                scan_reconstruct_filemark_map_with_report(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                    .unwrap_or_else(|e| panic!("probe of {last} bytes aborted the walk: {e:?}"));
+            assert_eq!(walked.map.entries()[1].kind, TapeFileKind::Object, "{last}");
+        }
     }
 
     #[test]

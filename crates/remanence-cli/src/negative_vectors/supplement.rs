@@ -525,6 +525,7 @@ pub fn resolve(v: &Value) -> Result<Resolved, String> {
         roles,
         targets,
         block,
+        injected: true,
     };
     assert_construction(&result)?;
     Ok(result)
@@ -686,7 +687,12 @@ fn unit_entries(parent: &str, variant: &str) -> Result<Vec<String>, String> {
         "overflow-8.3-component-starts" | "overflow-8.3-eod" => {
             vec!["TerminalTailLayout::validate"]
         }
-        "overflow-9.1-P" | "overflow-9.2-SxK" => vec!["sidecar::checked_sidecar_shard_product"],
+        "overflow-9.1-P" => vec!["sidecar::checked_sidecar_shard_product"],
+        // S × k is only compared (the Section 14 bound): every Resumer bound
+        // check uses this one exact comparison.
+        "overflow-9.2-SxK" => {
+            vec!["mapping::unprotected_ordinals_within_one_epoch (the Section 14 bound T − W < S × k)"]
+        }
         "overflow-9.1-total-2H-P-1" => vec!["sidecar::checked_sidecar_total_blocks"],
         "overflow-9.1-block-locator" => vec!["parity_block_position"],
         "overflow-10.1.2-M" | "overflow-10.1.2-2M-footer" => {
@@ -702,7 +708,11 @@ fn unit_entries(parent: &str, variant: &str) -> Result<Vec<String>, String> {
             "index_separation::checked_separation_footer_position",
         ],
         "overflow-10.4-footer-delta" => vec!["tape_index_replica::checked_replica_footer_position"],
-        "overflow-10.5-extent-geometry" => vec!["index_separation::checked_index_separation_bytes"],
+        // The production separation validator; the exact ceiling is asserted
+        // first, so a Reader that rejects at its intermediate cannot pass.
+        "overflow-10.5-extent-geometry" => vec![
+            "index_separation::index_separation_records (asserted to be 2^46) -> index_separation::plan_index_separation (the production separation validator)",
+        ],
         _ => return Err(format!("no public formula resolver for {parent}/{variant}")),
     };
     Ok(names.into_iter().map(str::to_string).collect())
@@ -727,8 +737,22 @@ fn unit(v: &Resolved, separation: bool) -> Result<(), ObservedError> {
             }
             l.validate().map_err(TapeIndexReplicaError::from)?;
         }
-        "overflow-9.1-P" | "overflow-9.2-SxK" => {
+        "overflow-9.1-P" => {
             sidecar::checked_sidecar_shard_product(1 << 63, 2)?;
+        }
+        "overflow-9.2-SxK" => {
+            // S = 2^63, k = 2, and the largest T − W: an exact comparison holds
+            // the bound; a wrapped product (0) would fail it.
+            if !remanence_parity::mapping::unprotected_ordinals_within_one_epoch(
+                u64::MAX,
+                1 << 63,
+                2,
+            ) {
+                return Err(ParityError::ResumeAppend(
+                    "T − W < S × k fails for S = 2^63, k = 2".into(),
+                )
+                .into());
+            }
         }
         "overflow-9.1-total-2H-P-1" => {
             sidecar::checked_sidecar_total_blocks(1 << 63, 4)?;
@@ -791,7 +815,24 @@ fn unit(v: &Resolved, separation: bool) -> Result<(), ObservedError> {
             }
         }
         "overflow-10.5-extent-geometry" => {
-            index_separation::checked_index_separation_bytes(BLOCK, u64::MAX)?;
+            // E = 2^64 − 1, B = 2^18: total_records is the exact ceiling 2^46,
+            // which the recorded count carries, so the validator's one
+            // violation is actual_bytes = 2^64 (REM-PARITY 10.5, 10.6, 2.4).
+            let records = index_separation_records(BLOCK, u64::MAX)?;
+            if records != 1 << 46 {
+                return Err(ObservedError::FormulaValue(records));
+            }
+            plan_index_separation(IndexSeparationDescriptor {
+                tape_uuid: [0x11; 16],
+                edition_id: [0x54; 16],
+                gap_ordinal: 1,
+                block_size: BLOCK,
+                nominal_extent_bytes: u64::MAX,
+                total_records: records,
+                compression_enabled: false,
+                terminal_layout: TerminalTailLayout::new(0, BLOCK, 1, 2, 3, records)
+                    .expect("a terminal layout with a 2^46-record extent fits"),
+            })?;
         }
         _ => unreachable!(),
     };
@@ -1302,14 +1343,18 @@ const ISOLATION_RULES: &[(&str, Option<&str>)] = &[
     ("overflow-9.1-total-2H-P-1/isolated", Some("sidecar parse error: sidecar total block count overflows")),
     ("overflow-9.1-block-locator/isolated", Some("sidecar parse error: sidecar parity block position overflows u64")),
     ("overflow-9.1-tail-start/isolated", Some("sidecar parse error: sidecar tail header start overflows")),
-    ("overflow-9.2-SxK/isolated", Some("sidecar parse error: sidecar shard product overflows")),
-    ("overflow-10.1.2-M/isolated", Some("parity-map parse error: parity-map replicated-control layout error: header plus payload length overflows u64")),
+    // Accepted under erratum set E2: an exact value that fits violates no rule.
+    ("overflow-9.2-SxK/isolated", None),
+    // Accepted under erratum set E2: an exact value that fits violates no rule.
+    ("overflow-10.1.2-M/isolated", None),
     ("overflow-10.4-slot-product/isolated-1", Some("terminal index payload authority failed: terminal tape-index replica error: structural slot byte count overflows u64")),
     ("overflow-10.4-slot-product/isolated-2", Some("Object-row slot byte count overflows u64")),
     ("overflow-10.4-slot-product/isolated-3", Some("terminal index payload authority failed: terminal tape-index replica error: tape-index payload length overflows u64")),
-    ("overflow-10.4-record-geometry/isolated", Some("terminal tape-index arithmetic overflow: payload record byte capacity")),
+    // Accepted under erratum set E2: an exact value that fits violates no rule.
+    ("overflow-10.4-record-geometry/isolated", None),
     ("overflow-10.3-manifest-range/isolated-1", Some("terminal index payload authority failed: terminal tape-index replica error: terminal tape-index replica error: plaintext manifest chunk range overflows")),
-    ("overflow-10.3-manifest-range/isolated-2", Some("terminal index payload authority failed: terminal tape-index replica error: plaintext manifest byte capacity overflows")),
+    // Accepted under erratum set E2: an exact value that fits violates no rule.
+    ("overflow-10.3-manifest-range/isolated-2", None),
     ("overflow-10.4-footer-delta/isolated-1", Some("arithmetic overflow: footer backward delta")),
     ("overflow-10.4-footer-delta/isolated-2", Some("terminal tape-index arithmetic overflow: observed footer LBA")),
     ("overflow-10.5-extent-geometry/isolated", Some("index separation arithmetic overflow: actual extent bytes")),
@@ -1356,13 +1401,15 @@ fn isolation_rule_matching_is_specific() {
         "overflow-8.3-eod/isolated",
         &o("terminal-tail arithmetic overflow: dense terminal tape-file number")
     ));
+    // The exact ceiling reaches the product, so only its own diagnostic
+    // isolates the target rule.
     assert!(!detail_matches(
-        "overflow-10.4-record-geometry/isolated",
-        &o("terminal tape-index arithmetic overflow: payload record ceiling division")
+        "overflow-10.5-extent-geometry/isolated",
+        &o("index separation arithmetic overflow: extent byte ceiling division")
     ));
     assert!(detail_matches(
-        "overflow-10.4-record-geometry/isolated",
-        &o("terminal tape-index arithmetic overflow: payload record byte capacity")
+        "overflow-10.5-extent-geometry/isolated",
+        &o("index separation arithmetic overflow: actual extent bytes")
     ));
 }
 
@@ -1373,6 +1420,8 @@ pub(super) fn execute(
     failures: &mut Vec<String>,
     adjudications: &Adjudications,
     seen_adjudications: &mut BTreeSet<(String, String, String)>,
+    errata: &erratum::Errata,
+    seen_errata: &mut BTreeSet<(String, String, String, String)>,
 ) {
     let source = source().expect("supplement source");
     let exceptions = parse_isolation_exceptions(
@@ -1432,33 +1481,55 @@ pub(super) fn execute(
             } else {
                 &variant["expected"]
             };
-            if adjudications.check_observation(
-                (id.into(), variant_name.into(), o.key.into()),
-                path,
-                &o,
-                expected,
-                seen_adjudications,
-                failures,
-            ) {
-                continue;
-            }
-            let matches = expected_matches(expected, &o);
-            let pinned = variant["pinned"].as_bool().unwrap();
-            let failed = o.name == "PANIC"
-                || (!matches && pinned)
-                || (v.descriptor["artifact"] == "unit level" && !matches);
-            let status = if failed {
-                "DISAGREEMENT"
-            } else if !pinned {
-                "INFORMATIVE"
+            let isolation = if let Some((entry, override_)) =
+                errata.observation("negative-cases-supplement.json", id, variant_name, o.key)
+            {
+                // Erratum set E2 replaces this pinned expectation.
+                seen_errata.insert((
+                    entry.source.clone(),
+                    entry.case.clone(),
+                    entry.variant.clone(),
+                    o.key.to_string(),
+                ));
+                let agrees = erratum::report(path, entry, override_, &o);
+                if !agrees || matches!(o.name, "PANIC" | "Invariant") {
+                    failures.push(format!("{path} [{}] (erratum)", o.key));
+                }
+                // An input the erratum accepts violates no rule, so there is no
+                // target check to isolate.
+                agrees && override_.outcome != "ACCEPTED" && !detail_matches(path, &o)
             } else {
-                "PASS"
+                if adjudications.check_observation(
+                    (id.into(), variant_name.into(), o.key.into()),
+                    path,
+                    &o,
+                    expected,
+                    seen_adjudications,
+                    failures,
+                ) {
+                    continue;
+                }
+                let matches = expected_matches(expected, &o);
+                let pinned = variant["pinned"].as_bool().unwrap();
+                let failed = o.name == "PANIC"
+                    || (!matches && pinned)
+                    || (v.descriptor["artifact"] == "unit level" && !matches);
+                let status = if failed {
+                    "DISAGREEMENT"
+                } else if !pinned {
+                    "INFORMATIVE"
+                } else {
+                    "PASS"
+                };
+                println!(
+                    "{status} {path} [{}]: expected {expected}; observed {}; {}; detail={:?}",
+                    o.key, o.outcome, o.location, o.detail
+                );
+                if failed {
+                    failures.push(format!("{path} [{}]", o.key));
+                }
+                matches && !detail_matches(path, &o)
             };
-            println!(
-                "{status} {path} [{}]: expected {expected}; observed {}; {}; detail={:?}",
-                o.key, o.outcome, o.location, o.detail
-            );
-            let isolation = matches && !detail_matches(path, &o);
             match exceptions.check(path, o.key, isolation, &mut seen_exceptions) {
                 Ok(Some(status)) => println!(
                     "{status} {path} [{}]: {}; target={}; detail={:?}",
@@ -1472,9 +1543,6 @@ pub(super) fn execute(
                     );
                     failures.push(error);
                 }
-            }
-            if failed {
-                failures.push(format!("{path} [{}]", o.key));
             }
         }
     }

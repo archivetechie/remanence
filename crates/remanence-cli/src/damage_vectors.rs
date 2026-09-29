@@ -12,7 +12,7 @@ use remanence_chaos::{
 };
 use remanence_library::scsi::ScsiError;
 use remanence_library::transport::{SgTransport, TimeoutClass, TransferOutcome};
-use remanence_library::DriveHandle;
+use remanence_library::{BlockRead, BlockSource, DriveHandle, TapeIoError};
 use remanence_parity::bootstrap::discover_bootstrap_with_recovery_hints;
 use remanence_parity::raw::tape_error_is_current_medium_damage;
 use remanence_parity::*;
@@ -87,6 +87,7 @@ fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
                     | "hints"
                     | "record_edits"
                     | "observations"
+                    | "read_data_addresses"
             ),
             "unknown fault map key {key}"
         );
@@ -530,8 +531,88 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
         }
         out["object_sha256_matches"] = json!(hashes_match);
     }
+    if let Some(reads) = faults.get("read_data_addresses") {
+        read_objects(
+            vector, &mut raw, &scoped, &scheme, uuid, block_size, reads, &mut out,
+        );
+    }
     out["observed_medium_error_lbas"] = json!(engine.observed_medium_error_lbas());
     out
+}
+
+/// Records every recovery attempt the object source reports.
+#[derive(Default)]
+struct RecoveryLog(Mutex<Vec<RecoveryEvent>>);
+impl ParityAuditHook for RecoveryLog {
+    fn on_recovery(&self, event: &RecoveryEvent) {
+        self.0.lock().unwrap().push(event.clone());
+    }
+}
+
+/// Read Object addresses through the production object source, the Reader
+/// that meets a record fault itself (REM-PARITY 3.5, 13.4). An address counts
+/// as recovered only when the source released the original block and reported
+/// reconstructing it from parity: a truncated over-length record would also
+/// release the original bytes, and must not count.
+#[allow(clippy::too_many_arguments)]
+fn read_objects(
+    vector: &VectorImage,
+    raw: &mut DriveHandleRawSource<'_>,
+    scoped: &ScopedFilemarkMap,
+    scheme: &ParityScheme,
+    uuid: [u8; 16],
+    block_size: u32,
+    reads: &Value,
+    out: &mut Value,
+) {
+    let mut all = true;
+    let mut results = serde_json::Map::new();
+    for address in reads.as_array().unwrap() {
+        let file = address[0].as_u64().unwrap();
+        let block = address[1].as_u64().unwrap();
+        let log = Arc::new(RecoveryLog::default());
+        let original = &vector.image.files[file as usize];
+        let offset = original.record_offsets[block as usize];
+        let expected = &original.bytes[offset..offset + block_size as usize];
+        let result = (|| -> Result<Vec<u8>, TapeIoError> {
+            let mut source = ObjectParitySource::open(
+                raw,
+                scheme.clone(),
+                uuid,
+                scoped.clone(),
+                block_size,
+                file,
+                OpenTrust::RequireValidated,
+            )
+            .map_err(|e| TapeIoError::OperationFailed(e.to_string()))?;
+            source.set_audit_hook(Some(log.clone()));
+            BlockSource::locate(&mut source, block)?;
+            let mut buf = vec![0; block_size as usize];
+            let n = source.read_block(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        })();
+        let events = log.0.lock().unwrap().clone();
+        let recovered_by_parity = events.iter().any(|e| {
+            e.at_requested == (file, block) && matches!(e.outcome, RecoveryOutcome::Recovered)
+        });
+        let entry = match result {
+            Ok(bytes) => {
+                let returned_original = bytes == expected;
+                all &= returned_original && recovered_by_parity;
+                json!({"returned_original": returned_original, "recovered_by_parity": recovered_by_parity,
+                    "lost_count": events.iter().find(|e| e.at_requested == (file, block)).map(|e| e.lost_blocks.len())})
+            }
+            Err(error) => {
+                all = false;
+                out["read_error"] = json!(format!("{error:?}"));
+                json!({"error": format!("{error:?}")})
+            }
+        };
+        results.insert(format!("({file}, {block})"), entry);
+    }
+    out["read"] = Value::Object(results);
+    out["read_recovered"] = json!(all);
 }
 
 /// Verification is an independent fixture check, including when discovery or
@@ -853,7 +934,9 @@ fn run(id: &str) {
         return;
     }
     let actual = execute(&vector, &faults, &faults["hints"]);
-    let failures = if pinned {
+    let failures = if case["erratum"] == "E2" {
+        compare_e2(id, &case["expected"], &actual)
+    } else if pinned {
         compare(&case["expected"], &actual)
     } else {
         Vec::new()
@@ -879,6 +962,154 @@ fn run(id: &str) {
     }
 }
 
+/// The walk classes the E2 author's phrases name: a phrase that starts with a
+/// structural kind names that kind; one that describes an Object candidate by
+/// elimination names Object. Any other phrase fails the case.
+fn e2_walk_class(phrase: &str) -> &'static str {
+    for kind in [
+        "Bootstrap",
+        "ParitySidecar",
+        "ParityMap",
+        "IndexSeparationExtent",
+        "TapeIndexReplica",
+    ] {
+        if phrase.starts_with(kind) {
+            return kind;
+        }
+    }
+    if phrase.contains("Object candidate") {
+        return "Object";
+    }
+    panic!("E2 classification phrase names no walk class: {phrase}")
+}
+
+/// Compare an E2 author's outcome with the executor's output. The author's
+/// entry is verbatim; the compared parts are its error and the leading clause
+/// of its result, through a closed vocabulary, and the component,
+/// classification and map notes where it gives them. An unknown key, clause or
+/// phrase fails the case rather than going uncompared.
+fn compare_e2(id: &str, expected: &Value, actual: &Value) -> Vec<String> {
+    for key in expected.as_object().expect("E2 expectation object").keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "result"
+                    | "error"
+                    | "sections"
+                    | "quotes"
+                    | "component"
+                    | "classification"
+                    | "map"
+                    | "open"
+            ),
+            "{id}: unknown E2 expectation key {key}"
+        );
+    }
+    let mut failures = Vec::new();
+    let mut check = |holds: bool, what: String| {
+        if !holds {
+            failures.push(what);
+        }
+    };
+    let no_error = actual.get("error").is_none() && actual.get("read_error").is_none();
+    match &expected["error"] {
+        Value::Null => check(no_error, "error: expected none".into()),
+        Value::String(name) if name == "BotStructuralRecoveryRequired" => check(
+            actual["outcome"] == "BotStructuralRecoveryRequired" && no_error,
+            "error: expected the explicit BotStructuralRecoveryRequired outcome and no failure"
+                .into(),
+        ),
+        other => panic!("{id}: no E2 vocabulary for error {other}"),
+    }
+    let result = expected["result"].as_str().expect("E2 result");
+    if result.starts_with("recovered.") {
+        check(
+            actual["read_recovered"] == true,
+            "result: expected every read address recovered from parity and released as the original".into(),
+        );
+    } else if result.starts_with("inventory returned, degraded.") {
+        check(
+            actual["inventory"] == true
+                && actual["inventory_unaffected"] == true
+                && actual["degraded"] == true,
+            "result: expected the image's own inventory, degraded".into(),
+        );
+    } else if result.starts_with(
+        "BotStructuralRecoveryRequired, and the walk produces a map that is validated against the final ParityMap. Terminal authority is reported as not recovered.",
+    ) {
+        check(
+            actual["walked_map_validated"] == true
+                && actual["terminal_authority_recovered"] == false,
+            "result: expected a walked map validated against the final ParityMap, with terminal authority not recovered".into(),
+        );
+    } else {
+        panic!("{id}: no E2 vocabulary for result {result}");
+    }
+    if let Some(component) = expected.get("component") {
+        for (who, what) in component.as_object().unwrap() {
+            let evidence = |i: usize| {
+                actual["replicas"][i]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            match (who.as_str(), what.as_str().unwrap()) {
+                ("replica C", "TerminalIndexReplicaParse (invalid, never TapeIo)") => check(
+                    evidence(2).starts_with("Invalid"),
+                    format!(
+                        "component replica C: expected invalid, observed {}",
+                        evidence(2)
+                    ),
+                ),
+                ("replicas A, B", "valid, agreeing") => {
+                    for i in [0, 1] {
+                        check(
+                            matches!(evidence(i).as_str(), "Valid" | "ConsistentEnvelope"),
+                            format!(
+                                "component replica {i}: expected valid, observed {}",
+                                evidence(i)
+                            ),
+                        );
+                    }
+                }
+                other => panic!("{id}: no E2 vocabulary for component {other:?}"),
+            }
+        }
+    }
+    if let Some(classification) = expected.get("classification") {
+        let classification = classification.as_object().unwrap();
+        check(
+            actual["walk_classes"].as_object().map(|c| c.len()) == Some(classification.len()),
+            format!(
+                "classification: expected {} tape files, observed {}",
+                classification.len(),
+                actual["walk_classes"]
+            ),
+        );
+        for (file, phrase) in classification {
+            let class = e2_walk_class(phrase.as_str().unwrap());
+            check(
+                actual["walk_classes"][file] == class,
+                format!(
+                    "classification {file}: expected {class}, observed {}",
+                    actual["walk_classes"][file]
+                ),
+            );
+        }
+    }
+    if let Some(map) = expected.get("map") {
+        assert!(
+            map.as_str().unwrap().starts_with("produced."),
+            "{id}: no E2 vocabulary for map {map}"
+        );
+        check(
+            actual["walked_map_validated"] == true,
+            "map: expected produced and validated".into(),
+        );
+    }
+    failures
+}
+
 macro_rules! cases { ($($name:ident => $id:literal),+ $(,)?) => { const CASE_IDS: &[&str] = &[$($id),+]; $(#[test] fn $name() { run($id); })+ }; }
 cases! {
     object_head => "object-head", burst_m => "burst-m", burst_m_plus_one => "burst-m-plus-one",
@@ -894,6 +1125,69 @@ cases! {
     e1_01 => "e1-01", e1_02 => "e1-02", e1_03 => "e1-03", e1_04 => "e1-04", e1_05 => "e1-05",
     e1_06 => "e1-06", e1_07 => "e1-07", e1_08 => "e1-08", e1_09 => "e1-09", e1_10 => "e1-10",
     e1_11 => "e1-11", e1_12 => "e1-12", e1_13 => "e1-13", e1_14 => "e1-14", e1_15 => "e1-15",
+    e2_01 => "e2-01", e2_02 => "e2-02", e2_03 => "e2-03", e2_04 => "e2-04",
+}
+
+/// Every E2 expectation quotes the specification text verbatim.
+#[test]
+fn e2_expectation_quotes_occur_in_the_specification() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let mut quotes = 0;
+    for case in frozen["cases"].as_array().unwrap() {
+        if case["erratum"] != "E2" {
+            continue;
+        }
+        for quote in case["expected"]["quotes"].as_array().unwrap() {
+            let quote = quote.as_str().unwrap();
+            assert!(
+                crate::tape_image_vectors::specification_quote_holds(quote),
+                "{}: quote not in the specification: {quote}",
+                case["id"]
+            );
+            quotes += 1;
+        }
+    }
+    assert!(quotes > 0, "no E2 quotes checked");
+}
+
+/// The E2 vocabulary fails closed on an unknown clause, key or phrase.
+#[test]
+fn e2_expectations_fail_closed() {
+    let recovered = json!({"result": "recovered. The block is rebuilt.", "error": null});
+    assert!(compare_e2("case", &recovered, &json!({"read_recovered": true})).is_empty());
+    assert_eq!(
+        compare_e2("case", &recovered, &json!({"read_recovered": false})).len(),
+        1
+    );
+    assert_eq!(
+        compare_e2(
+            "case",
+            &recovered,
+            &json!({"read_recovered": true, "read_error": "TapeIo"})
+        )
+        .len(),
+        1
+    );
+    for bad in [
+        json!({"result": "recovered, probably.", "error": null}),
+        json!({"result": "recovered.", "error": "TapeIo"}),
+        json!({"result": "recovered.", "error": null, "reasoning": "not compared"}),
+        json!({"result": "recovered.", "error": null, "component": {"replica D": "valid"}}),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| compare_e2("case", &bad, &json!({}))).is_err(),
+            "accepted {bad}"
+        );
+    }
+    assert!(std::panic::catch_unwind(|| e2_walk_class("a tape file")).is_err());
+    assert_eq!(
+        e2_walk_class("replica B, as file 4: Object candidate, 3 blocks"),
+        "Object"
+    );
+    assert_eq!(
+        e2_walk_class("ParitySidecar (item 5): epoch 0"),
+        "ParitySidecar"
+    );
 }
 
 /// A pending or unknown expectation fails, and every compared difference is a

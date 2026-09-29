@@ -13,11 +13,12 @@ use base64::Engine as _;
 use remanence_aead::{KeyFrame, RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 use remanence_parity::{
     bootstrap::discover_bootstrap_with_recovery_hints, read_terminal_index_inventory,
-    scan_reconstruct_filemark_map_with_report_mode, FilemarkMap, ImageDirectoryRawSource,
-    ObjectRecoveryRepresentation, ParityError, RawReadOutcome, RawTapeSource, ScanDamageKind,
-    ScanDamagedRegion, ScanMode, ScanRecoveryHints, ScanTailTruncation, ScanTailTruncationKind,
-    TapeFileKind, TapeFileMapEntry, TapeFilePosition, TapeIndexReplicaFileKind,
-    TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow, TerminalInventoryOutcome,
+    scan_reconstruct_filemark_map_with_report_mode, FilemarkMap, FixedRecordRead,
+    ImageDirectoryRawSource, ObjectRecoveryRepresentation, ParityError, RawTapeSource,
+    ScanDamageKind, ScanDamagedRegion, ScanMode, ScanRecoveryHints, ScanTailTruncation,
+    ScanTailTruncationKind, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
+    TerminalInventoryOutcome,
 };
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -107,6 +108,7 @@ impl From<ScanDamagedRegion> for RecoveryDamageRegion {
                 ScanDamageKind::UnreadableTapeFileHead => "unreadable_tape_file_head",
                 ScanDamageKind::ClassificationCountMismatch => "classification_count_mismatch",
                 ScanDamageKind::InvalidTerminalControl => "invalid_terminal_control",
+                ScanDamageKind::WrongLengthTapeFileHead => "wrong_length_tape_file_head",
             },
         }
     }
@@ -1070,16 +1072,19 @@ fn read_object_block(
     source
         .locate_physical(position)
         .map_err(|error| format!("locate LBA {}: {error}", position.lba))?;
-    match source.read_record(buf) {
-        Ok(RawReadOutcome::Block { bytes, .. }) if bytes == buf.len() => Ok(()),
-        Ok(RawReadOutcome::Block { bytes, .. }) => Err(format!(
-            "short block at LBA {}: {bytes} bytes",
-            position.lba
+    // REM-PARITY 3.5: a record shorter or longer than one block is a fact
+    // about the tape, reported with its measured length, not a device failure.
+    match remanence_parity::read_fixed_record(source, buf) {
+        Ok(FixedRecordRead::Block { .. }) => Ok(()),
+        Ok(FixedRecordRead::WrongLength { measured_bytes }) => Err(format!(
+            "record of the wrong length at LBA {}: {measured_bytes} bytes, not one {}-byte block",
+            position.lba,
+            buf.len()
         )),
-        Ok(RawReadOutcome::Filemark { .. }) => {
+        Ok(FixedRecordRead::Filemark { .. }) => {
             Err(format!("unexpected filemark at LBA {}", position.lba))
         }
-        Ok(RawReadOutcome::EndOfData { .. }) => {
+        Ok(FixedRecordRead::EndOfData { .. }) => {
             Err(format!("unexpected end of data at LBA {}", position.lba))
         }
         Err(error) => Err(format!("unreadable at LBA {}: {error}", position.lba)),
@@ -1242,6 +1247,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use remanence_parity::RawReadOutcome;
 
     const BLOCK_SIZE: u32 = 262_144;
     const TAPE_UUID: [u8; 16] = [0x42; 16];

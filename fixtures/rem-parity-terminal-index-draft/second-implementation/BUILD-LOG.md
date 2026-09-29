@@ -26,6 +26,7 @@ No change to the builder may follow a failed comparison without a row here.
 | 16 | the e1 damage cases and the E1 negative (F1): the 15 cases' record edits against my build of a4-minimal (every stated old byte, every edited record's SHA-256, and my own CRC for the nine edits that say they recompute one); e1-16's mutated bootstrap against `tape-images/negatives/MANIFEST.tsv`; then every other decision file regenerated, byte-identical (`resume`, `negatives`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide`, blind and real ids, and their traces; `negative-block-digests.json`) | 15 records, 23 byte edits, 9 CRCs, 1 block | 0 |
 | 17 | everything, after the changes for the owner's rulings (F-T1b, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
 | 18 | everything, after the narrowed rescue and the revised Section 2.2 (F-T1c, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
+| 19 | the e2 cases and the R2 manifest (F2): the record edits of e2-01 to e2-05 against my builds (every stated length and the SHA-256 of each result); the nine overflow-3.2-lba blocks against `tape-images/negatives/MANIFEST.tsv`; then every decision file regenerated, byte-identical (`negatives`, `negative-e1`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide` and `resume`, blind and real ids, and the traces; `negative-block-digests.json`) | 5 records, 9 blocks | 0 |
 
 ## Failed comparisons
 
@@ -277,6 +278,33 @@ changed.
   directory entry or, under the rescue's conditions, through the map entry.
 - The negatives table re-decides neg-33/a and neg-33/b, and the supplement
   table sup-16 and sup-17, back to `SidecarMetadataUnavailable`.
+
+## Changes for the e2 cases (F2)
+
+These changes add inputs. They change no decision in any earlier file, and
+run 19 confirms that.
+
+- The fault reader knows `read_data_addresses`. Each address is a
+  `[tape_file, block]` pair.
+- `read_address` judges a requested block as Section 13.4 judges a stripe
+  position (GAPS L-1). A read failure, a record of the wrong length, or a
+  CRC mismatch sends it to recovery. Otherwise the block is returned as read.
+- The Recoverer's peer reads, and the Verifier's data and parity reads,
+  report a record of the wrong length as a read failure instead of a CRC
+  mismatch. No earlier case had such a record.
+- Resume inputs are checked like fault maps (`validate_resume_case`): the
+  top level, prefix entries, `append_object` and its options, and
+  `tape_faults`. `resume` exits with status 2 on a refusal, as `decide` does,
+  and a case that reaches step 4 with no `append_object` fails the run.
+- `tape_faults` damages the tape the Resumer re-reads. Record edits are
+  checked as in `decide`, and each unreadable record's LBA is checked against
+  the image layout.
+- Step 2's refusal for a prefix whose finalization has begun now cites that
+  sentence in the decision as well as in step 2.
+- `blind-mapping.json` and `blind-resume-mapping.json` map the e2 ids to
+  themselves.
+- `test_unpinned_and_unit_cases` expects the nine overflow-3.2-lba rows to
+  match, now that the manifest pins them. No decision changed.
 
 ## Known divergences, not changed
 

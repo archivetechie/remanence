@@ -13,6 +13,7 @@ use crate::diagnostic_text::{
     WRITE_TIMESTAMP_MAX_BYTES,
 };
 use crate::error::ParityError;
+use crate::filemark_map::PhysicalPrefix;
 use crate::sidecar::crc64_xz;
 use crate::tape_index::{
     checked_tape_index_payload_byte_len, decode_tape_index_payload_map_entry_slot,
@@ -452,25 +453,14 @@ fn checked_tape_index_replica_layout_after_block_size(
 ) -> Result<TapeIndexReplicaLayout, TapeIndexReplicaError> {
     let payload_len = checked_tape_index_payload_len(counts)?;
     let block_size_u64 = u64::from(block_size);
-    let payload_record_count = if payload_len == 0 {
-        0
-    } else {
-        payload_len.checked_add(block_size_u64 - 1).ok_or(
-            TapeIndexReplicaError::ArithmeticOverflow {
-                context: "payload record ceiling division",
-            },
-        )? / block_size_u64
+    // Section 10.4's formulas denote exact values (REM-PARITY 2.4): the ceiling
+    // and the padding `count x B - len` are formed without their intermediate
+    // sum or product, which may exceed u64 when the exact results fit.
+    let payload_record_count = payload_len.div_ceil(block_size_u64);
+    let payload_padding_bytes = match payload_len % block_size_u64 {
+        0 => 0,
+        partial => block_size_u64 - partial,
     };
-    let payload_capacity = payload_record_count.checked_mul(block_size_u64).ok_or(
-        TapeIndexReplicaError::ArithmeticOverflow {
-            context: "payload record byte capacity",
-        },
-    )?;
-    let payload_padding_bytes = payload_capacity.checked_sub(payload_len).ok_or(
-        TapeIndexReplicaError::ArithmeticOverflow {
-            context: "payload padding subtraction",
-        },
-    )?;
     let footer_block_offset =
         payload_record_count
             .checked_add(1)
@@ -880,7 +870,7 @@ where
     let mut expected_data_ordinal = 0u64;
     let mut expected_protected_ordinal = 0u64;
     let mut expected_epoch_id = 0u64;
-    let mut covered_prefix_end_lba = 0u64;
+    let mut physical_prefix = PhysicalPrefix::new();
     let mut final_parity_map_seen = false;
     let mut sidecar_seen = false;
     let mut previous_row_file_number = None;
@@ -999,12 +989,17 @@ where
                         context: "structural tape-file sequence",
                     },
                 )?;
-                covered_prefix_end_lba = covered_prefix_end_lba
-                    .checked_add(entry.block_count)
-                    .and_then(|value| value.checked_add(1))
-                    .ok_or(TapeIndexReplicaError::ArithmeticOverflow {
-                        context: "covered prefix records plus filemarks",
-                    })?;
+                // REM-PARITY 7.2: every record and trailing filemark position
+                // the map describes must fit in u64, the rule every map
+                // validation path shares.
+                physical_prefix.push(entry.block_count).map_err(|_| {
+                    TapeIndexReplicaError::Payload {
+                        message: format!(
+                            "structural entry {} describes a record or filemark position beyond u64",
+                            entry.tape_file_number
+                        ),
+                    }
+                })?;
                 match entry.kind {
                     TapeIndexPayloadFileKind::Object => {
                         let first = entry.first_parity_data_ordinal.ok_or_else(|| {
@@ -1220,6 +1215,14 @@ where
             field: "canonical map SHA-256",
         });
     }
+    // The covered prefix ends where replica A starts, so that position is a
+    // real position and must fit too.
+    let covered_prefix_end_lba =
+        physical_prefix
+            .end()
+            .ok_or(TapeIndexReplicaError::ArithmeticOverflow {
+                context: "covered prefix records plus filemarks",
+            })?;
     let planned_start = plan.component_for_a()?.planned_start_lba;
     if covered_prefix_end_lba != planned_start {
         return Err(TapeIndexReplicaError::PlanMismatch {
@@ -2858,5 +2861,34 @@ mod tests {
             parse_tape_index_replica_header(&corrupt, &[0x11; 16]),
             Err(TapeIndexReplicaError::ReservedNonzero { .. })
         ));
+    }
+
+    /// REM-PARITY 2.4 and 10.4: the record geometry denotes exact values. With
+    /// payload_len = 2^64 − 64 the ceiling is 2^46 and the padding 64, although
+    /// both `len + B − 1` and `count × B` exceed u64.
+    #[test]
+    fn replica_record_geometry_is_exact() {
+        let layout = checked_tape_index_replica_layout(
+            256 * 1024,
+            TapeIndexReplicaCounts {
+                structural_entry_count: (1 << 58) - 1,
+                object_row_count: 0,
+            },
+        )
+        .expect("every exact value fits");
+        assert_eq!(layout.payload_len, u64::MAX - 63);
+        assert_eq!(layout.payload_record_count, 1 << 46);
+        assert_eq!(layout.payload_padding_bytes, 64);
+        assert_eq!(layout.footer_block_offset, (1 << 46) + 1);
+        assert_eq!(layout.replica_record_count, (1 << 46) + 2);
+        let exact = checked_tape_index_replica_layout(
+            256 * 1024,
+            TapeIndexReplicaCounts {
+                structural_entry_count: 4096,
+                object_row_count: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(exact.payload_padding_bytes, 0);
     }
 }

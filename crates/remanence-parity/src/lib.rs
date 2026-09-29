@@ -128,7 +128,8 @@ pub use parity_map::{
     SIDECAR_DIRECTORY_FLAG_PRIMARY_KNOWN_GOOD, SIDECAR_DIRECTORY_FLAG_TAIL_KNOWN_GOOD,
 };
 pub use raw::{
-    BlockSinkRawTapeSink, BlockSourceRawTapeSource, DriveHandleRawSink, DriveHandleRawSource,
+    classify_fixed_record, read_fixed_record, wrong_record_length, BlockSinkRawTapeSink,
+    BlockSourceRawTapeSource, DriveHandleRawSink, DriveHandleRawSource, FixedRecordRead,
     ImageDirectoryRawSource, PhysicalPositionHint, RawReadOutcome, RawTapeSink, RawTapeSource,
     RawWriteOutcome, SpaceFilemarksOutcome, TapeGeometryHint,
 };

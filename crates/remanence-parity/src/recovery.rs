@@ -18,11 +18,12 @@ use crate::filemark_map::{
 };
 #[cfg(test)]
 use crate::mapping::{data_shards_per_epoch, ordinal_to_stripe};
-use crate::mapping::{ordinal_to_stripe_in_epoch, stripe_data_to_ordinal_in_epoch};
+use crate::mapping::{ordinal_to_stripe_in_epoch, stripe_data_shard_in_epoch, EpochDataShard};
 use crate::model::{ParityScheme, SidecarMetadataHealth, StripeAddress, StripePosition};
 use crate::parity_map::{read_final_sidecar_directory, SidecarEpochDirectoryEntry};
 use crate::raw::{
-    tape_error_is_current_medium_damage, PhysicalPositionHint, RawReadOutcome, RawTapeSource,
+    read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
+    RawTapeSource,
 };
 use crate::sidecar::{
     data_shard_crc64, parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
@@ -132,8 +133,7 @@ pub fn recover_object_region_from_sidecar(
     let end_body_lba = start_body_lba
         .checked_add(block_count)
         .ok_or(ParityError::Invariant("bulk recovery range overflows"))?;
-    let capacity = usize::try_from(block_count)
-        .map_err(|_| ParityError::Invariant("bulk recovery block_count does not fit usize"))?;
+    let capacity = ParityError::host_usize(block_count, "bulk recovery block count")?;
     let mut epochs: BTreeMap<u64, EpochRegionRequest> = BTreeMap::new();
     let mut output_order = Vec::with_capacity(capacity);
 
@@ -330,20 +330,21 @@ fn recover_ordinal_from_sidecar_inside_boundary(
         let position = StripePosition::Data {
             index: data_index as u16,
         };
-        let ordinal = stripe_data_to_ordinal_in_epoch(
+        let shard = stripe_data_shard_in_epoch(
             &StripeAddress {
                 neighborhood: failed_stripe.neighborhood,
                 stripe_index: failed_stripe.stripe_index,
                 position,
             },
             epoch_start,
+            sidecar.index.header.protected_ordinal_end_exclusive,
             scheme,
         )?;
         attempted[data_index] = true;
-        if ordinal >= sidecar.index.header.protected_ordinal_end_exclusive {
+        let EpochDataShard::Real { ordinal } = shard else {
             shards[data_index] = Some(vec![0u8; block_size as usize]);
             continue;
-        }
+        };
 
         if let Some(peer) = read_verified_data_peer(
             source,
@@ -411,6 +412,10 @@ fn recover_ordinal_from_sidecar_inside_boundary(
         .map
         .position_for_ordinal(failed_ordinal)
         .and_then(|position| scoped_map.map.physical_position(position))?;
+    // Map-derived, not a device report: a validated map's trailing filemark
+    // position fits in u64 (REM-PARITY 7.2, `validate_entries`), and every
+    // record's next position is at most that filemark's, so this addition never
+    // saturates.
     source.locate_physical(PhysicalPositionHint {
         lba: failed_position.lba.saturating_add(1),
         partition: failed_position.partition,
@@ -537,18 +542,19 @@ fn read_bulk_window_peers(
             if requested_indexes.contains(&data_index) {
                 continue;
             }
-            let ordinal = stripe_data_to_ordinal_in_epoch(
+            let EpochDataShard::Real { ordinal } = stripe_data_shard_in_epoch(
                 &StripeAddress {
                     neighborhood: sidecar.header.epoch_id,
                     stripe_index: *stripe_index,
                     position: StripePosition::Data { index: data_index },
                 },
                 epoch_start,
+                sidecar.header.protected_ordinal_end_exclusive,
                 scheme,
-            )?;
-            if ordinal >= sidecar.header.protected_ordinal_end_exclusive {
+            )?
+            else {
                 continue;
-            }
+            };
             let position = scoped_map.map.position_for_ordinal(ordinal)?;
             if !read_boundary.contains_committed_tape_file(position.tape_file_number) {
                 continue;
@@ -647,16 +653,17 @@ fn recover_bulk_stripe_from_cache(
         if requested_by_index.contains_key(&data_index) {
             continue;
         }
-        let ordinal = stripe_data_to_ordinal_in_epoch(
+        let shard = stripe_data_shard_in_epoch(
             &StripeAddress {
                 neighborhood: epoch_id,
                 stripe_index,
                 position: StripePosition::Data { index: data_index },
             },
             epoch_start,
+            sidecar.header.protected_ordinal_end_exclusive,
             scheme,
         )?;
-        if ordinal >= sidecar.header.protected_ordinal_end_exclusive {
+        if shard == EpochDataShard::ImplicitZero {
             shards[shard_index] = Some(vec![0u8; block_size as usize]);
             continue;
         }
@@ -1110,32 +1117,22 @@ pub(crate) fn read_directory_tail_index(
     }
     let h = entry.sidecar_header_block_count;
     let parity = entry.parity_shard_block_count;
-    if h == 0 {
-        return Err(ParityError::SidecarParse(
-            "sidecar directory records a zero header block count".into(),
-        ));
+    // REM-PARITY 13.3 step 3: the rescue requires the entry's
+    // sidecar_total_block_count to equal 2H + P + 1, with H > 0. These are
+    // preconditions of the rescue, not Section 10.1.5 invariants: an entry that
+    // fails one is not available, no read is placed from it, and the epoch is
+    // metadata-unavailable (step 4). The comparison is exact (Section 2.4), so
+    // a large H or P fails it; it never overflows and never rejects the map.
+    let consistent_total =
+        u128::from(h) * 2 + u128::from(parity) + 1 == u128::from(entry.sidecar_total_block_count);
+    if h == 0 || !consistent_total {
+        return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
     }
     // Section 9.1 layout: primary 0..H-1, parity shards H..H+P-1, tail copy
-    // H+P..2H+P-1, footer at 2H+P. The directory carries both H and P, which is
-    // what lets the tail be located with the primary header and footer gone.
-    // Directory counts come from tape bytes, so an overflow is a malformed
-    // entry (the epoch stays metadata-unavailable), not an internal invariant failure.
-    let tail_start = h.checked_add(parity).ok_or_else(|| {
-        ParityError::SidecarParse("sidecar directory tail copy start overflows".into())
-    })?;
-    let tail_end = tail_start.checked_add(h).ok_or_else(|| {
-        ParityError::SidecarParse("sidecar directory tail copy range overflows".into())
-    })?;
-    let expected_total = tail_end
-        .checked_add(1)
-        .ok_or_else(|| ParityError::SidecarParse("sidecar directory total overflows".into()))?;
-    if expected_total != sidecar_entry.block_count {
-        return Err(ParityError::SidecarParse(format!(
-            "sidecar directory geometry 2H+P+1 = {expected_total} does not match \
-             map block_count {}",
-            sidecar_entry.block_count
-        )));
-    }
+    // H+P..2H+P-1, footer at 2H+P. Section 13.3 locates the tail copy at H + P.
+    // With 2H + P + 1 equal to a u64 total, every tail block position below
+    // fits.
+    let tail_start = h + parity;
 
     let mut blocks = Vec::new();
     for offset in 0..h {
@@ -1145,9 +1142,15 @@ pub(crate) fn read_directory_tail_index(
         })?;
         source.locate_physical(physical)?;
         let mut block = vec![0; block_size as usize];
-        match source.read_record(&mut block) {
-            Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block.len() => blocks.push(block),
-            Ok(_) => return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry)),
+        match read_fixed_record(source, &mut block) {
+            Ok(FixedRecordRead::Block { .. }) => blocks.push(block),
+            // A boundary, or a record of the wrong length (REM-PARITY 3.5), is
+            // invalid content of this copy: the copy is not validated.
+            Ok(
+                FixedRecordRead::WrongLength { .. }
+                | FixedRecordRead::Filemark { .. }
+                | FixedRecordRead::EndOfData { .. },
+            ) => return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry)),
             Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => {
                 return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
             }
@@ -1198,8 +1201,7 @@ fn read_primary_sidecar_index_without_footer(
         )));
     }
 
-    let h = usize::try_from(header.shard_index_block_count)
-        .map_err(|_| ParityError::Invariant("sidecar index block count overflows usize"))?;
+    let h = ParityError::host_usize(header.shard_index_block_count, "sidecar index block count")?;
     let mut blocks = Vec::with_capacity(h);
     blocks.push(block0);
     for block_within_file in 1..header.shard_index_block_count {
@@ -1252,8 +1254,10 @@ fn read_sidecar_index_copy(
         SidecarCopyKind::Primary => footer.primary_header_start_block,
         SidecarCopyKind::Tail => footer.tail_header_start_block,
     };
-    let h = usize::try_from(footer.sidecar_header_block_count)
-        .map_err(|_| ParityError::Invariant("sidecar index block count overflows usize"))?;
+    let h = ParityError::host_usize(
+        footer.sidecar_header_block_count,
+        "sidecar index block count",
+    )?;
     let mut blocks = Vec::with_capacity(h);
     for offset in 0..footer.sidecar_header_block_count {
         let block_within_file = start_block
@@ -1463,16 +1467,20 @@ fn read_required_block(
 ) -> Result<Vec<u8>, ParityError> {
     source.locate_physical(position)?;
     let mut block = vec![0u8; block_size as usize];
-    match source.read_record(&mut block)? {
-        RawReadOutcome::Block { bytes, .. } if bytes == block.len() => Ok(block),
-        RawReadOutcome::Block { bytes, .. } => Err(ParityError::SidecarParse(format!(
-            "short fixed-block read: got {bytes}, expected {}",
+    // REM-PARITY 3.5: a record shorter or longer than one block is invalid
+    // content, never TapeIo. For a data block or parity shard every caller
+    // treats this error as an erasure (Section 13.4); for sidecar metadata it
+    // invalidates the copy.
+    match read_fixed_record(source, &mut block)? {
+        FixedRecordRead::Block { .. } => Ok(block),
+        FixedRecordRead::WrongLength { measured_bytes } => Err(ParityError::SidecarParse(format!(
+            "recovery record is {measured_bytes} bytes, not one {}-byte block",
             block.len()
         ))),
-        RawReadOutcome::Filemark { .. } => Err(ParityError::SidecarParse(
+        FixedRecordRead::Filemark { .. } => Err(ParityError::SidecarParse(
             "unexpected filemark while reading recovery block".to_string(),
         )),
-        RawReadOutcome::EndOfData { .. } => Err(ParityError::SidecarParse(
+        FixedRecordRead::EndOfData { .. } => Err(ParityError::SidecarParse(
             "unexpected EOD while reading recovery block".to_string(),
         )),
     }
@@ -1498,7 +1506,7 @@ mod tests {
     use super::*;
     use crate::filemark_map::{FilemarkMap, TapeFileMapEntry, TapeFilePosition};
     use crate::model::SchemeId;
-    use crate::raw::{RawTapeSink, RawWriteOutcome};
+    use crate::raw::{RawReadOutcome, RawTapeSink, RawWriteOutcome};
     use crate::resume::{
         emit_resume_rebuilt_sidecars_to_raw_without_journal,
         rebuild_legacy_forensic_open_epoch_from_committed_prefix,
@@ -1578,6 +1586,17 @@ mod tests {
                 });
             };
             match record {
+                // A record longer than the buffer is consumed and reported as
+                // a drive reports it (ILI with a negative residual).
+                Record::Block(block) if block.len() > buf.len() => {
+                    self.cursor += 1;
+                    Err(ParityError::TapeIo(
+                        remanence_library::TapeIoError::ReadBufferTooSmall {
+                            actual: block.len() as u32,
+                            provided: buf.len() as u32,
+                        },
+                    ))
+                }
                 Record::Block(block) => {
                     let bytes = block.len();
                     buf[..bytes].copy_from_slice(block);
@@ -1787,8 +1806,8 @@ mod tests {
                 let stripe = stripe_for_sidecar_ordinal(&entry, ordinal, &scheme).unwrap();
                 assert_eq!(stripe.neighborhood, epoch_id);
                 assert_eq!(
-                    stripe_data_to_ordinal_in_epoch(&stripe, start, &scheme).unwrap(),
-                    ordinal
+                    stripe_data_shard_in_epoch(&stripe, start, end, &scheme).unwrap(),
+                    EpochDataShard::Real { ordinal }
                 );
             }
         }
@@ -5584,6 +5603,168 @@ mod tests {
             assert_eq!(
                 recovered.lost_shards, expected_lost,
                 "recovery should count only erasures from the failed stripe"
+            );
+        }
+    }
+
+    /// REM-PARITY 3.5 and 13.4: a data peer or parity shard whose record is
+    /// shorter or longer than one block is a read failure, an erasure, never a
+    /// trusted shard and never TapeIo.
+    #[test]
+    fn wrong_length_peer_records_are_erasures() {
+        let scheme = scheme(2, 2, 1);
+        let object_blocks = vec![block(9), block(10)];
+        let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+        let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+        let index_blocks = sidecar.header.shard_index_block_count as usize;
+        let half = BLOCK_SIZE as usize / 2;
+        let data = |records: &mut Vec<Vec<u8>>, _: &mut Vec<Vec<u8>>, len: usize| {
+            records[0].resize(len, 0); // the data peer of failed ordinal 1
+        };
+        let parity = |_: &mut Vec<Vec<u8>>, records: &mut Vec<Vec<u8>>, len: usize| {
+            records[index_blocks].resize(len, 0); // parity shard 0
+        };
+        type Mutation<'a> = &'a dyn Fn(&mut Vec<Vec<u8>>, &mut Vec<Vec<u8>>, usize);
+        let cases: [(&str, Mutation, usize, StripePosition); 3] = [
+            (
+                "short data peer",
+                &data,
+                half,
+                StripePosition::Data { index: 0 },
+            ),
+            (
+                "long data peer",
+                &data,
+                2 * BLOCK_SIZE as usize,
+                StripePosition::Data { index: 0 },
+            ),
+            (
+                "long parity shard",
+                &parity,
+                2 * BLOCK_SIZE as usize,
+                StripePosition::Parity { index: 0 },
+            ),
+        ];
+        for (label, mutate, length, erased) in cases {
+            let mut object_records = object_blocks.clone();
+            let mut sidecar_records = sidecar.blocks.clone();
+            mutate(&mut object_records, &mut sidecar_records, length);
+            let mut raw = raw_tape(&object_records, &sidecar_records);
+            raw.unreadable_lbas.push(3); // failed ordinal 1.
+            let recovered =
+                recover_ordinal_from_sidecar(&mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 1)
+                    .unwrap_or_else(|e| {
+                        panic!("{label}: the remaining shards rebuild the block: {e:?}")
+                    });
+            assert_eq!(recovered.recovered_block, object_blocks[1], "{label}");
+            let mut lost = vec![erased, StripePosition::Data { index: 1 }];
+            lost.sort_by_key(|p| match p {
+                StripePosition::Data { index } => (0, *index),
+                StripePosition::Parity { index } => (1, *index),
+            });
+            assert_eq!(recovered.lost_shards, lost, "{label}");
+        }
+    }
+
+    /// REM-PARITY 13.3 step 3: the rescue requires the entry's total to equal
+    /// 2H + P + 1 with H > 0, compared exactly. An entry that fails either is
+    /// not available: the epoch is metadata-unavailable, no read is placed from
+    /// it, and nothing overflows or rejects the map. A tail record of the wrong
+    /// length leaves the copy unvalidated, never TapeIo.
+    #[test]
+    fn directory_rescue_preconditions_make_an_entry_unavailable() {
+        let scheme = scheme(2, 1, 2);
+        let object_blocks = vec![block(1), block(2), block(3), block(4)];
+        let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+        let good = crate::parity_map::SidecarEpochDirectoryEntry {
+            tape_file_number: 2,
+            epoch_id: sidecar.header.epoch_id,
+            protected_ordinal_start: sidecar.header.protected_ordinal_start,
+            protected_ordinal_end_exclusive: sidecar.header.protected_ordinal_end_exclusive,
+            sidecar_total_block_count: sidecar.blocks.len() as u64,
+            sidecar_header_block_count: sidecar.header.shard_index_block_count,
+            parity_shard_block_count: sidecar.header.parity_block_count,
+            canonical_metadata_hash: sidecar.header.canonical_metadata_hash,
+            flags: 0,
+        };
+        let scoped = scoped_map(sidecar.blocks.len() as u64, object_blocks.len() as u64);
+        let sidecar_entry = &scoped.map.entries()[2];
+        let h = good.sidecar_header_block_count;
+        for (label, entry) in [
+            ("zero H", {
+                let mut e = good.clone();
+                e.sidecar_header_block_count = 0;
+                e
+            }),
+            ("total not 2H + P + 1", {
+                let mut e = good.clone();
+                e.sidecar_header_block_count = h + 1;
+                e
+            }),
+            ("H beyond u64 arithmetic", {
+                let mut e = good.clone();
+                e.sidecar_header_block_count = u64::MAX;
+                e
+            }),
+            ("P beyond u64 arithmetic", {
+                let mut e = good.clone();
+                e.parity_shard_block_count = u64::MAX;
+                e
+            }),
+            // Consistent in itself (2H + P + 1 = total), but the total
+            // disagrees with the sidecar's map entry (13.3's MUST NOT).
+            ("total disagrees with the map entry", {
+                let mut e = good.clone();
+                e.sidecar_header_block_count = h + 1;
+                e.sidecar_total_block_count = good.sidecar_total_block_count + 2;
+                e
+            }),
+        ] {
+            let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+            let error = read_directory_tail_index(
+                &mut raw,
+                &scoped.map,
+                sidecar_entry,
+                &entry,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ParityError::SidecarMetadataUnavailable { epoch_id } if epoch_id == sidecar.header.epoch_id),
+                "{label}: {error:?}"
+            );
+            assert!(raw.read_lbas.is_empty(), "{label}: a read was placed");
+        }
+        // The consistent entry locates and validates the tail copy at H + P.
+        let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
+        read_directory_tail_index(
+            &mut raw,
+            &scoped.map,
+            sidecar_entry,
+            &good,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+        )
+        .expect("a consistent entry rescues the tail copy");
+        // A tail record of the wrong length is invalid content of that copy.
+        let tail = usize::try_from(h + good.parity_shard_block_count).unwrap();
+        for length in [BLOCK_SIZE as usize / 2, 2 * BLOCK_SIZE as usize] {
+            let mut sidecar_blocks = sidecar.blocks.clone();
+            sidecar_blocks[tail].resize(length, 0);
+            let mut raw = raw_tape(&object_blocks, &sidecar_blocks);
+            let error = read_directory_tail_index(
+                &mut raw,
+                &scoped.map,
+                sidecar_entry,
+                &good,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, ParityError::SidecarMetadataUnavailable { .. }),
+                "length {length}: {error:?}"
             );
         }
     }
