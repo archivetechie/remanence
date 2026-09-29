@@ -2106,6 +2106,10 @@
           },
           {
             "section": "13.3",
+            "quote": "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry."
+          },
+          {
+            "section": "13.3",
             "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
           },
           {
@@ -2117,7 +2121,7 @@
             "quote": "SidecarMetadataUnavailable{epoch_id} no header/index copy validated (Section 13.3)"
           }
         ],
-        "order": "The directory validates and agrees with the map entry, but the entry's total (7) is not 2H + P + 1 for its H, so the entry is not available and no rescue read is placed (Section 13.3). The primary and footer are unreadable, so no copy validates.",
+        "order": "The directory validates and agrees with the map entry, but the entry's total (7) is not 2H + P + 1 for its H, so the entry is not available and no read is placed from it (Section 13.3). The final ParityMap validates, so the tail rescue from the terminal index does not apply either. The primary and footer are unreadable, so no copy validates.",
         "reader_must_reject": true,
         "formula": {
           "expression": "2H + P + 1 (the rescue's precondition, against total 7)",
@@ -2139,7 +2143,7 @@
           "result": "error",
           "error": "SidecarMetadataUnavailable",
           "epoch": 0,
-          "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 18446744073709551615 > 0, so the entry is not available; footer unreadable (LBA 13); primary copy unreadable (LBA 7)",
+          "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 18446744073709551615 > 0, so the entry is not available; footer unreadable (LBA 13); primary copy unreadable (LBA 7); a final ParityMap validates, so the tail rescue from the terminal index does not apply",
           "directory": "final ParityMap validates"
         }
       ],
@@ -2225,6 +2229,10 @@
           },
           {
             "section": "13.3",
+            "quote": "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry."
+          },
+          {
+            "section": "13.3",
             "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
           },
           {
@@ -2236,7 +2244,7 @@
             "quote": "SidecarMetadataUnavailable{epoch_id} no header/index copy validated (Section 13.3)"
           }
         ],
-        "order": "The directory validates and agrees with the map entry, but the entry's total (7) is not 2H + P + 1 for its H, so the entry is not available and no rescue read is placed (Section 13.3). The primary and footer are unreadable, so no copy validates.",
+        "order": "The directory validates and agrees with the map entry, but the entry's total (7) is not 2H + P + 1 for its H, so the entry is not available and no read is placed from it (Section 13.3). The final ParityMap validates, so the tail rescue from the terminal index does not apply either. The primary and footer are unreadable, so no copy validates.",
         "reader_must_reject": true,
         "formula": {
           "expression": "2H + P + 1 (the rescue's precondition, against total 7)",
@@ -2258,7 +2266,7 @@
           "result": "error",
           "error": "SidecarMetadataUnavailable",
           "epoch": 0,
-          "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 7 > 0, so the entry is not available; footer unreadable (LBA 13); primary copy unreadable (LBA 7)",
+          "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 7 > 0, so the entry is not available; footer unreadable (LBA 13); primary copy unreadable (LBA 7); a final ParityMap validates, so the tail rescue from the terminal index does not apply",
           "directory": "final ParityMap validates"
         }
       ],
@@ -5704,7 +5712,7 @@
           "result": "error",
           "error": "SidecarMetadataUnavailable",
           "epoch": 0,
-          "index_acquisition": "directory entry total 8 is not 2H + P + 1 with H = 1 > 0, so the entry is not available; footer invalid (footer magic); primary copy invalid (layout counts)",
+          "index_acquisition": "directory entry total 8 is not 2H + P + 1 with H = 1 > 0, so the entry is not available; footer invalid (footer magic); primary copy invalid (layout counts); a final ParityMap validates, so the tail rescue from the terminal index does not apply",
           "directory": "final ParityMap validates"
         }
       ],

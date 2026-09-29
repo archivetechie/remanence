@@ -266,10 +266,15 @@ The steps follow the text in order:
    final ParityMap (Section 13.1). A rung that fails a check, its count
    included, does not recognise a file: the failed classification is
    reported, and the file is an Object candidate.
-4. For each failed address, the Recoverer's refusals, index acquisition
-   (Section 13.3, in which the footer or an available directory entry
-   decides between copies), erasure taxonomy, reconstruction and CRC check
-   (Sections 13.2–13.5).
+4. For each failed address, the Recoverer's refusals, index acquisition,
+   erasure taxonomy, reconstruction and CRC check (Sections 13.2–13.5). In
+   index acquisition (Section 13.3), the footer or an available directory
+   entry decides between copies. The tail rescue from the terminal index
+   tries the tail copy at `H + P`, with `H = (total − 1 − P) / 2` from the
+   sidecar's map entry. It applies only under three conditions:
+   - the footer and the primary have both failed;
+   - no final ParityMap validates;
+   - the map entry comes from a validated replica, not a walked map.
 5. The Verifier. Its `result` is the terminal-suffix outcome that Sections
    10.6 and 12.6 define: complete, degraded, recovery required (no valid
    replica), or an error for a conflict. With no planned layout, a
@@ -279,9 +284,14 @@ The steps follow the text in order:
    component (Section 2.2), after reading every sidecar's two copies and
    footer (Section 9.1). A bootstrap that the supplied values made the
    Scanner treat as unreadable is reported as `TapeIo` for a medium error,
-   and as `BootstrapParse`, the parser's name, for damaged content (GAPS J-2). Whether a full verification checks every data block
-   and parity shard is still open (Appendix D TT-2), so findings on those are
-   listed in an `undecided` entry.
+   and as `BootstrapParse`, the parser's name, for damaged content (GAPS J-2).
+   The check is a full verification (Section 2.2). It reads every data block
+   that a sidecar protects and every parity shard, and checks each against
+   its sidecar's index. Each failure gets an `address`: a data block's tape
+   file and block, or a parity shard's epoch, stripe and parity index. A
+   finding's `checks` says whether it concerns structure and metadata or a
+   data block or parity shard. Each sidecar's tail copy is located as
+   Section 13.3 locates it.
 
 Where the text leaves an outcome open, the decision says `undecided` and
 lists the readings. Each decision cites the sentences that decide it, and

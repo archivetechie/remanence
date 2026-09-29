@@ -86,3 +86,53 @@ F1 adds decisions: the 19 observations of e1-01 to e1-15 in `decisions.json` and
 existing decision changed. A comparison of every earlier entry, and of its
 trace, with its predecessor finds them identical. The other decision files
 are byte-identical.
+
+## The owner's rulings of F-T1b
+
+The text now defines a full verification (Section 2.2) and adds a tail rescue
+from the sidecar's map entry (Section 13.3 step 3). Each decision below was
+re-decided from the sentence it cites. No row follows an expected outcome.
+A leaf-by-leaf comparison of each regenerated file with its predecessor
+finds only these changes, their citations, and the Recoverer's notes on index
+acquisition. The damage-case rows apply to `decisions.json` under
+`blind-mapping.json`'s opaque ids and to `decisions-real-ids.json`.
+
+| Case | Aspect | Old value | New value | Sentence |
+| --- | --- | --- | --- | --- |
+| parity-map-and-sidecar (case-25) | `recoverer.addresses[(1, 0)]`: `result`, `error`, `stripe` (and `bytes_match`) | error, `SidecarMetadataUnavailable` | `recovered`, stripe 0, and the rebuilt bytes match. The footer and the primary are unreadable, and the ParityMap does not validate, so no entry is available. The map entry's total 7 with P = 4 gives H = 1, and the tail copy at block 5 is valid and agrees | 13.3 step 3: "When the footer and the primary copy have both failed and no directory entry is available, a Recoverer MUST try the tail copy from the sidecar's map entry, which a validated terminal replica's structural rows give. With `total` the entry's block count and `P = S × m`, the tail copy starts at block `H + P`, where `H = (total − 1 − P) / 2`. The rescue requires that `total − 1 − P` is even and that `H` is greater than zero. The tail copy is used only if it is valid on its own (step 2's sense), its recorded `sidecar_header_block_count` equals `H`, and its epoch and protected range agree with the map entry." |
+| parity-map-and-sidecar (case-25) | `verifier.outside_terminal_suffix`: the sidecar's `SidecarMetadataUnavailable` finding | present | removed. The Verifier acquires the index through the same rescue, and reads a valid tail copy | The same sentences, and 2.2: the Verifier's full check includes "the Recoverer's index and CRC validation". |
+| bootstrap-wrong-scheme (22), burst-m (19), burst-m-plus-one (21), object-head (02), parity-and-data (12), parity-map-and-sidecar (25), parity-map-both (24), short-epoch-burst (23), short-epoch-recoverable (14), sidecar-footer (15), sidecar-primary (08), sidecar-primary-and-footer (03), walk-directory-rescue (11), walk-sidecar-isolation (10) | the aspect `verifier.outside_terminal_suffix (data blocks and parity shards)` | `undecided`: a full verification reports these findings, or checks only structure and metadata | decided: the findings on data blocks and parity shards, already listed by address in `verifier.outside_terminal_suffix`, are what a full verification reports. The `undecided` entry is removed | 2.2: "A full verification reads every data block and every parity shard and checks each against its sidecar's index (Section 13.4), reporting each failure by address. A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification." |
+| neg-33/a-H-seven, neg-33/b-H-max | `decision.error` and `decision.note` (outcome `rejected` unchanged: no read is placed from the directory entry) | `SidecarMetadataUnavailable`; epoch 0 metadata-unavailable | null: an entry that fails a precondition is not available, and no Section 15 name applies. The failed address (1, 0) is recovered through the map-entry rescue (H = 1, tail at block 5); `expect.recoverer` is `recovered` | 13.3 step 3, as the parity-map-and-sidecar row; and "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch." |
+| neg-33/c-total-zero | `decision.error`, `decision.error_set` and `decision.note` | `SidecarMetadataUnavailable` | the ParityMap's category, {`DirectoryInvalid`, `ParityMapParse`} ("The name is normative as a category: this document does not specify which of the two a Reader reports once it has failed both ParityMap copies."). No entry is available, and (1, 0) is recovered through the map-entry rescue | 13.3 step 3, as above; 10.1.5 "non-zero `sidecar_total_block_count`…"; 15 |
+| sup-16, sup-17 | `decision.error` and `decision.note` (outcome `rejected` unchanged) | `SidecarMetadataUnavailable{0}` | null. The entry is not available, the footer and the primary are unreadable, and (1, 0) is recovered through the map-entry rescue; `expect.recoverer` is `recovered` | 13.3 step 3, as the parity-map-and-sidecar row |
+
+Checked and unchanged:
+- sup-45: the map entry's total 8 gives `total − 1 − P = 3`, which is odd, so "The rescue requires that `total − 1 − P` is even" fails and the epoch stays metadata-unavailable. Only its note changed.
+- sup-11 and sup-38: the footer is valid (sup-11) or an entry is available (sup-38), so the rescue is not reached.
+- The walk cases: "On the walk route the sidecar is not identified without its primary copy or footer (Section 12.3), so this rescue is not reached there."
+
+## The narrowed rescue and the revised Section 2.2 (F-T1c)
+
+After a review, the text narrowed the F-T1b rescue. It is now its own
+paragraph at the end of Section 13.3 step 3, headed "Tail rescue from the
+terminal index", and it applies only under three conditions:
+- the footer and the primary copy have both failed;
+- no final ParityMap validates;
+- the map entry comes from a validated terminal replica.
+
+Section 2.2 now says which blocks a full verification reads and how it
+addresses a failure. Each decision below was re-decided from whether the
+three conditions hold, and no row follows an expected outcome.
+
+| Case | Aspect | Old value (F-T1b) | New value | Sentence |
+| --- | --- | --- | --- | --- |
+| neg-33/a-H-seven, neg-33/b-H-max | `decision.error`, `decision.note`, `expect.recoverer` | null; (1, 0) recovered through the map-entry rescue | changes back to the pre-F-T1b decision: `SidecarMetadataUnavailable{0}`. The final ParityMap validates, and only the sidecar's entry fails the precondition `total = 2H + P + 1`, so condition 2 does not hold | 13.3: "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry." |
+| sup-16, sup-17 | `decision.error`, `decision.note`, `expect.recoverer` | null; (1, 0) recovered | changes back to the pre-F-T1b decision: `SidecarMetadataUnavailable{0}`, for the same reason | The same sentence |
+| walk-sidecar-isolation (case-10) | `verifier.outside_terminal_suffix` | the tail copy of sidecar tape file 2 was not read | a finding is added: "tail copy unreadable (medium error)", `TapeIo`. The Verifier now locates the tail copy as Section 13.3 does. Here that is through the available directory entry, which the walk's validated final ParityMap gives. The Recoverer's outcome is unchanged | 9.1: "A Verifier MUST read every sidecar's primary copy, tail copy and footer"; 13.3 step 3: "locate the tail copy at block `sidecar_total_block_count − 1 − sidecar_header_block_count` using the entry's counts" |
+| The 14 cases with data-block or parity-shard findings (as in the F-T1b row) | each such finding's `address`, and a parity shard's `component` | a parity shard named by its LBA; no `address` | `address` gives a data block's tape file and block, and a parity shard's epoch, stripe and parity index; a parity shard's component names all three, with its LBA. A data block that no sidecar protects is not a full-verification finding (no case has one) | 2.2: "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4). It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index." |
+
+Checked and unchanged from F-T1b:
+- **parity-map-and-sidecar (case-25), epoch 0:** stays recovered. The sidecar's footer and primary are unreadable, the ParityMap does not validate, and the map entry comes from the validated replicas. 13.3: "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates."
+- **neg-33/c-total-zero:** stays recovered through the rescue. Its footer and primary fail, its ParityMap does not validate (`DirectoryInvalid` at my level), and its replicas validate. The ParityMap's name stays the category {`DirectoryInvalid`, `ParityMapParse`}.
+- **sup-45:** stays `SidecarMetadataUnavailable`. The final ParityMap validates, so the rescue does not apply; before, it failed on an odd remainder. Only its note changed.
+- **The walk cases:** "A walked map does not qualify: it gains a validated scope only through a final ParityMap (Section 13.1), which this case lacks."

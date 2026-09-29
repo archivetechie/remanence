@@ -363,7 +363,15 @@ A single implementation may fill several roles.
 - **Verifier**: validates a tape's structures and digests end to end without
   recovering payload — the Scanner's checks plus the Recoverer's index and
   CRC validation. It reports damage it finds before the terminal suffix with
-  the error a Reader reports for that component.
+  the error a Reader reports for that component. A Verifier's validation is
+  a full verification: it reads every data block that a sidecar protects and
+  every parity shard, and checks each against its sidecar's index
+  (Section 13.4). It reports each block or shard that fails by its address:
+  a data block's tape-file position, or a parity shard's epoch, stripe and
+  parity index. It reads those blocks as opaque bytes and does not interpret
+  Object content (Section 1.1, goal 2). A check of structure and metadata
+  alone, which reads no data block or parity shard, is not a full
+  verification.
 - **Reader**: any role that reads a tape: the Scanner, the Recoverer, the
   Resumer and the Verifier, and the Writer when it reads back what it has
   written. A requirement on a Reader binds each of them. This is not the
@@ -2549,6 +2557,30 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    against the directory entry before using the tail copy's metadata for rescue.
    The directory carries exactly the counts and hash needed to find and verify
    the tail copy without the footer — the case it exists for (Section 10.1.1).
+
+   **Tail rescue from the terminal index.** If the footer and the primary
+   copy have both failed, no final ParityMap validates (so the sidecar has no
+   directory entry), and the sidecar's map entry comes from a validated
+   terminal replica's structural rows, a Recoverer MUST try the tail copy
+   that the map entry locates. With `total` the map entry's block count and
+   `P = S × m`, the tail copy starts at block `H + P`, where
+   `H = (total − 1 − P) / 2`. This rescue requires that `total − 1 − P` is
+   even and that `H` is greater than zero. The tail copy is used only if it
+   is valid on its own (step 2's sense), its recorded
+   `sidecar_header_block_count` equals `H`, and its epoch and protected range
+   agree with the map entry. If this rescue fails, the epoch is
+   metadata-unavailable (step 4). A walked map does not qualify: it gains a
+   validated scope only through a final ParityMap (Section 13.1), which this
+   case lacks. When a final ParityMap validates but the sidecar's entry fails
+   a precondition of the directory-assisted rescue, this rescue does not
+   apply either, since the directory then contradicts the map entry. Here, as
+   in the directory-assisted rescue, a final ParityMap validates only when it
+   validates and is marked `is_final_directory`.
+
+   *Rationale.* Nothing outside a copy found this way vouches for it. Its own
+   CRCs and canonical metadata hash detect accidental damage, and every shard
+   and rebuilt block is still checked against the index (Sections 13.4 and
+   13.5).
 4. Only when no header/index copy can be validated is the epoch
    **metadata-unavailable** — and only that epoch (Section 12.5). A copy that
    the footer or the directory contradicts, or that step 2 leaves undecided,
@@ -2840,7 +2872,9 @@ Section 8.4 requires. The outcomes were written from this document before any
 reader was run on them. Of the 25 cases, 24 are pinned. The outcome pinned for
 `filemark-prefix` follows Section 12.3's rule that a rung which fails its
 count does not recognise the file. `parity-map-and-sidecar` is informative
-because this document does not yet decide part of it (Appendix D item TT-2).
+because this document did not decide part of it when its outcome was
+written; Section 13.3's tail rescue from the map entry now decides it, and
+the case is to be pinned to that outcome.
 The outcomes of the burst cases (`burst-m`, `burst-m-plus-one`,
 `short-epoch-burst` and `short-epoch-recoverable`) follow from Sections 3.3,
 9.1, 13.4 and 13.5; Appendix B.2 illustrates them and is informative. Their
@@ -3198,7 +3232,10 @@ sidecar file leaves a survivable copy at the other; the footer makes the tail
 copy findable without trusting block arithmetic; and the sidecar epoch
 directory makes it findable even with the footer gone (Section 13.3). The
 canonical metadata hash is copy-independent, so any surviving copy is
-verifiable against any directory entry.
+verifiable against any directory entry. When the footer, the primary copy and
+the final ParityMap are all lost, the terminal index's record of the sidecar
+still locates the tail copy (Section 13.3), which is then trusted on its own
+checksums.
 
 ### B.12. The Reference Off-Tape Journals Are Not a Media Format
 
@@ -3528,6 +3565,14 @@ an errata revision of draft.1.
     only; a no-parity bootstrap may record compression, as Sections 8.2 and
     11.4 already allow. Section 2.2 says that a Verifier reports damage it finds
     anywhere with the error a Reader reports for that component.
+  - The owner's rulings on two further questions then add: Section 13.3
+    requires a Recoverer, when the footer, the primary copy and the final
+    ParityMap are all unavailable, to try the tail copy at the position the
+    terminal index's record of the sidecar gives, and to use it only if it
+    validates and agrees with that record. An epoch that was
+    metadata-unavailable in that case can now be recovered; and Section 2.2
+    says that a full verification reads every data block and parity shard, and
+    that a check of structure and metadata alone is not one.
   - Sections 15 and 17 and Appendix D item TT-2 record these changes. TT-2
     also records what the second implementation now re-derives and what
     remains open.
@@ -3832,25 +3877,29 @@ This is the live preparing-copy snapshot for generation 2.
      under the exact-value rule is to be recorded when those vectors are
      revised: each either keeps a reachable vector or joins the formulas for
      which none can exist.
-   - Of the four questions this item recorded, three are now decided: a rung
-     that fails on a count mismatch does not recognise the file (Section
+   - Of the four questions this item recorded, all four are now decided: a
+     rung that fails on a count mismatch does not recognise the file (Section
      12.3; `filemark-prefix`); a sidecar's footer or directory decides between
      two copies that differ, and a Verifier reports the divergence (Sections
-     9.1 and 13.3; `sidecar-primary-tail-disagreement`); and which bootstraps
-     count as unreadable (Section 8.4; TT-7, now closed). One stays open:
-     whether a Recoverer may locate a sidecar's tail copy from its structural
-     row when the ParityMap and the sidecar's primary header and footer are
-     all unreadable (Section 13.3; `parity-map-and-sidecar`).
+     9.1 and 13.3; `sidecar-primary-tail-disagreement`); which bootstraps
+     count as unreadable (Section 8.4; TT-7, now closed); and when the footer,
+     the primary copy and the final ParityMap are all unavailable, a Recoverer
+     tries the tail copy that the terminal index's record of the sidecar
+     locates (Section 13.3; `parity-map-and-sidecar`). The reference is to
+     gain that route before freeze. The tail
+     rescue's formula `H = (total − 1 − P) / 2` keeps a vector, as the
+     formulas above do: a replica row for a sidecar with a block count of at
+     most `P` makes `total − 1 − P` negative, and the epoch is then
+     metadata-unavailable (Section 2.4), not a rejection of the replica.
    - The three readings this item listed are now stated: exact integer values
      (Section 2.4), the recorded fields in Section 10.6's `W = T` rule, and the
      tail copy at `H + P`, with a directory entry's total equal to
      `2H + P + 1` (Section 13.3).
    - Section 2.2 includes in a Verifier's full check the Recoverer's index and
      CRC validation. The reference's verification does not yet read a
-     sidecar's two copies, a data block or a parity shard. Whether a full
-     verification checks every data block and parity shard, or only structure
-     and metadata, is to be decided, and the reference brought into line,
-     before freeze.
+     sidecar's two copies, a data block or a parity shard. A full
+     verification reads every data block and parity shard (Section 2.2), and
+     the reference's verification is to be brought into line before freeze.
    - Where this document leaves a name open, some vectors give a set of
      permitted Section 15 errors, or none. The second implementation's
      `GAPS.md` and the notes in `tape-images/negatives/` list these and the
@@ -3870,7 +3919,8 @@ This is the live preparing-copy snapshot for generation 2.
    sidecar negatives.
 3. **TT-3 — media exercise of the default separation extents (VTL passed;
    physical open).** The exact one-GiB layout has passed clean VTL writes and
-   independent full verification at all three legal block sizes. The 256 KiB
+   independent verification of the terminal suffix at all three legal block
+sizes. The 256 KiB
    and 512 KiB legs respectively proved 4,096 and 2,048 records per separation
    extent, compression disabled, the five dense tape files of the terminal
    suffix, their filemarks, and exact EOD. At least two supervised

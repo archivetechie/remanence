@@ -2220,8 +2220,18 @@ QUOTES.update({
     'footer_uuid': ('9.6', "The footer's `tape_uuid` MUST match the bootstrap or, when the bootstrap is unreadable, the tape UUID supplied under Section 8.4.1, as each header copy's `tape_uuid` must (Section 9.2)."),
     'short_read_failure': ('13.4', 'A record shorter or longer than one block is a read failure (Section 3.5).'),
     'compression_parity_only': ('16.3', 'Both sentences concern a parity tape (Section 11.4): a no-parity bootstrap may record compression.'),
-    'full_verification_open': ('D', 'Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze.'),
-    'tail_route_open': ('D', "One stays open: whether a Recoverer may locate a sidecar's tail copy from its structural row when the ParityMap and the sidecar's primary header and footer are all unreadable (Section 13.3; `parity-map-and-sidecar`)."),
+    'full_verification': ('2.2', "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."),
+    'report_by_address': ('2.2', "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."),
+    'opaque_bytes': ('2.2', 'It reads those blocks as opaque bytes and does not interpret Object content (Section 1.1, goal 2).'),
+    'structure_not_full': ('2.2', 'A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification.'),
+    'full_verification_d': ('D', "A full verification reads every data block and parity shard (Section 2.2), and the reference's verification is to be brought into line before freeze."),
+    'map_rescue': ('13.3', "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates."),
+    'map_rescue_position': ('13.3', "With `total` the map entry's block count and `P = S × m`, the tail copy starts at block `H + P`, where `H = (total − 1 − P) / 2`."),
+    'map_rescue_requires': ('13.3', 'This rescue requires that `total − 1 − P` is even and that `H` is greater than zero.'),
+    'map_rescue_valid': ('13.3', "The tail copy is used only if it is valid on its own (step 2's sense), its recorded `sidecar_header_block_count` equals `H`, and its epoch and protected range agree with the map entry."),
+    'map_rescue_fails': ('13.3', 'If this rescue fails, the epoch is metadata-unavailable (step 4).'),
+    'map_rescue_not_walk': ('13.3', 'A walked map does not qualify: it gains a validated scope only through a final ParityMap (Section 13.1), which this case lacks.'),
+    'map_rescue_not_directory': ('13.3', "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry."),
 })
 
 
@@ -3530,7 +3540,37 @@ def acquire_index(ctx: RecoveryContext, sidecar: MapEntry, citations: list) -> t
     if entry is None:
         if ctx.directory is None:
             notes.append("no sidecar epoch directory entry is available (no final ParityMap validates)")
-        return unavailable()
+        # The tail rescue from the terminal index applies only when no final
+        # ParityMap validates and the map entry comes from a validated
+        # terminal replica's structural rows.
+        if ctx.directory is not None:
+            citations.append(cite("map_rescue_not_directory"))
+            notes.append("a final ParityMap validates, so the tail rescue from the terminal index does not apply")
+            return unavailable()
+        if ctx.route == "walk":
+            citations.append(cite("map_rescue_not_walk"))
+            notes.append("the map entry comes from a walked map, so the tail rescue from the terminal index does not "
+                         "apply")
+            return unavailable()
+        # The footer and the primary have both failed and no final ParityMap
+        # validates: try the tail copy that the terminal index's map entry locates.
+        citations.extend([cite("map_rescue"), cite("map_rescue_position"), cite("map_rescue_requires"),
+                          cite("map_rescue_valid")])
+        rest = count - 1 - parity_blocks
+        if rest < 0 or rest % 2 or rest // 2 == 0:
+            notes.append(f"map entry total {count}: total − 1 − P = {rest} is not even with H > 0, so no rescue")
+            citations.append(cite("map_rescue_fails"))
+            return unavailable()
+        header_blocks = rest // 2
+        tail = read_copy(header_blocks + parity_blocks, header_blocks, 2, "tail")
+        if tail is not None and (tail["H"] != header_blocks or (tail["epoch_id"], tail["start"], tail["end"]) != (
+                sidecar.epoch_id, sidecar.protected_ordinal_start, sidecar.protected_ordinal_end_exclusive)):
+            notes.append("tail copy's H, epoch or protected range differs from the map entry's")
+            tail = None
+        if tail is None:
+            citations.append(cite("map_rescue_fails"))
+            return unavailable()
+        return tail, "; ".join(notes + [f"tail copy used (rescue from the map entry, H = {header_blocks})"])
     citations.extend([cite("entry_agrees"), cite("rescue_block")])
     tail_first = entry["H"] + parity_blocks
     tail = read_copy(tail_first, entry["H"], 2, "tail") if tail_first + entry["H"] <= count else None
@@ -4900,24 +4940,37 @@ def negatives_table() -> dict[str, dict[str, Any]]:
         underflow = {"a-H-seven": "7 − 1 − 7", "b-H-max": "7 − 1 − (2^64 − 1)", "c-total-zero": "0 − 1 − 1"}[variant]
         t[f"neg-33/{variant}"] = {
             "image": "a4-minimal", "apply": apply33, "roles": [("parity-map", 3), ("recoverer", [1, 0])],
-            "decide": decision("rejected", "SidecarMetadataUnavailable",
-                               ["tail_rescue", "entry_agrees", "metadata_unavailable", "unavailable_report", "err_metadata_unavailable"]
-                               + (["dir_nonzero", "dir_rule", "pm_category"] if variant.startswith("c") else ["rescue_preconditions"]),
+            "decide": decision("rejected", "SidecarMetadataUnavailable" if not variant.startswith("c") else None,
+                               ["tail_rescue", "entry_agrees"]
+                               + (["dir_nonzero", "dir_rule", "pm_category", "map_rescue", "map_rescue_position",
+                                   "map_rescue_requires", "map_rescue_valid"] if variant.startswith("c") else
+                                  ["rescue_preconditions", "map_rescue_not_directory", "metadata_unavailable",
+                                   "unavailable_report", "err_metadata_unavailable"]),
                                ("The directory entry agrees with the map entry in tape file, epoch, range and block count, "
                                 "but its total (7) is not 2H + P + 1 for its H (Section 13.3), so the entry is not available "
-                                "and no rescue read is placed; with the primary header and footer failed, no header/index "
-                                "copy validates, and epoch 0 is metadata-unavailable."
+                                "and no read is placed from it. The final ParityMap validates, so the tail rescue from the "
+                                "terminal index does not apply either. With the primary header and footer failed, no "
+                                "header/index copy validates, and epoch 0 is metadata-unavailable."
                                 if not variant.startswith("c") else
                                 "The zero total breaks the directory invariant 'non-zero sidecar_total_block_count', so the "
                                 "ParityMap does not validate (DirectoryInvalid or ParityMapParse, the category Section 15 "
-                                "leaves open once both copies fail); no directory entry is available, and epoch 0 is "
-                                "metadata-unavailable. The Section 13.3 agreement rule would also forbid the read."),
+                                "leaves open once both copies fail) and no directory entry is available. The footer and "
+                                "the primary have failed, no final ParityMap validates, and the map entry comes from the "
+                                "validated replicas' structural rows, so the Recoverer tries the tail copy that the map "
+                                "entry locates (Section 13.3, tail rescue from the terminal index). The Section 13.3 "
+                                "agreement rule would also forbid a read from the directory entry."),
                                formula=(formula("total = 2H + P + 1 (the rescue's precondition)", {"H": {"a-H-seven": "7", "b-H-max": "2^64 - 1"}[variant], "P": 4, "total": 7},
                                                 {"a-H-seven": "19", "b-H-max": "2^65 + 3"}[variant] + ", not 7", False)
                                         if not variant.startswith("c") else
                                         formula("tail block = total − 1 − H", {"expression": underflow}, "underflow", True)),
-                               note="SidecarMetadataUnavailable{epoch_id: 0} for the failed address (1, 0)."),
-            "expect": {"recoverer": "SidecarMetadataUnavailable"}}
+                               error_set=["DirectoryInvalid", "ParityMapParse"] if variant.startswith("c") else None,
+                               note=("The map entry's total is 7 and P = S × m = 4, so H = (7 − 1 − 4) / 2 = 1 and the "
+                                     "tail copy starts at block 5. It is valid on its own, records H = 1, and its epoch "
+                                     "and range agree with the map entry, so it is used: the failed address (1, 0) is "
+                                     "recovered." if variant.startswith("c") else
+                                     "SidecarMetadataUnavailable{epoch_id: 0} for the failed address (1, 0).")),
+            "expect": ({"recoverer": "recovered", "parity-map": "DirectoryInvalid"} if variant.startswith("c") else
+                       {"recoverer": "SidecarMetadataUnavailable"})}
 
     sc("neg-34", 0x24, 4, 2, 0, "S u32", "hashed", ["sc_S", "sc_logical", "sc_P"])
 
@@ -6091,11 +6144,13 @@ def supplement_table() -> dict[str, dict[str, Any]]:
         t[sup] = {"parent": "neg-33", "image": "a4-minimal", "apply": apply_rescue, "unreadable": [(2, 0), (2, 6)],
                   "roles": ["pm-audit", "recover"], "named": "checked tail position",
                   "decide": decision("rejected", "SidecarMetadataUnavailable",
-                                     ["tail_rescue", "entry_agrees", "rescue_preconditions", "metadata_unavailable",
-                                      "unavailable_report", "err_metadata_unavailable"],
+                                     ["tail_rescue", "entry_agrees", "rescue_preconditions", "map_rescue_not_directory",
+                                      "metadata_unavailable", "unavailable_report", "err_metadata_unavailable"],
                                      "The directory validates and agrees with the map entry, but the entry's total (7) is "
-                                     "not 2H + P + 1 for its H, so the entry is not available and no rescue read is placed "
-                                     "(Section 13.3). The primary and footer are unreadable, so no copy validates.",
+                                     "not 2H + P + 1 for its H, so the entry is not available and no read is placed from "
+                                     "it (Section 13.3). The final ParityMap validates, so the tail rescue from the "
+                                     "terminal index does not apply either. The primary and footer are unreadable, so no "
+                                     "copy validates.",
                                      formula=unit_eval("2H + P + 1 (the rescue's precondition, against total 7)", 2 * value + 4 + 1,
                                                        {"total": 7, "H": str(value), "P": 4}),
                                      note="SidecarMetadataUnavailable{0}."
@@ -6921,7 +6976,8 @@ def load_parity_map_directory(tape: DamagedTape, entries: list[MapEntry], tape_u
 def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: int, tape_uuid: bytes,
                              block_size: int, scheme: tuple[int, int, int], bootstrap: dict[str, Any] | None,
                              directory: dict[int, dict] | None,
-                             bootstrap_unreadable: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+                             bootstrap_unreadable: tuple[str, str] | None = None,
+                             route: str = "verifier") -> list[dict[str, Any]]:
     """What a Verifier finds before replica A, each with the error a Reader reports for that component (Section 2.2).
 
     Every sidecar's primary copy, tail copy and footer are read (Section 9.1).
@@ -6931,8 +6987,14 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
     """
     findings: list[dict[str, Any]] = []
 
-    def add(component: str, finding: str, error: str | None, scope_kind: str = "structure") -> None:
-        findings.append({"component": component, "finding": finding, "error": error, "checks": scope_kind})
+    def add(component: str, finding: str, error: str | None, scope_kind: str = "structure",
+            address: dict[str, int] | None = None) -> None:
+        item = {"component": component, "finding": finding, "error": error, "checks": scope_kind}
+        if address is not None:
+            # Section 2.2: a data block by its tape-file position, a parity
+            # shard by its epoch, stripe and parity index.
+            item["address"] = address
+        findings.append(item)
 
     if bootstrap is None:
         # With supplied values the Scanner treats the bootstrap as unreadable
@@ -6975,9 +7037,23 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                 add(name, "primary copy unreadable (medium error)", "TapeIo")
             except ReadFailure as failure:
                 add(name, f"primary copy invalid ({failure.reason})", "SidecarParse")
+            if header_blocks is None:
+                # Neither the footer nor the primary gives H. Section 13.3 step 3
+                # locates the tail copy through an available directory entry, or,
+                # when no final ParityMap validates and the map entry comes from
+                # a validated terminal replica, through the map entry.
+                listed = directory.get(entry.tape_file_number) if directory is not None else None
+                if listed is not None and (listed["epoch_id"], listed["start"], listed["end"], listed["total"]) == (
+                        entry.epoch_id, entry.protected_ordinal_start, entry.protected_ordinal_end_exclusive,
+                        entry.block_count) and listed["H"] > 0 and listed["total"] == 2 * listed["H"] + stripes * m + 1:
+                    header_blocks = listed["H"]
+                elif directory is None and route != "walk":
+                    rest = entry.block_count - 1 - stripes * m
+                    if rest > 0 and rest % 2 == 0:
+                        header_blocks = rest // 2
             if header_blocks is not None:
                 # The footer locates the tail copy when it is valid (Section 9.6);
-                # otherwise Section 13.3 step 2 places it at H + P.
+                # otherwise Section 13.3 places it at H + P.
                 tail_first = footer["tail_start"] if footer is not None else header_blocks + stripes * m
                 try:
                     copies["tail"] = parse_sidecar_copy(read_blocks(tape, start + tail_first, header_blocks), tape_uuid,
@@ -6988,7 +7064,7 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                     add(name, f"tail copy invalid ({failure.reason})", "SidecarParse")
             if len(copies) == 2 and copies["primary"]["hash"] != copies["tail"]["hash"]:
                 add(name, "the two copies diverge", "SidecarParse")
-            ctx = RecoveryContext(tape, tape_uuid, block_size, scheme, entries, scope, 0, directory, "verifier")
+            ctx = RecoveryContext(tape, tape_uuid, block_size, scheme, entries, scope, 0, directory, route)
             index, note = acquire_index(ctx, entry, [])
             if index is None:
                 add(name, f"no header/index copy validates ({note})", "SidecarMetadataUnavailable")
@@ -7001,12 +7077,14 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                 if index["H"] <= block < index["H"] + index["P"]:
                     shard = block - index["H"]
                     key = (shard % index["S"], shard // index["S"])
+                    address = {"epoch": index["epoch_id"], "stripe": key[0], "parity_index": key[1]}
+                    component = (f"parity shard epoch {index['epoch_id']} stripe {key[0]} parity index {key[1]} "
+                                 f"(LBA {start + block})")
                     try:
                         if crc64_xz(tape.read_data(start + block)) != index["parity_crcs"][key]:
-                            add(f"parity shard at LBA {start + block}", "CRC mismatch (an erasure, Section 13.4)", None,
-                                "data")
+                            add(component, "CRC mismatch (an erasure, Section 13.4)", None, "data", address)
                     except MediumError:
-                        add(f"parity shard at LBA {start + block}", "unreadable (medium error)", "TapeIo", "data")
+                        add(component, "unreadable (medium error)", "TapeIo", "data", address)
         elif entry.kind == KIND_PARITY_MAP:
             name = f"ParityMap tape file {entry.tape_file_number}"
             try:
@@ -7025,16 +7103,21 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
             ordinal = entry.first_parity_data_ordinal + block
             covering = [e for e in entries[:scope] if e.kind == KIND_SIDECAR
                         and e.protected_ordinal_start <= ordinal < e.protected_ordinal_end_exclusive]
+            if not covering:
+                # Section 2.2: a full verification reads every data block that
+                # a sidecar protects; this one is protected by none.
+                continue
             component = f"Object tape file {entry.tape_file_number} block {block} (LBA {start + block})"
+            address = {"tape_file": entry.tape_file_number, "block": block}
             try:
                 data = tape.read_data(start + block)
             except MediumError:
-                add(component, "unreadable (medium error)", "TapeIo", "data")
+                add(component, "unreadable (medium error)", "TapeIo", "data", address)
                 continue
-            if covering and covering[0].tape_file_number in indexes:
+            if covering[0].tape_file_number in indexes:
                 index = indexes[covering[0].tape_file_number]
                 if crc64_xz(data) != index["data_crcs"][ordinal - index["start"]]:
-                    add(component, "CRC mismatch (an erasure, Section 13.4)", None, "data")
+                    add(component, "CRC mismatch (an erasure, Section 13.4)", None, "data", address)
     return findings
 
 
@@ -7314,7 +7397,8 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         verifier["citations"].append(cite("normal_finalized"))
     if context is not None:
         findings = verifier_prefix_findings(tape, context.entries, context.scope, tape_uuid, block_size, scheme,
-                                            boot, directory, bootstrap_unreadable)
+                                            boot, directory, bootstrap_unreadable,
+                                            "walk" if context.route == "walk" else "verifier")
         trace["verifier_prefix_findings"] = findings
         if findings:
             # Section 2.2: the Verifier reports each finding before the
@@ -7325,17 +7409,11 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
                 verifier["citations"].append(cite("boot_parser_name"))
             if any(f["component"].startswith("sidecar") for f in findings):
                 verifier["citations"].append(cite("verifier_divergence"))
-            data = [f for f in findings if f["checks"] == "data"]
-            if data:
-                decision["undecided"].append({
-                    "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-                    "readings": [
-                        "a full verification checks every data block and parity shard, and reports these findings: "
-                        + "; ".join(f"{f['component']}: {f['finding']}" for f in data),
-                        "a full verification checks only structure and metadata, and does not report them",
-                    ],
-                    "citations": [cite("verifier_role"), cite("full_verification_open")],
-                })
+            if any(f["checks"] == "data" for f in findings):
+                # Section 2.2: a full verification reads every data block and
+                # parity shard and reports each failure by address.
+                verifier["citations"].extend([cite("full_verification"), cite("report_by_address"),
+                                              cite("structure_not_full")])
     return decision
 
 

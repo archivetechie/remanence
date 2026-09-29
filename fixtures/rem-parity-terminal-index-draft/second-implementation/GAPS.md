@@ -144,7 +144,8 @@ or ParityMap copy, or for a `SchemeMismatch` found while checking indexes.
 *Decided:* `verifier.result` reports the terminal-suffix outcome, which
 Sections 10.6 and 12.6 do define. *Undecided:*
 `verifier.outside_terminal_suffix` lists what the Verifier finds before A.
-**Decided by the revised text.** Section 2.2 now says the Verifier "reports damage it finds before the terminal suffix with the error a Reader reports for that component." Each finding is now listed with its error in `verifier.outside_terminal_suffix`. Still open (Appendix D TT-2): "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided". Findings on data blocks and parity shards stay in an `undecided` entry.
+**Decided by the revised text.** Section 2.2 now says the Verifier "reports damage it finds before the terminal suffix with the error a Reader reports for that component." Each finding is now listed with its error in `verifier.outside_terminal_suffix`. Findings on data blocks and parity shards stayed undecided until F-T1b.
+**Decided by the revised text (F-T1b, reworded F-T1c).** Section 2.2: "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4). It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index." It adds: "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification." The data-block and parity-shard findings of the 14 cases are decided and carry those addresses. No `undecided` entry remains for them (DECISION-LOG).
 
 **B-4. Section 10.6: an invalid separation extent has no outcome category
 (case 17).** "A Verifier that finds a separation extent invalid MUST report
@@ -185,6 +186,9 @@ routes, so epoch 0 of case 25 is `SidecarMetadataUnavailable`. The case,
 parity-map-and-sidecar, is not pinned, and its informative note says the
 text does not decide epoch 0. The two readings survive, and the blind
 decision took the first.
+**Decided by the revised text (F-T1b, narrowed F-T1c).** Section 13.3 step 3 ends with "Tail rescue from the terminal index": "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates. With `total` the map entry's block count and `P = S × m`, the tail copy starts at block `H + P`, where `H = (total − 1 − P) / 2`." The procedure is not the complete list of routes that this implementation took it to be. The rescue applies to case 25. Its footer and primary are unreadable, its ParityMap does not validate, and its replicas do. total = 7 and P = 4 give H = 1, and the tail copy at block 5 is valid and agrees with the map entry, so epoch 0 is recovered (DECISION-LOG).
+
+Among the negatives, it applies to neg-33/c, whose ParityMap does not validate. It does not apply to neg-33/a, neg-33/b, sup-16 or sup-17. There the final ParityMap validates, and only the sidecar's entry fails a precondition: "this rescue does not apply either, since the directory then contradicts the map entry." "A walked map does not qualify".
 
 **B-8. Section 8.4 step 1: how to find the footer "from EOD" is not
 specified.** This Reader spaces back over at most five filemarks from EOD
@@ -698,7 +702,7 @@ revised text (Sections 2.2, 2.4, 3.3, 3.5, 7.2, 8.4, 9.1, 9.6, 10.1.3,
 10.1.4, 10.6, 12.3, 12.6, 13.3–13.5, 14, 15 and 16.3, and Appendix D). Each
 decision the revision changed has a row in `DECISION-LOG.md`. The entries
 above that the revision decides end in a line beginning **Decided by the
-revised text**. B-4, B-5, B-7, B-11, E-2, E-3, E-5 to E-7, F-1, F-2, F-7,
+revised text**. B-4, B-5, B-7 (decided in F-T1b), B-11, E-2, E-3, E-5 to E-7, F-1, F-2, F-7,
 G-1, G-4, G-6 and H-8 to H-10 stay as they were.
 
 **I-1. sup-15 is not isolated under Section 7.2.** `overflow-7.2-T/isolated`
@@ -722,7 +726,12 @@ footer's `tail_header_start_block`, and otherwise `H + P` as in Section 13.3
 step 2. The footer holds "everything needed to find and check either header
 copy without reading the other" (Section 9.6). In bootstrap-wrong-scheme the
 supplied scheme is wrong, so `H + P` would name the wrong block. There the
-footer is valid and names the right one.
+footer is valid and names the right one. Since F-T1c, when neither the footer
+nor the primary gives `H`, this Verifier locates the tail copy as Section
+13.3 step 3 does. It uses an available directory entry's counts, on either
+route. When no final ParityMap validates and the map entry comes from a
+validated replica, it uses `H = (total − 1 − P) / 2` from the map entry. This
+adds one finding in walk-sidecar-isolation, where the tail copy is unreadable.
 
 **I-4. Section 15: discovery with only a known block size is not
 exercised.** Every damage case supplies all three values or none, so this
@@ -817,3 +826,40 @@ That comparison was run after the decision was written.
 **J-6. The resume inputs are not checked for unknown keys.** The F1 brief
 asks this of the fault reader, and `decide` applies it. `resume` still reads
 only the keys it uses.
+
+## K. The owner's rulings of F-T1b and F-T1c
+
+The text now states two further rulings. Section 2.2 defines a full
+verification. Section 13.3 step 3 ends with the tail rescue from the terminal
+index, which was narrowed after a review (F-T1c). They decide B-3's
+remaining part and B-7 (above), and Appendix D TT-2 records both as decided.
+Every decision they change has a row in `DECISION-LOG.md`.
+
+**K-1. The Verifier's name for a data-block CRC mismatch.** A full
+verification "reads every data block that a sidecar protects and every parity
+shard, and checks each against its sidecar's index". Each failure carries its
+address in `address`: a data block's tape file and block, or a parity shard's
+epoch, stripe and parity index. A medium error is reported as `TapeIo`. A CRC mismatch has no Section 15 name,
+because a Reader treats it as an erasure (Section 13.4), so it is reported
+with `error` null. No case has a data-block CRC mismatch.
+
+**K-2. Section 13.3's map-entry rescue checks a copy against its own
+count.** "its recorded `sidecar_header_block_count` equals `H`" is checked
+as written. The copy's own Section 9.4 check, which this parser evaluates
+with its recomputed `H` (G-1), is part of its being "valid on its own". In
+every case that reaches the rescue, the two agree.
+
+**K-3. Section 2.2: a data block that no sidecar protects.** A full
+verification reads "every data block that a sidecar protects". This Verifier
+reports no finding for a block outside every sidecar's range, such as an
+open epoch's blocks at or beyond `W`. No damage case damages such a block.
+
+**K-4. Section 13.3: a final ParityMap that validates but omits the sidecar.**
+The rescue needs "no final ParityMap validates (so the sidecar has no
+directory entry)". A validated final directory that has no entry for a
+sidecar would satisfy the parenthesis without the condition. This Reader
+applies the condition as written: any validated final ParityMap excludes the
+rescue. Section 10.1.5 requires the entries' protected ranges to "partition
+`[0, scope_highest_protected_ordinal)`" with no gaps, so a validated
+directory omits no sidecar whose range lies in that span. No vector has such
+a directory.

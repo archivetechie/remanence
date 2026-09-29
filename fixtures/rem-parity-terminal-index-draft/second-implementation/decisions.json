@@ -328,6 +328,18 @@
           {
             "section": "2.2",
             "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -335,29 +347,15 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-03": {
       "image": "two-epoch",
@@ -616,6 +614,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -635,35 +645,25 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           },
           {
             "component": "Object tape file 1 block 4 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 4
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-04": {
       "image": "two-edition",
@@ -1548,6 +1548,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -1561,35 +1573,25 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           },
           {
             "component": "Object tape file 1 block 4 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 4
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-09": {
       "image": "a4-minimal",
@@ -2066,6 +2068,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -2083,6 +2097,12 @@
           },
           {
             "component": "sidecar tape file 2",
+            "finding": "tail copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
             "finding": "no header/index copy validates (footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16))",
             "error": "SidecarMetadataUnavailable",
             "checks": "structure"
@@ -2091,35 +2111,25 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           },
           {
             "component": "Object tape file 1 block 4 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 4
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-11": {
       "image": "a4-minimal",
@@ -2377,6 +2387,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -2396,29 +2418,15 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-12": {
       "image": "a4-minimal",
@@ -2606,42 +2614,45 @@
           {
             "section": "2.2",
             "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
           {
-            "component": "parity shard at LBA 8",
+            "component": "parity shard epoch 0 stripe 0 parity index 0 (LBA 8)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 0
+            }
           },
           {
             "component": "Object tape file 1 block 2 (LBA 4)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 2
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 8: unreadable (medium error); Object tape file 1 block 2 (LBA 4): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-13": {
       "image": "a4-minimal",
@@ -2936,6 +2947,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -2946,62 +2969,73 @@
             "checks": "structure"
           },
           {
-            "component": "parity shard at LBA 6",
+            "component": "parity shard epoch 0 stripe 0 parity index 0 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 7",
+            "component": "parity shard epoch 0 stripe 1 parity index 0 (LBA 7)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 1,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 8",
+            "component": "parity shard epoch 0 stripe 2 parity index 0 (LBA 8)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 2,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 9",
+            "component": "parity shard epoch 0 stripe 3 parity index 0 (LBA 9)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 3,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 10",
+            "component": "parity shard epoch 0 stripe 0 parity index 1 (LBA 10)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 1
+            }
           },
           {
             "component": "Object tape file 1 block 1 (LBA 3)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 1
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 6: unreadable (medium error); parity shard at LBA 7: unreadable (medium error); parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); parity shard at LBA 10: unreadable (medium error); Object tape file 1 block 1 (LBA 3): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-15": {
       "image": "two-epoch",
@@ -3248,6 +3282,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -3261,35 +3307,25 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           },
           {
             "component": "Object tape file 1 block 4 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 4
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-16": {
       "image": "a4-minimal",
@@ -3969,6 +4005,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -3979,50 +4027,50 @@
             "checks": "structure"
           },
           {
-            "component": "parity shard at LBA 8",
+            "component": "parity shard epoch 0 stripe 0 parity index 0 (LBA 8)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 9",
+            "component": "parity shard epoch 0 stripe 1 parity index 0 (LBA 9)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 1,
+              "parity_index": 0
+            }
           },
           {
             "component": "Object tape file 1 block 2 (LBA 4)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 2
+            }
           },
           {
             "component": "Object tape file 1 block 3 (LBA 5)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 3
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); Object tape file 1 block 2 (LBA 4): unreadable (medium error); Object tape file 1 block 3 (LBA 5): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-20": {
       "image": "a4-minimal",
@@ -4393,6 +4441,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -4403,56 +4463,61 @@
             "checks": "structure"
           },
           {
-            "component": "parity shard at LBA 8",
+            "component": "parity shard epoch 0 stripe 0 parity index 0 (LBA 8)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 9",
+            "component": "parity shard epoch 0 stripe 1 parity index 0 (LBA 9)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 1,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 10",
+            "component": "parity shard epoch 0 stripe 0 parity index 1 (LBA 10)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 1
+            }
           },
           {
             "component": "Object tape file 1 block 2 (LBA 4)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 2
+            }
           },
           {
             "component": "Object tape file 1 block 3 (LBA 5)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 3
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); parity shard at LBA 10: unreadable (medium error); Object tape file 1 block 2 (LBA 4): unreadable (medium error); Object tape file 1 block 3 (LBA 5): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-22": {
       "image": "a4-minimal",
@@ -4664,6 +4729,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -4683,29 +4760,15 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-23": {
       "image": "short-epoch",
@@ -4897,6 +4960,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -4907,68 +4982,84 @@
             "checks": "structure"
           },
           {
-            "component": "parity shard at LBA 6",
+            "component": "parity shard epoch 0 stripe 0 parity index 0 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 7",
+            "component": "parity shard epoch 0 stripe 1 parity index 0 (LBA 7)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 1,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 8",
+            "component": "parity shard epoch 0 stripe 2 parity index 0 (LBA 8)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 2,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 9",
+            "component": "parity shard epoch 0 stripe 3 parity index 0 (LBA 9)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 3,
+              "parity_index": 0
+            }
           },
           {
-            "component": "parity shard at LBA 10",
+            "component": "parity shard epoch 0 stripe 0 parity index 1 (LBA 10)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 0,
+              "parity_index": 1
+            }
           },
           {
-            "component": "parity shard at LBA 11",
+            "component": "parity shard epoch 0 stripe 1 parity index 1 (LBA 11)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "epoch": 0,
+              "stripe": 1,
+              "parity_index": 1
+            }
           },
           {
             "component": "Object tape file 1 block 1 (LBA 3)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 1
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 6: unreadable (medium error); parity shard at LBA 7: unreadable (medium error); parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); parity shard at LBA 10: unreadable (medium error); parity shard at LBA 11: unreadable (medium error); Object tape file 1 block 1 (LBA 3): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-24": {
       "image": "a4-minimal",
@@ -5156,6 +5247,18 @@
           {
             "section": "2.2",
             "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -5169,29 +5272,15 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-25": {
       "image": "two-epoch",
@@ -5289,12 +5378,12 @@
               0
             ],
             "epoch": 0,
-            "result": "error",
-            "error": "SidecarMetadataUnavailable",
-            "stripe": null,
+            "result": "recovered",
+            "error": null,
+            "stripe": 0,
             "lost": null,
             "limit": null,
-            "bytes_match": null,
+            "bytes_match": true,
             "citations": [
               {
                 "section": "13.1",
@@ -5322,15 +5411,39 @@
               },
               {
                 "section": "13.3",
-                "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
+                "quote": "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates."
               },
               {
                 "section": "13.3",
-                "quote": "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
+                "quote": "With `total` the map entry's block count and `P = S × m`, the tail copy starts at block `H + P`, where `H = (total − 1 − P) / 2`."
               },
               {
-                "section": "15",
-                "quote": "SidecarMetadataUnavailable{epoch_id} no header/index copy validated (Section 13.3)"
+                "section": "13.3",
+                "quote": "This rescue requires that `total − 1 − P` is even and that `H` is greater than zero."
+              },
+              {
+                "section": "13.3",
+                "quote": "The tail copy is used only if it is valid on its own (step 2's sense), its recorded `sidecar_header_block_count` equals `H`, and its epoch and protected range agree with the map entry."
+              },
+              {
+                "section": "13.3",
+                "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Trusted shard**: the read succeeded, AND its CRC-64 matches the sidecar index (data CRC for data peers, parity CRC for parity peers), AND — for data peers — its object tape file is inside the durable boundary (in catalog-less recovery, inside the validated map scope; Section 13.2)."
+              },
+              {
+                "section": "13.4",
+                "quote": "**Erasure**: a read failure, a CRC mismatch, or a position outside the durable boundary."
+              },
+              {
+                "section": "13.5",
+                "quote": "Reconstruct per Section 6.5 from the first `k` trusted or implicit shards (data shards first in index order, then parity)."
+              },
+              {
+                "section": "13.5",
+                "quote": "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
               }
             ]
           },
@@ -5434,6 +5547,18 @@
           {
             "section": "9.1",
             "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "A check of structure and metadata alone, which reads no data block or parity shard, is not a full verification."
           }
         ],
         "outside_terminal_suffix": [
@@ -5450,12 +5575,6 @@
             "checks": "structure"
           },
           {
-            "component": "sidecar tape file 2",
-            "finding": "no header/index copy validates (footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates))",
-            "error": "SidecarMetadataUnavailable",
-            "checks": "structure"
-          },
-          {
             "component": "ParityMap tape file 4",
             "finding": "no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28)",
             "error": "ParityMapParse",
@@ -5465,35 +5584,25 @@
             "component": "Object tape file 1 block 0 (LBA 2)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 0
+            }
           },
           {
             "component": "Object tape file 1 block 4 (LBA 6)",
             "finding": "unreadable (medium error)",
             "error": "TapeIo",
-            "checks": "data"
+            "checks": "data",
+            "address": {
+              "tape_file": 1,
+              "block": 4
+            }
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
-          "readings": [
-            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
-            "a full verification checks only structure and metadata, and does not report them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "D",
-              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "e1-01": {
       "image": "a4-minimal",
