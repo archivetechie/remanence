@@ -22,6 +22,7 @@ No change to the builder may follow a failed comparison without a row here.
 | 12 | the 14 survivor sets: the same checks for the two byte-change statuses, then the self-checks | 165 + 14 | 0 |
 | 13 | everything, after the three new commands were added: `build` reproduced 146 with a byte-identical `build-report.json`; `negatives` and `negatives-supplement` on `blind-inputs/` byte-identical to the committed files; `decide` and `resume` on the tests' synthetic cases byte-identical to the tool as it was before this change | 146 + 4 files | 0 |
 | 14 | after the resume case-id fix and the Section 14 quote fix: `resume` on `tape-images/resume/*/inputs.json` and on the same inputs under their opaque ids, and `negatives`, each equal to its committed file with the one quote replaced; then `build`, `decide`, `negatives-supplement` and the three new commands reproduced their committed files byte for byte | 146 + 9 files | 0 |
+| 15 | everything, after the changes for the revised text (F0, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks` byte-identical; `decide`, `resume`, `negatives`, `negatives-supplement`, `mutations` and `selection` regenerated, each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md), and reproduced byte for byte on a second run; the blind `decisions.json` and `resume-decisions.json` equal the real-id files under the mappings (25 and 8 cases); every self-check agrees | 146 + 11 files | 0 |
 
 ## Failed comparisons
 
@@ -131,26 +132,83 @@ their outputs are byte-identical.
   the key.
 - The Section 14 step 1 quote now matches the current text (the row above).
 
+## Changes for the revised text (F0)
+
+These changes follow the revised text, not a failed comparison. No
+byte-producing code changed. `build-report.json` and
+`negative-block-digests.json` are byte-identical. Every decision file was
+regenerated, and each change to a decision has a row in `DECISION-LOG.md`.
+
+- Quotes. The four stale quotes (`hint_discovery`, `replica_footer_type`,
+  `separation_footer_type`, `sidecar_copy_agree`) were replaced with the
+  revised sentences. The quotes the revised sections add were added too.
+  `test_decision_quotes_occur_in_the_text` checks every quote against the
+  text.
+- Section 8.4 step 1: `discover_layout` spaces back over up to five
+  filemarks from EOD. A footer supplies the layout only at its recorded
+  position and when its planned EOD is at or after the tape's EOD. When no
+  footer supplies one, no replica validates.
+- Section 8.4's tables for the first record with supplied values
+  (`judge_supplied_bootstrap`), and Section 15's bootstrap names by level.
+  A parser reports `BootstrapParse`; discovery without supplied values
+  reports `NoBootstrapFound`; a refusal with supplied values carries the
+  table's name. The negatives' bootstrap entries run a second role,
+  `bootstrap-discovery`.
+- Section 12.3: rungs 1, 4, 5 and 6 recognise a file only when every check
+  passes. Otherwise the failed classification is reported and item 7 makes
+  the file an Object candidate. A matching, fully parsed footer establishes
+  a terminal type when the head is unreadable.
+- Section 13.3: index acquisition follows the revised steps.
+  - A valid footer decides unless an available entry disagrees.
+  - An available entry decides by hash.
+  - Without an entry, the tail copy is read at `H + P`, and a differing
+    hash leaves the epoch unavailable.
+  - An entry is available only with `total = 2H + P + 1` and `H > 0`.
+  - An unavailable epoch is always reported as `SidecarMetadataUnavailable`.
+- Section 2.4: formulas denote exact values. A value that is only compared
+  is compared exactly. The rejections of an intermediate overflow in the
+  replica padding formula and in the ParityMap's `0xC8 + L` were removed.
+- Section 7.2: every position a replica map describes must fit in u64
+  (`validate_structural_rows`).
+- Section 10.6: `W = T` is evaluated on the recorded fields. This removes
+  the G-7 divergence.
+- Sections 2.2 and 9.1: the Verifier reads every sidecar's footer, primary
+  copy and tail copy. It reports a divergence as `SidecarParse`, and reports
+  each finding before the terminal suffix with the error a Reader reports.
+  Findings on data blocks and parity shards stay undecided (Appendix D).
+  With no planned layout, a separation extent that the walk finds damaged is
+  reported invalid.
+- Section 12.6: an inventory's degraded flag follows the Scanner's reads
+  (`per reads`).
+- Section 14: step 2 refuses a prefix whose finalization has begun. In step
+  3, a boundary or wrong-length read is `ResumeAppend` and a medium error is
+  `TapeIo`.
+- Terminal commands:
+  - With no layout, the Scanner walks from BOT and reports the walk's
+    classes, and the separation status comes from the walk.
+  - A survivor set's layout comes from the first of C, B and A whose footer
+    supplies one.
+  - A new mutation kind covers an extent that gains a record (mut-38).
+
 ## Known divergences, not changed
 
-The supplement's rule-by-rule auditor found the first three places below
-where this implementation's parsers read the text differently from the most
-direct reading; the fourth was found while writing the terminal commands.
-Changing them would alter earlier decision files, which must stay
-byte-identical, and none changes a decision, so they are recorded here and
-in GAPS.md instead:
+The supplement's rule-by-rule auditor found places where this
+implementation's parsers read the text differently from the most direct
+reading. None changes a decision, so they are recorded here and in GAPS.md:
 
 - The sidecar header parser evaluates the locator formulas with the Section
   9.4 recomputed H and the 0x50 field P (GAPS G-1).
-- The replica payload check evaluates "W equals T" on recomputed values, not
-  on the recorded fields (GAPS G-7).
 - The directory decoder checks the range chain in array order, where the
   text says "taken in ascending `tape_file_number` order" (GAPS G-6).
-- `check_replica` and `check_separation` report a filemark or EOD met where
-  the plan puts a data record as a `TapeIo` read failure. Under Section 10.6
-  ("The declared locations, the counts, and the trailing filemark agree with
-  the device's measurements.") that is a failed validity condition, and
-  Section 15 keeps I/O faults distinct from format violations. The new
-  commands name it with the component's parse error. Changing the checks
-  themselves would alter the reasons recorded in earlier files, and no
-  earlier decision reports that name.
+- `check_replica` and `check_separation` record a filemark or EOD met where
+  the plan puts a data record with a reason that begins `TapeIo`. Section
+  3.5 reserves `TapeIo` for "a transport or medium failure and for the
+  device reports that Section 2.4 names", and Section 10.6 makes the
+  measured location a validity condition. Every decision and every
+  implementation `error` names the component's parse error. Only the
+  reason string keeps the old prefix, in one place: `mut-04`'s
+  implementation reason for extent A-B.
+
+The replica payload check's evaluation of "W equals T" on recomputed values
+(GAPS G-7) was fixed in F0: Section 10.6 now says the rule uses the recorded
+fields.

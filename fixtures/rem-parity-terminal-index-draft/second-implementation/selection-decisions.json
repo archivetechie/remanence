@@ -45,9 +45,9 @@
         "acceptable_selections": [],
         "degraded": null,
         "replicas": {
-          "A": "invalid: its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)",
-          "B": "invalid: its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)",
-          "C": "invalid: its footer record is shorter than one complete record, so the record-length condition fails (GAPS H-5)"
+          "A": "invalid: its footer record is shorter than one complete record: invalid content of the replica (Section 3.5), and the record-length condition fails",
+          "B": "invalid: its footer record is shorter than one complete record: invalid content of the replica (Section 3.5), and the record-length condition fails",
+          "C": "invalid: its footer record is shorter than one complete record: invalid content of the replica (Section 3.5), and the record-length condition fails"
         },
         "rules": [
           {
@@ -87,6 +87,22 @@
             "quote": "Terminal replicas and separation extents are written and read only at the record sizes 256 KiB, 512 KiB, and 1 MiB;"
           },
           {
+            "section": "3.5",
+            "quote": "A Reader treats it as invalid content of the component it belongs to: an invalid candidate for a control component, an erasure when the Recoverer reads a data block or parity shard (Section 13.4), and, for the first record with a supplied or known block size, the refusal of Sections 8.4 and 15."
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+          },
+          {
             "section": "8.4",
             "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
           },
@@ -107,35 +123,42 @@
         "undecided": []
       },
       "implementation": {
-        "layout_source": "no terminal-replica footer found from EOD",
+        "layout_source": "no terminal-replica footer supplies a layout from EOD",
         "replicas": {
           "A": {
             "valid": false,
             "error": null,
-            "reason": "no planned layout: no replica footer found from EOD"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
           },
           "B": {
             "valid": false,
             "error": null,
-            "reason": "no planned layout: no replica footer found from EOD"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
           },
           "C": {
             "valid": false,
             "error": null,
-            "reason": "no planned layout: no replica footer found from EOD"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
           }
         },
         "separations": {
           "A-B": {
             "status": "not_run",
             "error": null,
-            "reason": "no planned layout"
+            "reason": "walk: separation header matches the plan"
           },
           "B-C": {
             "status": "not_run",
             "error": null,
-            "reason": "no planned layout"
+            "reason": "walk: separation header matches the plan"
           }
+        },
+        "walk_classes": {
+          "tape file 6": "TapeIndexReplica: terminal replica header matches the plan",
+          "tape file 7": "IndexSeparationExtent: separation header matches the plan",
+          "tape file 8": "TapeIndexReplica: terminal replica header matches the plan",
+          "tape file 9": "IndexSeparationExtent: separation header matches the plan",
+          "tape file 10": "TapeIndexReplica: terminal replica header matches the plan"
         },
         "outcome": "BotStructuralRecoveryRequired",
         "acceptable_selections": [],
@@ -143,7 +166,7 @@
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: BotStructuralRecoveryRequired "
+        "detail": "implementation: BotStructuralRecoveryRequired"
       }
     },
     "sel-02": {
@@ -210,6 +233,14 @@
           },
           {
             "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
             "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
           },
           {
@@ -268,7 +299,7 @@
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: BotStructuralRecoveryRequired "
+        "detail": "implementation: BotStructuralRecoveryRequired"
       }
     },
     "sel-03": {
@@ -321,6 +352,14 @@
           {
             "section": "8.5",
             "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
             "section": "12.6",
@@ -441,6 +480,14 @@
           {
             "section": "10.4",
             "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
             "section": "12.6",
@@ -567,6 +614,14 @@
             "quote": "| `0x300` | 248 | reserved zero | fixed |"
           },
           {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
             "section": "12.6",
             "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
           },
@@ -685,6 +740,14 @@
             "quote": "| `0x300` | 248 | reserved zero | fixed |"
           },
           {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
             "section": "12.6",
             "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
           },
@@ -799,6 +862,18 @@
           },
           {
             "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+          },
+          {
+            "section": "8.4",
             "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
           },
           {
@@ -819,70 +894,81 @@
       },
       "implementation": {
         "filemark kept": {
-          "layout_source": "no terminal-replica footer found from EOD",
+          "layout_source": "no terminal-replica footer supplies a layout from EOD",
           "replicas": {
             "A": {
               "valid": false,
               "error": null,
-              "reason": "no planned layout: no replica footer found from EOD"
+              "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
             },
             "B": {
               "valid": false,
               "error": null,
-              "reason": "no planned layout: no replica footer found from EOD"
+              "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
             },
             "C": {
               "valid": false,
               "error": null,
-              "reason": "no planned layout: no replica footer found from EOD"
+              "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
             }
           },
           "separations": {
             "A-B": {
-              "status": "not_run",
-              "error": null,
-              "reason": "no planned layout"
+              "status": "invalid",
+              "error": "TerminalIndexSeparationParse",
+              "reason": "walk: damaged separation extent: header plan differs from the measured file"
             },
             "B-C": {
-              "status": "not_run",
-              "error": null,
-              "reason": "no planned layout"
+              "status": "invalid",
+              "error": "TerminalIndexSeparationParse",
+              "reason": "walk: damaged separation extent: header plan differs from the measured file"
             }
+          },
+          "walk_classes": {
+            "tape file 6": "structural damage: structural damage: zero-block file",
+            "tape file 7": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+            "tape file 8": "structural damage: structural damage: zero-block file",
+            "tape file 9": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+            "tape file 10": "structural damage: structural damage: zero-block file"
           },
           "outcome": "BotStructuralRecoveryRequired",
           "acceptable_selections": [],
           "degraded": null
         },
         "filemark absent": {
-          "layout_source": "no terminal-replica footer found from EOD",
+          "layout_source": "no terminal-replica footer supplies a layout from EOD",
           "replicas": {
             "A": {
               "valid": false,
               "error": null,
-              "reason": "no planned layout: no replica footer found from EOD"
+              "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
             },
             "B": {
               "valid": false,
               "error": null,
-              "reason": "no planned layout: no replica footer found from EOD"
+              "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
             },
             "C": {
               "valid": false,
               "error": null,
-              "reason": "no planned layout: no replica footer found from EOD"
+              "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD"
             }
           },
           "separations": {
             "A-B": {
-              "status": "not_run",
-              "error": null,
-              "reason": "no planned layout"
+              "status": "invalid",
+              "error": "TerminalIndexSeparationParse",
+              "reason": "walk: damaged separation extent: header plan differs from the measured file"
             },
             "B-C": {
               "status": "not_run",
               "error": null,
               "reason": "no planned layout"
             }
+          },
+          "walk_classes": {
+            "tape file 6": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+            "tape file 7": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file"
           },
           "outcome": "BotStructuralRecoveryRequired",
           "acceptable_selections": [],
@@ -891,7 +977,7 @@
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: BotStructuralRecoveryRequired "
+        "detail": "implementation: BotStructuralRecoveryRequired"
       }
     },
     "sel-08": {
@@ -911,13 +997,15 @@
         ]
       },
       "decision": {
-        "outcome": "undecided",
-        "acceptable_selections": null,
-        "degraded": null,
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B"
+        ],
+        "degraded": true,
         "replicas": {
-          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule",
+          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule",
           "B": "valid: the profile's replica, which is locally eligible",
-          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule"
+          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule"
         },
         "rules": [
           {
@@ -958,98 +1046,67 @@
           },
           {
             "section": "8.4",
-            "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
             "section": "8.4",
-            "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
-          }
-        ],
-        "readings": [
-          {
-            "outcome": "BotStructuralRecoveryRequired",
-            "acceptable_selections": [],
-            "degraded": null,
-            "reading": "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT"
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
-            "outcome": "inventory",
-            "acceptable_selections": [
-              "B"
-            ],
-            "degraded": true,
-            "reading": "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are B"
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
           }
         ],
-        "undecided": [
-          {
-            "aspect": "tape.outcome",
-            "readings": [
-              "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT",
-              "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are B"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
-              },
-              {
-                "section": "8.4",
-                "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
-              },
-              {
-                "section": "8.4",
-                "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
-              },
-              {
-                "section": "8.4",
-                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
-              }
-            ]
-          }
-        ]
+        "readings": null,
+        "undecided": []
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "layout_source": "replica footer at LBA 35 (replica ordinal 2)",
         "replicas": {
           "A": {
             "valid": false,
             "envelope_valid": false,
             "error": "TerminalIndexReplicaParse",
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
           },
           "B": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "TapeIo: LBA 10: expected a data block, found filemark"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           },
           "C": {
             "valid": false,
             "envelope_valid": false,
             "error": "TerminalIndexReplicaParse",
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
           }
         },
         "separations": {
           "A-B": {
-            "status": "invalid",
-            "error": "TerminalIndexSeparationParse",
-            "reason": "TerminalIndexSeparationParse: role magic does not match"
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
           },
           "B-C": {
-            "status": "invalid",
-            "error": "TerminalIndexSeparationParse",
-            "reason": "TapeIo: LBA 14: expected a data block, found filemark"
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
           }
         },
-        "outcome": "BotStructuralRecoveryRequired",
-        "acceptable_selections": [],
-        "degraded": null
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "B"
+        ],
+        "degraded": true
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: BotStructuralRecoveryRequired "
+        "detail": "implementation: inventory B degraded"
       }
     },
     "sel-09": {
@@ -1112,6 +1169,14 @@
           {
             "section": "10.4",
             "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
             "section": "12.6",
@@ -1191,13 +1256,16 @@
         ]
       },
       "decision": {
-        "outcome": "undecided",
-        "acceptable_selections": null,
-        "degraded": null,
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "B"
+        ],
+        "degraded": true,
         "replicas": {
           "A": "valid: the profile's replica, which is locally eligible",
           "B": "valid: the profile's replica, which is locally eligible",
-          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule"
+          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule"
         },
         "rules": [
           {
@@ -1238,99 +1306,72 @@
           },
           {
             "section": "8.4",
-            "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
             "section": "8.4",
-            "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
-          }
-        ],
-        "readings": [
-          {
-            "outcome": "BotStructuralRecoveryRequired",
-            "acceptable_selections": [],
-            "degraded": null,
-            "reading": "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT"
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
-            "outcome": "inventory",
-            "acceptable_selections": [
-              "A",
-              "B"
-            ],
-            "degraded": true,
-            "reading": "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are A and B"
+            "section": "12.6",
+            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+          },
+          {
+            "section": "C",
+            "quote": "the selection order among agreeing replicas"
           }
         ],
-        "undecided": [
-          {
-            "aspect": "tape.outcome",
-            "readings": [
-              "the Scanner takes the planned layout from the first replica footer it finds from EOD, C's; under that plan no planned coordinate holds a valid replica, so it walks from BOT",
-              "a footer that is not locally eligible cannot supply the layout (or every footer's layout is considered, Section 8.4's pointer to Section 8.5); the next replica footer from EOD gives the profile's plan, under which the valid replicas are A and B"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
-              },
-              {
-                "section": "8.4",
-                "quote": "When footers propose different planned layouts, Section 8.5 decides which replicas are accepted."
-              },
-              {
-                "section": "8.4",
-                "quote": "Footer-local observed positions MUST agree with the footer's planned shared layout before that replica is eligible."
-              },
-              {
-                "section": "8.4",
-                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
-              }
-            ]
-          }
-        ]
+        "readings": null,
+        "undecided": []
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
+        "layout_source": "replica footer at LBA 35 (replica ordinal 2)",
         "replicas": {
           "A": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           },
           "B": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "TapeIo: LBA 10: expected a data block, found filemark"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           },
           "C": {
             "valid": false,
             "envelope_valid": false,
             "error": "TerminalIndexReplicaParse",
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
           }
         },
         "separations": {
           "A-B": {
-            "status": "invalid",
-            "error": "TerminalIndexSeparationParse",
-            "reason": "TerminalIndexSeparationParse: role magic does not match"
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
           },
           "B-C": {
-            "status": "invalid",
-            "error": "TerminalIndexSeparationParse",
-            "reason": "TapeIo: LBA 14: expected a data block, found filemark"
+            "status": "valid",
+            "error": null,
+            "reason": "header, footer, zero interior and trailing filemark validate"
           }
         },
-        "outcome": "BotStructuralRecoveryRequired",
-        "acceptable_selections": [],
-        "degraded": null
+        "outcome": "inventory",
+        "acceptable_selections": [
+          "A",
+          "B"
+        ],
+        "degraded": true
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: BotStructuralRecoveryRequired "
+        "detail": "implementation: inventory A/B degraded"
       }
     },
     "sel-11": {
@@ -1356,7 +1397,7 @@
         ],
         "degraded": true,
         "replicas": {
-          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule",
+          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule",
           "B": "valid: the profile's replica, which is locally eligible",
           "C": "valid: the profile's replica, which is locally eligible"
         },
@@ -1396,6 +1437,14 @@
           {
             "section": "10.6",
             "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
             "section": "12.6",
@@ -1522,6 +1571,14 @@
             "quote": "| `0x300` | 248 | reserved zero | fixed |"
           },
           {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
             "section": "12.6",
             "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
           },
@@ -1602,7 +1659,7 @@
         "degraded": true,
         "replicas": {
           "A": "valid: the profile's replica, which is locally eligible",
-          "B": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its declared tape-file number and start LBA disagree with the device's measurements wherever it is read, so it is never locally eligible and takes no part in the conflict rule",
+          "B": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule",
           "C": "valid: the profile's replica, which is locally eligible"
         },
         "rules": [
@@ -1641,6 +1698,14 @@
           {
             "section": "10.6",
             "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
             "section": "12.6",
@@ -1765,6 +1830,14 @@
           {
             "section": "10.4",
             "quote": "| `0x300` | 248 | reserved zero | fixed |"
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
             "section": "12.6",

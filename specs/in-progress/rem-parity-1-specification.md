@@ -362,7 +362,8 @@ A single implementation may fill several roles.
 - **Resumer**: re-opens a committed tape for append (Section 14).
 - **Verifier**: validates a tape's structures and digests end to end without
   recovering payload — the Scanner's checks plus the Recoverer's index and
-  CRC validation.
+  CRC validation. It reports damage it finds before the terminal suffix with
+  the error a Reader reports for that component.
 - **Reader**: any role that reads a tape: the Scanner, the Recoverer, the
   Resumer and the Verifier, and the Writer when it reads back what it has
   written. A requirement on a Reader binds each of them. This is not the
@@ -438,7 +439,21 @@ end of medium. SHA-256 is the hash function of [FIPS180-4]. Text fields
 (scheme and format
 identifiers, version strings, timestamps) are UTF-8 [RFC3629]. Arithmetic on values
 read from tape MUST be checked; overflow is rejection, never wraparound
-(Section 16.2).
+(Section 16.2). Here, overflow means that a value's exact integer value does
+not fit, as the next paragraph defines.
+
+Every formula in this document denotes its exact integer value. A Reader
+rejects a value that is recorded, or used as a position, a count or an
+ordinal, when its exact value does not fit the field or the u64 that holds
+it; the error is the one named for the structure that carries the value. A
+value that is only compared is compared exactly, and is never too large. An
+intermediate overflow in one way of writing a formula is not a format
+violation, and a Reader MUST NOT reject for it. The same rule applies to
+values from off-tape commit records, which are `ResumeAppend` when they do
+not fit (Sections 3.4 and 14), and to positions a device reports, which are
+`TapeIo` when they do not fit or when they go backwards: the device, not the
+tape, is then at fault. A limit of the host, such as an allocation bound, is
+an implementation limit and not a format violation.
 
 ### 2.5. Constants
 
@@ -539,6 +554,12 @@ data_index  = d / S                    (0 ≤ data_index < k)
 inverse:  o = start + data_index·S + stripe
 ```
 
+The Recoverer uses the inverse to decide whether a stripe position holds a
+real data shard or an implicit zero (Section 13.4). That decision compares the
+exact value of `o` with the protected end, as Section 2.4 requires, so a
+position whose `o` would not fit in u64 is an implicit zero, and is not
+rejected.
+
 The interleave is essential: `N ≤ S` physically consecutive data blocks land
 in `N` distinct stripes, so contiguous damage of up to `S × m` blocks stays
 within the per-stripe tolerance `m` (Appendix B.2). Parity shards are
@@ -613,6 +634,18 @@ block is an error, with two classified boundary outcomes: **Filemark** and
 **EndOfData**. The tape I/O layer MUST distinguish the Filemark and EndOfData
 outcomes on every transport, and on a SCSI transport in both of its sense-data
 formats [LTO-SCSI].
+
+A read that returns a record shorter or longer than one block reports a fact
+about the tape, not a failure of the device: the record on tape is not one
+block long. A Reader treats it as invalid content of the component it belongs
+to: an invalid candidate for a control component, an erasure when the
+Recoverer reads a data block or parity shard (Section 13.4), and, for the first
+record with a supplied or known block size, the refusal of Sections 8.4 and
+15. It is never `TapeIo`, which is reserved for a transport or medium failure
+and for the device reports that Section 2.4 names. The
+tape I/O layer therefore reports a record of the wrong length, with its
+measured length, as an outcome of its own, distinct from both boundary
+outcomes and from a transport failure.
 
 The tape I/O layer MUST persist blocks and filemarks to medium strictly in
 submission order. The tape I/O layer MUST provide a **synchronizing barrier**:
@@ -917,7 +950,13 @@ contiguous from 0 in tape order (Section 3.2). Kind-specific fields are
 exclusive to their kinds; an entry carrying a field outside its kind is
 invalid. A terminal-replica payload describes only the prefix before A, so
 kinds 4 and 5 inside that payload are invalid, even though a Scanner
-recognizes those kinds in the measured physical tail. Derived scalars:
+recognizes those kinds in the measured physical tail. Every record position
+and every trailing filemark position that the map describes, by Section 3.2's
+`LBA(f, b)`, MUST fit in u64; a recorded map that breaks this is invalid. The
+append position after the last filemark is not a validity rule of the map; it
+is a Writer and Resumer concern (Sections 3.4 and 14). A walked map's
+positions are device reports, so for it Section 2.4's `TapeIo` applies.
+Derived scalars:
 
 ```text
 T = max(first_parity_data_ordinal + block_count) over object entries    (0 if none)
@@ -1207,7 +1246,15 @@ tape identity, block size, and parity geometry. It then positions to EOD and
 discovers the terminal replicas:
 
 1. locate, from EOD, the local footer of a terminal replica, and from it the
-   planned terminal layout (Section 8.3);
+   planned terminal layout (Section 8.3); the Scanner spaces back over up to
+   five filemarks from EOD and reads the record before each, stopping early
+   when a backspace does not cross exactly one filemark or leaves the
+   partition. A terminal replica's footer that parses supplies a planned
+   layout only when its recorded footer position equals the position at which
+   it was read, and the layout's planned EOD is at or after the tape's EOD. A
+   layout whose planned EOD lies before the tape's EOD may be followed by
+   later tape files, so it is not used, and when no footer supplies a layout,
+   no replica validates;
 2. validate the header, footer and trailing filemark of every replica that
    layout plans; a replica's payload need be validated only for the replica to
    be accepted, or when two replica envelopes differ in an edition-common
@@ -1220,11 +1267,43 @@ discovers the terminal replicas:
 When footers propose different planned layouts, Section 8.5 decides which
 replicas are accepted.
 
-A Scanner that cannot read the bootstrap MAY perform the discovery above
-when it is given the three values Section 8.4.1 names. It then uses the
-supplied tape UUID as the key of the role magics (Section 5.2). A readable
+A Scanner that cannot read the bootstrap, and is given the three values
+Section 8.4.1 names, MUST perform the discovery above with them. It then uses
+the supplied tape UUID as the key of the role magics (Section 5.2). A readable
 bootstrap whose values disagree with the supplied ones is refused; the
 supplied values never take its place.
+
+With supplied values, the Scanner judges the first record in two stages: the
+physical read first and then, for a record of the right length, its content.
+The bootstrap's fixed header is 0x38 bytes, and its header CRC covers the
+first 0x30 of them; the payload carries its own CRC.
+
+| Reading the first record gives | The Scanner |
+| --- | --- |
+| a medium error, or a filemark or EOD where the record should be | treats the bootstrap as unreadable and continues on the supplied values |
+| a transport failure | reports `TapeIo` |
+| a record whose measured length differs from the supplied block size, shorter or longer | refuses it (`BootstrapParse`, naming the block size) |
+
+The comparison is always with the supplied block size. A Scanner that also
+reads the first record at a candidate size other than the supplied one does
+not refuse for a mismatch with that candidate; it refuses only when the
+record's measured length differs from the supplied size.
+
+For a record of the right length, the first matching row applies:
+
+| Content | The Scanner |
+| --- | --- |
+| the magic is missing, or the header CRC fails | treats the bootstrap as unreadable |
+| the header CRC is valid, and the format major, tape UUID, block size, sequence (which Section 8.1 fixes at 0) or no-parity flag is impossible or disagrees with the supplied values | refuses it (`BootstrapParse`, naming the first such field in that order), even when the payload is damaged |
+| the header is valid, and the payload CRC fails or the payload's length runs past the block | treats the bootstrap as unreadable |
+| both CRCs are valid, and the payload breaks a later rule of Section 8 | treats the bootstrap as unreadable, unless a value that can still be decoded disagrees, as in the next two rows |
+| a decodable `drive_compression` is true, and the tape is a parity tape | refuses it (`DriveCompressionEnabled`) |
+| a decodable parity scheme disagrees with the supplied scheme | refuses it (`BootstrapParse`, naming the scheme) |
+
+A bootstrap that is treated as unreadable is not trusted for any value. A
+bootstrap whose label is imperfect but agrees with the supplied values
+therefore leaves the tape recoverable, and a bootstrap that contradicts them
+is refused.
 
 Footer-local observed positions MUST agree with the footer's planned shared
 layout before that replica is eligible. A planned position or digest for a
@@ -1263,7 +1342,7 @@ separation extent at that size eligible.
 Section 10.6 defines the exact local eligibility conditions. A magic or CRC
 miss invalidates that candidate. A medium error invalidates the affected
 candidate, while a non-medium transport error aborts discovery.
-`drive_compression = true` on the bootstrap still rejects the tape
+`drive_compression = true` on a parity bootstrap still rejects the tape
 (Sections 11.4, 16.3).
 
 #### 8.4.1. All-Replicas-Invalid BOT Walk
@@ -1358,17 +1437,22 @@ data→sidecar boundary spreads across stripes exactly as it does within the dat
 region (Appendix B.2). It is the sole reason the contiguous-damage guarantee of
 Section 1.1 holds across that boundary and not merely within object data.
 
-Parity shard blocks are raw blocks with no headers. Physical block placement is
-determined solely by the locator above from a shard's explicit `(stripe_index,
-parity_index)` fields; it is **independent of the order of that shard's entry in
-the Section 9.3 index stream** (which remains stripe-major). A Reader MUST locate
-a parity shard by computing `block(stripe, parity_index)` from its explicit
-fields, never by the position of its index entry. The tail copy MUST carry
-metadata and index content identical to the primary; only `copy_kind` and the
-recomputed CRCs differ. When both copies parse, a Reader MUST verify that they
-agree and reject divergence. The minimum block size for sidecars is 0xE0 —
-block 0 must hold the 0xC8-byte header, at least one 16-byte parity index
-entry, and the trailing 8-byte CRC.
+Parity shard blocks are raw blocks with no headers. Physical block placement
+is determined solely by the locator above from a shard's explicit
+`(stripe_index, parity_index)` fields; it is **independent of the order of
+that shard's entry in the Section 9.3 index stream** (which remains
+stripe-major). A Reader MUST locate a parity shard by computing
+`block(stripe, parity_index)` from its explicit fields, never by the position
+of its index entry. The tail copy MUST carry metadata and index content
+identical to the primary; only `copy_kind` and the recomputed CRCs differ.
+When both copies are valid and their canonical metadata hashes (Section 9.5)
+differ, a Recoverer MUST use a copy that the footer or the sidecar epoch
+directory vouches for and neither contradicts, and MUST reject both when
+neither is available (Section 13.3). A Verifier MUST read every sidecar's
+primary copy, tail copy and footer, and MUST report a divergence between the
+copies as `SidecarParse`, even when the footer or the directory decides it.
+The minimum block size for sidecars is 0xE0 — block 0 must hold the 0xC8-byte
+header, at least one 16-byte parity index entry, and the trailing 8-byte CRC.
 
 ### 9.2. The Header Block (Block 0 of Each Copy) — All Little-Endian
 
@@ -1505,6 +1589,11 @@ directory (Section 10.1.5) can verify a surviving header copy independently of
 | 0x80 | 8 | footer_crc64 — CRC-64/XZ over bytes 0x00..0x80 |
 | 0x88… | | zero fill, MUST be zero |
 
+The footer's `tape_uuid` MUST match the bootstrap or, when the bootstrap is
+unreadable, the tape UUID supplied under Section 8.4.1, as each header copy's
+`tape_uuid` must (Section 9.2). The magic alone does not check it, because the
+magic is derived from the tape UUID the Reader already holds.
+
 The footer is a *locator*: it holds everything needed to find and check
 either header copy without reading the other, and it sits at the end of the
 tape file where it is found by reading the file's last block (Section 12.3
@@ -1602,6 +1691,9 @@ zero. The header/footer version is 2. The payload immediately follows byte
 | 0xC0 | 8 | CRC-64/XZ over bytes 0x00..0xC0 |
 | 0xC8… | | payload in headers; zero fill in footer |
 
+`block_size` MUST equal the tape's block size, which is the length of every
+block read, as the sidecar header's `block_size` must (Section 9.2).
+
 A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the
 footer, and MUST NOT rely on a block whose CRC does not verify. Such a header
 copy or footer is invalid. When one header copy is invalid and the other is
@@ -1630,7 +1722,9 @@ key's absence, and MUST NOT refuse the ParityMap on account of either.
 
 Readers MUST validate the locator arithmetic (`M` from `payload_len` and
 `block_size`; total = 2M + 1; the three start indices) and reject
-disagreement between header, footer, and the measured tape file length.
+disagreement between header, footer, and the measured tape file length. The
+agreement between a header copy and the footer covers every field that both
+carry, other than `copy_kind` and the CRC, not only the locator fields.
 
 The decoded payload MUST match the header/footer locator fields (UUID,
 sequence, digest, scope, and `is_final_directory`) and the payload bytes MUST
@@ -2077,7 +2171,8 @@ never falls through to Object (Section 12.3).
   bytes, and padding validate against Section 10.4, and the block size is one
   of the terminal record sizes of Section 8.3.
 - Every size formula of Section 10.4 evaluates without overflow, and the
-  recorded geometry fields equal its results.
+  recorded geometry fields equal its results. As Section 2.4 defines it, a
+  formula evaluates without overflow when its exact value fits in u64.
 - The planned layout of the terminal suffix validates against Section 8.3, and
   its layout digest recomputes to the recorded value.
 - The edition digest and the local descriptor digest recompute to the
@@ -2100,6 +2195,8 @@ additional relationships hold:
   `ParitySidecar` row is present;
 - when sidecars are present, `highest_protected_ordinal` equals
   `total_data_ordinals`, so finalization left no Object ordinal unprotected;
+  both are the recorded fields, and Section 7.4 separately requires each to
+  equal the value recomputed from the map;
 - `covered_prefix_tape_file_count`, `structural_row_count`, and replica A's
   planned tape-file number are equal.
 
@@ -2226,11 +2323,21 @@ structural damage; EOD at a file start ends the walk.
 The bootstrap at tape file 0 establishes the tape identity against which every
 later classification is checked. When the bootstrap cannot be read, the
 identity is the expected tape UUID supplied out of band (Sections 8.4 and
-8.4.1). The items below are numbered for reference, not as an order of trial.
-Items 1 to 6 recognise kinds that are disjoint by magic; items 5 and 6 are two
-ways of recognising a sidecar. When the primary header parses, item 5 requires
-the header's total block count to match the measured count. A mismatch is a
-hard error. Item 7 applies to a tape file that none of items 1 to 6 recognises.
+8.4.1). The items below are numbered for reference, not as an order of trial,
+with the one exception for items 5 and 6 stated below. Items 1 to 6 recognise
+kinds that are disjoint by magic; items 5 and 6 are two ways of recognising a
+sidecar.
+
+Items 2 and 3 commit a tape file to its control type as soon as its magic
+matches, as they state. For items 1, 4, 5 and 6, a rung *recognises* a tape
+file only when the file passes every check of that rung, its measured block
+count included; a file that fails one of them is not recognised. A rung that
+parses a file but fails its measured count reports the failed classification.
+At tape file 0 with supplied values, the first record is judged by
+Section 8.4 before item 1. When a sidecar's
+primary header parses, item 5 decides the sidecar rung for that file: if its
+count fails, item 6 is not tried. Item 7 applies to a tape file that none of
+items 1 to 6 recognises.
 
 1. **Bootstrap**: the fixed magic matches, the full frame parses, the frame's
    `block_size_bytes` equals the read size, the frame's `tape_uuid` equals the
@@ -2240,33 +2347,37 @@ hard error. Item 7 applies to a tape file that none of items 1 to 6 recognises.
    checked against the encoded component plan. A malformed frame or count
    mismatch is reported as a damaged terminal replica; it MUST NOT fall through
    to Object. When the head is unreadable, a matching, fully parsed terminal
-   footer may establish the same type after its measured count is checked.
+   footer establishes the same type, after its measured count is checked.
 3. **IndexSeparationExtent**: matching separation-header magic commits the
    tape file to this control type under the same malformed-control and measured
-   count rules. A matching, fully parsed footer may establish the type when the
-   head is unreadable.
+   count rules. When the head is unreadable, a matching, fully parsed footer
+   establishes the type.
 4. **ParityMap**: a complete copy/header and payload validate, and the
    measured block count agrees with its locator footer. It is classified as
    parity-closeout metadata written before the terminal suffix, not selected
    as terminal inventory authority.
 5. **Sidecar (primary)**: the primary header parses, and the measured block
-   count MUST equal the header's `sidecar_total_block_count`. A mismatch is a
-   hard error.
+   count MUST equal the header's `sidecar_total_block_count`. On a mismatch the
+   file is not recognised, and item 6 is not tried.
 6. **Sidecar (footer/tail probe)**: the Scanner reads the file's last block.
    If it parses as a sidecar footer, the footer's total MUST equal the
    measured block count, and the Scanner verifies the tail header copy against
-   the footer, field for field. The Scanner MAY classify from the footer
-   fields alone if the tail copy is unreadable.
+   the footer, field for field. On a mismatch the file is not recognised. The
+   Scanner MAY classify from the footer fields alone if the tail copy is
+   unreadable.
 7. **Object, by elimination** — never by reading object content.
 
 In items 2 through 6, a count-mismatch “hard error” is scoped to that rung and
 that tape file's classification: the Scanner reports the failed
 classification and continues the walk with the next tape file. It MUST NOT
-abort the whole walk for that mismatch.
+abort the whole walk for that mismatch. Under items 2 and 3 the file keeps its
+control type, damaged; under items 4, 5 and 6, as under item 1, the file is
+not recognised, and item 7 applies.
 
 **Unreadable head block:** the Scanner MUST NOT abort. It MUST measure the
 file by filemark spacing, run the footer/tail sidecar probe, and otherwise
-classify the file as an object candidate.
+classify the file as an object candidate. The last block it reads for that
+probe also serves the terminal footer probe of items 2 and 3.
 
 *Rationale.* This is the no-circular-failure rule in action: the block needing
 recovery may be the very block that would have classified the file.
@@ -2331,7 +2442,11 @@ exists.
 
 On a tape presented without host state, a validating C/B/A survivor attests
 the complete terminal inventory carried in that replica. Missing or invalid
-siblings make the result degraded; disagreement makes it a conflict. No valid
+siblings make the result degraded; disagreement makes it a conflict. An
+inventory is *degraded* when the Scanner found a replica of the planned
+layout missing or invalid. A Scanner need not read every replica's payload
+(Section 8.4 step 2), so a replica whose payload it did not read is not found
+invalid for that reason; a Verifier's full check reports every replica. No valid
 replica invokes the explicit BOT structural walk, whose result is recovery
 evidence rather than a fabricated terminal edition. A structural artifact
 after the exact terminal suffix is nonconformant and MUST NOT be admitted as
@@ -2383,22 +2498,49 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    epoch's footer and its total matches the map entry: read and verify
    **both** header copies against the footer locator, including the
    `canonical_metadata_hash`; use the primary if valid, else the tail;
-   record copy health (both-usable / tail-lost / primary-lost).
+   record copy health (both-usable / tail-lost / primary-lost). Such a footer
+   is valid, and it decides, unless an available sidecar epoch directory
+   entry (step 3) disagrees with it: a copy it contradicts is damaged, and the
+   directory-assisted rescue of step 3 is not used. When an available entry
+   disagrees with a valid footer, on the canonical metadata hash or on the
+   tail copy's position, neither decides: a copy that either contradicts is
+   not used. If no copy remains, the epoch is metadata-unavailable (step 4).
 2. **Primary fallback.** If the footer is unreadable, unparseable, **or
    inconsistent with the map entry** — a footer that parses but contradicts
    the map is treated as an invalid footer, not as a hard stop — fall back to
    the primary header at block 0 (copy-kind and map-entry block-count
    cross-checks apply).
+   - When a sidecar epoch directory entry is available (step 3), it decides
+     as the footer would: a copy is used only if its `canonical_metadata_hash`
+     equals the entry's. The primary is used if it does; otherwise step 3
+     applies.
+   - When no entry is available, a Recoverer whose primary copy validates MUST
+     also read the tail copy at block `H + P`, where `H` is the primary's
+     `sidecar_header_block_count` and `P = S × m`. The tail copy is valid when
+     it satisfies Sections 9.2 to 9.5 on its own, its `copy_kind` is 2, and it
+     passes the cross-checks of this step. A valid tail copy whose canonical
+     metadata hash (Section 9.5) differs from the primary's leaves nothing to
+     decide between them, and the epoch is metadata-unavailable. If the tail
+     copy is unreadable or invalid, the primary is used.
 3. **Directory-assisted tail rescue.** If the primary also fails and a sidecar
    epoch directory entry is available: locate the tail copy at block
    `sidecar_total_block_count − 1 − sidecar_header_block_count` using the
    entry's counts, and verify its `canonical_metadata_hash` against the entry.
+   The same applies when the primary is valid but its hash disagrees with an
+   available entry. For an entry that meets the preconditions below, that
+   block is `H + P`, where `H` is the entry's `sidecar_header_block_count` and
+   `P = S × m`.
    An entry is available whenever the tape's final ParityMap validates and is
    marked `is_final_directory`, reached through a validated replica's
    structural rows or found by the Section 8.4.1 walk. A Recoverer MUST NOT
    place a read from a directory entry unless the entry agrees with the
    sidecar's map entry in tape file, epoch, protected range and block count.
-   This applies to every map entry the rescue uses, on either route.
+   This applies to every map entry the rescue uses, on either route. The
+   rescue also requires the entry's `sidecar_total_block_count` to equal
+   `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not
+   available. These are
+   preconditions of the rescue, not invariants of Section 10.1.5: an entry that
+   fails them affects only its own epoch.
    On the walk route, the Scanner identifies each Object candidate at a tape
    file the directory entry names as that sidecar when its measured length
    equals the entry's `sidecar_total_block_count`, without reading its tail.
@@ -2408,7 +2550,10 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    The directory carries exactly the counts and hash needed to find and verify
    the tail copy without the footer — the case it exists for (Section 10.1.1).
 4. Only when no header/index copy can be validated is the epoch
-   **metadata-unavailable** — and only that epoch (Section 12.5).
+   **metadata-unavailable** — and only that epoch (Section 12.5). A copy that
+   the footer or the directory contradicts, or that step 2 leaves undecided,
+   is not validated. The Recoverer then reports `SidecarMetadataUnavailable`
+   for the epoch, whatever each copy's own failure was.
 
 This is the **recovery-usable rule**: at least one valid header/index copy
 plus CRC-passing needed shards ⇒ the epoch is usable. The acquired index
@@ -2428,7 +2573,8 @@ peer position is exactly one of:
   catalog-less recovery, inside the validated map scope; Section 13.2).
 - **Erasure**: a read failure, a CRC mismatch, or a position outside the
   durable boundary. An erasure is *never* a trusted shard and never poisons
-  the session.
+  the session. A record shorter or longer than one block is a read failure
+  (Section 3.5).
 - **Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an
   all-zero shard supplied without tape I/O; not an erasure (Section 6.4).
 
@@ -2437,7 +2583,9 @@ peer position is exactly one of:
 Reconstruct per Section 6.5 from the first `k` trusted or implicit shards
 (data shards first in index order, then parity). More than `m` erasures in
 a stripe is unrecoverable — a typed result carrying the stripe and the
-counts (`Unrecoverable{stripe, lost_count, limit}`).
+counts (`Unrecoverable{stripe, lost_count, limit}`). `lost_count` is the
+number of erasures in the stripe, including the failed block, and `limit` is
+`m`.
 
 Every reconstructed data block MUST be verified against its sidecar data CRC
 before release. A mismatch is an unrecoverable result, even though the matrix
@@ -2463,11 +2611,18 @@ the last object, and not at the watermark.
 2. Enforce the version-1 bound: `T − W < S × k` (at most one open epoch).
    `W ≤ T`; committed sidecar ranges MUST be contiguous from zero through
    `W`; epoch ids MUST be consecutive; and the prefix's final object entry
-   MUST end exactly at `T`. A violation is `ResumeAppend`.
+   MUST end exactly at `T`. A violation is `ResumeAppend`. A committed prefix
+   that records a terminal component or a final ParityMap describes a tape
+   whose finalization has begun, and Section 3.4's transition to `Finalizing`
+   permanently disables Object admission, so it is refused as
+   `ResumeAppend` too.
 3. Rebuild the open epoch by **re-reading ordinals `[W, T)` from the
    committed prefix on tape** — a boundary or short read where data is
    expected is fatal — recomputing per-block CRCs and re-accumulating
-   parity. (Under the step-2 bound, `[W, T)` is the next open epoch range;
+   parity. A read that finds a filemark, EOD or a record shorter or longer
+   than one block where the committed prefix places a data block contradicts
+   the commit record, and is `ResumeAppend`; a medium or transport failure is
+   `TapeIo`. (Under the step-2 bound, `[W, T)` is the next open epoch range;
    a committed prefix never contains a complete unprotected epoch,
    because an object and the sidecars emitted at its close commit as one
    bundle — Section 11.1.)
@@ -2517,6 +2672,27 @@ Invariant                       internal consistency failure (implementation def
 TapeIo                          transport/medium failure (not a format violation)
 Journal                         commit-store failure (not a format violation)
 ```
+
+Some names cover cases stated elsewhere. `BootstrapParse` includes a
+readable bootstrap that disagrees with supplied values (Section 8.4).
+`TerminalIndexReplicaParse` includes a replica map that describes a position
+that does not fit (Section 7.2). `ResumeAppend` includes a commit record whose
+values do not fit, and `TapeIo` a device-reported position that does not fit
+or goes backwards (Section 2.4). `NoBootstrapFound` is a discovery outcome, as
+the next paragraph states.
+
+The bootstrap names depend on the level at which a Reader meets the block. A
+parser given one block as the bootstrap reports a breach of Section 8 as
+`BootstrapParse`, including a missing magic and a failed CRC, except that a
+parity bootstrap recording drive compression is `DriveCompressionEnabled`.
+Discovery over the candidate block sizes, without supplied values, reports
+`NoBootstrapFound` when it finds no usable bootstrap at any candidate, and
+`DriveCompressionEnabled` when a parity bootstrap records compression; a
+record of another length only rules out that candidate. Discovery with only a
+known block size is discovery over that one candidate, except that a record
+of another length, or a bootstrap whose recorded block size differs from it,
+is `BootstrapParse`. Discovery with supplied values follows Section 8.4.
+`BootstrapPayloadTooLarge` is a Writer error.
 
 Framing, CBOR, and type errors in a ParityMap, its directory included, are
 `ParityMapParse`; a well-formed directory that breaks an invariant of
@@ -2580,7 +2756,8 @@ correspondence while appearing to work. Hence the dual defense. The Writer
 verifies compression off before writing (Section 11.4). The recorded
 `drive_compression` flag (bootstrap key 5) makes a tape written with
 compression enabled identify itself as nonconformant. A Reader MUST reject
-such a tape.
+such a tape. Both sentences concern a parity tape (Section 11.4): a no-parity
+bootstrap may record compression.
 
 ### 16.4. Structure Leakage and Confidential Payloads
 
@@ -2656,19 +2833,19 @@ stated records of an image unreadable or remove a filemark; the other reads
 the second-edition image undamaged. Each gives the outcome it expects under
 this document: the inventory a Scanner reports, the result of the walk, or
 each failed address's recovery or error, and in one case what a Verifier
-reports. Three of them (`replicas-all`, `bootstrap-hinted` and
-`bootstrap-wrong-scheme`) expect a Scanner to use a permission that this
-document grants but does not require. The outcomes were written from this
-document before any reader was run on them. Of the 25 cases, 24 are
-pinned. The outcome pinned for `filemark-prefix`
-depends on a reading of Section 12.3 that this document leaves open, and
-`parity-map-and-sidecar` is informative because this document does not decide
-part of it. The outcomes of the burst cases (`burst-m`, `burst-m-plus-one`,
+reports. One of them (`replicas-all`) expects a Scanner to run the walk that
+Section 8.4.1 requires it to offer. Two (`bootstrap-hinted` and
+`bootstrap-wrong-scheme`) expect the discovery with supplied values that
+Section 8.4 requires. The outcomes were written from this document before any
+reader was run on them. Of the 25 cases, 24 are pinned. The outcome pinned for
+`filemark-prefix` follows Section 12.3's rule that a rung which fails its
+count does not recognise the file. `parity-map-and-sidecar` is informative
+because this document does not yet decide part of it (Appendix D item TT-2).
+The outcomes of the burst cases (`burst-m`, `burst-m-plus-one`,
 `short-epoch-burst` and `short-epoch-recoverable`) follow from Sections 3.3,
 9.1, 13.4 and 13.5; Appendix B.2 illustrates them and is informative. Their
-pinned loss counts read Section 13.5's `lost_count` as the number of erasures
-in the stripe, including the failed block, a reading this document does not
-state (Appendix D item TT-2).
+pinned loss counts are Section 13.5's `lost_count`: the number of erasures in
+the stripe, including the failed block.
 
 The resume vectors, `tape-images/resume/`, give a committed prefix over an
 image as Section 7.1 entries, with `W` and `T`. Two resumes of unfinalized
@@ -3293,6 +3470,67 @@ an errata revision of draft.1.
     behind the burst cases; the Status section and TT-1 describe the terminal
     verifier as Section 17 does; and paragraphs left with ragged wraps by
     earlier edits are rewrapped.
+
+  Rulings on the questions the fixtures raised, and readings of the text the
+  fixtures showed to be open, then changed the text as follows. No byte of the
+  format changed. Where a Reader's outcome changes, the change is stated. The
+  rulings, and the new requirements of Sections 2.2, 2.4, 3.5, 7.2, 8.4, 9.6,
+  10.1.3, 10.1.4, 12.3 and 14, are a minor change of the draft.
+
+  - Section 12.3 defines when a rung recognises a tape file. Items 2 and 3
+    commit a file to its control type when the magic matches; items 1, 4, 5
+    and 6 recognise a file only when it passes every check, its count
+    included; a file that parses at such a rung but fails one of its checks is
+    not recognised, and a count mismatch is reported as damage. A primary
+    sidecar header that parses decides the sidecar rung, so item 6 is not
+    tried after item 5 fails. With the head unreadable, a terminal footer now
+    establishes the control type, where the text had said it may.
+  - Sections 9.1 and 13.3 say which copy of a sidecar's index a Recoverer uses
+    when the two differ. A valid footer decides, unless an available sidecar
+    epoch directory entry disagrees with it, in which case neither does; when
+    the footer is unusable, an available sidecar epoch directory entry
+    decides; when neither is available, a Recoverer whose primary copy
+    validates reads the tail copy too, and two valid copies that differ leave
+    the epoch metadata-unavailable. With a valid footer, the
+    directory-assisted rescue is not used. A Verifier reads both copies and
+    reports a divergence.
+  - Section 13.3 makes `total = 2H + P + 1`, with `H > 0`, a precondition of
+    the directory-assisted rescue, and states that for such an entry the tail
+    copy's block is `H + P`. An entry that fails the precondition is not
+    available; it affects only its epoch. The Recoverer reports
+    `SidecarMetadataUnavailable` whenever no copy can be validated.
+  - Section 8.4 states, in two stages, which bootstraps count as unreadable
+    when values are supplied, and a Scanner given the values now MUST use them
+    when it cannot read the bootstrap. A first record whose length differs
+    from the supplied block size is refused. Section 15 states the bootstrap
+    error names by level. Appendix D item TT-7 closes.
+  - Section 2.4 defines every formula by its exact integer value: a value
+    that is recorded or used must fit, and a value that is only compared is
+    compared exactly. Commit-record values that do not fit are `ResumeAppend`,
+    and device-reported positions that do not fit or go backwards are
+    `TapeIo`. Section 3.3 states that an inverse ordinal that would not fit is
+    an implicit zero. Section 7.2 requires every position a recorded map
+    describes to fit in u64.
+  - Section 8.4 states the rule by which a footer supplies the planned
+    terminal layout: it must be where it says, and the tape must not run past
+    the layout's planned EOD.
+  - Section 9.6 requires the sidecar footer's `tape_uuid` to match the tape.
+    Section 10.1.3 requires the ParityMap's `block_size` to equal the tape's,
+    and Section 10.1.4 extends header–footer agreement to every field both
+    carry.
+  - Section 10.6's `W = T` rule names the recorded fields; Section 12.6
+    defines a degraded inventory; Section 13.5 defines `lost_count`.
+  - Section 14 refuses a committed prefix that records a terminal component
+    or a final ParityMap, and names the outcome of a failed re-read.
+  - Section 3.5 states that a record shorter or longer than one block is
+    invalid content of its component, never `TapeIo`.
+  - Sections 8.4 and 16.3 refuse recorded drive compression on a parity tape
+    only; a no-parity bootstrap may record compression, as Sections 8.2 and
+    11.4 already allow. Section 2.2 says that a Verifier reports damage it finds
+    anywhere with the error a Reader reports for that component.
+  - Sections 15 and 17 and Appendix D item TT-2 record these changes. TT-2
+    also records what the second implementation now re-derives and what
+    remains open.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -3534,28 +3772,47 @@ This is the live preparing-copy snapshot for generation 2.
    that Section 17 describes. A second implementation written from this
    document re-derives the pinned bytes Section 17 lists and decides the cases
    Section 17 describes. Publication promotion remains gated by TT-5 and the
-   other freeze criteria. These items remain open:
-   - The second implementation does not yet re-derive or compare the
-     mutated-block digests of the negative vectors
-     (`tape-images/negatives/MANIFEST.tsv`), or the bytes and digests that
-     `MUTATIONS.tsv`, `SELECTION.tsv` and `INTERRUPTIONS.tsv` pin. The terminal
-     verifier checks those, but it is not the second implementation that
-     freeze criterion 2 asks for, so these are criterion-2 gaps until the
-     second implementation re-derives them.
-   - Five formulas block freeze under the release record's minimum coverage
+   other freeze criteria. The items below record what is decided and what
+   remains open:
+   - The second implementation now compares the mutated-block digests of the
+     negative vectors (`tape-images/negatives/MANIFEST.tsv`) and decides the
+     outcomes that `MUTATIONS.tsv` and `SELECTION.tsv` pin. Of the 387 digest
+     rows, 340 match, and 28 are blocks a mutation leaves unchanged, whose
+     digests equal the pinned ones. The other 19, in two supplement variants
+     (`sidecar-real-data-shard-count/isolated-2` and
+     `overflow-7.2-T/isolated`), pin bytes that this document does not
+     determine: parity for an epoch longer than `S × k`, and a generated
+     profile the variant leaves open. They record the reference's construction
+     and are not criterion-2 items. The implementation's decisions agree with
+     the Section 15 names written from this document on 49 of the 50 mutation
+     rows; the fiftieth defines no bytes. `SELECTION.tsv`'s choice among valid
+     replicas is the reference's policy; this document decides the outcome
+     class and the set of acceptable replicas. `INTERRUPTIONS.tsv` records the
+     reference Writer's states at cut points, which are implementation state
+     and not format values, so criterion 2 does not ask a second
+     implementation to re-derive them. At tape level, the decisions agree with
+     the reference except on the five rows whose damaged payload the Scanner
+     never reads, which stay informative because a Scanner need not read every
+     payload (Section 12.6), and `gap-wrong-total-length`, whose outcome is
+     the BOT walk (Section 8.4 step 1). Open: the four conflict rows of
+     `SELECTION.tsv`, whose conflicting replica could not be eligible on any
+     tape and which are to be rebuilt; and every vector changed or added by
+     this revision, until the second implementation has decided it without
+     seeing its expectation.
+   - Five formulas blocked freeze under the release record's minimum coverage
      for negative candidates, whose last item asks for overflow in every size
-     and location formula, because this document leaves the outcome of their
-     overflow undefined. The first is Section 3.2's `LBA(f, b)`, which no role
-     in this document evaluates over counts read from tape. The second is
-     Section 3.3's inverse mapping, which can be evaluated in two ways that give
-     different outcomes on overflow. The third is the append point of Sections
-     3.2 and 14, whose inputs come from off-tape commit records, while Section
-     2.4 governs values read from tape. The fourth is Section 12.2's walk
-     length, whose inputs are positions the device reports. The fifth is
-     Section 13.3's tail location, whose rejection has no Section 15 name and
-     which the reference computes differently (the third reading below). The
-     `freeze_blocker` flags in `negative-cases.json` predate this
-     classification; where they differ, this item governs.
+     and location formula, because this document left the outcome of their
+     overflow undefined. It now decides each. Section 3.2's `LBA(f, b)` must
+     fit for a map to be valid (Section 7.2). Section 3.3's inverse compares
+     the exact ordinal, so an ordinal that would not fit is an implicit zero
+     (Sections 2.4 and 3.3). The append point's inputs come from commit
+     records, so its overflow is `ResumeAppend`, and the walk length's inputs
+     are device reports, so its overflow is `TapeIo` (Section 2.4). Section
+     13.3's tail location is `H + P`, with the precondition
+     `total = 2H + P + 1` and `H > 0`. These stay open until their vectors are
+     pinned to these outcomes. The `freeze_blocker` flags in
+     `negative-cases.json` predate this classification; where they differ,
+     this item governs, until the flags are cleared.
    - No vector can exist for four formulas, and they do not block freeze for
      that reason. No input a Reader reads can make Section 10.1.2's `2M + 1`
      overflow at a legal block size, and no operation in Section 3.3's forward
@@ -3563,27 +3820,37 @@ This is the live preparing-copy snapshot for generation 2.
      Writer evaluates Section 10.3's close-reserve formula, from its own
      state.
    - Three formulas have a pinned overflow vector that the reference rejects
-     at an earlier check, with the outcome the vector expects: Section 7.2's
-     `T`, Section 10.4's record-geometry product and Section 10.5's
-     `actual_bytes`. The vector covers the formula, and the second
-     implementation reaches it.
-   - Four questions this document leaves open are recorded with the vectors
-     that pin or report them. The first is whether a Section 12.3 rung that
-     fails on a count mismatch has recognised the file (`filemark-prefix`).
-     The second is what a Reader rejects when a sidecar's two index copies
-     each validate but disagree, and whether a Verifier checks sidecars
-     (Section 9.1; `sidecar-primary-tail-disagreement`, which the reference
-     does not yet pass). The third is whether a Recoverer may locate a
-     sidecar's tail copy from its structural row when the ParityMap and the
-     sidecar's primary header and footer are all unreadable (Section 13.3;
-     `parity-map-and-sidecar`). The fourth is which
-     bootstraps count as unreadable (TT-7).
-   - Three readings are to be stated. The first is whether a Reader rejects an
-     intermediate overflow when the exact result fits (Section 2.4). The
-     second is whether Section 10.6's `W = T` rule names the recorded or the
-     recomputed values. The third is where a sidecar's tail copy is: the
-     reference locates it at `H + P` and requires a directory entry's total
-     to equal `2H + P + 1`, which Section 13.3 does not state.
+     at an earlier check: Section 7.2's `T`, Section 10.4's record-geometry
+     product and Section 10.5's `actual_bytes`. Under Section 2.4's exact-value
+     rule, three pinned vectors describe inputs whose exact values fit, and
+     are accepted: `overflow-10.1.2-M/isolated`,
+     `overflow-10.4-record-geometry/isolated` and
+     `overflow-10.3-manifest-range/isolated-2`. Their expectations are to be
+     revised, and every other pinned overflow vector checked against the rule.
+     Whether Section 10.1.2's `M`, Section 10.4's record geometry and Section
+     10.3's manifest capacity still have an overflow that a vector can reach
+     under the exact-value rule is to be recorded when those vectors are
+     revised: each either keeps a reachable vector or joins the formulas for
+     which none can exist.
+   - Of the four questions this item recorded, three are now decided: a rung
+     that fails on a count mismatch does not recognise the file (Section
+     12.3; `filemark-prefix`); a sidecar's footer or directory decides between
+     two copies that differ, and a Verifier reports the divergence (Sections
+     9.1 and 13.3; `sidecar-primary-tail-disagreement`); and which bootstraps
+     count as unreadable (Section 8.4; TT-7, now closed). One stays open:
+     whether a Recoverer may locate a sidecar's tail copy from its structural
+     row when the ParityMap and the sidecar's primary header and footer are
+     all unreadable (Section 13.3; `parity-map-and-sidecar`).
+   - The three readings this item listed are now stated: exact integer values
+     (Section 2.4), the recorded fields in Section 10.6's `W = T` rule, and the
+     tail copy at `H + P`, with a directory entry's total equal to
+     `2H + P + 1` (Section 13.3).
+   - Section 2.2 includes in a Verifier's full check the Recoverer's index and
+     CRC validation. The reference's verification does not yet read a
+     sidecar's two copies, a data block or a parity shard. Whether a full
+     verification checks every data block and parity shard, or only structure
+     and metadata, is to be decided, and the reference brought into line,
+     before freeze.
    - Where this document leaves a name open, some vectors give a set of
      permitted Section 15 errors, or none. The second implementation's
      `GAPS.md` and the notes in `tape-images/negatives/` list these and the
@@ -3631,15 +3898,10 @@ This is the live preparing-copy snapshot for generation 2.
    512 KiB, and 1 MiB record sizes. REM-PARITY freeze criterion 3, recorded in
    `specs/README.md`, remains open until those targets, committed corpus
    replay, and measured plateau reports exist.
-7. **TT-7 — which bootstraps count as unreadable (open).** Section 8.4 lets a
-   Scanner that cannot read the bootstrap proceed with supplied values, but the
-   text does not yet say which bootstraps count as unreadable. The reference
-   treats as unreadable a block that cannot be read, is short, lacks the magic
-   or fails a checksum, and a checksum-valid bootstrap whose payload breaks a
-   later rule while its scheme and compression agree with the supplied values.
-   It refuses a checksum-valid bootstrap with another format major, a nonzero
-   sequence, drive compression, or a value that disagrees with the supplied
-   ones. This is to be decided before freeze.
+7. **TT-7 — which bootstraps count as unreadable (closed).** Section 8.4 now
+   states it, in two stages: the physical read, then the content of a record
+   of the right length. Section 15 states the bootstrap error names by the
+   level at which a Reader meets the block.
 
 ## Author's Address
 

@@ -213,30 +213,44 @@ computed only after every decision in the case is fixed.
 
 The steps follow the text in order:
 
-1. Bootstrap discovery (Section 8.4, and the Section 8.4.1 hints).
-2. Terminal discovery from EOD, replica validation under Section 10.6, and
-   selection under Section 8.5.
+1. Bootstrap discovery (Section 8.4). Without supplied values, each
+   discovery candidate is tried, and no usable bootstrap at any of them is
+   `NoBootstrapFound`. With supplied values, which a Scanner that cannot read
+   the bootstrap must use, the first record is judged in Section 8.4's two
+   stages: the physical read, then the content of a record of the right
+   length.
+2. Terminal discovery from EOD (Section 8.4 step 1): the Scanner spaces back
+   over up to five filemarks and reads the record before each. A replica
+   footer supplies the planned layout only when it sits at its recorded
+   position and plans an EOD at or after the tape's. Then replica validation
+   under Section 10.6 and selection under Section 8.5.
 3. When no replica validates, the BOT walk and its second pass (Sections
    8.4.1, 12.2 and 12.3), and the validation of the walked map against the
-   final ParityMap (Section 13.1).
-4. For each failed address, the Recoverer's refusals, index acquisition,
-   erasure taxonomy, reconstruction and CRC check (Sections 13.2–13.5).
+   final ParityMap (Section 13.1). A rung that fails a check, its count
+   included, does not recognise a file: the failed classification is
+   reported, and the file is an Object candidate.
+4. For each failed address, the Recoverer's refusals, index acquisition
+   (Section 13.3, in which the footer or an available directory entry
+   decides between copies), erasure taxonomy, reconstruction and CRC check
+   (Sections 13.2–13.5).
 5. The Verifier. Its `result` is the terminal-suffix outcome that Sections
    10.6 and 12.6 define: complete, degraded, recovery required (no valid
-   replica), or an error for a conflict. The text names no Verifier outcome
-   for damage before replica A, so each such finding is listed in an
-   `undecided` entry instead (`GAPS.md` entry B-3).
+   replica), or an error for a conflict. With no planned layout, a
+   separation extent that the walk finds damaged is reported invalid
+   (Section 12.3 items 2 and 3). Its `outside_terminal_suffix` lists
+   each finding before replica A with the error a Reader reports for that
+   component (Section 2.2), after reading every sidecar's two copies and
+   footer (Section 9.1). Whether a full verification checks every data block
+   and parity shard is still open (Appendix D TT-2), so findings on those are
+   listed in an `undecided` entry.
 
 Where the text leaves an outcome open, the decision says `undecided` and
 lists the readings. Each decision cites the sentences that decide it, and
 the tests check that every quoted sentence occurs in the specification.
-Where the text grants a permission that a case's inputs make usable, and
-declining it leaves only a refusal, this implementation chooses to use it.
-That is a documented choice, not a requirement: a Scanner that declines
-the §8.4 hint path and reports `NoBootstrapFound` is also conformant
-(`GAPS.md` entry B-1). Where declining a permission leads to a
-different conformant outcome, the aspect is reported as `undecided`
-(entry B-2).
+Where the text defines an outcome by what a role reads, the decision records
+the outcome for each case: a Scanner's degraded flag is `per reads`, with
+`degraded_by_reads` giving the flag for a Scanner that reads the damaged
+payload and for one that does not (Section 12.6).
 
 ## How the Resumer works
 
@@ -245,12 +259,14 @@ The steps follow Section 14:
 1. W and T are derived from the prefix (Section 7.2) and compared with
    the values given. The append point is `Σ(block_count + 1)` over the
    prefix.
-2. The step-2 rules that need no scheme are checked first. Then the
-   bootstrap at LBA 0 is read for `S` and `k`, and the bound
-   `T − W < S × k` is checked. The text does not say where a Resumer
+2. The step-2 rules that need no scheme are checked first, among them the
+   refusal of a prefix that records a final ParityMap or a terminal
+   component. Then the bootstrap at LBA 0 is read for `S` and `k`, and the
+   bound `T − W < S × k` is checked. The text does not say where a Resumer
    obtains the scheme (`GAPS.md` entry E-2).
-3. The open epoch `[W, T)` is re-read from the tape. A filemark, EOD, a
-   medium error or a record of the wrong size there is fatal.
+3. The open epoch `[W, T)` is re-read from the tape. A filemark, EOD or a
+   record of the wrong size there contradicts the commit record and is
+   `ResumeAppend`; a medium error is `TapeIo`.
 4. The Resumer positions to the append point and writes the Object as the
    next tape file. At `S × k` ordinals the epoch closes at Object close.
    When the session ends, the Writer closes an epoch still open by writing
@@ -280,14 +296,16 @@ and a `cases` map keyed by case id. Every case has the same aspects:
 
 `negative-decisions.json` has `"schema": "rem-parity-second-implementation-negatives/1"`
 and an `entries` map keyed `neg-NN`, or `neg-NN/<variant>` for a case with
-variants. Every entry has the same keys:
+variants. Every entry has the same keys, and a bootstrap entry whose Section
+15 name depends on the level at which a Reader meets the block adds
+`decision.by_level`:
 
 | Key | Contents |
 | --- | --- |
 | `id`, `variant`, `target` | The case, its variant, and the target as the case names it |
 | `apply` | `resolved` (`true`, `false`, or `null` when there is no tape vector), `vector` (`bytes`, an injected commit record, or `none`), `checks` (each stated `from` value against the byte found), `repairs` applied, `mutated_blocks` (size and SHA-256 of each changed block after repair), `notes` |
 | `decision` | The text decision. `outcome` is `rejected`, `accepted`, `undecided`, `no-vector` or `unresolved`. `error` is a Section 15 name, `undecided`, or `null` where no name applies. `error_set` holds the names where Section 15 permits a set. `readings` are given where the text leaves the outcome or the name open. `rules` are the quoted sentences that fail. `order` says which rule fires first, or that the text fixes no order. `reader_must_reject` is `true`, `false` or `undecided`. `formula` gives a named formula evaluated with the case's inputs, with its type and whether it overflows. `note` gives the consequence at the level of the whole tape. |
-| `implementation` | What my implementation reported for each role run: a copy or footer validator, the Recoverer, a Verifier reading both copies, the bootstrap parser, ParityMap validation, terminal selection with separation checks, or the Resumer |
+| `implementation` | What my implementation reported for each role run: a copy or footer validator, the Recoverer, a Verifier reading both copies, the bootstrap parser, bootstrap discovery (without and with supplied values), ParityMap validation, terminal selection with separation checks, or the Resumer |
 | `self_check` | Whether the implementation's result agrees with the text decision, with the detail |
 
 Entries whose inputs are off tape, reported by the device, or evaluated by
@@ -320,10 +338,10 @@ and an `entries` map keyed `mut-NN`.
 | `id`, `kind`, `base_profile`, `target`, `other_profile` | The row as the file gives it |
 | `apply` | `resolved`, `vector` (`bytes` or `none`), `checks_total` and `checks_failed` (stated old values, recomputed checksums and retained values against my bytes), `repairs` performed, `notes` (including what the row leaves stale), `record_lengths` of each component as written to tape, and `changed_components` with their size and SHA-256 |
 | `decision.component` | The mutated component (`replica A`, `separation extent A-B`, or `null`), `outcome` (`rejected`, `no-vector` or `unresolved`), `error`, `error_set` where more than one name is permitted, `readings`, the quoted `rules` and the reasoning (`why`) |
-| `decision.tape` | `outcome` (`inventory`, `TerminalIndexReplicaConflict`, `BotStructuralRecoveryRequired` or `undecided`), `acceptable_selections`, `degraded` (`true`, `false` or `undecided`), each replica's status, the quoted `rules` and the reasoning |
-| `decision.verifier` | What a Verifier must report: `result` (`complete`, `degraded` or `not complete`) and each separation extent's status |
+| `decision.tape` | `outcome` (`inventory`, `TerminalIndexReplicaConflict`, `BotStructuralRecoveryRequired` or `undecided`), `acceptable_selections`, `degraded` (`true`, `false`, `per reads` with `degraded_by_reads`, or `undecided`), each replica's status, the quoted `rules` and the reasoning |
+| `decision.verifier` | What a Verifier must report: `result` (`complete`, `degraded`, `not complete`, or `recovery_required` when no replica validates) and each separation extent's status |
 | `decision.undecided` | Aspects the text leaves open, each with its readings and citations |
-| `implementation` | What my Scanner and Verifier reported: the layout source, each replica's and extent's validity, error and reason, and the selection |
+| `implementation` | What my Scanner and Verifier reported: the layout source, each replica's and extent's validity, error and reason, and the selection; when no footer supplies a layout, the walk's classification of the terminal tape files |
 | `self_check` | Whether the implementation's result agrees with the decision; where the decision is `undecided`, it must be one of the readings |
 
 `selection-decisions.json` has `"schema": "rem-parity-second-implementation-selection/1"`,

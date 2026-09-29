@@ -753,14 +753,16 @@ class SelectionTests(unittest.TestCase):
                 self.assertTrue(entry["apply"]["resolved"], entry["apply"]["checks_failed"])
                 self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
 
-    def test_a_foreign_replica_at_c_leaves_the_layout_reading_open(self) -> None:
+    def test_a_foreign_replica_at_c_supplies_no_layout(self) -> None:
+        # Section 8.4 step 1: a footer supplies the layout only where it says
+        # it is, so the foreign footer at C is passed over and B's is used.
         statuses = {"S0": impl.parse_status("the profile's replica, unchanged"),
                     "S4": impl.parse_status("at this position, the replica of the same position taken from the minimal "
                                             "profile at the same block size, unchanged")}
         decision = impl.selection_decision({"A": "S0", "B": "S0", "C": "S4"}, statuses)
-        self.assertEqual(decision["outcome"], "undecided")
-        self.assertEqual([r["outcome"] for r in decision["readings"]], ["BotStructuralRecoveryRequired", "inventory"])
-        self.assertEqual(decision["readings"][1]["acceptable_selections"], ["A", "B"])
+        self.assertEqual((decision["outcome"], decision["acceptable_selections"], decision["degraded"]),
+                         ("inventory", ["A", "B"], True))
+        self.assertFalse(decision.get("readings"))
         decided = impl.selection_decision({"A": "S4", "B": "S0", "C": "S0"}, statuses)
         self.assertEqual((decided["outcome"], decided["acceptable_selections"], decided["degraded"]), ("inventory", ["B", "C"], True))
 
@@ -769,6 +771,118 @@ class SelectionTests(unittest.TestCase):
         decision = impl.selection_decision({"A": "S0", "B": "S0", "C": "S0"}, statuses)
         self.assertEqual((decision["outcome"], decision["acceptable_selections"], decision["degraded"]),
                          ("inventory", ["A", "B", "C"], False))
+
+
+# ---------------------------------------------------------------------------
+# The revised text (F0): each test names the sentence it checks.
+# ---------------------------------------------------------------------------
+
+
+class RevisedTextTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+
+    def tape(self, records=None, unreadable=()):
+        return impl.DamagedTape(self.image.records() if records is None else records, set(unreadable))
+
+    def hints(self):
+        return {"tape_uuid": self.image.tape_uuid, "block_size": self.image.block_size, "scheme": self.image.scheme}
+
+    def test_a_footer_supplies_the_layout_only_where_it_says_it_is(self) -> None:
+        # 8.4 step 1: "... only when its recorded footer position equals the position at which it was read".
+        layout, note = impl.discover_layout(self.tape(), self.image.tape_uuid, self.image.block_size)
+        self.assertIsNotNone(layout)
+        self.assertIn("replica ordinal 3", note)
+        shifted, _ = impl.damaged_tape_for(self.image, {"removed_filemark_after_tape_file": 1})
+        layout, note = impl.discover_layout(shifted, self.image.tape_uuid, self.image.block_size)
+        self.assertIsNone(layout)
+        self.assertEqual(note.count("records its position as"), 3)
+
+    def test_a_layout_whose_planned_eod_precedes_the_tape_eod_is_not_used(self) -> None:
+        # 8.4 step 1: "A layout whose planned EOD lies before the tape's EOD ... is not used".
+        records = self.image.records()
+        longer = self.tape(records + [records[2], None])
+        layout, note = impl.discover_layout(longer, self.image.tape_uuid, self.image.block_size)
+        self.assertIsNone(layout)
+        self.assertIn("before the tape's EOD", note)
+
+    def test_a_count_mismatch_leaves_the_file_to_item_7(self) -> None:
+        # 12.3: "under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies."
+        case = {"failed_data_addresses": [], "hints": None, "image": "a4-minimal",
+                "removed_filemark_after_tape_file": 1, "unreadable_records": []}
+        decision = impl.decide_case(case, self.image, {})
+        walk = decision["walk"]
+        self.assertEqual(walk["classes"]["1"], "Object")
+        self.assertIn("differs from the measured 11 blocks", walk["failed_classifications"]["1"])
+        self.assertEqual(walk["error"], "FilemarkMapDigestMismatch")
+        self.assertEqual(walk["object_identity"], "unknown")
+        self.assertEqual(decision["verifier"]["separations"], {"A-B": "invalid", "B-C": "invalid"})
+        self.assertEqual(decision["undecided"], [])
+
+    def test_the_first_record_with_supplied_values(self) -> None:
+        # 8.4's tables: a wrong length is refused; a medium error leaves the bootstrap unreadable.
+        self.assertEqual(impl.judge_supplied_bootstrap(self.tape(), self.hints())[0], "use")
+        records = self.image.records()
+        records[0] = records[0][:100]
+        outcome, error, _, key, _ = impl.judge_supplied_bootstrap(self.tape(records), self.hints())
+        self.assertEqual((outcome, error, key), ("refused", "BootstrapParse", "first_record_length"))
+        outcome, error, _, key, _ = impl.judge_supplied_bootstrap(self.tape(unreadable=[0]), self.hints())
+        self.assertEqual((outcome, error, key), ("unreadable", None, "first_record_unreadable"))
+
+    def test_a_boundary_read_in_step_3_is_resume_append(self) -> None:
+        # 14 step 3: "A read that finds a filemark, EOD or a record shorter or longer than one block where the
+        # committed prefix places a data block contradicts the commit record, and is `ResumeAppend`".
+        case = copy.deepcopy(synthetic_resume_cases()["synthetic-accepted"])
+        case["committed_prefix"][-1]["block_count"] += 1
+        case["T"] += 1
+        decision, appended = impl.resume_case(case, impl._image_cache("unfinalized-open"), {})
+        self.assertIsNone(appended)
+        self.assertEqual((decision["decision"]["result"], decision["decision"]["error"], decision["decision"]["refused_at"]),
+                         ("refused", "ResumeAppend", "step 3"))
+        self.assertIn("filemark where data is expected", decision["step3"]["failure"])
+        self.assertEqual(decision["undecided"], [])
+
+    def test_a_map_position_that_does_not_fit_invalidates_the_replicas(self) -> None:
+        # 7.2: "Every record position and every trailing filemark position that the map describes ... MUST fit in u64".
+        path = SCRATCH / "negatives-44.json"
+        path.write_text(json.dumps({"description": "neg-44 alone", "conventions": {}, "cases": [
+            {"id": "neg-44", "target": "replica map position arithmetic"}]}), encoding="utf-8")
+        entry = impl.run_negatives(path, SCRATCH / "negatives-44-out.json")["entries"]["neg-44"]
+        self.assertEqual((entry["decision"]["outcome"], entry["decision"]["error"]),
+                         ("rejected", "TerminalIndexReplicaParse"))
+        self.assertEqual(entry["implementation"][0]["selection"], "BotStructuralRecoveryRequired")
+        self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
+
+    def sidecar_context(self, with_directory: bool):
+        ws = impl.Workspace(image=impl._image_cache("a4-minimal"))
+        res = impl.Resolution()
+        impl.negatives_table()["neg-11"]["apply"](ws, res)  # the tail copy diverges, and both copies are valid
+        self.assertTrue(res.resolved)
+        tape = impl.DamagedTape(ws.records(), {ws.image.file_start_lba(2) + 6})  # the footer is unreadable
+        boot = impl.parse_bootstrap(tape.read_data(0), ws.block_size)
+        entries = ws.image.prefix_entries
+        directory = impl.load_parity_map_directory(tape, entries, ws.tape_uuid, ws.block_size)[0] if with_directory else None
+        ctx = impl.RecoveryContext(tape, ws.tape_uuid, ws.block_size, boot["scheme"], entries, len(entries),
+                                   impl.derived_watermark(entries), directory, "replica")
+        return ctx, next(e for e in entries if e.tape_file_number == 2)
+
+    def test_without_an_entry_a_diverging_tail_leaves_the_epoch_unavailable(self) -> None:
+        # 13.3: "A valid tail copy whose canonical metadata hash (Section 9.5) differs from the primary's leaves
+        # nothing to decide between them, and the epoch is metadata-unavailable."
+        ctx, sidecar = self.sidecar_context(with_directory=False)
+        index, note = impl.acquire_index(ctx, sidecar, [])
+        self.assertIsNone(index)
+        self.assertIn("hash differs from the primary's", note)
+        self.assertEqual(impl.recover_address(ctx, [1, 0])["error"], "SidecarMetadataUnavailable")
+
+    def test_an_available_entry_decides_by_hash(self) -> None:
+        # 13.3: "When a sidecar epoch directory entry is available (step 3), it decides as the footer would".
+        ctx, sidecar = self.sidecar_context(with_directory=True)
+        index, note = impl.acquire_index(ctx, sidecar, [])
+        self.assertIsNotNone(index)
+        self.assertIn("its hash equals the directory entry's", note)
+        self.assertEqual(impl.recover_address(ctx, [1, 0])["result"], "recovered")
 
 
 if __name__ == "__main__":

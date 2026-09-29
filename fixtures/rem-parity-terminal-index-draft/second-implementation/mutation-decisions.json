@@ -59,6 +59,10 @@
               "quote": "One extent is a full header record, the zero-filled interior records, a full footer record, and a trailing filemark."
             },
             {
+              "section": "3.5",
+              "quote": "A Reader treats it as invalid content of the component it belongs to: an invalid candidate for a control component, an erasure when the Recoverer reads a data block or parity shard (Section 13.4), and, for the first record with a supplied or known block size, the refusal of Sections 8.4 and 15."
+            },
+            {
               "section": "10.6",
               "quote": "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4, with two exceptions:"
             },
@@ -67,7 +71,7 @@
               "quote": "TerminalIndexSeparationParse separation extent violates Section 8.3, 10.5, or 10.6"
             }
           ],
-          "why": "Every record of the extent now starts 100 bytes later in the original stream: the header record begins with original byte 100, so its role magic does not match, and the footer record begins with byte 100 of the old footer and is 262 044 bytes long. The magic miss alone invalidates the extent; the short record also fails the record-length condition (GAPS H-5). The extent still has three records, so nothing after it moves. Section 10.6 fixes no order among its conditions, and every failing one has the same name."
+          "why": "Every record of the extent now starts 100 bytes later in the original stream: the header record begins with original byte 100, so its role magic does not match, and the footer record begins with byte 100 of the old footer and is 262 044 bytes long. The magic miss alone invalidates the extent; the short record is invalid content of the extent as well (Section 3.5). The extent still has three records, so nothing after it moves. Section 10.6 fixes no order among its conditions, and every failing one has the same name."
         },
         "tape": {
           "outcome": "inventory",
@@ -602,6 +606,14 @@
           "rules": [
             {
               "section": "8.4",
+              "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            },
+            {
+              "section": "8.4",
+              "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+            },
+            {
+              "section": "8.4",
               "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
             },
             {
@@ -629,7 +641,7 @@
               "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
             }
           ],
-          "why": "The extent's record count changed, so every record after it moved by the difference: B, B-C and C are no longer at the positions the immutable plan gives, and their declared locations disagree with the device's measurements. A precedes the change and stays valid. The footer found first from EOD (C's) is itself displaced, but A's footer carries the same plan, so every reading of GAPS B-8 reaches the same replicas."
+          "why": "The extent lost a record, so every record after it moved down one position: B, B-C and C are no longer at the positions the immutable plan gives. C's and B's footers are not at their recorded positions, so they supply no layout. A's footer is, and its planned EOD is after the tape's EOD, so it supplies the plan (Section 8.4 step 1). Under it B's and C's declared locations disagree with the device's measurements, and A, which precedes the change, stays valid."
         },
         "verifier": {
           "result": "degraded",
@@ -652,7 +664,7 @@
         "note": ""
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 42 (replica ordinal 3)",
+        "layout_source": "replica footer at LBA 27 (replica ordinal 1)",
         "replicas": {
           "A": {
             "valid": true,
@@ -1102,6 +1114,14 @@
           "rules": [
             {
               "section": "8.4",
+              "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            },
+            {
+              "section": "8.4",
+              "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+            },
+            {
+              "section": "8.4",
               "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
             },
             {
@@ -1129,7 +1149,7 @@
               "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
             }
           ],
-          "why": "The extent's record count changed, so every record after it moved by the difference: B, B-C and C are no longer at the positions the immutable plan gives, and their declared locations disagree with the device's measurements. A precedes the change and stays valid. The footer found first from EOD (C's) is itself displaced, but A's footer carries the same plan, so every reading of GAPS B-8 reaches the same replicas."
+          "why": "The extent lost a record, so every record after it moved down one position: B, B-C and C are no longer at the positions the immutable plan gives. C's and B's footers are not at their recorded positions, so they supply no layout. A's footer is, and its planned EOD is after the tape's EOD, so it supplies the plan (Section 8.4 step 1). Under it B's and C's declared locations disagree with the device's measurements, and A, which precedes the change, stays valid."
         },
         "verifier": {
           "result": "degraded",
@@ -1152,7 +1172,7 @@
         "note": ""
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 42 (replica ordinal 3)",
+        "layout_source": "replica footer at LBA 27 (replica ordinal 1)",
         "replicas": {
           "A": {
             "valid": true,
@@ -1428,7 +1448,11 @@
             "B",
             "C"
           ],
-          "degraded": "undecided",
+          "degraded": "per reads",
+          "degraded_by_reads": {
+            "A's payload not read": false,
+            "A's payload read": true
+          },
           "replicas": {
             "A": "invalid: its payload fails; its envelope is valid and agrees with B's and C's",
             "B": "valid",
@@ -1449,14 +1473,18 @@
             },
             {
               "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "quote": "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid."
+            },
+            {
+              "section": "12.6",
+              "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
               "section": "C",
               "quote": "the selection order among agreeing replicas"
             }
           ],
-          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. Whether the result is degraded depends on whether the Scanner reads A's payload (GAPS B-6)."
+          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. The inventory is degraded when the Scanner found a replica invalid, and a replica whose payload it did not read is not found invalid for that reason (Section 12.6): the flag is false for a Scanner that never reads A's payload and true for one that does. A Verifier's full check reports A."
         },
         "verifier": {
           "result": "degraded",
@@ -1479,29 +1507,7 @@
             }
           ]
         },
-        "undecided": [
-          {
-            "aspect": "tape.degraded",
-            "readings": [
-              "true: a Scanner that validates replica A's payload (for example, because it tries A first and must validate a payload to accept a replica) finds A invalid, so a sibling is invalid and the result is degraded",
-              "false: a Scanner that accepts B or C after validating only that payload, as Section 8.4 permits when the envelopes agree, never reads A's payload and reports no degraded evidence"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
-              },
-              {
-                "section": "12.6",
-                "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-              },
-              {
-                "section": "C",
-                "quote": "the selection order among agreeing replicas"
-              }
-            ]
-          }
-        ],
+        "undecided": [],
         "note": ""
       },
       "implementation": {
@@ -2957,6 +2963,10 @@
               "quote": "One extent is a full header record, the zero-filled interior records, a full footer record, and a trailing filemark."
             },
             {
+              "section": "3.5",
+              "quote": "A Reader treats it as invalid content of the component it belongs to: an invalid candidate for a control component, an erasure when the Recoverer reads a data block or parity shard (Section 13.4), and, for the first record with a supplied or known block size, the refusal of Sections 8.4 and 15."
+            },
+            {
               "section": "10.6",
               "quote": "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4, with two exceptions:"
             },
@@ -2965,7 +2975,7 @@
               "quote": "TerminalIndexSeparationParse separation extent violates Section 8.3, 10.5, or 10.6"
             }
           ],
-          "why": "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, not a full record. The record-length condition fails (GAPS H-5). The record count is unchanged, so nothing after the extent moves."
+          "why": "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, not a full record: invalid content of the extent (Section 3.5), and the record-length condition fails. The record count is unchanged, so nothing after the extent moves."
         },
         "tape": {
           "outcome": "inventory",
@@ -3649,7 +3659,11 @@
             "B",
             "C"
           ],
-          "degraded": "undecided",
+          "degraded": "per reads",
+          "degraded_by_reads": {
+            "A's payload not read": false,
+            "A's payload read": true
+          },
           "replicas": {
             "A": "invalid: its payload fails; its envelope is valid and agrees with B's and C's",
             "B": "valid",
@@ -3670,14 +3684,18 @@
             },
             {
               "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "quote": "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid."
+            },
+            {
+              "section": "12.6",
+              "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
               "section": "C",
               "quote": "the selection order among agreeing replicas"
             }
           ],
-          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. Whether the result is degraded depends on whether the Scanner reads A's payload (GAPS B-6)."
+          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. The inventory is degraded when the Scanner found a replica invalid, and a replica whose payload it did not read is not found invalid for that reason (Section 12.6): the flag is false for a Scanner that never reads A's payload and true for one that does. A Verifier's full check reports A."
         },
         "verifier": {
           "result": "degraded",
@@ -3700,29 +3718,7 @@
             }
           ]
         },
-        "undecided": [
-          {
-            "aspect": "tape.degraded",
-            "readings": [
-              "true: a Scanner that validates replica A's payload (for example, because it tries A first and must validate a payload to accept a replica) finds A invalid, so a sibling is invalid and the result is degraded",
-              "false: a Scanner that accepts B or C after validating only that payload, as Section 8.4 permits when the envelopes agree, never reads A's payload and reports no degraded evidence"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
-              },
-              {
-                "section": "12.6",
-                "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-              },
-              {
-                "section": "C",
-                "quote": "the selection order among agreeing replicas"
-              }
-            ]
-          }
-        ],
+        "undecided": [],
         "note": ""
       },
       "implementation": {
@@ -4321,11 +4317,19 @@
               "quote": "Terminal replicas and separation extents are written and read only at the record sizes 256 KiB, 512 KiB, and 1 MiB;"
             },
             {
+              "section": "3.5",
+              "quote": "A Reader treats it as invalid content of the component it belongs to: an invalid candidate for a control component, an erasure when the Recoverer reads a data block or parity shard (Section 13.4), and, for the first record with a supplied or known block size, the refusal of Sections 8.4 and 15."
+            },
+            {
+              "section": "3.5",
+              "quote": "It is never `TapeIo`, which is reserved for a transport or medium failure and for the device reports that Section 2.4 names."
+            },
+            {
               "section": "15",
               "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
             }
           ],
-          "why": "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, not one complete record. The record-length condition fails (GAPS H-5)."
+          "why": "The last 100 bytes of the footer record (zero padding) are removed, so the footer record is 262 044 bytes, not one complete record: invalid content of the replica, never TapeIo (Section 3.5), and the record-length condition fails."
         },
         "tape": {
           "outcome": "inventory",
@@ -4488,6 +4492,10 @@
             {
               "section": "10.6",
               "quote": "Each frame's record length, CRC, schema version, role, flags, tape UUID, partition, block size, compression mode, ordinals and counts, reserved bytes, and padding validate against Section 10.4, and the block size is one of the terminal record sizes of Section 8.3."
+            },
+            {
+              "section": "3.5",
+              "quote": "A Reader treats it as invalid content of the component it belongs to: an invalid candidate for a control component, an erasure when the Recoverer reads a data block or parity shard (Section 13.4), and, for the first record with a supplied or known block size, the refusal of Sections 8.4 and 15."
             },
             {
               "section": "15",
@@ -4989,7 +4997,11 @@
             "B",
             "C"
           ],
-          "degraded": "undecided",
+          "degraded": "per reads",
+          "degraded_by_reads": {
+            "A's payload not read": false,
+            "A's payload read": true
+          },
           "replicas": {
             "A": "invalid: its payload fails; its envelope is valid and agrees with B's and C's",
             "B": "valid",
@@ -5010,14 +5022,18 @@
             },
             {
               "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "quote": "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid."
+            },
+            {
+              "section": "12.6",
+              "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
               "section": "C",
               "quote": "the selection order among agreeing replicas"
             }
           ],
-          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. Whether the result is degraded depends on whether the Scanner reads A's payload (GAPS B-6)."
+          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. The inventory is degraded when the Scanner found a replica invalid, and a replica whose payload it did not read is not found invalid for that reason (Section 12.6): the flag is false for a Scanner that never reads A's payload and true for one that does. A Verifier's full check reports A."
         },
         "verifier": {
           "result": "degraded",
@@ -5040,29 +5056,7 @@
             }
           ]
         },
-        "undecided": [
-          {
-            "aspect": "tape.degraded",
-            "readings": [
-              "true: a Scanner that validates replica A's payload (for example, because it tries A first and must validate a payload to accept a replica) finds A invalid, so a sibling is invalid and the result is degraded",
-              "false: a Scanner that accepts B or C after validating only that payload, as Section 8.4 permits when the envelopes agree, never reads A's payload and reports no degraded evidence"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
-              },
-              {
-                "section": "12.6",
-                "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-              },
-              {
-                "section": "C",
-                "quote": "the selection order among agreeing replicas"
-              }
-            ]
-          }
-        ],
+        "undecided": [],
         "note": ""
       },
       "implementation": {
@@ -5710,7 +5704,11 @@
             "B",
             "C"
           ],
-          "degraded": "undecided",
+          "degraded": "per reads",
+          "degraded_by_reads": {
+            "A's payload not read": false,
+            "A's payload read": true
+          },
           "replicas": {
             "A": "invalid: its payload fails; its envelope is valid and agrees with B's and C's",
             "B": "valid",
@@ -5731,14 +5729,18 @@
             },
             {
               "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "quote": "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid."
+            },
+            {
+              "section": "12.6",
+              "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
               "section": "C",
               "quote": "the selection order among agreeing replicas"
             }
           ],
-          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. Whether the result is degraded depends on whether the Scanner reads A's payload (GAPS B-6)."
+          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. The inventory is degraded when the Scanner found a replica invalid, and a replica whose payload it did not read is not found invalid for that reason (Section 12.6): the flag is false for a Scanner that never reads A's payload and true for one that does. A Verifier's full check reports A."
         },
         "verifier": {
           "result": "degraded",
@@ -5761,29 +5763,7 @@
             }
           ]
         },
-        "undecided": [
-          {
-            "aspect": "tape.degraded",
-            "readings": [
-              "true: a Scanner that validates replica A's payload (for example, because it tries A first and must validate a payload to accept a replica) finds A invalid, so a sibling is invalid and the result is degraded",
-              "false: a Scanner that accepts B or C after validating only that payload, as Section 8.4 permits when the envelopes agree, never reads A's payload and reports no degraded evidence"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
-              },
-              {
-                "section": "12.6",
-                "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-              },
-              {
-                "section": "C",
-                "quote": "the selection order among agreeing replicas"
-              }
-            ]
-          }
-        ],
+        "undecided": [],
         "note": ""
       },
       "implementation": {
@@ -6023,7 +6003,11 @@
             "B",
             "C"
           ],
-          "degraded": "undecided",
+          "degraded": "per reads",
+          "degraded_by_reads": {
+            "A's payload not read": false,
+            "A's payload read": true
+          },
           "replicas": {
             "A": "invalid: its payload fails; its envelope is valid and agrees with B's and C's",
             "B": "valid",
@@ -6044,14 +6028,18 @@
             },
             {
               "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "quote": "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid."
+            },
+            {
+              "section": "12.6",
+              "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
             },
             {
               "section": "C",
               "quote": "the selection order among agreeing replicas"
             }
           ],
-          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. Whether the result is degraded depends on whether the Scanner reads A's payload (GAPS B-6)."
+          "why": "A's envelope is valid and agrees with B's and C's in every edition-common field, so no conflict can arise and A's payload need be validated only if A is to be accepted. A cannot be accepted, because its payload fails; B and C are fully valid and agree. The inventory is degraded when the Scanner found a replica invalid, and a replica whose payload it did not read is not found invalid for that reason (Section 12.6): the flag is false for a Scanner that never reads A's payload and true for one that does. A Verifier's full check reports A."
         },
         "verifier": {
           "result": "degraded",
@@ -6074,29 +6062,7 @@
             }
           ]
         },
-        "undecided": [
-          {
-            "aspect": "tape.degraded",
-            "readings": [
-              "true: a Scanner that validates replica A's payload (for example, because it tries A first and must validate a payload to accept a replica) finds A invalid, so a sibling is invalid and the result is degraded",
-              "false: a Scanner that accepts B or C after validating only that payload, as Section 8.4 permits when the envelopes agree, never reads A's payload and reports no degraded evidence"
-            ],
-            "citations": [
-              {
-                "section": "8.4",
-                "quote": "a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
-              },
-              {
-                "section": "12.6",
-                "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-              },
-              {
-                "section": "C",
-                "quote": "the selection order among agreeing replicas"
-              }
-            ]
-          }
-        ],
+        "undecided": [],
         "note": ""
       },
       "implementation": {
@@ -6382,6 +6348,14 @@
               "quote": "One extent is a full header record, the zero-filled interior records, a full footer record, and a trailing filemark."
             },
             {
+              "section": "3.5",
+              "quote": "A Reader treats it as invalid content of the component it belongs to: an invalid candidate for a control component, an erasure when the Recoverer reads a data block or parity shard (Section 13.4), and, for the first record with a supplied or known block size, the refusal of Sections 8.4 and 15."
+            },
+            {
+              "section": "12.3",
+              "quote": "**IndexSeparationExtent**: matching separation-header magic commits the tape file to this control type under the same malformed-control and measured count rules."
+            },
+            {
               "section": "10.6",
               "quote": "A separation extent is valid when its header and footer satisfy the conditions in the first list above, read against the fields of Section 10.5 in place of those of Section 10.4, with two exceptions:"
             },
@@ -6390,65 +6364,71 @@
               "quote": "TerminalIndexSeparationParse separation extent violates Section 8.3, 10.5, or 10.6"
             }
           ],
-          "why": "One byte appended after the footer record makes a fourth, one-byte record: the extent's measured count and trailing filemark disagree with the plan (3 records), and the extra record is not a full record."
+          "why": "One byte appended after the footer record makes a fourth, one-byte record: the extent's measured count and trailing filemark disagree with its own frames (3 records), and the extra record is not a full record (Section 3.5). Its magic commits the tape file to the separation type, damaged."
         },
         "tape": {
-          "outcome": "inventory",
-          "acceptable_selections": [
-            "A"
-          ],
-          "degraded": true,
+          "outcome": "BotStructuralRecoveryRequired",
+          "acceptable_selections": [],
+          "degraded": null,
           "replicas": {
-            "A": "valid",
-            "B": "invalid: not at its planned coordinate",
-            "C": "invalid: not at its planned coordinate"
+            "A": "not validated: no footer supplies a planned layout",
+            "B": "not validated: no footer supplies a planned layout",
+            "C": "not validated: no footer supplies a planned layout"
           },
           "rules": [
             {
               "section": "8.4",
-              "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
-            },
-            {
-              "section": "10.6",
-              "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
+              "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
             },
             {
               "section": "8.4",
-              "quote": "A planned position or digest for a later component does not prove that the component was written."
+              "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
             },
             {
-              "section": "10.6",
-              "quote": "The validity of a separation extent does not affect whether a replica is accepted for an inventory."
+              "section": "8.4",
+              "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+            },
+            {
+              "section": "8.4",
+              "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
             },
             {
               "section": "8.5",
-              "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
+              "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
             },
             {
-              "section": "12.6",
-              "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+              "section": "12.4",
+              "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
             },
             {
-              "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "section": "15",
+              "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
             }
           ],
-          "why": "The extent's record count changed, so every record after it moved by the difference: B, B-C and C are no longer at the positions the immutable plan gives, and their declared locations disagree with the device's measurements. A precedes the change and stays valid. The footer found first from EOD (C's) is itself displaced, but A's footer carries the same plan, so every reading of GAPS B-8 reaches the same replicas."
+          "why": "The extent gained a record, so every record after it moved up one position and the tape's EOD is one beyond the planned EOD. C's and B's footers are not at their recorded positions, and A's footer, which is, plans an EOD before the tape's EOD, so its layout is not used. No footer supplies a layout, so no replica validates, and the Scanner walks from BOT (Section 8.4 step 1)."
         },
         "verifier": {
-          "result": "degraded",
+          "result": "recovery_required",
           "separations": {
             "A-B": "invalid",
             "B-C": "invalid"
           },
           "rules": [
             {
-              "section": "10.6",
-              "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+              "section": "12.6",
+              "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
             },
             {
-              "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+              "section": "15",
+              "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+            },
+            {
+              "section": "12.3",
+              "quote": "**IndexSeparationExtent**: matching separation-header magic commits the tape file to this control type under the same malformed-control and measured count rules."
+            },
+            {
+              "section": "12.3",
+              "quote": "A malformed frame or count mismatch is reported as a damaged terminal replica; it MUST NOT fall through to Object."
             }
           ]
         },
@@ -6456,48 +6436,50 @@
         "note": ""
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 44 (replica ordinal 3)",
+        "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 44 records its position as 43; footer at LBA 36 records its position as 35; footer at LBA 27 plans EOD 45, before the tape's EOD 46)",
         "replicas": {
           "A": {
-            "valid": true,
-            "envelope_valid": true,
+            "valid": false,
             "error": null,
-            "reason": "locally eligible under Section 10.6"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 44 records its position as 43; footer at LBA 36 records its position as 35; footer at LBA 27 plans EOD 45, before the tape's EOD 46)"
           },
           "B": {
             "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "TapeIo: LBA 33: expected a data block, found filemark"
+            "error": null,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 44 records its position as 43; footer at LBA 36 records its position as 35; footer at LBA 27 plans EOD 45, before the tape's EOD 46)"
           },
           "C": {
             "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "TapeIo: LBA 41: expected a data block, found filemark"
+            "error": null,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 44 records its position as 43; footer at LBA 36 records its position as 35; footer at LBA 27 plans EOD 45, before the tape's EOD 46)"
           }
         },
         "separations": {
           "A-B": {
             "status": "invalid",
             "error": "TerminalIndexSeparationParse",
-            "reason": "trailing filemark not measured at the planned position"
+            "reason": "walk: damaged separation extent: header plan differs from the measured file"
           },
           "B-C": {
             "status": "invalid",
             "error": "TerminalIndexSeparationParse",
-            "reason": "TapeIo: LBA 37: expected a data block, found filemark"
+            "reason": "walk: damaged separation extent: header plan differs from the measured file"
           }
         },
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "A"
-        ],
-        "degraded": true
+        "walk_classes": {
+          "tape file 6": "TapeIndexReplica: terminal replica header matches the plan",
+          "tape file 7": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+          "tape file 8": "TapeIndexReplica: damaged terminal replica: header plan differs from the measured file",
+          "tape file 9": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+          "tape file 10": "TapeIndexReplica: damaged terminal replica: header plan differs from the measured file"
+        },
+        "outcome": "BotStructuralRecoveryRequired",
+        "acceptable_selections": [],
+        "degraded": null
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: inventory A degraded"
+        "detail": "implementation: BotStructuralRecoveryRequired"
       }
     },
     "mut-39": {

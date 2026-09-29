@@ -259,6 +259,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -316,15 +324,27 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -332,8 +352,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -472,6 +492,10 @@
               },
               {
                 "section": "13.3",
+                "quote": "For an entry that meets the preconditions below, that block is `H + P`, where `H` is the entry's `sidecar_header_block_count` and `P = S × m`."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -516,6 +540,14 @@
               {
                 "section": "13.3",
                 "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
               },
               {
                 "section": "13.3",
@@ -576,15 +608,49 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "footer unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 4 (LBA 6)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy used (directory-assisted rescue); Object tape file 1 block 0 (LBA 2): unreadable (TapeIo); Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -592,8 +658,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -851,11 +917,11 @@
           "1": "Object",
           "2": "ParitySidecar",
           "3": "ParityMap",
-          "4": "undecided",
+          "4": "TapeIndexReplica",
           "5": "IndexSeparationExtent",
-          "6": "undecided",
+          "6": "TapeIndexReplica",
           "7": "IndexSeparationExtent",
-          "8": "undecided"
+          "8": "TapeIndexReplica"
         },
         "object_identity": "unknown",
         "terminal_authority_recovered": false,
@@ -874,11 +940,15 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer may establish the same type after its measured count is checked."
+            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
           },
           {
             "section": "12.3",
-            "quote": "A matching, fully parsed footer may establish the type when the head is unreadable."
+            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
           },
           {
             "section": "8.4.1",
@@ -944,29 +1014,7 @@
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "walk.classes",
-          "readings": [
-            "tape files 4 (TapeIndexReplica), 6 (TapeIndexReplica), 8 (TapeIndexReplica): the head is unreadable and a matching, fully parsed footer establishes the type, as Section 12.3 permits",
-            "tape files 4, 6, 8: Object candidates, because a Scanner that does not use that permission must classify an unreadable-head file it cannot otherwise recognise as an object candidate"
-          ],
-          "citations": [
-            {
-              "section": "12.3",
-              "quote": "When the head is unreadable, a matching, fully parsed terminal footer may establish the same type after its measured count is checked."
-            },
-            {
-              "section": "12.3",
-              "quote": "A matching, fully parsed footer may establish the type when the head is unreadable."
-            },
-            {
-              "section": "12.3",
-              "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-06": {
       "image": "a4-minimal",
@@ -998,7 +1046,7 @@
           "A",
           "B"
         ],
-        "degraded": null,
+        "degraded": "per reads",
         "replicas": {
           "A": {
             "valid": true,
@@ -1042,8 +1090,24 @@
           {
             "section": "12.6",
             "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+          },
+          {
+            "section": "12.6",
+            "quote": "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid."
+          },
+          {
+            "section": "12.6",
+            "quote": "A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica."
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
           }
-        ]
+        ],
+        "degraded_by_reads": {
+          "replica C's payload not read": false,
+          "replica C's payload read": true
+        }
       },
       "walk": {
         "result": "not_run",
@@ -1100,29 +1164,7 @@
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "scanner.degraded",
-          "readings": [
-            "true: the Scanner validates the payload of replica C and finds it unreadable, so a sibling is invalid and the result is degraded",
-            "false: the Scanner accepts A after validating only that payload, as Section 8.4 permits, never reads replica C's payload, and reports no degraded evidence"
-          ],
-          "citations": [
-            {
-              "section": "8.4",
-              "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
-            },
-            {
-              "section": "12.6",
-              "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-            },
-            {
-              "section": "C",
-              "quote": "the selection order among agreeing replicas"
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-07": {
       "image": "a4-minimal",
@@ -1378,6 +1420,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -1422,6 +1472,14 @@
               {
                 "section": "13.3",
                 "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
               },
               {
                 "section": "13.3",
@@ -1482,15 +1540,43 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 4 (LBA 6)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: primary copy unreadable (LBA 11); footer valid; tail copy used; Object tape file 1 block 0 (LBA 2): unreadable (TapeIo); Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -1498,8 +1584,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -1524,7 +1610,19 @@
           },
           {
             "section": "8.4",
-            "quote": "A Scanner that cannot read the bootstrap MAY perform the discovery above when it is given the three values Section 8.4.1 names."
+            "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+          },
+          {
+            "section": "8.4",
+            "quote": "| a medium error, or a filemark or EOD where the record should be | treats the bootstrap as unreadable and continues on the supplied values |"
+          },
+          {
+            "section": "8.4",
+            "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
           },
           {
             "section": "8.4",
@@ -1563,7 +1661,7 @@
         "citations": [
           {
             "section": "8.4",
-            "quote": "A Scanner that cannot read the bootstrap MAY perform the discovery above when it is given the three values Section 8.4.1 names."
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
           },
           {
             "section": "8.4",
@@ -1647,28 +1745,22 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "bootstrap",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "verifier.outside_terminal_suffix",
-          "readings": [
-            "the Verifier reports each finding before replica A (bootstrap unreadable or absent: its frame and trailing fill cannot be verified (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "case-10": {
       "image": "two-epoch",
@@ -1753,11 +1845,11 @@
           "2": "ParitySidecar",
           "3": "ParitySidecar",
           "4": "ParityMap",
-          "5": "undecided",
+          "5": "TapeIndexReplica",
           "6": "IndexSeparationExtent",
-          "7": "undecided",
+          "7": "TapeIndexReplica",
           "8": "IndexSeparationExtent",
-          "9": "undecided"
+          "9": "TapeIndexReplica"
         },
         "object_identity": "unknown",
         "terminal_authority_recovered": false,
@@ -1776,11 +1868,15 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer may establish the same type after its measured count is checked."
+            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
           },
           {
             "section": "12.3",
-            "quote": "A matching, fully parsed footer may establish the type when the head is unreadable."
+            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
           },
           {
             "section": "12.3",
@@ -1850,7 +1946,15 @@
               },
               {
                 "section": "13.3",
+                "quote": "For an entry that meets the preconditions below, that block is `H + P`, where `H` is the entry's `sidecar_header_block_count` and `P = S × m`."
+              },
+              {
+                "section": "13.3",
                 "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
+              },
+              {
+                "section": "13.3",
+                "quote": "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
               },
               {
                 "section": "15",
@@ -1882,6 +1986,14 @@
               {
                 "section": "13.3",
                 "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
               },
               {
                 "section": "13.3",
@@ -1946,36 +2058,55 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "footer unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "no header/index copy validates (footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16))",
+            "error": "SidecarMetadataUnavailable",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 4 (LBA 6)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "walk.classes",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "tape files 5 (TapeIndexReplica), 7 (TapeIndexReplica), 9 (TapeIndexReplica): the head is unreadable and a matching, fully parsed footer establishes the type, as Section 12.3 permits",
-            "tape files 5, 7, 9: Object candidates, because a Scanner that does not use that permission must classify an unreadable-head file it cannot otherwise recognise as an object candidate"
-          ],
-          "citations": [
-            {
-              "section": "12.3",
-              "quote": "When the head is unreadable, a matching, fully parsed terminal footer may establish the same type after its measured count is checked."
-            },
-            {
-              "section": "12.3",
-              "quote": "A matching, fully parsed footer may establish the type when the head is unreadable."
-            },
-            {
-              "section": "12.3",
-              "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
-            }
-          ]
-        },
-        {
-          "aspect": "verifier.outside_terminal_suffix",
-          "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16); Object tape file 1 block 0 (LBA 2): unreadable (TapeIo); Object block at LBA 3: CRC not checkable (epoch metadata unavailable); Object block at LBA 4: CRC not checkable (epoch metadata unavailable); Object block at LBA 5: CRC not checkable (epoch metadata unavailable); Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -1983,8 +2114,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -2072,11 +2203,11 @@
           "1": "Object",
           "2": "ParitySidecar",
           "3": "ParityMap",
-          "4": "undecided",
+          "4": "TapeIndexReplica",
           "5": "IndexSeparationExtent",
-          "6": "undecided",
+          "6": "TapeIndexReplica",
           "7": "IndexSeparationExtent",
-          "8": "undecided"
+          "8": "TapeIndexReplica"
         },
         "object_identity": "unknown",
         "terminal_authority_recovered": false,
@@ -2095,11 +2226,15 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer may establish the same type after its measured count is checked."
+            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
           },
           {
             "section": "12.3",
-            "quote": "A matching, fully parsed footer may establish the type when the head is unreadable."
+            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
           },
           {
             "section": "12.3",
@@ -2169,6 +2304,10 @@
               },
               {
                 "section": "13.3",
+                "quote": "For an entry that meets the preconditions below, that block is `H + P`, where `H` is the entry's `sidecar_header_block_count` and `P = S × m`."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -2230,36 +2369,43 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "footer unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "walk.classes",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "tape files 4 (TapeIndexReplica), 6 (TapeIndexReplica), 8 (TapeIndexReplica): the head is unreadable and a matching, fully parsed footer establishes the type, as Section 12.3 permits",
-            "tape files 4, 6, 8: Object candidates, because a Scanner that does not use that permission must classify an unreadable-head file it cannot otherwise recognise as an object candidate"
-          ],
-          "citations": [
-            {
-              "section": "12.3",
-              "quote": "When the head is unreadable, a matching, fully parsed terminal footer may establish the same type after its measured count is checked."
-            },
-            {
-              "section": "12.3",
-              "quote": "A matching, fully parsed footer may establish the type when the head is unreadable."
-            },
-            {
-              "section": "12.3",
-              "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
-            }
-          ]
-        },
-        {
-          "aspect": "verifier.outside_terminal_suffix",
-          "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: footer unreadable (LBA 13); primary copy unreadable (LBA 7); tail copy used (directory-assisted rescue); Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -2267,8 +2413,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -2391,6 +2537,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -2448,15 +2602,33 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "parity shard at LBA 8",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 2 (LBA 4)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (parity shard at LBA 8: unreadable (TapeIo); Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 8: unreadable (medium error); Object tape file 1 block 2 (LBA 4): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -2464,8 +2636,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -2491,6 +2663,10 @@
           {
             "section": "15",
             "quote": "NoBootstrapFound bootstrap is absent or invalid"
+          },
+          {
+            "section": "15",
+            "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
           },
           {
             "section": "8.4.1",
@@ -2683,6 +2859,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -2744,15 +2928,67 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "parity shard at LBA 6",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 7",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 8",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 9",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 10",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 1 (LBA 3)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: primary copy unreadable (LBA 5); footer valid; tail copy used; parity shard at LBA 6: unreadable (TapeIo); parity shard at LBA 7: unreadable (TapeIo); parity shard at LBA 8: unreadable (TapeIo); parity shard at LBA 9: unreadable (TapeIo); parity shard at LBA 10: unreadable (TapeIo); Object tape file 1 block 1 (LBA 3): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 6: unreadable (medium error); parity shard at LBA 7: unreadable (medium error); parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); parity shard at LBA 10: unreadable (medium error); Object tape file 1 block 1 (LBA 3): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -2760,8 +2996,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -2888,6 +3124,10 @@
               },
               {
                 "section": "13.3",
+                "quote": "When a sidecar epoch directory entry is available (step 3), it decides as the footer would: a copy is used only if its `canonical_metadata_hash` equals the entry's."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -2932,6 +3172,14 @@
               {
                 "section": "13.3",
                 "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
               },
               {
                 "section": "13.3",
@@ -2992,15 +3240,43 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "footer unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 4 (LBA 6)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: footer unreadable (LBA 17); primary copy used (fallback); Object tape file 1 block 0 (LBA 2): unreadable (TapeIo); Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -3008,8 +3284,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -3565,6 +3841,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -3609,6 +3893,14 @@
               {
                 "section": "13.3",
                 "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
               },
               {
                 "section": "13.3",
@@ -3669,15 +3961,55 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "parity shard at LBA 8",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 9",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 2 (LBA 4)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 3 (LBA 5)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: primary copy unreadable (LBA 7); footer valid; tail copy used; parity shard at LBA 8: unreadable (TapeIo); parity shard at LBA 9: unreadable (TapeIo); Object tape file 1 block 2 (LBA 4): unreadable (TapeIo); Object tape file 1 block 3 (LBA 5): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); Object tape file 1 block 2 (LBA 4): unreadable (medium error); Object tape file 1 block 3 (LBA 5): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -3685,8 +4017,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -3723,15 +4055,15 @@
         "replicas": {
           "A": {
             "valid": false,
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
           },
           "B": {
             "valid": false,
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
           },
           "C": {
             "valid": false,
-            "reason": "TerminalIndexReplicaParse: role magic does not match"
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
           }
         },
         "inventory_equals_true_prefix": null,
@@ -3746,11 +4078,15 @@
           },
           {
             "section": "8.4",
-            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
-            "section": "10.6",
-            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
           },
           {
             "section": "8.4",
@@ -3768,10 +4104,10 @@
       },
       "walk": {
         "result": "error",
-        "error": "FilemarkMapReconstruct",
+        "error": "FilemarkMapDigestMismatch",
         "classes": {
           "0": "Bootstrap",
-          "1": "classification failed",
+          "1": "Object",
           "2": "ParityMap",
           "3": "TapeIndexReplica",
           "4": "IndexSeparationExtent",
@@ -3779,7 +4115,7 @@
           "6": "IndexSeparationExtent",
           "7": "TapeIndexReplica"
         },
-        "object_identity": null,
+        "object_identity": "unknown",
         "terminal_authority_recovered": false,
         "citations": [
           {
@@ -3792,7 +4128,11 @@
           },
           {
             "section": "12.3",
-            "quote": "If it parses as a sidecar footer, the footer's total MUST equal the measured block count, and the Scanner verifies the tail header copy against the footer, field for field."
+            "quote": "For items 1, 4, 5 and 6, a rung *recognises* a tape file only when the file passes every check of that rung, its measured block count included; a file that fails one of them is not recognised."
+          },
+          {
+            "section": "12.3",
+            "quote": "A rung that parses a file but fails its measured count reports the failed classification."
           },
           {
             "section": "12.3",
@@ -3800,17 +4140,32 @@
           },
           {
             "section": "12.3",
+            "quote": "Under items 2 and 3 the file keeps its control type, damaged; under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies."
+          },
+          {
+            "section": "12.3",
             "quote": "Item 7 applies to a tape file that none of items 1 to 6 recognises."
+          },
+          {
+            "section": "12.3",
+            "quote": "If it parses as a sidecar footer, the footer's total MUST equal the measured block count, and the Scanner verifies the tail header copy against the footer, field for field."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
           },
           {
             "section": "8.4.1",
             "quote": "The Scanner MUST report that terminal authority was not recovered."
           },
           {
-            "section": "15",
-            "quote": "FilemarkMapReconstruct BOT recovery walk could not produce a valid map"
+            "section": "13.1",
+            "quote": "A walked map whose projection does not hash to a validated final ParityMap's `canonical_map_digest`, or whose prefix disagrees with those scope fields, is not validated and gives the Recoverer no map, with no fallback to the bootstrap's scope."
           }
-        ]
+        ],
+        "failed_classifications": {
+          "1": "sidecar footer total 7 differs from the measured 11 blocks (Section 12.3 item 6)"
+        }
       },
       "recoverer": {
         "result": "not_run",
@@ -3833,8 +4188,8 @@
             "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
           },
           {
-            "section": "10.6",
-            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+            "section": "12.3",
+            "quote": "Under items 2 and 3 the file keeps its control type, damaged; under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies."
           },
           {
             "section": "10.6",
@@ -3969,6 +4324,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -4022,15 +4385,61 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "parity shard at LBA 8",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 9",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 10",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 2 (LBA 4)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 3 (LBA 5)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: primary copy unreadable (LBA 7); footer valid; tail copy used; parity shard at LBA 8: unreadable (TapeIo); parity shard at LBA 9: unreadable (TapeIo); parity shard at LBA 10: unreadable (TapeIo); Object tape file 1 block 2 (LBA 4): unreadable (TapeIo); Object tape file 1 block 3 (LBA 5): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); parity shard at LBA 10: unreadable (medium error); Object tape file 1 block 2 (LBA 4): unreadable (medium error); Object tape file 1 block 3 (LBA 5): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -4038,8 +4447,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -4064,7 +4473,19 @@
           },
           {
             "section": "8.4",
-            "quote": "A Scanner that cannot read the bootstrap MAY perform the discovery above when it is given the three values Section 8.4.1 names."
+            "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+          },
+          {
+            "section": "8.4",
+            "quote": "| a medium error, or a filemark or EOD where the record should be | treats the bootstrap as unreadable and continues on the supplied values |"
+          },
+          {
+            "section": "8.4",
+            "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
           },
           {
             "section": "8.4",
@@ -4103,7 +4524,7 @@
         "citations": [
           {
             "section": "8.4",
-            "quote": "A Scanner that cannot read the bootstrap MAY perform the discovery above when it is given the three values Section 8.4.1 names."
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
           },
           {
             "section": "8.4",
@@ -4178,6 +4599,18 @@
               },
               {
                 "section": "13.3",
+                "quote": "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -4223,15 +4656,43 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "bootstrap",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "the acquired index disagrees with the bootstrap or supplied scheme",
+            "error": "SchemeMismatch",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (bootstrap unreadable or absent: its frame and trailing fill cannot be verified (TapeIo); sidecar tape file 2: SchemeMismatch against the bootstrap or supplied scheme; Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -4239,8 +4700,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -4363,6 +4824,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -4420,15 +4889,73 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "parity shard at LBA 6",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 7",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 8",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 9",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 10",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "parity shard at LBA 11",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 1 (LBA 3)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: primary copy unreadable (LBA 5); footer valid; tail copy used; parity shard at LBA 6: unreadable (TapeIo); parity shard at LBA 7: unreadable (TapeIo); parity shard at LBA 8: unreadable (TapeIo); parity shard at LBA 9: unreadable (TapeIo); parity shard at LBA 10: unreadable (TapeIo); parity shard at LBA 11: unreadable (TapeIo); Object tape file 1 block 1 (LBA 3): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: parity shard at LBA 6: unreadable (medium error); parity shard at LBA 7: unreadable (medium error); parity shard at LBA 8: unreadable (medium error); parity shard at LBA 9: unreadable (medium error); parity shard at LBA 10: unreadable (medium error); parity shard at LBA 11: unreadable (medium error); Object tape file 1 block 1 (LBA 3): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -4436,8 +4963,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -4560,6 +5087,14 @@
               },
               {
                 "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+              },
+              {
+                "section": "13.3",
                 "quote": "The acquired index MUST then be pinned against the bootstrap's scheme record (`k`, `m`, `S`, block size), or against the supplied scheme and block size when the bootstrap is unreadable, and against the map entry's ordinal range; disagreement is `SchemeMismatch`."
               },
               {
@@ -4617,15 +5152,33 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "ParityMap tape file 3",
+            "finding": "no header copy validates (primary: medium error at LBA 15; tail: medium error at LBA 16)",
+            "error": "ParityMapParse",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (ParityMap tape file 3: ParityMapParse: no header copy validates (primary: medium error at LBA 15; tail: medium error at LBA 16); Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -4633,8 +5186,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
@@ -4772,6 +5325,10 @@
                 "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
               },
               {
+                "section": "13.3",
+                "quote": "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
+              },
+              {
                 "section": "15",
                 "quote": "SidecarMetadataUnavailable{epoch_id} no header/index copy validated (Section 13.3)"
               }
@@ -4801,6 +5358,14 @@
               {
                 "section": "13.3",
                 "quote": "If it parses as the epoch's footer and its total matches the map entry: read and verify **both** header copies against the footer locator, including the `canonical_metadata_hash`; use the primary if valid, else the tail; record copy health (both-usable / tail-lost / primary-lost)."
+              },
+              {
+                "section": "13.3",
+                "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
+              },
+              {
+                "section": "9.1",
+                "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
               },
               {
                 "section": "13.3",
@@ -4861,15 +5426,61 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "9.1",
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "sidecar tape file 2",
+            "finding": "footer unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "primary copy unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "structure"
+          },
+          {
+            "component": "sidecar tape file 2",
+            "finding": "no header/index copy validates (footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates))",
+            "error": "SidecarMetadataUnavailable",
+            "checks": "structure"
+          },
+          {
+            "component": "ParityMap tape file 4",
+            "finding": "no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28)",
+            "error": "ParityMapParse",
+            "checks": "structure"
+          },
+          {
+            "component": "Object tape file 1 block 0 (LBA 2)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
+          },
+          {
+            "component": "Object tape file 1 block 4 (LBA 6)",
+            "finding": "unreadable (medium error)",
+            "error": "TapeIo",
+            "checks": "data"
           }
         ]
       },
       "undecided": [
         {
-          "aspect": "verifier.outside_terminal_suffix",
+          "aspect": "verifier.outside_terminal_suffix (data blocks and parity shards)",
           "readings": [
-            "the Verifier reports each finding before replica A (sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates); ParityMap tape file 4: ParityMapParse: no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28); Object tape file 1 block 0 (LBA 2): unreadable (TapeIo); Object block at LBA 3: CRC not checkable (epoch metadata unavailable); Object block at LBA 4: CRC not checkable (epoch metadata unavailable); Object block at LBA 5: CRC not checkable (epoch metadata unavailable); Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)) and its terminal-suffix result stands",
-            "the findings make the Verifier's end-to-end result a failure; the text names no Verifier outcome for them"
+            "a full verification checks every data block and parity shard, and reports these findings: Object tape file 1 block 0 (LBA 2): unreadable (medium error); Object tape file 1 block 4 (LBA 6): unreadable (medium error)",
+            "a full verification checks only structure and metadata, and does not report them"
           ],
           "citations": [
             {
@@ -4877,8 +5488,8 @@
               "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
             },
             {
-              "section": "15",
-              "quote": "Refusals (Section 13.2), parse failures, and reconstruction failures MUST remain distinguishable; I/O faults MUST remain distinct from format violations."
+              "section": "D",
+              "quote": "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided, and the reference brought into line, before freeze."
             }
           ]
         }
