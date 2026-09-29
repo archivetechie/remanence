@@ -165,7 +165,7 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "10.6",
@@ -188,7 +188,7 @@
             "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
           }
         ],
-        "order": "Several rules fail at once: the EOD formula overflows, the footer's observed start (2) differs from its planned tuple, and the declared location differs from the device's. Section 10.6 fixes no order among its conditions, and all are TerminalIndexReplicaParse.",
+        "order": "Several rules fail at once: the EOD formula's exact value, 2^64, exceeds u64, so the recorded EOD cannot equal it (Section 2.4 compares it exactly); the footer's observed start (2) differs from its planned tuple; and the declared location differs from the device's. Section 10.6 fixes no order among its conditions, and all are TerminalIndexReplicaParse.",
         "reader_must_reject": true,
         "formula": {
           "expression": "EOD = start(C) + record_count(C) + 1",
@@ -209,7 +209,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "TerminalIndexReplicaParse: planned layout: the EOD formula overflows u64 (checked arithmetic, Section 2.4)"
+              "reason": "TerminalIndexReplicaParse: planned layout: the EOD formula's exact value exceeds u64, so the recorded EOD cannot equal it"
             },
             "B": {
               "valid": true,
@@ -270,12 +270,9 @@
       },
       "decision": {
         "outcome": "rejected",
-        "error": "undecided",
+        "error": "BootstrapParse",
         "error_set": null,
-        "readings": [
-          "BootstrapParse: the frame or payload violates Section 8",
-          "NoBootstrapFound: Section 15 also names an invalid bootstrap 'absent or invalid', and Appendix D TT-7 records that which bootstraps count as unreadable is still open"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "8.2",
@@ -286,19 +283,19 @@
             "quote": "k ≥ 2 1 ≤ m ≤ k S ≥ 1 k + m ≤ 255 S × (k + m) ≤ 2³² − 1"
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "section": "15",
+            "quote": "The bootstrap names depend on the level at which a Reader meets the block."
+          },
+          {
+            "section": "15",
+            "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
           },
           {
             "section": "15",
             "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
-          },
-          {
-            "section": "15",
-            "quote": "NoBootstrapFound bootstrap is absent or invalid"
           }
         ],
-        "order": "Section 8.2 requires the recorded scheme to satisfy Section 6.6 before it is used, so the Reader rejects the bootstrap at payload validation. A Reader that computes P first must reject its overflow instead (Section 2.4). Either way the bootstrap is rejected; the text orders neither, and both paths give the same outcome.",
+        "order": "Section 8.2 requires the recorded scheme to satisfy Section 6.6, and S × (k + m) = 2^65 exceeds 2^32 − 1 (compared exactly, Section 2.4), so the bootstrap breaks Section 8. P = S × m is a count whose exact value does not fit, so a Reader that forms it rejects it; The name depends on the level at which the Reader meets the block (Section 15); the case's target is a Reader of the one block.",
         "reader_must_reject": true,
         "formula": {
           "expression": "P = S × m",
@@ -311,7 +308,12 @@
           "type": "u64",
           "overflows": true
         },
-        "note": "Without a valid bootstrap and without hints, discovery stops (Section 8.4.1)."
+        "note": "Without a usable bootstrap and without supplied values, discovery stops (Section 8.4.1).",
+        "by_level": {
+          "a parser given the block": "BootstrapParse (Section 15)",
+          "discovery over the candidate sizes, without supplied values": "NoBootstrapFound (Section 15)",
+          "discovery with supplied values": "BootstrapParse: the decodable scheme disagrees with the supplied scheme (Section 8.4)"
+        }
       },
       "implementation": [
         {
@@ -319,11 +321,21 @@
           "result": "rejected",
           "error": "BootstrapParse",
           "reason": "scheme triple invalid"
+        },
+        {
+          "level": "bootstrap discovery",
+          "result": "rejected",
+          "error": "NoBootstrapFound",
+          "with_supplied_values": {
+            "outcome": "refused",
+            "error": "BootstrapParse",
+            "reason": "a decodable parity scheme disagrees with the supplied scheme"
+          }
         }
       ],
       "self_check": {
         "agrees": true,
-        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse"
+        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse; bootstrap-discovery: expected NoBootstrapFound, implementation NoBootstrapFound"
       }
     },
     "neg-03": {
@@ -407,22 +419,26 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "10.6",
             "quote": "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate."
           },
           {
-            "section": "10.6",
-            "quote": "when sidecars are present, `highest_protected_ordinal` equals `total_data_ordinals`, so finalization left no Object ordinal unprotected;"
+            "section": "7.2",
+            "quote": "Every record position and every trailing filemark position that the map describes, by Section 3.2's `LBA(f, b)`, MUST fit in u64; a recorded map that breaks this is invalid."
+          },
+          {
+            "section": "15",
+            "quote": "`TerminalIndexReplicaParse` includes a replica map that describes a position that does not fit (Section 7.2)."
           },
           {
             "section": "15",
             "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
           }
         ],
-        "order": "T = 2 + (2^64 − 2) overflows (Section 2.4), and the recorded T (5) cannot equal it; with sidecars present W must equal T. All are replica scope rules with one name.",
+        "order": "T = 2 + (2^64 − 2) is 2^64 exactly, so the recorded T (5) cannot equal it (Section 7.4, compared exactly under Section 2.4), and the positions of tape file 3's records and filemark do not fit in u64 (Section 7.2). All are replica rules with one name.",
         "reader_must_reject": true,
         "formula": {
           "expression": "T = max(first_parity_data_ordinal + block_count)",
@@ -443,7 +459,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; highest protected ordinal differs from total data ordinals"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 3: its records and trailing filemark reach position 18446744073709551625, which does not fit in u64 (Section 7.2)"
             },
             "B": {
               "valid": true,
@@ -488,38 +504,39 @@
       },
       "decision": {
         "outcome": "no-vector",
-        "error": "undecided",
+        "error": "TapeIo",
         "error_set": null,
-        "readings": [
-          "structural damage: a file whose position delta gives no blocks is the zero-block case of Section 12.2",
-          "TapeIo: an inconsistent device report is a transport failure, not a format violation"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "12.2",
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
           },
           {
-            "section": "16.2",
-            "quote": "Every declared count or length is validated against the measured physical extent. All arithmetic on tape-derived values is checked. Reserved fields and declared zero-fill MUST be verified zero."
+            "section": "2.4",
+            "quote": "The same rule applies to values from off-tape commit records, which are `ResumeAppend` when they do not fit (Sections 3.4 and 14), and to positions a device reports, which are `TapeIo` when they do not fit or when they go backwards: the device, not the tape, is then at fault."
+          },
+          {
+            "section": "7.2",
+            "quote": "A walked map's positions are device reports, so for it Section 2.4's `TapeIo` applies."
           },
           {
             "section": "15",
             "quote": "TapeIo transport/medium failure (not a format violation)"
           }
         ],
-        "order": "",
+        "order": "The count comes from positions the device reports. A count whose exact value (−1) does not fit, from a device that reports no motion over a filemark, puts the device at fault: TapeIo (Sections 2.4 and 7.2).",
         "reader_must_reject": true,
         "formula": {
           "expression": "block_count = position delta − 1",
           "inputs": {
             "delta": 0
           },
-          "value": "-1 (underflow)",
+          "value": "-1 (does not fit)",
           "type": "u64",
           "overflows": true
         },
-        "note": "Section 16.2 makes arithmetic on tape-derived values checked, so the Scanner must not wrap the value. The text does not say which outcome the walk reports for it."
+        "note": "No tape vector: the input is a device report."
       },
       "implementation": [],
       "self_check": {
@@ -542,29 +559,30 @@
         ]
       },
       "decision": {
-        "outcome": "undecided",
-        "error": "undecided",
+        "outcome": "accepted",
+        "error": null,
         "error_set": null,
-        "readings": [
-          "reject: the Recoverer forms the peer ordinal o = start + data_index·S + stripe in u64, it overflows, and checked arithmetic makes that a rejection; no Section 15 name is given for it",
-          "recover: the Recoverer classifies the peer as an implicit zero from its position (data_index·S + stripe ≥ real_data_shard_count) without forming o; Section 13.4 defines implicit zeros by ordinal but prescribes no computation"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "3.3",
             "quote": "inverse: o = start + data_index·S + stripe"
           },
           {
-            "section": "13.4",
-            "quote": "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
+            "section": "3.3",
+            "quote": "That decision compares the exact value of `o` with the protected end, as Section 2.4 requires, so a position whose `o` would not fit in u64 is an implicit zero, and is not rejected."
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
+          },
+          {
+            "section": "13.4",
+            "quote": "**Implicit zero**: an ordinal ≥ `protected_ordinal_end_exclusive` — an all-zero shard supplied without tape I/O; not an erasure (Section 6.4)."
           }
         ],
-        "order": "",
-        "reader_must_reject": "undecided",
+        "order": "The Recoverer compares the exact value of the peer ordinal, 2^64, with the protected end, 2^64 − 1: the peer is an implicit zero and is not rejected (Section 3.3).",
+        "reader_must_reject": false,
         "formula": {
           "expression": "o = start + data_index·S + stripe",
           "inputs": {
@@ -573,9 +591,9 @@
             "S": 2,
             "stripe": 0
           },
-          "value": "2^64",
+          "value": "2^64, compared exactly",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "Not constructible as a byte image: a validated map needs contiguous epochs from 0."
       },
@@ -965,7 +983,7 @@
           "result": "recovered",
           "error": null,
           "epoch": 0,
-          "index_acquisition": "footer invalid (footer version, reserved, UUID or fill); primary copy used (fallback)",
+          "index_acquisition": "footer invalid (footer version, reserved, UUID or fill); primary copy used; its hash equals the directory entry's",
           "directory": "final ParityMap validates"
         }
       ],
@@ -1120,7 +1138,7 @@
             "quote": "SidecarParse sidecar structure violates Section 9"
           }
         ],
-        "order": "Section 9.2 fixes no order. The range rule (1..=S×k) and data_crc_count reject without the Section 9.4 computation; a Reader that computes the layout first must reject its closed-form overflow (Section 2.4) or bound the loop. Every path is SidecarParse.",
+        "order": "Section 9.2 fixes no order. The range rule (1..=S×k) and data_crc_count reject without the Section 9.4 computation. A Reader that computes the layout first compares its exact results with the recorded H and inline_index_entry_bytes (Section 2.4), and they differ. Every path is SidecarParse.",
         "reader_must_reject": true,
         "formula": {
           "expression": "16·S·m + 8·real_data_shard_count",
@@ -1282,17 +1300,25 @@
         "rules": [
           {
             "section": "9.1",
-            "quote": "When both copies parse, a Reader MUST verify that they agree and reject divergence."
+            "quote": "A Verifier MUST read every sidecar's primary copy, tail copy and footer, and MUST report a divergence between the copies as `SidecarParse`, even when the footer or the directory decides it."
+          },
+          {
+            "section": "9.1",
+            "quote": "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)."
+          },
+          {
+            "section": "13.3",
+            "quote": "Such a footer is valid, and it decides, unless an available sidecar epoch directory entry (step 3) disagrees with it: a copy it contradicts is damaged, and the directory-assisted rescue of step 3 is not used."
           },
           {
             "section": "15",
             "quote": "SidecarParse sidecar structure violates Section 9"
           }
         ],
-        "order": "Each copy validates alone; the agreement rule of Section 9.1 is the one that fails.",
+        "order": "Each copy validates alone, and their canonical metadata hashes differ. A Verifier reads both copies and the footer and reports the divergence as SidecarParse (Section 9.1).",
         "reader_must_reject": true,
         "formula": null,
-        "note": "A Verifier reading both copies rejects the divergence. For a Recoverer the text leaves the consequence open (GAPS F-3): it may use the primary, which matches the footer's hash, or refuse the epoch because the copies diverge."
+        "note": "A Recoverer uses the primary: the valid footer vouches for it, and the directory entry agrees with the footer (Sections 9.1 and 13.3 step 1)."
       },
       "implementation": [
         {
@@ -1312,13 +1338,13 @@
           "result": "recovered",
           "error": null,
           "epoch": 0,
-          "index_acquisition": "tail copy differs from the footer; footer valid; primary copy used",
+          "index_acquisition": "tail copy is contradicted by the footer or the directory entry; footer valid; primary copy used",
           "directory": "final ParityMap validates"
         }
       ],
       "self_check": {
         "agrees": true,
-        "detail": "verifier: expected SidecarParse, implementation SidecarParse; copy: expected accepted, implementation accepted"
+        "detail": "verifier: expected SidecarParse, implementation SidecarParse; copy: expected accepted, implementation accepted; recoverer: expected recovered, implementation recovered"
       }
     },
     "neg-12/a-one-past": {
@@ -1353,13 +1379,9 @@
       },
       "decision": {
         "outcome": "rejected",
-        "error": "undecided",
+        "error": "NoBootstrapFound",
         "error_set": null,
-        "readings": [
-          "BootstrapParse: the frame violates Section 8.1's payload bounds",
-          "BootstrapPayloadTooLarge: the framed payload cannot fit the block",
-          "NoBootstrapFound: an invalid bootstrap, in Section 15's words"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "8.1",
@@ -1367,22 +1389,30 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "15",
-            "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+            "quote": "The bootstrap names depend on the level at which a Reader meets the block."
           },
           {
             "section": "15",
-            "quote": "BootstrapPayloadTooLarge framed BOT payload cannot fit the block"
+            "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
+          },
+          {
+            "section": "15",
+            "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+          },
+          {
+            "section": "15",
+            "quote": "`BootstrapPayloadTooLarge` is a Writer error."
           },
           {
             "section": "15",
             "quote": "NoBootstrapFound bootstrap is absent or invalid"
           }
         ],
-        "order": "Section 8.1 fixes the parse order: the header CRC (repaired) and schema_major pass, and the payload-bounds step fails before the payload CRC.",
+        "order": "Section 8.1 fixes the parse order: the header CRC (repaired) and schema_major pass, and the payload-bounds step fails before the payload CRC; the bound is compared exactly (Section 2.4). The case's target is the parser's step in Scanner discovery: without supplied values no candidate gives a usable bootstrap, which is NoBootstrapFound (Section 15). BootstrapPayloadTooLarge is a Writer error.",
         "reader_must_reject": true,
         "formula": {
           "expression": "0x38 + cbor_payload_len + 8 ≤ B",
@@ -1390,11 +1420,16 @@
             "cbor_payload_len": 262081,
             "B": 262144
           },
-          "value": "262145",
-          "type": "u32",
+          "value": "262145, compared exactly",
+          "type": "u64",
           "overflows": false
         },
-        "note": ""
+        "note": "",
+        "by_level": {
+          "a parser given the block": "BootstrapParse (Section 15)",
+          "discovery over the candidate sizes, without supplied values": "NoBootstrapFound (Section 15)",
+          "discovery with supplied values": "no error: the payload runs past the block, so the bootstrap is treated as unreadable and discovery continues on the supplied values (Section 8.4)"
+        }
       },
       "implementation": [
         {
@@ -1402,11 +1437,21 @@
           "result": "rejected",
           "error": "BootstrapParse",
           "reason": "payload bounds exceed the block"
+        },
+        {
+          "level": "bootstrap discovery",
+          "result": "rejected",
+          "error": "NoBootstrapFound",
+          "with_supplied_values": {
+            "outcome": "unreadable",
+            "error": null,
+            "reason": "the payload CRC fails or the payload runs past the block"
+          }
         }
       ],
       "self_check": {
         "agrees": true,
-        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse"
+        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse; bootstrap-discovery: expected NoBootstrapFound, implementation NoBootstrapFound"
       }
     },
     "neg-12/b-hostile-max": {
@@ -1441,13 +1486,9 @@
       },
       "decision": {
         "outcome": "rejected",
-        "error": "undecided",
+        "error": "NoBootstrapFound",
         "error_set": null,
-        "readings": [
-          "BootstrapParse: the frame violates Section 8.1's payload bounds",
-          "BootstrapPayloadTooLarge: the framed payload cannot fit the block",
-          "NoBootstrapFound: an invalid bootstrap, in Section 15's words"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "8.1",
@@ -1455,22 +1496,30 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "15",
-            "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+            "quote": "The bootstrap names depend on the level at which a Reader meets the block."
           },
           {
             "section": "15",
-            "quote": "BootstrapPayloadTooLarge framed BOT payload cannot fit the block"
+            "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
+          },
+          {
+            "section": "15",
+            "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+          },
+          {
+            "section": "15",
+            "quote": "`BootstrapPayloadTooLarge` is a Writer error."
           },
           {
             "section": "15",
             "quote": "NoBootstrapFound bootstrap is absent or invalid"
           }
         ],
-        "order": "Section 8.1 fixes the parse order: the header CRC (repaired) and schema_major pass, and the payload-bounds step fails before the payload CRC.",
+        "order": "Section 8.1 fixes the parse order: the header CRC (repaired) and schema_major pass, and the payload-bounds step fails before the payload CRC; the bound is compared exactly (Section 2.4). The case's target is the parser's step in Scanner discovery: without supplied values no candidate gives a usable bootstrap, which is NoBootstrapFound (Section 15). BootstrapPayloadTooLarge is a Writer error.",
         "reader_must_reject": true,
         "formula": {
           "expression": "0x38 + cbor_payload_len + 8 ≤ B",
@@ -1478,11 +1527,16 @@
             "cbor_payload_len": 4294967295,
             "B": 262144
           },
-          "value": "4294967359",
-          "type": "u32",
-          "overflows": true
+          "value": "4294967359, compared exactly",
+          "type": "u64",
+          "overflows": false
         },
-        "note": ""
+        "note": "",
+        "by_level": {
+          "a parser given the block": "BootstrapParse (Section 15)",
+          "discovery over the candidate sizes, without supplied values": "NoBootstrapFound (Section 15)",
+          "discovery with supplied values": "no error: the payload runs past the block, so the bootstrap is treated as unreadable and discovery continues on the supplied values (Section 8.4)"
+        }
       },
       "implementation": [
         {
@@ -1490,11 +1544,21 @@
           "result": "rejected",
           "error": "BootstrapParse",
           "reason": "payload bounds exceed the block"
+        },
+        {
+          "level": "bootstrap discovery",
+          "result": "rejected",
+          "error": "NoBootstrapFound",
+          "with_supplied_values": {
+            "outcome": "unreadable",
+            "error": null,
+            "reason": "the payload CRC fails or the payload runs past the block"
+          }
         }
       ],
       "self_check": {
         "agrees": true,
-        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse"
+        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse; bootstrap-discovery: expected NoBootstrapFound, implementation NoBootstrapFound"
       }
     },
     "neg-13": {
@@ -1660,6 +1724,10 @@
         "readings": null,
         "rules": [
           {
+            "section": "10.1.3",
+            "quote": "`block_size` MUST equal the tape's block size, which is the length of every block read, as the sidecar header's `block_size` must (Section 9.2)."
+          },
+          {
             "section": "10.1.4",
             "quote": "Readers MUST validate the locator arithmetic (`M` from `payload_len` and `block_size`; total = 2M + 1; the three start indices) and reject disagreement between header, footer, and the measured tape file length."
           },
@@ -1668,29 +1736,25 @@
             "quote": "With payload length `L`, block size `B`, and `M = ceil((0xC8 + L) / B)` blocks per copy:"
           },
           {
-            "section": "10.1.2",
-            "quote": "The minimum block size for ParityMap files is 0xC8."
-          },
-          {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "15",
             "quote": "ParityMapParse final ParityMap violates Section 10.1"
           }
         ],
-        "order": "If the Reader takes B from the header field, M = 2^63 and 2M overflows (rejected, Section 2.4). If it takes the tape's block size, M = 2^46 ≠ the recorded copy_block_count 1 (rejected). The payload cannot fit the measured 3-block file either. Every path is ParityMapParse; the text does not say which B the locator uses (GAPS F-4).",
+        "order": "The header and footer block_size (2) is not the tape's block size, which Section 10.1.3 requires. With the tape's block size, M = ceil((0xC8 + L) / B) = 2^46 exactly, which differs from the recorded copy_block_count 1, and the payload cannot fit the measured 3-block file. Every rule that fails is ParityMapParse.",
         "reader_must_reject": true,
         "formula": {
-          "expression": "total = 2M + 1, M = ceil((0xC8 + L) / B)",
+          "expression": "M = ceil((0xC8 + L) / B)",
           "inputs": {
             "L": "2^64 - 0xC9",
-            "B": "2 (header) or 262144 (tape)"
+            "B": 262144
           },
-          "value": "M = 2^63, 2M = 2^64 with B = 2",
+          "value": "M = 2^46, compared exactly",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "The directory is unavailable; the Recoverer still acquires the index by the footer and primary."
       },
@@ -1777,7 +1841,7 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "10.6",
@@ -1788,7 +1852,7 @@
             "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
           }
         ],
-        "order": "The chunk-range and byte-length rules of Section 10.3 have no stated order; both reject (with checked arithmetic) and share one name.",
+        "order": "The chunk range fails in both variants: first + count, compared exactly (Section 2.4), exceeds stored_block_count 2. The byte-length rule compares size with count × B exactly, and holds. The name is TerminalIndexReplicaParse.",
         "reader_must_reject": true,
         "formula": {
           "expression": "first + count ≤ stored; size ≤ count × B",
@@ -1797,9 +1861,9 @@
             "count": "1",
             "B": 262144
           },
-          "value": "2^64",
+          "value": "compared exactly",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "Replica A is ineligible; B and C supply the inventory (degraded)."
       },
@@ -1901,7 +1965,7 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "10.6",
@@ -1912,7 +1976,7 @@
             "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
           }
         ],
-        "order": "The chunk-range and byte-length rules of Section 10.3 have no stated order; both reject (with checked arithmetic) and share one name.",
+        "order": "The chunk range fails in both variants: first + count, compared exactly (Section 2.4), exceeds stored_block_count 2. The byte-length rule compares size with count × B exactly, and holds. The name is TerminalIndexReplicaParse.",
         "reader_must_reject": true,
         "formula": {
           "expression": "first + count ≤ stored; size ≤ count × B",
@@ -1921,9 +1985,9 @@
             "count": "70368744177664",
             "B": 262144
           },
-          "value": "2^64",
+          "value": "compared exactly",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "Replica A is ineligible; B and C supply the inventory (degraded)."
       },
@@ -2076,14 +2140,14 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "15",
             "quote": "SidecarParse sidecar structure violates Section 9"
           }
         ],
-        "order": "H + P overflows, so tail_header_start_block = H + P cannot hold; checked arithmetic makes it a rejection.",
+        "order": "H + P is 2^64 exactly, so tail_header_start_block (5) cannot equal it (Section 2.4 compares it exactly).",
         "reader_must_reject": true,
         "formula": {
           "expression": "tail_header_start_block = H + P",
@@ -2102,14 +2166,14 @@
           "level": "sidecar footer",
           "result": "rejected",
           "error": "SidecarParse",
-          "reason": "footer H + P overflows u64 (checked arithmetic, Section 2.4)"
+          "reason": "footer H + P exceeds u64, so tail_header_start_block cannot equal it"
         },
         {
           "level": "Recoverer, failed address [1, 0]",
           "result": "recovered",
           "error": null,
           "epoch": 0,
-          "index_acquisition": "footer invalid (footer H + P overflows u64 (checked arithmetic, Section 2.4)); primary copy used (fallback)",
+          "index_acquisition": "footer invalid (footer H + P exceeds u64, so tail_header_start_block cannot equal it); primary copy used; its hash equals the directory entry's",
           "directory": "final ParityMap validates"
         }
       ],
@@ -3505,14 +3569,18 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "Every formula in this document denotes its exact integer value."
+          },
+          {
+            "section": "2.4",
+            "quote": "An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it."
           },
           {
             "section": "15",
             "quote": "ParityMapParse final ParityMap violates Section 10.1"
           }
         ],
-        "order": "0xC8 + L overflows before M can be formed; checked arithmetic makes it a rejection.",
+        "order": "M's exact value, ceil((0xC8 + 2^64 − 1) / 2^18) = 2^46 + 1, fits in u64; the intermediate 0xC8 + L is not a violation (Section 2.4). M differs from the recorded copy_block_count 1, and the payload cannot fit the measured file, so the locator arithmetic rejects the ParityMap.",
         "reader_must_reject": true,
         "formula": {
           "expression": "tail copy at block M",
@@ -3520,9 +3588,9 @@
             "L": "2^64 - 1",
             "B": 262144
           },
-          "value": "0xC8 + L = 2^64 + 0xC7",
+          "value": "M = 2^46 + 1",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "The case gives its mutation 'as overflow-10.1.2-M'; resolved to neg-45's mutation, whose formula is M's. The tail index adds no arithmetic of its own."
       },
@@ -3834,7 +3902,7 @@
           "result": "recovered",
           "error": null,
           "epoch": 0,
-          "index_acquisition": "footer invalid (footer version, reserved, UUID or fill); primary copy used (fallback)",
+          "index_acquisition": "footer invalid (footer version, reserved, UUID or fill); primary copy used; its hash equals the directory entry's",
           "directory": "final ParityMap validates"
         }
       ],
@@ -3875,12 +3943,9 @@
       },
       "decision": {
         "outcome": "rejected",
-        "error": "undecided",
+        "error": "NoBootstrapFound",
         "error_set": null,
-        "readings": [
-          "BootstrapParse: the frame or payload violates Section 8",
-          "NoBootstrapFound: Section 15 also names an invalid bootstrap 'absent or invalid', and Appendix D TT-7 records that which bootstraps count as unreadable is still open"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "8.2",
@@ -3891,19 +3956,19 @@
             "quote": "k ≥ 2 1 ≤ m ≤ k S ≥ 1 k + m ≤ 255 S × (k + m) ≤ 2³² − 1"
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "section": "15",
+            "quote": "The bootstrap names depend on the level at which a Reader meets the block."
           },
           {
             "section": "15",
-            "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+            "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
           },
           {
             "section": "15",
             "quote": "NoBootstrapFound bootstrap is absent or invalid"
           }
         ],
-        "order": "Section 8.2 requires the recorded scheme to satisfy Section 6.6 before it is used, so the Reader rejects the bootstrap at payload validation. A Reader that computes the product first must reject its overflow instead (Section 2.4). Either way the bootstrap is rejected; the text orders neither, and both paths give the same outcome.",
+        "order": "Section 8.2 requires the recorded scheme to satisfy Section 6.6, and S × (k + m) = 2^65 exceeds 2^32 − 1 (compared exactly, Section 2.4), so the bootstrap breaks Section 8. The name depends on the level at which the Reader meets the block (Section 15); the case's target is discovery.",
         "reader_must_reject": true,
         "formula": {
           "expression": "S × (k + m) ≤ 2^32 − 1",
@@ -3916,7 +3981,12 @@
           "type": "u64",
           "overflows": true
         },
-        "note": "Without a valid bootstrap and without hints, discovery stops (Section 8.4.1)."
+        "note": "Without a usable bootstrap and without supplied values, discovery stops (Section 8.4.1).",
+        "by_level": {
+          "a parser given the block": "BootstrapParse (Section 15)",
+          "discovery over the candidate sizes, without supplied values": "NoBootstrapFound (Section 15)",
+          "discovery with supplied values": "BootstrapParse: the decodable scheme disagrees with the supplied scheme (Section 8.4)"
+        }
       },
       "implementation": [
         {
@@ -3924,11 +3994,21 @@
           "result": "rejected",
           "error": "BootstrapParse",
           "reason": "scheme triple invalid"
+        },
+        {
+          "level": "bootstrap discovery",
+          "result": "rejected",
+          "error": "NoBootstrapFound",
+          "with_supplied_values": {
+            "outcome": "refused",
+            "error": "BootstrapParse",
+            "reason": "a decodable parity scheme disagrees with the supplied scheme"
+          }
         }
       ],
       "self_check": {
         "agrees": true,
-        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse"
+        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse; bootstrap-discovery: expected NoBootstrapFound, implementation NoBootstrapFound"
       }
     },
     "neg-31": {
@@ -4160,28 +4240,34 @@
             "quote": "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count."
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
-          },
-          {
             "section": "13.3",
             "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
           },
           {
+            "section": "13.3",
+            "quote": "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
+          },
+          {
             "section": "15",
             "quote": "SidecarMetadataUnavailable{epoch_id} no header/index copy validated (Section 13.3)"
+          },
+          {
+            "section": "13.3",
+            "quote": "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available."
           }
         ],
-        "order": "The directory entry agrees with the map entry in tape file, epoch, range and block count, so the Recoverer may place a read from it; the tail position underflows, checked arithmetic rejects it, no header/index copy validates, and epoch 0 is metadata-unavailable.",
+        "order": "The directory entry agrees with the map entry in tape file, epoch, range and block count, but its total (7) is not 2H + P + 1 for its H (Section 13.3), so the entry is not available and no rescue read is placed; with the primary header and footer failed, no header/index copy validates, and epoch 0 is metadata-unavailable.",
         "reader_must_reject": true,
         "formula": {
-          "expression": "tail block = total − 1 − H",
+          "expression": "total = 2H + P + 1 (the rescue's precondition)",
           "inputs": {
-            "expression": "7 − 1 − 7"
+            "H": "7",
+            "P": 4,
+            "total": 7
           },
-          "value": "underflow",
+          "value": "19, not 7",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "SidecarMetadataUnavailable{epoch_id: 0} for the failed address (1, 0)."
       },
@@ -4197,7 +4283,7 @@
           "result": "error",
           "error": "SidecarMetadataUnavailable",
           "epoch": 0,
-          "index_acquisition": "footer invalid (footer CRC); primary copy invalid (header CRC); the directory entry's counts put the tail copy outside the file (checked arithmetic); no read placed",
+          "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 7 > 0, so the entry is not available; footer invalid (footer CRC); primary copy invalid (header CRC)",
           "directory": "final ParityMap validates"
         }
       ],
@@ -4289,28 +4375,34 @@
             "quote": "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count."
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
-          },
-          {
             "section": "13.3",
             "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
           },
           {
+            "section": "13.3",
+            "quote": "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
+          },
+          {
             "section": "15",
             "quote": "SidecarMetadataUnavailable{epoch_id} no header/index copy validated (Section 13.3)"
+          },
+          {
+            "section": "13.3",
+            "quote": "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available."
           }
         ],
-        "order": "The directory entry agrees with the map entry in tape file, epoch, range and block count, so the Recoverer may place a read from it; the tail position underflows, checked arithmetic rejects it, no header/index copy validates, and epoch 0 is metadata-unavailable.",
+        "order": "The directory entry agrees with the map entry in tape file, epoch, range and block count, but its total (7) is not 2H + P + 1 for its H (Section 13.3), so the entry is not available and no rescue read is placed; with the primary header and footer failed, no header/index copy validates, and epoch 0 is metadata-unavailable.",
         "reader_must_reject": true,
         "formula": {
-          "expression": "tail block = total − 1 − H",
+          "expression": "total = 2H + P + 1 (the rescue's precondition)",
           "inputs": {
-            "expression": "7 − 1 − (2^64 − 1)"
+            "H": "2^64 - 1",
+            "P": 4,
+            "total": 7
           },
-          "value": "underflow",
+          "value": "2^65 + 3, not 7",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "SidecarMetadataUnavailable{epoch_id: 0} for the failed address (1, 0)."
       },
@@ -4326,7 +4418,7 @@
           "result": "error",
           "error": "SidecarMetadataUnavailable",
           "epoch": 0,
-          "index_acquisition": "footer invalid (footer CRC); primary copy invalid (header CRC); the directory entry's counts put the tail copy outside the file (checked arithmetic); no read placed",
+          "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 18446744073709551615 > 0, so the entry is not available; footer invalid (footer CRC); primary copy invalid (header CRC)",
           "directory": "final ParityMap validates"
         }
       ],
@@ -4418,12 +4510,12 @@
             "quote": "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count."
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "section": "13.3",
+            "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
           },
           {
             "section": "13.3",
-            "quote": "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5)."
+            "quote": "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
           },
           {
             "section": "15",
@@ -4589,14 +4681,14 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "15",
             "quote": "ResumeAppend Section 14 invariant violation"
           }
         ],
-        "order": "T − W underflows (6 − 8) and W ≤ T fails. A Resumer that evaluates the bound first, as listed, must reject the underflow (Section 2.4); one that checks W ≤ T first refuses directly. Both are step-2 violations, and a violation is ResumeAppend.",
+        "order": "W ≤ T fails (8 > 6), a step-2 violation, which is ResumeAppend. The bound compares T − W = −2 exactly (Section 2.4) and holds, so it is not the rule that refuses.",
         "reader_must_reject": true,
         "formula": {
           "expression": "T − W < S × k",
@@ -4606,9 +4698,9 @@
             "S": 2,
             "k": 2
           },
-          "value": "-2 (underflow)",
+          "value": "-2 < 4, compared exactly",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "Decidable from the prefix alone, before any tape read (GAPS E-2)."
       },
@@ -5089,7 +5181,7 @@
           "result": "recovered",
           "error": null,
           "epoch": 0,
-          "index_acquisition": "footer invalid (footer locator: primary start is not 0 or tail start is not H + P); primary copy used (fallback)",
+          "index_acquisition": "footer invalid (footer locator: primary start is not 0 or tail start is not H + P); primary copy used; its hash equals the directory entry's",
           "directory": "final ParityMap validates"
         }
       ],
@@ -5335,7 +5427,7 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "A value that is only compared is compared exactly, and is never too large."
           },
           {
             "section": "10.6",
@@ -5354,7 +5446,7 @@
             "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
           }
         ],
-        "order": "The start rule overflows before it can be compared with (5,1)'s start of 6. The footer's observed start (2) also differs from its tuple, and the declared location from the device's. No order is fixed; one name.",
+        "order": "The next start's exact value, 2^64 + 2, is compared with (5,1)'s recorded start of 6 and differs (Section 2.4). The footer's observed start (2) also differs from its tuple, and the declared location from the device's. No order is fixed; one name.",
         "reader_must_reject": true,
         "formula": {
           "expression": "start(next) = start + record_count + 1",
@@ -5375,7 +5467,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "TerminalIndexReplicaParse: planned layout: a start-position formula overflows u64 (checked arithmetic, Section 2.4)"
+              "reason": "TerminalIndexReplicaParse: planned layout: a start-position formula's exact value exceeds u64, so no recorded position equals it"
             },
             "B": {
               "valid": true,
@@ -5597,28 +5689,36 @@
         "notes": []
       },
       "decision": {
-        "outcome": "accepted",
-        "error": null,
+        "outcome": "rejected",
+        "error": "TerminalIndexReplicaParse",
         "error_set": null,
         "readings": null,
         "rules": [
           {
-            "section": "10.6",
-            "quote": "Every fixed slot of the payload decodes, and the dense map, scope, deterministic CBOR, zero padding, exact map↔Object-row bijection, payload digest, and canonical-map digest validate."
+            "section": "7.2",
+            "quote": "Every record position and every trailing filemark position that the map describes, by Section 3.2's `LBA(f, b)`, MUST fit in u64; a recorded map that breaks this is invalid."
+          },
+          {
+            "section": "15",
+            "quote": "`TerminalIndexReplicaParse` includes a replica map that describes a position that does not fit (Section 7.2)."
           },
           {
             "section": "3.2",
             "quote": "`LBA(f, b) = Σ_{g<f}(block_count(g) + 1) + b`."
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
           }
         ],
-        "order": "No Section 10.6 condition fails: a sidecar row's block count has no bound beyond being non-zero, and the text does not require replica A's planned start LBA to equal the prefix sum. The replicas are eligible and agree.",
-        "reader_must_reject": "undecided",
+        "order": "The map describes tape file 4's trailing filemark at position 2 + 3 + 6 + 4 + (2^64 − 1) = 2^64 + 14, which does not fit in u64, so the recorded map is invalid (Section 7.2), and each replica is TerminalIndexReplicaParse (Section 15).",
+        "reader_must_reject": true,
         "formula": {
-          "expression": "LBA(5, 0) = Σ_{g<5}(block_count(g) + 1)",
+          "expression": "LBA(4, block_count(4)) = Σ_{g<4}(block_count(g) + 1) + block_count(4)",
           "inputs": {
             "block_counts": [
               1,
@@ -5632,7 +5732,7 @@
           "type": "u64",
           "overflows": true
         },
-        "note": "The inventory is accepted. A role that later computes a position from it must reject the overflow (Section 2.4), for example the Recoverer locating tape file 4's footer or the ParityMap, but the text names no such role and no error (GAPS F-5)."
+        "note": "All three replicas carry the same map, so no replica validates: BotStructuralRecoveryRequired."
       },
       "implementation": [
         {
@@ -5640,19 +5740,19 @@
           "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
           "replicas": {
             "A": {
-              "valid": true,
-              "reason": "locally eligible under Section 10.6"
+              "valid": false,
+              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2)"
             },
             "B": {
-              "valid": true,
-              "reason": "locally eligible under Section 10.6"
+              "valid": false,
+              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2)"
             },
             "C": {
-              "valid": true,
-              "reason": "locally eligible under Section 10.6"
+              "valid": false,
+              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2)"
             }
           },
-          "selection": "Inventory from A/B/C",
+          "selection": "BotStructuralRecoveryRequired",
           "separations": {
             "A-B": {
               "status": "valid",
@@ -5667,7 +5767,7 @@
       ],
       "self_check": {
         "agrees": true,
-        "detail": "selection: expected Inventory from A/B/C, implementation Inventory from A/B/C"
+        "detail": "selection: expected BotStructuralRecoveryRequired, implementation BotStructuralRecoveryRequired"
       }
     },
     "neg-45": {
@@ -5744,14 +5844,18 @@
           },
           {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "Every formula in this document denotes its exact integer value."
+          },
+          {
+            "section": "2.4",
+            "quote": "An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it."
           },
           {
             "section": "15",
             "quote": "ParityMapParse final ParityMap violates Section 10.1"
           }
         ],
-        "order": "0xC8 + L overflows before M can be formed; checked arithmetic makes it a rejection.",
+        "order": "M's exact value, ceil((0xC8 + 2^64 − 1) / 2^18) = 2^46 + 1, fits in u64; the intermediate 0xC8 + L is not a violation (Section 2.4). M differs from the recorded copy_block_count 1, and the payload cannot fit the measured file, so the locator arithmetic rejects the ParityMap.",
         "reader_must_reject": true,
         "formula": {
           "expression": "M = ceil((0xC8 + L) / B)",
@@ -5759,9 +5863,9 @@
             "L": "2^64 - 1",
             "B": 262144
           },
-          "value": "0xC8 + L = 2^64 + 0xC7",
+          "value": "M = 2^46 + 1",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": ""
       },
@@ -5859,15 +5963,19 @@
             "quote": "Every size formula of Section 10.4 evaluates without overflow, and the recorded geometry fields equal its results."
           },
           {
+            "section": "10.6",
+            "quote": "As Section 2.4 defines it, a formula evaluates without overflow when its exact value fits in u64."
+          },
+          {
             "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "quote": "An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it."
           },
           {
             "section": "15",
             "quote": "TerminalIndexReplicaParse replica framing or fixed-slot payload violates Section 8.3, 10.2–10.4, or 10.6"
           }
         ],
-        "order": "payload_len = 2^64 − 64 fits; payload_padding_bytes needs count × B = 2^64, which overflows. Section 10.6 requires every size formula to evaluate without overflow. The recorded geometry also differs, with the same name.",
+        "order": "payload_len = 2^64 − 64 fits, and so does payload_padding_bytes, whose exact value is 64: the intermediate product count × B = 2^64 is not a violation (Sections 2.4 and 10.6). The recorded payload length (64) differs from the formula's 2^64 − 64, so the recorded geometry fails, which is TerminalIndexReplicaParse.",
         "reader_must_reject": true,
         "formula": {
           "expression": "payload_padding_bytes = payload_record_count × B − payload_len",
@@ -5875,9 +5983,9 @@
             "payload_record_count": "2^46",
             "B": "2^18"
           },
-          "value": "count × B = 2^64",
+          "value": "64",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
         "note": "footer_block_offset and replica_record_count cannot overflow here. Replica A is ineligible; B and C supply the inventory."
       },
@@ -5888,7 +5996,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "TerminalIndexReplicaParse: payload_padding_bytes formula overflows u64 (payload_record_count × B)"
+              "reason": "TerminalIndexReplicaParse: payload geometry; replica record count or footer offset; edition digest; local planned location; descriptor digest"
             },
             "B": {
               "valid": true,
@@ -6096,7 +6204,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; recorded highest protected ordinal differs from recorded total data ordinals"
             },
             "B": {
               "valid": true,
@@ -6200,7 +6308,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; recorded highest protected ordinal differs from recorded total data ordinals"
             },
             "B": {
               "valid": true,
@@ -7395,7 +7503,7 @@
           "result": "recovered",
           "error": null,
           "epoch": 0,
-          "index_acquisition": "footer contradicts the map entry; primary copy used (fallback)",
+          "index_acquisition": "footer contradicts the map entry; primary copy used; its hash equals the directory entry's",
           "directory": "final ParityMap validates"
         }
       ],
@@ -7830,12 +7938,9 @@
       },
       "decision": {
         "outcome": "rejected",
-        "error": "undecided",
+        "error": "BootstrapParse",
         "error_set": null,
-        "readings": [
-          "BootstrapParse: the frame or payload violates Section 8",
-          "NoBootstrapFound: Section 15 also names an invalid bootstrap 'absent or invalid', and Appendix D TT-7 records that which bootstraps count as unreadable is still open"
-        ],
+        "readings": null,
         "rules": [
           {
             "section": "8.2",
@@ -7846,19 +7951,19 @@
             "quote": "k ≥ 2 1 ≤ m ≤ k S ≥ 1 k + m ≤ 255 S × (k + m) ≤ 2³² − 1"
           },
           {
-            "section": "2.4",
-            "quote": "Arithmetic on values read from tape MUST be checked; overflow is rejection, never wraparound (Section 16.2)."
+            "section": "15",
+            "quote": "The bootstrap names depend on the level at which a Reader meets the block."
+          },
+          {
+            "section": "15",
+            "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
           },
           {
             "section": "15",
             "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
-          },
-          {
-            "section": "15",
-            "quote": "NoBootstrapFound bootstrap is absent or invalid"
           }
         ],
-        "order": "Section 8.2 requires the recorded scheme to satisfy Section 6.6 before it is used, so the Reader rejects the bootstrap at payload validation. A Reader that computes logical_shard_count first must reject its overflow instead (Section 2.4). Either way the bootstrap is rejected; the text orders neither, and both paths give the same outcome.",
+        "order": "Section 8.2 requires the recorded scheme to satisfy Section 6.6, and S × (k + m) = 2^65 exceeds 2^32 − 1 (compared exactly, Section 2.4), so the bootstrap breaks Section 8. S × k is only compared, in the Recoverer's pin and the Resumer's bound, so it is compared exactly and is never too large; The name depends on the level at which the Reader meets the block (Section 15); the case's target is a Reader of the one block.",
         "reader_must_reject": true,
         "formula": {
           "expression": "logical_shard_count = S × k",
@@ -7869,9 +7974,14 @@
           },
           "value": "2^64",
           "type": "u64",
-          "overflows": true
+          "overflows": false
         },
-        "note": "Without a valid bootstrap and without hints, discovery stops (Section 8.4.1)."
+        "note": "Without a usable bootstrap and without supplied values, discovery stops (Section 8.4.1).",
+        "by_level": {
+          "a parser given the block": "BootstrapParse (Section 15)",
+          "discovery over the candidate sizes, without supplied values": "NoBootstrapFound (Section 15)",
+          "discovery with supplied values": "BootstrapParse: the decodable scheme disagrees with the supplied scheme (Section 8.4)"
+        }
       },
       "implementation": [
         {
@@ -7879,11 +7989,21 @@
           "result": "rejected",
           "error": "BootstrapParse",
           "reason": "scheme triple invalid"
+        },
+        {
+          "level": "bootstrap discovery",
+          "result": "rejected",
+          "error": "NoBootstrapFound",
+          "with_supplied_values": {
+            "outcome": "refused",
+            "error": "BootstrapParse",
+            "reason": "a decodable parity scheme disagrees with the supplied scheme"
+          }
         }
       ],
       "self_check": {
         "agrees": true,
-        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse"
+        "detail": "bootstrap: expected BootstrapParse, implementation BootstrapParse; bootstrap-discovery: expected NoBootstrapFound, implementation NoBootstrapFound"
       }
     },
     "neg-58/a-not-end-minus-start": {

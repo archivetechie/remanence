@@ -120,6 +120,7 @@ conformant Scanners can reach different outcomes. Section 1.5 says the text
 exists to prevent that.
 **Expectation:** bootstrap-hinted (case-09) and bootstrap-wrong-scheme
 (case-22) both take the hint path, as this Reader does.
+**Decided by the revised text.** Section 8.4 now says: "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them." The hint path is required, not a permission, so cases 09 and 22 take it as this Reader did; no decision changed.
 
 **B-2. Section 12.3: a terminal file with an unreadable head is classified
 two ways (cases 05, 10 and 11).** "When the head is unreadable, a matching,
@@ -131,6 +132,7 @@ validated scope is unaffected, because it ends at the ParityMap.
 *Undecided:* `walk.classes`.
 **Expectation:** replicas-all (case-05) takes the first reading: files 4 to 8
 are "terminal components".
+**Decided by the revised text.** Section 12.3 items 2 and 3 now say that "a matching, fully parsed terminal footer establishes the same type, after its measured count is checked", and "When the head is unreadable, a matching, fully parsed footer establishes the type." `walk.classes` of cases 05, 10 and 11 is `TapeIndexReplica` (DECISION-LOG).
 
 **B-3. The text names no Verifier outcome for damage before replica A
 (cases 02, 03, 08–12, 14, 15, 19 and 21–25).** Enumerated with a search: the
@@ -142,6 +144,7 @@ or ParityMap copy, or for a `SchemeMismatch` found while checking indexes.
 *Decided:* `verifier.result` reports the terminal-suffix outcome, which
 Sections 10.6 and 12.6 do define. *Undecided:*
 `verifier.outside_terminal_suffix` lists what the Verifier finds before A.
+**Decided by the revised text.** Section 2.2 now says the Verifier "reports damage it finds before the terminal suffix with the error a Reader reports for that component." Each finding is now listed with its error in `verifier.outside_terminal_suffix`. Still open (Appendix D TT-2): "Whether a full verification checks every data block and parity shard, or only structure and metadata, is to be decided". Findings on data blocks and parity shards stay in an `undecided` entry.
 
 **B-4. Section 10.6: an invalid separation extent has no outcome category
 (case 17).** "A Verifier that finds a separation extent invalid MUST report
@@ -169,6 +172,7 @@ payload reports no degraded evidence; one that reads it reports the result
 as degraded. *Undecided:* `scanner.degraded`. The acceptable selections (A,
 B) are determined. The informative note of replica-c-payload (case-06)
 describes the same gap, and its pinned key does not depend on it.
+**Decided by the revised text.** Section 12.6 now says: "An inventory is *degraded* when the Scanner found a replica of the planned layout missing or invalid. A Scanner need not read every replica's payload (Section 8.4 step 2), so a replica whose payload it did not read is not found invalid for that reason; a Verifier's full check reports every replica." The flag follows the Scanner's reads, and both flags are conformant. Case 06 and the five payload-only mutations record `per reads`, with the flag for each (DECISION-LOG).
 
 **B-7. Section 13.3: can the tail copy be located by arithmetic (case
 25)?** The steps reach the tail copy through the footer (step 1) or through
@@ -192,6 +196,7 @@ reading changes a decision here. In case 07, replica A is fully eligible
 and its footer carries the same layout. In case 20 every footer sits one
 LBA below its recorded position, so no replica can be eligible under any
 layout, and the walk follows either way.
+**Decided by the revised text.** Section 8.4 step 1 now fixes the search: "the Scanner spaces back over up to five filemarks from EOD and reads the record before each", and "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD." This Reader now applies both. In case 07 the layout comes from A's footer, with the same outcome. In case 20 no footer supplies one, so no replica validates, as before.
 
 **B-9. Section 12.3: a sidecar rung's count mismatch leaves the file's
 class unstated (case 20).** When the sidecar footer probe parses but its
@@ -208,6 +213,7 @@ does not classify the file, so item 7 applies and the file is an 11-block
 Object candidate. This is the comparison's one disagreement, class (c). No
 sentence excludes either reading: "recognises" is not defined, and "reports
 the failed classification" can name the rung's failure or the file's.
+**Decided by the revised text.** Section 12.3 now says: "Under items 2 and 3 the file keeps its control type, damaged; under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies." In case 20 the merged 11-block file is an Object candidate and its failed classification is reported. The walked map does not match the final ParityMap, so the walk ends in `FilemarkMapDigestMismatch` instead of `FilemarkMapReconstruct` (DECISION-LOG).
 
 **B-10. Section 12.3: a ParityMap that fails validation has no stated
 class.** Items 2 and 3 say a matching terminal magic commits the file, and
@@ -215,6 +221,7 @@ Section 10.6 says malformed control never falls through to Object. Item 4
 says nothing similar for a ParityMap whose magic matches but whose copies
 fail. No case reaches this, because the walk here only meets ParityMaps that
 validate.
+**Decided by the revised text.** The same sentence of Section 12.3 decides it: a file that item 4 does not recognise falls to item 7, an Object candidate, with its failed classification reported.
 
 **B-11. Section 13.2: the third refusal has no error name.** The text lists
 three refusals and names two (`OutsideValidatedMapPrefix`,
@@ -230,10 +237,12 @@ erasures in the stripe, implicit zeros excluded, and `m` as `limit` (cases
 pin `lost` 3, and burst-m (case-19) pins `losses_per_stripe` [2, 2]. Both
 take the same reading: every erasure in the stripe, the failed block
 included, and no implicit zero.
+**Decided by the revised text.** Section 13.5 now says: "`lost_count` is the number of erasures in the stripe, including the failed block, and `limit` is `m`." That is this Reader's reading; no decision changed.
 
 **B-13. Appendix D TT-7: which bootstraps count as unreadable is open.** No
 case depends on it: every unreadable bootstrap in these cases is a medium
 error on the block itself.
+**Decided by the revised text.** Section 8.4's two tables for the first record with supplied values, and Section 15's bootstrap names by level, now decide it (TT-7 is closed).
 
 ## C. Criterion-2 evidence
 
@@ -303,6 +312,7 @@ violation)". In resume-01 the prefix records a 3-block tape file 3, but
 the tape holds 2 blocks and a filemark. The re-read of ordinal 6 meets that
 filemark at LBA 17. *Undecided:* `decision.error`, between `ResumeAppend`
 and `TapeIo`.
+**Decided by the revised text.** Section 14 step 3 now says: "A read that finds a filemark, EOD or a record shorter or longer than one block where the committed prefix places a data block contradicts the commit record, and is `ResumeAppend`; a medium or transport failure is `TapeIo`." resume-01 is `ResumeAppend` (DECISION-LOG).
 
 **E-2. Section 14 does not say where a Resumer obtains `S` and `k`
 (resume-03).** Step 2's bound `T − W < S × k` needs the scheme, and a
@@ -328,6 +338,7 @@ Resumer that relies on a portable prefix no way to detect finalization.
 The prefixes of resume-04 and resume-06 cover only tape files 0–3 of the
 finalized two-epoch image, which also carries a ParityMap and a terminal
 suffix. Step 2 refuses both first, so no decision depends on this.
+**Decided by the revised text.** Section 14 step 2 now refuses such a prefix: "A committed prefix that records a terminal component or a final ParityMap describes a tape whose finalization has begun ... so it is refused as `ResumeAppend` too." This Resumer checks it; no case's prefix records one.
 
 **E-5. Step 2 does not list the density of Object first ordinals.**
 Section 7.2 requires Object first ordinals to be "dense and contiguous from
@@ -380,6 +391,7 @@ whether the Reader rejects one copy, both, or the epoch. A Verifier reports
 the divergence (`SidecarParse`). A Recoverer on step 1 finds that only the
 primary matches the footer's hash, and may use it. It may also refuse the
 epoch because the copies diverge. This implementation uses the primary.
+**Decided by the revised text.** Section 9.1 now says: "When both copies are valid and their canonical metadata hashes (Section 9.5) differ, a Recoverer MUST use a copy that the footer or the sidecar epoch directory vouches for and neither contradicts, and MUST reject both when neither is available (Section 13.3)." For neg-11 the footer vouches for the primary, so the Recoverer recovers, as this implementation did. A Verifier reports the divergence as `SidecarParse`.
 
 **F-4. Section 10.1.4: which block size the ParityMap locator uses
 (neg-14).** "`M` from `payload_len` and `block_size`" may mean the header
@@ -388,6 +400,7 @@ field or the tape's block size, and Section 10.1.3 gives the header's
 equal the actual block size". neg-14 is rejected under either reading.
 This implementation also requires the field to equal the tape's block
 size, which is stricter than the text.
+**Decided by the revised text.** Section 10.1.3 now says: "`block_size` MUST equal the tape's block size, which is the length of every block read". This implementation already required it, and neg-14 fails that rule.
 
 **F-5. No role checks an inventory's counts against positions (neg-44).**
 No Section 10.6 condition bounds a sidecar row's block count beyond
@@ -397,6 +410,7 @@ claim a 2^64 − 1-block sidecar and still validate. A role that later
 computes a position from it must reject the overflow (Section 2.4), but the
 text names no such role and no error. *Decided:* the replicas are
 accepted. Which role rejects, and with which name, is undecided.
+**Decided by the revised text.** Section 7.2 now says: "Every record position and every trailing filemark position that the map describes, by Section 3.2's `LBA(f, b)`, MUST fit in u64; a recorded map that breaks this is invalid." Section 15 names it `TerminalIndexReplicaParse`. neg-44's replicas are rejected, and the tape-level outcome is `BotStructuralRecoveryRequired` (DECISION-LOG).
 
 **F-6. Section 15's names overlap for an invalid bootstrap (neg-02, 12, 30,
 57).** `NoBootstrapFound` is "absent or invalid" and `BootstrapParse` is
@@ -405,6 +419,7 @@ accepted. Which role rejects, and with which name, is undecided.
 picks one, and Appendix D TT-7 records that which bootstraps count as
 unreadable is open. *Undecided:* the error name; rejection itself is
 decided.
+**Decided by the revised text.** Section 15 now says: "The bootstrap names depend on the level at which a Reader meets the block." A parser reports `BootstrapParse`, and discovery without supplied values reports `NoBootstrapFound`. With supplied values, Section 8.4's tables decide. The decisions now give the name for each level (`by_level`), and name the level each case's target names (DECISION-LOG).
 
 **F-7. Section 9.6 gives the footer's total no rule of its own (neg-40a,
 54c).** The footer table states `tail_header_start_block = H + P` and
@@ -421,11 +436,13 @@ computation (neg-05).** For a descriptor near 2^64, forming the peer
 ordinal overflows, while classifying the peer by position (`data_index·S +
 stripe ≥ real_data_shard_count`) does not. *Undecided:* whether a Recoverer
 must reject. The case is unit-level only.
+**Decided by the revised text.** Section 3.3 now says: "That decision compares the exact value of `o` with the protected end, as Section 2.4 requires, so a position whose `o` would not fit in u64 is an implicit zero, and is not rejected." neg-05 is accepted (DECISION-LOG).
 
 **F-9. The walk's outcome for an inconsistent device report is unstated
 (neg-04).** Section 16.2 makes arithmetic on tape-derived values checked,
 so a zero position delta must not wrap. The text does not say whether the
 walk reports structural damage or a transport failure. *Undecided.*
+**Decided by the revised text.** Section 2.4 now says that "positions a device reports ... are `TapeIo` when they do not fit or when they go backwards", and Section 7.2 that "A walked map's positions are device reports". neg-04 is `TapeIo` (DECISION-LOG).
 
 **F-10. Fixture notes (no text defect).**
 - neg-02, neg-30 and neg-57 describe the same bytes, the bootstrap with
@@ -473,6 +490,7 @@ M and the Section 10.3 byte-length rule, the text states the formula but
 not the order of its operations. It does not say whether a Reader must
 evaluate the formula as written, overflowing intermediate included.
 *Undecided:* sup-01 and sup-08.
+**Decided by the revised text.** Section 2.4 now says: "Every formula in this document denotes its exact integer value." It adds that "A value that is only compared is compared exactly, and is never too large. An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it." sup-01, sup-08, sup-23 and sup-31 are accepted (DECISION-LOG).
 
 **G-3. Unit-level rejections without a §15 name (sup-23, sup-25,
 sup-27).**
@@ -480,6 +498,7 @@ sup-27).**
 - **sup-23 and sup-27:** S × k and S × m take their name from the role
   that evaluates them. From a bootstrap the name is open (F-6); from a
   Resumer's bound it is `ResumeAppend`.
+**Decided by the revised text.** Section 2.4 now names the error: "the error is the one named for the structure that carries the value". sup-25 is `SidecarParse` (the sidecar's H). sup-27 is `BootstrapParse` at parser level (the bootstrap's S). sup-23 is not rejected, because its product is only compared (DECISION-LOG).
 
 Rejection itself is decided for all three: the value is not representable
 in u64.
@@ -499,6 +518,7 @@ This implementation's ParityMap parser takes the broad reading, so it
 rejects sup-12 on the header/footer comparison rather than on the
 payload/footer match the variant names. The name is `ParityMapParse` either
 way.
+**Decided by the revised text.** Section 10.1.4 now says: "The agreement between a header copy and the footer covers every field that both carry, other than `copy_kind` and the CRC, not only the locator fields." That is this parser's reading, so sup-12 breaks two rules under the text.
 
 **G-6. Section 10.1.5: the order of the epoch-id rule (sup-35).** "epoch_id
 values are unique and consecutive starting from 0 (0, 1, …, count−1)" does
@@ -520,6 +540,7 @@ recomputed values rather than on the recorded fields, so it also reports
 that rule. The text names the recorded fields
 (`highest_protected_ordinal`, `total_data_ordinals`). This is a known
 divergence in BUILD-LOG.
+**Decided by the revised text.** Section 10.6 now says of the `W = T` rule: "both are the recorded fields, and Section 7.4 separately requires each to equal the value recomputed from the map". This implementation now evaluates the recorded fields, so the divergence is gone and sup-32 breaks one rule.
 
 **G-8. Fixture notes (no text defect).**
 - The variants name one another by labels `supplement.json` does not
@@ -546,6 +567,8 @@ A's payload: mut-09, mut-22, mut-30, mut-34 and mut-36. B-4 (no category for
 an invalid separation extent) leaves the Verifier's category open for the 14
 mutations that damage only extent A-B. B-5 is decided as before: in mut-05
 the extents are compared with the accepted edition.
+Under the revised text B-6 is decided (Section 12.6), and those five
+mutations record `degraded` as `per reads`. B-4 stays open.
 
 **H-1. Section 6.2: no parity is defined for an epoch longer than `S × k`
 (sup-14).** The generator is defined by "X_j = k + j (j in 0..m) Y_i = i (i in
@@ -603,6 +626,7 @@ plan. It then accepts B (sel-08) or A and B (sel-10), degraded. Two
 conformant Scanners reach different outcomes. *Undecided:* `tape.outcome`.
 This implementation's Scanner takes the first footer that parses (B-8), so
 it reports the walk.
+**Decided by the revised text.** Section 8.4 step 1's new sentences decide it (see B-8). The minimal profile's footer at position C records the minimal tape's position, so it supplies no layout, and B's footer supplies the profile's. sel-08 is an inventory from B and sel-10 from A and B, both degraded (DECISION-LOG).
 
 **H-5. Section 3.5 and Section 10.6: a record that is not one full block
 (mut-01, mut-18, mut-26, mut-27, sel-01).** Section 3.5 says that "a read
@@ -619,6 +643,7 @@ continues. Under the other reading, a Reader that reads the short record
 would abort: mut-26 would end in a transport error at replica A's footer
 instead of an inventory from B and C, and sel-01 would end at the first
 footer read from EOD instead of in `BotStructuralRecoveryRequired`.
+**Decided by the revised text.** Section 3.5 now says a record of the wrong length "reports a fact about the tape, not a failure of the device", and "A Reader treats it as invalid content of the component it belongs to". It adds: "It is never `TapeIo`". That is the reading this implementation took; no decision changed.
 
 **H-6. Fixture note: the event row mut-35 defines no mutation.** Its
 description says that "No exact byte effect is defined". The decision is
@@ -665,3 +690,57 @@ projection digest mismatch" `FilemarkMapDigestMismatch`. In mut-39 the stale
 edition digest fails as well, and the text fixes no order. *Decided:* the
 component is rejected, and the name is the set
 {`TerminalIndexReplicaParse`, `FilemarkMapDigestMismatch`}.
+
+## I. The revised text
+
+These were found while bringing this implementation into line with the
+revised text (Sections 2.2, 2.4, 3.3, 3.5, 7.2, 8.4, 9.1, 9.6, 10.1.3,
+10.1.4, 10.6, 12.3, 12.6, 13.3–13.5, 14, 15 and 16.3, and Appendix D). Each
+decision the revision changed has a row in `DECISION-LOG.md`. The entries
+above that the revision decides end in a line beginning **Decided by the
+revised text**. B-4, B-5, B-7, B-11, E-2, E-3, E-5 to E-7, F-1, F-2, F-7,
+G-1, G-4, G-6 and H-8 to H-10 stay as they were.
+
+**I-1. sup-15 is not isolated under Section 7.2.** `overflow-7.2-T/isolated`
+places an Object of 2^64 − 1 blocks at tape file 2. Its records and trailing
+filemark reach positions that do not fit in u64, which Section 7.2 now makes
+a rule of the map, so the variant breaks that rule as well as the T
+cross-check it names. Both are `TerminalIndexReplicaParse` (Section 15), so
+the name is unchanged, but the isolation claim no longer holds.
+
+**I-2. Section 8.4 step 1: "a backspace does not cross exactly one
+filemark".** The text does not say how a Scanner observes this. This
+Reader stops when the position it spaces back over is not a filemark, or when
+the record before a filemark is itself a filemark. No decision depends on it.
+In sel-07 all three replicas are absent, and no replica footer exists
+whichever way the absent replicas' filemarks are modelled.
+
+**I-3. Section 9.1: where a Verifier reads the tail copy.** "A Verifier MUST
+read every sidecar's primary copy, tail copy and footer", but only Section
+13.3 locates the tail copy, for a Recoverer. This Verifier takes the valid
+footer's `tail_header_start_block`, and otherwise `H + P` as in Section 13.3
+step 2. The footer holds "everything needed to find and check either header
+copy without reading the other" (Section 9.6). In bootstrap-wrong-scheme the
+supplied scheme is wrong, so `H + P` would name the wrong block. There the
+footer is valid and names the right one.
+
+**I-4. Section 15: discovery with only a known block size is not
+exercised.** Every damage case supplies all three values or none, so this
+Reader's treatment of a block-size hint alone ("discovery over that one
+candidate") has no vector.
+
+**I-5. The level of neg-02 and neg-57.** Their targets name "a Reader
+deriving P from the bootstrap's scheme record" and "any Reader using the
+bootstrap's S and k", not a level. The decisions name the parser's
+`BootstrapParse` and give every level in `by_level`. The targets of neg-12
+and neg-30 name "Scanner discovery", so their decisions name
+`NoBootstrapFound`. neg-12's target also names "the bootstrap frame parser's
+payload-bounds step", whose name, `BootstrapParse`, is in its `by_level`.
+Which level a vector's single expected name belongs to is a question about
+the vectors, not the text.
+
+**I-6. Section 9.6: the footer's `tape_uuid` now has a rule.** "The footer's
+`tape_uuid` MUST match the bootstrap or, when the bootstrap is unreadable,
+the tape UUID supplied under Section 8.4.1, as each header copy's
+`tape_uuid` must (Section 9.2)." This parser already rejected a footer whose
+`tape_uuid` differs from the tape's identity, so no decision changes.

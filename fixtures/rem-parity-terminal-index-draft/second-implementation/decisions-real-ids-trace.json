@@ -2,7 +2,7 @@
   "bootstrap-hinted": {
     "fault_notes": [],
     "bootstrap_attempts": [
-      "read size 262144: medium error at LBA 0"
+      "supplied block size 262144: medium error at LBA 0"
     ],
     "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
     "directory": "final ParityMap validates",
@@ -11,7 +11,12 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "bootstrap unreadable or absent: its frame and trailing fill cannot be verified (TapeIo)"
+      {
+        "component": "bootstrap",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      }
     ]
   },
   "bootstrap-unhinted": {
@@ -25,7 +30,7 @@
   "bootstrap-wrong-scheme": {
     "fault_notes": [],
     "bootstrap_attempts": [
-      "read size 262144: medium error at LBA 0"
+      "supplied block size 262144: medium error at LBA 0"
     ],
     "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
     "directory": "final ParityMap validates",
@@ -42,7 +47,7 @@
         "lost": null,
         "limit": null,
         "bytes_match": null,
-        "index_acquisition": "footer valid; primary copy used"
+        "index_acquisition": "directory entry total 7 is not 2H + P + 1 with H = 1 > 0, so the entry is not available; footer valid; primary copy used"
       }
     ],
     "separations": {
@@ -50,9 +55,24 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "bootstrap unreadable or absent: its frame and trailing fill cannot be verified (TapeIo)",
-      "sidecar tape file 2: SchemeMismatch against the bootstrap or supplied scheme",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+      {
+        "component": "bootstrap",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "the acquired index disagrees with the bootstrap or supplied scheme",
+        "error": "SchemeMismatch",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "burst-m": {
@@ -109,11 +129,36 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: primary copy unreadable (LBA 7); footer valid; tail copy used",
-      "parity shard at LBA 8: unreadable (TapeIo)",
-      "parity shard at LBA 9: unreadable (TapeIo)",
-      "Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)",
-      "Object tape file 1 block 3 (LBA 5): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "parity shard at LBA 8",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 9",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 2 (LBA 4)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 3 (LBA 5)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "burst-m-plus-one": {
@@ -150,12 +195,42 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: primary copy unreadable (LBA 7); footer valid; tail copy used",
-      "parity shard at LBA 8: unreadable (TapeIo)",
-      "parity shard at LBA 9: unreadable (TapeIo)",
-      "parity shard at LBA 10: unreadable (TapeIo)",
-      "Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)",
-      "Object tape file 1 block 3 (LBA 5): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "parity shard at LBA 8",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 9",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 10",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 2 (LBA 4)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 3 (LBA 5)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "editions-conflict": {
@@ -189,7 +264,7 @@
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
     ],
-    "layout_source": "replica footer at LBA 36 (replica ordinal 3)",
+    "layout_source": "replica footer at LBA 21 (replica ordinal 1)",
     "directory": "final ParityMap validates",
     "separations": {
       "A-B": "header, footer, zero interior and trailing filemark validate",
@@ -204,7 +279,7 @@
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
     ],
-    "layout_source": "replica footer at LBA 36 (replica ordinal 3)",
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)",
     "walk": [
       {
         "tape_file_number": 0,
@@ -215,17 +290,19 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
         "tape_file_number": 1,
         "start": 2,
         "count": 11,
-        "kind": null,
-        "note": "classification failed: sidecar footer total 7 differs from the measured 11 blocks (hard error, Section 12.3 item 6)",
+        "kind": 0,
+        "note": "failed classification: sidecar footer total 7 differs from the measured 11 blocks (Section 12.3 item 6); not recognised, so item 7 applies: Object by elimination",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": "sidecar footer total 7 differs from the measured 11 blocks (Section 12.3 item 6)",
         "parity_map": null
       },
       {
@@ -237,6 +314,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -248,6 +326,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -259,6 +338,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -270,6 +350,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -281,6 +362,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -292,14 +374,15 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       }
     ],
     "walk_damage": [],
-    "walk_map": "tape file(s) 1 could not be classified",
+    "walk_map": "scope count is not the ParityMap's tape file number plus one; walked projection does not hash to canonical_map_digest; recomputed T or W differs from the scope fields",
     "separations": {
-      "A-B": "TerminalIndexSeparationParse: role magic does not match",
-      "B-C": "TerminalIndexSeparationParse: role magic does not match"
+      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
+      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
     }
   },
   "object-head": {
@@ -336,7 +419,12 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "parity-and-data": {
@@ -373,8 +461,18 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "parity shard at LBA 8: unreadable (TapeIo)",
-      "Object tape file 1 block 2 (LBA 4): unreadable (TapeIo)"
+      {
+        "component": "parity shard at LBA 8",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 2 (LBA 4)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "parity-map-and-sidecar": {
@@ -425,13 +523,42 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates)",
-      "ParityMap tape file 4: ParityMapParse: no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28)",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
-      "Object block at LBA 3: CRC not checkable (epoch metadata unavailable)",
-      "Object block at LBA 4: CRC not checkable (epoch metadata unavailable)",
-      "Object block at LBA 5: CRC not checkable (epoch metadata unavailable)",
-      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "no header/index copy validates (footer unreadable (LBA 17); primary copy unreadable (LBA 11); no sidecar epoch directory entry is available (no final ParityMap validates))",
+        "error": "SidecarMetadataUnavailable",
+        "checks": "structure"
+      },
+      {
+        "component": "ParityMap tape file 4",
+        "finding": "no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28)",
+        "error": "ParityMapParse",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 4 (LBA 6)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "parity-map-both": {
@@ -468,8 +595,18 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "ParityMap tape file 3: ParityMapParse: no header copy validates (primary: medium error at LBA 15; tail: medium error at LBA 16)",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+      {
+        "component": "ParityMap tape file 3",
+        "finding": "no header copy validates (primary: medium error at LBA 15; tail: medium error at LBA 16)",
+        "error": "ParityMapParse",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "replica-c": {
@@ -527,6 +664,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -538,6 +676,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -549,6 +688,7 @@
         "epoch_id": 0,
         "start_ordinal": 0,
         "end_ordinal": 4,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -560,6 +700,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -571,6 +712,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -582,6 +724,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -593,6 +736,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -604,6 +748,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -615,6 +760,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       }
     ],
@@ -674,14 +820,54 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: primary copy unreadable (LBA 5); footer valid; tail copy used",
-      "parity shard at LBA 6: unreadable (TapeIo)",
-      "parity shard at LBA 7: unreadable (TapeIo)",
-      "parity shard at LBA 8: unreadable (TapeIo)",
-      "parity shard at LBA 9: unreadable (TapeIo)",
-      "parity shard at LBA 10: unreadable (TapeIo)",
-      "parity shard at LBA 11: unreadable (TapeIo)",
-      "Object tape file 1 block 1 (LBA 3): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "parity shard at LBA 6",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 7",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 8",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 9",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 10",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 11",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 1 (LBA 3)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "short-epoch-recoverable": {
@@ -718,13 +904,48 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: primary copy unreadable (LBA 5); footer valid; tail copy used",
-      "parity shard at LBA 6: unreadable (TapeIo)",
-      "parity shard at LBA 7: unreadable (TapeIo)",
-      "parity shard at LBA 8: unreadable (TapeIo)",
-      "parity shard at LBA 9: unreadable (TapeIo)",
-      "parity shard at LBA 10: unreadable (TapeIo)",
-      "Object tape file 1 block 1 (LBA 3): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "parity shard at LBA 6",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 7",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 8",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 9",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "parity shard at LBA 10",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 1 (LBA 3)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "sidecar-footer": {
@@ -747,7 +968,7 @@
         "lost": null,
         "limit": null,
         "bytes_match": null,
-        "index_acquisition": "footer unreadable (LBA 17); primary copy used (fallback)",
+        "index_acquisition": "footer unreadable (LBA 17); primary copy used; its hash equals the directory entry's",
         "peers": [
           "erasure (the failed block)",
           "trusted",
@@ -781,9 +1002,24 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: footer unreadable (LBA 17); primary copy used (fallback)",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
-      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 4 (LBA 6)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "sidecar-primary": {
@@ -840,9 +1076,24 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: primary copy unreadable (LBA 11); footer valid; tail copy used",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
-      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 4 (LBA 6)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "sidecar-primary-and-footer": {
@@ -899,9 +1150,30 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy used (directory-assisted rescue)",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
-      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 4 (LBA 6)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "walk-directory-rescue": {
@@ -920,6 +1192,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -931,6 +1204,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -942,6 +1216,7 @@
         "epoch_id": 0,
         "start_ordinal": 0,
         "end_ordinal": 4,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -953,6 +1228,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -964,6 +1240,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -975,6 +1252,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -986,6 +1264,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -997,6 +1276,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1008,6 +1288,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       }
     ],
@@ -1041,8 +1322,24 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: footer unreadable (LBA 13); primary copy unreadable (LBA 7); tail copy used (directory-assisted rescue)",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   },
   "walk-sidecar-isolation": {
@@ -1061,6 +1358,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1072,6 +1370,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1083,6 +1382,7 @@
         "epoch_id": 0,
         "start_ordinal": 0,
         "end_ordinal": 4,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1094,6 +1394,7 @@
         "epoch_id": 1,
         "start_ordinal": 4,
         "end_ordinal": 8,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1105,6 +1406,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1116,6 +1418,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1127,6 +1430,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1138,6 +1442,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1149,6 +1454,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       },
       {
@@ -1160,6 +1466,7 @@
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
+        "failed_classification": null,
         "parity_map": null
       }
     ],
@@ -1207,12 +1514,36 @@
       "B-C": "header, footer, zero interior and trailing filemark validate"
     },
     "verifier_prefix_findings": [
-      "sidecar tape file 2: footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16)",
-      "Object tape file 1 block 0 (LBA 2): unreadable (TapeIo)",
-      "Object block at LBA 3: CRC not checkable (epoch metadata unavailable)",
-      "Object block at LBA 4: CRC not checkable (epoch metadata unavailable)",
-      "Object block at LBA 5: CRC not checkable (epoch metadata unavailable)",
-      "Object tape file 1 block 4 (LBA 6): unreadable (TapeIo)"
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "no header/index copy validates (footer unreadable (LBA 17); primary copy unreadable (LBA 11); tail copy unreadable (LBA 16))",
+        "error": "SidecarMetadataUnavailable",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      },
+      {
+        "component": "Object tape file 1 block 4 (LBA 6)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data"
+      }
     ]
   }
 }

@@ -79,7 +79,7 @@
       },
       "decision": {
         "result": "refused",
-        "error": "undecided",
+        "error": "ResumeAppend",
         "refused_at": "step 3",
         "before_any_tape_read": false,
         "before_any_write": true,
@@ -93,33 +93,19 @@
           {
             "section": "14",
             "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
+          },
+          {
+            "section": "14",
+            "quote": "A read that finds a filemark, EOD or a record shorter or longer than one block where the committed prefix places a data block contradicts the commit record, and is `ResumeAppend`; a medium or transport failure is `TapeIo`."
+          },
+          {
+            "section": "15",
+            "quote": "ResumeAppend Section 14 invariant violation"
           }
         ]
       },
       "append": null,
-      "undecided": [
-        {
-          "aspect": "decision.error",
-          "readings": [
-            "ResumeAppend: the committed prefix does not describe the tape, a Section 14 invariant violation",
-            "TapeIo: a Filemark or EndOfData outcome where a block was expected is a tape I/O failure, not a format violation"
-          ],
-          "citations": [
-            {
-              "section": "14",
-              "quote": "Rebuild the open epoch by **re-reading ordinals `[W, T)` from the committed prefix on tape** — a boundary or short read where data is expected is fatal — recomputing per-block CRCs and re-accumulating parity."
-            },
-            {
-              "section": "15",
-              "quote": "ResumeAppend Section 14 invariant violation"
-            },
-            {
-              "section": "15",
-              "quote": "TapeIo transport/medium failure (not a format violation)"
-            }
-          ]
-        }
-      ]
+      "undecided": []
     },
     "resume-02": {
       "image": "unfinalized-open",
