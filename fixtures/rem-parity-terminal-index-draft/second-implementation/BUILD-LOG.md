@@ -23,6 +23,7 @@ No change to the builder may follow a failed comparison without a row here.
 | 13 | everything, after the three new commands were added: `build` reproduced 146 with a byte-identical `build-report.json`; `negatives` and `negatives-supplement` on `blind-inputs/` byte-identical to the committed files; `decide` and `resume` on the tests' synthetic cases byte-identical to the tool as it was before this change | 146 + 4 files | 0 |
 | 14 | after the resume case-id fix and the Section 14 quote fix: `resume` on `tape-images/resume/*/inputs.json` and on the same inputs under their opaque ids, and `negatives`, each equal to its committed file with the one quote replaced; then `build`, `decide`, `negatives-supplement` and the three new commands reproduced their committed files byte for byte | 146 + 9 files | 0 |
 | 15 | everything, after the changes for the revised text (F0, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks` byte-identical; `decide`, `resume`, `negatives`, `negatives-supplement`, `mutations` and `selection` regenerated, each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md), and reproduced byte for byte on a second run; the blind `decisions.json` and `resume-decisions.json` equal the real-id files under the mappings (25 and 8 cases); every self-check agrees | 146 + 11 files | 0 |
+| 16 | the e1 damage cases and the E1 negative (F1): the 15 cases' record edits against my build of a4-minimal (every stated old byte, every edited record's SHA-256, and my own CRC for the nine edits that say they recompute one); e1-16's mutated bootstrap against `tape-images/negatives/MANIFEST.tsv`; then every other decision file regenerated, byte-identical (`resume`, `negatives`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide`, blind and real ids, and their traces; `negative-block-digests.json`) | 15 records, 23 byte edits, 9 CRCs, 1 block | 0 |
 
 ## Failed comparisons
 
@@ -189,6 +190,42 @@ regenerated, and each change to a decision has a row in `DECISION-LOG.md`.
   - A survivor set's layout comes from the first of C, B and A whose footer
     supplies one.
   - A new mutation kind covers an extent that gains a record (mut-38).
+
+## Changes for the e1 cases (F1)
+
+These changes add inputs and a command. They change no decision in any earlier
+file, and run 16 confirms that.
+
+- The fault reader (`load_fault_map`) knows its keys at every level and
+  refuses any other, and any missing required key, before a case is decided.
+  `decide` exits with status 2 and names the file and the key. Before F1 an
+  unknown key was ignored without a word.
+- `record_edits` replace a record before the other faults are applied. Each
+  replacement is checked in four ways, and a failed check fails the run:
+  - the stated LBA is the record's LBA in my build;
+  - the stated original length is my record's length;
+  - the construction agrees with the two lengths;
+  - every stated old byte matches my byte, and the SHA-256 of the result
+    matches the stated one.
+  An edit that says it recomputes a CRC is also compared with my CRC. The
+  result is recorded, not enforced.
+- `observations` are decided one by one on the same damaged tape. The case's
+  entry holds the edit checks and a decision per observation.
+- Section 8.4's content table reads a decodable value without the Section
+  5.3 canonical-form rules (`decode_cbor_lenient`; GAPS J-1). Before F1 the
+  strict decoder was used, so a payload with its keys out of order could
+  never yield a disagreeing value. No earlier decision reached that row with
+  such a payload.
+- A refusal with supplied values records the value it names
+  (`discovery.refusal_names`), and cites the refusal's sentences instead of
+  `NoBootstrapFound`'s.
+- The Verifier reports a bootstrap the Scanner treated as unreadable with its
+  cause: `TapeIo` for a medium error, `BootstrapParse` for damaged content
+  (GAPS J-2). Before F1 every such bootstrap was a medium error.
+- `negative-e1` decides the E1 negative from its own table (e1-16) and writes
+  `negative-e1-decisions.json`. `negative-blocks` now includes that case, by
+  default from `blind-inputs/negatives-e1-blind.json`.
+- `blind-mapping.json` maps the e1 ids to themselves.
 
 ## Known divergences, not changed
 

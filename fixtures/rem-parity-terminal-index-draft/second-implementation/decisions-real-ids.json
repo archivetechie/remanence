@@ -1071,6 +1071,2705 @@
         }
       ]
     },
+    "e1-01": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 16,
+              "bytes": 16,
+              "reason": "tape_uuid: set",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 80,
+              "bytes": 1,
+              "reason": "CBOR payload byte: xor 01",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 48,
+              "bytes": 8,
+              "reason": "header CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "header CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the header CRC is valid, and the format major, tape UUID, block size, sequence (which Section 8.1 fixes at 0) or no-parity flag is impossible or disagrees with the supplied values | refuses it (`BootstrapParse`, naming the first such field in that order), even when the payload is damaged |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "tape UUID"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        },
+        "no supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": null,
+            "used_hints": false,
+            "error": "NoBootstrapFound",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              },
+              {
+                "section": "15",
+                "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "error",
+            "error": "NoBootstrapFound",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "NoBootstrapFound",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-02": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 32,
+              "bytes": 4,
+              "reason": "block_size_bytes (u32 BE) = 524288: set",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 48,
+              "bytes": 8,
+              "reason": "header CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "header CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the header CRC is valid, and the format major, tape UUID, block size, sequence (which Section 8.1 fixes at 0) or no-parity flag is impossible or disagrees with the supplied values | refuses it (`BootstrapParse`, naming the first such field in that order), even when the payload is damaged |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "block size"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        },
+        "no supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": null,
+            "used_hints": false,
+            "error": "NoBootstrapFound",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              },
+              {
+                "section": "15",
+                "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "error",
+            "error": "NoBootstrapFound",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "NoBootstrapFound",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-03": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 8,
+              "bytes": 2,
+              "reason": "schema_major (u16 BE) = 3: set",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 48,
+              "bytes": 8,
+              "reason": "header CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "header CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the header CRC is valid, and the format major, tape UUID, block size, sequence (which Section 8.1 fixes at 0) or no-parity flag is impossible or disagrees with the supplied values | refuses it (`BootstrapParse`, naming the first such field in that order), even when the payload is damaged |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "format major"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        },
+        "no supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": null,
+            "used_hints": false,
+            "error": "NoBootstrapFound",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              },
+              {
+                "section": "15",
+                "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "error",
+            "error": "NoBootstrapFound",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "NoBootstrapFound",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "15",
+                "quote": "NoBootstrapFound bootstrap is absent or invalid"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-04": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 36,
+              "bytes": 8,
+              "reason": "sequence (u64 BE) = 1: set",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 48,
+              "bytes": 8,
+              "reason": "header CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "header CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the header CRC is valid, and the format major, tape UUID, block size, sequence (which Section 8.1 fixes at 0) or no-parity flag is impossible or disagrees with the supplied values | refuses it (`BootstrapParse`, naming the first such field in that order), even when the payload is damaged |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "sequence"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-05": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 12,
+              "bytes": 4,
+              "reason": "flags (u32 BE) with bit 0 (no-parity) set: set",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 48,
+              "bytes": 8,
+              "reason": "header CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "header CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the header CRC is valid, and the format major, tape UUID, block size, sequence (which Section 8.1 fixes at 0) or no-parity flag is impossible or disagrees with the supplied values | refuses it (`BootstrapParse`, naming the first such field in that order), even when the payload is damaged |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "no-parity flag"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-06": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 56,
+              "bytes": 138,
+              "reason": "replacement payload (scheme)",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 194,
+              "bytes": 8,
+              "reason": "payload CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "payload CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| a decodable parity scheme disagrees with the supplied scheme | refuses it (`BootstrapParse`, naming the scheme) |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "scheme"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-07": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 56,
+              "bytes": 138,
+              "reason": "replacement payload (key_order, scheme)",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 194,
+              "bytes": 8,
+              "reason": "payload CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "payload CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| both CRCs are valid, and the payload breaks a later rule of Section 8 | treats the bootstrap as unreadable, unless a value that can still be decoded disagrees, as in the next two rows |"
+              },
+              {
+                "section": "5.3",
+                "quote": "When a Reader decodes any CBOR item of this format, it MUST reject duplicate keys and non-canonical encoding, and MUST ignore unknown integer keys at every map level."
+              },
+              {
+                "section": "8.4",
+                "quote": "| a decodable parity scheme disagrees with the supplied scheme | refuses it (`BootstrapParse`, naming the scheme) |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "scheme"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-08": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 56,
+              "bytes": 138,
+              "reason": "replacement payload (drive_compression)",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 194,
+              "bytes": 8,
+              "reason": "payload CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "payload CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "DriveCompressionEnabled",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| both CRCs are valid, and the payload breaks a later rule of Section 8 | treats the bootstrap as unreadable, unless a value that can still be decoded disagrees, as in the next two rows |"
+              },
+              {
+                "section": "8.4",
+                "quote": "| a decodable `drive_compression` is true, and the tape is a parity tape | refuses it (`DriveCompressionEnabled`) |"
+              },
+              {
+                "section": "8.4",
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "error",
+            "error": "DriveCompressionEnabled",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+              },
+              {
+                "section": "15",
+                "quote": "DriveCompressionEnabled compression detected on / recorded for a parity tape"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "DriveCompressionEnabled",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+              },
+              {
+                "section": "15",
+                "quote": "DriveCompressionEnabled compression detected on / recorded for a parity tape"
+              }
+            ]
+          },
+          "undecided": []
+        },
+        "no supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": false,
+            "error": "DriveCompressionEnabled",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+              },
+              {
+                "section": "15",
+                "quote": "Discovery over the candidate block sizes, without supplied values, reports `NoBootstrapFound` when it finds no usable bootstrap at any candidate, and `DriveCompressionEnabled` when a parity bootstrap records compression; a record of another length only rules out that candidate."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "error",
+            "error": "DriveCompressionEnabled",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+              },
+              {
+                "section": "15",
+                "quote": "DriveCompressionEnabled compression detected on / recorded for a parity tape"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "DriveCompressionEnabled",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "`drive_compression = true` on a parity bootstrap still rejects the tape (Sections 11.4, 16.3)."
+              },
+              {
+                "section": "15",
+                "quote": "DriveCompressionEnabled compression detected on / recorded for a parity tape"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-09": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 1000,
+          "construction": "the first 1000 bytes of the original record",
+          "edits": [],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| a record whose measured length differs from the supplied block size, shorter or longer | refuses it (`BootstrapParse`, naming the block size) |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "block size"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-10": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 524288,
+          "construction": "the original record followed by 262144 zero bytes",
+          "edits": [],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| a record whose measured length differs from the supplied block size, shorter or longer | refuses it (`BootstrapParse`, naming the block size) |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "block size"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-11": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 40,
+          "construction": "the first 40 bytes of the original record",
+          "edits": [
+            {
+              "offset": 0,
+              "bytes": 1,
+              "reason": "magic byte 0: xor 01",
+              "old_bytes_agree": true
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "error",
+            "block_size": null,
+            "used_hints": true,
+            "error": "BootstrapParse",
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| a record whose measured length differs from the supplied block size, shorter or longer | refuses it (`BootstrapParse`, naming the block size) |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              }
+            ],
+            "refusal_names": "block size"
+          },
+          "scanner": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "acceptable_selections": [],
+            "degraded": null,
+            "replicas": {
+              "A": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "B": {
+                "valid": null,
+                "reason": "not examined"
+              },
+              "C": {
+                "valid": null,
+                "reason": "not examined"
+              }
+            },
+            "inventory_equals_true_prefix": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4.1",
+                "quote": "If it is unreadable, the expected tape UUID, the block size and the parity scheme (`k`, `m` and `S` of `rs-cauchy-gf256-v1`, or no parity) supplied out of band are required."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "error",
+            "error": "BootstrapParse",
+            "separations": {
+              "A-B": "not_run",
+              "B-C": "not_run"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.4",
+                "quote": "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."
+              },
+              {
+                "section": "15",
+                "quote": "BootstrapParse bootstrap frame or payload violates Section 8"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-12": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 0,
+              "bytes": 1,
+              "reason": "magic byte 0: xor 01",
+              "old_bytes_agree": true
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": 262144,
+            "used_hints": true,
+            "error": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the magic is missing, or the header CRC fails | treats the bootstrap as unreadable |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+              },
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "12.1",
+                "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "Inventory",
+            "error": null,
+            "acceptable_selections": [
+              "A",
+              "B",
+              "C"
+            ],
+            "degraded": false,
+            "replicas": {
+              "A": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "B": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "C": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              }
+            },
+            "inventory_equals_true_prefix": true,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "8.4",
+                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+              },
+              {
+                "section": "8.4",
+                "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+              },
+              {
+                "section": "8.4",
+                "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+              },
+              {
+                "section": "8.4",
+                "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "12.6",
+                "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "complete",
+            "error": null,
+            "separations": {
+              "A-B": "valid",
+              "B-C": "valid"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "12.6",
+                "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+              },
+              {
+                "section": "15",
+                "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+              }
+            ],
+            "outside_terminal_suffix": [
+              {
+                "component": "bootstrap",
+                "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+                "error": "BootstrapParse",
+                "checks": "structure"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-13": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 48,
+              "bytes": 1,
+              "reason": "crc64_header byte 0: xor 01",
+              "old_bytes_agree": true
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": 262144,
+            "used_hints": true,
+            "error": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the magic is missing, or the header CRC fails | treats the bootstrap as unreadable |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+              },
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "12.1",
+                "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "Inventory",
+            "error": null,
+            "acceptable_selections": [
+              "A",
+              "B",
+              "C"
+            ],
+            "degraded": false,
+            "replicas": {
+              "A": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "B": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "C": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              }
+            },
+            "inventory_equals_true_prefix": true,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "8.4",
+                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+              },
+              {
+                "section": "8.4",
+                "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+              },
+              {
+                "section": "8.4",
+                "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+              },
+              {
+                "section": "8.4",
+                "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "12.6",
+                "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "complete",
+            "error": null,
+            "separations": {
+              "A-B": "valid",
+              "B-C": "valid"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "12.6",
+                "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+              },
+              {
+                "section": "15",
+                "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+              }
+            ],
+            "outside_terminal_suffix": [
+              {
+                "component": "bootstrap",
+                "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+                "error": "BootstrapParse",
+                "checks": "structure"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-14": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 80,
+              "bytes": 1,
+              "reason": "CBOR payload byte: xor 01",
+              "old_bytes_agree": true
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": 262144,
+            "used_hints": true,
+            "error": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "8.4",
+                "quote": "| the header is valid, and the payload CRC fails or the payload's length runs past the block | treats the bootstrap as unreadable |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+              },
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "12.1",
+                "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "Inventory",
+            "error": null,
+            "acceptable_selections": [
+              "A",
+              "B",
+              "C"
+            ],
+            "degraded": false,
+            "replicas": {
+              "A": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "B": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "C": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              }
+            },
+            "inventory_equals_true_prefix": true,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "8.4",
+                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+              },
+              {
+                "section": "8.4",
+                "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+              },
+              {
+                "section": "8.4",
+                "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+              },
+              {
+                "section": "8.4",
+                "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "12.6",
+                "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "complete",
+            "error": null,
+            "separations": {
+              "A-B": "valid",
+              "B-C": "valid"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "12.6",
+                "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+              },
+              {
+                "section": "15",
+                "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+              }
+            ],
+            "outside_terminal_suffix": [
+              {
+                "component": "bootstrap",
+                "finding": "the payload CRC fails or the payload runs past the block, so with supplied values it is treated as unreadable",
+                "error": "BootstrapParse",
+                "checks": "structure"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
+    "e1-15": {
+      "image": "a4-minimal",
+      "record_edits": [
+        {
+          "tape_file": 0,
+          "record_index": 0,
+          "lba": 0,
+          "length": 262144,
+          "construction": "the original record's length",
+          "edits": [
+            {
+              "offset": 56,
+              "bytes": 138,
+              "reason": "replacement payload (key_order)",
+              "old_bytes_agree": true
+            },
+            {
+              "offset": 194,
+              "bytes": 8,
+              "reason": "payload CRC recomputed",
+              "old_bytes_agree": true,
+              "recomputation": "payload CRC agrees with mine"
+            }
+          ],
+          "sha256_agrees": true
+        }
+      ],
+      "observations": {
+        "supplied values": {
+          "image": "a4-minimal",
+          "image_unreproduced": [],
+          "discovery": {
+            "result": "not_found",
+            "block_size": 262144,
+            "used_hints": true,
+            "error": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+              },
+              {
+                "section": "8.4.1",
+                "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+              },
+              {
+                "section": "8.4",
+                "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+              },
+              {
+                "section": "5.3",
+                "quote": "When a Reader decodes any CBOR item of this format, it MUST reject duplicate keys and non-canonical encoding, and MUST ignore unknown integer keys at every map level."
+              },
+              {
+                "section": "8.4",
+                "quote": "| both CRCs are valid, and the payload breaks a later rule of Section 8 | treats the bootstrap as unreadable, unless a value that can still be decoded disagrees, as in the next two rows |"
+              },
+              {
+                "section": "8.4",
+                "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+              },
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "12.1",
+                "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+              }
+            ]
+          },
+          "scanner": {
+            "result": "Inventory",
+            "error": null,
+            "acceptable_selections": [
+              "A",
+              "B",
+              "C"
+            ],
+            "degraded": false,
+            "replicas": {
+              "A": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "B": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              },
+              "C": {
+                "valid": true,
+                "reason": "locally eligible under Section 10.6"
+              }
+            },
+            "inventory_equals_true_prefix": true,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+              },
+              {
+                "section": "8.4",
+                "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+              },
+              {
+                "section": "8.4",
+                "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+              },
+              {
+                "section": "8.4",
+                "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+              },
+              {
+                "section": "8.4",
+                "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+              },
+              {
+                "section": "8.4",
+                "quote": "before accepting any replica, consider every replica that validates for conflict under Section 8.5;"
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "12.6",
+                "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
+              }
+            ]
+          },
+          "walk": {
+            "result": "not_run",
+            "error": null,
+            "classes": {},
+            "object_identity": null,
+            "terminal_authority_recovered": null,
+            "citations": [
+              {
+                "section": "8.4",
+                "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+              }
+            ]
+          },
+          "recoverer": {
+            "result": "not_run",
+            "addresses": []
+          },
+          "verifier": {
+            "result": "complete",
+            "error": null,
+            "separations": {
+              "A-B": "valid",
+              "B-C": "valid"
+            },
+            "citations": [
+              {
+                "section": "2.2",
+                "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+              },
+              {
+                "section": "8.5",
+                "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+              },
+              {
+                "section": "10.6",
+                "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "10.6",
+                "quote": "Its edition ID MUST equal the replicas'."
+              },
+              {
+                "section": "12.6",
+                "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+              },
+              {
+                "section": "15",
+                "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+              }
+            ],
+            "outside_terminal_suffix": [
+              {
+                "component": "bootstrap",
+                "finding": "the payload breaks a later rule of Section 8 (bootstrap payload: CBOR map keys are duplicate or not in deterministic order), so with supplied values it is treated as unreadable",
+                "error": "BootstrapParse",
+                "checks": "structure"
+              }
+            ]
+          },
+          "undecided": []
+        }
+      }
+    },
     "editions-conflict": {
       "image": "two-edition",
       "image_unreproduced": [],

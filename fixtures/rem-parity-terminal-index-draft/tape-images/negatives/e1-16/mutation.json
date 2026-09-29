@@ -1,0 +1,64 @@
+{
+  "artifact": "tape-image a4-minimal",
+  "case": "e1-16",
+  "edits": [
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 12,
+      "new_bytes": "00000001",
+      "old_bytes": "00000000",
+      "repair": "mutation: flags bit 0 (no-parity)",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 56,
+      "new_bytes": "a402a50158204844cab0503375f6ec546eb944144f641975cf4a2840de39e8cce23653fab6cf02010300040005f403782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310474323032362d30382d30395430303a30303a30305a05f5",
+      "old_bytes": "a501a4017272732d6361756368792d67663235362d763102020302040202a50158204844cab0503375f6ec546eb944144f641975cf4a2840de39e8cce23653fab6cf02010300040005f403782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e65726174",
+      "repair": "mutation: payload without key 1 (scheme), key 5 (drive_compression) true",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 174,
+      "new_bytes": "00000000000000000000000000000000000000000000000000000000",
+      "old_bytes": "32362d30382d30395430303a30303a30305a05f4c7fd539ae984d935",
+      "repair": "zero fill after the shorter payload",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 44,
+      "new_bytes": "6e000000",
+      "old_bytes": "8a000000",
+      "repair": "cbor_payload_len",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 166,
+      "new_bytes": "a2680702fe3f2068",
+      "old_bytes": "6f722f3104743230",
+      "repair": "payload CRC",
+      "tape_file": 0
+    },
+    {
+      "artifact": "tape-image a4-minimal",
+      "block_within_file": 0,
+      "byte_offset": 48,
+      "new_bytes": "64e991162562904c",
+      "old_bytes": "c0054196e69cbdc8",
+      "repair": "header CRC",
+      "tape_file": 0
+    }
+  ],
+  "entry_points": [
+    "parse_bootstrap_block"
+  ],
+  "target_role": "Bootstrap"
+}

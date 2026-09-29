@@ -11,6 +11,39 @@ use crate::journal::JournalError;
 use crate::model::StripeAddress;
 use crate::raw::PhysicalPositionHint;
 
+/// The field a bootstrap refusal names (REM-PARITY 8.4), in the order the
+/// header's fields are judged, followed by the payload's scheme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootstrapRefusedField {
+    /// `schema_major` is not 2.
+    FormatMajor,
+    /// `tape_uuid` differs from the supplied tape UUID.
+    TapeUuid,
+    /// The record's measured length, or `block_size_bytes`, differs from the
+    /// supplied block size.
+    BlockSize,
+    /// `sequence` is not 0.
+    Sequence,
+    /// The no-parity flag contradicts the supplied scheme.
+    NoParityFlag,
+    /// A decodable parity scheme differs from the supplied scheme.
+    Scheme,
+}
+
+impl BootstrapRefusedField {
+    /// The field's name in the words of REM-PARITY 8.4.
+    pub fn section_8_4_name(self) -> &'static str {
+        match self {
+            Self::FormatMajor => "format major",
+            Self::TapeUuid => "tape UUID",
+            Self::BlockSize => "block size",
+            Self::Sequence => "sequence",
+            Self::NoParityFlag => "no-parity flag",
+            Self::Scheme => "scheme",
+        }
+    }
+}
+
 /// Errors a Layer 3c operation can return.
 #[derive(Debug, thiserror::Error)]
 pub enum ParityError {
@@ -67,9 +100,16 @@ pub enum ParityError {
     #[error("bootstrap parse error: {0}")]
     BootstrapParse(String),
 
-    /// A checksummed recovery bootstrap contradicts the required tape identity.
-    #[error("filemark map could not be reconstructed: {0}")]
-    TapeIdentityMismatch(String),
+    /// A readable first record refused under supplied values (REM-PARITY 8.4).
+    /// Section 15 names it `BootstrapParse`. It is never a reason to continue
+    /// discovery: supplied values never replace a bootstrap that contradicts them.
+    #[error("filemark map could not be reconstructed: {detail}")]
+    BootstrapRefused {
+        /// The field Section 8.4 names for the refusal.
+        field: BootstrapRefusedField,
+        /// What disagreed, worded for the operator.
+        detail: String,
+    },
 
     /// A bootstrap payload serialized successfully but does not fit in one
     /// fixed-size bootstrap tape block.

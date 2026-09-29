@@ -78,3 +78,11 @@ resume row applies to `resume-decisions.json` (resume-01) and to
 | sel-11, sel-13 | The foreign replica's footer supplies no layout, which is now stated. Outcome unchanged | 8.4 step 1, as the mut-38 row |
 | bootstrap-hinted, bootstrap-wrong-scheme, bootstrap-unhinted | The hint path is required, not a permission, and discovery without supplied values reports `NoBootstrapFound`. Citations only | 8.4: "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them." |
 | neg-07/c, neg-29/c, neg-40/a, neg-47/b, neg-47/c, neg-54/c; sup-03, sup-05, sup-09, sup-14, sup-21, sup-26, sup-33, sup-36 to sup-38, sup-40, sup-42, sup-43, sup-48, sup-49 | Implementation notes only (index acquisition under the revised Section 13.3, reworded reasons). No decision field changed | 13.3, as above |
+
+## The e1 cases (F1)
+
+F1 adds decisions: the 19 observations of e1-01 to e1-15 in `decisions.json` and
+`decisions-real-ids.json`, and e1-16 in `negative-e1-decisions.json`. No
+existing decision changed. A comparison of every earlier entry, and of its
+trace, with its predecessor finds them identical. The other decision files
+are byte-identical.

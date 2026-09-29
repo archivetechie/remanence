@@ -182,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check,
         &mut emitted,
     )?;
-    artifact(&root, "README.md", b"# Full-tape review candidates\n\nReview-only REM-PARITY generation-2 fixtures. These are not publication artifacts. Image bytes are pinned by size and SHA-256 per tape file and for the concatenation of all data records in MANIFEST.tsv. Filemarks and EOD are structural expectations, not bytes in those streams; an unterminated tail has no filemark. Image streams are regenerated, never checked in. REM-PARITY's companion archive will carry the bytes at freeze.\n\nRun `cargo run -p remanence-cli --example generate_tape_images` to regenerate metadata, or append `-- --check` to compare every digest and descriptor. Inputs record the complete byte-deciding recipe, including repeat-byte payloads, REM-OBJECT options, diagnostics, checkpoints and stop points. The second edition uses the same recipe except its explicit edition id and sequence, and replaces only replica B.\n\nexpected-cases.json is the frozen specification-authored source. Per-case expected.json preserves its case verbatim, including pinned and sections. Never derive expectations from executor results. The executor runs as damage_vectors in the workspace suite; `cargo test -p remanence-cli --lib damage_vectors -- --nocapture` reports every outcome. Copy-health annotations and note/informative fields are informative. Unpinned cases execute but do not decide a pass. Disagreements remain failing pending specification review. Fault maps include physical and file-relative addresses; failed data addresses also produce real medium errors.\n", check, &mut emitted)?;
+    artifact(&root, "README.md", b"# Full-tape review candidates\n\nReview-only REM-PARITY generation-2 fixtures. These are not publication artifacts. Image bytes are pinned by size and SHA-256 per tape file and for the concatenation of all data records in MANIFEST.tsv. Filemarks and EOD are structural expectations, not bytes in those streams; an unterminated tail has no filemark. Image streams are regenerated, never checked in. REM-PARITY's companion archive will carry the bytes at freeze.\n\nRun `cargo run -p remanence-cli --example generate_tape_images` to regenerate metadata, or append `-- --check` to compare every digest and descriptor. Inputs record the complete byte-deciding recipe, including repeat-byte payloads, REM-OBJECT options, diagnostics, checkpoints and stop points. The second edition uses the same recipe except its explicit edition id and sequence, and replaces only replica B.\n\nexpected-cases.json is the frozen specification-authored source. Per-case expected.json preserves its case verbatim, including pinned and sections. Never derive expectations from executor results. The executor runs as damage_vectors in the workspace suite; `cargo test -p remanence-cli --lib damage_vectors -- --nocapture` reports every outcome. Copy-health annotations and note/informative fields are informative. Unpinned cases execute but do not decide a pass. Disagreements remain failing pending specification review. Fault maps include physical and file-relative addresses; failed data addresses also produce real medium errors. Record faults replace one record by a record of a stated length (the original's leading bytes, or the original followed by zero bytes) and edit bytes within it, rebuilding a bootstrap's payload and recomputing or leaving stale its two CRCs as the case states; the fault map records every resolved edit with its old and new bytes. A case with observations runs the reader once per observation, each with its own supplied values or none. Such a case's expected outcome gives each observation's outcome, written from the specification text alone; one that reads pending, or that the executor does not know, fails the case.\n", check, &mut emitted)?;
     artifact(
         &root,
         "resume/expected-cases.json",
@@ -351,6 +351,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Erratum set E1's negative constructions; their expectations are pending.
+    let erratum_bytes = fs::read(root.join("negatives/negative-cases-e1.json"))?;
+    let erratum = negatives::parse_erratum_source(&erratum_bytes)?;
+    artifact(
+        &root,
+        "negatives/negative-cases-e1.json",
+        &erratum_bytes,
+        check,
+        &mut emitted,
+    )?;
+    for case in erratum["cases"].as_array().ok_or("erratum cases missing")? {
+        let path = negatives::case_path(case, None);
+        artifact(
+            &root,
+            &format!("negatives/{path}/expected.json"),
+            &serde_json::to_vec_pretty(case)?,
+            check,
+            &mut emitted,
+        )?;
+        match negatives::resolve(case, None) {
+            Ok(vector) => {
+                artifact(
+                    &root,
+                    &format!("negatives/{path}/mutation.json"),
+                    &serde_json::to_vec_pretty(&vector.descriptor)?,
+                    check,
+                    &mut emitted,
+                )?;
+                negative_manifest.push_str(&vector.manifest);
+            }
+            Err(e) => {
+                eprintln!("UNRESOLVED {path}: {e}");
+                unresolved.push(path);
+            }
+        }
+    }
     artifact(
         &root,
         "negatives/MANIFEST.tsv",
@@ -373,9 +409,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "{}: all six image digests, 25 damage descriptors and nine resume cases; all 7a/7b/7c negative descriptors and {} supplement variants",
+        "{}: all six image digests, {} damage descriptors and nine resume cases; all 7a/7b/7c negative descriptors, {} supplement variants and {} erratum E1 negative cases",
         if check { "CHECK PASS" } else { "GENERATED" },
-        supplement["variants"].as_array().unwrap().len()
+        source["cases"].as_array().unwrap().len(),
+        supplement["variants"].as_array().unwrap().len(),
+        erratum["cases"].as_array().unwrap().len()
     );
     Ok(())
 }

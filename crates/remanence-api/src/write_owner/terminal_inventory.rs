@@ -70,8 +70,15 @@ pub(crate) fn prepare_catalog_recovery_read(
         .locate_physical(PhysicalPositionHint::new(0))
         .map_err(|error| Status::unavailable(format!("locate BOT: {error}")))?;
     let mut block = vec![0; block_size as usize];
-    let bytes = match source.read_record(&mut block) {
-        Ok(RawReadOutcome::Block { bytes, .. }) => bytes,
+    let read = source.read_record(&mut block);
+    // A record whose measured length differs from the supplied size is refused
+    // before anything else, shorter or longer (REM-PARITY 8.4).
+    prepared
+        .hints
+        .check_bootstrap_read_length(&read, block.len())
+        .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    match read {
+        Ok(RawReadOutcome::Block { .. }) => {}
         Ok(RawReadOutcome::Filemark { .. } | RawReadOutcome::EndOfData { .. }) => {
             prepared.bootstrap_unreadable_reason = Some("no BOT block".to_string());
             return Ok(prepared);
@@ -81,11 +88,6 @@ pub(crate) fn prepare_catalog_recovery_read(
             return Ok(prepared);
         }
         Err(error) => return Err(Status::unavailable(format!("read BOT: {error}"))),
-    };
-    if bytes != block.len() {
-        return Err(Status::failed_precondition(format!(
-            "short fixed-block bootstrap read: got {bytes} bytes, expected {block_size}"
-        )));
     }
     match prepared
         .hints

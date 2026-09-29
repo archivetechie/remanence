@@ -39,6 +39,43 @@ pub fn source() -> Result<Value, String> {
     )
 }
 
+/// Parse erratum set E1's negative vectors: each construction with the
+/// expectation a text-only author wrote for it. Unlike the frozen sources this
+/// file is not SHA-pinned; the executor fails a pending or unknown expectation.
+pub fn parse_erratum_source(bytes: &[u8]) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let cases = value["cases"].as_array().ok_or("erratum cases missing")?;
+    let mut ids = BTreeSet::new();
+    for case in cases {
+        let id = case["id"].as_str().ok_or("erratum case id missing")?;
+        if !ids.insert(id) {
+            return Err(format!("duplicate erratum case {id}"));
+        }
+        if case["group"] != "e1" || !case["base"]["artifact"].is_string() {
+            return Err(format!(
+                "erratum case {id} lacks its group or base artifact"
+            ));
+        }
+        if case["pinned"].as_bool().is_none() || case.get("expected").is_none() {
+            return Err(format!("erratum case {id} lacks expected or pinned"));
+        }
+        if case["expected"] == "pending (E1)" && case["pinned"] != false {
+            return Err(format!(
+                "erratum case {id} is pinned without an expectation"
+            ));
+        }
+    }
+    Ok(value)
+}
+
+/// Read erratum set E1's negative constructions from the fixture tree.
+pub fn erratum_source() -> Result<Value, String> {
+    parse_erratum_source(
+        &fs::read(fixture_root().join("tape-images/negatives/negative-cases-e1.json"))
+            .map_err(|e| e.to_string())?,
+    )
+}
+
 fn unhex(s: &str) -> Vec<u8> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(s.len().is_multiple_of(2));
@@ -409,7 +446,9 @@ fn section15(error: &ObservedError) -> &'static str {
         ObservedError::Parity(ParityError::SidecarParse(_)) => "SidecarParse",
         ObservedError::Parity(ParityError::ParityMapParse(_)) => "ParityMapParse",
         ObservedError::Parity(ParityError::DirectoryInvalid(_)) => "DirectoryInvalid",
-        ObservedError::Parity(ParityError::BootstrapParse(_)) => "BootstrapParse",
+        ObservedError::Parity(ParityError::BootstrapParse(_))
+        | ObservedError::Parity(ParityError::BootstrapRefused { .. }) => "BootstrapParse",
+        ObservedError::Parity(ParityError::DriveCompressionEnabled) => "DriveCompressionEnabled",
         ObservedError::Parity(ParityError::BootstrapPayloadTooLarge { .. }) => {
             "BootstrapPayloadTooLarge"
         }
@@ -921,6 +960,70 @@ pub fn resolve(case: &Value, variant: Option<&Value>) -> Result<Resolved, String
         editor.field(file, 0, &mutation)?;
         editor.crc(file, 0, 0x30, "R-BOOT-HDR CRC");
         Role::Bootstrap
+    } else if id == "e1-16" {
+        // A conformant no-parity bootstrap recording drive compression: flags
+        // bit 0 set, the payload re-encoded without key 1 and with key 5 true,
+        // then its length, zero fill and both CRCs.
+        let original = &editor.files[&file][0];
+        let len = u32::from_le_bytes(original[0x2c..0x30].try_into().unwrap()) as usize;
+        let mut payload: Cbor =
+            ciborium::from_reader(&original[0x38..0x38 + len]).map_err(|e| e.to_string())?;
+        let entries = payload
+            .as_map_mut()
+            .ok_or("bootstrap payload is not a map")?;
+        let before = entries.len();
+        entries.retain(|(k, _)| k.as_integer().map(i128::from) != Some(1));
+        if entries.len() + 1 != before {
+            return Err("bootstrap payload has no key 1".into());
+        }
+        if *cbor_key(&mut payload, 5) != Cbor::Bool(false) {
+            return Err("bootstrap payload key 5 is not false".into());
+        }
+        *cbor_key(&mut payload, 5) = Cbor::Bool(true);
+        let new = cbor_bytes(&payload);
+        if new.len() >= len {
+            return Err("no-parity payload is not shorter than the original".into());
+        }
+        if original[0x0c..0x10] != [0, 0, 0, 0] {
+            return Err("bootstrap flags are not zero".into());
+        }
+        editor.write(
+            file,
+            0,
+            0x0c,
+            &1u32.to_be_bytes(),
+            "mutation: flags bit 0 (no-parity)",
+        );
+        editor.write(
+            file,
+            0,
+            0x38,
+            &new,
+            "mutation: payload without key 1 (scheme), key 5 (drive_compression) true",
+        );
+        editor.write(
+            file,
+            0,
+            0x38 + new.len() + 8,
+            &vec![0; len - new.len()],
+            "zero fill after the shorter payload",
+        );
+        editor.write(
+            file,
+            0,
+            0x2c,
+            &(new.len() as u32).to_le_bytes(),
+            "cbor_payload_len",
+        );
+        editor.write(
+            file,
+            0,
+            0x38 + new.len(),
+            &crc64_xz(&new).to_le_bytes(),
+            "payload CRC",
+        );
+        editor.crc(file, 0, 0x30, "header CRC");
+        Role::Bootstrap
     } else if id == "terminal-object-id-over-64" {
         targets = v["replicas"]
             .as_array()
@@ -1252,6 +1355,19 @@ mod tests {
             )),
             "UNMAPPED"
         );
+        // Typed refusals keep their Section 15 names once every continuation
+        // decision has been made.
+        assert_eq!(
+            section15(&ObservedError::Parity(ParityError::BootstrapRefused {
+                field: BootstrapRefusedField::TapeUuid,
+                detail: "tape identity mismatch".into(),
+            })),
+            "BootstrapParse"
+        );
+        assert_eq!(
+            section15(&ObservedError::Parity(ParityError::DriveCompressionEnabled)),
+            "DriveCompressionEnabled"
+        );
     }
     #[test]
     fn healthy_roles_and_repairs() {
@@ -1317,6 +1433,104 @@ mod tests {
             }
         }
     }
+    /// Run erratum set E1's negative constructions. Their expectations are not
+    /// merged yet, so each observation is informative; a panic still fails.
+    fn execute_erratum(root: &std::path::Path, manifest: &mut String, failures: &mut Vec<String>) {
+        let source = erratum_source().expect("erratum source");
+        for case in source["cases"].as_array().unwrap() {
+            let path = case_path(case, None);
+            let mut resolved = match resolve(case, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("UNRESOLVED {path}: {e}");
+                    failures.push(path);
+                    continue;
+                }
+            };
+            for (name, wanted) in [
+                ("expected.json", &resolved.expected),
+                ("mutation.json", &resolved.descriptor),
+            ] {
+                let actual: Value = serde_json::from_slice(
+                    &fs::read(root.join(&path).join(name)).expect("generated vector file"),
+                )
+                .expect("vector JSON");
+                assert_eq!(&actual, wanted, "{path}/{name}");
+            }
+            manifest.push_str(&resolved.manifest);
+            let pinned = case["pinned"].as_bool().expect("pinned flag");
+            let expected = case["expected"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{path}: expectation missing or pending"));
+            let mut compared = BTreeSet::new();
+            for observation in observe(&resolved) {
+                // The author's role names the observation point.
+                let role = match observation.key {
+                    "bootstrap" => "bootstrap role",
+                    other => panic!("{path}: no expectation vocabulary for role {other}"),
+                };
+                let wanted = &expected[role];
+                let keys = wanted
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{path} [{role}]: expectation missing"));
+                for key in keys.keys() {
+                    assert!(
+                        matches!(key.as_str(), "accepts" | "error" | "sections" | "quotes"),
+                        "{path} [{role}]: unknown expectation key {key}"
+                    );
+                }
+                assert!(
+                    wanted["accepts"].is_boolean() && wanted["error"].is_string(),
+                    "{path} [{role}]: accepts must be a bool and error a Section 15 name or none"
+                );
+                let wanted = json!({"accepts": wanted["accepts"], "error": wanted["error"]});
+                let accepted = observation.name == "ACCEPTED";
+                let observed = json!({"accepts": accepted,
+                    "error": if accepted { "none" } else { observation.outcome.as_str() }});
+                let status = if !pinned {
+                    "INFORMATIVE"
+                } else if wanted == observed {
+                    "PASS"
+                } else {
+                    "DISAGREEMENT"
+                };
+                println!(
+                    "{status} {path} [{role}]: expected {wanted}; observed {observed}; {}; detail={:?}",
+                    observation.location, observation.detail
+                );
+                if (pinned && wanted != observed)
+                    || matches!(observation.name, "PANIC" | "Invariant")
+                {
+                    failures.push(format!("{path} {}", observation.location));
+                }
+                for quote in expected[role]["quotes"].as_array().into_iter().flatten() {
+                    let quote = quote.as_str().expect("quote text");
+                    assert!(
+                        crate::tape_image_vectors::specification_quote_holds(quote),
+                        "{path} [{role}]: quote not in the specification: {quote}"
+                    );
+                }
+                compared.insert(role);
+            }
+            assert_eq!(
+                compared,
+                expected.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                "{path}: every expectation must name an observed role"
+            );
+            // The observation point accepts the exact unmutated base.
+            let (files, _) = base_artifact(resolved.descriptor["artifact"].as_str().unwrap())
+                .expect("erratum base");
+            resolved.files = files;
+            for observation in observe(&resolved) {
+                assert_eq!(
+                    observation.name, "ACCEPTED",
+                    "{path} healthy base: {}",
+                    observation.detail
+                );
+            }
+        }
+    }
+
     #[test]
     fn negative_vectors() {
         let source = source().expect("frozen negative source");
@@ -1454,6 +1668,7 @@ mod tests {
             &adjudications,
             &mut seen_adjudications,
         );
+        execute_erratum(&root, &mut manifest, &mut failures);
         adjudications
             .ensure_all_observed(&seen_adjudications)
             .expect("every adjudication observation must execute");

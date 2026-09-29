@@ -2,11 +2,16 @@
 //! inventory, BOT recovery, sidecar recovery and full verification. Expected
 //! results never affect reader behavior; only the comparison interprets them.
 
-use crate::tape_image_vectors::{generate, hex, VectorImage, BLOCK, EXPECTATIONS};
+use crate::tape_image_vectors::{
+    apply_record_edits, check_hints, check_observations, generate, hex, VectorImage, BLOCK,
+    EXPECTATIONS,
+};
 use remanence_chaos::{
     model::{DeviceRole, ModelTransport, Record, VirtualTape, VirtualWorld},
     ChaosTransport, DeviceCtx, FaultEngine,
 };
+use remanence_library::scsi::ScsiError;
+use remanence_library::transport::{SgTransport, TimeoutClass, TransferOutcome};
 use remanence_library::DriveHandle;
 use remanence_parity::bootstrap::discover_bootstrap_with_recovery_hints;
 use remanence_parity::raw::tape_error_is_current_medium_damage;
@@ -19,18 +24,100 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// Report a record longer than the host buffer as a drive does for a
+/// variable-block READ(6) with SILI clear: CHECK CONDITION, ILI, VALID and
+/// INFORMATION = requested − actual, with the record consumed. The chaos model
+/// silently truncates such a read, so the record-length fault needs this to be
+/// observed faithfully. Every other command passes through unchanged.
+struct OverlengthReads<T> {
+    inner: T,
+    scratch: Vec<u8>,
+}
+
+impl<T: SgTransport> SgTransport for OverlengthReads<T> {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let variable_read = cdb.first() == Some(&0x08) && cdb.get(1).is_some_and(|b| b & 1 == 0);
+        if !variable_read {
+            return self.inner.execute_in(cdb, buf);
+        }
+        // Read with the largest transfer READ(6) allows, then report the fit.
+        const MAX_TRANSFER: usize = 0x00ff_ffff;
+        self.scratch.resize(MAX_TRANSFER, 0);
+        let mut probe = cdb.to_vec();
+        probe[2..5].copy_from_slice(&(MAX_TRANSFER as u32).to_be_bytes()[1..]);
+        let outcome = self.inner.execute_in(&probe, &mut self.scratch)?;
+        let actual = outcome.bytes_transferred as usize;
+        let copied = actual.min(buf.len());
+        buf[..copied].copy_from_slice(&self.scratch[..copied]);
+        if actual <= buf.len() {
+            return Ok(outcome);
+        }
+        let mut sense = vec![0u8; 18];
+        sense[0] = 0xf0; // VALID, current fixed-format sense
+        sense[2] = 0x20; // NO SENSE with ILI
+        let information = buf.len() as i64 - actual as i64;
+        sense[3..7].copy_from_slice(&(information as i32).to_be_bytes());
+        sense[7] = 10;
+        Err(ScsiError::CheckCondition {
+            sense,
+            bytes_transferred: buf.len() as u32,
+        })
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.inner.execute_none(cdb)
+    }
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
 fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
+    // No key of the fault map may be ignored silently.
+    for key in faults.as_object().expect("fault map object").keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "image"
+                    | "unreadable_records"
+                    | "removed_filemark_after_tape_file"
+                    | "failed_data_addresses"
+                    | "hints"
+                    | "record_edits"
+                    | "observations"
+            ),
+            "unknown fault map key {key}"
+        );
+    }
     let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK);
     let removed = faults["removed_filemark_after_tape_file"].as_u64();
+    let edits = faults["record_edits"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     for (i, file) in vector.image.files.iter().enumerate() {
-        tape.records.extend(
-            file.bytes
-                .chunks_exact(BLOCK as usize)
-                .map(|b| Record::Block(b.to_vec())),
-        );
+        for (index, block) in file.bytes.chunks_exact(BLOCK as usize).enumerate() {
+            let edited = edits
+                .iter()
+                .find(|e| e["tape_file"] == json!(i) && e["record_index"] == json!(index));
+            tape.records.push(Record::Block(match edited {
+                Some(resolved) => apply_record_edits(block, resolved),
+                None => block.to_vec(),
+            }));
+        }
         if file.filemark_record.is_some() && removed != Some(i as u64) {
             tape.records.push(Record::Filemark);
         }
+    }
+    for resolved in &edits {
+        let file = &vector.image.files[resolved["tape_file"].as_u64().unwrap() as usize];
+        assert_eq!(
+            resolved["lba"].as_u64().unwrap() as usize,
+            file.start_record + resolved["record_index"].as_u64().unwrap() as usize,
+            "record edit address"
+        );
     }
     let lbas: Vec<u64> = faults["unreadable_records"]
         .as_array()
@@ -41,10 +128,13 @@ fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
     let engine = FaultEngine::for_read_medium_errors(lbas).unwrap();
     let mut world = VirtualWorld::single_drive("IMAGE-LIB", 0x100, "IMAGE-DRV", 0x400, 1);
     world.put_tape_in_drive(0x100, "IMAGE001", None, tape);
-    let model = ModelTransport::new(
-        Arc::new(Mutex::new(world)),
-        DeviceRole::Drive { bay: 0x100 },
-    );
+    let model = OverlengthReads {
+        inner: ModelTransport::new(
+            Arc::new(Mutex::new(world)),
+            DeviceRole::Drive { bay: 0x100 },
+        ),
+        scratch: Vec::new(),
+    };
     let transport = ChaosTransport::new(
         model,
         engine.clone(),
@@ -79,6 +169,11 @@ fn parity_error(error: ParityError) -> Value {
             json!({"error":"Unrecoverable", "stripe":stripe.stripe_index, "lost":lost_count, "limit":limit})
         }
         ParityError::NoBootstrapFound => json!({"error":"NoBootstrapFound"}),
+        // Section 15's names, applied after every continuation decision.
+        ParityError::BootstrapRefused { field, .. } => {
+            json!({"error":"BootstrapParse", "field":field.section_8_4_name()})
+        }
+        ParityError::DriveCompressionEnabled => json!({"error":"DriveCompressionEnabled"}),
         ParityError::SchemeMismatch { .. } => json!({"error":"SchemeMismatch"}),
         ParityError::SidecarMetadataUnavailable { epoch_id } => {
             json!({"error":"SidecarMetadataUnavailable", "epoch":epoch_id})
@@ -107,11 +202,12 @@ fn map_entry(row: TapeIndexReplicaMapEntry) -> TapeFileMapEntry {
 }
 
 /// Reader inputs come only from discovered bootstrap bytes or declared hints.
-fn execute_reader(vector: &VectorImage, faults: &Value) -> Value {
+fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value {
     let (mut drive, engine) = source(vector, faults);
     let mut raw = DriveHandleRawSource::new(&mut drive);
-    let hints = if faults["hints"].is_object() {
-        let h = &faults["hints"];
+    check_hints(hints);
+    let hints = if hints.is_object() {
+        let h = hints;
         Some(ScanRecoveryHints {
             tape_uuid: vector.written.inputs.tape_uuid,
             block_size: h["block_size"].as_u64().unwrap() as u32,
@@ -128,15 +224,27 @@ fn execute_reader(vector: &VectorImage, faults: &Value) -> Value {
     if let Some(hints) = &hints {
         candidates.push(hints.block_size);
     }
-    let bootstrap =
+    // Section 15 names are rendered only after the continuation decision.
+    let (bootstrap, discovery) =
         match discover_bootstrap_with_recovery_hints(&mut raw, &candidates, hints.as_ref()) {
-            Ok(b) => Some(b),
+            Ok(b) => (Some(b), "uses the bootstrap"),
             Err(ParityError::NoBootstrapFound | ParityError::BootstrapParse(_))
                 if hints.is_some() =>
             {
-                None
+                (None, "continues on the supplied values")
             }
-            Err(e) => return parity_error(e),
+            Err(e) => {
+                let discovery = match &e {
+                    ParityError::BootstrapRefused { .. } | ParityError::DriveCompressionEnabled => {
+                        "refused"
+                    }
+                    ParityError::NoBootstrapFound => "no bootstrap found",
+                    _ => "failed",
+                };
+                let mut out = parity_error(e);
+                out["discovery"] = json!(discovery);
+                return out;
+            }
         };
     let (uuid, block_size, scheme) = if let Some(b) = &bootstrap {
         let s = b
@@ -162,7 +270,7 @@ fn execute_reader(vector: &VectorImage, faults: &Value) -> Value {
             },
         )
     };
-    let mut out = json!({"records": raw.locate_end_of_data().unwrap().lba});
+    let mut out = json!({"records": raw.locate_end_of_data().unwrap().lba, "discovery": discovery});
     let mut entries = Vec::new();
     let mut objects = Vec::new();
     let mut attempt = None;
@@ -429,8 +537,8 @@ fn execute_reader(vector: &VectorImage, faults: &Value) -> Value {
 /// Verification is an independent fixture check, including when discovery or
 /// recovery returns early. Its required identity comes from the image inputs;
 /// it never supplies that identity to the discovery/recovery reader.
-fn execute(vector: &VectorImage, faults: &Value) -> Value {
-    let mut out = execute_reader(vector, faults);
+fn execute(vector: &VectorImage, faults: &Value, hints: &Value) -> Value {
+    let mut out = execute_reader(vector, faults, hints);
     let (mut drive, _) = source(vector, faults);
     let mut raw = DriveHandleRawSource::new(&mut drive);
     let uuid = vector.written.inputs.tape_uuid;
@@ -564,6 +672,120 @@ fn compare(expected: &Value, actual: &Value) -> Vec<String> {
     failures
 }
 
+/// The observation vocabulary of the E1 expectations: REM-PARITY 8.4's four
+/// discovery outcomes and the field names of 8.4, as the renderer prints them.
+const DISCOVERY_OUTCOMES: [&str; 4] = [
+    "continues on the supplied values",
+    "uses the bootstrap",
+    "refused",
+    "no bootstrap found",
+];
+const REFUSED_FIELDS: [BootstrapRefusedField; 6] = [
+    BootstrapRefusedField::FormatMajor,
+    BootstrapRefusedField::TapeUuid,
+    BootstrapRefusedField::BlockSize,
+    BootstrapRefusedField::Sequence,
+    BootstrapRefusedField::NoParityFlag,
+    BootstrapRefusedField::Scheme,
+];
+
+/// An observation case's expectation names exactly the fault map's
+/// observations, so no misspelt or missing name goes uncompared.
+fn check_observation_names(id: &str, expected: &Value, observations: &[Value]) {
+    let expected = expected
+        .as_object()
+        .unwrap_or_else(|| panic!("{id}: expectation missing or pending: {expected}"));
+    let named: std::collections::BTreeSet<_> = expected.keys().map(String::as_str).collect();
+    let observed: std::collections::BTreeSet<_> = observations
+        .iter()
+        .map(|observation| observation["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        named, observed,
+        "{id}: the expectation's observation names differ from the fault map's"
+    );
+}
+
+/// Validate one observation's expectation and project the compared outcome.
+/// A pending expectation, an unknown key or an unknown value fails the case;
+/// `sections`, `quotes` and `ambiguity` are the author's grounds, not compared.
+fn expected_observation(id: &str, name: &str, expected: &Value) -> Value {
+    let Some(fields) = expected.as_object() else {
+        panic!("{id} [{name}]: expectation missing or pending: {expected}")
+    };
+    for key in fields.keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "discovery" | "error" | "field" | "inventory" | "sections" | "quotes" | "ambiguity"
+            ),
+            "{id} [{name}]: unknown expectation key {key}"
+        );
+    }
+    let discovery = expected["discovery"].as_str().unwrap_or_default();
+    assert!(
+        DISCOVERY_OUTCOMES.contains(&discovery),
+        "{id} [{name}]: unknown discovery outcome {}",
+        expected["discovery"]
+    );
+    assert!(
+        expected["error"].is_string(),
+        "{id} [{name}]: error must be a Section 15 name or none"
+    );
+    assert!(
+        expected["field"].is_null()
+            || REFUSED_FIELDS
+                .iter()
+                .any(|field| expected["field"] == field.section_8_4_name()),
+        "{id} [{name}]: unknown field {}",
+        expected["field"]
+    );
+    let inventory = &expected["inventory"];
+    let returned = inventory["returned"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("{id} [{name}]: inventory.returned must be a bool"));
+    assert!(
+        if returned {
+            inventory["degraded"].is_boolean()
+        } else {
+            inventory["degraded"] == "not applicable"
+        },
+        "{id} [{name}]: inventory.degraded {} does not fit returned={returned}",
+        inventory["degraded"]
+    );
+    assert_eq!(inventory.as_object().map(|o| o.len()), Some(2));
+    json!({"discovery": discovery, "error": expected["error"], "field": expected["field"],
+        "inventory": {"returned": returned, "degraded": inventory["degraded"]}})
+}
+
+/// Project an executor output onto the same vocabulary: no `error` key is
+/// `none`, no `field` is null, and an inventory not returned has no degraded state.
+fn observed_outcome(actual: &Value) -> Value {
+    let returned = actual["inventory"] == true;
+    json!({"discovery": actual["discovery"], "error": actual.get("error").cloned().unwrap_or(json!("none")),
+        "field": actual["field"],
+        "inventory": {"returned": returned, "degraded": if returned { actual["degraded"].clone() } else { json!("not applicable") }}})
+}
+
+/// Every compared part must equal the expectation. A returned inventory must
+/// also be the image's own, since every replica of the image is intact.
+fn compare_observation(wanted: &Value, observed: &Value, actual: &Value) -> Vec<String> {
+    let mut failures: Vec<String> = ["discovery", "error", "field", "inventory"]
+        .into_iter()
+        .filter(|key| wanted[*key] != observed[*key])
+        .map(|key| {
+            format!(
+                "{key}: expected {}, observed {}",
+                wanted[key], observed[key]
+            )
+        })
+        .collect();
+    if observed["inventory"]["returned"] == true && actual["inventory_unaffected"] != true {
+        failures.push("inventory: returned, but not the image's own".to_string());
+    }
+    failures
+}
+
 fn run(id: &str) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/rem-parity-terminal-index-draft/tape-images/cases")
@@ -598,8 +820,39 @@ fn run(id: &str) {
             .unwrap()
             .join("MANIFEST.tsv"),
     );
-    let actual = execute(&vector, &faults);
     let pinned = case["pinned"].as_bool().unwrap();
+    if let Some(observations) = faults.get("observations") {
+        // Each observation is a separate reader run with its own supplied values
+        // and its own expectation; a pending or unknown expectation fails.
+        check_observations(observations);
+        let observations = observations.as_array().unwrap();
+        check_observation_names(id, &case["expected"], observations);
+        let mut failures = Vec::new();
+        for observation in observations {
+            let name = observation["id"].as_str().unwrap();
+            let wanted = expected_observation(id, name, &case["expected"][name]);
+            let actual = execute(&vector, &faults, &observation["hints"]);
+            let observed = observed_outcome(&actual);
+            let disagreements = compare_observation(&wanted, &observed, &actual);
+            println!(
+                "CASE {id} {} observation={name:?} sections={} expected={wanted} observed={observed} outcome={actual}",
+                if !pinned {
+                    "INFORMATIVE"
+                } else if disagreements.is_empty() {
+                    "PASS"
+                } else {
+                    "DISAGREEMENT"
+                },
+                case["expected"][name]["sections"]
+            );
+            if pinned {
+                failures.extend(disagreements.into_iter().map(|d| format!("[{name}] {d}")));
+            }
+        }
+        assert!(failures.is_empty(), "{id}: {}", failures.join("; "));
+        return;
+    }
+    let actual = execute(&vector, &faults, &faults["hints"]);
     let failures = if pinned {
         compare(&case["expected"], &actual)
     } else {
@@ -638,6 +891,190 @@ cases! {
     editions_survivor => "editions-survivor", separation => "separation", filemark_prefix => "filemark-prefix",
     filemark_after_b => "filemark-after-b", bootstrap_hinted => "bootstrap-hinted", bootstrap_unhinted => "bootstrap-unhinted",
     bootstrap_wrong_scheme => "bootstrap-wrong-scheme",
+    e1_01 => "e1-01", e1_02 => "e1-02", e1_03 => "e1-03", e1_04 => "e1-04", e1_05 => "e1-05",
+    e1_06 => "e1-06", e1_07 => "e1-07", e1_08 => "e1-08", e1_09 => "e1-09", e1_10 => "e1-10",
+    e1_11 => "e1-11", e1_12 => "e1-12", e1_13 => "e1-13", e1_14 => "e1-14", e1_15 => "e1-15",
+}
+
+/// A pending or unknown expectation fails, and every compared difference is a
+/// disagreement, including an inventory that is not the image's own.
+#[test]
+fn e1_expectations_fail_closed() {
+    let wanted = json!({"discovery": "refused", "error": "BootstrapParse", "field": "tape UUID",
+        "inventory": {"returned": false, "degraded": "not applicable"}, "sections": ["8.4"], "quotes": []});
+    let projected = expected_observation("case", "observation", &wanted);
+    let refused = json!({"discovery": "refused", "error": "BootstrapParse", "field": "tape UUID"});
+    assert!(compare_observation(&projected, &observed_outcome(&refused), &refused).is_empty());
+    for actual in [
+        json!({"discovery": "refused", "error": "BootstrapParse", "field": "block size"}),
+        json!({"discovery": "refused", "error": "DriveCompressionEnabled"}),
+        json!({"discovery": "continues on the supplied values", "inventory": true,
+            "inventory_unaffected": true, "degraded": false}),
+    ] {
+        assert!(!compare_observation(&projected, &observed_outcome(&actual), &actual).is_empty());
+    }
+    let inventory = expected_observation(
+        "case",
+        "observation",
+        &json!({"discovery": "continues on the supplied values", "error": "none", "field": null,
+            "inventory": {"returned": true, "degraded": false}}),
+    );
+    let foreign = json!({"discovery": "continues on the supplied values", "inventory": true,
+        "inventory_unaffected": false, "degraded": false});
+    assert_eq!(
+        compare_observation(&inventory, &observed_outcome(&foreign), &foreign).len(),
+        1
+    );
+    let mut unknown_key = wanted.clone();
+    unknown_key["reasoning"] = json!("not a compared key");
+    let mut unknown_field = wanted.clone();
+    unknown_field["field"] = json!("UUID");
+    let mut unknown_discovery = wanted.clone();
+    unknown_discovery["discovery"] = json!("refused, probably");
+    let mut unfit_degraded = wanted.clone();
+    unfit_degraded["inventory"]["degraded"] = json!(false);
+    for bad in [
+        json!("pending (E1)"),
+        Value::Null,
+        unknown_key,
+        unknown_field,
+        unknown_discovery,
+        unfit_degraded,
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| expected_observation("case", "observation", &bad)).is_err(),
+            "accepted {bad}"
+        );
+    }
+}
+
+/// Observation names must match the fault map's exactly.
+#[test]
+fn e1_observation_names_must_match_the_fault_map() {
+    let observations = [json!({"id": "supplied values", "hints": null})];
+    let outcome = json!({"discovery": "refused"});
+    check_observation_names("case", &json!({"supplied values": outcome}), &observations);
+    for expected in [
+        json!({"supplied value": outcome}),
+        json!({"supplied values": outcome, "no supplied values": outcome}),
+        json!({}),
+        json!("pending (E1)"),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| check_observation_names("case", &expected, &observations))
+                .is_err(),
+            "accepted {expected}"
+        );
+    }
+}
+
+/// Every key of the record-fault and observation vocabulary is recognised or
+/// fails, including a replacement payload's scheme sub-keys.
+#[test]
+fn e1_fault_vocabulary_refuses_unknown_keys() {
+    let vector = generate("a4-minimal").unwrap();
+    let hints = json!({"tape_uuid": "the image's", "block_size": 262144,
+        "scheme": {"k": 2, "m": 2, "S": 2}});
+    let case = |record_fault: Value, observations: Value| {
+        json!({"id": "vocabulary", "image": "a4-minimal",
+            "fault": {"record_faults": [record_fault]},
+            "observations": observations, "expected": {}, "pinned": false})
+    };
+    let payload = |scheme: Value| {
+        json!({"tape_file": 0, "record_index": 0, "payload": {"scheme": scheme},
+            "header_crc": "recomputed if the length changes", "payload_crc": "recomputed"})
+    };
+    let supplied = json!([{"id": "supplied values", "hints": hints}]);
+    let map = fault_map_of(&case(payload(json!({"k": 3})), supplied.clone()), &vector);
+    assert_eq!(map["record_edits"][0]["edits"].as_array().unwrap().len(), 2);
+    let mut foreign = hints.clone();
+    foreign["tape_uuid"] = json!("12345678-1234-4234-8234-123456789abc");
+    let mut extra_hint = hints.clone();
+    extra_hint["candidates"] = json!([524288]);
+    let mut hint_scheme = hints.clone();
+    hint_scheme["scheme"]["s"] = json!(2);
+    for bad in [
+        case(payload(json!({"K": 3})), supplied.clone()),
+        case(payload(json!({"k": 3, "extra": 1})), supplied.clone()),
+        case(payload(json!({"k": "3"})), supplied.clone()),
+        case(payload(json!({})), supplied.clone()),
+        case(
+            json!({"tape_file": 0, "record_index": 0,
+                "byte_edits": [{"offset": "0x00", "field": "magic byte 0", "xor": "01", "form": "52"}]}),
+            supplied.clone(),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "lenght": 1000}),
+            supplied.clone(),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "length": "1000"}),
+            supplied.clone(),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "header_crc": true}),
+            supplied.clone(),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "length": 1000}),
+            json!([{"id": "supplied values", "hints": hints, "note": "extra"}]),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "length": 1000}),
+            json!([{"id": "supplied values", "hints": foreign}]),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "length": 1000}),
+            json!([{"id": "supplied values", "hints": extra_hint}]),
+        ),
+        case(
+            json!({"tape_file": 0, "record_index": 0, "length": 1000}),
+            json!([{"id": "supplied values", "hints": hint_scheme}]),
+        ),
+        json!({"id": "vocabulary", "image": "a4-minimal",
+            "fault": {"record_fault": [{"tape_file": 0, "record_index": 0, "length": 1000}]},
+            "expected": {}, "pinned": false}),
+        json!({"id": "vocabulary", "image": "a4-minimal",
+            "fault": {"record_faults": [{"tape_file": 0, "record_index": 0, "length": 1000}]},
+            "observation": supplied, "expected": {}, "pinned": false}),
+    ] {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fault_map_of(&bad, &vector)))
+                .is_err(),
+            "accepted {bad}"
+        );
+    }
+}
+
+fn fault_map_of(case: &Value, vector: &VectorImage) -> Value {
+    crate::tape_image_vectors::fault_map(case, &vector.image)
+}
+
+/// Every E1 expectation quotes the specification text verbatim.
+#[test]
+fn e1_expectation_quotes_occur_in_the_specification() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let mut quotes = 0;
+    for case in frozen["cases"].as_array().unwrap() {
+        let Some(expected) = case["expected"]
+            .as_object()
+            .filter(|_| case["observations"].is_array())
+        else {
+            continue;
+        };
+        for (name, outcome) in expected {
+            for quote in outcome["quotes"].as_array().unwrap() {
+                let quote = quote.as_str().unwrap();
+                assert!(
+                    crate::tape_image_vectors::specification_quote_holds(quote),
+                    "{} [{name}]: quote not in the specification: {quote}",
+                    case["id"]
+                );
+                quotes += 1;
+            }
+        }
+    }
+    assert!(quotes > 0, "no E1 quotes checked");
 }
 
 /// Every frozen case must have a separately named test, so no new row can be

@@ -1,0 +1,45 @@
+{
+  "failed_data_addresses": [],
+  "image": "a4-minimal",
+  "observations": [
+    {
+      "hints": {
+        "block_size": 262144,
+        "scheme": {
+          "S": 2,
+          "k": 2,
+          "m": 2
+        },
+        "tape_uuid": "the image's"
+      },
+      "id": "supplied values"
+    }
+  ],
+  "record_edits": [
+    {
+      "construction": "the original record's length",
+      "edits": [
+        {
+          "new_bytes": "a502a50158204844cab0503375f6ec546eb944144f641975cf4a2840de39e8cce23653fab6cf02010300040005f401a4017272732d6361756368792d67663235362d763102030302040203782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310474323032362d30382d30395430303a30303a30305a05f4",
+          "offset": 56,
+          "old_bytes": "a501a4017272732d6361756368792d67663235362d763102020302040202a50158204844cab0503375f6ec546eb944144f641975cf4a2840de39e8cce23653fab6cf02010300040005f403782572656d616e656e63652d7465726d696e616c2d766563746f722d67656e657261746f722f310474323032362d30382d30395430303a30303a30305a05f4",
+          "reason": "replacement payload (key_order, scheme)"
+        },
+        {
+          "new_bytes": "3c1023e910f7da8a",
+          "offset": 194,
+          "old_bytes": "c7fd539ae984d935",
+          "reason": "payload CRC recomputed"
+        }
+      ],
+      "lba": 0,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 0,
+      "sha256": "8745ae4169a1dcaa0f97555de26bc53e77b86ecb232fa702db459bc002d9acb3",
+      "tape_file": 0
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": []
+}

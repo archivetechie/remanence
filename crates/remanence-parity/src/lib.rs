@@ -84,7 +84,7 @@ pub use capacity::{
     TerminalTripleCloseReport, TerminalTripleObjectReservation,
 };
 pub use diagnostic_text::escape_member_name;
-pub use error::ParityError;
+pub use error::{BootstrapRefusedField, ParityError};
 pub use filemark_map::{
     sole_bot_filemark_map_digest, FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, MapScope,
     ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,

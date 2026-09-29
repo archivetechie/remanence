@@ -10,7 +10,7 @@
 //! framing remains typed control evidence so it cannot consume Object ordinals.
 
 use crate::bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload};
-use crate::error::ParityError;
+use crate::error::{BootstrapRefusedField, ParityError};
 use crate::filemark_map::{
     FilemarkMap, FilemarkMapBuilder, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry,
     TapeFilePosition,
@@ -37,7 +37,6 @@ use crate::tape_index_replica::{
     derive_tape_index_replica_footer_magic, derive_tape_index_replica_header_magic,
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
 };
-#[cfg(test)]
 use remanence_library::TapeIoError;
 use std::time::{Duration, Instant};
 
@@ -109,9 +108,69 @@ pub enum RecoveryBootstrap {
 }
 
 impl ScanRecoveryHints {
+    /// Refuse a first record whose measured length differs from the supplied
+    /// block size (REM-PARITY 8.4). Every hinted path compares the length here.
+    fn refuse_record_length(
+        &self,
+        measured: usize,
+        detail: impl FnOnce() -> String,
+    ) -> Result<(), ParityError> {
+        if usize::try_from(self.block_size).ok() == Some(measured) {
+            Ok(())
+        } else {
+            Err(bootstrap_refused(
+                BootstrapRefusedField::BlockSize,
+                detail(),
+            ))
+        }
+    }
+
+    /// Judge the measured length of a first-record read that did not fill its
+    /// read size exactly: a short read's `bytes`, or the `actual` of
+    /// [`TapeIoError::ReadBufferTooSmall`]. The comparison is always with the
+    /// supplied block size (REM-PARITY 8.4), so at a candidate read size other
+    /// than the supplied one, a record of the supplied length passes and only
+    /// that candidate is ruled out by the caller. A read that fills its read
+    /// size is judged by [`Self::classify_bootstrap`], which checks the length
+    /// first. Every other outcome is left to the caller.
+    pub fn check_bootstrap_read_length(
+        &self,
+        read: &Result<RawReadOutcome, ParityError>,
+        read_size: usize,
+    ) -> Result<(), ParityError> {
+        match read {
+            Ok(RawReadOutcome::Block { bytes, .. }) if *bytes != read_size => self
+                .refuse_record_length(*bytes, || {
+                    format!(
+                        "short fixed-block bootstrap read: got {bytes} bytes, expected {}",
+                        self.block_size
+                    )
+                }),
+            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { actual, .. })) => {
+                let measured = usize::try_from(*actual).unwrap_or(usize::MAX);
+                self.refuse_record_length(measured, || {
+                    format!(
+                        "bootstrap block larger than supplied block size: got {actual} bytes, expected {}",
+                        self.block_size
+                    )
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Classify a recovery BOT block, refusing validated disagreements before
-    /// parsing its payload. Physical read failures are handled by the caller.
+    /// parsing its payload (REM-PARITY 8.4). The record's length is judged
+    /// first; the physical read outcome is handled by the caller through
+    /// [`Self::check_bootstrap_read_length`].
     pub fn classify_bootstrap(&self, block: &[u8]) -> Result<RecoveryBootstrap, ParityError> {
+        self.refuse_record_length(block.len(), || {
+            format!(
+                "readable bootstrap block size differs from supplied hints: got {} bytes, expected {}",
+                block.len(),
+                self.block_size
+            )
+        })?;
         let header_error = if block.len() < crate::bootstrap::BOOTSTRAP_HEADER_LEN {
             Some("bootstrap header buffer too short")
         } else if block[..8] != crate::bootstrap::BOOTSTRAP_MAGIC {
@@ -128,44 +187,44 @@ impl ScanRecoveryHints {
         }
         let major = u16::from_be_bytes(block[8..10].try_into().expect("header schema bytes"));
         if major != crate::bootstrap::BOOTSTRAP_SCHEMA_MAJOR {
-            return Err(filemark_scan_error(format!(
-                "unsupported bootstrap schema major version: got {major}, accept {}",
-                crate::bootstrap::BOOTSTRAP_SCHEMA_MAJOR
-            )));
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::FormatMajor,
+                format!(
+                    "unsupported bootstrap schema major version: got {major}, accept {}",
+                    crate::bootstrap::BOOTSTRAP_SCHEMA_MAJOR
+                ),
+            ));
         }
         if block[16..32] != self.tape_uuid {
-            return Err(ParityError::TapeIdentityMismatch(
-                "tape identity mismatch: readable bootstrap header differs from supplied hints"
-                    .into(),
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::TapeUuid,
+                "tape identity mismatch: readable bootstrap header differs from supplied hints",
             ));
         }
         if u32::from_be_bytes(block[32..36].try_into().expect("header block size bytes"))
             != self.block_size
         {
-            return Err(filemark_scan_error(
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::BlockSize,
                 "readable bootstrap block size differs from supplied hints",
             ));
         }
         let sequence = u64::from_be_bytes(block[36..44].try_into().expect("header sequence bytes"));
         if sequence != 0 {
-            return Err(filemark_scan_error(format!(
-                "schema-major 2 permits only the sequence-0 BOT Bootstrap: got sequence {sequence}"
-            )));
-        }
-        let flags = u32::from_be_bytes(block[12..16].try_into().expect("header flags bytes"));
-        if (flags & crate::bootstrap::FLAG_NO_PARITY != 0)
-            != matches!(self.scheme, crate::ParityConfig::None)
-        {
-            return Err(filemark_scan_error(
-                "readable bootstrap parity scheme differs from supplied hints: no-parity flag contradicts scheme",
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::Sequence,
+                format!(
+                    "schema-major 2 permits only the sequence-0 BOT Bootstrap: got sequence {sequence}"
+                ),
             ));
         }
-        if block.len() != self.block_size as usize {
-            return Err(filemark_scan_error(format!(
-                "readable bootstrap block size differs from supplied hints: got {} bytes, expected {}",
-                block.len(),
-                self.block_size
-            )));
+        let flags = u32::from_be_bytes(block[12..16].try_into().expect("header flags bytes"));
+        let no_parity = flags & crate::bootstrap::FLAG_NO_PARITY != 0;
+        if no_parity != matches!(self.scheme, crate::ParityConfig::None) {
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::NoParityFlag,
+                "readable bootstrap parity scheme differs from supplied hints: no-parity flag contradicts scheme",
+            ));
         }
         match parse_bootstrap_block(block) {
             Ok(payload) => {
@@ -197,11 +256,17 @@ impl ScanRecoveryHints {
                 // these rules must not hide independently readable conflicts.
                 use ciborium::value::Value;
                 if let Ok(Value::Map(entries)) = ciborium::from_reader::<Value, _>(bytes) {
-                    for (key, value) in entries {
-                        if key == Value::Integer(5.into()) && value == Value::Bool(true) {
-                            return Err(ParityError::DriveCompressionEnabled);
-                        }
-                        if key != Value::Integer(1.into()) {
+                    // Recorded compression is judged before the scheme, as the
+                    // parser does, and only on a parity tape (REM-PARITY 16.3).
+                    if !no_parity
+                        && entries.iter().any(|(key, value)| {
+                            *key == Value::Integer(5.into()) && *value == Value::Bool(true)
+                        })
+                    {
+                        return Err(ParityError::DriveCompressionEnabled);
+                    }
+                    for (key, value) in &entries {
+                        if *key != Value::Integer(1.into()) {
                             continue;
                         }
                         let Value::Map(fields) = value else { continue };
@@ -229,7 +294,8 @@ impl ScanRecoveryHints {
                                 }
                             };
                             if !agrees {
-                                return Err(filemark_scan_error(
+                                return Err(bootstrap_refused(
+                                    BootstrapRefusedField::Scheme,
                                     "readable bootstrap parity scheme differs from supplied hints",
                                 ));
                             }
@@ -247,12 +313,14 @@ impl ScanRecoveryHints {
     /// Refuse any disagreement with a readable, valid bootstrap.
     fn validate_bootstrap(&self, bootstrap: &BootstrapPayload) -> Result<(), ParityError> {
         if self.tape_uuid != bootstrap.tape_uuid {
-            return Err(ParityError::TapeIdentityMismatch(
-                "tape identity mismatch: readable bootstrap differs from supplied hints".into(),
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::TapeUuid,
+                "tape identity mismatch: readable bootstrap differs from supplied hints",
             ));
         }
         if self.block_size != bootstrap.block_size_bytes {
-            return Err(filemark_scan_error(
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::BlockSize,
                 "readable bootstrap block size differs from supplied hints",
             ));
         }
@@ -268,7 +336,8 @@ impl ScanRecoveryHints {
             _ => false,
         };
         if !matches {
-            return Err(filemark_scan_error(
+            return Err(bootstrap_refused(
+                BootstrapRefusedField::Scheme,
                 "readable bootstrap parity scheme differs from supplied hints",
             ));
         }
@@ -837,7 +906,21 @@ where
 
     loop {
         let file_start = source.position()?;
-        match source.read_record(&mut buf) {
+        let at_bot = builder.next_tape_file_number()? == 0 && file_start.lba == 0;
+        // Supplied values judge only tape file 0's record at LBA 0 (REM-PARITY 8.4).
+        let bot_hints = match mode {
+            ScanMode::Recovery(hints) if at_bot => Some(hints),
+            _ => None,
+        };
+        let read = source.read_record(&mut buf);
+        if let Some(hints) = bot_hints {
+            // The measured length is judged before anything else.
+            hints.check_bootstrap_read_length(&read, block_size_usize)?;
+        }
+        match read {
+            // A filemark or EOD where the first record should be is an unreadable
+            // bootstrap, never a refusal (REM-PARITY 8.4): the walk continues on
+            // the supplied values, and ends here with no tape file 0 to map.
             Ok(RawReadOutcome::EndOfData { .. }) => break,
             Ok(RawReadOutcome::Filemark { .. }) => {
                 truncation = Some(ScanTailTruncation {
@@ -856,19 +939,17 @@ where
             Ok(RawReadOutcome::Block { .. }) => {
                 let first_block = buf.clone();
                 let mut invalid_bootstrap = false;
-                if builder.next_tape_file_number()? == 0 && file_start.lba == 0 {
-                    if let ScanMode::Recovery(hints) = mode {
-                        match hints.classify_bootstrap(&first_block)? {
-                            RecoveryBootstrap::Validated(_) => {}
-                            RecoveryBootstrap::Unreadable(_) => {
-                                invalid_bootstrap = true;
-                                bootstrap_recovery_hints = Some(hints.clone());
-                                damaged_regions.push(ScanDamagedRegion {
-                                    start: file_start,
-                                    block_count: 1,
-                                    kind: ScanDamageKind::UnreadableTapeFileHead,
-                                });
-                            }
+                if let Some(hints) = bot_hints {
+                    match hints.classify_bootstrap(&first_block)? {
+                        RecoveryBootstrap::Validated(_) => {}
+                        RecoveryBootstrap::Unreadable(_) => {
+                            invalid_bootstrap = true;
+                            bootstrap_recovery_hints = Some(hints.clone());
+                            damaged_regions.push(ScanDamagedRegion {
+                                start: file_start,
+                                block_count: 1,
+                                kind: ScanDamageKind::UnreadableTapeFileHead,
+                            });
                         }
                     }
                 }
@@ -879,7 +960,7 @@ where
                             &first_block,
                             tape_uuid,
                             block_size,
-                            builder.next_tape_file_number()? == 0 && file_start.lba == 0,
+                            at_bot,
                         ));
                         truncation = Some(ScanTailTruncation {
                             tape_file_number: builder.next_tape_file_number()?,
@@ -925,10 +1006,8 @@ where
                     block_count: 1,
                     kind: ScanDamageKind::UnreadableTapeFileHead,
                 });
-                if builder.next_tape_file_number()? == 0 && file_start.lba == 0 {
-                    if let ScanMode::Recovery(hints) = mode {
-                        bootstrap_recovery_hints = Some(hints.clone());
-                    }
+                if let Some(hints) = bot_hints {
+                    bootstrap_recovery_hints = Some(hints.clone());
                 }
                 source.locate_physical(file_start)?;
                 let measured = match measure_current_file(source, file_start)? {
@@ -1500,6 +1579,13 @@ fn validate_catalog_scope(
 
 fn filemark_scan_error(message: impl Into<String>) -> ParityError {
     ParityError::FilemarkMapReconstruct(message.into())
+}
+
+fn bootstrap_refused(field: BootstrapRefusedField, detail: impl Into<String>) -> ParityError {
+    ParityError::BootstrapRefused {
+        field,
+        detail: detail.into(),
+    }
 }
 
 #[cfg(test)]
@@ -3319,5 +3405,358 @@ mod tests {
         )
         .expect_err("recovery still requires a complete structural BOT file");
         assert!(error.to_string().contains("sole tape-file-0 BOT Bootstrap"));
+    }
+
+    /// Supplied values that agree with the parity bootstrap of these tests.
+    fn matching_hints(payload: &BootstrapPayload) -> ScanRecoveryHints {
+        let record = payload.scheme.as_ref().expect("parity bootstrap");
+        ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::Scheme(ParityScheme {
+                id: SchemeId::new_owned(record.id.clone()),
+                data_blocks_per_stripe: record.data_blocks_per_stripe,
+                parity_blocks_per_stripe: record.parity_blocks_per_stripe,
+                stripes_per_neighborhood: record.stripes_per_neighborhood,
+            }),
+        }
+    }
+
+    fn refused_field<T: std::fmt::Debug>(result: Result<T, ParityError>) -> BootstrapRefusedField {
+        match result {
+            Err(ParityError::BootstrapRefused { field, .. }) => field,
+            other => panic!("expected a typed bootstrap refusal, got {other:?}"),
+        }
+    }
+
+    fn with_header_crc(mut block: Vec<u8>) -> Vec<u8> {
+        let crc = crate::crc64_xz(&block[..48]);
+        block[48..56].copy_from_slice(&crc.to_le_bytes());
+        block
+    }
+
+    /// The measured length is compared with the supplied size, never with the read size.
+    #[test]
+    fn check_bootstrap_read_length_compares_with_the_supplied_size() {
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::None,
+        };
+        let size = BLOCK_SIZE as usize;
+        let read = |bytes| {
+            Ok(RawReadOutcome::Block {
+                bytes,
+                position_after: PhysicalPositionHint::new(1),
+            })
+        };
+        let longer = |actual: usize, provided: usize| {
+            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
+                actual: actual as u32,
+                provided: provided as u32,
+            }))
+        };
+        // At the supplied size, any other measured length is refused.
+        hints
+            .check_bootstrap_read_length(&read(size), size)
+            .expect("a full record");
+        for (outcome, read_size) in [
+            (read(size - 1), size),
+            (read(40), size),
+            (longer(2 * size, size), size),
+        ] {
+            assert_eq!(
+                refused_field(hints.check_bootstrap_read_length(&outcome, read_size)),
+                BootstrapRefusedField::BlockSize
+            );
+        }
+        // At another candidate size, a record of the supplied length only rules
+        // that candidate out; one of any other length is still refused.
+        hints
+            .check_bootstrap_read_length(&read(size), 2 * size)
+            .expect("a short read of the supplied length");
+        hints
+            .check_bootstrap_read_length(&longer(size, size / 2), size / 2)
+            .expect("an over-length read of the supplied length");
+        for (outcome, read_size) in [(read(40), 2 * size), (longer(2 * size, size / 2), size / 2)] {
+            assert_eq!(
+                refused_field(hints.check_bootstrap_read_length(&outcome, read_size)),
+                BootstrapRefusedField::BlockSize
+            );
+        }
+        // Every other outcome is left to the caller.
+        for outcome in [
+            Ok(RawReadOutcome::Filemark {
+                position_after: PhysicalPositionHint::new(1),
+            }),
+            Ok(RawReadOutcome::EndOfData {
+                position_after: PhysicalPositionHint::new(0),
+            }),
+            Err(TestReadFault::Medium.error()),
+            Err(TestReadFault::Transport.error()),
+        ] {
+            hints
+                .check_bootstrap_read_length(&outcome, size)
+                .expect("not a length judgement");
+        }
+    }
+
+    /// The walk's BOT read judges the record's length before its content.
+    #[test]
+    fn scanner_recovery_refuses_first_record_length_before_content() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let hints = matching_hints(&payload);
+        let valid = bootstrap_block_for_payload(&payload);
+        let mut no_magic = valid[..40].to_vec();
+        no_magic[0] ^= 1;
+        let mut longer = valid.clone();
+        longer.resize(2 * BLOCK_SIZE as usize, 0);
+        for first in [valid[..valid.len() - 1].to_vec(), no_magic, longer] {
+            let records = vec![
+                Record::Block(first),
+                Record::Filemark,
+                Record::Block(block(0x33)),
+                Record::Filemark,
+            ];
+            let mut source = RecordingRawSource::new(records.clone());
+            let result = scan_reconstruct_filemark_map_with_report_mode(
+                &mut source,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                ScanMode::Recovery(&hints),
+            );
+            assert_eq!(refused_field(result), BootstrapRefusedField::BlockSize);
+            assert_eq!(
+                source
+                    .calls
+                    .iter()
+                    .filter(|call| matches!(call, ScanCall::ReadRecord(_)))
+                    .count(),
+                1,
+                "the refusal stops the walk at the first record"
+            );
+            // Without supplied values the length is the walk's own concern.
+            let error = scan_reconstruct_filemark_map_with_report(
+                &mut RecordingRawSource::new(records),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect_err("a first record of the wrong length");
+            assert!(
+                !matches!(error, ParityError::BootstrapRefused { .. }),
+                "{error}"
+            );
+        }
+    }
+
+    /// A filemark or EOD where the first record should be is unreadable, not
+    /// refused: the walk continues and fails only for want of tape file 0.
+    #[test]
+    fn scanner_recovery_treats_a_missing_first_record_as_unreadable() {
+        let hints = ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::None,
+        };
+        for records in [
+            vec![
+                Record::Filemark,
+                Record::Block(block(0x33)),
+                Record::Filemark,
+            ],
+            Vec::new(),
+        ] {
+            let recovery = scan_reconstruct_filemark_map_with_report_mode(
+                &mut RecordingRawSource::new(records.clone()),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                ScanMode::Recovery(&hints),
+            )
+            .expect_err("no tape file 0 to map");
+            let standard = scan_reconstruct_filemark_map_with_report(
+                &mut RecordingRawSource::new(records),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect_err("no tape file 0 to map");
+            assert!(
+                matches!(&recovery, ParityError::FilemarkMapReconstruct(_)),
+                "{recovery}"
+            );
+            assert_eq!(recovery.to_string(), standard.to_string());
+        }
+    }
+
+    /// Each refusal names the field Section 8.4 names, first in its order, and
+    /// survives a damaged payload.
+    #[test]
+    fn classify_bootstrap_names_the_first_refused_field() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let hints = matching_hints(&payload);
+        let valid = bootstrap_block_for_payload(&payload);
+        let edit = |edits: &[(usize, Vec<u8>)], damaged_payload: bool| {
+            let mut block = valid.clone();
+            for (offset, bytes) in edits {
+                block[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+            }
+            if damaged_payload {
+                block[80] ^= 1;
+            }
+            with_header_crc(block)
+        };
+        let major = (8, 3u16.to_be_bytes().to_vec());
+        let uuid = (16, vec![0x99; 16]);
+        let size = (32, (2 * BLOCK_SIZE).to_be_bytes().to_vec());
+        let sequence = (36, 1u64.to_be_bytes().to_vec());
+        let flag = (12, crate::bootstrap::FLAG_NO_PARITY.to_be_bytes().to_vec());
+        for (edits, field) in [
+            (vec![major.clone()], BootstrapRefusedField::FormatMajor),
+            (vec![uuid.clone()], BootstrapRefusedField::TapeUuid),
+            (vec![size.clone()], BootstrapRefusedField::BlockSize),
+            (vec![sequence.clone()], BootstrapRefusedField::Sequence),
+            (vec![flag.clone()], BootstrapRefusedField::NoParityFlag),
+            (
+                vec![flag, sequence, size.clone(), uuid.clone(), major],
+                BootstrapRefusedField::FormatMajor,
+            ),
+            (vec![size, uuid], BootstrapRefusedField::TapeUuid),
+        ] {
+            for damaged_payload in [false, true] {
+                assert_eq!(
+                    refused_field(hints.classify_bootstrap(&edit(&edits, damaged_payload))),
+                    field
+                );
+            }
+        }
+        let mut other_scheme = hints.clone();
+        let crate::ParityConfig::Scheme(scheme) = &mut other_scheme.scheme else {
+            panic!("parity hints")
+        };
+        scheme.parity_blocks_per_stripe += 1;
+        assert_eq!(
+            refused_field(other_scheme.classify_bootstrap(&valid)),
+            BootstrapRefusedField::Scheme
+        );
+        assert!(matches!(
+            hints.classify_bootstrap(&valid),
+            Ok(RecoveryBootstrap::Validated(_))
+        ));
+    }
+
+    /// The salvage path judges recorded compression before the scheme, and only
+    /// on a parity tape, as the parser does.
+    #[test]
+    fn recovery_salvage_judges_compression_first_and_only_on_a_parity_tape() {
+        use ciborium::value::Value;
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let hints = matching_hints(&payload);
+        // A noncanonical payload (keys out of order) with key 5 true, as a
+        // parity or a no-parity bootstrap, with or without the scheme.
+        let build = |no_parity: bool, keep_scheme: bool| {
+            let mut block = bootstrap_block_for_payload(&payload);
+            let len = u32::from_le_bytes(block[44..48].try_into().unwrap()) as usize;
+            let Value::Map(mut entries) =
+                ciborium::from_reader::<Value, _>(&block[56..56 + len]).expect("payload")
+            else {
+                panic!("map")
+            };
+            entries
+                .iter_mut()
+                .find(|(key, _)| *key == Value::Integer(5.into()))
+                .expect("key 5")
+                .1 = Value::Bool(true);
+            if !keep_scheme {
+                entries.retain(|(key, _)| *key != Value::Integer(1.into()));
+            }
+            entries.swap(0, 1);
+            let mut bytes = Vec::new();
+            ciborium::into_writer(&Value::Map(entries), &mut bytes).expect("encode");
+            block[56..56 + len + 8].fill(0);
+            block[44..48].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            block[56..56 + bytes.len()].copy_from_slice(&bytes);
+            let end = 56 + bytes.len();
+            block[end..end + 8].copy_from_slice(&crate::crc64_xz(&bytes).to_le_bytes());
+            let flags = if no_parity {
+                crate::bootstrap::FLAG_NO_PARITY
+            } else {
+                0
+            };
+            block[12..16].copy_from_slice(&flags.to_be_bytes());
+            let block = with_header_crc(block);
+            assert!(matches!(
+                parse_bootstrap_block(&block),
+                Err(ParityError::BootstrapParse(_))
+            ));
+            block
+        };
+        // Parity tape: compression is refused even when the scheme also disagrees.
+        let mut other_scheme = hints.clone();
+        let crate::ParityConfig::Scheme(scheme) = &mut other_scheme.scheme else {
+            panic!("parity hints")
+        };
+        scheme.data_blocks_per_stripe += 1;
+        for supplied in [&hints, &other_scheme] {
+            assert!(matches!(
+                supplied.classify_bootstrap(&build(false, true)),
+                Err(ParityError::DriveCompressionEnabled)
+            ));
+        }
+        // No-parity tape: recorded compression is not a refusal.
+        let no_parity = ScanRecoveryHints {
+            scheme: crate::ParityConfig::None,
+            ..hints.clone()
+        };
+        assert!(matches!(
+            no_parity.classify_bootstrap(&build(true, false)),
+            Ok(RecoveryBootstrap::Unreadable(_))
+        ));
+        // A decodable scheme still disagrees with a supplied no-parity scheme.
+        assert_eq!(
+            refused_field(no_parity.classify_bootstrap(&build(true, true))),
+            BootstrapRefusedField::Scheme
+        );
+    }
+
+    /// BOT recovery reports only the UUID refusal as the operator's identity
+    /// mismatch; every other refusal stays a scan failure with its wording.
+    #[test]
+    fn bot_recovery_maps_only_the_uuid_refusal_to_identity_mismatch() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let hints = matching_hints(&payload);
+        let valid = bootstrap_block_for_payload(&payload);
+        let recover = |first: Vec<u8>| {
+            crate::bot_recovery::recover_terminal_inventory_from_bot_controlled_mode(
+                &mut RecordingRawSource::new(vec![Record::Block(first), Record::Filemark]),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                ScanMode::Recovery(&hints),
+                |_| ScanWalkControl::Continue,
+                |_| Ok(()),
+            )
+        };
+        let mut foreign = valid.clone();
+        foreign[16] ^= 1;
+        foreign[80] ^= 1;
+        assert!(matches!(
+            recover(with_header_crc(foreign)).expect_err("foreign BOT"),
+            crate::BotStructuralRecoveryError::TapeIdentityMismatch
+        ));
+        let mut sequence = valid.clone();
+        sequence[36..44].copy_from_slice(&1u64.to_be_bytes());
+        let short = valid[..valid.len() - 1].to_vec();
+        for (first, wording) in [
+            (with_header_crc(sequence), "got sequence 1"),
+            (short, "short fixed-block bootstrap read"),
+        ] {
+            let error = recover(first).expect_err("refused BOT");
+            assert!(
+                matches!(&error, crate::BotStructuralRecoveryError::Scan { message } if message.contains(wording)),
+                "{error}"
+            );
+        }
     }
 }

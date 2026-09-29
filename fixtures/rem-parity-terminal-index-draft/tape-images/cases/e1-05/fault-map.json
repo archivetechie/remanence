@@ -1,0 +1,45 @@
+{
+  "failed_data_addresses": [],
+  "image": "a4-minimal",
+  "observations": [
+    {
+      "hints": {
+        "block_size": 262144,
+        "scheme": {
+          "S": 2,
+          "k": 2,
+          "m": 2
+        },
+        "tape_uuid": "the image's"
+      },
+      "id": "supplied values"
+    }
+  ],
+  "record_edits": [
+    {
+      "construction": "the original record's length",
+      "edits": [
+        {
+          "new_bytes": "00000001",
+          "offset": 12,
+          "old_bytes": "00000000",
+          "reason": "flags (u32 BE) with bit 0 (no-parity) set: set"
+        },
+        {
+          "new_bytes": "a8428782f37dbbd7",
+          "offset": 48,
+          "old_bytes": "c0054196e69cbdc8",
+          "reason": "header CRC recomputed"
+        }
+      ],
+      "lba": 0,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 0,
+      "sha256": "fab08c176f601ecf4cac4568c8d982f3816aaaf1c1e91d1da6c7eea43e50e0b8",
+      "tape_file": 0
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": []
+}
