@@ -14,7 +14,7 @@
       {
         "component": "bootstrap",
         "finding": "unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       }
     ]
@@ -58,7 +58,7 @@
       {
         "component": "bootstrap",
         "finding": "unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -136,7 +136,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -220,7 +220,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -1165,6 +1165,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1179,6 +1180,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1193,6 +1195,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1207,6 +1210,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1221,6 +1225,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1235,6 +1240,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1249,6 +1255,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1263,6 +1270,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1277,6 +1285,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -1440,7 +1449,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -1504,7 +1513,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -1597,7 +1606,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -1690,7 +1699,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -1914,6 +1923,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1928,6 +1938,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1942,6 +1953,7 @@
         "failed_classification": "sidecar tail copy differs from its footer (Section 12.3 item 6)",
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1956,6 +1968,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1970,6 +1983,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1984,6 +1998,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -1998,6 +2013,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2012,6 +2028,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2026,6 +2043,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -2040,7 +2058,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -2072,6 +2090,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2086,6 +2105,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2100,6 +2120,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2114,6 +2135,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2128,6 +2150,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2135,13 +2158,14 @@
         "start": 23,
         "count": 4,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "damaged separation extent: measured 4 blocks, the planned component has 3",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2149,13 +2173,14 @@
         "start": 28,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2163,13 +2188,14 @@
         "start": 32,
         "count": 3,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "separation header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2177,13 +2203,14 @@
         "start": 36,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -2191,8 +2218,8 @@
     "walk_map": "walked map validated against the final ParityMap",
     "directory": "final ParityMap found by the walk",
     "separations": {
-      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
-      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+      "A-B": "walk: damaged separation extent: measured 4 blocks, the planned component has 3",
+      "B-C": "walk: separation header matches the plan"
     },
     "verifier_prefix_findings": []
   },
@@ -2219,6 +2246,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2233,6 +2261,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2247,6 +2276,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2261,6 +2291,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2275,6 +2306,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2289,6 +2321,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2303,6 +2336,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2317,6 +2351,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2331,6 +2366,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2338,13 +2374,14 @@
         "start": 39,
         "count": 2,
         "kind": 0,
-        "note": "Object by elimination; follows the exact terminal suffix, so not admitted as an Object (Section 12.6)",
+        "note": "incomplete Object candidate (torn: no trailing filemark before EOD); follows the exact terminal suffix: an artifact, in no inventory (Section 12.6)",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": true,
         "undecidable": false,
+        "torn": true,
         "parity_map": null
       }
     ],
@@ -2383,6 +2420,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2397,6 +2435,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2411,6 +2450,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2425,6 +2465,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2439,6 +2480,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2453,6 +2495,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2467,6 +2510,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2474,13 +2518,14 @@
         "start": 31,
         "count": 6,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "damaged separation extent: measured 6 blocks, the planned component has 3",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2495,6 +2540,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -2503,7 +2549,7 @@
     "directory": "final ParityMap found by the walk",
     "separations": {
       "A-B": "walk: separation header matches the plan",
-      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+      "B-C": "walk: damaged separation extent: measured 6 blocks, the planned component has 3"
     },
     "verifier_prefix_findings": []
   },
@@ -2531,6 +2577,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2545,6 +2592,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2559,6 +2607,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2573,6 +2622,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2587,6 +2637,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2594,13 +2645,14 @@
         "start": 23,
         "count": 6,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "damaged separation extent: measured 6 blocks, the planned component has 3",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2608,13 +2660,14 @@
         "start": 30,
         "count": 3,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "separation header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2622,13 +2675,14 @@
         "start": 34,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2643,6 +2697,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -2650,8 +2705,8 @@
     "walk_map": "walked map validated against the final ParityMap",
     "directory": "final ParityMap found by the walk",
     "separations": {
-      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
-      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+      "A-B": "walk: damaged separation extent: measured 6 blocks, the planned component has 3",
+      "B-C": "walk: separation header matches the plan"
     },
     "verifier_prefix_findings": []
   },
@@ -2679,6 +2734,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2693,6 +2749,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2707,6 +2764,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2721,6 +2779,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2735,6 +2794,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2742,13 +2802,14 @@
         "start": 23,
         "count": 6,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "damaged separation extent: measured 6 blocks, the planned component has 3",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2756,13 +2817,14 @@
         "start": 30,
         "count": 3,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "separation header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2770,27 +2832,29 @@
         "start": 34,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
         "tape_file_number": 8,
         "start": 38,
         "count": 2,
-        "kind": 0,
-        "note": "Object by elimination",
+        "kind": 4,
+        "note": "damaged terminal replica: type established by its footer, measured 2 blocks, the planned component has 3",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -2798,8 +2862,8 @@
     "walk_map": "walked map validated against the final ParityMap",
     "directory": "final ParityMap found by the walk",
     "separations": {
-      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
-      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+      "A-B": "walk: damaged separation extent: measured 6 blocks, the planned component has 3",
+      "B-C": "walk: separation header matches the plan"
     },
     "verifier_prefix_findings": []
   },
@@ -2826,6 +2890,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2840,6 +2905,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2854,6 +2920,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2868,6 +2935,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2882,6 +2950,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2896,6 +2965,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2910,6 +2980,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2924,6 +2995,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2938,6 +3010,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -2945,13 +3018,14 @@
         "start": 39,
         "count": 2,
         "kind": 0,
-        "note": "Object by elimination; follows the exact terminal suffix, so not admitted as an Object (Section 12.6)",
+        "note": "Object by elimination; follows the exact terminal suffix: an artifact, in no inventory (Section 12.6)",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": true,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -2993,6 +3067,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3007,6 +3082,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3021,6 +3097,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3035,6 +3112,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3049,6 +3127,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3063,6 +3142,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3077,6 +3157,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3091,6 +3172,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3098,13 +3180,14 @@
         "start": 35,
         "count": 6,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "damaged terminal replica: measured 6 blocks, the planned component has 3",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -3177,6 +3260,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3191,6 +3275,7 @@
         "failed_classification": "sidecar footer total 7 differs from the measured 11 blocks (Section 12.3 item 6)",
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3205,6 +3290,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3212,13 +3298,14 @@
         "start": 18,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3226,13 +3313,14 @@
         "start": 22,
         "count": 3,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "separation header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3240,13 +3328,14 @@
         "start": 26,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3254,13 +3343,14 @@
         "start": 30,
         "count": 3,
         "kind": 5,
-        "note": "damaged separation extent: header plan differs from the measured file",
+        "note": "separation header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3268,21 +3358,22 @@
         "start": 34,
         "count": 3,
         "kind": 4,
-        "note": "damaged terminal replica: header plan differs from the measured file",
+        "note": "terminal replica header matches the plan",
         "epoch_id": null,
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
     "walk_damage": [],
     "walk_map": "scope count is not the ParityMap's tape file number plus one; walked projection does not hash to canonical_map_digest; recomputed T or W differs from the scope fields",
     "separations": {
-      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
-      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
     }
   },
   "object-head": {
@@ -3445,13 +3536,13 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -3592,6 +3683,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3606,6 +3698,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3620,6 +3713,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3634,6 +3728,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3648,6 +3743,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3662,6 +3758,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3676,6 +3773,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3690,6 +3788,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -3704,6 +3803,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -3766,7 +3866,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -3884,7 +3984,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -4011,7 +4111,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -4093,7 +4193,7 @@
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -4175,13 +4275,13 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -4225,6 +4325,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4239,6 +4340,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4253,6 +4355,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4267,6 +4370,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4281,6 +4385,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4295,6 +4400,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4309,6 +4415,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4323,6 +4430,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4337,6 +4445,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -4373,13 +4482,13 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
@@ -4413,6 +4522,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4427,6 +4537,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4441,6 +4552,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4455,6 +4567,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4469,6 +4582,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4483,6 +4597,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4497,6 +4612,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4511,6 +4627,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4525,6 +4642,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       },
       {
@@ -4539,6 +4657,7 @@
         "failed_classification": null,
         "artifact": false,
         "undecidable": false,
+        "torn": false,
         "parity_map": null
       }
     ],
@@ -4589,19 +4708,19 @@
       {
         "component": "sidecar tape file 2",
         "finding": "footer unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
         "component": "sidecar tape file 2",
         "finding": "primary copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {
         "component": "sidecar tape file 2",
         "finding": "tail copy unreadable (medium error)",
-        "error": "TapeIo",
+        "error": null,
         "checks": "structure"
       },
       {

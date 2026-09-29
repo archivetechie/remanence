@@ -459,7 +459,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 3: its records and trailing filemark reach position 18446744073709551625, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 3: its records and trailing filemark reach position 18446744073709551625, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             },
             "B": {
               "valid": true,
@@ -5756,15 +5756,15 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             },
             "B": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             },
             "C": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: row 4: its records and trailing filemark reach position 18446744073709551630, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             }
           },
           "selection": "BotStructuralRecoveryRequired",
@@ -6115,7 +6115,7 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+              "reason": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 7, structural_row_count 6 and replica A's planned tape-file number 6 are not equal (the payload is not read)"
             },
             "B": {
               "valid": true,

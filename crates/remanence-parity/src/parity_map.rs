@@ -782,7 +782,7 @@ pub fn parse_parity_map_tape_file(
 
     let primary = parse_copy_at(blocks, &footer, ParityMapCopyKind::Primary);
     let tail = parse_copy_at(blocks, &footer, ParityMapCopyKind::Tail);
-    select_parity_map_copy(primary, tail)
+    select_parity_map_copy(primary, tail).map(|(decoded, _)| decoded)
 }
 
 /// Parse a replicated parity-map tape file whose individual blocks may be
@@ -796,6 +796,44 @@ pub fn parse_parity_map_tape_file_with_unreadable_blocks(
     blocks: &[Option<Vec<u8>>],
     expected_tape_uuid: &[u8; 16],
 ) -> Result<DecodedParityMapTapeFile, ParityError> {
+    parse_parity_map_reporting_unused_copy(blocks, expected_tape_uuid).map(|(decoded, _)| decoded)
+}
+
+/// What a Verifier reports of one ParityMap tape file (REM-PARITY 2.2): each
+/// copy that is unreadable or invalid, even when the other is used, and the
+/// file itself when no copy can be used, and an unreadable footer. Empty when both copies validate and
+/// agree. It reads through the same parser as every other path.
+pub(crate) fn parity_map_damage(
+    blocks: &[Option<Vec<u8>>],
+    expected_tape_uuid: &[u8; 16],
+) -> Vec<String> {
+    let mut damage = Vec::new();
+    // The footer is redundancy a Reader does without; a block of it that
+    // cannot be read is damage all the same (as a sidecar's footer is).
+    if matches!(blocks.last(), Some(None)) {
+        damage.push("the ParityMap footer is unreadable".to_string());
+    }
+    match parse_parity_map_reporting_unused_copy(blocks, expected_tape_uuid) {
+        Ok((_, unused)) => damage.extend(unused),
+        // The error a Reader reports for the file carries its Section 15 name.
+        Err(error) => {
+            let name = match &error {
+                ParityError::DirectoryInvalid(_) => "",
+                _ => "ParityMapParse: ",
+            };
+            damage.push(format!("no ParityMap copy can be used: {name}{error}"));
+        }
+    }
+    damage
+}
+
+/// The one parser of a ParityMap tape file whose blocks may be unreadable. The
+/// second value says why the copy that was not used could not be, when one
+/// was not.
+fn parse_parity_map_reporting_unused_copy(
+    blocks: &[Option<Vec<u8>>],
+    expected_tape_uuid: &[u8; 16],
+) -> Result<(DecodedParityMapTapeFile, Option<String>), ParityError> {
     let measured_total = u64::try_from(blocks.len())
         .map_err(|_| parity_map_parse("parity-map measured block count overflows u64"))?;
     if measured_total < 3 || measured_total.is_multiple_of(2) {
@@ -852,6 +890,36 @@ pub(crate) fn read_final_sidecar_directory(
         .map(|decoded| decoded.payload.directory))
 }
 
+/// Read every block of one ParityMap tape file. A record of the wrong length
+/// (REM-PARITY 3.5), like a boundary or a medium error, is an absent block of
+/// this control file's copies. The one reader of a ParityMap's blocks.
+pub(crate) fn read_parity_map_blocks(
+    source: &mut dyn crate::raw::RawTapeSource,
+    map: &crate::filemark_map::FilemarkMap,
+    entry: &crate::filemark_map::TapeFileMapEntry,
+    block_size: u32,
+) -> Result<Vec<Option<Vec<u8>>>, ParityError> {
+    use crate::filemark_map::TapeFilePosition;
+    use crate::raw::{read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead};
+
+    let mut blocks = Vec::new();
+    for block_within_file in 0..entry.block_count {
+        source.locate_physical(map.physical_position(TapeFilePosition {
+            tape_file_number: entry.tape_file_number,
+            block_within_file,
+        })?)?;
+        let mut block = vec![0; block_size as usize];
+        let block = match read_fixed_record(source, &mut block) {
+            Ok(FixedRecordRead::Block { .. }) => Some(block),
+            Ok(_) => None,
+            Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => None,
+            Err(error) => return Err(error),
+        };
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
 /// Load validated final ParityMap metadata, retaining its canonical map digest
 /// so a reconciled BOT walk can establish a bounded recovery scope.
 pub(crate) fn read_final_parity_map(
@@ -860,8 +928,7 @@ pub(crate) fn read_final_parity_map(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<Option<DecodedParityMapTapeFile>, ParityError> {
-    use crate::filemark_map::{TapeFileKind, TapeFilePosition};
-    use crate::raw::{read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead};
+    use crate::filemark_map::TapeFileKind;
 
     let Some(entry) = map
         .entries()
@@ -871,23 +938,7 @@ pub(crate) fn read_final_parity_map(
     else {
         return Ok(None);
     };
-    let mut blocks = Vec::new();
-    for block_within_file in 0..entry.block_count {
-        source.locate_physical(map.physical_position(TapeFilePosition {
-            tape_file_number: entry.tape_file_number,
-            block_within_file,
-        })?)?;
-        let mut block = vec![0; block_size as usize];
-        // A record of the wrong length (REM-PARITY 3.5), like a boundary or a
-        // medium error, is an absent block of this control file's copies.
-        let block = match read_fixed_record(source, &mut block) {
-            Ok(FixedRecordRead::Block { .. }) => Some(block),
-            Ok(_) => None,
-            Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => None,
-            Err(error) => return Err(error),
-        };
-        blocks.push(block);
-    }
+    let blocks = read_parity_map_blocks(source, map, entry, block_size)?;
     let Ok(decoded) = parse_parity_map_tape_file_with_unreadable_blocks(&blocks, tape_uuid) else {
         return Ok(None);
     };
@@ -907,7 +958,7 @@ pub(crate) fn read_final_parity_map(
 fn select_parity_map_copy(
     primary: Result<DecodedParityMapTapeFile, ParityError>,
     tail: Result<DecodedParityMapTapeFile, ParityError>,
-) -> Result<DecodedParityMapTapeFile, ParityError> {
+) -> Result<(DecodedParityMapTapeFile, Option<String>), ParityError> {
     match (primary, tail) {
         (Ok(primary), Ok(tail)) => {
             if !parity_map_copies_agree(&primary, &tail) {
@@ -915,10 +966,16 @@ fn select_parity_map_copy(
                     "parity-map primary and tail copies disagree",
                 ));
             }
-            Ok(primary)
+            Ok((primary, None))
         }
-        (Ok(primary), Err(_)) => Ok(primary),
-        (Err(_), Ok(tail)) => Ok(tail),
+        (Ok(primary), Err(error)) => Ok((
+            primary,
+            Some(format!("the tail ParityMap copy is not usable: {error}")),
+        )),
+        (Err(error), Ok(tail)) => Ok((
+            tail,
+            Some(format!("the primary ParityMap copy is not usable: {error}")),
+        )),
         (Err(primary_err), Err(tail_err)) => Err(parity_map_parse(format!(
             "both parity-map metadata copies failed: primary={primary_err}; tail={tail_err}"
         ))),
@@ -2149,6 +2206,70 @@ mod tests {
             assert_eq!(decoded.header.sequence, value);
             assert_eq!(decoded.header.directory_scope_tape_file_count, value);
         }
+    }
+
+    /// REM-PARITY 2.2: a Verifier reports a ParityMap copy that is unreadable
+    /// or invalid even when the other copy is used, and reports nothing when
+    /// both validate.
+    #[test]
+    fn parity_map_damage_names_the_copy_that_is_not_used() {
+        let encoded =
+            encode_parity_map_tape_file(&sample_payload(), BLOCK_SIZE).expect("payload encodes");
+        let whole: Vec<Option<Vec<u8>>> = encoded.blocks.iter().cloned().map(Some).collect();
+        assert!(parity_map_damage(&whole, &TAPE_UUID).is_empty());
+        let tail_start = (whole.len() - 1) / 2;
+
+        // The primary header is unreadable; the tail is used.
+        let mut blocks = whole.clone();
+        blocks[0] = None;
+        let damage = parity_map_damage(&blocks, &TAPE_UUID);
+        assert_eq!(damage.len(), 1, "{damage:?}");
+        assert!(damage[0].contains("primary"), "{damage:?}");
+        assert!(
+            parse_parity_map_tape_file_with_unreadable_blocks(&blocks, &TAPE_UUID).is_ok(),
+            "the surviving copy is still used"
+        );
+
+        // The tail header is invalid; the primary is used.
+        let mut blocks = whole.clone();
+        blocks[tail_start].as_mut().unwrap()[0] ^= 0xff;
+        let damage = parity_map_damage(&blocks, &TAPE_UUID);
+        assert_eq!(damage.len(), 1, "{damage:?}");
+        assert!(damage[0].contains("tail"), "{damage:?}");
+
+        // Both copies gone: the file itself is reported.
+        let mut blocks = whole;
+        blocks[0] = None;
+        blocks[tail_start] = None;
+        let damage = parity_map_damage(&blocks, &TAPE_UUID);
+        assert_eq!(damage.len(), 1, "{damage:?}");
+        assert!(damage[0].contains("no ParityMap copy"), "{damage:?}");
+        assert!(damage[0].contains("ParityMapParse"), "{damage:?}");
+
+        // The footer alone is unreadable: both copies validate without it.
+        let mut blocks: Vec<Option<Vec<u8>>> = encoded.blocks.iter().cloned().map(Some).collect();
+        *blocks.last_mut().unwrap() = None;
+        assert_eq!(
+            parity_map_damage(&blocks, &TAPE_UUID),
+            vec!["the ParityMap footer is unreadable".to_string()]
+        );
+
+        // Copies that both validate and disagree: reported with the Reader's name.
+        let mut other = sample_payload();
+        other.sequence += 1;
+        let other = encode_parity_map_tape_file(&other, BLOCK_SIZE).expect("payload encodes");
+        let half = (encoded.blocks.len() - 1) / 2;
+        let mut blocks: Vec<Option<Vec<u8>>> = encoded.blocks.iter().cloned().map(Some).collect();
+        for (offset, block) in other.blocks[half..2 * half].iter().enumerate() {
+            blocks[half + offset] = Some(block.clone());
+        }
+        blocks.pop();
+        blocks.push(None);
+        let damage = parity_map_damage(&blocks, &TAPE_UUID);
+        assert!(
+            damage.iter().any(|d| d.contains("ParityMapParse")),
+            "{damage:?}"
+        );
     }
 
     #[test]

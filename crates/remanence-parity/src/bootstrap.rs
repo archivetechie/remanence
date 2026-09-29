@@ -61,26 +61,23 @@ const LEGACY_OBJECT_ROWS_KEY: i128 = 30;
 
 /// Decoded bootstrap-block payload.
 ///
-/// `scheme` is `Option<...>` because the design (§5.6) says a
-/// `FLAG_NO_PARITY` bootstrap may omit the scheme record
-/// entirely: "all other fields except magic, schema version,
-/// tape UUID, block size, sequence, and header CRC may be
-/// absent." Codex idref=794a16ac caught the earlier always-Some
-/// shape rejecting compliant minimal no-parity bootstraps.
+/// `scheme` is `Option<...>` because a `FLAG_NO_PARITY` bootstrap
+/// MUST omit the scheme record (REM-PARITY 8.2): "all other fields
+/// except magic, schema version, tape UUID, block size, sequence,
+/// and header CRC may be absent."
 ///
-/// Invariant: if `scheme` is `Some`, its `no_parity_flag`
-/// matches the bootstrap header's `FLAG_NO_PARITY` bit; if
-/// `scheme` is `None`, the header's flag MUST be set.
+/// Invariant: `scheme` is `Some` only on a parity bootstrap, whose
+/// record's `no_parity_flag` is false; if `scheme` is `None`, the
+/// header's flag MUST be set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapPayload {
-    /// Parity scheme this tape was written with. `None` for
-    /// no-parity bootstraps that omit the record entirely.
+    /// Parity scheme this tape was written with. `None` on every
+    /// no-parity bootstrap, which carries no scheme record.
     pub scheme: Option<ParitySchemeRecord>,
     /// True iff this tape was written with `--parity none`
     /// (mirrors the [`FLAG_NO_PARITY`] bit in the bootstrap
     /// header). When `scheme` is `None`, this must be `true`.
-    /// When `scheme` is `Some`, this should match
-    /// `scheme.as_ref().unwrap().no_parity_flag`.
+    /// When `scheme` is `Some`, this must be `false`.
     pub no_parity_flag: bool,
     /// Filemark-map digest carried by this bootstrap. It may be
     /// omitted only on minimal no-parity bootstraps.
@@ -142,6 +139,22 @@ pub struct ParitySchemeRecord {
     pub no_parity_flag: bool,
 }
 
+/// The one place that decides REM-PARITY 8.2's rule that a no-parity
+/// bootstrap carries no parity scheme: a bootstrap with the no-parity flag
+/// whose payload carries a scheme record (key 1) is `BootstrapParse`. The
+/// writer, the parser, `validate_bootstrap` and the salvage path in `scan.rs`
+/// all decide it here; the error text is the message each wraps.
+pub(crate) fn no_parity_scheme_conflict(
+    no_parity: bool,
+    carries_scheme_record: bool,
+) -> Result<(), &'static str> {
+    if no_parity && carries_scheme_record {
+        Err("a no-parity bootstrap carries no parity scheme record (key 1)")
+    } else {
+        Ok(())
+    }
+}
+
 /// Serialize a `BootstrapPayload` into a tape block buffer.
 ///
 /// **Buffer contract** (codex idref=794a16ac Low catch): `buf`
@@ -163,6 +176,8 @@ pub fn write_bootstrap_block(
     // invariants on the no_parity_flag / scheme pair before
     // serializing, so the writer never emits a frame the
     // parser would reject.
+    no_parity_scheme_conflict(payload.no_parity_flag, payload.scheme.is_some())
+        .map_err(ParityError::Invariant)?;
     match (&payload.scheme, payload.no_parity_flag) {
         (None, false) => {
             return Err(ParityError::Invariant(
@@ -351,6 +366,8 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
     // Codex idref=794a16ac Medium: scheme record is optional
     // only when FLAG_NO_PARITY is set. Reject a missing scheme
     // record on a parity-protected tape.
+    no_parity_scheme_conflict(no_parity, decoded.scheme_record.is_some())
+        .map_err(|message| ParityError::BootstrapParse(message.into()))?;
     if decoded.scheme_record.is_none() && !no_parity {
         return Err(ParityError::BootstrapParse(
             "CBOR payload missing scheme record (and FLAG_NO_PARITY not set)".into(),
@@ -1568,18 +1585,33 @@ mod tests {
         assert_eq!(parsed, payload);
     }
 
+    /// REM-PARITY 8.2: a no-parity bootstrap carries no parity scheme. The
+    /// writer refuses to build one, and the parser refuses a frame whose flag
+    /// says no-parity while the payload carries a scheme record.
     #[test]
-    fn roundtrip_no_parity_flag_with_scheme_record() {
-        // Bootstrap declares no_parity but still carries the
-        // scheme record (informational). Both must round-trip.
+    fn no_parity_flag_with_scheme_record_is_bootstrap_parse() {
         let mut payload = sample_payload();
         payload.no_parity_flag = true;
         payload.scheme.as_mut().unwrap().no_parity_flag = true;
         let mut buf = vec![0u8; 1_048_576];
-        write_bootstrap_block(&payload, &mut buf).expect("write ok");
-        let parsed = parse_bootstrap_block(&buf[..]).expect("parse ok");
-        assert!(parsed.no_parity_flag);
-        assert!(parsed.scheme.as_ref().unwrap().no_parity_flag);
+        assert!(matches!(
+            write_bootstrap_block(&payload, &mut buf),
+            Err(ParityError::Invariant(_))
+        ));
+
+        // A parity frame with the no-parity bit set and the header CRC redone:
+        // the payload still carries key 1.
+        let parity = sample_payload();
+        write_bootstrap_block(&parity, &mut buf).expect("write ok");
+        buf[12..16].copy_from_slice(&FLAG_NO_PARITY.to_be_bytes());
+        let crc = crc64_xz(&buf[0..BOOTSTRAP_HEADER_CRC_OFFSET]);
+        buf[48..56].copy_from_slice(&crc.to_le_bytes());
+        match parse_bootstrap_block(&buf[..]) {
+            Err(ParityError::BootstrapParse(message)) => {
+                assert!(message.contains("no-parity bootstrap"), "{message}");
+            }
+            other => panic!("expected BootstrapParse, got {other:?}"),
+        }
     }
 
     #[test]

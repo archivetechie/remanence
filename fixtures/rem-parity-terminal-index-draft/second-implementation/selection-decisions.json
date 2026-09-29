@@ -914,21 +914,21 @@
           },
           "separations": {
             "A-B": {
-              "status": "invalid",
-              "error": "TerminalIndexSeparationParse",
-              "reason": "walk: damaged separation extent: header plan differs from the measured file"
+              "status": "not_run",
+              "error": null,
+              "reason": "walk: separation header matches the plan"
             },
             "B-C": {
-              "status": "invalid",
-              "error": "TerminalIndexSeparationParse",
-              "reason": "walk: damaged separation extent: header plan differs from the measured file"
+              "status": "not_run",
+              "error": null,
+              "reason": "walk: separation header matches the plan"
             }
           },
           "walk_classes": {
             "tape file 6": "structural damage: structural damage: zero-block file",
-            "tape file 7": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+            "tape file 7": "IndexSeparationExtent: separation header matches the plan",
             "tape file 8": "structural damage: structural damage: zero-block file",
-            "tape file 9": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
+            "tape file 9": "IndexSeparationExtent: separation header matches the plan",
             "tape file 10": "structural damage: structural damage: zero-block file"
           },
           "outcome": "BotStructuralRecoveryRequired",
@@ -956,9 +956,9 @@
           },
           "separations": {
             "A-B": {
-              "status": "invalid",
-              "error": "TerminalIndexSeparationParse",
-              "reason": "walk: damaged separation extent: header plan differs from the measured file"
+              "status": "not_run",
+              "error": null,
+              "reason": "walk: separation header matches the plan"
             },
             "B-C": {
               "status": "not_run",
@@ -967,8 +967,8 @@
             }
           },
           "walk_classes": {
-            "tape file 6": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file",
-            "tape file 7": "IndexSeparationExtent: damaged separation extent: header plan differs from the measured file"
+            "tape file 6": "IndexSeparationExtent: separation header matches the plan",
+            "tape file 7": "IndexSeparationExtent: separation header matches the plan"
           },
           "outcome": "BotStructuralRecoveryRequired",
           "acceptable_selections": [],

@@ -202,3 +202,36 @@ selection files. Only e3-07 changed, and no row follows an expected outcome.
 | e3-07 | `verifier-full.terminal_suffix.complete` | `undecided` | `false`: replicas A, B and C invalid, both extents invalid, EOD at 42 not the planned EOD | 10.6 and 12.6, as above |
 | e3-07 | `undecided` | scanner, verifier | none | |
 | e3-07 | `walk` | classes as F3, with a note that it holds either way | the same classes; the walk is offered because no replica validates (the note is gone) | 8.4.1: "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT." |
+
+## The text after T2 (F4)
+
+Section 12.2, 12.3, 12.6, 8.2, 8.4, 2.2 and 10.6 were revised. Each change below
+was re-decided from its sentence, and no row follows an expected outcome. The
+resume, negative-block and build files are byte-identical to F3b's. In the negative,
+supplement, mutation and selection files only the `implementation` blocks change
+(reason strings, and walk-based extent statuses); no `decision`, no `self_check`
+verdict and no citation changed except as the first row says.
+
+| Case | Aspect | Old value | New value | Sentence |
+| --- | --- | --- | --- | --- |
+| negative-e1-decisions.json (e1-16) | the cited §8.2 sentence (`decision.rules`, `decision.order`) | "It MAY omit the scheme record (key 1) and the digest record (key 2). A Reader MUST NOT require those records on it." | "It MUST omit the scheme record (key 1) and MAY omit the digest record (key 2). A Reader MUST NOT require those records on it. A no-parity bootstrap's payload carries no parity scheme; one that does is `BootstrapParse`." The outcome stays `accepted`: e1-16 removes key 1 | 8.2, as quoted; 15 |
+| (parser) | a no-parity bootstrap whose payload carries key 1 | accepted | `BootstrapParse` | 8.2: "A no-parity bootstrap's payload carries no parity scheme; one that does is `BootstrapParse`." No case in the set has one, so no decision changes |
+| e3-02 | `walk.classes["9"]`; new `walk.artifacts` = ["9"] | "nonconformant artifact after the terminal suffix (not admitted as an Object)" | `Object (incomplete candidate)`; file 9 is listed in `walk.artifacts`, in no inventory. Structural damage stays reported; it is no map entry | 12.6: "A structural artifact is any tape file, complete or torn, that follows the last of the five files of the terminal suffix, whatever it contains." "The rule is one of scope: an artifact is not an Object of any inventory. The walk may report it ... as an Object candidate of unknown identity or, when torn, as an incomplete candidate." 12.2: "A file whose trailing filemark is missing before EOD is not a tape file of the map. The walk reports structural damage, classifies the file by its head ... as a torn candidate (an incomplete Object candidate when nothing else fits ...), and ends there." |
+| e3-06 | `walk.classes["9"]`; new `walk.artifacts` = ["9"] | the same artifact class | `Object` (a candidate of unknown identity), in `walk.artifacts` | 12.6, as above |
+| e3-05 | `walk.classes["8"]` | `Object` | `TapeIndexReplica`, damaged (2 blocks, 3 planned). Its last record is a footer whose magic matches; the head is readable and foreign and no rung of items 1, 4 or 5 parses it | 12.3: "In items 2 and 3 a footer whose magic matches establishes the type also when the head is readable, is not a header of that type, and no rung of items 1, 4 or 5 parses it. If the footer does not parse or the count disagrees, the file keeps its control type, damaged." |
+| e3-01, e3-04, e3-05, filemark-prefix | `verifier.separations`, and the walk's damage findings of extents and replicas whose count is right | `invalid` for extents and replicas that were only shifted | `not_run` (no layout validates them); the findings that remain are the count mismatches (A-B in e3-01; the merged extent in e3-03 to e3-05) | 12.3: "It does not compare the planned tape-file number or start position with the file's measured tape-file number or start position; Section 10.6 checks those when a replica is validated." |
+| e3-07 | `scanner.replicas.A.reason` and its `verifier-full` finding (the outcome, `BotStructuralRecoveryRequired`, is unchanged) | payload: covered count, structural_row_count and A's tape-file number differ | header: the three are not equal (4, 4 and 9), and the payload is not read | 10.6: "A replica whose header breaks the covered-count relationship is not eligible, and a Reader need not read its payload." "replica A's planned start LBA equals the end of the covered prefix" (38 against 19) |
+| Every case with an unreadable sidecar copy or footer, ParityMap copy, terminal replica or (supplied values) bootstrap (about 30 cases: burst-m, e2-08 to e2-13, replicas-all, sidecar-primary, the walk cases, and the rest) | the `error` of that finding in `verifier.outside_terminal_suffix` and `verifier-full.other_findings` | `TapeIo` | none: "an unreadable component" | 2.2: "a sidecar copy or footer, a copy of the ParityMap, or a terminal replica whose records cannot be read, even when another copy or replica is used, and a bootstrap that is unreadable while supplied values are used. A medium error on such a component is reported as an unreadable component. A non-medium fault of the transport stays `TapeIo`." Data blocks, parity shards and separation extents keep `TapeIo` (GAPS N-2) |
+| bootstrap-wrong-scheme | `verifier-full.coverage` | the acquired index checked 4 data blocks and 4 shards | `data_blocks_read_but_not_checkable` 4, `parity_shards_read_but_not_checkable` 4, `epochs_index_failing_the_pin` [0]; the `SchemeMismatch` finding stays | 2.2: "An index that fails the pin of Section 13.3 is likewise not used for CRC checks: the Verifier reports the pin's error and the read failures, and takes the parity shards from the acquired index." |
+| Every damage case | new `verifier-full.tape_complete` | absent | false in every case (each has a finding, a failed block or shard, or an incomplete suffix); it is true only for an undamaged tape | 2.2: "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix." |
+| Quotes | `full_verification_d` (Appendix D TT-2) | "... and the reference's verification is to be brought into line before freeze." | "... and the reference's verification does so." | Appendix D TT-2 |
+
+Checked and unchanged:
+- Section 8.4 step 1 now says the Scanner does not stop at the first footer that supplies a
+  layout, that a separation extent's footer supplies none, and that the first backspace
+  crosses trailing records (GAPS M-5). `discover_layouts` collects every layout. No case has
+  two, so no scanner decision changed.
+- Section 10.6's new relationship, replica A's planned start LBA equals the end of the covered
+  prefix, adds a failing rule to neg-03, neg-44 and sup-15's replica A; their decisions and
+  self-checks are unchanged, and sup-15's dispute count rises from 2 rules to 3.
+- e3-07's Scanner, walk and Verifier results, and e3-01's Scanner and walk kinds, are as in F3b.

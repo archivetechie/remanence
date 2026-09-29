@@ -1953,9 +1953,9 @@
         "claim": "The first ordinals are dense: file 2's first ordinal 1 equals the running total after file 1. There are no sidecar rows, so the W = T rule and the ParityMap-iff-sidecar rule hold vacuously. W = 0 matches its recompute. The Object rows are in bijection with the kind-0 rows and match their block counts, and the manifest ranges fit. covered = rows = A's planned tape-file number, and the layout and digests are consistent.",
         "disputed_by_implementation": true,
         "disputes": [
-          "replica A: this implementation finds 2 failing rules: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2)"
+          "replica A: this implementation finds 3 failing rules: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
         ],
-        "replica_A_rules_failing": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2)"
+        "replica_A_rules_failing": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
       },
       "decision": {
         "outcome": "rejected",
@@ -2000,15 +2000,15 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             },
             "B": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             },
             "C": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2)"
+              "reason": "payload: TerminalIndexReplicaParse: T or W differs from the frame; row 2: its records and trailing filemark reach position 18446744073709551619, which does not fit in u64 (Section 7.2); replica A's planned start LBA differs from the end of the covered prefix (Section 10.6)"
             }
           },
           "selection": "BotStructuralRecoveryRequired",
@@ -2877,7 +2877,7 @@
         "claim": "covered = 6 = rows, and the canonical-map digest over exactly the 6 leading entries matches (Section 7.4). The component file numbers are dense (7..11) in the fixed order, and starts and EOD are unchanged. The footer observations equal the plan. T, W and every digest recompute. The footers' tape-file fields are Writer observations, 'not an independent device tape-file counter', so no device measurement contradicts them.",
         "disputed_by_implementation": false,
         "disputes": [],
-        "replica_A_rules_failing": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+        "replica_A_rules_failing": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 6, structural_row_count 6 and replica A's planned tape-file number 7 are not equal (the payload is not read)"
       },
       "decision": {
         "outcome": "rejected",
@@ -2910,15 +2910,15 @@
           "replicas": {
             "A": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+              "reason": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 6, structural_row_count 6 and replica A's planned tape-file number 7 are not equal (the payload is not read)"
             },
             "B": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+              "reason": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 6, structural_row_count 6 and replica A's planned tape-file number 7 are not equal (the payload is not read)"
             },
             "C": {
               "valid": false,
-              "reason": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+              "reason": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 6, structural_row_count 6 and replica A's planned tape-file number 7 are not equal (the payload is not read)"
             }
           },
           "selection": "BotStructuralRecoveryRequired",

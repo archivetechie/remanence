@@ -1223,8 +1223,8 @@ fn separation_health_keeps_a_two_record_zero_and_omits_an_invalid_count() {
 #[test]
 fn verification_names_every_protected_content_failure_and_is_never_complete() {
     use remanence_parity::{
-        BlockFailureReason, FailedDataBlock, FailedParityShard, ProtectedContentVerification,
-        SidecarComponentState, SidecarVerification, TapeFilePosition,
+        BlockFailureReason, FailedDataBlock, FailedParityShard, ParityMapFinding,
+        ProtectedContentVerification, SidecarComponentState, SidecarVerification, TapeFilePosition,
     };
     let counts = TapeIndexReplicaCounts {
         structural_entry_count: 2,
@@ -1262,6 +1262,10 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
     };
     let protected = ProtectedContentVerification {
         sidecars: vec![sidecar],
+        parity_map_findings: vec![ParityMapFinding {
+            tape_file_number: 3,
+            detail: "the tail ParityMap copy is not usable".to_string(),
+        }],
         not_performed: None,
         prefix_damage: vec!["UnreadableTapeFileHead at LBA 2".to_string()],
     };
@@ -1296,6 +1300,8 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
     assert!(addresses.contains(&(Kind::ParityShard as i32, Some("epoch 0 stripe 1 parity 0"))));
     // Prefix damage has no address, and every finding states its reason.
     assert!(addresses.contains(&(Kind::PrefixDamage as i32, None)));
+    // A ParityMap copy that was not used is a finding at its tape file.
+    assert!(addresses.contains(&(Kind::ParityMap as i32, Some("tape_file 3"))));
     assert!(projected
         .protected_content_findings
         .iter()

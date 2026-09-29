@@ -154,6 +154,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -170,15 +174,16 @@
         "other_findings": [
           {
             "component": "terminal replica A",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 19"
           },
           {
             "component": "terminal replica B",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 27"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -418,6 +423,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -441,6 +450,7 @@
           "parity_shards_not_locatable": 0
         },
         "other_findings": [],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -729,13 +739,13 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -774,6 +784,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -808,14 +822,15 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -1015,6 +1030,10 @@
           {
             "section": "10.6",
             "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": null,
@@ -1040,6 +1059,7 @@
             "finding": "its header, footer, zero interior and trailing filemark validate; whether its edition ID equals 'the replicas'' is undecided, because the valid replicas carry different edition IDs (Section 10.6)"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -1252,6 +1272,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -1268,20 +1292,21 @@
         "other_findings": [
           {
             "component": "terminal replica A",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 19"
           },
           {
             "component": "terminal replica B",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 27"
           },
           {
             "component": "terminal replica C",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 35"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -1455,6 +1480,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -1471,10 +1500,11 @@
         "other_findings": [
           {
             "component": "terminal replica C",
-            "error": "TapeIo",
+            "error": null,
             "finding": "payload record unreadable: medium error at LBA 36"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -1644,6 +1674,10 @@
           {
             "section": "10.6",
             "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -1679,6 +1713,7 @@
             "finding": "EOD at LBA 38 is not the planned EOD immediately after C's trailing filemark"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -1956,7 +1991,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -1995,6 +2030,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -2029,9 +2068,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -2209,7 +2249,7 @@
           {
             "component": "bootstrap",
             "finding": "unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           }
         ]
@@ -2228,6 +2268,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -2245,9 +2289,10 @@
           {
             "component": "bootstrap",
             "finding": "unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -2587,19 +2632,19 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
             "component": "sidecar tape file 2",
             "finding": "tail copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -2652,6 +2697,10 @@
           {
             "section": "2.2",
             "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -2688,17 +2737,17 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
             "finding": "tail copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
@@ -2707,20 +2756,21 @@
           },
           {
             "component": "terminal replica A",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 31"
           },
           {
             "component": "terminal replica B",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 39"
           },
           {
             "component": "terminal replica C",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 47"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -3010,13 +3060,13 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -3045,6 +3095,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -3071,29 +3125,30 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "terminal replica A",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 19"
           },
           {
             "component": "terminal replica B",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 27"
           },
           {
             "component": "terminal replica C",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 35"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -3343,6 +3398,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -3376,6 +3435,7 @@
           "parity_shards_not_locatable": 0
         },
         "other_findings": [],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -3508,6 +3568,7 @@
           ],
           "replicas_valid": []
         },
+        "tape_complete": false,
         "citations": [
           {
             "section": "2.2",
@@ -3736,7 +3797,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -3820,6 +3881,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -3892,9 +3957,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -4171,7 +4237,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -4210,6 +4276,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -4244,9 +4314,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -4414,6 +4485,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -4430,10 +4505,11 @@
         "other_findings": [
           {
             "component": "terminal replica C",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 35"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -4611,6 +4687,10 @@
           {
             "section": "10.6",
             "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -4631,6 +4711,7 @@
             "finding": "medium error at LBA 25"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -4798,6 +4879,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -4814,10 +4899,11 @@
         "other_findings": [
           {
             "component": "terminal replica B",
-            "error": "TapeIo",
+            "error": null,
             "finding": "medium error at LBA 27"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -5093,7 +5179,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -5154,6 +5240,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -5207,9 +5297,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -5378,8 +5469,8 @@
         "result": "recovery_required",
         "error": null,
         "separations": {
-          "A-B": "invalid",
-          "B-C": "invalid"
+          "A-B": "not_run",
+          "B-C": "not_run"
         },
         "citations": [
           {
@@ -5389,14 +5480,6 @@
           {
             "section": "8.5",
             "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
-          },
-          {
-            "section": "12.3",
-            "quote": "Under items 2 and 3 the file keeps its control type, damaged; under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies."
-          },
-          {
-            "section": "10.6",
-            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
           },
           {
             "section": "12.6",
@@ -5430,6 +5513,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": null,
@@ -5443,33 +5530,9 @@
             "component": "terminal replicas",
             "error": "BotStructuralRecoveryRequired",
             "finding": "no footer supplies a planned layout, so no replica validates"
-          },
-          {
-            "component": "tape file 3 (terminal replica)",
-            "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 4 (separation extent)",
-            "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 5 (terminal replica)",
-            "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 6 (separation extent)",
-            "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 7 (terminal replica)",
-            "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -5683,7 +5746,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -5755,6 +5818,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -5817,9 +5884,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -6061,7 +6129,7 @@
           {
             "component": "bootstrap",
             "finding": "unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -6096,6 +6164,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -6114,15 +6186,18 @@
           "data_blocks_read": 4,
           "parity_shards_read": 4,
           "epochs_without_index": [],
-          "data_blocks_read_but_not_checkable": 0,
-          "parity_shards_read_but_not_checkable": 0,
-          "parity_shards_not_locatable": 0
+          "data_blocks_read_but_not_checkable": 4,
+          "parity_shards_read_but_not_checkable": 4,
+          "parity_shards_not_locatable": 0,
+          "epochs_index_failing_the_pin": [
+            0
+          ]
         },
         "other_findings": [
           {
             "component": "bootstrap",
             "finding": "unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
@@ -6130,6 +6205,7 @@
             "error": "SchemeMismatch"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -6351,7 +6427,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -6446,6 +6522,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -6527,9 +6607,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -6776,6 +6857,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -6805,6 +6890,7 @@
             "error": "ParityMapParse"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -7101,13 +7187,13 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -7152,6 +7238,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -7186,12 +7276,12 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "ParityMap tape file 4",
@@ -7199,6 +7289,7 @@
             "error": "ParityMapParse"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -7374,6 +7465,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -7513,6 +7605,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -7687,6 +7780,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -7826,6 +7920,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -8000,6 +8095,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -8139,6 +8235,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -8313,6 +8410,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -8491,6 +8589,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -8669,6 +8768,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -8855,6 +8955,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -9036,6 +9137,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -9175,6 +9277,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -9339,6 +9442,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -9503,6 +9607,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -9674,6 +9779,7 @@
               ],
               "replicas_valid": []
             },
+            "tape_complete": false,
             "citations": [
               {
                 "section": "2.2",
@@ -9904,6 +10010,10 @@
               {
                 "section": "2.2",
                 "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
               }
             ],
             "data_blocks_failed": [],
@@ -9924,6 +10034,7 @@
                 "error": "BootstrapParse"
               }
             ],
+            "tape_complete": false,
             "terminal_suffix": {
               "complete": true,
               "reasons": [
@@ -10147,6 +10258,10 @@
               {
                 "section": "2.2",
                 "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
               }
             ],
             "data_blocks_failed": [],
@@ -10167,6 +10282,7 @@
                 "error": "BootstrapParse"
               }
             ],
+            "tape_complete": false,
             "terminal_suffix": {
               "complete": true,
               "reasons": [
@@ -10390,6 +10506,10 @@
               {
                 "section": "2.2",
                 "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
               }
             ],
             "data_blocks_failed": [],
@@ -10410,6 +10530,7 @@
                 "error": "BootstrapParse"
               }
             ],
+            "tape_complete": false,
             "terminal_suffix": {
               "complete": true,
               "reasons": [
@@ -10644,6 +10765,10 @@
               {
                 "section": "2.2",
                 "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+              },
+              {
+                "section": "2.2",
+                "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
               }
             ],
             "data_blocks_failed": [],
@@ -10664,6 +10789,7 @@
                 "error": "BootstrapParse"
               }
             ],
+            "tape_complete": false,
             "terminal_suffix": {
               "complete": true,
               "reasons": [
@@ -10916,6 +11042,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -10939,6 +11069,7 @@
           "parity_shards_not_locatable": 0
         },
         "other_findings": [],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -11189,6 +11320,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -11212,6 +11347,7 @@
           "parity_shards_not_locatable": 0
         },
         "other_findings": [],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -11379,6 +11515,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -11399,6 +11539,7 @@
             "finding": "TerminalIndexReplicaParse: record length"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -11620,6 +11761,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -11649,6 +11794,7 @@
             "finding": "no footer supplies a planned layout, so no replica validates"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -11870,7 +12016,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -11919,6 +12065,10 @@
           {
             "section": "2.2",
             "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -11947,7 +12097,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
@@ -11960,6 +12110,7 @@
             "error": "SidecarMetadataUnavailable"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -12181,7 +12332,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -12210,6 +12361,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -12236,9 +12391,10 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -12460,7 +12616,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -12495,6 +12651,10 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -12521,7 +12681,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
@@ -12529,6 +12689,7 @@
             "error": "SidecarParse"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -12750,7 +12911,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -12805,6 +12966,10 @@
           {
             "section": "2.2",
             "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -12833,7 +12998,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "footer unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
@@ -12851,6 +13016,7 @@
             "error": "ParityMapParse"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -13101,6 +13267,10 @@
           {
             "section": "2.2",
             "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [
@@ -13132,6 +13302,7 @@
             "error": "SidecarMetadataUnavailable"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": true,
           "reasons": [
@@ -13346,7 +13517,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo",
+            "error": null,
             "checks": "structure"
           },
           {
@@ -13387,6 +13558,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -13406,7 +13581,7 @@
           {
             "component": "sidecar tape file 2",
             "finding": "primary copy unreadable (medium error)",
-            "error": "TapeIo"
+            "error": null
           },
           {
             "component": "sidecar tape file 2",
@@ -13419,6 +13594,7 @@
             "finding": "no footer supplies a planned layout, so no replica validates"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -13562,7 +13738,7 @@
         "error": null,
         "separations": {
           "A-B": "invalid",
-          "B-C": "invalid"
+          "B-C": "not_run"
         },
         "citations": [
           {
@@ -13613,6 +13789,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -13635,24 +13815,10 @@
           {
             "component": "tape file 5 (separation extent)",
             "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 6 (terminal replica)",
-            "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 7 (separation extent)",
-            "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 8 (terminal replica)",
-            "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
+            "finding": "damaged separation extent: measured 4 blocks, the planned component has 3"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -13753,7 +13919,7 @@
           "6": "TapeIndexReplica",
           "7": "IndexSeparationExtent",
           "8": "TapeIndexReplica",
-          "9": "nonconformant artifact after the terminal suffix (not admitted as an Object)"
+          "9": "Object (incomplete candidate)"
         },
         "object_identity": "unknown",
         "terminal_authority_recovered": false,
@@ -13772,11 +13938,19 @@
           },
           {
             "section": "12.6",
+            "quote": "A structural artifact is any tape file, complete or torn, that follows the last of the five files of the terminal suffix, whatever it contains. The suffix is exact when the walk recognises, in order, replica, separation extent, replica, separation extent and replica, none of them damaged. The rule is one of scope: an artifact is not an Object of any inventory. The walk may report it as it reports any file beyond the validated scope, as an Object candidate of unknown identity or, when torn, as an incomplete candidate (Section 8.4.1), so that an operator sees it."
+          },
+          {
+            "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
           },
           {
             "section": "12.2",
             "quote": "a zero-block file or a missing trailing filemark is structural damage;"
+          },
+          {
+            "section": "12.2",
+            "quote": "A file whose trailing filemark is missing before EOD is not a tape file of the map. The walk reports structural damage, classifies the file by its head, when the head can be read, as a torn candidate (an incomplete Object candidate when nothing else fits, Section 8.4.1), and ends there."
           },
           {
             "section": "8.4.1",
@@ -13794,6 +13968,9 @@
             "section": "13.1",
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
+        ],
+        "artifacts": [
+          "9"
         ],
         "structural_damage": [
           "tape file 9: missing trailing filemark before EOD"
@@ -13863,6 +14040,10 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -13885,7 +14066,7 @@
           {
             "component": "tape file 9",
             "error": null,
-            "finding": "a structural artifact after the exact terminal suffix: nonconformant, and not admitted as an Object"
+            "finding": "a structural artifact after the exact terminal suffix: nonconformant, in no inventory (the walk lists it as a candidate)"
           },
           {
             "component": "tape",
@@ -13893,6 +14074,7 @@
             "finding": "structural damage: tape file 9: missing trailing filemark before EOD"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -14088,6 +14270,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -14110,9 +14296,10 @@
           {
             "component": "tape file 7 (separation extent)",
             "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
+            "finding": "damaged separation extent: measured 6 blocks, the planned component has 3"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -14256,7 +14443,7 @@
         "error": null,
         "separations": {
           "A-B": "invalid",
-          "B-C": "invalid"
+          "B-C": "not_run"
         },
         "citations": [
           {
@@ -14307,6 +14494,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -14329,19 +14520,10 @@
           {
             "component": "tape file 5 (separation extent)",
             "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 6 (separation extent)",
-            "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 7 (terminal replica)",
-            "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
+            "finding": "damaged separation extent: measured 6 blocks, the planned component has 3"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -14441,7 +14623,7 @@
           "5": "IndexSeparationExtent",
           "6": "IndexSeparationExtent",
           "7": "TapeIndexReplica",
-          "8": "Object"
+          "8": "TapeIndexReplica"
         },
         "object_identity": "unknown",
         "terminal_authority_recovered": false,
@@ -14453,6 +14635,18 @@
           {
             "section": "12.2",
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
           },
           {
             "section": "8.4.1",
@@ -14485,7 +14679,7 @@
         "error": null,
         "separations": {
           "A-B": "invalid",
-          "B-C": "invalid"
+          "B-C": "not_run"
         },
         "citations": [
           {
@@ -14536,6 +14730,10 @@
           {
             "section": "15",
             "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -14558,19 +14756,15 @@
           {
             "component": "tape file 5 (separation extent)",
             "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
+            "finding": "damaged separation extent: measured 6 blocks, the planned component has 3"
           },
           {
-            "component": "tape file 6 (separation extent)",
-            "error": "TerminalIndexSeparationParse",
-            "finding": "damaged separation extent: header plan differs from the measured file"
-          },
-          {
-            "component": "tape file 7 (terminal replica)",
+            "component": "tape file 8 (terminal replica)",
             "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: header plan differs from the measured file"
+            "finding": "damaged terminal replica: type established by its footer, measured 2 blocks, the planned component has 3"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -14671,7 +14865,7 @@
           "6": "TapeIndexReplica",
           "7": "IndexSeparationExtent",
           "8": "TapeIndexReplica",
-          "9": "nonconformant artifact after the terminal suffix (not admitted as an Object)"
+          "9": "Object"
         },
         "object_identity": "unknown",
         "terminal_authority_recovered": false,
@@ -14687,6 +14881,10 @@
           {
             "section": "12.6",
             "quote": "A structural artifact after the exact terminal suffix is nonconformant and MUST NOT be admitted as an Object."
+          },
+          {
+            "section": "12.6",
+            "quote": "A structural artifact is any tape file, complete or torn, that follows the last of the five files of the terminal suffix, whatever it contains. The suffix is exact when the walk recognises, in order, replica, separation extent, replica, separation extent and replica, none of them damaged. The rule is one of scope: an artifact is not an Object of any inventory. The walk may report it as it reports any file beyond the validated scope, as an Object candidate of unknown identity or, when torn, as an incomplete candidate (Section 8.4.1), so that an operator sees it."
           },
           {
             "section": "12.6",
@@ -14708,6 +14906,9 @@
             "section": "13.1",
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
+        ],
+        "artifacts": [
+          "9"
         ],
         "map": {
           "produced": true,
@@ -14774,6 +14975,10 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -14796,9 +15001,10 @@
           {
             "component": "tape file 9",
             "error": null,
-            "finding": "a structural artifact after the exact terminal suffix: nonconformant, and not admitted as an Object"
+            "finding": "a structural artifact after the exact terminal suffix: nonconformant, in no inventory (the walk lists it as a candidate)"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [
@@ -14840,7 +15046,7 @@
         "replicas": {
           "A": {
             "valid": false,
-            "reason": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+            "reason": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 4, structural_row_count 4 and replica A's planned tape-file number 9 are not equal (the payload is not read)"
           },
           "B": {
             "valid": false,
@@ -14990,6 +15196,10 @@
           {
             "section": "10.6",
             "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
           }
         ],
         "data_blocks_failed": [],
@@ -15007,7 +15217,7 @@
           {
             "component": "terminal replica A",
             "error": "TerminalIndexReplicaParse",
-            "finding": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+            "finding": "TerminalIndexReplicaParse: header: covered_prefix_tape_file_count 4, structural_row_count 4 and replica A's planned tape-file number 9 are not equal (the payload is not read)"
           },
           {
             "component": "terminal replica B",
@@ -15035,6 +15245,7 @@
             "finding": "EOD at LBA 42 is not the planned EOD immediately after C's trailing filemark"
           }
         ],
+        "tape_complete": false,
         "terminal_suffix": {
           "complete": false,
           "reasons": [

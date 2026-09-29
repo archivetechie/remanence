@@ -315,6 +315,11 @@ impl ScanRecoveryHints {
 
     /// Refuse any disagreement with a readable, valid bootstrap.
     fn validate_bootstrap(&self, bootstrap: &BootstrapPayload) -> Result<(), ParityError> {
+        crate::bootstrap::no_parity_scheme_conflict(
+            bootstrap.no_parity_flag,
+            bootstrap.scheme.is_some(),
+        )
+        .map_err(|message| bootstrap_refused(BootstrapRefusedField::Scheme, message))?;
         if self.tape_uuid != bootstrap.tape_uuid {
             return Err(bootstrap_refused(
                 BootstrapRefusedField::TapeUuid,
@@ -3420,7 +3425,8 @@ mod tests {
         }
     }
 
-    /// Nonconformance cannot conceal authenticated scheme or compression conflicts.
+    /// Nonconformance cannot conceal authenticated scheme or compression
+    /// conflicts; a scheme record on a no-parity bootstrap is one (Section 8.4).
     #[test]
     fn recovery_nonconformant_payload_preserves_readable_conflicts() {
         use ciborium::value::Value;
@@ -3975,11 +3981,52 @@ mod tests {
             no_parity.classify_bootstrap(&build(true, false)),
             Ok(RecoveryBootstrap::Unreadable(_))
         ));
-        // A decodable scheme still disagrees with a supplied no-parity scheme.
+        // A scheme record in the payload of a no-parity bootstrap is a value
+        // that disagrees with the supplied no-parity scheme (Section 8.4).
         assert_eq!(
             refused_field(no_parity.classify_bootstrap(&build(true, true))),
             BootstrapRefusedField::Scheme
         );
+    }
+
+    /// REM-PARITY 8.2 and 8.4 with supplied values: a no-parity bootstrap that
+    /// carries a scheme record is `BootstrapParse` on the parser, and discovery
+    /// with supplied values refuses it, naming the scheme, whether the payload
+    /// is canonical or not. `validate_bootstrap` refuses it the same way.
+    #[test]
+    fn no_parity_bootstrap_with_scheme_record_is_refused_with_supplied_values() {
+        let map = FilemarkMap::new(vec![TapeFileMapEntry::bootstrap(0, 1)]).expect("map");
+        let payload = bootstrap_payload(map.digest(false).expect("digest"), 0);
+        let no_parity = ScanRecoveryHints {
+            scheme: crate::ParityConfig::None,
+            ..matching_hints(&payload)
+        };
+        // A well-formed, canonical parity payload under a no-parity header.
+        let mut block = bootstrap_block_for_payload(&payload);
+        block[12..16].copy_from_slice(&crate::bootstrap::FLAG_NO_PARITY.to_be_bytes());
+        let block = with_header_crc(block);
+        assert!(matches!(
+            parse_bootstrap_block(&block),
+            Err(ParityError::BootstrapParse(_))
+        ));
+        let refusal = no_parity.classify_bootstrap(&block);
+        assert!(matches!(
+            refusal,
+            Err(ParityError::BootstrapRefused {
+                field: BootstrapRefusedField::Scheme,
+                ..
+            })
+        ));
+        // The funnel also holds when a payload reaches validation directly.
+        let mut direct = payload.clone();
+        direct.no_parity_flag = true;
+        assert_eq!(
+            refused_field(no_parity.validate_bootstrap(&direct)),
+            BootstrapRefusedField::Scheme
+        );
+        // A no-parity bootstrap without a scheme record is still readable.
+        direct.scheme = None;
+        assert!(no_parity.validate_bootstrap(&direct).is_ok());
     }
 
     /// BOT recovery reports only the UUID refusal as the operator's identity

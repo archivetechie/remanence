@@ -1102,6 +1102,9 @@ enum ProtectedContentFindingKind {
   PROTECTED_CONTENT_FINDING_KIND_PREFIX_DAMAGE = 4;
   // The protected-content pass could not be performed.
   PROTECTED_CONTENT_FINDING_KIND_NOT_PERFORMED = 5;
+  // A ParityMap copy that was unreadable or invalid, reported even when the
+  // other copy is used (REM-PARITY 2.2); address = tape-file number.
+  PROTECTED_CONTENT_FINDING_KIND_PARITY_MAP = 6;
 }
 
 message ProtectedContentFinding {
