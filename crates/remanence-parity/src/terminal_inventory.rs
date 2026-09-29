@@ -14,7 +14,7 @@ use crate::bot_recovery::{
     BotObjectRecoveryAuthority, BotStructuralRecoveryError, BotStructuralRecoverySummary,
 };
 use crate::error::ParityError;
-use crate::filemark_map::{TapeFileKind, TapeFileMapEntry};
+use crate::filemark_map::{TapeFileKind, TapeFileMapEntry, TapeFilePosition};
 use crate::index_separation::{
     parse_index_separation_footer, parse_index_separation_header, validate_index_separation_full,
     validate_index_separation_pair, IndexSeparationError, IndexSeparationInteriorBlockSource,
@@ -23,7 +23,10 @@ use crate::raw::{
     read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
     RawTapeSource,
 };
-use crate::scan::{scan_reconstruct_filemark_map_with_report_mode, ScanDamageKind, ScanMode};
+use crate::scan::{
+    scan_reconstruct_filemark_map_with_report_mode, validate_scan_reconstruction_with_report,
+    ScanDamageKind, ScanMode, ScanWalkResult,
+};
 use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
     validate_tape_index_replica_pair, validate_tape_index_replica_payload, TapeIndexEditionPlan,
@@ -35,6 +38,7 @@ use crate::terminal_tail::{
     validate_terminal_index_block_size_hint, TerminalTailLayout, TERMINAL_INDEX_REPLICA_COUNT,
     TERMINAL_TAIL_COMPONENT_COUNT,
 };
+use crate::verify_protected::{verify_protected_content, ProtectedContentVerification};
 #[cfg(test)]
 use remanence_library::TapeIoError;
 use std::cell::RefCell;
@@ -238,6 +242,8 @@ struct TerminalIndexCompleteEvidence {
     pub verified_prefix_record_count: u64,
     /// Number of filemark-delimited files measured from BOT through C.
     pub measured_tape_file_count: u64,
+    /// Full verification of every sidecar's protected content.
+    pub protected: ProtectedContentVerification,
 }
 
 /// Full physical evidence for one separation extent.
@@ -274,6 +280,10 @@ pub struct TerminalIndexVerification {
     pub verified_prefix_record_count: u64,
     /// Number of structurally complete tape files measured from BOT.
     pub measured_tape_file_count: u64,
+    /// Full verification of every sidecar's protected content (REM-PARITY
+    /// 2.2): each sidecar's copies and footer, and every data block and
+    /// parity shard it protects, checked against the acquired index.
+    pub protected: ProtectedContentVerification,
 }
 
 /// Full verification could not establish a canonical physical prefix.
@@ -287,9 +297,17 @@ pub struct TerminalIndexRecoveryRequired {
     pub replicas: [TerminalReplicaEvidence; 3],
     /// Stable recovery reason.
     pub detail: String,
+    /// Full verification of the protected content of the walked map, when the
+    /// walk validated against a final ParityMap or the bootstrap's scope.
+    pub protected: ProtectedContentVerification,
 }
 
 /// Typed full physical verification outcome.
+///
+/// The variants describe the terminal suffix and the canonical prefix. Every
+/// variant carries the full verification of the protected content
+/// (`protected`); a tape is complete only when [`Self::is_complete_tape`] says
+/// so, never on `VerifiedComplete` alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalIndexVerificationOutcome {
     /// Canonical prefix, A/B/C, AB/BC, and terminal EOD all validated.
@@ -298,6 +316,31 @@ pub enum TerminalIndexVerificationOutcome {
     VerifiedDegraded(Box<TerminalIndexVerification>),
     /// No survivor could prove the physical prefix; BOT recovery evidence is attached.
     RecoveryRequired(Box<TerminalIndexRecoveryRequired>),
+}
+
+impl TerminalIndexVerificationOutcome {
+    /// The full verification of the protected content (REM-PARITY 2.2).
+    pub fn protected(&self) -> &ProtectedContentVerification {
+        match self {
+            Self::VerifiedComplete(verified) | Self::VerifiedDegraded(verified) => {
+                &verified.protected
+            }
+            Self::RecoveryRequired(recovery) => &recovery.protected,
+        }
+    }
+
+    /// Whether the terminal suffix and the canonical prefix validated
+    /// completely.
+    pub fn is_terminal_suffix_complete(&self) -> bool {
+        matches!(self, Self::VerifiedComplete(_))
+    }
+
+    /// Whether the whole tape verified: the terminal suffix is complete and
+    /// no data block, parity shard or sidecar failed. A failed block, shard or
+    /// sidecar means the tape is not reported complete.
+    pub fn is_complete_tape(&self) -> bool {
+        self.is_terminal_suffix_complete() && self.protected().is_clean()
+    }
 }
 
 /// Typed reason a full physical terminal-index verification failed.
@@ -762,6 +805,13 @@ where
 
 /// Perform a complete physical verification distinct from bounded inventory.
 ///
+/// This is REM-PARITY 2.2's full verification: besides the terminal suffix and
+/// the canonical prefix, it reads every data block a sidecar protects and every
+/// parity shard, checks each against the acquired index, and reads each
+/// sidecar's copies and footer (`protected` in the result). The outcome
+/// variants describe the terminal suffix only; a tape is complete only when
+/// [`TerminalIndexVerificationOutcome::is_complete_tape`] says so.
+///
 /// Integrity damage is a typed outcome, not a transport error: a verified
 /// canonical prefix with damaged redundancy is `VerifiedDegraded`, while lack
 /// of a surviving canonical authority returns `RecoveryRequired` with a real
@@ -829,6 +879,7 @@ fn verify_terminal_index_full_inner(
                     verified_prefix_tape_file_count: complete.verified_prefix_tape_file_count,
                     verified_prefix_record_count: complete.verified_prefix_record_count,
                     measured_tape_file_count: complete.measured_tape_file_count,
+                    protected: complete.protected,
                 }),
             ))
         }
@@ -946,17 +997,13 @@ fn verify_terminal_index_after_damage(
     if walked
         .truncation
         .is_some_and(|truncation| truncation.tape_file_number < prefix_count)
-        || walked
-            .damaged_regions
-            .iter()
-            .any(|damage| damage.start.lba < layout.components[0].planned_start_lba)
     {
         return terminal_recovery_required(
             source,
             tape_uuid,
             block_size,
             selection.replicas,
-            "physical damage or truncation lies inside the canonical pre-tail prefix".to_string(),
+            "truncation lies inside the canonical pre-tail prefix".to_string(),
             authority,
             mode,
         );
@@ -987,6 +1034,43 @@ fn verify_terminal_index_after_damage(
 
     let mut replicas = missing_evidence("replica full verification was not attempted");
     let mut replica_editions: [Option<TapeIndexEditionPlan>; 3] = std::array::from_fn(|_| None);
+    // Physical damage inside the pre-tail prefix does not by itself abandon the
+    // terminal route (REM-PARITY 2.2, 12.6): it is reported as a finding, and
+    // the walked entries need only agree with the replica's structural rows in
+    // tape-file count and each file's record count. A row that disagrees, a
+    // truncation before the prefix end, or a walk that ends early still
+    // requires the BOT recovery route.
+    // The tape files a damage region touches: only their entries are compared
+    // by count. Every undamaged file keeps the kind-and-ordinal comparison.
+    let file_start = |entry: &TapeFileMapEntry| {
+        walked
+            .map
+            .physical_position(TapeFilePosition {
+                tape_file_number: entry.tape_file_number,
+                block_within_file: 0,
+            })
+            .ok()
+            .map(|position| position.lba)
+    };
+    let damaged_files: std::collections::BTreeSet<u64> = walked
+        .damaged_regions
+        .iter()
+        .filter(|damage| damage.start.lba < layout.components[0].planned_start_lba)
+        .filter_map(|damage| {
+            walked.map.entries().iter().find_map(|entry| {
+                let start = file_start(entry)?;
+                (damage.start.lba >= start && damage.start.lba <= start + entry.block_count)
+                    .then_some(entry.tape_file_number)
+            })
+        })
+        .collect();
+    let prefix_damage: Vec<String> = walked
+        .damaged_regions
+        .iter()
+        .filter(|damage| damage.start.lba < layout.components[0].planned_start_lba)
+        .map(|damage| format!("{:?} at LBA {}", damage.kind, damage.start.lba))
+        .collect();
+    let mut replica_rows: [Vec<TapeIndexReplicaMapEntry>; 3] = Default::default();
     for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
         let index = usize::from(ordinal - 1);
         let envelope =
@@ -1001,6 +1085,7 @@ fn verify_terminal_index_after_damage(
                 }
             };
         let mut entry_index = 0usize;
+        let mut rows = Vec::new();
         let result = validate_member_payload(
             source,
             block_size,
@@ -1011,13 +1096,21 @@ fn verify_terminal_index_after_damage(
                         message: format!("canonical replica map emitted extra row {entry_index}"),
                     });
                 };
-                if !canonical_entry_matches_physical(entry, physical) {
+                let agrees = if !damaged_files.contains(&physical.tape_file_number) {
+                    canonical_entry_matches_physical(entry, physical)
+                } else {
+                    // Damaged files may be typed by elimination: counts decide.
+                    entry.tape_file_number == physical.tape_file_number
+                        && entry.block_count == physical.block_count
+                };
+                if !agrees {
                     return Err(TapeIndexReplicaError::Payload {
                         message: format!(
                             "canonical row {entry:?} disagrees with measured row {physical:?}"
                         ),
                     });
                 }
+                rows.push(entry.clone());
                 entry_index = entry_index.checked_add(1).ok_or(
                     TapeIndexReplicaError::ArithmeticOverflow {
                         context: "degraded verification canonical row index",
@@ -1029,6 +1122,7 @@ fn verify_terminal_index_after_damage(
         );
         replicas[index] = match result {
             Ok(summary) if entry_index == physical_prefix.len() => {
+                replica_rows[index] = std::mem::take(&mut rows);
                 replica_editions[index] = Some(envelope.header.plan.edition.clone());
                 TerminalReplicaEvidence::Valid { summary }
             }
@@ -1136,6 +1230,15 @@ fn verify_terminal_index_after_damage(
                 .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
                     context: "degraded verification complete file count",
                 })?;
+    let protected = verify_protected_prefix(
+        source,
+        tape_uuid,
+        block_size,
+        &walked,
+        &edition,
+        &replica_rows[selected_index],
+        prefix_damage,
+    )?;
     let evidence = Box::new(TerminalIndexVerification {
         edition,
         selected_payload,
@@ -1145,12 +1248,204 @@ fn verify_terminal_index_after_damage(
         verified_prefix_tape_file_count: prefix_count,
         verified_prefix_record_count,
         measured_tape_file_count: walked.map.tape_file_count(),
+        protected,
     });
     Ok(if complete {
         TerminalIndexVerificationOutcome::VerifiedComplete(evidence)
     } else {
         TerminalIndexVerificationOutcome::VerifiedDegraded(evidence)
     })
+}
+
+/// The parity scheme a walk's authority records: the readable bootstrap's
+/// scheme record, or the supplied scheme when the bootstrap is unreadable.
+/// `Ok(None)` is a tape with no parity, which protects no content.
+fn walked_verification_scheme(
+    walked: &ScanWalkResult,
+) -> Result<Option<crate::model::ParityScheme>, String> {
+    let scheme_of_record = |record: &crate::bootstrap::ParitySchemeRecord| {
+        let scheme = crate::model::ParityScheme {
+            id: crate::model::SchemeId::new_owned(record.id.clone()),
+            data_blocks_per_stripe: record.data_blocks_per_stripe,
+            parity_blocks_per_stripe: record.parity_blocks_per_stripe,
+            stripes_per_neighborhood: record.stripes_per_neighborhood,
+        };
+        scheme.validate().map_err(|error| error.to_string())?;
+        Ok(Some(scheme))
+    };
+    if let Some(candidate) = walked.bootstrap_candidates.first() {
+        if candidate.payload.no_parity_flag {
+            return Ok(None);
+        }
+        return match &candidate.payload.scheme {
+            Some(record) => scheme_of_record(record),
+            None => Err("the bootstrap records no scheme".to_string()),
+        };
+    }
+    match &walked.bootstrap_recovery_hints {
+        Some(hints) => match &hints.scheme {
+            crate::ParityConfig::Scheme(scheme) => Ok(Some(scheme.clone())),
+            crate::ParityConfig::None => Ok(None),
+        },
+        None => Err("the walk found neither a valid bootstrap nor supplied values".to_string()),
+    }
+}
+
+/// The full verification of the protected content of a canonical prefix that
+/// a validated terminal replica describes (REM-PARITY 2.2). The map is the
+/// physical prefix the replicas' rows were compared with row by row.
+fn verify_protected_prefix(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    walked: &ScanWalkResult,
+    edition: &TapeIndexEditionPlan,
+    replica_rows: &[TapeIndexReplicaMapEntry],
+    prefix_damage: Vec<String>,
+) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
+    let mut protected =
+        verify_protected_prefix_rows(source, tape_uuid, block_size, walked, edition, replica_rows)?;
+    // The damage is a finding whatever the pass could read.
+    protected.prefix_damage = prefix_damage;
+    Ok(protected)
+}
+
+fn verify_protected_prefix_rows(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    walked: &ScanWalkResult,
+    edition: &TapeIndexEditionPlan,
+    replica_rows: &[TapeIndexReplicaMapEntry],
+) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
+    let scheme = match walked_verification_scheme(walked) {
+        Ok(Some(scheme)) => scheme,
+        Ok(None) => return Ok(ProtectedContentVerification::none_protected()),
+        Err(reason) => {
+            return Ok(ProtectedContentVerification::not_performed(format!(
+                "no parity scheme for the protected-content pass: {reason}"
+            )))
+        }
+    };
+    // The validated replica's structural rows scope the pass: the walked
+    // entries of a damaged prefix may be typed by elimination.
+    let scoped = scoped_map_from_terminal_replica(edition, replica_rows).map_err(|error| {
+        TerminalIndexVerificationError::PrefixWalk {
+            message: error.to_string(),
+        }
+    })?;
+    verify_protected_content(source, &scoped, &scheme, tape_uuid, block_size)
+        .map_err(|error| verification_source_error("protected-content read", error))
+}
+
+/// The scoped map a validated terminal replica gives: its structural rows at
+/// its recorded scope, checked against the edition's canonical map digest. The
+/// only way to obtain a map whose source is a terminal replica, which is what
+/// REM-PARITY 13.3's tail rescue from the terminal index applies to: a caller
+/// cannot label a catalog or walked map as one. The check is of consistency
+/// with the edition's digest, not of the replica's provenance: every production
+/// caller passes the rows of a replica that validated.
+pub fn scoped_map_from_terminal_replica(
+    edition: &TapeIndexEditionPlan,
+    rows: &[TapeIndexReplicaMapEntry],
+) -> Result<crate::filemark_map::ScopedFilemarkMap, ParityError> {
+    let scope = &edition.descriptor.scope;
+    let map =
+        crate::filemark_map::FilemarkMap::new(rows.iter().map(replica_row_as_map_entry).collect())?;
+    let mut scoped = crate::filemark_map::ScopedFilemarkMap::validate_against_digest(
+        map,
+        &crate::filemark_map::FilemarkMapDigest {
+            map_sha256: edition.canonical_map_sha256,
+            tape_file_count: scope.covered_prefix_tape_file_count,
+            map_total_data_ordinals: scope.total_data_ordinals,
+            highest_protected_ordinal: scope.highest_protected_ordinal,
+            covers_complete_map: true,
+        },
+    )?;
+    scoped.map_source = crate::filemark_map::MapSource::TerminalReplica;
+    Ok(scoped)
+}
+
+fn replica_row_as_map_entry(row: &TapeIndexReplicaMapEntry) -> TapeFileMapEntry {
+    TapeFileMapEntry {
+        tape_file_number: row.tape_file_number,
+        block_count: row.block_count,
+        kind: match row.kind {
+            TapeIndexReplicaFileKind::Bootstrap => TapeFileKind::Bootstrap,
+            TapeIndexReplicaFileKind::Object => TapeFileKind::Object,
+            TapeIndexReplicaFileKind::ParitySidecar => TapeFileKind::ParitySidecar,
+            TapeIndexReplicaFileKind::ParityMap => TapeFileKind::ParityMap,
+            TapeIndexReplicaFileKind::TapeIndexReplica => TapeFileKind::TapeIndexReplica,
+            TapeIndexReplicaFileKind::IndexSeparationExtent => TapeFileKind::IndexSeparationExtent,
+        },
+        first_parity_data_ordinal: row.first_parity_data_ordinal,
+        protected_ordinal_start: row.protected_ordinal_start,
+        protected_ordinal_end_exclusive: row.protected_ordinal_end_exclusive,
+        epoch_id: row.epoch_id,
+    }
+}
+
+/// The full verification of the protected content of a map that the BOT walk
+/// produced, when no terminal replica supplies a canonical prefix: validated
+/// against the final ParityMap or, without one, the bootstrap's scope.
+fn verify_protected_walk(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
+    let walked =
+        scan_reconstruct_filemark_map_with_report_mode(source, tape_uuid, block_size, mode)
+            .map_err(|error| TerminalIndexVerificationError::PrefixWalk {
+                message: error.to_string(),
+            })?;
+    let scheme = match walked_verification_scheme(&walked) {
+        Ok(Some(scheme)) => scheme,
+        Ok(None) => return Ok(ProtectedContentVerification::none_protected()),
+        Err(reason) => {
+            return Ok(ProtectedContentVerification::not_performed(format!(
+                "no parity scheme for the protected-content pass: {reason}"
+            )))
+        }
+    };
+    let bootstrap = walked
+        .bootstrap_candidates
+        .first()
+        .map(|candidate| candidate.payload.clone());
+    let scoped =
+        match (bootstrap, walked.final_parity_map()) {
+            (Some(bootstrap), _) => {
+                match validate_scan_reconstruction_with_report(source, &bootstrap, walked) {
+                    Ok(result) => result.scoped_map,
+                    Err(error) => {
+                        return Ok(ProtectedContentVerification::not_performed(format!(
+                            "the walked map did not validate: {error}"
+                        )))
+                    }
+                }
+            }
+            // The bootstrap is unreadable and its supplied values stand in for it.
+            // A validated final ParityMap scopes the walked map by itself
+            // (REM-PARITY 13.1).
+            (None, Some(parity_map)) => {
+                match crate::filemark_map::ScopedFilemarkMap::validate_against_final_parity_map(
+                    walked.map.clone(),
+                    parity_map,
+                ) {
+                    Ok(scoped) => scoped,
+                    Err(error) => {
+                        return Ok(ProtectedContentVerification::not_performed(format!(
+                            "the walked map did not validate against the final ParityMap: {error}"
+                        )))
+                    }
+                }
+            }
+            (None, None) => return Ok(ProtectedContentVerification::not_performed(
+                "the walked map has neither a readable bootstrap nor a final ParityMap to scope it",
+            )),
+        };
+    verify_protected_content(source, &scoped, &scheme, tape_uuid, block_size)
+        .map_err(|error| verification_source_error("protected-content read", error))
 }
 
 fn terminal_recovery_required(
@@ -1190,12 +1485,16 @@ fn terminal_recovery_required(
         ),
     }
     .map_err(bot_recovery_verification_error)?;
+    // No terminal replica supplies a canonical prefix, but the walked map still
+    // has a validated scope, and the protected content within it is verified.
+    let protected = verify_protected_walk(source, tape_uuid, block_size, mode)?;
     Ok(TerminalIndexVerificationOutcome::RecoveryRequired(
         Box::new(TerminalIndexRecoveryRequired {
             measured_eod,
             bot_recovery,
             replicas,
             detail,
+            protected,
         }),
     ))
 }
@@ -1314,10 +1613,14 @@ fn verify_terminal_index_strict(
 
     let mut replica_summaries = Vec::with_capacity(usize::from(TERMINAL_INDEX_REPLICA_COUNT));
     let mut edition: Option<TapeIndexEditionPlan> = None;
+    // The structural rows of the validated replicas (they agree row by row
+    // with the measured prefix), which scope the protected-content pass.
+    let mut rows: Vec<TapeIndexReplicaMapEntry> = Vec::new();
     for ordinal in 1..=TERMINAL_INDEX_REPLICA_COUNT {
         let envelope = validate_member_envelope(source, tape_uuid, block_size, layout, ordinal)
             .map_err(|error| member_error_to_verification(ordinal, error))?;
         let mut entry_index = 0usize;
+        let mut replica_rows_seen = Vec::new();
         let mut canonical_mismatch = None;
         let summary = validate_member_payload(
             source,
@@ -1339,6 +1642,7 @@ fn verify_terminal_index_strict(
                             .expect("mismatch detail was just populated"),
                     });
                 }
+                replica_rows_seen.push(entry.clone());
                 entry_index = entry_index.checked_add(1).ok_or(
                     TapeIndexReplicaError::ArithmeticOverflow {
                         context: "full verification canonical row index",
@@ -1366,6 +1670,9 @@ fn verify_terminal_index_strict(
                 }
             }
         })?;
+        if rows.is_empty() {
+            rows = replica_rows_seen;
+        }
         if entry_index != physical_prefix.len() {
             return Err(TerminalIndexVerificationError::CanonicalMapMismatch {
                 ordinal,
@@ -1406,6 +1713,15 @@ fn verify_terminal_index_strict(
     let replicas: [TapeIndexReplicaPayloadSummary; 3] = replica_summaries
         .try_into()
         .expect("terminal replica count is exactly three");
+    let protected = verify_protected_prefix(
+        source,
+        tape_uuid,
+        block_size,
+        &walked,
+        &edition,
+        &rows,
+        vec![],
+    )?;
     Ok(TerminalIndexCompleteEvidence {
         edition,
         replicas,
@@ -1414,6 +1730,7 @@ fn verify_terminal_index_strict(
         verified_prefix_tape_file_count: prefix_count,
         verified_prefix_record_count,
         measured_tape_file_count: walked.map.tape_file_count(),
+        protected,
     })
 }
 
@@ -2723,6 +3040,37 @@ mod tests {
         }
     }
 
+    /// A map is a terminal replica's only through the replica's own rows,
+    /// checked against the edition's canonical map digest: another set of rows
+    /// is refused, and no public setter relabels a catalog or walked map.
+    #[test]
+    fn terminal_replica_maps_come_only_from_the_replicas_rows() {
+        let counts = TapeIndexReplicaCounts {
+            structural_entry_count: 1,
+            object_row_count: 0,
+        };
+        let records = checked_tape_index_replica_layout(BLOCK_SIZE, counts)
+            .unwrap()
+            .replica_record_count;
+        let layout = TerminalTailLayout::new(0, BLOCK_SIZE, 1, 2, records, 3).unwrap();
+        let edition = edition_plan(layout, [0x72; 16]);
+        let mut rows = Vec::new();
+        BotOnlyRows
+            .visit_structural_entries(&mut |row| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let scoped = scoped_map_from_terminal_replica(&edition, &rows).unwrap();
+        assert_eq!(
+            scoped.map_source(),
+            crate::filemark_map::MapSource::TerminalReplica
+        );
+        let mut other = rows.clone();
+        other[0].block_count = 2;
+        assert!(scoped_map_from_terminal_replica(&edition, &other).is_err());
+    }
+
     #[test]
     fn full_verify_walks_prefix_and_validates_three_replicas_and_two_gaps() {
         let fixture = triple_fixture();
@@ -3498,11 +3846,18 @@ mod tests {
         let mut medium_source =
             RecordingSource::new(fixture.records.clone()).with_read_fault(0, TestReadFault::Medium);
         let medium_outcome = verify_terminal_index_full(&mut medium_source, &TAPE_UUID, BLOCK_SIZE)
-            .expect("BOT medium damage remains a typed recovery outcome");
-        assert!(matches!(
+            .expect("BOT medium damage remains a typed outcome");
+        // The damaged bootstrap is prefix damage: the replicas' rows agree with
+        // the walk, so the terminal route stands, the damage is a finding, and
+        // with no bootstrap or supplied scheme the protected pass is not
+        // performed.
+        assert!(!matches!(
             medium_outcome,
             TerminalIndexVerificationOutcome::RecoveryRequired(_)
         ));
+        assert!(!medium_outcome.protected().prefix_damage.is_empty());
+        assert!(medium_outcome.protected().not_performed.is_some());
+        assert!(!medium_outcome.is_complete_tape());
 
         for fault in [
             TestReadFault::DeferredFixedMedium,

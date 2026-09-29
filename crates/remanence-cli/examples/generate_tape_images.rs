@@ -92,7 +92,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/rem-parity-terminal-index-draft/tape-images");
-    let mut emitted = BTreeSet::from([PathBuf::from("expected-cases.json")]);
+    // Erratum set E4's overlay for existing damage cases is a source, like the
+    // expected cases; it is read by the executor and never generated.
+    let mut emitted = BTreeSet::from([
+        PathBuf::from("expected-cases.json"),
+        PathBuf::from("expected-e4.json"),
+    ]);
     let source: Value = serde_json::from_str(EXPECTATIONS)?;
     // Preserve each source case's literal JSON rather than synthesizing outcomes.
     let literal_cases: BTreeMap<String, &str> = EXPECTATIONS
@@ -182,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check,
         &mut emitted,
     )?;
-    artifact(&root, "README.md", b"# Full-tape review candidates\n\nReview-only REM-PARITY generation-2 fixtures. These are not publication artifacts. Image bytes are pinned by size and SHA-256 per tape file and for the concatenation of all data records in MANIFEST.tsv. Filemarks and EOD are structural expectations, not bytes in those streams; an unterminated tail has no filemark. Image streams are regenerated, never checked in. REM-PARITY's companion archive will carry the bytes at freeze.\n\nRun `cargo run -p remanence-cli --example generate_tape_images` to regenerate metadata, or append `-- --check` to compare every digest and descriptor. Inputs record the complete byte-deciding recipe, including repeat-byte payloads, REM-OBJECT options, diagnostics, checkpoints and stop points. The second edition uses the same recipe except its explicit edition id and sequence, and replaces only replica B.\n\nexpected-cases.json is the frozen specification-authored source. Per-case expected.json preserves its case verbatim, including pinned and sections. Never derive expectations from executor results. The executor runs as damage_vectors in the workspace suite; `cargo test -p remanence-cli --lib damage_vectors -- --nocapture` reports every outcome. Copy-health annotations and note/informative fields are informative. Unpinned cases execute but do not decide a pass. Disagreements remain failing pending specification review. Fault maps include physical and file-relative addresses; failed data addresses also produce real medium errors. Record faults replace one record by a record of a stated length (the original's leading bytes, or the original followed by zero bytes) and edit bytes within it, rebuilding a bootstrap's payload and recomputing or leaving stale its two CRCs as the case states; the fault map records every resolved edit with its old and new bytes. A case with observations runs the reader once per observation, each with its own supplied values or none. Such a case's expected outcome gives each observation's outcome, written from the specification text alone; one that reads pending, or that the executor does not know, fails the case.\n", check, &mut emitted)?;
+    artifact(&root, "README.md", b"# Full-tape review candidates\n\nReview-only REM-PARITY generation-2 fixtures. These are not publication artifacts. Image bytes are pinned by size and SHA-256 per tape file and for the concatenation of all data records in MANIFEST.tsv. Filemarks and EOD are structural expectations, not bytes in those streams; an unterminated tail has no filemark. Image streams are regenerated, never checked in. REM-PARITY's companion archive will carry the bytes at freeze.\n\nRun `cargo run -p remanence-cli --example generate_tape_images` to regenerate metadata, or append `-- --check` to compare every digest and descriptor. Inputs record the complete byte-deciding recipe, including repeat-byte payloads, REM-OBJECT options, diagnostics, checkpoints and stop points. The second edition uses the same recipe except its explicit edition id and sequence, and replaces only replica B.\n\nexpected-cases.json is the frozen specification-authored source. Per-case expected.json preserves its case verbatim, including pinned and sections. Never derive expectations from executor results. The executor runs as damage_vectors in the workspace suite; `cargo test -p remanence-cli --lib damage_vectors -- --nocapture` reports every outcome. Copy-health annotations and note/informative fields are informative. Unpinned cases execute but do not decide a pass. Disagreements remain failing pending specification review. Fault maps include physical and file-relative addresses; failed data addresses also produce real medium errors. Record faults replace one record by a record of a stated length (the original's leading bytes, or the original followed by zero bytes) and edit bytes within it, rebuilding a bootstrap's payload and recomputing or leaving stale its two CRCs as the case states; the fault map records every resolved edit with its old and new bytes. A sidecar copy's canonical metadata hash and CRCs can be recomputed after an edit (`sidecar_hash`, `sidecar_crcs`), and a ParityMap directory entry can be changed with the ParityMap re-encoded through the production codec (`parity_map_edits`), so every hash and CRC it carries is recomputed. A tape file can gain an extra record after its last record (`extra_records`, resolved to `record_insertions`), a filemark can be removed (`removed_filemark_after_tape_file`), and tape files can be appended after the image's last filemark (`appended_files`, each a list of foreign records, zeros with a stated first byte, or byte copies of a stated record, with or without a trailing filemark), or a replica A of a second edition planned as a later tape file (`second_edition_replica`); every such key is explicit, and an unknown key fails a run. A case with observations runs the reader once per observation, each with its own supplied values or none. Such a case's expected outcome gives each observation's outcome, written from the specification text alone; one that reads pending, or that the executor does not know, fails the case.\n", check, &mut emitted)?;
     artifact(
         &root,
         "resume/expected-cases.json",
@@ -279,15 +284,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     // Erratum set E2 overrides pinned expectations without editing the frozen
     // sources; it also makes the cases it unblocks executable.
-    let erratum_bytes_e2 = fs::read(root.join("negatives/erratum-e2.json"))?;
-    let errata = negatives::erratum::parse(&erratum_bytes_e2)?;
-    artifact(
-        &root,
-        "negatives/erratum-e2.json",
-        &erratum_bytes_e2,
-        check,
-        &mut emitted,
-    )?;
+    // Erratum set E4 replaces E2's expectation for the vectors that the owner's
+    // Q9 and Q10 rulings decide; each set is its own file.
+    let mut errata = negatives::erratum::Errata::default();
+    for path in negatives::erratum::paths() {
+        let bytes = fs::read(&path)?;
+        let set = negatives::erratum::parse(&bytes)?;
+        errata.entries.extend(set.entries);
+        artifact(
+            &root,
+            &format!("negatives/{}", path.file_name().unwrap().to_string_lossy()),
+            &bytes,
+            check,
+            &mut emitted,
+        )?;
+    }
     let negative_source = parsed_negatives;
     let mut negative_manifest =
         String::from("case\tartifact\ttape_file\tblock_within_file\tbytes\tsha256\n");

@@ -1,0 +1,27 @@
+{
+  "appended_files": [
+    {
+      "records": [
+        {
+          "first_byte": "58",
+          "length": 262144,
+          "sha256": "2c6afa39a4b3a0643a0da0b1ceb30be5cbea7b59d078ab0f3d74f1a4ab0f9337",
+          "source": "foreign"
+        },
+        {
+          "length": 262144,
+          "record_index": 2,
+          "sha256": "b0d124b783a23209827e07c6ad82616b7bdd341ea8847ee5594094889c2ab928",
+          "source": "copy_of",
+          "tape_file": 8
+        }
+      ],
+      "trailing_filemark": true
+    }
+  ],
+  "failed_data_addresses": [],
+  "hints": null,
+  "image": "a4-minimal",
+  "removed_filemark_after_tape_file": 5,
+  "unreadable_records": []
+}

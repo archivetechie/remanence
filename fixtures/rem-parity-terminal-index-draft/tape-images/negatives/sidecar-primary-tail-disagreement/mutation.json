@@ -40,7 +40,11 @@
     }
   ],
   "entry_points": [
-    "parse_sidecar_tape_file (copy agreement after footer validation)"
+    "parse_sidecar_index_blocks (the primary copy, then the tail copy, each on its own)",
+    "recover_ordinal_from_sidecar (the map from the validated terminal replicas' structural rows)",
+    "verify_sidecar (a Verifier's full verification: footer, both copies, the acquired index, every data block and parity shard)",
+    "read_terminal_index_inventory (no off-tape state; prefix records present, their bytes unread)",
+    "scan_reconstruct_filemark_map_with_report (device report injected by the raw source)"
   ],
-  "target_role": "SidecarAgreement"
+  "target_role": "SidecarCopies"
 }

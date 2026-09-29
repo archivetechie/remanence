@@ -1,5 +1,5 @@
 {
-  "description": "The opaque ids under which the second implementation decided the damage cases before it saw any expected outcome (decisions.json), and the repository case each stands for. decisions-real-ids.json equals decisions.json under this mapping. The e1 and e2 cases' ids are already opaque and map to themselves.",
+  "description": "The opaque ids under which the second implementation decided the damage cases before it saw any expected outcome (decisions.json), and the repository case each stands for. decisions-real-ids.json equals decisions.json under this mapping. The e1, e2 and e3 cases' ids are already opaque and map to themselves.",
   "mapping": {
     "case-01": "replicas-a-b",
     "case-02": "object-head",
@@ -44,6 +44,19 @@
     "e2-01": "e2-01",
     "e2-02": "e2-02",
     "e2-03": "e2-03",
-    "e2-04": "e2-04"
+    "e2-04": "e2-04",
+    "e2-08": "e2-08",
+    "e2-09": "e2-09",
+    "e2-10": "e2-10",
+    "e2-11": "e2-11",
+    "e2-12": "e2-12",
+    "e2-13": "e2-13",
+    "e3-01": "e3-01",
+    "e3-02": "e3-02",
+    "e3-03": "e3-03",
+    "e3-04": "e3-04",
+    "e3-05": "e3-05",
+    "e3-06": "e3-06",
+    "e3-07": "e3-07"
   }
 }

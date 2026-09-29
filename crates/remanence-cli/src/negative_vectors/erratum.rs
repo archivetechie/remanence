@@ -1,12 +1,17 @@
-//! Erratum set E2: overrides of pinned negative expectations, written from the
-//! REM-PARITY text alone by a separate author. The frozen sources are never
-//! edited; each override names its case, variant and executor observation,
-//! states the expectation it replaces, and is reported as ERRATUM.
+//! Erratum sets E2 and E4: overrides of pinned negative expectations, written
+//! from the REM-PARITY text alone by separate authors. The frozen sources are
+//! never edited; each override names its case, variant and executor
+//! observation, states the expectation it replaces, and is reported as ERRATUM.
+//! E4's entries replace E2's for the vectors the owner's rulings Q9 and Q10
+//! decide; each set is its own file, and no observation is overridden twice.
 use super::*;
 
-/// The erratum file, beside the frozen negative sources.
-pub fn path() -> PathBuf {
-    fixture_root().join("tape-images/negatives/erratum-e2.json")
+/// The erratum files, beside the frozen negative sources: E2, then E4.
+pub fn paths() -> [PathBuf; 2] {
+    [
+        fixture_root().join("tape-images/negatives/erratum-e2.json"),
+        fixture_root().join("tape-images/negatives/erratum-e4.json"),
+    ]
 }
 
 /// One override of one executor observation.
@@ -48,6 +53,22 @@ pub struct Errata {
 /// The compared outcome of an author's entry: a Section 15 name, a scoped
 /// metadata-unavailable outcome, or `ACCEPTED` when the author names no error.
 fn outcome_of(expected: &Value) -> Result<String, String> {
+    // Erratum set E4 states the outcome, and names the error without its epoch
+    // (`SidecarMetadataUnavailable`); the outcome carries the epoch.
+    if let Some(outcome) = expected.get("outcome").and_then(Value::as_str) {
+        return match &expected["error"] {
+            Value::Null => Ok("ACCEPTED".into()),
+            Value::String(name) if name == "SidecarMetadataUnavailable" => {
+                let epoch = outcome
+                    .strip_prefix("SidecarMetadataUnavailable{epoch_id: ")
+                    .and_then(|s| s.split_once('}'))
+                    .and_then(|(epoch, _)| epoch.parse::<u64>().ok())
+                    .ok_or_else(|| format!("E4 outcome without an epoch: {outcome}"))?;
+                Ok(format!("SidecarMetadataUnavailable{{epoch_id: {epoch}}}"))
+            }
+            error => outcome_of(&json!({"error": error})),
+        };
+    }
     match &expected["error"] {
         Value::Null => Ok("ACCEPTED".into()),
         Value::String(name) => {
@@ -147,7 +168,7 @@ pub fn parse(bytes: &[u8]) -> Result<Errata, String> {
             {
                 if !matches!(
                     key.as_str(),
-                    "result" | "error" | "sections" | "quotes" | "open"
+                    "result" | "error" | "sections" | "quotes" | "open" | "outcome" | "derivation"
                 ) {
                     return Err(format!("unknown author key {key}"));
                 }
@@ -178,9 +199,31 @@ pub fn parse(bytes: &[u8]) -> Result<Errata, String> {
     Ok(errata)
 }
 
-/// Read the erratum set from the fixture tree.
+/// Read the erratum sets from the fixture tree. No observation may be
+/// overridden by two entries, in one set or across them.
 pub fn load() -> Result<Errata, String> {
-    parse(&fs::read(path()).map_err(|e| e.to_string())?)
+    let mut all = Errata::default();
+    let mut seen = BTreeSet::new();
+    for path in paths() {
+        let set = parse(&fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?)?;
+        for entry in &set.entries {
+            for key in entry.observations.keys() {
+                if !seen.insert((
+                    entry.source.clone(),
+                    entry.case.clone(),
+                    entry.variant.clone(),
+                    key.clone(),
+                )) {
+                    return Err(format!(
+                        "erratum override in two sets: {}/{} [{key}]",
+                        entry.case, entry.variant
+                    ));
+                }
+            }
+        }
+        all.entries.extend(set.entries);
+    }
+    Ok(all)
 }
 
 impl Errata {
@@ -199,8 +242,10 @@ impl Errata {
         variant: &str,
         key: &str,
     ) -> Option<(&ErratumEntry, &ErratumObservation)> {
-        let entry = self.entry(source, case, variant)?;
-        Some((entry, entry.observations.get(key)?))
+        self.entries
+            .iter()
+            .filter(|e| e.source == source && e.case == case && e.variant == variant)
+            .find_map(|entry| Some((entry, entry.observations.get(key)?)))
     }
 
     /// Every entry must replace exactly the frozen expectation it names, so a

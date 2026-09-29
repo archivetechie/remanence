@@ -268,13 +268,16 @@ pub enum SidecarMetadataHealth {
     ///
     /// Audit case for losing the sidecar primary header.
     PrimaryHeaderLost,
+    /// The primary copy was usable and an available directory entry vouched
+    /// for it, so the tail copy was never read: nothing is recorded as lost.
+    TailCopyNotRead,
 }
 
 impl SidecarMetadataHealth {
     /// Whether the sidecar remained usable only because one replicated metadata
     /// copy survived.
     pub fn is_degraded(self) -> bool {
-        self != Self::BothCopiesUsable
+        !matches!(self, Self::BothCopiesUsable | Self::TailCopyNotRead)
     }
 }
 

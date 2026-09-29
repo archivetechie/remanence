@@ -843,6 +843,7 @@ fn recover_and_verify(
                 kind: match region.kind {
                     ScanDamageKind::UnreadableTapeFileHead => "unreadable_tape_file_head",
                     ScanDamageKind::ClassificationCountMismatch => "classification_count_mismatch",
+                    ScanDamageKind::ClassificationTailMismatch => "classification_tail_mismatch",
                     ScanDamageKind::InvalidTerminalControl => "invalid_terminal_control",
                     ScanDamageKind::WrongLengthTapeFileHead => "wrong_length_tape_file_head",
                 },

@@ -46,7 +46,9 @@
     }
   ],
   "entry_points": [
-    "scan_reconstruct_filemark_map_with_report (BOT Scanner; footer medium error)"
+    "scan_reconstruct_filemark_map_with_report (BOT Scanner; footer medium error)",
+    "recover_ordinal_from_sidecar (the footer unreadable; the directory entry decides)",
+    "verify_sidecar (a Verifier's full verification; footer medium error)"
   ],
   "faults": [
     {

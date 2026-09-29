@@ -284,6 +284,37 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 16,
+                "bytes": 16,
+                "reason": "tape_uuid: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 80,
+                "bytes": 1,
+                "reason": "CBOR payload byte: xor 01",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the header's tape UUID is impossible or disagrees with the supplied values"
         ]
@@ -291,6 +322,37 @@
       "no supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 16,
+                "bytes": 16,
+                "reason": "tape_uuid: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 80,
+                "bytes": 1,
+                "reason": "CBOR payload byte: xor 01",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "read size 262144: NoBootstrapFound: payload CRC does not verify",
@@ -306,6 +368,31 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 32,
+                "bytes": 4,
+                "reason": "block_size_bytes (u32 BE) = 524288: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the header's block size is impossible or disagrees with the supplied values"
         ]
@@ -313,6 +400,31 @@
       "no supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 32,
+                "bytes": 4,
+                "reason": "block_size_bytes (u32 BE) = 524288: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "read size 262144: NoBootstrapFound: block_size_bytes differs from the configured read size",
@@ -328,6 +440,31 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 8,
+                "bytes": 2,
+                "reason": "schema_major (u16 BE) = 3: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the header's format major is impossible or disagrees with the supplied values"
         ]
@@ -335,6 +472,31 @@
       "no supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 8,
+                "bytes": 2,
+                "reason": "schema_major (u16 BE) = 3: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "read size 262144: BootstrapParse: schema_major 3",
@@ -350,6 +512,31 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 36,
+                "bytes": 8,
+                "reason": "sequence (u64 BE) = 1: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the header's sequence is impossible or disagrees with the supplied values"
         ]
@@ -361,6 +548,31 @@
       "supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 12,
+                "bytes": 4,
+                "reason": "flags (u32 BE) with bit 0 (no-parity) set: set",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 48,
+                "bytes": 8,
+                "reason": "header CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "header CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "supplied block size 262144: the header's no-parity flag is impossible or disagrees with the supplied values"
@@ -374,6 +586,31 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 56,
+                "bytes": 138,
+                "reason": "replacement payload (scheme)",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 194,
+                "bytes": 8,
+                "reason": "payload CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "payload CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the parity scheme disagrees with the supplied scheme"
         ]
@@ -385,6 +622,31 @@
       "supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 56,
+                "bytes": 138,
+                "reason": "replacement payload (key_order, scheme)",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 194,
+                "bytes": 8,
+                "reason": "payload CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "payload CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "supplied block size 262144: a decodable parity scheme disagrees with the supplied scheme",
@@ -399,6 +661,31 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 56,
+                "bytes": 138,
+                "reason": "replacement payload (drive_compression)",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 194,
+                "bytes": 8,
+                "reason": "payload CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "payload CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: a decodable drive_compression is true on a parity tape",
           "the payload breaks a later rule of Section 8 (drive_compression true on a parity bootstrap)"
@@ -407,6 +694,31 @@
       "no supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 56,
+                "bytes": 138,
+                "reason": "replacement payload (drive_compression)",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 194,
+                "bytes": 8,
+                "reason": "payload CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "payload CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "read size 262144: DriveCompressionEnabled: drive_compression true on a parity bootstrap"
@@ -420,6 +732,17 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the first 1000 bytes of the original record, 1000 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 1000,
+            "construction": "the first 1000 bytes of the original record",
+            "edits": [],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the record is 1000 bytes, not the supplied block size 262144"
         ]
@@ -431,6 +754,17 @@
       "supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 524288,
+            "construction": "the original record followed by 262144 zero bytes",
+            "edits": [],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "supplied block size 262144: the record is 524288 bytes, not the supplied block size 262144"
@@ -444,6 +778,24 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the first 40 bytes of the original record, 40 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 40,
+            "construction": "the first 40 bytes of the original record",
+            "edits": [
+              {
+                "offset": 0,
+                "bytes": 1,
+                "reason": "magic byte 0: xor 01",
+                "old_bytes_agree": true
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the record is 40 bytes, not the supplied block size 262144"
         ]
@@ -455,6 +807,24 @@
       "supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 0,
+                "bytes": 1,
+                "reason": "magic byte 0: xor 01",
+                "old_bytes_agree": true
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "supplied block size 262144: the magic is missing or the header CRC fails"
@@ -482,6 +852,24 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 48,
+                "bytes": 1,
+                "reason": "crc64_header byte 0: xor 01",
+                "old_bytes_agree": true
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the magic is missing or the header CRC fails"
         ],
@@ -507,6 +895,24 @@
       "supplied values": {
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+        ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 80,
+                "bytes": 1,
+                "reason": "CBOR payload byte: xor 01",
+                "old_bytes_agree": true
+              }
+            ],
+            "sha256_agrees": true
+          }
         ],
         "bootstrap_attempts": [
           "supplied block size 262144: the payload CRC fails or the payload runs past the block"
@@ -534,6 +940,31 @@
         "fault_notes": [
           "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
         ],
+        "record_edit_checks": [
+          {
+            "tape_file": 0,
+            "record_index": 0,
+            "lba": 0,
+            "length": 262144,
+            "construction": "the original record's length",
+            "edits": [
+              {
+                "offset": 56,
+                "bytes": 138,
+                "reason": "replacement payload (key_order)",
+                "old_bytes_agree": true
+              },
+              {
+                "offset": 194,
+                "bytes": 8,
+                "reason": "payload CRC recomputed",
+                "old_bytes_agree": true,
+                "recomputation": "payload CRC agrees with mine"
+              }
+            ],
+            "sha256_agrees": true
+          }
+        ],
         "bootstrap_attempts": [
           "supplied block size 262144: the payload breaks a later rule of Section 8 (bootstrap payload: CBOR map keys are duplicate or not in deterministic order)"
         ],
@@ -557,6 +988,17 @@
   "e2-01": {
     "fault_notes": [
       "record at LBA 2 (tape file 1 record 0) replaced: the first 1000 bytes of the original record, 1000 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 1,
+        "record_index": 0,
+        "lba": 2,
+        "length": 1000,
+        "construction": "the first 1000 bytes of the original record",
+        "edits": [],
+        "sha256_agrees": true
+      }
     ],
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
@@ -608,6 +1050,17 @@
     "fault_notes": [
       "record at LBA 3 (tape file 1 record 1) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
     ],
+    "record_edit_checks": [
+      {
+        "tape_file": 1,
+        "record_index": 1,
+        "lba": 3,
+        "length": 524288,
+        "construction": "the original record followed by 262144 zero bytes",
+        "edits": [],
+        "sha256_agrees": true
+      }
+    ],
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
     ],
@@ -658,6 +1111,17 @@
     "fault_notes": [
       "record at LBA 37 (tape file 8 record 2) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
     ],
+    "record_edit_checks": [
+      {
+        "tape_file": 8,
+        "record_index": 2,
+        "lba": 37,
+        "length": 524288,
+        "construction": "the original record followed by 262144 zero bytes",
+        "edits": [],
+        "sha256_agrees": true
+      }
+    ],
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
     ],
@@ -672,6 +1136,17 @@
   "e2-04": {
     "fault_notes": [
       "record at LBA 2 (tape file 1 record 0) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 1,
+        "record_index": 0,
+        "lba": 2,
+        "length": 524288,
+        "construction": "the original record followed by 262144 zero bytes",
+        "edits": [],
+        "sha256_agrees": true
+      }
     ],
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
@@ -688,6 +1163,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -700,6 +1177,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -712,6 +1191,8 @@
         "start_ordinal": 0,
         "end_ordinal": 4,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -724,6 +1205,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -736,6 +1219,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -748,6 +1233,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -760,6 +1247,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -772,6 +1261,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -784,6 +1275,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       }
     ],
@@ -806,6 +1299,1819 @@
         }
       }
     ]
+  },
+  "e2-08": {
+    "fault_notes": [
+      "record at LBA 11 (tape file 2 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 27 (tape file 4 record 0) replaced: the ParityMap re-encoded with the edited directory entry, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 28 (tape file 4 record 1) replaced: the ParityMap re-encoded with the edited directory entry, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 29 (tape file 4 record 2) replaced: the ParityMap re-encoded with the edited directory entry, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 2,
+        "record_index": 0,
+        "lba": 11,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 262136,
+            "bytes": 1,
+            "reason": "block0_crc64 (the index block's CRC): xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 4,
+        "record_index": 0,
+        "lba": 27,
+        "length": 262144,
+        "construction": "the ParityMap re-encoded with the edited directory entry",
+        "edits": [
+          {
+            "offset": 56,
+            "bytes": 32,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 262,
+            "bytes": 1,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 4,
+        "record_index": 1,
+        "lba": 28,
+        "length": 262144,
+        "construction": "the ParityMap re-encoded with the edited directory entry",
+        "edits": [
+          {
+            "offset": 56,
+            "bytes": 32,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 262,
+            "bytes": 1,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 4,
+        "record_index": 2,
+        "lba": 29,
+        "length": 262144,
+        "construction": "the ParityMap re-encoded with the edited directory entry",
+        "edits": [
+          {
+            "offset": 56,
+            "bytes": 32,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine"
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "SidecarMetadataUnavailable",
+        "stripe": null,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "directory entry disagrees with the map entry; no read is placed from it; footer unreadable (LBA 17); primary copy invalid (block 0 CRC); a final ParityMap validates, so the tail rescue from the terminal index does not apply"
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy invalid (block 0 CRC)",
+        "error": "SidecarParse",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "no header/index copy validates (directory entry disagrees with the map entry; no read is placed from it; footer unreadable (LBA 17); primary copy invalid (block 0 CRC); a final ParityMap validates, so the tail rescue from the terminal index does not apply)",
+        "error": "SidecarMetadataUnavailable",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
+  "e2-09": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); primary copy used; its hash equals the directory entry's",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
+  "e2-10": {
+    "fault_notes": [
+      "record at LBA 16 (tape file 2 record 5) replaced: the original record's length, 262144 bytes, 4 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 2,
+        "record_index": 5,
+        "lba": 16,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 264,
+            "bytes": 1,
+            "reason": "data CRC entry 0 of the tail copy: xor 01",
+            "old_bytes_agree": true
+          },
+          {
+            "offset": 152,
+            "bytes": 32,
+            "reason": "canonical_metadata_hash recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "header_crc64 recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          },
+          {
+            "offset": 262136,
+            "bytes": 8,
+            "reason": "block0_crc64 recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); primary copy used; its hash equals the directory entry's",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ]
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "the two copies diverge",
+        "error": "SidecarParse",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
+  "e2-11": {
+    "fault_notes": [
+      "record at LBA 16 (tape file 2 record 5) replaced: the original record's length, 262144 bytes, 4 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 2,
+        "record_index": 5,
+        "lba": 16,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 264,
+            "bytes": 1,
+            "reason": "data CRC entry 0 of the tail copy: xor 01",
+            "old_bytes_agree": true
+          },
+          {
+            "offset": 152,
+            "bytes": 32,
+            "reason": "canonical_metadata_hash recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "header_crc64 recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          },
+          {
+            "offset": 262136,
+            "bytes": 8,
+            "reason": "block0_crc64 recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "ParityMap does not validate (ParityMapParse: no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28))",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "SidecarMetadataUnavailable",
+        "stripe": null,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer unreadable (LBA 17); valid tail copy's hash differs from the primary's; nothing decides between them"
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "sidecar tape file 2",
+        "finding": "footer unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "the two copies diverge",
+        "error": "SidecarParse",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "no header/index copy validates (footer unreadable (LBA 17); valid tail copy's hash differs from the primary's; nothing decides between them)",
+        "error": "SidecarMetadataUnavailable",
+        "checks": "structure"
+      },
+      {
+        "component": "ParityMap tape file 4",
+        "finding": "no header copy validates (primary: medium error at LBA 27; tail: medium error at LBA 28)",
+        "error": "ParityMapParse",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
+  "e2-12": {
+    "fault_notes": [
+      "record at LBA 27 (tape file 4 record 0) replaced: the ParityMap re-encoded with the edited directory entry, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 28 (tape file 4 record 1) replaced: the ParityMap re-encoded with the edited directory entry, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 29 (tape file 4 record 2) replaced: the ParityMap re-encoded with the edited directory entry, 262144 bytes, 2 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 4,
+        "record_index": 0,
+        "lba": 27,
+        "length": 262144,
+        "construction": "the ParityMap re-encoded with the edited directory entry",
+        "edits": [
+          {
+            "offset": 56,
+            "bytes": 32,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 270,
+            "bytes": 1,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 4,
+        "record_index": 1,
+        "lba": 28,
+        "length": 262144,
+        "construction": "the ParityMap re-encoded with the edited directory entry",
+        "edits": [
+          {
+            "offset": 56,
+            "bytes": 32,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          },
+          {
+            "offset": 270,
+            "bytes": 1,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine; payload SHA-256 at 0x38 agrees with mine"
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 4,
+        "record_index": 2,
+        "lba": 29,
+        "length": 262144,
+        "construction": "the ParityMap re-encoded with the edited directory entry",
+        "edits": [
+          {
+            "offset": 56,
+            "bytes": 32,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)",
+            "old_bytes_agree": true,
+            "recomputation": "CRC at 0xC0 agrees with mine"
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 49 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "error",
+        "error": "SidecarMetadataUnavailable",
+        "stripe": null,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "the directory entry disagrees with the valid footer, so neither decides; primary copy is contradicted by the footer or the directory entry; tail copy is contradicted by the footer or the directory entry"
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "sidecar tape file 2",
+        "finding": "no header/index copy validates (the directory entry disagrees with the valid footer, so neither decides; primary copy is contradicted by the footer or the directory entry; tail copy is contradicted by the footer or the directory entry)",
+        "error": "SidecarMetadataUnavailable",
+        "checks": "structure"
+      },
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
+  "e2-13": {
+    "fault_notes": [
+      "record at LBA 12 (tape file 2 record 5) replaced: the original record's length, 262144 bytes, 3 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 2,
+        "record_index": 5,
+        "lba": 12,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 24,
+            "bytes": 1,
+            "reason": "epoch_id: xor 01",
+            "old_bytes_agree": true
+          },
+          {
+            "offset": 152,
+            "bytes": 32,
+            "reason": "canonical_metadata_hash recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          },
+          {
+            "offset": 192,
+            "bytes": 8,
+            "reason": "header_crc64 recomputed",
+            "old_bytes_agree": true,
+            "recomputation": "canonical metadata hash and both CRCs agree with mine (the copy parses under Sections 9.2 to 9.5)"
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "failed classification: sidecar tail copy differs from its footer (Section 12.3 item 6); not recognised, so item 7 applies: Object by elimination; identified as a sidecar by the second pass",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": "sidecar tail copy differs from its footer (Section 12.3 item 6)",
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 19); last block unreadable",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 27); last block unreadable",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 35); last block unreadable",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "sidecar tape file 2",
+        "finding": "primary copy unreadable (medium error)",
+        "error": "TapeIo",
+        "checks": "structure"
+      },
+      {
+        "component": "sidecar tape file 2",
+        "finding": "no header/index copy validates (primary copy unreadable (LBA 7); tail copy is contradicted by the footer or the directory entry)",
+        "error": "SidecarMetadataUnavailable",
+        "checks": "structure"
+      }
+    ]
+  },
+  "e3-01": {
+    "fault_notes": [
+      "a 1-byte record of 0x00 inserted after record 2 of tape file 5 (before the record now at LBA 26); every later record moves up by one"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 38 records its position as 37; footer at LBA 30 records its position as 29; footer at LBA 21 plans EOD 39, before the tape's EOD 40)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 4,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 28,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 32,
+        "count": 3,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 36,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
+      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e3-02": {
+    "fault_notes": [
+      "appended file 0 record 0 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 1 at LBA 40: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0: no trailing filemark; the tape ends after LBA 40"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 37 plans EOD 39, before the tape's EOD 41; footer at LBA 29 plans EOD 39, before the tape's EOD 41; footer at LBA 21 plans EOD 39, before the tape's EOD 41)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 9,
+        "start": 39,
+        "count": 2,
+        "kind": 0,
+        "note": "Object by elimination; follows the exact terminal suffix, so not admitted as an Object (Section 12.6)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": true,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [
+      "tape file 9: missing trailing filemark before EOD"
+    ],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e3-03": {
+    "fault_notes": [
+      "filemark at LBA 34 removed; later records move down by one",
+      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 1 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0: trailing filemark at LBA 40"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 29 plans EOD 39, before the tape's EOD 41; footer at LBA 21 plans EOD 39, before the tape's EOD 41)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 6,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 38,
+        "count": 2,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e3-04": {
+    "fault_notes": [
+      "filemark at LBA 26 removed; later records move down by one",
+      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 1 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0: trailing filemark at LBA 40"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 21 plans EOD 39, before the tape's EOD 41)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 6,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 30,
+        "count": 3,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 34,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 38,
+        "count": 2,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
+      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e3-05": {
+    "fault_notes": [
+      "filemark at LBA 26 removed; later records move down by one",
+      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 1 at LBA 39: copy_of, 262144 bytes, a copy of my build's tape file 8 record 2",
+      "appended file 0: trailing filemark at LBA 40"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 39 records its position as 37; footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 21 plans EOD 39, before the tape's EOD 41)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 6,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 30,
+        "count": 3,
+        "kind": 5,
+        "note": "damaged separation extent: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 34,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 38,
+        "count": 2,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: damaged separation extent: header plan differs from the measured file",
+      "B-C": "walk: damaged separation extent: header plan differs from the measured file"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e3-06": {
+    "fault_notes": [
+      "appended file 0 record 0 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 1 at LBA 40: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0: trailing filemark at LBA 41"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 37 plans EOD 39, before the tape's EOD 42; footer at LBA 29 plans EOD 39, before the tape's EOD 42)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 9,
+        "start": 39,
+        "count": 2,
+        "kind": 0,
+        "note": "Object by elimination; follows the exact terminal suffix, so not admitted as an Object (Section 12.6)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": true,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e3-07": {
+    "fault_notes": [
+      "filemark at LBA 38 removed; later records move down by one",
+      "appended file 0 record 0 at LBA 38: second_edition_replica, 262144 bytes, bytes not derivable from the file and the text (GAPS.md)",
+      "appended file 0 record 1 at LBA 39: second_edition_replica, 262144 bytes, bytes not derivable from the file and the text (GAPS.md)",
+      "appended file 0 record 2 at LBA 40: second_edition_replica, 262144 bytes, bytes not derivable from the file and the text (GAPS.md)",
+      "appended file 0: trailing filemark at LBA 41"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "undecidable: the record at LBA 40 is not derivable",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 6,
+        "kind": 4,
+        "note": "damaged terminal replica: header plan differs from the measured file",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    },
+    "verifier_prefix_findings": []
   },
   "editions-conflict": {
     "fault_notes": [],
@@ -865,6 +3171,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -877,6 +3185,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": "sidecar footer total 7 differs from the measured 11 blocks (Section 12.3 item 6)",
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -889,6 +3199,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -901,6 +3213,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -913,6 +3227,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -925,6 +3241,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -937,6 +3255,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -949,6 +3269,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       }
     ],
@@ -1264,6 +3586,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1276,6 +3600,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1288,6 +3614,8 @@
         "start_ordinal": 0,
         "end_ordinal": 4,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1300,6 +3628,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1312,6 +3642,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1324,6 +3656,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1336,6 +3670,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1348,6 +3684,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1360,6 +3698,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       }
     ],
@@ -1879,6 +4219,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1891,6 +4233,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1903,6 +4247,8 @@
         "start_ordinal": 0,
         "end_ordinal": 4,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1915,6 +4261,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1927,6 +4275,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1939,6 +4289,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1951,6 +4303,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1963,6 +4317,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -1975,6 +4331,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       }
     ],
@@ -2049,6 +4407,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2061,6 +4421,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2073,6 +4435,8 @@
         "start_ordinal": 0,
         "end_ordinal": 4,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2085,6 +4449,8 @@
         "start_ordinal": 4,
         "end_ordinal": 8,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2097,6 +4463,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2109,6 +4477,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2121,6 +4491,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2133,6 +4505,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2145,6 +4519,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       },
       {
@@ -2157,6 +4533,8 @@
         "start_ordinal": null,
         "end_ordinal": null,
         "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
         "parity_map": null
       }
     ],

@@ -1,0 +1,125 @@
+{
+  "failed_data_addresses": [
+    [
+      1,
+      0
+    ]
+  ],
+  "hints": null,
+  "image": "two-epoch",
+  "record_edits": [
+    {
+      "construction": "the original record's length",
+      "edits": [
+        {
+          "new_bytes": "0f",
+          "offset": 262136,
+          "old_bytes": "0e",
+          "reason": "block0_crc64 (the index block's CRC): xor 01"
+        }
+      ],
+      "lba": 11,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 0,
+      "sha256": "51b520c2be2a6a4d6a6a9cb00e22d3ef957f1cf09316a04be0fec3eae6da3c56",
+      "tape_file": 2
+    },
+    {
+      "construction": "the ParityMap re-encoded with the edited directory entry",
+      "edits": [
+        {
+          "new_bytes": "46e10c29114e25db78b81ed2865810cd76ef5414692a9fa26883611c868379fc",
+          "offset": 56,
+          "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "ed6d270315c80a1e",
+          "offset": 192,
+          "old_bytes": "30274b7578ea464c",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "08",
+          "offset": 262,
+          "old_bytes": "07",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        }
+      ],
+      "lba": 27,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 0,
+      "sha256": "95f9c28167092e67d8dc45b26b269fbf103e867fa23860866e8265db95aaa115",
+      "tape_file": 4
+    },
+    {
+      "construction": "the ParityMap re-encoded with the edited directory entry",
+      "edits": [
+        {
+          "new_bytes": "46e10c29114e25db78b81ed2865810cd76ef5414692a9fa26883611c868379fc",
+          "offset": 56,
+          "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "82227259f7d6ef2b",
+          "offset": 192,
+          "old_bytes": "5f681e2f9af4a379",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "08",
+          "offset": 262,
+          "old_bytes": "07",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        }
+      ],
+      "lba": 28,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 1,
+      "sha256": "4a917084c3016f83db8c84df9a3838c7ecd4ffe1dd4d9f309c9140c2dd81fb4e",
+      "tape_file": 4
+    },
+    {
+      "construction": "the ParityMap re-encoded with the edited directory entry",
+      "edits": [
+        {
+          "new_bytes": "46e10c29114e25db78b81ed2865810cd76ef5414692a9fa26883611c868379fc",
+          "offset": 56,
+          "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "c8a8ebcab43d560d",
+          "offset": 192,
+          "old_bytes": "15e287bcd91f1a5f",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        }
+      ],
+      "lba": 29,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 2,
+      "sha256": "507d2cdf2d07941a6df0017209d0bae35d95f5b0beccda7b9171fe97eb6b3019",
+      "tape_file": 4
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 2,
+      "record_index": 0,
+      "tape_file": 1
+    },
+    {
+      "filemark": false,
+      "lba": 17,
+      "record_index": 6,
+      "tape_file": 2
+    }
+  ]
+}

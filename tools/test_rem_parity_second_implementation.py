@@ -758,18 +758,35 @@ class SelectionTests(unittest.TestCase):
                 self.assertTrue(entry["apply"]["resolved"], entry["apply"]["checks_failed"])
                 self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
 
-    def test_a_foreign_replica_at_c_supplies_no_layout(self) -> None:
-        # Section 8.4 step 1: a footer supplies the layout only where it says
-        # it is, so the foreign footer at C is passed over and B's is used.
+    def test_a_second_edition_replica_conflicts_with_a_valid_replica_of_the_first(self) -> None:
+        # 8.5: a fully valid replica that differs from another fully valid replica in any edition-common field is
+        # TerminalIndexReplicaConflict; S4 differs from the profile's replica only in edition ID and sequence.
         statuses = {"S0": impl.parse_status("the profile's replica, unchanged"),
-                    "S4": impl.parse_status("at this position, the replica of the same position taken from the minimal "
-                                            "profile at the same block size, unchanged")}
-        decision = impl.selection_decision({"A": "S0", "B": "S0", "C": "S4"}, statuses)
-        self.assertEqual((decision["outcome"], decision["acceptable_selections"], decision["degraded"]),
-                         ("inventory", ["A", "B"], True))
-        self.assertFalse(decision.get("readings"))
-        decided = impl.selection_decision({"A": "S4", "B": "S0", "C": "S0"}, statuses)
-        self.assertEqual((decided["outcome"], decided["acceptable_selections"], decided["degraded"]), ("inventory", ["B", "C"], True))
+                    "S4": impl.parse_status("at this position, a second-edition replica: a replica that is locally "
+                                            "eligible at this position (its planned layout, recorded positions, counts and "
+                                            "every CRC and digest are valid for this tape) and differs from the profile's "
+                                            "replica at this position only in its edition id and edition sequence")}
+        self.assertEqual(statuses["S4"], {"class": "second-edition"})
+        for row in ({"A": "S0", "B": "S0", "C": "S4"}, {"A": "S4", "B": "S0", "C": "S0"}, {"A": "S4", "B": "S0", "C": "S4"}):
+            decision = impl.selection_decision(row, statuses)
+            self.assertEqual((decision["outcome"], decision["acceptable_selections"], decision["degraded"]),
+                             ("TerminalIndexReplicaConflict", [], None), row)
+        # All three of one edition, whichever it is, agree.
+        decision = impl.selection_decision({"A": "S4", "B": "S4", "C": "S4"}, statuses)
+        self.assertEqual((decision["outcome"], decision["acceptable_selections"]), ("inventory", ["A", "B", "C"]))
+
+    def test_a_second_edition_replica_differs_only_in_its_edition_fields(self) -> None:
+        inputs, terminal = impl.profile_build("multi-256k")
+        first = terminal.components[0]
+        second = impl.second_edition_stream("multi-256k", "replica-a.bin")
+        records = [second[i:i + inputs["block_size"]] for i in range(0, len(second), inputs["block_size"])]
+        self.assertEqual(len(records), len(first))
+        self.assertEqual(records[1], first[1])  # the payload records are the edition's, and unchanged
+        self.assertNotEqual(records[0], first[0])
+        frame = impl.parse_replica_frame(records[0], bytes.fromhex(inputs["tape_uuid"]), inputs["block_size"], 1)
+        old = impl.parse_replica_frame(first[0], bytes.fromhex(inputs["tape_uuid"]), inputs["block_size"], 1)
+        self.assertNotEqual(frame["edition_id"], old["edition_id"])
+        self.assertEqual((frame["ordinal"], frame["tuples"]), (old["ordinal"], old["tuples"]))
 
     def test_agreeing_valid_replicas_are_all_acceptable(self) -> None:
         statuses = {"S0": impl.parse_status("the profile's replica, unchanged")}
@@ -1159,6 +1176,224 @@ class ResumeInputTests(unittest.TestCase):
         path.write_text(json.dumps(case), encoding="utf-8")
         decision = impl.run_resume([path], SCRATCH / "resume-medium-out.json")["cases"]["resume-medium"]["decision"]
         self.assertEqual((decision["result"], decision["error"], decision["refused_at"]), ("refused", "TapeIo", "step 3"))
+
+
+# ---------------------------------------------------------------------------
+# F3: new fault keys, artifacts after the terminal suffix, the full verification.
+# ---------------------------------------------------------------------------
+
+
+class InsertionAndAppendTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+        cls.dir = SCRATCH / "f3"
+        cls.dir.mkdir(parents=True, exist_ok=True)
+
+    def base(self, **extra):
+        return dict({"failed_data_addresses": [], "hints": None, "image": "a4-minimal",
+                     "removed_filemark_after_tape_file": None, "unreadable_records": []}, **extra)
+
+    def foreign(self, length=262144):
+        data = b"X" + bytes(length - 1)
+        return {"first_byte": "58", "length": length, "sha256": hashlib.sha256(data).hexdigest(), "source": "foreign"}
+
+    def run_case(self, name, case):
+        path = self.dir / f"{name}.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        return impl.run_decide([path], self.dir / f"{name}-out.json")["cases"][name]
+
+    def test_every_new_key_is_checked_at_every_level(self) -> None:
+        good_insertion = {"after_record_index": 2, "fill": "00", "length": 1, "tape_file": 5,
+                          "sha256": hashlib.sha256(b"\x00").hexdigest()}
+        impl.validate_fault_map(self.base(record_insertions=[good_insertion]), "test")
+        bad = [self.base(record_insertions=[dict(good_insertion, surprise=1)]),
+               self.base(appended_files=[{"records": [self.foreign()], "trailing_filemark": True, "surprise": 1}]),
+               self.base(appended_files=[{"records": [dict(self.foreign(), surprise=1)], "trailing_filemark": True}]),
+               self.base(appended_files=[{"records": [dict(self.foreign(), source="unheard-of")], "trailing_filemark": True}]),
+               self.base(appended_files=[{"records": [self.foreign()]}])]
+        for case in bad:
+            with self.assertRaises(impl.FaultMapError):
+                impl.validate_fault_map(case, "test")
+
+    def test_an_insertion_moves_every_later_record_and_its_digest_is_checked(self) -> None:
+        insertion = {"after_record_index": 2, "fill": "00", "length": 1, "tape_file": 5,
+                     "sha256": hashlib.sha256(b"\x00").hexdigest()}
+        tape, _ = impl.damaged_tape_for(self.image, self.base(record_insertions=[insertion]))
+        start = self.image.file_start_lba(5)
+        self.assertEqual(tape.read(start + 3), b"\x00")
+        self.assertTrue(tape.is_filemark(start + 4))
+        self.assertEqual(tape.eod(), len(self.image.records()) + 1)
+        with self.assertRaises(impl.FaultMapError):
+            impl.damaged_tape_for(self.image, self.base(record_insertions=[dict(insertion, sha256="00" * 32)]))
+
+    def test_an_unreadable_record_keeps_its_image_lba_when_records_are_inserted(self) -> None:
+        insertion = {"after_record_index": 0, "fill": "00", "length": 1, "tape_file": 1,
+                     "sha256": hashlib.sha256(b"\x00").hexdigest()}
+        case = self.base(record_insertions=[insertion],
+                         unreadable_records=[{"filemark": False, "lba": 4, "record_index": 2, "tape_file": 1}])
+        tape, _ = impl.damaged_tape_for(self.image, case)
+        with self.assertRaises(impl.MediumError):
+            tape.read(5)  # image LBA 4 is now at position 5
+        self.assertEqual(tape.read(3), b"\x00")  # the inserted record
+
+    def test_appended_files_follow_the_tape_and_a_foreign_record_is_checked_by_its_digest(self) -> None:
+        case = self.base(appended_files=[{"records": [self.foreign(), self.foreign()], "trailing_filemark": False}])
+        tape, _ = impl.damaged_tape_for(self.image, case)
+        end = len(self.image.records())
+        self.assertEqual(tape.eod(), end + 2)
+        self.assertEqual(tape.read(end)[:2], b"X\x00")
+        bad = self.foreign()
+        bad["sha256"] = "00" * 32
+        with self.assertRaises(impl.FaultMapError):
+            impl.damaged_tape_for(self.image, self.base(appended_files=[{"records": [bad], "trailing_filemark": True}]))
+
+    def test_a_copy_of_a_record_is_my_own_build_of_it(self) -> None:
+        record = self.image.files[8].blocks[2]
+        copy_of = {"length": len(record), "record_index": 2, "sha256": hashlib.sha256(record).hexdigest(),
+                   "source": "copy_of", "tape_file": 8}
+        tape, _ = impl.damaged_tape_for(self.image, self.base(appended_files=[{"records": [copy_of], "trailing_filemark": True}]))
+        self.assertEqual(tape.read(len(self.image.records())), record)
+
+    def test_a_record_whose_bytes_cannot_be_derived_is_not_read(self) -> None:
+        # GAPS: a second-edition replica's ordinal, layout and digests are not stated.
+        replica = {"length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9, "record_index": 0,
+                   "sha256": "00" * 32, "source": "second_edition_replica"}
+        case = self.base(appended_files=[{"records": [replica], "trailing_filemark": True}])
+        tape, _ = impl.damaged_tape_for(self.image, case)
+        self.assertEqual(tape.underivable, {len(self.image.records())})
+        with self.assertRaises(impl.Underivable):
+            tape.read(len(self.image.records()))
+
+    def test_spacing_back_from_eod_crosses_records_to_the_nearest_filemark(self) -> None:
+        # 8.4 step 1: a tape whose last file lacks its filemark still spaces back over one filemark,
+        # crossing the records after it, and reads the record before it.
+        case = self.base(appended_files=[{"records": [self.foreign(), self.foreign()], "trailing_filemark": False}])
+        tape, _ = impl.damaged_tape_for(self.image, case)
+        layout, note = impl.discover_layout(tape, self.image.tape_uuid, self.image.block_size)
+        self.assertIsNone(layout)
+        self.assertIn("plans EOD 39, before the tape's EOD 41", note)
+
+    def test_an_object_after_the_exact_terminal_suffix_is_not_admitted_as_an_object(self) -> None:
+        # 12.6: "A structural artifact after the exact terminal suffix is nonconformant and MUST NOT be admitted as an Object."
+        case = self.base(appended_files=[{"records": [self.foreign(), self.foreign()], "trailing_filemark": True}])
+        decision = self.run_case("artifact", case)
+        self.assertEqual(decision["scanner"]["result"], "BotStructuralRecoveryRequired")
+        self.assertEqual(decision["walk"]["classes"]["9"], impl.ARTIFACT_CLASS)
+        self.assertEqual(decision["walk"]["classes"]["1"], "Object")
+        full = decision["verifier-full"]
+        self.assertIs(full["terminal_suffix"]["complete"], False)
+        self.assertTrue(any("after the exact terminal suffix" in f["finding"] for f in full["other_findings"]))
+
+    def test_a_missing_trailing_filemark_is_structural_damage(self) -> None:
+        # 12.2: "a zero-block file or a missing trailing filemark is structural damage".
+        case = self.base(appended_files=[{"records": [self.foreign()], "trailing_filemark": False}])
+        decision = self.run_case("torn", case)
+        self.assertEqual(decision["walk"]["structural_damage"], ["tape file 9: missing trailing filemark before EOD"])
+
+    def test_an_object_after_a_broken_suffix_is_an_object_candidate(self) -> None:
+        # 12.3 item 7 applies when the five terminal files are not exact.
+        case = self.base(appended_files=[{"records": [self.foreign()], "trailing_filemark": True}],
+                         removed_filemark_after_tape_file=5)
+        decision = self.run_case("broken", case)
+        self.assertEqual(decision["walk"]["classes"]["8"], "Object")
+
+    def test_a_record_the_scanner_reads_first_and_cannot_derive_leaves_it_undecided(self) -> None:
+        replica = {"length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9, "record_index": 0,
+                   "sha256": "00" * 32, "source": "second_edition_replica"}
+        case = self.base(appended_files=[{"records": [replica], "trailing_filemark": True}])
+        decision = self.run_case("underivable", case)
+        self.assertEqual((decision["scanner"]["result"], decision["verifier"]["result"]), ("undecided", "undecided"))
+        self.assertEqual(decision["verifier-full"]["terminal_suffix"]["complete"], "undecided")
+        self.assertEqual(sorted(u["aspect"] for u in decision["undecided"]), ["scanner", "verifier"])
+        # A file whose head the walk must read, and cannot derive, has no classification: the walk's result is undecided.
+        self.assertEqual((decision["walk"]["classes"]["9"], decision["walk"]["result"]), ("undecided", "undecided"))
+
+    def test_a_walk_that_never_reads_the_underivable_records_is_decided(self) -> None:
+        # The file's head is C's own header; its count already differs from the plan (12.3 item 2), so the file keeps
+        # its control type, damaged, whatever the underivable records hold.
+        records = [{"length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9, "record_index": index,
+                    "sha256": "00" * 32, "source": "second_edition_replica"} for index in range(3)]
+        case = self.base(appended_files=[{"records": records, "trailing_filemark": True}],
+                         removed_filemark_after_tape_file=8)
+        decision = self.run_case("merged", case)
+        self.assertEqual(decision["scanner"]["result"], "undecided")
+        self.assertEqual(decision["walk"]["classes"]["8"], "TapeIndexReplica")
+        self.assertEqual(decision["walk"]["result"], "run")
+
+
+class FullVerificationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+        cls.dir = SCRATCH / "f3-verifier"
+        cls.dir.mkdir(parents=True, exist_ok=True)
+
+    def run_case(self, name, unreadable, failed=()):
+        case = {"failed_data_addresses": list(failed), "hints": None, "image": "a4-minimal",
+                "removed_filemark_after_tape_file": None,
+                "unreadable_records": [{"filemark": False, "lba": lba, "record_index": lba - self.image.file_start_lba(tf),
+                                        "tape_file": tf} for tf, lba in unreadable]}
+        path = self.dir / f"{name}.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        return impl.run_decide([path], self.dir / f"{name}-out.json")["cases"][name]
+
+    def test_a_healthy_tape_is_complete_and_every_block_and_shard_is_read(self) -> None:
+        full = self.run_case("healthy", [])["verifier-full"]
+        self.assertEqual((full["data_blocks_failed"], full["parity_shards_failed"], full["other_findings"]), ([], [], []))
+        self.assertEqual(full["terminal_suffix"]["complete"], True)
+        self.assertEqual((full["coverage"]["data_blocks_read"], full["coverage"]["parity_shards_read"]), (4, 4))
+
+    def test_a_failed_block_and_a_failed_shard_are_reported_by_address(self) -> None:
+        # 2.2: "a data block's tape-file position, or a parity shard's epoch, stripe and parity index".
+        sidecar = self.image.file_start_lba(2)
+        full = self.run_case("addresses", [(1, self.image.file_start_lba(1) + 2), (2, sidecar + 1 + 3)])["verifier-full"]
+        self.assertEqual([f["address"] for f in full["data_blocks_failed"]], [{"tape_file": 1, "block": 2}])
+        shards = [f["address"] for f in full["parity_shards_failed"]]
+        self.assertEqual(len(shards), 1)
+        self.assertEqual(set(shards[0]), {"epoch", "stripe", "parity_index"})
+        self.assertEqual(shards[0]["epoch"], 0)
+
+    def test_a_shard_is_read_and_reported_even_when_the_epochs_index_is_unavailable(self) -> None:
+        # 9.1 fixes total = 2H + P + 1 with P = S x m, so the parity region is located from the map entry; 13.3 step 4
+        # leaves the epoch metadata-unavailable, so the shard can be read but not checked against a CRC.
+        start = self.image.file_start_lba(2)
+        count = len(self.image.files[2].blocks)
+        header_blocks = [(2, start + 0), (2, start + count - 2), (2, start + count - 1)]
+        full = self.run_case("no-index", header_blocks + [(2, start + 2)])["verifier-full"]
+        self.assertEqual(full["coverage"]["epochs_without_index"], [0])
+        self.assertEqual(full["coverage"]["parity_shards_read_but_not_checkable"], 4)
+        self.assertEqual([f["address"]["epoch"] for f in full["parity_shards_failed"]], [0])
+        self.assertTrue(any(f["error"] == "SidecarMetadataUnavailable" for f in full["other_findings"]))
+
+    def test_an_invalid_separation_extent_keeps_the_suffix_from_complete(self) -> None:
+        # 10.6: "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+        full = self.run_case("separation", [(5, self.image.file_start_lba(5) + 1)])["verifier-full"]
+        self.assertIs(full["terminal_suffix"]["complete"], False)
+        self.assertTrue(any(f["component"] == "separation extent A-B" for f in full["other_findings"]))
+
+    def test_every_decision_carries_a_full_verification_observation(self) -> None:
+        case = SYNTHETIC_CASES["synthetic-replica-headers"]
+        path = self.dir / "synthetic.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        entry = impl.run_decide([path], self.dir / "synthetic-out.json")["cases"]["synthetic"]
+        self.assertEqual(set(entry["verifier-full"]), {"data_blocks_failed", "parity_shards_failed", "coverage",
+                                                       "other_findings", "terminal_suffix", "citations"})
+
+
+class ParityMapConstructionTests(unittest.TestCase):
+    def test_a_reencoded_parity_map_keeps_its_length(self) -> None:
+        self.assertTrue(impl._construction_matches(impl.PARITY_MAP_RECONSTRUCTION, 262144, 262144))
+        self.assertFalse(impl._construction_matches(impl.PARITY_MAP_RECONSTRUCTION, 1000, 262144))
+        self.assertFalse(impl._construction_matches("re-encoded some other way", 262144, 262144))
+
+    def test_a_recomputed_parity_map_hash_and_crc_are_compared_with_mine(self) -> None:
+        image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+        record = image.files[3].blocks[0]
+        self.assertIn("agrees with mine", impl._recomputed_check(record, 0xC0, record[0xC0:0xC8], image))
+        broken = bytearray(record)
+        broken[0x38] ^= 1
+        self.assertIn("differs from mine", impl._recomputed_check(bytes(broken), 0x38, bytes(broken[0x38:0x58]), image))
 
 
 if __name__ == "__main__":

@@ -14,7 +14,8 @@ use crate::codec::ReedSolomonCodec;
 use crate::durable::DurableBoundaryState;
 use crate::error::ParityError;
 use crate::filemark_map::{
-    FilemarkMap, MapScope, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    FilemarkMap, MapScope, MapSource, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry,
+    TapeFilePosition,
 };
 #[cfg(test)]
 use crate::mapping::{data_shards_per_epoch, ordinal_to_stripe};
@@ -101,9 +102,9 @@ struct BulkReadPlanItem {
 type BulkWindowCache = BTreeMap<BulkShardKey, Option<Vec<u8>>>;
 
 #[derive(Clone, Debug)]
-struct SidecarIndexRead {
-    index: DecodedSidecarIndex,
-    metadata_health: SidecarMetadataHealth,
+pub(crate) struct SidecarIndexRead {
+    pub(crate) index: DecodedSidecarIndex,
+    pub(crate) metadata_health: SidecarMetadataHealth,
 }
 
 /// Recover a contiguous object-local region through an epoch-scoped sidecar plan.
@@ -297,8 +298,14 @@ fn recover_ordinal_from_sidecar_inside_boundary(
     )?;
 
     source.configure_fixed_block_size(block_size)?;
-    let sidecar =
-        read_and_parse_sidecar_index(source, scoped_map, sidecar_entry, &tape_uuid, block_size)?;
+    let sidecar = read_and_parse_sidecar_index(
+        source,
+        scoped_map,
+        sidecar_entry,
+        scheme,
+        &tape_uuid,
+        block_size,
+    )?;
     validate_sidecar_for_recovery(
         &sidecar.index,
         sidecar_entry,
@@ -452,8 +459,14 @@ fn recover_epoch_region_from_sidecar(
         sidecar_entry.tape_file_number,
         epoch_start,
     )?;
-    let sidecar =
-        read_and_parse_sidecar_index(source, scoped_map, sidecar_entry, tape_uuid, block_size)?;
+    let sidecar = read_and_parse_sidecar_index(
+        source,
+        scoped_map,
+        sidecar_entry,
+        scheme,
+        tape_uuid,
+        block_size,
+    )?;
     validate_sidecar_for_recovery(&sidecar.index, sidecar_entry, scheme, epoch_id, block_size)?;
     let mut stripes: BTreeMap<u32, Vec<RequestedDataShard>> = BTreeMap::new();
     for (body_lba, ordinal) in request.ordinals {
@@ -894,10 +907,98 @@ pub(crate) fn stripe_for_sidecar_ordinal(
     ordinal_to_stripe_in_epoch(ordinal, epoch_id, start, real_data_shard_count, scheme)
 }
 
-fn read_and_parse_sidecar_index(
+/// The sidecar epoch directory's standing for one sidecar (REM-PARITY 13.3).
+enum DirectoryEvidence {
+    /// No final ParityMap validates, so the sidecar has no directory entry.
+    Absent,
+    /// A final ParityMap validates, but its entry for this sidecar is missing,
+    /// disagrees with the map entry, or fails a precondition of the
+    /// directory-assisted rescue: the entry is not available.
+    Unavailable,
+    /// An available entry: it agrees with the map entry in tape file, epoch,
+    /// protected range and block count, and `total = 2H + P + 1` with `H > 0`.
+    Available(SidecarEpochDirectoryEntry),
+}
+
+/// `P = S x m` (REM-PARITY 13.3, 9.1): the parity shard block count the scheme
+/// gives. S is u32 and m is u16, so the product fits in u64.
+pub(crate) fn scheme_parity_blocks(scheme: &ParityScheme) -> u64 {
+    u64::from(scheme.stripes_per_neighborhood) * u64::from(scheme.parity_blocks_per_stripe)
+}
+
+/// The sidecar geometry that `total = 2H + P + 1` fixes: `H = (total - 1 - P) / 2`
+/// with `total - 1 - P` even and `H` above zero, and the tail copy's start
+/// block `H + P`. The one place that computes it (13.3, Q9).
+pub(crate) fn sidecar_geometry_from_total(total: u64, parity: u64) -> Option<(u64, u64)> {
+    let rest = total.checked_sub(1)?.checked_sub(parity)?;
+    if rest % 2 != 0 || rest == 0 {
+        return None;
+    }
+    let h = rest / 2;
+    Some((h, h + parity))
+}
+
+/// Classify the directory's entry for one sidecar. The one place that decides
+/// whether an entry is available, shared with the directory-assisted rescue.
+/// A ParityMap that does not validate against this map (its scope exceeds the
+/// map) supplies no directory. When `tolerate_faults` is set, a fault while
+/// reading the ParityMap does not abort the acquisition: the footer decides.
+fn directory_evidence(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
     sidecar_entry: &TapeFileMapEntry,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    parity: u64,
+    tolerate_faults: bool,
+) -> Result<DirectoryEvidence, ParityError> {
+    let loaded_directory;
+    let directory = match scoped_map.sidecar_directory.as_ref() {
+        Some(directory) => directory,
+        None => {
+            loaded_directory = match read_final_sidecar_directory(
+                source,
+                &scoped_map.map,
+                tape_uuid,
+                block_size,
+            ) {
+                Ok(loaded) => loaded,
+                Err(ParityError::FilemarkMapDigestMismatch { .. }) => None,
+                // A device fault is tolerated when the footer decides; an
+                // internal failure (`Invariant`) is a defect and propagates.
+                Err(ParityError::TapeIo(_)) if tolerate_faults => None,
+                Err(error) => return Err(error),
+            };
+            match loaded_directory.as_ref() {
+                Some(directory) => directory,
+                None => return Ok(DirectoryEvidence::Absent),
+            }
+        }
+    };
+    if sidecar_entry.tape_file_number >= directory.directory_scope_tape_file_count {
+        return Ok(DirectoryEvidence::Unavailable);
+    }
+    Ok(directory
+        .entries
+        .iter()
+        .find(|entry| entry.tape_file_number == sidecar_entry.tape_file_number)
+        .filter(|entry| directory_entry_available(entry, sidecar_entry, parity))
+        .map_or(DirectoryEvidence::Unavailable, |entry| {
+            DirectoryEvidence::Available(entry.clone())
+        }))
+}
+
+/// Acquire one epoch's sidecar index (REM-PARITY 13.3).
+///
+/// Every route ends in one of two results: a usable copy with its health, or
+/// `SidecarMetadataUnavailable` for the epoch (step 4), whatever each copy's
+/// own failure was. Only a fault outside the copies (the directory's own
+/// read) is reported as itself.
+pub(crate) fn read_and_parse_sidecar_index(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    scheme: &ParityScheme,
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<SidecarIndexRead, ParityError> {
@@ -907,56 +1008,98 @@ fn read_and_parse_sidecar_index(
             sidecar_entry.tape_file_number
         )));
     }
-    let footer_block = match read_sidecar_block(
+    let parity = scheme_parity_blocks(scheme);
+    // Step 1: the footer, valid when it parses and its total matches the map.
+    let footer = read_sidecar_block(
         source,
         scoped_map,
         sidecar_entry,
         sidecar_entry.block_count - 1,
         block_size,
-    ) {
-        Ok(block) => block,
-        Err(_err) => {
-            return read_sidecar_index_without_footer(
+    )
+    .ok()
+    .and_then(|block| parse_sidecar_footer_block(&block, tape_uuid).ok())
+    .filter(|footer| footer.sidecar_total_block_count == sidecar_entry.block_count);
+    match footer {
+        Some(footer) => {
+            // The directory is consulted only to see whether an available
+            // entry disagrees with the valid footer; a fault while reading it
+            // does not abort an acquisition the footer decides.
+            let directory = directory_evidence(
                 source,
                 scoped_map,
                 sidecar_entry,
                 tape_uuid,
                 block_size,
-            )
-        }
-    };
-    let footer = match parse_sidecar_footer_block(&footer_block, tape_uuid) {
-        Ok(footer) => footer,
-        Err(_err) => {
-            return read_sidecar_index_without_footer(
+                parity,
+                true,
+            )?;
+            read_sidecar_index_by_footer(
                 source,
                 scoped_map,
                 sidecar_entry,
                 tape_uuid,
                 block_size,
+                &footer,
+                &directory,
+                parity,
             )
         }
-    };
-    if sidecar_entry.block_count != footer.sidecar_total_block_count {
-        // REM-PARITY 13.3 step 2: a footer that parses but contradicts the map
-        // entry is treated as an invalid footer, not as a hard stop — the same
-        // fall-through the unreadable and unparseable branches above take.
-        return read_sidecar_index_without_footer(
-            source,
-            scoped_map,
-            sidecar_entry,
-            tape_uuid,
-            block_size,
-        );
+        None => {
+            let directory = directory_evidence(
+                source,
+                scoped_map,
+                sidecar_entry,
+                tape_uuid,
+                block_size,
+                parity,
+                false,
+            )?;
+            read_sidecar_index_without_footer(
+                source,
+                scoped_map,
+                sidecar_entry,
+                scheme,
+                tape_uuid,
+                block_size,
+                &directory,
+            )
+        }
     }
+}
 
+/// Step 1: a valid footer decides, unless an available directory entry
+/// disagrees with it on the canonical metadata hash or on the tail copy's
+/// position. Then neither decides, and a copy that either contradicts is not
+/// used; every copy the footer vouches for is contradicted by the entry.
+/// There is no directory rescue after a valid footer.
+#[allow(clippy::too_many_arguments)]
+fn read_sidecar_index_by_footer(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    footer: &SidecarFooter,
+    directory: &DirectoryEvidence,
+    parity: u64,
+) -> Result<SidecarIndexRead, ParityError> {
+    if let DirectoryEvidence::Available(entry) = directory {
+        let entry_tail_start = u128::from(entry.sidecar_header_block_count) + u128::from(parity);
+        if entry.canonical_metadata_hash != footer.canonical_metadata_hash
+            || entry.sidecar_header_block_count != footer.sidecar_header_block_count
+            || entry_tail_start != u128::from(footer.tail_header_start_block)
+        {
+            return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
+        }
+    }
     let primary = read_sidecar_index_copy(
         source,
         scoped_map,
         sidecar_entry,
         tape_uuid,
         block_size,
-        &footer,
+        footer,
         SidecarCopyKind::Primary,
     );
     let tail = read_sidecar_index_copy(
@@ -965,10 +1108,9 @@ fn read_and_parse_sidecar_index(
         sidecar_entry,
         tape_uuid,
         block_size,
-        &footer,
+        footer,
         SidecarCopyKind::Tail,
     );
-
     match (primary, tail) {
         (Ok(primary), Ok(_tail)) => Ok(SidecarIndexRead {
             index: primary,
@@ -982,111 +1124,238 @@ fn read_and_parse_sidecar_index(
             index: tail,
             metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
         }),
-        // REM-PARITY 13.3 step 4: metadata-unavailable only when no header/index
-        // copy can be validated. With both copies unreadable through the footer's
-        // own locators, the directory is the last witness that can place a read.
-        (Err(_primary_err), Err(_tail_err)) => rescue_tail_sidecar_index_with_directory(
-            source,
-            scoped_map,
-            sidecar_entry,
-            tape_uuid,
-            block_size,
-        )
-        .map_err(|error| match error {
-            ParityError::SidecarParse(_) | ParityError::SidecarMetadataUnavailable { .. } => {
-                ParityError::SidecarMetadataUnavailable {
-                    epoch_id: footer.epoch_id,
-                }
-            }
-            error => error,
-        }),
+        (Err(_primary_err), Err(_tail_err)) => {
+            Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry))
+        }
     }
 }
 
-/// Acquire a sidecar index when the footer is unusable.
-///
-/// REM-PARITY 13.3: the primary header copy is tried first; if it cannot be
-/// read or validated, step 3's directory-assisted tail rescue locates the tail
-/// metadata copy from the authoritative sidecar epoch directory. The epoch is
-/// declared metadata-unavailable only when no header/index copy can be
-/// validated (step 4).
+/// Steps 2 and 3, and the tail rescue from the terminal index, when the footer
+/// is unreadable, unparseable or inconsistent with the map entry.
 fn read_sidecar_index_without_footer(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
     sidecar_entry: &TapeFileMapEntry,
+    scheme: &ParityScheme,
     tape_uuid: &[u8; 16],
     block_size: u32,
+    directory: &DirectoryEvidence,
 ) -> Result<SidecarIndexRead, ParityError> {
-    let primary_err = match read_primary_sidecar_index_without_footer(
+    let unavailable = || sidecar_metadata_unavailable_from_map_entry(sidecar_entry);
+    let parity = scheme_parity_blocks(scheme);
+    let primary = read_primary_sidecar_index_without_footer(
         source,
         scoped_map,
         sidecar_entry,
         tape_uuid,
         block_size,
-    ) {
-        Ok(read) => return Ok(read),
-        Err(err) => err,
-    };
-    match rescue_tail_sidecar_index_with_directory(
-        source,
-        scoped_map,
-        sidecar_entry,
-        tape_uuid,
-        block_size,
-    ) {
-        Ok(read) => Ok(read),
-        // The rescue is only available when a directory is present and agrees;
-        // when it is not, the primary attempt's error is the honest answer.
-        Err(ParityError::SidecarParse(_) | ParityError::SidecarMetadataUnavailable { .. }) => {
-            Err(primary_err)
+    );
+    match directory {
+        DirectoryEvidence::Available(entry) => {
+            // The entry decides as the footer would: a copy is used only if its
+            // canonical metadata hash equals the entry's. The tail was not
+            // read, and the health says so.
+            if let Ok(read) = primary {
+                if read.index.header.canonical_metadata_hash == entry.canonical_metadata_hash {
+                    return Ok(read);
+                }
+            }
+            // Step 3, the directory-assisted tail rescue.
+            read_directory_tail_index(
+                source,
+                &scoped_map.map,
+                sidecar_entry,
+                entry,
+                tape_uuid,
+                block_size,
+                parity,
+            )
+            .map(|index| SidecarIndexRead {
+                index,
+                metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
+            })
+            .map_err(|error| rescue_failure(error, sidecar_entry))
         }
-        Err(error) => Err(error),
+        DirectoryEvidence::Absent | DirectoryEvidence::Unavailable => match primary {
+            // No entry is available: a Recoverer whose primary copy validates
+            // MUST also read the tail copy at block H + P, with H the primary's
+            // sidecar_header_block_count and P = S x m. The primary is valid by
+            // copy kind and block count (step 2); a tail that is unreadable or
+            // invalid at H + P leaves it in use, and the pin against the scheme
+            // then reports any disagreement as SchemeMismatch.
+            Ok(read) => {
+                let h = read.index.header.shard_index_block_count;
+                let tail = read_tail_copy_at(
+                    source,
+                    scoped_map,
+                    sidecar_entry,
+                    tape_uuid,
+                    block_size,
+                    h.saturating_add(parity),
+                    h,
+                );
+                match tail {
+                    // A valid tail whose metadata or index content differs
+                    // leaves nothing to decide between the copies.
+                    Ok(tail)
+                        if tail.header.canonical_metadata_hash
+                            != read.index.header.canonical_metadata_hash
+                            || tail.index != read.index.index =>
+                    {
+                        Err(unavailable())
+                    }
+                    Ok(_) => Ok(SidecarIndexRead {
+                        index: read.index,
+                        metadata_health: SidecarMetadataHealth::BothCopiesUsable,
+                    }),
+                    // A transport or hardware fault is the device's, not a
+                    // fact about the tail copy.
+                    Err(error @ ParityError::TapeIo(_)) => Err(error),
+                    // A medium error or an invalid tail leaves the primary in
+                    // use, and the tail is observed lost.
+                    Err(_) => Ok(SidecarIndexRead {
+                        index: read.index,
+                        metadata_health: SidecarMetadataHealth::TailCopyLost,
+                    }),
+                }
+            }
+            Err(_) => {
+                // The footer and the primary have both failed. Only a map
+                // whose entry comes from a validated terminal replica, with no
+                // final ParityMap validating, has the tail rescue.
+                if matches!(directory, DirectoryEvidence::Absent)
+                    && scoped_map.map_source == MapSource::TerminalReplica
+                {
+                    rescue_tail_from_terminal_index(
+                        source,
+                        scoped_map,
+                        sidecar_entry,
+                        scheme,
+                        tape_uuid,
+                        block_size,
+                    )
+                    .map(|index| SidecarIndexRead {
+                        index,
+                        metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
+                    })
+                    .map_err(|error| rescue_failure(error, sidecar_entry))
+                } else {
+                    Err(unavailable())
+                }
+            }
+        },
     }
 }
 
-/// REM-PARITY 13.3 step 3. The directory records, per sidecar, the total block
-/// count, the header/index copy block count `H` and the canonical metadata hash
-/// shared by both copies. The tail copy begins at block `H + P`, so the directory
-/// both locates it and supplies the hash that validates it — which is what makes
-/// the rescue possible with the primary header and the footer both gone.
-fn rescue_tail_sidecar_index_with_directory(
+/// The result of a rescue that validated no copy: step 4's metadata-unavailable
+/// for the epoch, whatever the copy's own failure was. A fault outside the
+/// copy (a device failure that is not medium damage) is reported as itself.
+fn rescue_failure(error: ParityError, sidecar_entry: &TapeFileMapEntry) -> ParityError {
+    match error {
+        ParityError::SidecarParse(_) | ParityError::SidecarMetadataUnavailable { .. } => {
+            sidecar_metadata_unavailable_from_map_entry(sidecar_entry)
+        }
+        error => error,
+    }
+}
+
+/// Read one tail header/index copy at `start_block` and check it on its own
+/// (REM-PARITY 9.2 to 9.5), its copy kind, and the map entry's block count.
+fn read_tail_copy_at(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
     sidecar_entry: &TapeFileMapEntry,
     tape_uuid: &[u8; 16],
     block_size: u32,
-) -> Result<SidecarIndexRead, ParityError> {
-    let loaded_directory;
-    let directory = match scoped_map.sidecar_directory.as_ref() {
-        Some(directory) => directory,
-        None => {
-            loaded_directory =
-                read_final_sidecar_directory(source, &scoped_map.map, tape_uuid, block_size)?;
-            loaded_directory
-                .as_ref()
-                .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?
+    start_block: u64,
+    header_block_count: u64,
+) -> Result<DecodedSidecarIndex, ParityError> {
+    // No capacity is reserved from a count that a hostile map or header may
+    // state: the reads stop at the first block the file does not hold.
+    let mut blocks = Vec::new();
+    for offset in 0..header_block_count {
+        let block_within_file = start_block
+            .checked_add(offset)
+            .ok_or(ParityError::Invariant(
+                "sidecar index block offset overflows",
+            ))?;
+        if block_within_file >= sidecar_entry.block_count {
+            return Err(ParityError::SidecarParse(
+                "sidecar tail copy runs past the sidecar tape file".into(),
+            ));
         }
-    };
-    if sidecar_entry.tape_file_number >= directory.directory_scope_tape_file_count {
-        return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
+        let physical = scoped_map.map.physical_position(TapeFilePosition {
+            tape_file_number: sidecar_entry.tape_file_number,
+            block_within_file,
+        })?;
+        match read_required_block(source, physical, block_size) {
+            Ok(block) => blocks.push(block),
+            // Only current medium damage is a fact about the copy.
+            Err(ParityError::TapeIo(error)) if !tape_error_is_current_medium_damage(&error) => {
+                return Err(ParityError::TapeIo(error));
+            }
+            Err(ParityError::TapeIo(_)) => {
+                return Err(ParityError::SidecarParse(format!(
+                    "could not read sidecar tape_file {} block {block_within_file}",
+                    sidecar_entry.tape_file_number
+                )))
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let entry = directory
-        .entries
-        .iter()
-        .find(|entry| entry.tape_file_number == sidecar_entry.tape_file_number)
-        .ok_or_else(|| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
-    let index = read_directory_tail_index(
+    let decoded = parse_sidecar_index_blocks(&blocks, tape_uuid)?;
+    if decoded.header.copy_kind != SidecarCopyKind::Tail {
+        return Err(ParityError::SidecarParse(
+            "sidecar tail copy decoded as a non-tail copy".into(),
+        ));
+    }
+    if decoded.header.sidecar_total_block_count != sidecar_entry.block_count {
+        return Err(ParityError::SidecarParse(format!(
+            "sidecar map block_count {} does not match decoded tail total {}",
+            sidecar_entry.block_count, decoded.header.sidecar_total_block_count
+        )));
+    }
+    Ok(decoded)
+}
+
+/// REM-PARITY 13.3, "Tail rescue from the terminal index". With `total` the
+/// map entry's block count and `P = S x m`, the tail copy starts at `H + P`
+/// where `H = (total - 1 - P) / 2`; `total - 1 - P` must be even and `H` above
+/// zero. The copy is used only if it is valid on its own, records `H`, and its
+/// epoch and protected range agree with the map entry. Nothing outside the
+/// copy vouches for it: its own CRCs and canonical hash detect accidental
+/// damage, and every shard and rebuilt block is still checked against it.
+fn rescue_tail_from_terminal_index(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    scheme: &ParityScheme,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<DecodedSidecarIndex, ParityError> {
+    let unavailable = || sidecar_metadata_unavailable_from_map_entry(sidecar_entry);
+    let (h, tail_start) =
+        sidecar_geometry_from_total(sidecar_entry.block_count, scheme_parity_blocks(scheme))
+            .ok_or_else(unavailable)?;
+    // H + P <= total - 1, so the tail start fits.
+    let decoded = read_tail_copy_at(
         source,
-        &scoped_map.map,
+        scoped_map,
         sidecar_entry,
-        entry,
         tape_uuid,
         block_size,
+        tail_start,
+        h,
     )?;
-    Ok(SidecarIndexRead {
-        index,
-        metadata_health: SidecarMetadataHealth::PrimaryHeaderLost,
-    })
+    if decoded.header.shard_index_block_count != h
+        || Some(decoded.header.epoch_id) != sidecar_entry.epoch_id
+        || Some(decoded.header.protected_ordinal_start) != sidecar_entry.protected_ordinal_start
+        || Some(decoded.header.protected_ordinal_end_exclusive)
+            != sidecar_entry.protected_ordinal_end_exclusive
+    {
+        return Err(unavailable());
+    }
+    Ok(decoded)
 }
 
 /// Check the directory's structural claims before using its counts to place I/O.
@@ -1102,6 +1371,25 @@ pub(crate) fn directory_entry_matches_sidecar(
         && entry.sidecar_total_block_count == sidecar.block_count
 }
 
+/// REM-PARITY 13.3 step 3: whether a directory entry is available for a
+/// sidecar. It must agree with the map entry, and the rescue requires
+/// `total = 2H + P + 1` with `H > 0`, where `P = S x m` (the scheme's parity
+/// block count, `parity`), not the entry's recorded count. These are
+/// preconditions of the rescue, not Section 10.1.5 invariants: an entry that
+/// fails one is not available, no read is placed from it, and only its own
+/// epoch is affected. The comparison is exact (Section 2.4), so a large H
+/// fails it; it never overflows and never rejects the map.
+pub(crate) fn directory_entry_available(
+    entry: &SidecarEpochDirectoryEntry,
+    sidecar: &TapeFileMapEntry,
+    parity: u64,
+) -> bool {
+    directory_entry_matches_sidecar(entry, sidecar)
+        && entry.sidecar_header_block_count != 0
+        && u128::from(entry.sidecar_header_block_count) * 2 + u128::from(parity) + 1
+            == u128::from(entry.sidecar_total_block_count)
+}
+
 /// Read and verify the directory-located tail before using its metadata for rescue.
 /// Replica and walk recovery share geometry, copy-kind and canonical-hash checks.
 pub(crate) fn read_directory_tail_index(
@@ -1111,23 +1399,12 @@ pub(crate) fn read_directory_tail_index(
     entry: &SidecarEpochDirectoryEntry,
     tape_uuid: &[u8; 16],
     block_size: u32,
+    parity: u64,
 ) -> Result<DecodedSidecarIndex, ParityError> {
-    if !directory_entry_matches_sidecar(entry, sidecar_entry) {
+    if !directory_entry_available(entry, sidecar_entry, parity) {
         return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
     }
     let h = entry.sidecar_header_block_count;
-    let parity = entry.parity_shard_block_count;
-    // REM-PARITY 13.3 step 3: the rescue requires the entry's
-    // sidecar_total_block_count to equal 2H + P + 1, with H > 0. These are
-    // preconditions of the rescue, not Section 10.1.5 invariants: an entry that
-    // fails one is not available, no read is placed from it, and the epoch is
-    // metadata-unavailable (step 4). The comparison is exact (Section 2.4), so
-    // a large H or P fails it; it never overflows and never rejects the map.
-    let consistent_total =
-        u128::from(h) * 2 + u128::from(parity) + 1 == u128::from(entry.sidecar_total_block_count);
-    if h == 0 || !consistent_total {
-        return Err(sidecar_metadata_unavailable_from_map_entry(sidecar_entry));
-    }
     // Section 9.1 layout: primary 0..H-1, parity shards H..H+P-1, tail copy
     // H+P..2H+P-1, footer at 2H+P. Section 13.3 locates the tail copy at H + P.
     // With 2H + P + 1 equal to a u64 total, every tail block position below
@@ -1225,9 +1502,10 @@ fn read_primary_sidecar_index_without_footer(
             sidecar_entry.block_count, decoded.header.sidecar_total_block_count
         )));
     }
+    // The tail was not read: nothing is recorded as lost.
     Ok(SidecarIndexRead {
         index: decoded,
-        metadata_health: SidecarMetadataHealth::TailCopyLost,
+        metadata_health: SidecarMetadataHealth::TailCopyNotRead,
     })
 }
 
@@ -1346,7 +1624,7 @@ fn read_verified_parity_peer(
     Ok(Some(block))
 }
 
-fn validate_sidecar_for_recovery(
+pub(crate) fn validate_sidecar_for_recovery(
     sidecar: &DecodedSidecarIndex,
     sidecar_entry: &TapeFileMapEntry,
     scheme: &ParityScheme,
@@ -1440,7 +1718,18 @@ fn read_verified_data_peer(
     Ok(Some(block))
 }
 
-fn data_crc_for_ordinal(
+/// The parity shard CRC the index records for `(stripe, parity index)`: the
+/// Recoverer's lookup, shared with the Verifier.
+pub(crate) fn parity_crc_for(
+    sidecar: &DecodedSidecarIndex,
+    stripe_index: u32,
+    parity_index: u16,
+) -> Result<u64, ParityError> {
+    let index = parity_entry_index(sidecar, stripe_index, parity_index)?;
+    Ok(sidecar.index.parity_entries[index].parity_shard_crc64)
+}
+
+pub(crate) fn data_crc_for_ordinal(
     sidecar: &DecodedSidecarIndex,
     ordinal: u64,
     epoch_start: u64,
@@ -1528,6 +1817,8 @@ mod tests {
         cursor: usize,
         configured_block_size: Option<u32>,
         unreadable_lbas: Vec<usize>,
+        /// Reads that fail as a transport fault, which is not medium damage.
+        transport_fault_lbas: Vec<usize>,
         read_lbas: Vec<usize>,
     }
 
@@ -1538,6 +1829,7 @@ mod tests {
                 cursor: 0,
                 configured_block_size: None,
                 unreadable_lbas: Vec::new(),
+                transport_fault_lbas: Vec::new(),
                 read_lbas: Vec::new(),
             }
         }
@@ -1572,12 +1864,23 @@ mod tests {
 
         fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
             self.read_lbas.push(self.cursor);
-            if self.unreadable_lbas.contains(&self.cursor) {
+            if self.transport_fault_lbas.contains(&self.cursor) {
                 return Err(ParityError::TapeIo(
-                    remanence_library::TapeIoError::OperationFailed(format!(
-                        "unreadable test LBA {}",
-                        self.cursor
-                    )),
+                    remanence_library::TapeIoError::Transport(
+                        remanence_library::scsi::ScsiError::InvalidInput("test transport fault"),
+                    ),
+                ));
+            }
+            if self.unreadable_lbas.contains(&self.cursor) {
+                // A current medium error (MEDIUM ERROR, 03/11/00), as a drive
+                // reports an unreadable record.
+                return Err(ParityError::TapeIo(
+                    remanence_library::TapeIoError::CheckCondition(
+                        remanence_library::scsi::ScsiError::CheckCondition {
+                            sense: vec![0x72, 0x03, 0x11, 0x00],
+                            bytes_transferred: 0,
+                        },
+                    ),
                 ));
             }
             let Some(record) = self.records.get(self.cursor) else {
@@ -2587,10 +2890,12 @@ mod tests {
             recover_ordinal_from_sidecar(&mut raw, &scoped, &scheme, TAPE_UUID, BLOCK_SIZE, 2)
                 .expect("footer loss with intact primary metadata remains recoverable");
 
+        // Step 2's no-entry rule reads the tail copy too; it is intact and
+        // identical, so both copies are usable.
         assert_eq!(recovered.recovered_block, object_blocks[2]);
         assert_eq!(
             recovered.sidecar_metadata_health,
-            SidecarMetadataHealth::TailCopyLost
+            SidecarMetadataHealth::BothCopiesUsable
         );
     }
 
@@ -4248,6 +4553,7 @@ mod tests {
                 highest_protected_ordinal: 2,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let mut raw = RawVec::new(Vec::new());
 
@@ -4286,6 +4592,7 @@ mod tests {
                 highest_protected_ordinal: protected,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
 
@@ -4335,6 +4642,7 @@ mod tests {
                 highest_protected_ordinal: protected,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let suffix_peer_lbas = object_lbas_for_ordinals(&scoped, &[1, 2]);
         let mut raw = RawVec::new(records_for_object_sidecar_then_object(
@@ -4401,6 +4709,7 @@ mod tests {
                 highest_protected_ordinal: protected,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let committed_peer_lba = object_lbas_for_ordinals(&scoped, &[1])
             .pop()
@@ -4475,6 +4784,7 @@ mod tests {
                 highest_protected_ordinal: protected,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let committed_peer_lba = object_lbas_for_ordinals(&scoped, &[1])
             .pop()
@@ -4558,6 +4868,7 @@ mod tests {
                 highest_protected_ordinal: protected,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let failed_ordinal = 1;
         let committed_same_stripe_peer_ordinal = 3;
@@ -5706,11 +6017,10 @@ mod tests {
                 e.sidecar_header_block_count = u64::MAX;
                 e
             }),
-            ("P beyond u64 arithmetic", {
-                let mut e = good.clone();
-                e.parity_shard_block_count = u64::MAX;
-                e
-            }),
+            // P is the scheme's S x m, not the entry's recorded count: an
+            // entry whose recorded P differs is judged on S x m, and the
+            // scheme's P beyond u64 arithmetic fails the exact comparison.
+            ("scheme P beyond u64 arithmetic", good.clone()),
             // Consistent in itself (2H + P + 1 = total), but the total
             // disagrees with the sidecar's map entry (13.3's MUST NOT).
             ("total disagrees with the map entry", {
@@ -5720,6 +6030,11 @@ mod tests {
                 e
             }),
         ] {
+            let parity = if label == "scheme P beyond u64 arithmetic" {
+                u64::MAX
+            } else {
+                scheme_parity_blocks(&scheme)
+            };
             let mut raw = raw_tape(&object_blocks, &sidecar.blocks);
             let error = read_directory_tail_index(
                 &mut raw,
@@ -5728,6 +6043,7 @@ mod tests {
                 &entry,
                 &TAPE_UUID,
                 BLOCK_SIZE,
+                parity,
             )
             .unwrap_err();
             assert!(
@@ -5745,10 +6061,11 @@ mod tests {
             &good,
             &TAPE_UUID,
             BLOCK_SIZE,
+            scheme_parity_blocks(&scheme),
         )
         .expect("a consistent entry rescues the tail copy");
         // A tail record of the wrong length is invalid content of that copy.
-        let tail = usize::try_from(h + good.parity_shard_block_count).unwrap();
+        let tail = usize::try_from(h + scheme_parity_blocks(&scheme)).unwrap();
         for length in [BLOCK_SIZE as usize / 2, 2 * BLOCK_SIZE as usize] {
             let mut sidecar_blocks = sidecar.blocks.clone();
             sidecar_blocks[tail].resize(length, 0);
@@ -5760,6 +6077,7 @@ mod tests {
                 &good,
                 &TAPE_UUID,
                 BLOCK_SIZE,
+                scheme_parity_blocks(&scheme),
             )
             .unwrap_err();
             assert!(
@@ -5767,6 +6085,823 @@ mod tests {
                 "length {length}: {error:?}"
             );
         }
+    }
+
+    /// One epoch on a tape with the acquisition tests' fixed geometry
+    /// (k = 2, m = 1, S = 2, four data blocks: H = 1, P = 2, total 5).
+    struct AcquisitionTape {
+        scheme: ParityScheme,
+        object_blocks: Vec<Vec<u8>>,
+        sidecar: crate::sidecar::EncodedSidecarTapeFile,
+        /// A second, independently valid sidecar for other data: its copies
+        /// validate on their own and differ from `sidecar`'s in index content.
+        other: crate::sidecar::EncodedSidecarTapeFile,
+    }
+
+    impl AcquisitionTape {
+        fn new() -> Self {
+            let scheme = scheme(2, 1, 2);
+            let object_blocks = vec![block(1), block(2), block(3), block(4)];
+            let sidecar = sidecar_for_epoch(&scheme, &object_blocks);
+            let other = sidecar_for_epoch(&scheme, &[block(9), block(10), block(11), block(12)]);
+            assert_ne!(
+                sidecar.header.canonical_metadata_hash,
+                other.header.canonical_metadata_hash
+            );
+            Self {
+                scheme,
+                object_blocks,
+                sidecar,
+                other,
+            }
+        }
+
+        fn tail_start(&self) -> usize {
+            usize::try_from(self.sidecar.header.tail_header_start_block).unwrap()
+        }
+
+        fn footer_index(&self) -> usize {
+            self.sidecar.blocks.len() - 1
+        }
+
+        /// The sidecar's blocks with the tail copy replaced by the other
+        /// sidecar's valid, diverging tail copy.
+        fn diverging_tail(&self) -> Vec<Vec<u8>> {
+            let mut blocks = self.sidecar.blocks.clone();
+            let h = usize::try_from(self.sidecar.header.shard_index_block_count).unwrap();
+            for i in 0..h {
+                blocks[self.tail_start() + i] = self.other.blocks[self.tail_start() + i].clone();
+            }
+            blocks
+        }
+
+        /// The sidecar's blocks with the primary copy replaced by the other
+        /// sidecar's valid, diverging primary copy.
+        fn diverging_primary(&self) -> Vec<Vec<u8>> {
+            let mut blocks = self.sidecar.blocks.clone();
+            let h = usize::try_from(self.sidecar.header.shard_index_block_count).unwrap();
+            blocks[..h].clone_from_slice(&self.other.blocks[..h]);
+            blocks
+        }
+
+        fn scoped(&self, blocks: &[Vec<u8>]) -> ScopedFilemarkMap {
+            scoped_map(blocks.len() as u64, self.object_blocks.len() as u64)
+        }
+
+        fn entry(&self, hash: [u8; 32]) -> SidecarEpochDirectoryEntry {
+            SidecarEpochDirectoryEntry {
+                tape_file_number: 2,
+                epoch_id: self.sidecar.header.epoch_id,
+                protected_ordinal_start: self.sidecar.header.protected_ordinal_start,
+                protected_ordinal_end_exclusive: self
+                    .sidecar
+                    .header
+                    .protected_ordinal_end_exclusive,
+                sidecar_total_block_count: self.sidecar.blocks.len() as u64,
+                sidecar_header_block_count: self.sidecar.header.shard_index_block_count,
+                parity_shard_block_count: self.sidecar.header.parity_block_count,
+                canonical_metadata_hash: hash,
+                flags: 0,
+            }
+        }
+
+        fn with_directory(
+            &self,
+            scoped: ScopedFilemarkMap,
+            entry: SidecarEpochDirectoryEntry,
+        ) -> ScopedFilemarkMap {
+            scoped.with_sidecar_directory(Some(crate::parity_map::SidecarEpochDirectory {
+                directory_scope_tape_file_count: 3,
+                directory_scope_total_data_ordinals: self.object_blocks.len() as u64,
+                directory_scope_highest_protected_ordinal: self.object_blocks.len() as u64,
+                is_final_directory: true,
+                entries: vec![entry],
+            }))
+        }
+
+        fn recover(
+            &self,
+            scoped: &ScopedFilemarkMap,
+            blocks: &[Vec<u8>],
+        ) -> (Result<SidecarRecoveryResult, ParityError>, RawVec) {
+            let mut raw = raw_tape(&self.object_blocks, blocks);
+            let result = recover_ordinal_from_sidecar(
+                &mut raw,
+                scoped,
+                &self.scheme,
+                TAPE_UUID,
+                BLOCK_SIZE,
+                2,
+            );
+            (result, raw)
+        }
+
+        /// Whether the read that the sidecar's block `block` needs was placed:
+        /// bootstrap, filemark, objects, filemark, then the sidecar.
+        fn read_block(&self, raw: &RawVec, block: usize) -> bool {
+            raw.read_lbas
+                .contains(&(2 + self.object_blocks.len() + 1 + block))
+        }
+    }
+
+    fn assert_unavailable(result: Result<SidecarRecoveryResult, ParityError>, label: &str) {
+        assert!(
+            matches!(
+                result,
+                Err(ParityError::SidecarMetadataUnavailable { epoch_id: 0 })
+            ),
+            "{label}: {result:?}"
+        );
+    }
+
+    fn with_sidecar_block_count(mut scoped: ScopedFilemarkMap, delta: u64) -> ScopedFilemarkMap {
+        let entries: Vec<_> = scoped
+            .map
+            .entries()
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                if entry.kind == TapeFileKind::ParitySidecar {
+                    entry.block_count += delta;
+                }
+                entry
+            })
+            .collect();
+        scoped.map = FilemarkMap::new(entries).unwrap();
+        scoped
+    }
+
+    /// REM-PARITY 13.3 step 1 and D2 rule 1: a valid footer decides between two
+    /// copies that both validate on their own and differ.
+    #[test]
+    fn valid_footer_decides_between_diverging_copies() {
+        let t = AcquisitionTape::new();
+        // The footer carries the primary's hash: the tail is contradicted.
+        let blocks = t.diverging_tail();
+        let (result, _) = t.recover(&t.scoped(&blocks), &blocks);
+        let recovered = result.expect("the footer vouches for the primary");
+        assert_eq!(recovered.recovered_block, t.object_blocks[2]);
+        assert_eq!(
+            recovered.sidecar_metadata_health,
+            SidecarMetadataHealth::TailCopyLost
+        );
+        // The available entry agrees with the footer, so the footer decides.
+        let scoped = t.with_directory(
+            t.scoped(&blocks),
+            t.entry(t.sidecar.header.canonical_metadata_hash),
+        );
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_eq!(
+            result.unwrap().sidecar_metadata_health,
+            SidecarMetadataHealth::TailCopyLost
+        );
+        // The primary is the contradicted copy: the tail is used.
+        let blocks = t.diverging_primary();
+        let (result, _) = t.recover(&t.scoped(&blocks), &blocks);
+        let recovered = result.expect("the footer vouches for the tail");
+        assert_eq!(recovered.recovered_block, t.object_blocks[2]);
+        assert_eq!(
+            recovered.sidecar_metadata_health,
+            SidecarMetadataHealth::PrimaryHeaderLost
+        );
+    }
+
+    /// D2: when a valid footer and an available directory entry disagree, on
+    /// the hash or on the tail's position, neither decides; a copy that either
+    /// contradicts is not used, and the directory is not used to rescue.
+    #[test]
+    fn valid_footer_and_disagreeing_entry_leave_no_copy() {
+        let t = AcquisitionTape::new();
+        let blocks = t.sidecar.blocks.clone();
+        // The entry's hash differs from the footer's: both copies are contradicted.
+        let scoped = t.with_directory(
+            t.scoped(&blocks),
+            t.entry(t.other.header.canonical_metadata_hash),
+        );
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_unavailable(result, "entry hash disagrees with the valid footer");
+        // The entry names another split of the same total (H + 1, P - 2). REM-PARITY
+        // 13.3 takes P = S x m from the scheme ("the entry's
+        // `sidecar_header_block_count` and `P = S x m`"), so 2(H + 1) + P + 1 is
+        // not the total: the entry is not available, the valid footer decides,
+        // and the block is recovered. The directory never places a read.
+        let mut entry = t.entry(t.sidecar.header.canonical_metadata_hash);
+        entry.sidecar_header_block_count += 1;
+        entry.parity_shard_block_count -= 2;
+        let scoped = t.with_directory(t.scoped(&blocks), entry);
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_eq!(
+            result
+                .expect("an entry that fails 2H + P + 1 with the scheme's P is not available")
+                .sidecar_metadata_health,
+            SidecarMetadataHealth::BothCopiesUsable
+        );
+        // A footer whose recorded P is not S x m (a sidecar written with m = 2,
+        // read with a scheme of m = 1): an entry that is available under the
+        // scheme's P (H = 3: 2H + P + 1 = 9 = total) carries the footer's hash
+        // but locates the tail at H + P = 5, where the footer says 6. They
+        // disagree on the tail's position, so neither decides and no copy is
+        // used.
+        let wide = scheme(2, 2, 2);
+        let wide_sidecar = sidecar_for_epoch(&wide, &t.object_blocks);
+        assert_eq!(wide_sidecar.blocks.len(), 9);
+        let mut entry = t.entry(wide_sidecar.header.canonical_metadata_hash);
+        entry.sidecar_total_block_count = 9;
+        entry.sidecar_header_block_count = 3;
+        entry.parity_shard_block_count = 2;
+        let scoped = t.with_directory(scoped_map(9, t.object_blocks.len() as u64), entry);
+        let mut raw = raw_tape(&t.object_blocks, &wide_sidecar.blocks);
+        let result =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &t.scheme, TAPE_UUID, BLOCK_SIZE, 2);
+        assert_unavailable(
+            result,
+            "entry and valid footer disagree on the tail position",
+        );
+        // Both copies failing a valid footer is unavailable, whatever the entry.
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[0][0] ^= 0xff;
+        let tail_start = t.tail_start();
+        blocks[tail_start][0] ^= 0xff;
+        let scoped = t.with_directory(
+            t.scoped(&blocks),
+            t.entry(t.sidecar.header.canonical_metadata_hash),
+        );
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_unavailable(result, "valid footer, both copies damaged");
+    }
+
+    /// D2 rule 2: with the footer unusable and an entry available, a copy is
+    /// used only if its canonical metadata hash equals the entry's.
+    #[test]
+    fn available_entry_decides_when_the_footer_is_unusable() {
+        let t = AcquisitionTape::new();
+        let hash = t.sidecar.header.canonical_metadata_hash;
+        // The primary agrees with the entry: used, and the tail is not read.
+        let mut blocks = t.diverging_tail();
+        let footer_index = t.footer_index();
+        blocks[footer_index][0] ^= 0xff;
+        let scoped = t.with_directory(t.scoped(&blocks), t.entry(hash));
+        let (result, raw) = t.recover(&scoped, &blocks);
+        let recovered = result.expect("the entry vouches for the primary");
+        assert_eq!(recovered.recovered_block, t.object_blocks[2]);
+        assert_eq!(
+            recovered.sidecar_metadata_health,
+            SidecarMetadataHealth::TailCopyNotRead
+        );
+        assert!(!t.read_block(&raw, t.tail_start()), "the tail was read");
+        // The primary contradicts the entry: the directory-assisted rescue
+        // finds the tail copy the entry vouches for.
+        let mut blocks = t.diverging_primary();
+        blocks[footer_index][0] ^= 0xff;
+        let scoped = t.with_directory(t.scoped(&blocks), t.entry(hash));
+        let (result, _) = t.recover(&scoped, &blocks);
+        let recovered = result.expect("the entry vouches for the tail");
+        assert_eq!(recovered.recovered_block, t.object_blocks[2]);
+        assert_eq!(
+            recovered.sidecar_metadata_health,
+            SidecarMetadataHealth::PrimaryHeaderLost
+        );
+        // The entry vouches for neither copy.
+        let mut blocks = t.diverging_tail();
+        blocks[footer_index][0] ^= 0xff;
+        let scoped = t.with_directory(t.scoped(&blocks), t.entry([0x5a; 32]));
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_unavailable(result, "the entry vouches for neither copy");
+        // An entry that fails a rescue precondition is not available: rule 3
+        // applies, and a valid diverging tail leaves nothing to decide.
+        let mut entry = t.entry(hash);
+        entry.sidecar_header_block_count += 1;
+        let mut blocks = t.diverging_tail();
+        blocks[footer_index][0] ^= 0xff;
+        let scoped = t.with_directory(t.scoped(&blocks), entry);
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_unavailable(result, "unavailable entry, diverging tail");
+    }
+
+    /// D2 rule 3: with neither footer nor entry, a Recoverer whose primary
+    /// validates also reads the tail at H + P.
+    #[test]
+    fn primary_without_footer_or_entry_requires_the_tail_read() {
+        let t = AcquisitionTape::new();
+        let footer_index = t.footer_index();
+        // A valid tail that differs leaves nothing to decide between the copies.
+        let mut blocks = t.diverging_tail();
+        blocks[footer_index][0] ^= 0xff;
+        let (result, raw) = t.recover(&t.scoped(&blocks), &blocks);
+        assert_unavailable(result, "diverging tail");
+        assert!(t.read_block(&raw, t.tail_start()), "the tail was not read");
+        // An identical tail: both copies usable.
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[footer_index][0] ^= 0xff;
+        let (result, _) = t.recover(&t.scoped(&blocks), &blocks);
+        assert_eq!(
+            result.unwrap().sidecar_metadata_health,
+            SidecarMetadataHealth::BothCopiesUsable
+        );
+        // An invalid tail, or an unreadable one, leaves the primary in use.
+        let mut invalid = blocks.clone();
+        let tail_start = t.tail_start();
+        invalid[tail_start][0] ^= 0xff;
+        let (result, _) = t.recover(&t.scoped(&invalid), &invalid);
+        assert_eq!(
+            result.unwrap().sidecar_metadata_health,
+            SidecarMetadataHealth::TailCopyLost
+        );
+        let mut raw = raw_tape(&t.object_blocks, &blocks);
+        raw.unreadable_lbas = vec![2 + t.object_blocks.len() + 1 + tail_start];
+        let result = recover_ordinal_from_sidecar(
+            &mut raw,
+            &t.scoped(&blocks),
+            &t.scheme,
+            TAPE_UUID,
+            BLOCK_SIZE,
+            2,
+        );
+        assert_eq!(
+            result.unwrap().sidecar_metadata_health,
+            SidecarMetadataHealth::TailCopyLost
+        );
+        // A block of the other copy kind is not a valid tail copy.
+        let mut primary_as_tail = blocks.clone();
+        primary_as_tail[tail_start] = blocks[0].clone();
+        let (result, _) = t.recover(&t.scoped(&primary_as_tail), &primary_as_tail);
+        assert_eq!(
+            result.unwrap().sidecar_metadata_health,
+            SidecarMetadataHealth::TailCopyLost
+        );
+    }
+
+    /// D2 rule 4: when no copy can be used the error is
+    /// `SidecarMetadataUnavailable`, whatever each copy's own failure was.
+    #[test]
+    fn no_usable_copy_is_metadata_unavailable_whatever_the_copy_failure() {
+        let t = AcquisitionTape::new();
+        let footer_index = t.footer_index();
+        // The primary header records a total that disagrees with the map entry
+        // (a SidecarParse of the copy itself), and the footer is gone.
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[footer_index][0] ^= 0xff;
+        let scoped = with_sidecar_block_count(t.scoped(&blocks), 1);
+        let (result, _) = t.recover(&scoped, &blocks);
+        assert_unavailable(result, "primary total disagrees with the map entry");
+        // The primary is not one block long.
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[footer_index][0] ^= 0xff;
+        blocks[0].truncate(BLOCK_SIZE as usize / 2);
+        let (result, _) = t.recover(&t.scoped(&blocks), &blocks);
+        assert_unavailable(result, "primary record of the wrong length");
+        // The primary header is damaged.
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[footer_index][0] ^= 0xff;
+        blocks[0][0] ^= 0xff;
+        let (result, _) = t.recover(&t.scoped(&blocks), &blocks);
+        assert_unavailable(result, "primary header damaged");
+    }
+
+    impl AcquisitionTape {
+        /// Verify the sidecar in full over `blocks` (the sidecar's file) and
+        /// the tape's object blocks, with `object_blocks` as the data read.
+        fn verify(
+            &self,
+            scoped: &ScopedFilemarkMap,
+            object_blocks: &[Vec<u8>],
+            blocks: &[Vec<u8>],
+            unreadable: Vec<usize>,
+        ) -> (
+            crate::verify_protected::ProtectedContentVerification,
+            RawVec,
+        ) {
+            let mut raw = raw_tape(object_blocks, blocks);
+            raw.unreadable_lbas = unreadable;
+            let verification = crate::verify_protected::verify_protected_content(
+                &mut raw,
+                scoped,
+                &self.scheme,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+            )
+            .expect("verification");
+            (verification, raw)
+        }
+
+        fn sidecar_lba(&self, block: usize) -> usize {
+            2 + self.object_blocks.len() + 1 + block
+        }
+    }
+
+    /// REM-PARITY 2.2: a Verifier's validation reads every data block that a
+    /// sidecar protects and every parity shard, and checks each against the
+    /// acquired index. A healthy sidecar verifies clean.
+    #[test]
+    fn full_verification_reads_every_protected_block_and_every_shard() {
+        let t = AcquisitionTape::new();
+        let blocks = t.sidecar.blocks.clone();
+        let (verification, raw) = t.verify(&t.scoped(&blocks), &t.object_blocks, &blocks, vec![]);
+        assert!(verification.is_clean(), "{verification:?}");
+        let sidecar = &verification.sidecars[0];
+        assert_eq!(
+            sidecar.metadata_health,
+            Some(SidecarMetadataHealth::BothCopiesUsable)
+        );
+        assert!(sidecar.checked_against_index);
+        // Every object block, and every parity shard: (H .. H + P).
+        for ordinal in 0..t.object_blocks.len() {
+            assert!(raw.read_lbas.contains(&(2 + ordinal)), "data {ordinal}");
+        }
+        let h = t.sidecar.header.shard_index_block_count as usize;
+        let p = t.sidecar.header.parity_block_count as usize;
+        for shard in 0..p {
+            assert!(
+                raw.read_lbas.contains(&t.sidecar_lba(h + shard)),
+                "shard {shard}"
+            );
+        }
+    }
+
+    /// The shard pass on a tape with one corrupted data block and one
+    /// corrupted parity shard reports each by the address Section 2.2 names,
+    /// with its reason, and the tape is not clean.
+    #[test]
+    fn shard_pass_reports_a_corrupt_data_block_and_a_corrupt_parity_shard() {
+        let t = AcquisitionTape::new();
+        let mut objects = t.object_blocks.clone();
+        objects[2][0] ^= 0xff;
+        let mut blocks = t.sidecar.blocks.clone();
+        // Parity block index H + parity_index * S + stripe: (stripe 1, parity 0).
+        let h = t.sidecar.header.shard_index_block_count as usize;
+        let s = t.scheme.stripes_per_neighborhood as usize;
+        blocks[h + 1].iter_mut().for_each(|byte| *byte ^= 0x5a);
+        let (verification, _) = t.verify(&t.scoped(&blocks), &objects, &blocks, vec![]);
+        assert!(!verification.is_clean());
+        let data: Vec<_> = verification.failed_data_blocks().collect();
+        assert_eq!(data.len(), 1, "{data:?}");
+        assert_eq!(
+            data[0].position,
+            TapeFilePosition {
+                tape_file_number: 1,
+                block_within_file: 2
+            }
+        );
+        assert_eq!(data[0].ordinal, 2);
+        assert_eq!(
+            data[0].reason,
+            crate::verify_protected::BlockFailureReason::CrcMismatch
+        );
+        let parity: Vec<_> = verification.failed_parity_shards().collect();
+        assert_eq!(parity.len(), 1, "{parity:?}");
+        assert_eq!(
+            (
+                parity[0].epoch_id,
+                parity[0].stripe_index,
+                parity[0].parity_index
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(parity[0].sidecar_block, (h + 1) as u64);
+        assert_eq!(
+            parity[0].reason,
+            crate::verify_protected::BlockFailureReason::CrcMismatch
+        );
+        let _ = s;
+        // Read failures are reported with their own reasons, wrong length
+        // included (a read failure of the block, Section 3.5).
+        let mut short = t.object_blocks.clone();
+        short[0].truncate(BLOCK_SIZE as usize / 2);
+        let blocks = t.sidecar.blocks.clone();
+        let (verification, _) =
+            t.verify(&t.scoped(&blocks), &short, &blocks, vec![t.sidecar_lba(h)]);
+        let data: Vec<_> = verification.failed_data_blocks().collect();
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            data[0].reason,
+            crate::verify_protected::BlockFailureReason::WrongLength {
+                measured_bytes: BLOCK_SIZE as u64 / 2
+            }
+        );
+        let parity: Vec<_> = verification.failed_parity_shards().collect();
+        assert_eq!(parity.len(), 1);
+        assert_eq!(
+            parity[0].reason,
+            crate::verify_protected::BlockFailureReason::Unreadable
+        );
+        assert_eq!((parity[0].stripe_index, parity[0].parity_index), (0, 0));
+    }
+
+    /// REM-PARITY 9.1 and D2: a Verifier reads the primary copy, the tail copy
+    /// and the footer, and reports a divergence between the copies as
+    /// `SidecarParse`, even when the footer or the directory decides it.
+    #[test]
+    fn verifier_reports_copy_divergence_even_when_the_footer_or_directory_decides() {
+        use crate::verify_protected::SidecarFindingKind;
+        let t = AcquisitionTape::new();
+        let hash = t.sidecar.header.canonical_metadata_hash;
+        // The footer decides for the primary.
+        let blocks = t.diverging_tail();
+        let (verification, raw) = t.verify(&t.scoped(&blocks), &t.object_blocks, &blocks, vec![]);
+        let sidecar = &verification.sidecars[0];
+        assert!(sidecar.copies_diverge);
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert_eq!(
+            sidecar.metadata_health,
+            Some(SidecarMetadataHealth::TailCopyLost)
+        );
+        assert!(t.read_block(&raw, 0) && t.read_block(&raw, t.tail_start()));
+        assert!(t.read_block(&raw, t.footer_index()));
+        // The directory decides for the primary; the footer is unreadable.
+        let mut blocks = t.diverging_tail();
+        let footer_index = t.footer_index();
+        blocks[footer_index][0] ^= 0xff;
+        let scoped = t.with_directory(t.scoped(&blocks), t.entry(hash));
+        let (verification, _) = t.verify(&scoped, &t.object_blocks, &blocks, vec![]);
+        let sidecar = &verification.sidecars[0];
+        assert!(sidecar.copies_diverge);
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert_eq!(
+            sidecar.metadata_health,
+            Some(SidecarMetadataHealth::TailCopyNotRead)
+        );
+        // Nothing decides: the epoch is metadata-unavailable as well, and the
+        // divergence is still reported.
+        let (verification, _) = t.verify(&t.scoped(&blocks), &t.object_blocks, &blocks, vec![]);
+        let sidecar = &verification.sidecars[0];
+        assert!(sidecar.copies_diverge);
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarMetadataUnavailable));
+        assert_eq!(sidecar.metadata_health, None);
+        assert!(!sidecar.checked_against_index);
+    }
+
+    /// An unreadable copy is copy health only, never `SidecarParse`; an
+    /// unreadable data block is still reported when no index can check the
+    /// rest (a metadata-unavailable epoch).
+    #[test]
+    fn verifier_treats_unreadable_copies_as_health_and_unavailable_epochs_read_only() {
+        use crate::verify_protected::{SidecarComponentState, SidecarFindingKind};
+        let t = AcquisitionTape::new();
+        let blocks = t.sidecar.blocks.clone();
+        let unreadable = vec![t.sidecar_lba(0)];
+        let (verification, _) = t.verify(&t.scoped(&blocks), &t.object_blocks, &blocks, unreadable);
+        let sidecar = &verification.sidecars[0];
+        assert_eq!(sidecar.primary, SidecarComponentState::Unreadable);
+        assert_eq!(sidecar.tail, SidecarComponentState::Valid);
+        assert!(!sidecar.copies_diverge);
+        // An unreadable copy is never SidecarParse, but it is damage the
+        // Verifier reports (REM-PARITY 2.2): lost redundancy is not a clean
+        // verification.
+        assert!(!sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert!(sidecar.has_finding(SidecarFindingKind::CopyHealth));
+        assert_eq!(
+            sidecar.metadata_health,
+            Some(SidecarMetadataHealth::PrimaryHeaderLost)
+        );
+        assert!(!verification.is_clean());
+        // Likewise an unreadable footer or tail copy on its own.
+        for lost in [t.footer_index(), t.tail_start()] {
+            let (verification, _) = t.verify(
+                &t.scoped(&blocks),
+                &t.object_blocks,
+                &blocks,
+                vec![t.sidecar_lba(lost)],
+            );
+            assert!(
+                verification.sidecars[0].has_finding(SidecarFindingKind::CopyHealth),
+                "block {lost}"
+            );
+            assert!(!verification.is_clean());
+        }
+        // Both copies and the footer unreadable, and a data block unreadable.
+        let unreadable = vec![
+            t.sidecar_lba(0),
+            t.sidecar_lba(t.tail_start()),
+            t.sidecar_lba(t.footer_index()),
+            2,
+        ];
+        let (verification, _) = t.verify(&t.scoped(&blocks), &t.object_blocks, &blocks, unreadable);
+        let sidecar = &verification.sidecars[0];
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarMetadataUnavailable));
+        assert!(!sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert!(!sidecar.checked_against_index);
+        let data: Vec<_> = verification.failed_data_blocks().collect();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].ordinal, 0);
+        assert!(verification.failed_parity_shards().next().is_none());
+        assert!(!verification.is_clean());
+    }
+
+    /// A copy the footer contradicts, and a footer that contradicts the map
+    /// entry, are damage the Verifier reports as `SidecarParse`.
+    #[test]
+    fn verifier_reports_a_damaged_copy_and_a_footer_that_contradicts_the_map() {
+        use crate::verify_protected::{SidecarComponentState, SidecarFindingKind};
+        let t = AcquisitionTape::new();
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[0][0xd0] ^= 0x01;
+        let (verification, _) = t.verify(&t.scoped(&blocks), &t.object_blocks, &blocks, vec![]);
+        let sidecar = &verification.sidecars[0];
+        assert!(matches!(
+            sidecar.primary,
+            SidecarComponentState::Invalid { .. }
+        ));
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert_eq!(
+            sidecar.metadata_health,
+            Some(SidecarMetadataHealth::PrimaryHeaderLost)
+        );
+        // The footer records a total that disagrees with the map entry.
+        let blocks = t.sidecar.blocks.clone();
+        let scoped = with_sidecar_block_count(t.scoped(&blocks), 0);
+        let mut footer_off = blocks.clone();
+        let footer_index = t.footer_index();
+        footer_off[footer_index][0x48] ^= 0x01;
+        let crc = remanence_crc::crc64_xz(
+            &footer_off[footer_index][..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET],
+        );
+        footer_off[footer_index][crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET
+            ..crate::sidecar::SIDECAR_FOOTER_CRC_OFFSET + 8]
+            .copy_from_slice(&crc.to_le_bytes());
+        let (verification, _) = t.verify(&scoped, &t.object_blocks, &footer_off, vec![]);
+        let sidecar = &verification.sidecars[0];
+        assert!(matches!(
+            sidecar.footer,
+            SidecarComponentState::Invalid { .. }
+        ));
+        assert!(sidecar.has_finding(SidecarFindingKind::SidecarParse));
+        assert!(!sidecar.copies_diverge);
+    }
+
+    /// Device faults stay device faults. Rule 3's mandatory tail read reports a
+    /// transport failure as `TapeIo`; only a medium error or an invalid tail
+    /// leaves the primary in use. A tail beyond the sidecar tape file is not
+    /// read, and a primary whose recorded tail position is not H + P (P = S x m)
+    /// is invalid for that reason.
+    #[test]
+    fn rule_three_tail_read_keeps_device_faults_and_bounds() {
+        let t = AcquisitionTape::new();
+        let footer_index = t.footer_index();
+        let mut blocks = t.sidecar.blocks.clone();
+        blocks[footer_index][0] ^= 0xff;
+        let mut raw = raw_tape(&t.object_blocks, &blocks);
+        raw.transport_fault_lbas = vec![2 + t.object_blocks.len() + 1 + t.tail_start()];
+        let result = recover_ordinal_from_sidecar(
+            &mut raw,
+            &t.scoped(&blocks),
+            &t.scheme,
+            TAPE_UUID,
+            BLOCK_SIZE,
+            2,
+        );
+        assert!(matches!(result, Err(ParityError::TapeIo(_))), "{result:?}");
+        // The read is bounded by the file's own block count.
+        let scoped = t.scoped(&blocks);
+        let entry = scoped.map.entries()[2].clone();
+        let mut raw = raw_tape(&t.object_blocks, &blocks);
+        let error = read_tail_copy_at(
+            &mut raw,
+            &scoped,
+            &entry,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            entry.block_count,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ParityError::SidecarParse(_)), "{error:?}");
+        // A scheme whose S x m is not the sidecar's P. With no usable footer and
+        // no entry, the primary is valid by copy kind and block count (13.3
+        // step 2); the tail read at H + S x m finds nothing, the primary stays
+        // in use, and the pin against the scheme reports SchemeMismatch.
+        let wrong = scheme(2, 2, 2);
+        let mut raw = raw_tape(&t.object_blocks, &blocks);
+        let result = recover_ordinal_from_sidecar(
+            &mut raw,
+            &t.scoped(&blocks),
+            &wrong,
+            TAPE_UUID,
+            BLOCK_SIZE,
+            2,
+        );
+        assert!(
+            matches!(result, Err(ParityError::SchemeMismatch { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// The directory is consulted with a valid footer only to see whether an
+    /// available entry disagrees; a fault while reading the ParityMap does not
+    /// abort what the footer decides. With no valid footer the fault is the
+    /// device's and is reported.
+    #[test]
+    fn a_directory_read_fault_does_not_abort_a_footer_decided_acquisition() {
+        let t = AcquisitionTape::new();
+        let blocks = t.sidecar.blocks.clone();
+        let mut map_entries = t.scoped(&blocks).map.entries().to_vec();
+        map_entries.push(TapeFileMapEntry::parity_map(3, 3));
+        let scoped = ScopedFilemarkMap::from_catalog(
+            FilemarkMap::new(map_entries).unwrap(),
+            t.object_blocks.len() as u64,
+        );
+        let build = |blocks: &[Vec<u8>]| {
+            let mut raw = raw_tape(&t.object_blocks, blocks);
+            let parity_map_start = raw.records.len();
+            for _ in 0..3 {
+                raw.records
+                    .push(Record::Block(vec![0; BLOCK_SIZE as usize]));
+            }
+            raw.records.push(Record::Filemark);
+            raw.transport_fault_lbas = vec![parity_map_start];
+            raw
+        };
+        let mut raw = build(&blocks);
+        let recovered =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &t.scheme, TAPE_UUID, BLOCK_SIZE, 2)
+                .expect("the footer decides");
+        assert_eq!(recovered.recovered_block, t.object_blocks[2]);
+        let mut damaged = blocks.clone();
+        damaged[t.footer_index()][0] ^= 0xff;
+        let mut raw = build(&damaged);
+        let result =
+            recover_ordinal_from_sidecar(&mut raw, &scoped, &t.scheme, TAPE_UUID, BLOCK_SIZE, 2);
+        assert!(matches!(result, Err(ParityError::TapeIo(_))), "{result:?}");
+    }
+
+    /// An empty sidecar file has no block to probe: the Verifier records its
+    /// copies as not located rather than asking for block 0.
+    #[test]
+    fn verifier_records_an_empty_sidecar_as_not_located() {
+        let t = AcquisitionTape::new();
+        let scoped = t.scoped(&t.sidecar.blocks);
+        let mut entry = scoped.map.entries()[2].clone();
+        entry.block_count = 0;
+        let mut raw = raw_tape(&t.object_blocks, &t.sidecar.blocks);
+        let verification = crate::verify_protected::verify_sidecar(
+            &mut raw, &scoped, &entry, &t.scheme, &TAPE_UUID, BLOCK_SIZE,
+        );
+        // Whatever the map does with a zero-length file, no read of block 0 of
+        // the sidecar is placed for a copy.
+        if let Ok(verification) = verification {
+            assert_eq!(
+                verification.primary,
+                crate::verify_protected::SidecarComponentState::NotLocated
+            );
+        }
+        assert!(!t.read_block(&raw, 0));
+    }
+
+    /// REM-PARITY 13.3, "Tail rescue from the terminal index": with the footer
+    /// and the primary failed, no final ParityMap validating, and the map entry
+    /// from a validated terminal replica, the tail copy at H + P with
+    /// H = (total - 1 - P) / 2 is tried.
+    #[test]
+    fn terminal_index_rescue_reads_the_tail_and_has_two_exclusions() {
+        let t = AcquisitionTape::new();
+        let tail_start = t.tail_start();
+        let mut blocks = t.sidecar.blocks.clone();
+        let footer_index = t.footer_index();
+        blocks[footer_index][0] ^= 0xff;
+        blocks[0][0] ^= 0xff;
+        let replica = t
+            .scoped(&blocks)
+            .with_map_source(MapSource::TerminalReplica);
+        let (result, raw) = t.recover(&replica, &blocks);
+        let recovered = result.expect("the tail copy is tried and used");
+        assert_eq!(recovered.recovered_block, t.object_blocks[2]);
+        assert_eq!(
+            recovered.sidecar_metadata_health,
+            SidecarMetadataHealth::PrimaryHeaderLost
+        );
+        assert!(t.read_block(&raw, tail_start));
+        // Exclusion 1: a walked map does not qualify, and neither does a
+        // catalog map, whose rows are not a terminal replica's.
+        for source in [MapSource::Walk, MapSource::Catalog] {
+            let scoped = t.scoped(&blocks).with_map_source(source);
+            let (result, raw) = t.recover(&scoped, &blocks);
+            assert_unavailable(result, &format!("{source:?}"));
+            assert!(!t.read_block(&raw, tail_start), "{source:?} read the tail");
+        }
+        // Exclusion 2: a final ParityMap validates but the entry fails a
+        // precondition of the directory-assisted rescue: the directory then
+        // contradicts the map entry.
+        let mut entry = t.entry(t.sidecar.header.canonical_metadata_hash);
+        entry.sidecar_header_block_count += 1;
+        let scoped = t.with_directory(replica.clone(), entry);
+        let (result, raw) = t.recover(&scoped, &blocks);
+        assert_unavailable(result, "final ParityMap validates, entry unavailable");
+        assert!(!t.read_block(&raw, tail_start));
+        // The same entry, available, is the directory-assisted rescue instead.
+        let entry = t.entry(t.sidecar.header.canonical_metadata_hash);
+        let scoped = t.with_directory(replica.clone(), entry);
+        let (result, _) = t.recover(&scoped, &blocks);
+        result.expect("the directory-assisted rescue");
+        // The rescue's own conditions: total - 1 - P must be even (H above
+        // zero), and the block at H + P must be a tail copy recording H.
+        let mut odd = blocks.clone();
+        odd.push(vec![0; BLOCK_SIZE as usize]);
+        let (result, _) = t.recover(&with_sidecar_block_count(replica.clone(), 1), &odd);
+        assert_unavailable(result, "total - 1 - P odd");
+        let mut not_a_tail = blocks.clone();
+        not_a_tail[tail_start] = t.sidecar.blocks[0].clone();
+        let (result, _) = t.recover(&replica, &not_a_tail);
+        assert_unavailable(result, "the block at H + P is not a tail copy");
     }
 
     #[test]

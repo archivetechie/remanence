@@ -1,0 +1,372 @@
+{
+  "description": "Erratum set E4 for the frozen negative vectors (negative-cases.json) and their supplement (negative-cases-supplement.json), neither of which is edited. It replaces erratum set E2's expectations for overflow-13.3-tail-location and its variants, after the owner's Q9 ruling (Section 13.3's tail rescue from the terminal index). Each entry names a case, its variant ('' for none) and the executor observations it overrides, gives the pinned expectation it replaces, and the outcome a text-only author wrote for that observation, transcribed without change (outcome, error, derivation, sections and quotes). The executor applies each override, pins it, and reports it as ERRATUM with both the old and the new expectation. The compared outcome is the author's outcome: a Section 15 name, SidecarMetadataUnavailable{epoch_id: n}, or ACCEPTED for an input that is accepted, or recovered, with no error.",
+  "source": "Outcomes of erratum set E4, written from the REM-PARITY in-progress text (SHA-256 149543719094644275beea17c2ef4f728a4b92f8a536e2ab8d08fc177e95ed47) by an author who saw only the text and the constructions, never the reference's outcomes.",
+  "entries": [
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "a-H-seven",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "ParityMap",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Directory entry 0 names tape file 2 (< scope 4), with total 7, H 7 and P 4, all non-zero; the one range [0,4) partitions [0, W = 4); epoch id 0. The value 7 encodes in one CBOR byte, as 1 did, so the payload length is unchanged, and R-PM-PAYLOAD repairs payload_sha256 and the CRCs. No invariant of Section 10.1.5 relates total, H and P, and no ParityMap locator rule reads them.",
+            "sections": [
+              "10.1.5",
+              "10.1.4",
+              "10.1.3",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and `parity_shard_block_count`;",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "directory primary",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Directory entry 0 names tape file 2 (< scope 4), with total 7, H 7 and P 4, all non-zero; the one range [0,4) partitions [0, W = 4); epoch id 0. The value 7 encodes in one CBOR byte, as 1 did, so the payload length is unchanged, and R-PM-PAYLOAD repairs payload_sha256 and the CRCs. No invariant of Section 10.1.5 relates total, H and P, and no ParityMap locator rule reads them.",
+            "sections": [
+              "10.1.5",
+              "10.1.4",
+              "10.1.3",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and `parity_shard_block_count`;",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "directory tail",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Directory entry 0 names tape file 2 (< scope 4), with total 7, H 7 and P 4, all non-zero; the one range [0,4) partitions [0, W = 4); epoch id 0. The value 7 encodes in one CBOR byte, as 1 did, so the payload length is unchanged, and R-PM-PAYLOAD repairs payload_sha256 and the CRCs. No invariant of Section 10.1.5 relates total, H and P, and no ParityMap locator rule reads them.",
+            "sections": [
+              "10.1.5",
+              "10.1.4",
+              "10.1.3",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and `parity_shard_block_count`;",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        },
+        {
+          "observation": "recovery",
+          "author_observation": "Recoverer",
+          "expected": {
+            "outcome": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "error": "SidecarMetadataUnavailable",
+            "derivation": "Step 1: the footer (block 6) fails its CRC. Step 2: the primary (block 0) fails its header CRC. The final ParityMap validates and is final, so its entry for tape file 2 is considered. It agrees with the map entry in tape file, epoch, range and block count 7, but it fails the second precondition: 2H + P + 1 = 2*7 + 4 + 1 = 19, not 7. The entry is therefore not available, and the directory-assisted rescue does not run. The location total - 1 - H (7 - 1 - 7) is never evaluated as a position, so Section 2.4's rejection is never reached and the ParityMap is not rejected. The tail rescue from the terminal index does not apply, because a final ParityMap validates and its entry fails a precondition. No copy was validated, so step 4 applies. The intact tail copy (block 5) is never read.",
+            "sections": [
+              "13.3",
+              "2.4",
+              "12.5",
+              "15",
+              "Appendix D TT-2"
+            ],
+            "quotes": [
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch.",
+              "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry.",
+              "Only when no header/index copy can be validated is the epoch **metadata-unavailable** — and only that epoch (Section 12.5).",
+              "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+              "Section 13.3's tail location is `H + P`, with the precondition `total = 2H + P + 1` and `H > 0`."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "b-H-max",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "ParityMap",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Key 6 = 2^64 - 1 is a well-formed CBOR uint (1b ff..ff) and fits u64. The payload grows by 8 bytes, M stays 1, and payload_len, payload_sha256 and the CRCs are repaired, so the locator arithmetic holds. The directory invariants hold: H is non-zero, and no invariant relates total, H and P.",
+            "sections": [
+              "10.1.5",
+              "10.1.4",
+              "10.1.2",
+              "2.4",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "A Reader rejects a value that is recorded, or used as a position, a count or an ordinal, when its exact value does not fit the field or the u64 that holds it; the error is the one named for the structure that carries the value."
+            ]
+          }
+        },
+        {
+          "observation": "directory primary",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Key 6 = 2^64 - 1 is a well-formed CBOR uint (1b ff..ff) and fits u64. The payload grows by 8 bytes, M stays 1, and payload_len, payload_sha256 and the CRCs are repaired, so the locator arithmetic holds. The directory invariants hold: H is non-zero, and no invariant relates total, H and P.",
+            "sections": [
+              "10.1.5",
+              "10.1.4",
+              "10.1.2",
+              "2.4",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "A Reader rejects a value that is recorded, or used as a position, a count or an ordinal, when its exact value does not fit the field or the u64 that holds it; the error is the one named for the structure that carries the value."
+            ]
+          }
+        },
+        {
+          "observation": "directory tail",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Key 6 = 2^64 - 1 is a well-formed CBOR uint (1b ff..ff) and fits u64. The payload grows by 8 bytes, M stays 1, and payload_len, payload_sha256 and the CRCs are repaired, so the locator arithmetic holds. The directory invariants hold: H is non-zero, and no invariant relates total, H and P.",
+            "sections": [
+              "10.1.5",
+              "10.1.4",
+              "10.1.2",
+              "2.4",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "A Reader rejects a value that is recorded, or used as a position, a count or an ordinal, when its exact value does not fit the field or the u64 that holds it; the error is the one named for the structure that carries the value."
+            ]
+          }
+        },
+        {
+          "observation": "recovery",
+          "author_observation": "Recoverer",
+          "expected": {
+            "outcome": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "error": "SidecarMetadataUnavailable",
+            "derivation": "As variant a. The precondition's 2H + P + 1 = 2^65 + 3 is only compared, so it is compared exactly, is never too large, and differs from 7. The entry is not available, and 7 - 1 - (2^64 - 1) is never used as a position. The tail rescue from the terminal index is excluded because the ParityMap validates, so step 4 applies.",
+            "sections": [
+              "13.3",
+              "2.4",
+              "12.5",
+              "15"
+            ],
+            "quotes": [
+              "A value that is only compared is compared exactly, and is never too large.",
+              "An intermediate overflow in one way of writing a formula is not a format violation, and a Reader MUST NOT reject for it.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry.",
+              "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "c-total-zero",
+      "replaces": {
+        "expected": {
+          "one_of": [
+            "DirectoryInvalid",
+            "ParityMapParse"
+          ],
+          "permitting_text": "Section 15 category sentence (both copies carry the violation)"
+        },
+        "pinned": true
+      },
+      "observations": [
+        {
+          "observation": "directory primary",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "DirectoryInvalid (both copies carry the same well-formed directory with sidecar_total_block_count 0); the ParityMap does not validate",
+            "error": "DirectoryInvalid",
+            "derivation": "Key 5 = 0 is well formed (a uint), so the error is not ParityMapParse. It breaks the invariant 'non-zero sidecar_total_block_count'. Both copies are identical, so both fail on that invariant.",
+            "sections": [
+              "10.1.5",
+              "15"
+            ],
+            "quotes": [
+              "non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and `parity_shard_block_count`;",
+              "Framing, CBOR, and type errors in a ParityMap, its directory included, are `ParityMapParse`; a well-formed directory that breaks an invariant of Section 10.1.5 is `DirectoryInvalid`.",
+              "The name is normative as a category: this document does not specify which of the two a Reader reports once it has failed both ParityMap copies."
+            ]
+          }
+        },
+        {
+          "observation": "directory tail",
+          "author_observation": "ParityMap parser",
+          "expected": {
+            "outcome": "DirectoryInvalid (both copies carry the same well-formed directory with sidecar_total_block_count 0); the ParityMap does not validate",
+            "error": "DirectoryInvalid",
+            "derivation": "Key 5 = 0 is well formed (a uint), so the error is not ParityMapParse. It breaks the invariant 'non-zero sidecar_total_block_count'. Both copies are identical, so both fail on that invariant.",
+            "sections": [
+              "10.1.5",
+              "15"
+            ],
+            "quotes": [
+              "non-zero `sidecar_total_block_count`, `sidecar_header_block_count`, and `parity_shard_block_count`;",
+              "Framing, CBOR, and type errors in a ParityMap, its directory included, are `ParityMapParse`; a well-formed directory that breaks an invariant of Section 10.1.5 is `DirectoryInvalid`.",
+              "The name is normative as a category: this document does not specify which of the two a Reader reports once it has failed both ParityMap copies."
+            ]
+          }
+        },
+        {
+          "observation": "recovery",
+          "author_observation": "Recoverer",
+          "expected": {
+            "outcome": "recovered",
+            "error": null,
+            "derivation": "The footer and primary fail on their CRCs. The final ParityMap does not validate (DirectoryInvalid), so no directory entry is available, and the agreement rule, the precondition and 0 - 1 - 1 are never evaluated. The map entry comes from the validated terminal replicas: the ParityMap's content is not a replica validity condition, only its structural row is. The tail rescue from the terminal index therefore applies: total 7, P 4, H = (7 - 1 - 4)/2 = 1, tail at block 5. The tail is valid on its own, its recorded H is 1, and its epoch and range agree, so it is used. The requested block is reconstructed from its stripe peers and CRC-verified.",
+            "sections": [
+              "13.3",
+              "13.1",
+              "10.6",
+              "13.4",
+              "13.5"
+            ],
+            "quotes": [
+              "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates.",
+              "Here, as in the directory-assisted rescue, a final ParityMap validates only when it validates and is marked `is_final_directory`.",
+              "The tail copy is used only if it is valid on its own (step 2's sense), its recorded `sidecar_header_block_count` equals `H`, and its epoch and protected range agree with the map entry.",
+              "a final `ParityMap` is present if and only if at least one `ParitySidecar` row is present;",
+              "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "isolated-1",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "outcome": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "error": "SidecarMetadataUnavailable",
+            "derivation": "Sidecar blocks 0 and 6 are unreadable, so steps 1 and 2 fail. The entry agrees with the map entry in tape file, epoch, range and count, but 2H + P + 1 = 19 is not 7. The entry is not available and no read is placed from it, so the checked evaluation of 7 - 1 - 7 that the construction targets is never reached. The tail rescue from the terminal index is excluded because the ParityMap validates, so step 4 applies. This contradicts the construction's claim that 'the Recoverer may place the read': the text's second precondition forbids it.",
+            "sections": [
+              "13.3",
+              "2.4",
+              "12.5",
+              "Appendix D TT-2"
+            ],
+            "quotes": [
+              "A Recoverer MUST NOT place a read from a directory entry unless the entry agrees with the sidecar's map entry in tape file, epoch, protected range and block count.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry.",
+              "The Recoverer then reports `SidecarMetadataUnavailable` for the epoch, whatever each copy's own failure was.",
+              "Section 13.3's tail location is `H + P`, with the precondition `total = 2H + P + 1` and `H > 0`."
+            ]
+          }
+        }
+      ],
+      "unobserved": [
+        {
+          "author_observation": "ParityMap parser",
+          "reason": "the supplement variant observes only the Recoverer; the ParityMap parser is observed by the parent variant (a or b), whose construction it repeats",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "Same directory as variant a (key 6 = 7, payload length unchanged, repaired). No invariant relates total, H and P.",
+            "sections": [
+              "10.1.5",
+              "15"
+            ],
+            "quotes": [
+              "Whenever a Reader decodes a sidecar epoch directory, it MUST validate all of the following invariants; a violation is `DirectoryInvalid` (Section 15).",
+              "These are preconditions of the rescue, not invariants of Section 10.1.5: an entry that fails them affects only its own epoch."
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "source": "negative-cases-supplement.json",
+      "case": "overflow-13.3-tail-location",
+      "variant": "isolated-2",
+      "replaces": {
+        "expected": "SidecarMetadataUnavailable{epoch_id: 0}",
+        "pinned": false
+      },
+      "observations": [
+        {
+          "observation": "error",
+          "author_observation": "the variant",
+          "expected": {
+            "outcome": "SidecarMetadataUnavailable{epoch_id: 0}",
+            "error": "SidecarMetadataUnavailable",
+            "derivation": "As isolated-1. 2H + P + 1 = 2^65 + 3 is compared exactly with 7, and the comparison fails. The entry is not available, the location is never evaluated, and the terminal-index rescue is excluded, so step 4 applies.",
+            "sections": [
+              "13.3",
+              "2.4",
+              "12.5"
+            ],
+            "quotes": [
+              "A value that is only compared is compared exactly, and is never too large.",
+              "The rescue also requires the entry's `sidecar_total_block_count` to equal `2H + P + 1`, with `H > 0`. An entry that fails either precondition is not available.",
+              "When a final ParityMap validates but the sidecar's entry fails a precondition of the directory-assisted rescue, this rescue does not apply either, since the directory then contradicts the map entry."
+            ]
+          }
+        }
+      ],
+      "unobserved": [
+        {
+          "author_observation": "ParityMap parser",
+          "reason": "the supplement variant observes only the Recoverer; the ParityMap parser is observed by the parent variant (a or b), whose construction it repeats",
+          "expected": {
+            "outcome": "accepted: the ParityMap validates and is final; no Section 15 error",
+            "error": null,
+            "derivation": "As variant b: 2^64 - 1 is a valid uint that fits u64, payload_len is repaired, and M stays 1.",
+            "sections": [
+              "10.1.5",
+              "10.1.2",
+              "2.4",
+              "15"
+            ],
+            "quotes": [
+              "A Reader rejects a value that is recorded, or used as a position, a count or an ordinal, when its exact value does not fit the field or the u64 that holds it; the error is the one named for the structure that carries the value."
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

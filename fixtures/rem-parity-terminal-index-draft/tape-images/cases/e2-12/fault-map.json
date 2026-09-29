@@ -1,0 +1,102 @@
+{
+  "failed_data_addresses": [
+    [
+      1,
+      0
+    ]
+  ],
+  "hints": null,
+  "image": "two-epoch",
+  "record_edits": [
+    {
+      "construction": "the ParityMap re-encoded with the edited directory entry",
+      "edits": [
+        {
+          "new_bytes": "b21a73f807075f73ec96e6641d8366ac246d9198381dbb4c2992f2f9925bcc3a",
+          "offset": 56,
+          "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "1c67503a3956d871",
+          "offset": 192,
+          "old_bytes": "30274b7578ea464c",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "11",
+          "offset": 270,
+          "old_bytes": "10",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        }
+      ],
+      "lba": 27,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 0,
+      "sha256": "9261e797b7f6b6b3ecb517b9faa20f7628ca593acefe244dea2f32548224feb5",
+      "tape_file": 4
+    },
+    {
+      "construction": "the ParityMap re-encoded with the edited directory entry",
+      "edits": [
+        {
+          "new_bytes": "b21a73f807075f73ec96e6641d8366ac246d9198381dbb4c2992f2f9925bcc3a",
+          "offset": 56,
+          "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "73280560db483d44",
+          "offset": 192,
+          "old_bytes": "5f681e2f9af4a379",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "11",
+          "offset": 270,
+          "old_bytes": "10",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        }
+      ],
+      "lba": 28,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 1,
+      "sha256": "cde709d3f3e4f0bfb3e8ca502e65137057abbe711cb379d0f5a3a22df29665d3",
+      "tape_file": 4
+    },
+    {
+      "construction": "the ParityMap re-encoded with the edited directory entry",
+      "edits": [
+        {
+          "new_bytes": "b21a73f807075f73ec96e6641d8366ac246d9198381dbb4c2992f2f9925bcc3a",
+          "offset": 56,
+          "old_bytes": "457a0d662400b8e9ffb09f7500e5c9e9dd82ab22ab2b7a3ee28029a48dcd6033",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        },
+        {
+          "new_bytes": "39a29cf398a38462",
+          "offset": 192,
+          "old_bytes": "15e287bcd91f1a5f",
+          "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"
+        }
+      ],
+      "lba": 29,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 2,
+      "sha256": "b012e55ced459323aece070852ecbb659feb45699805e78eb7bbbe4a24c4fc8c",
+      "tape_file": 4
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 2,
+      "record_index": 0,
+      "tape_file": 1
+    }
+  ]
+}

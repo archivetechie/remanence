@@ -1562,6 +1562,18 @@ fn print_verification(
         verification.verification_basis
     )
     .map_err(|error| error.to_string())?;
+    for finding in &verification.protected_content_findings {
+        writeln!(
+            out,
+            "protected_content_finding: {} [{}] {}",
+            pb::ProtectedContentFindingKind::try_from(finding.kind)
+                .map(|kind| kind.as_str_name())
+                .unwrap_or("UNRECOGNISED"),
+            finding.address.as_deref().unwrap_or(""),
+            finding.detail.as_deref().unwrap_or("")
+        )
+        .map_err(|error| error.to_string())?;
+    }
     writeln!(out, "measured_eod_lba: {}", verification.measured_eod_lba)
         .map_err(|error| error.to_string())?;
     writeln!(
@@ -1976,6 +1988,7 @@ mod tests {
             payload_digest: Some(vec![3; 32]),
             canonical_map_digest: Some(vec![4; 32]),
             verification_basis: "measured_full_physical".to_string(),
+            protected_content_findings: Vec::new(),
             recovery_inventory: None,
         };
         let fast_inventory =
@@ -2039,6 +2052,7 @@ mod tests {
             payload_digest: Some(vec![3; 32]),
             canonical_map_digest: Some(vec![4; 32]),
             verification_basis: "measured_full_physical".to_string(),
+            protected_content_findings: Vec::new(),
             ..Default::default()
         };
 
@@ -2077,6 +2091,7 @@ mod tests {
                 .structural_entry_count
                 .expect("BOT recovery fixture counts its structure"),
             verification_basis: "bot_structural_recovery".to_string(),
+            protected_content_findings: Vec::new(),
             recovery_inventory: Some(recovery),
             ..Default::default()
         };
@@ -2135,6 +2150,7 @@ mod tests {
             payload_digest: Some(vec![3; 32]),
             canonical_map_digest: Some(vec![4; 32]),
             verification_basis: "measured_full_physical".to_string(),
+            protected_content_findings: Vec::new(),
             ..Default::default()
         }
     }

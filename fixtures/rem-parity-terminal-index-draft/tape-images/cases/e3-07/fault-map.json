@@ -1,0 +1,38 @@
+{
+  "appended_files": [
+    {
+      "records": [
+        {
+          "length": 262144,
+          "planned_start_lba": 38,
+          "planned_tape_file_number": 9,
+          "record_index": 0,
+          "sha256": "dacf1c67c5d4511bef250c278ebd403e0325f5cf5650f30493302ad36e5242aa",
+          "source": "second_edition_replica"
+        },
+        {
+          "length": 262144,
+          "planned_start_lba": 38,
+          "planned_tape_file_number": 9,
+          "record_index": 1,
+          "sha256": "8ee59d8b924c1f28268243c5741af8686d70d4223f4606b913492308d89ce223",
+          "source": "second_edition_replica"
+        },
+        {
+          "length": 262144,
+          "planned_start_lba": 38,
+          "planned_tape_file_number": 9,
+          "record_index": 2,
+          "sha256": "22efaf55aed81d7c89b6d0f79d3005012a48daf19ebbc6ea7665ce056d2a4c8b",
+          "source": "second_edition_replica"
+        }
+      ],
+      "trailing_filemark": true
+    }
+  ],
+  "failed_data_addresses": [],
+  "hints": null,
+  "image": "a4-minimal",
+  "removed_filemark_after_tape_file": 8,
+  "unreadable_records": []
+}

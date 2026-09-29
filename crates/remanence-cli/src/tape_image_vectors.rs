@@ -291,7 +291,11 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
         );
     }
     if let Some(erratum) = case.get("erratum") {
-        assert_eq!(erratum, "E2", "{}: erratum set", case["id"]);
+        assert!(
+            matches!(erratum.as_str(), Some("E2" | "E3" | "E4")),
+            "{}: erratum set",
+            case["id"]
+        );
     }
     if let Some(authority) = case.get("object_authority") {
         assert_eq!(
@@ -308,6 +312,10 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
                     | "unreadable"
                     | "removed_filemark_after_tape_file"
                     | "record_faults"
+                    | "extra_records"
+                    | "appended_files"
+                    | "second_edition_replica"
+                    | "parity_map_edits"
             ),
             "{}: unknown fault key {key}",
             case["id"]
@@ -329,9 +337,11 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
             "all three replica header records; epoch 0 sidecar primary header, tail copy and footer" |
             "both ParityMap copies (tape file 3)" |
             "both ParityMap copies; epoch 0 sidecar primary header and footer" |
-            "every record of all three terminal replicas"
+            "epoch 0 sidecar footer; both ParityMap copies" |
+            "every record of all three terminal replicas" |
+            "every record of all three terminal replicas; epoch 0 sidecar primary header"
         ), "unrecognized fault description: {description}");
-        if description == "every record of all three terminal replicas" {
+        if description.starts_with("every record of all three terminal replicas") {
             for replica in [map_file + 1, map_file + 3, map_file + 5] {
                 lbas.extend(start(replica)..=last(replica));
             }
@@ -404,6 +414,29 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
     if let Some(faults) = case["fault"].get("record_faults") {
         assert!(faults.is_array(), "{}: record_faults is a list", case["id"]);
         map["record_edits"] = record_edits(case, image);
+    }
+    if let Some(edits) = case["fault"].get("parity_map_edits") {
+        // The ParityMap's three blocks are rebuilt through the production
+        // codec, so every payload length, hash and CRC is recomputed.
+        let mut resolved = map["record_edits"].as_array().cloned().unwrap_or_default();
+        resolved.extend(parity_map_edits(case, edits, image));
+        map["record_edits"] = json!(resolved);
+    }
+    if let Some(extra) = case["fault"].get("extra_records") {
+        map["record_insertions"] = record_insertions(case, extra, image);
+    }
+    let appended = case["fault"].get("appended_files");
+    let replica = case["fault"].get("second_edition_replica");
+    assert!(
+        appended.is_none() || replica.is_none(),
+        "{}: appended_files and second_edition_replica are separate keys",
+        case["id"]
+    );
+    if let Some(appended) = appended {
+        map["appended_files"] = appended_files(case, appended, image);
+    }
+    if let Some(replica) = replica {
+        map["appended_files"] = second_edition_replica_file(case, replica, image);
     }
     if let Some(observations) = case.get("observations") {
         // Each observation runs the reader separately, with its own supplied values.
@@ -482,6 +515,14 @@ pub(crate) fn check_observations(observations: &Value) {
     }
 }
 
+/// One byte from a two-digit hex string.
+#[cfg(test)]
+pub(crate) fn unhex_byte(text: &str) -> u8 {
+    let bytes = unhex(text);
+    assert_eq!(bytes.len(), 1, "one byte");
+    bytes[0]
+}
+
 fn unhex(text: &str) -> Vec<u8> {
     assert!(text.len().is_multiple_of(2), "odd hex string {text}");
     (0..text.len())
@@ -506,7 +547,7 @@ const BOOTSTRAP_PAYLOAD_START: usize = 0x38;
 ///
 /// The executor applies only the resolved edits, checking each edit's old bytes.
 pub(crate) fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
-    const KEYS: [&str; 7] = [
+    const KEYS: [&str; 9] = [
         "tape_file",
         "record_index",
         "length",
@@ -514,6 +555,8 @@ pub(crate) fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
         "payload",
         "header_crc",
         "payload_crc",
+        "sidecar_hash",
+        "sidecar_crcs",
     ];
     let faults = case["fault"]["record_faults"].as_array().unwrap();
     json!(faults
@@ -594,6 +637,35 @@ pub(crate) fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
                     (new, format!("{field}: xor {}", hex(&mask)))
                 };
                 write(&mut record, offset, &new, &reason);
+            }
+            // A sidecar header/index copy whose index is one block: its
+            // canonical metadata hash (Section 9.5) and its two CRCs (9.2),
+            // recomputed after the edits above.
+            let sidecar_treatment = |key: &str| {
+                fault.get(key).map(|value| {
+                    assert_eq!(value, "recomputed", "{key} is recomputed or absent");
+                })
+            };
+            if sidecar_treatment("sidecar_hash").is_some() {
+                assert_eq!(
+                    u64::from_le_bytes(record[0x60..0x68].try_into().unwrap()),
+                    1,
+                    "sidecar_hash is defined for a one-block index"
+                );
+                let inline = u64::from_le_bytes(record[0x68..0x70].try_into().unwrap()) as usize;
+                let mut hash = Sha256::new();
+                hash.update(b"remanence-sidecar-metadata-v1");
+                hash.update(&record[..0x90]);
+                hash.update(&record[0xc8..0xc8 + inline]);
+                let hash: [u8; 32] = hash.finalize().into();
+                write(&mut record, 0x98, &hash, "canonical_metadata_hash recomputed");
+            }
+            if sidecar_treatment("sidecar_crcs").is_some() {
+                let crc = remanence_parity::crc64_xz(&record[..0xc0]);
+                write(&mut record, 0xc0, &crc.to_le_bytes(), "header_crc64 recomputed");
+                let tail = record.len() - 8;
+                let crc = remanence_parity::crc64_xz(&record[..tail]);
+                write(&mut record, tail, &crc.to_le_bytes(), "block0_crc64 recomputed");
             }
             let bootstrap_frame = tape_file == 0 && record_index == 0;
             let old_len = |record: &[u8]| {
@@ -725,6 +797,361 @@ pub(crate) fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
                 "edits": edits, "sha256": hex(&Sha256::digest(&record))})
         })
         .collect::<Vec<_>>())
+}
+
+/// The concrete records of a tape file, as the image holds them.
+fn file_records(image: &ExportedTapeImage, tape_file: usize) -> Vec<Vec<u8>> {
+    let file = &image.files[tape_file];
+    (0..file.record_offsets.len())
+        .map(|i| {
+            let start = file.record_offsets[i];
+            let end = file
+                .record_offsets
+                .get(i + 1)
+                .copied()
+                .unwrap_or(file.bytes.len());
+            file.bytes[start..end].to_vec()
+        })
+        .collect()
+}
+
+/// Resolve `parity_map_edits`: each names a ParityMap tape file, a directory
+/// entry, a field and a change (`add`, `set` or `xor`). The ParityMap is
+/// decoded and re-encoded through the production codec, which recomputes the
+/// payload length, the payload hash and every CRC, so the result still
+/// validates. The codec's re-encoding of the unchanged ParityMap is checked to
+/// reproduce the image's bytes first. Each block that changes becomes a
+/// resolved record edit.
+fn parity_map_edits(case: &Value, edits: &Value, image: &ExportedTapeImage) -> Vec<Value> {
+    let id = case["id"].as_str().unwrap_or_default();
+    let edits = edits.as_array().expect("parity_map_edits is a list");
+    let mut by_file: std::collections::BTreeMap<usize, Vec<&Value>> = Default::default();
+    for edit in edits {
+        for key in edit.as_object().expect("parity map edit object").keys() {
+            assert!(
+                matches!(
+                    key.as_str(),
+                    "tape_file" | "directory_entry" | "field" | "add" | "set" | "xor"
+                ),
+                "{id}: unknown parity map edit key {key}"
+            );
+        }
+        by_file
+            .entry(edit["tape_file"].as_u64().expect("parity map tape file") as usize)
+            .or_default()
+            .push(edit);
+    }
+    let uuid: [u8; 16] = image.files[0].bytes[0x10..0x20].try_into().unwrap();
+    let mut resolved = Vec::new();
+    for (tape_file, edits) in by_file {
+        let blocks = file_records(image, tape_file);
+        let decoded = remanence_parity::parse_parity_map_tape_file(&blocks, &uuid)
+            .unwrap_or_else(|e| panic!("{id}: tape file {tape_file} is not a ParityMap: {e}"));
+        let reencoded = remanence_parity::encode_parity_map_tape_file(&decoded.payload, BLOCK)
+            .expect("the codec re-encodes a decoded ParityMap");
+        assert_eq!(
+            reencoded.blocks, blocks,
+            "{id}: the codec's re-encoding of the unchanged ParityMap differs from the image"
+        );
+        let mut payload = decoded.payload.clone();
+        for edit in edits {
+            let index = edit["directory_entry"]
+                .as_u64()
+                .expect("directory entry index") as usize;
+            let entry = &mut payload.directory.entries[index];
+            match edit["field"].as_str().expect("parity map field") {
+                "sidecar_total_block_count" => {
+                    let add = edit["add"].as_u64().expect("a total change is an add");
+                    entry.sidecar_total_block_count += add;
+                }
+                "canonical_metadata_hash" => {
+                    let mask = unhex(edit["xor"].as_str().expect("a hash change is an xor"));
+                    for (byte, mask) in entry.canonical_metadata_hash.iter_mut().zip(&mask) {
+                        *byte ^= mask;
+                    }
+                }
+                other => panic!("{id}: unknown parity map field {other}"),
+            }
+        }
+        let rebuilt = remanence_parity::encode_parity_map_tape_file(&payload, BLOCK)
+            .expect("the edited ParityMap still encodes");
+        assert_eq!(
+            rebuilt.blocks.len(),
+            blocks.len(),
+            "{id}: length is unchanged"
+        );
+        let file = &image.files[tape_file];
+        for (record_index, (old, new)) in blocks.iter().zip(&rebuilt.blocks).enumerate() {
+            if old == new {
+                continue;
+            }
+            let mut edits = Vec::new();
+            let mut offset = 0;
+            while offset < old.len() {
+                if old[offset] == new[offset] {
+                    offset += 1;
+                    continue;
+                }
+                let start = offset;
+                while offset < old.len() && old[offset] != new[offset] {
+                    offset += 1;
+                }
+                edits.push(json!({"offset": start, "old_bytes": hex(&old[start..offset]),
+                    "new_bytes": hex(&new[start..offset]),
+                    "reason": "ParityMap rebuilt through the codec with the edited directory entry (payload, hashes and CRCs recomputed)"}));
+            }
+            resolved.push(
+                json!({"lba": file.start_record + record_index, "tape_file": tape_file,
+                "record_index": record_index, "original_length": old.len(), "length": old.len(),
+                "construction": "the ParityMap re-encoded with the edited directory entry",
+                "edits": edits, "sha256": hex(&Sha256::digest(new))}),
+            );
+        }
+    }
+    resolved
+}
+
+/// Resolve `extra_records`: a record of stated length and fill inserted into a
+/// tape file after a stated record (or its last record), before its filemark.
+fn record_insertions(case: &Value, extra: &Value, image: &ExportedTapeImage) -> Value {
+    let id = case["id"].as_str().unwrap_or_default();
+    json!(extra
+        .as_array()
+        .expect("extra_records is a list")
+        .iter()
+        .map(|record| {
+            for key in record.as_object().expect("extra record object").keys() {
+                assert!(
+                    matches!(key.as_str(), "tape_file" | "after" | "length" | "fill"),
+                    "{id}: unknown extra record key {key}"
+                );
+            }
+            let tape_file = record["tape_file"].as_u64().unwrap() as usize;
+            let count = image.files[tape_file].record_offsets.len();
+            let after = match record["after"].as_str() {
+                Some("last record") => count - 1,
+                other => panic!("{id}: an extra record goes after the last record, not {other:?}"),
+            };
+            let length = record["length"].as_u64().expect("extra record length") as usize;
+            let fill = unhex(record["fill"].as_str().expect("extra record fill"));
+            assert_eq!(fill.len(), 1, "{id}: one fill byte");
+            let bytes = vec![fill[0]; length];
+            json!({"tape_file": tape_file, "after_record_index": after, "length": length,
+                "fill": hex(&fill), "sha256": hex(&Sha256::digest(&bytes))})
+        })
+        .collect::<Vec<_>>())
+}
+
+/// The bytes of one appended record, from its resolved description.
+#[cfg(test)]
+pub(crate) fn appended_record_bytes(record: &Value, image: &ExportedTapeImage) -> Vec<u8> {
+    let bytes = match record["source"].as_str().expect("appended record source") {
+        "foreign" => {
+            // Bytes that match no structure of the document: zeros, with the
+            // stated first byte.
+            let mut bytes = vec![0u8; record["length"].as_u64().unwrap() as usize];
+            bytes[0] = unhex(record["first_byte"].as_str().unwrap())[0];
+            bytes
+        }
+        "copy_of" => file_records(image, record["tape_file"].as_u64().unwrap() as usize)
+            [record["record_index"].as_u64().unwrap() as usize]
+            .clone(),
+        "second_edition_replica" => second_edition_replica_a(
+            record["planned_tape_file_number"].as_u64().unwrap(),
+            record["planned_start_lba"].as_u64().unwrap(),
+        )
+        .expect("second-edition replica")[record["record_index"].as_u64().unwrap() as usize]
+            .clone(),
+        other => panic!("unknown appended record source {other}"),
+    };
+    assert_eq!(
+        hex(&Sha256::digest(&bytes)),
+        record["sha256"].as_str().unwrap(),
+        "resolved appended record digest"
+    );
+    bytes
+}
+
+/// Resolve `appended_files`: tape files appended after the image's last
+/// filemark, each a list of records of stated content, with or without a
+/// trailing filemark. A record is foreign (zeros with a stated first byte) or
+/// a byte copy of a given record of the image.
+fn appended_files(case: &Value, appended: &Value, image: &ExportedTapeImage) -> Value {
+    let id = case["id"].as_str().unwrap_or_default();
+    json!(appended
+        .as_array()
+        .expect("appended_files is a list")
+        .iter()
+        .map(|file| {
+            for key in file.as_object().expect("appended file object").keys() {
+                assert!(
+                    matches!(key.as_str(), "records" | "trailing_filemark"),
+                    "{id}: unknown appended file key {key}"
+                );
+            }
+            let trailing = file["trailing_filemark"]
+                .as_bool()
+                .expect("an appended file states its trailing filemark");
+            let records: Vec<_> = file["records"]
+                .as_array()
+                .expect("appended file records")
+                .iter()
+                .map(|record| {
+                    let kinds = record.as_object().expect("appended record object");
+                    assert_eq!(kinds.len(), 1, "{id}: one record source");
+                    let resolved = if let Some(foreign) = record.get("foreign") {
+                        for key in foreign.as_object().unwrap().keys() {
+                            assert_eq!(key, "first_byte", "{id}: unknown foreign record key");
+                        }
+                        json!({"source": "foreign", "length": BLOCK,
+                            "first_byte": foreign["first_byte"]})
+                    } else if let Some(copy) = record.get("copy_of") {
+                        for key in copy.as_object().unwrap().keys() {
+                            assert!(
+                                matches!(key.as_str(), "tape_file" | "record"),
+                                "{id}: unknown copy_of key {key}"
+                            );
+                        }
+                        let tape_file = copy["tape_file"].as_u64().unwrap() as usize;
+                        let index = match copy["record"].as_str() {
+                            Some("last") => image.files[tape_file].record_offsets.len() - 1,
+                            other => panic!("{id}: copy_of names the last record, not {other:?}"),
+                        };
+                        json!({"source": "copy_of", "tape_file": tape_file, "record_index": index})
+                    } else {
+                        panic!("{id}: an appended record is foreign or a copy_of");
+                    };
+                    let mut resolved = resolved;
+                    let bytes = match resolved["source"].as_str().unwrap() {
+                        "foreign" => {
+                            let mut b = vec![0u8; BLOCK as usize];
+                            b[0] = unhex(resolved["first_byte"].as_str().unwrap())[0];
+                            b
+                        }
+                        _ => file_records(image, resolved["tape_file"].as_u64().unwrap() as usize)
+                            [resolved["record_index"].as_u64().unwrap() as usize]
+                            .clone(),
+                    };
+                    resolved["length"] = json!(bytes.len());
+                    resolved["sha256"] = json!(hex(&Sha256::digest(&bytes)));
+                    resolved
+                })
+                .collect();
+            json!({"records": records, "trailing_filemark": trailing})
+        })
+        .collect::<Vec<_>>())
+}
+
+/// Resolve `second_edition_replica`: a replica of a second edition (its edition
+/// id and edition sequence differ from the profile's and nothing else does),
+/// planned as a later tape file and written directly after the last record of
+/// a named tape file, with its own trailing filemark.
+fn second_edition_replica_file(case: &Value, replica: &Value, image: &ExportedTapeImage) -> Value {
+    let id = case["id"].as_str().unwrap_or_default();
+    for key in replica
+        .as_object()
+        .expect("second edition replica object")
+        .keys()
+    {
+        assert!(
+            matches!(
+                key.as_str(),
+                "replica" | "planned_tape_file" | "after_last_record_of"
+            ),
+            "{id}: unknown second edition replica key {key}"
+        );
+    }
+    assert_eq!(replica["replica"], "A", "{id}: only replica A is defined");
+    let after = replica["after_last_record_of"].as_u64().unwrap() as usize;
+    let planned_tape_file = replica["planned_tape_file"].as_u64().unwrap();
+    let last =
+        image.files[after].start_record as u64 + image.files[after].record_offsets.len() as u64 - 1;
+    let start = last + 1;
+    let records =
+        second_edition_replica_a(planned_tape_file, start).expect("second-edition replica");
+    let resolved: Vec<_> = records
+        .iter()
+        .enumerate()
+        .map(|(i, bytes)| {
+            json!({"source": "second_edition_replica", "planned_tape_file_number": planned_tape_file,
+                "planned_start_lba": start, "record_index": i, "length": bytes.len(),
+                "sha256": hex(&Sha256::digest(bytes))})
+        })
+        .collect();
+    json!([{"records": resolved, "trailing_filemark": true}])
+}
+
+/// The records of replica A of a second edition of `a4-minimal` (edition id
+/// and sequence differ, as in `two-edition`), re-planned as tape file
+/// `planned_tape_file` starting at `planned_start_lba`, with its own five-file
+/// terminal layout. The production planner refuses a layout whose first
+/// replica is not the covered prefix's next tape file, so the header and footer
+/// are rewritten field by field, and every digest and CRC they carry is
+/// recomputed: the replica validates on its own, and lies where it says it is.
+pub(crate) fn second_edition_replica_a(
+    planned_tape_file: u64,
+    planned_start_lba: u64,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut second = inputs("a4-minimal");
+    second.edition_id = [0x55; 16];
+    second.edition_sequence += 1;
+    let nominal = second.nominal_extent_bytes;
+    let (_, image) = write_model(second)?;
+    let mut blocks = file_records(&image, 4);
+    let separation =
+        remanence_parity::index_separation_records(BLOCK, nominal).map_err(|e| e.to_string())?;
+    let layout = remanence_parity::TerminalTailLayout::new(
+        0,
+        BLOCK,
+        planned_tape_file,
+        planned_start_lba,
+        blocks.len() as u64,
+        separation,
+    )
+    .map_err(|e| e.to_string())?;
+    let put = |block: &mut Vec<u8>, offset: usize, bytes: &[u8]| {
+        block[offset..offset + bytes.len()].copy_from_slice(bytes)
+    };
+    let header_len = blocks.len();
+    for index in [0, header_len - 1] {
+        let block = &mut blocks[index];
+        put(block, 0x88, &planned_tape_file.to_le_bytes());
+        put(block, 0x90, &planned_start_lba.to_le_bytes());
+        put(block, 0xa0, &layout.expected_eod_lba.to_le_bytes());
+        put(block, 0x108, &layout.digest().map_err(|e| e.to_string())?);
+        for (i, component) in layout.components.iter().enumerate() {
+            let at = 0x148 + i * 32;
+            put(block, at, &component.kind.code().to_le_bytes());
+            put(block, at + 2, &component.ordinal.to_le_bytes());
+            put(block, at + 4, &1u32.to_le_bytes());
+            put(
+                block,
+                at + 8,
+                &component.planned_tape_file_number.to_le_bytes(),
+            );
+            put(block, at + 16, &component.planned_start_lba.to_le_bytes());
+            put(block, at + 24, &component.record_count.to_le_bytes());
+        }
+        let mut descriptor = Sha256::new();
+        descriptor.update(b"REM-TAPE-INDEX-REPLICA-DESCRIPTOR-V1\0");
+        descriptor.update(&block[0xe8..0x128]);
+        descriptor.update(&block[0x38..0x3c]);
+        descriptor.update(&block[0x148..0x168]);
+        descriptor.update(&block[0x98..0xa0]);
+        put(block, 0x128, &descriptor.finalize());
+    }
+    let footer = header_len - 1;
+    let last_record = planned_start_lba + (header_len as u64) - 1;
+    put(&mut blocks[footer], 0x2d8, &planned_tape_file.to_le_bytes());
+    put(&mut blocks[footer], 0x2e0, &planned_start_lba.to_le_bytes());
+    put(&mut blocks[footer], 0x2f0, &last_record.to_le_bytes());
+    let crc = remanence_parity::crc64_xz(&blocks[0][..0x3f8]);
+    put(&mut blocks[0], 0x3f8, &crc.to_le_bytes());
+    let header_sha: [u8; 32] = Sha256::digest(&blocks[0]).into();
+    put(&mut blocks[footer], 0x2b8, &header_sha);
+    let crc = remanence_parity::crc64_xz(&blocks[footer][..0x3f8]);
+    put(&mut blocks[footer], 0x3f8, &crc.to_le_bytes());
+    Ok(blocks)
 }
 
 /// Whether an expectation's quote occurs verbatim in the in-progress

@@ -577,8 +577,12 @@ pub(crate) fn terminal_verification_to_proto(
 ) -> pb::TapeIndexVerification {
     use remanence_parity::TerminalIndexVerificationOutcome as Outcome;
     match outcome {
+        // A complete terminal suffix is not a complete tape: a failed data
+        // block, parity shard or sidecar of the protected content means the
+        // tape is not reported as verified complete (REM-PARITY 2.2).
         Outcome::VerifiedComplete(verified) => {
-            terminal_verified_to_proto(tape_uuid, *verified, true)
+            let complete = verified.protected.is_clean();
+            terminal_verified_to_proto(tape_uuid, *verified, complete)
         }
         Outcome::VerifiedDegraded(verified) => {
             terminal_verified_to_proto(tape_uuid, *verified, false)
@@ -612,12 +616,68 @@ pub(crate) fn terminal_verification_to_proto(
             payload_digest: None,
             canonical_map_digest: None,
             verification_basis: "bot_structural_recovery".to_string(),
+            protected_content_findings: protected_content_findings(&recovery.protected),
             recovery_inventory: Some(bot_structural_recovery_to_proto(
                 tape_uuid,
                 recovery.bot_recovery,
             )),
         },
     }
+}
+
+/// Every failure a Verifier's protected-content pass reported, by its address
+/// (REM-PARITY 2.2), for the operator: nothing the library found is reduced to
+/// a count.
+fn protected_content_findings(
+    protected: &remanence_parity::ProtectedContentVerification,
+) -> Vec<pb::ProtectedContentFinding> {
+    use pb::ProtectedContentFindingKind as Kind;
+    let finding =
+        |kind: Kind, address: Option<String>, detail: String| pb::ProtectedContentFinding {
+            kind: kind as i32,
+            address,
+            detail: Some(detail),
+        };
+    let mut out = Vec::new();
+    if let Some(reason) = &protected.not_performed {
+        out.push(finding(Kind::NotPerformed, None, reason.clone()));
+    }
+    for damage in &protected.prefix_damage {
+        out.push(finding(Kind::PrefixDamage, None, damage.clone()));
+    }
+    for sidecar in &protected.sidecars {
+        for f in &sidecar.findings {
+            out.push(finding(
+                Kind::Sidecar,
+                Some(format!(
+                    "tape_file {} epoch {}",
+                    sidecar.tape_file_number, sidecar.epoch_id
+                )),
+                format!("{}: {}", f.kind.section_15_name(), f.detail),
+            ));
+        }
+    }
+    for block in protected.failed_data_blocks() {
+        out.push(finding(
+            Kind::DataBlock,
+            Some(format!(
+                "tape_file {} block {}",
+                block.position.tape_file_number, block.position.block_within_file
+            )),
+            block.reason.describe().to_string(),
+        ));
+    }
+    for shard in protected.failed_parity_shards() {
+        out.push(finding(
+            Kind::ParityShard,
+            Some(format!(
+                "epoch {} stripe {} parity {}",
+                shard.epoch_id, shard.stripe_index, shard.parity_index
+            )),
+            shard.reason.describe().to_string(),
+        ));
+    }
+    out
 }
 
 pub(crate) fn terminal_verified_to_proto(
@@ -634,7 +694,25 @@ pub(crate) fn terminal_verified_to_proto(
         },
         fast_inventory: None,
         detail: if complete {
-            "physical prefix, A/B/C, AB/BC, and terminal EOD validated".to_string()
+            "physical prefix, A/B/C, AB/BC, terminal EOD, and every protected data block and parity shard validated".to_string()
+        } else if !verified.protected.is_clean() {
+            format!(
+                "protected content failed verification: {} data block(s), {} parity shard(s), {} sidecar finding(s){}",
+                verified.protected.failed_data_blocks().count(),
+                verified.protected.failed_parity_shards().count(),
+                verified
+                    .protected
+                    .sidecars
+                    .iter()
+                    .map(|sidecar| sidecar.findings.len())
+                    .sum::<usize>(),
+                verified
+                    .protected
+                    .not_performed
+                    .as_ref()
+                    .map(|reason| format!("; not performed: {reason}"))
+                    .unwrap_or_default()
+            )
         } else {
             "canonical physical prefix verified from a surviving replica; degraded terminal component evidence is attached".to_string()
         },
@@ -654,6 +732,7 @@ pub(crate) fn terminal_verified_to_proto(
         payload_digest: Some(verified.selected_payload.payload_sha256.to_vec()),
         canonical_map_digest: Some(verified.selected_payload.canonical_map_sha256.to_vec()),
         verification_basis: "measured_full_physical".to_string(),
+        protected_content_findings: protected_content_findings(&verified.protected),
         recovery_inventory: None,
     }
 }

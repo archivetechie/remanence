@@ -60,6 +60,7 @@ pub mod tape_index_replica;
 pub mod terminal_inventory;
 pub mod terminal_tail;
 pub mod terminal_writer;
+pub mod verify_protected;
 mod writer_identity;
 pub use writer_identity::{ParityMapDiagnostics, WriterIdentity};
 
@@ -87,7 +88,7 @@ pub use diagnostic_text::escape_member_name;
 pub use error::{BootstrapRefusedField, ParityError};
 pub use filemark_map::{
     sole_bot_filemark_map_digest, FilemarkMap, FilemarkMapBuilder, FilemarkMapDigest, MapScope,
-    ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
+    MapSource, ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
 };
 pub use index_separation::{
     derive_index_separation_footer_magic, derive_index_separation_header_magic,
@@ -192,13 +193,14 @@ pub use tape_index_replica::{
 };
 pub use terminal_inventory::{
     read_terminal_index_inventory, read_terminal_index_inventory_streamed,
-    read_terminal_index_inventory_summary, verify_terminal_index_full,
-    verify_terminal_index_full_with_authority, verify_terminal_index_full_with_scan_mode,
-    BotStructuralRecoveryReason, BotStructuralRecoveryRequired, TerminalIndexRecoveryRequired,
-    TerminalIndexVerification, TerminalIndexVerificationError, TerminalIndexVerificationOutcome,
-    TerminalInventoryOutcome, TerminalInventoryReadError, TerminalInventorySelection,
-    TerminalInventoryStreamEvent, TerminalReplicaEvidence, TerminalReplicaFailure,
-    TerminalReplicaFailureKind, TerminalSeparationEvidence,
+    read_terminal_index_inventory_summary, scoped_map_from_terminal_replica,
+    verify_terminal_index_full, verify_terminal_index_full_with_authority,
+    verify_terminal_index_full_with_scan_mode, BotStructuralRecoveryReason,
+    BotStructuralRecoveryRequired, TerminalIndexRecoveryRequired, TerminalIndexVerification,
+    TerminalIndexVerificationError, TerminalIndexVerificationOutcome, TerminalInventoryOutcome,
+    TerminalInventoryReadError, TerminalInventorySelection, TerminalInventoryStreamEvent,
+    TerminalReplicaEvidence, TerminalReplicaFailure, TerminalReplicaFailureKind,
+    TerminalSeparationEvidence,
 };
 pub use terminal_tail::{
     validate_terminal_index_block_size, TerminalTailComponentKind, TerminalTailComponentPlan,
@@ -210,6 +212,11 @@ pub use terminal_writer::{
     write_terminal_tail, write_terminal_tail_step, TerminalComponentCommit,
     TerminalComponentReconcileEvidence, TerminalTailAuthority, TerminalTailRunOutcome,
     TerminalTailStepOutcome, TerminalTailWriteError, TerminalTripleWritePlan,
+};
+pub use verify_protected::{
+    verify_protected_content, verify_sidecar, BlockFailureReason, FailedDataBlock,
+    FailedParityShard, ProtectedContentVerification, SidecarComponentState, SidecarFinding,
+    SidecarFindingKind, SidecarVerification,
 };
 
 // ====================================================================

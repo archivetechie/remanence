@@ -30,7 +30,7 @@
       "observation": "*",
       "first_check": "the rescue precondition total = 2H + P + 1 with H > 0 (Section 13.3 step 3)",
       "target": "the §13.3 tail location (total − 1 − H in the variant's construction; H + P in the current text)",
-      "reason": "Section 13.3 now locates the tail copy at H + P and requires the entry's total to equal 2H + P + 1 with H > 0; an entry that fails is not available. Here 7 ≠ 2·7 + 4 + 1, so the precondition fails first, no read is placed, and the construction's formula total − 1 − H is never evaluated. The rescue's specific failure is then reported only as the epoch-level outcome, SidecarMetadataUnavailable{0}, whose detail cannot show which check fired; the acquisition boundary keeps the primary's error (commit R3 decides that boundary).",
+      "reason": "Section 13.3 now locates the tail copy at H + P and requires the entry's total to equal 2H + P + 1 with H > 0; an entry that fails is not available. Here 7 ≠ 2·7 + 4 + 1, so the precondition fails first, no read is placed, and the construction's formula total − 1 − H is never evaluated. The rescue's specific failure is reported only as the epoch-level outcome, SidecarMetadataUnavailable{0}, which Section 13.3 step 4 makes the error whatever each copy's own failure was, so its detail cannot show which check fired. The tail rescue from the terminal index does not apply either, because a final ParityMap validates and its entry fails a precondition.",
       "tt2": null
     },
     {

@@ -1221,6 +1221,123 @@ fn separation_health_keeps_a_two_record_zero_and_omits_an_invalid_count() {
 }
 
 #[test]
+fn verification_names_every_protected_content_failure_and_is_never_complete() {
+    use remanence_parity::{
+        BlockFailureReason, FailedDataBlock, FailedParityShard, ProtectedContentVerification,
+        SidecarComponentState, SidecarVerification, TapeFilePosition,
+    };
+    let counts = TapeIndexReplicaCounts {
+        structural_entry_count: 2,
+        object_row_count: 1,
+    };
+    let payload = converter_payload_summary(counts);
+    let sidecar = SidecarVerification {
+        tape_file_number: 2,
+        epoch_id: 0,
+        footer: SidecarComponentState::Unreadable,
+        primary: SidecarComponentState::Valid,
+        tail: SidecarComponentState::Valid,
+        copies_diverge: false,
+        metadata_health: None,
+        checked_against_index: true,
+        findings: vec![],
+        failed_data_blocks: vec![FailedDataBlock {
+            position: TapeFilePosition {
+                tape_file_number: 1,
+                block_within_file: 2,
+            },
+            ordinal: 2,
+            physical: PhysicalPositionHint::new(4),
+            reason: BlockFailureReason::CrcMismatch,
+        }],
+        failed_parity_shards: vec![FailedParityShard {
+            epoch_id: 0,
+            stripe_index: 1,
+            parity_index: 0,
+            sidecar_tape_file_number: 2,
+            sidecar_block: 2,
+            physical: PhysicalPositionHint::new(9),
+            reason: BlockFailureReason::Unreadable,
+        }],
+    };
+    let protected = ProtectedContentVerification {
+        sidecars: vec![sidecar],
+        not_performed: None,
+        prefix_damage: vec!["UnreadableTapeFileHead at LBA 2".to_string()],
+    };
+    let verified = TerminalIndexVerification {
+        edition: converter_edition_plan(counts),
+        selected_payload: payload,
+        replicas: std::array::from_fn(|_| TerminalReplicaEvidence::Valid { summary: payload }),
+        separations: std::array::from_fn(|_| TerminalSeparationEvidence::Valid {
+            interior_record_count: 1,
+        }),
+        measured_eod: PhysicalPositionHint::new(40),
+        verified_prefix_tape_file_count: 2,
+        verified_prefix_record_count: 3,
+        measured_tape_file_count: 7,
+        protected: protected.clone(),
+    };
+    let projected = terminal_verification_to_proto(
+        RANGE_TAPE_UUID,
+        TerminalIndexVerificationOutcome::VerifiedComplete(Box::new(verified)),
+    );
+    assert_ne!(
+        projected.state,
+        pb::TapeIndexVerificationState::VerifiedComplete as i32
+    );
+    let addresses: Vec<_> = projected
+        .protected_content_findings
+        .iter()
+        .map(|f| (f.kind, f.address.as_deref()))
+        .collect();
+    use pb::ProtectedContentFindingKind as Kind;
+    assert!(addresses.contains(&(Kind::DataBlock as i32, Some("tape_file 1 block 2"))));
+    assert!(addresses.contains(&(Kind::ParityShard as i32, Some("epoch 0 stripe 1 parity 0"))));
+    // Prefix damage has no address, and every finding states its reason.
+    assert!(addresses.contains(&(Kind::PrefixDamage as i32, None)));
+    assert!(projected
+        .protected_content_findings
+        .iter()
+        .all(|f| f.detail.is_some()));
+    assert!(projected
+        .protected_content_findings
+        .iter()
+        .any(|f| f.detail.as_deref() == Some("CRC mismatch")));
+    // The recovery-required route carries the same pass.
+    let recovery = remanence_parity::TerminalIndexRecoveryRequired {
+        measured_eod: PhysicalPositionHint::new(9),
+        bot_recovery: remanence_parity::BotStructuralRecoverySummary {
+            bootstrap_recovery_hints: None,
+            structural_entry_count: 3,
+            complete_object_count: 1,
+            recovered_object_count: 0,
+            unknown_object_count: 1,
+            incomplete_object_count: 0,
+            canonical_map_digest: [0x44; 32],
+            damaged_region_count: 0,
+        },
+        replicas: std::array::from_fn(|_| {
+            TerminalReplicaEvidence::Invalid(TerminalReplicaFailure {
+                kind: TerminalReplicaFailureKind::Missing,
+                detail: "test".to_string(),
+            })
+        }),
+        detail: "no survivor".to_string(),
+        protected,
+    };
+    let projected = terminal_verification_to_proto(
+        RANGE_TAPE_UUID,
+        TerminalIndexVerificationOutcome::RecoveryRequired(Box::new(recovery)),
+    );
+    assert!(projected
+        .protected_content_findings
+        .iter()
+        .any(|f| f.kind == Kind::DataBlock as i32
+            && f.address.as_deref() == Some("tape_file 1 block 2")));
+}
+
+#[test]
 fn verified_index_reports_present_prefix_counts_and_digests() {
     let counts = TapeIndexReplicaCounts {
         structural_entry_count: 2,
@@ -1240,6 +1357,7 @@ fn verified_index_reports_present_prefix_counts_and_digests() {
             verified_prefix_tape_file_count: 2,
             verified_prefix_record_count: 3,
             measured_tape_file_count: 7,
+            protected: remanence_parity::ProtectedContentVerification::none_protected(),
         })),
     );
 
@@ -1322,6 +1440,7 @@ fn recovery_required_verification_projects_measured_bot_evidence() {
                 },
                 replicas,
                 detail: "no canonical survivor".to_string(),
+                protected: remanence_parity::ProtectedContentVerification::none_protected(),
             },
         )),
     );
@@ -7742,9 +7861,14 @@ fn catalog_recovery_terminal_tail_retains_bootstrap_provenance() {
                     verification.detail
                 );
                 assert!(verification.detail.contains("catalog hints"));
+                // Damage inside the prefix does not abandon the terminal route
+                // when the surviving replicas' rows agree with the walk: the
+                // damaged bootstrap is a finding, so the tape is not complete.
                 assert_eq!(
                     verification.state,
-                    pb::TapeIndexVerificationState::RecoveryRequired as i32
+                    pb::TapeIndexVerificationState::VerifiedDegraded as i32,
+                    "{}",
+                    verification.detail
                 );
             },
         );

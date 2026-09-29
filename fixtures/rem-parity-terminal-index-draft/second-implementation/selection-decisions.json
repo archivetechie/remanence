@@ -15,7 +15,7 @@
       "class": "absent"
     },
     "S4": {
-      "class": "foreign"
+      "class": "second-edition"
     }
   },
   "entries": {
@@ -992,20 +992,18 @@
         "checks_failed": [],
         "repairs": [],
         "notes": [
-          "position A: my minimal-256k/replica-a.bin",
-          "position C: my minimal-256k/replica-c.bin"
+          "position A: my multi-256k/replica-a.bin rebuilt with another edition ID and sequence",
+          "position C: my multi-256k/replica-c.bin rebuilt with another edition ID and sequence"
         ]
       },
       "decision": {
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "B"
-        ],
-        "degraded": true,
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null,
         "replicas": {
-          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule",
+          "A": "valid: a replica that is locally eligible at this position and differs from the profile's replica only in its edition ID and edition sequence, both edition-common fields: fully valid, with an edition of its own",
           "B": "valid: the profile's replica, which is locally eligible",
-          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule"
+          "C": "valid: a replica that is locally eligible at this position and differs from the profile's replica only in its edition ID and edition sequence, both edition-common fields: fully valid, with an edition of its own"
         },
         "rules": [
           {
@@ -1033,45 +1031,33 @@
             "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
           },
           {
-            "section": "10.6",
-            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
-          },
-          {
             "section": "8.4",
-            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
-          },
-          {
-            "section": "10.6",
-            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
             "section": "8.4",
             "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
-            "section": "8.4",
-            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            "section": "8.5",
+            "quote": "A disagreement in any edition-common field is `TerminalIndexReplicaConflict` and is never resolved by ordinal preference; a Scanner MUST NOT choose one side of a conflict merely because it is newer in the terminal suffix."
           },
           {
-            "section": "12.6",
-            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
-          },
-          {
-            "section": "12.6",
-            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
+            "section": "15",
+            "quote": "TerminalIndexReplicaConflict independently valid survivors disagree"
           }
         ],
         "readings": null,
         "undecided": []
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 35 (replica ordinal 2)",
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
         "replicas": {
           "A": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           },
           "B": {
             "valid": true,
@@ -1080,10 +1066,10 @@
             "reason": "locally eligible under Section 10.6"
           },
           "C": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           }
         },
         "separations": {
@@ -1098,15 +1084,13 @@
             "reason": "header, footer, zero interior and trailing filemark validate"
           }
         },
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "B"
-        ],
-        "degraded": true
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: inventory B degraded"
+        "detail": "implementation: TerminalIndexReplicaConflict"
       }
     },
     "sel-09": {
@@ -1252,20 +1236,17 @@
         "checks_failed": [],
         "repairs": [],
         "notes": [
-          "position C: my minimal-256k/replica-c.bin"
+          "position C: my multi-256k/replica-c.bin rebuilt with another edition ID and sequence"
         ]
       },
       "decision": {
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "A",
-          "B"
-        ],
-        "degraded": true,
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null,
         "replicas": {
           "A": "valid: the profile's replica, which is locally eligible",
           "B": "valid: the profile's replica, which is locally eligible",
-          "C": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule"
+          "C": "valid: a replica that is locally eligible at this position and differs from the profile's replica only in its edition ID and edition sequence, both edition-common fields: fully valid, with an edition of its own"
         },
         "rules": [
           {
@@ -1293,43 +1274,27 @@
             "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
           },
           {
-            "section": "10.6",
-            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
-          },
-          {
             "section": "8.4",
-            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
-          },
-          {
-            "section": "10.6",
-            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
             "section": "8.4",
             "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
-            "section": "8.4",
-            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            "section": "8.5",
+            "quote": "A disagreement in any edition-common field is `TerminalIndexReplicaConflict` and is never resolved by ordinal preference; a Scanner MUST NOT choose one side of a conflict merely because it is newer in the terminal suffix."
           },
           {
-            "section": "12.6",
-            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
-          },
-          {
-            "section": "12.6",
-            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-          },
-          {
-            "section": "C",
-            "quote": "the selection order among agreeing replicas"
+            "section": "15",
+            "quote": "TerminalIndexReplicaConflict independently valid survivors disagree"
           }
         ],
         "readings": null,
         "undecided": []
       },
       "implementation": {
-        "layout_source": "replica footer at LBA 35 (replica ordinal 2)",
+        "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
         "replicas": {
           "A": {
             "valid": true,
@@ -1344,10 +1309,10 @@
             "reason": "locally eligible under Section 10.6"
           },
           "C": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           }
         },
         "separations": {
@@ -1362,16 +1327,13 @@
             "reason": "header, footer, zero interior and trailing filemark validate"
           }
         },
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "A",
-          "B"
-        ],
-        "degraded": true
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: inventory A/B degraded"
+        "detail": "implementation: TerminalIndexReplicaConflict"
       }
     },
     "sel-11": {
@@ -1386,18 +1348,15 @@
         "checks_failed": [],
         "repairs": [],
         "notes": [
-          "position A: my minimal-256k/replica-a.bin"
+          "position A: my multi-256k/replica-a.bin rebuilt with another edition ID and sequence"
         ]
       },
       "decision": {
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "B",
-          "C"
-        ],
-        "degraded": true,
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null,
         "replicas": {
-          "A": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule",
+          "A": "valid: a replica that is locally eligible at this position and differs from the profile's replica only in its edition ID and edition sequence, both edition-common fields: fully valid, with an edition of its own",
           "B": "valid: the profile's replica, which is locally eligible",
           "C": "valid: the profile's replica, which is locally eligible"
         },
@@ -1427,36 +1386,20 @@
             "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
           },
           {
-            "section": "10.6",
-            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
-          },
-          {
             "section": "8.4",
-            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
-          },
-          {
-            "section": "10.6",
-            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
             "section": "8.4",
             "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
-            "section": "8.4",
-            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            "section": "8.5",
+            "quote": "A disagreement in any edition-common field is `TerminalIndexReplicaConflict` and is never resolved by ordinal preference; a Scanner MUST NOT choose one side of a conflict merely because it is newer in the terminal suffix."
           },
           {
-            "section": "12.6",
-            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
-          },
-          {
-            "section": "12.6",
-            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-          },
-          {
-            "section": "C",
-            "quote": "the selection order among agreeing replicas"
+            "section": "15",
+            "quote": "TerminalIndexReplicaConflict independently valid survivors disagree"
           }
         ],
         "readings": null,
@@ -1466,10 +1409,10 @@
         "layout_source": "replica footer at LBA 43 (replica ordinal 3)",
         "replicas": {
           "A": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           },
           "B": {
             "valid": true,
@@ -1496,16 +1439,13 @@
             "reason": "header, footer, zero interior and trailing filemark validate"
           }
         },
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "B",
-          "C"
-        ],
-        "degraded": true
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: inventory B/C degraded"
+        "detail": "implementation: TerminalIndexReplicaConflict"
       }
     },
     "sel-12": {
@@ -1647,19 +1587,16 @@
         "checks_failed": [],
         "repairs": [],
         "notes": [
-          "position B: my minimal-256k/replica-b.bin"
+          "position B: my multi-256k/replica-b.bin rebuilt with another edition ID and sequence"
         ]
       },
       "decision": {
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "A",
-          "C"
-        ],
-        "degraded": true,
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null,
         "replicas": {
           "A": "valid: the profile's replica, which is locally eligible",
-          "B": "invalid: a replica of another edition planned for other coordinates (the minimal profile's layout): its footer's recorded position is not where it is read, so it supplies no layout, and its declared tape-file number and start LBA disagree with the device's measurements, so it is never locally eligible and takes no part in the conflict rule",
+          "B": "valid: a replica that is locally eligible at this position and differs from the profile's replica only in its edition ID and edition sequence, both edition-common fields: fully valid, with an edition of its own",
           "C": "valid: the profile's replica, which is locally eligible"
         },
         "rules": [
@@ -1688,36 +1625,20 @@
             "quote": "A missing or invalid replica is degraded evidence, not a conflict, and does not invalidate an agreeing survivor."
           },
           {
-            "section": "10.6",
-            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
-          },
-          {
             "section": "8.4",
-            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
-          },
-          {
-            "section": "10.6",
-            "quote": "The footer's backward delta names the same header start as the discovered planned layout; the header at that planned coordinate has a complete-record SHA-256 equal to the footer's recorded header hash, and header and footer carry the same common descriptor."
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
           },
           {
             "section": "8.4",
             "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
           },
           {
-            "section": "8.4",
-            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            "section": "8.5",
+            "quote": "A disagreement in any edition-common field is `TerminalIndexReplicaConflict` and is never resolved by ordinal preference; a Scanner MUST NOT choose one side of a conflict merely because it is newer in the terminal suffix."
           },
           {
-            "section": "12.6",
-            "quote": "On a tape presented without host state, a validating C/B/A survivor attests the complete terminal inventory carried in that replica."
-          },
-          {
-            "section": "12.6",
-            "quote": "Missing or invalid siblings make the result degraded; disagreement makes it a conflict."
-          },
-          {
-            "section": "C",
-            "quote": "the selection order among agreeing replicas"
+            "section": "15",
+            "quote": "TerminalIndexReplicaConflict independently valid survivors disagree"
           }
         ],
         "readings": null,
@@ -1733,10 +1654,10 @@
             "reason": "locally eligible under Section 10.6"
           },
           "B": {
-            "valid": false,
-            "envelope_valid": false,
-            "error": "TerminalIndexReplicaParse",
-            "reason": "frame layout differs from the discovered planned layout; footer backward delta does not name the planned header start"
+            "valid": true,
+            "envelope_valid": true,
+            "error": null,
+            "reason": "locally eligible under Section 10.6"
           },
           "C": {
             "valid": true,
@@ -1757,16 +1678,13 @@
             "reason": "header, footer, zero interior and trailing filemark validate"
           }
         },
-        "outcome": "inventory",
-        "acceptable_selections": [
-          "A",
-          "C"
-        ],
-        "degraded": true
+        "outcome": "TerminalIndexReplicaConflict",
+        "acceptable_selections": [],
+        "degraded": null
       },
       "self_check": {
         "agrees": true,
-        "detail": "implementation: inventory A/C degraded"
+        "detail": "implementation: TerminalIndexReplicaConflict"
       }
     },
     "sel-14": {

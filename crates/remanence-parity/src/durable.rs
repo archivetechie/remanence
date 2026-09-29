@@ -190,7 +190,7 @@ impl DurableBoundaryState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filemark_map::{MapScope, TapeFileMapEntry};
+    use crate::filemark_map::{MapScope, MapSource, TapeFileMapEntry};
 
     #[test]
     fn durable_boundary_abandons_failed_file_to_last_committed_tape_file() {
@@ -308,6 +308,7 @@ mod tests {
                 highest_protected_ordinal: 4,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let boundary = DurableBoundaryState::from_scoped_map(&scoped)
             .expect("prefix boundary derives from scoped map");
@@ -330,6 +331,7 @@ mod tests {
                 highest_protected_ordinal: 0,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         };
         let zero_boundary = DurableBoundaryState::from_scoped_map(&zero_prefix)
             .expect("zero prefix derives an empty durable boundary");

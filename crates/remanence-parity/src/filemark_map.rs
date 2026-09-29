@@ -720,6 +720,24 @@ pub struct ScopedFilemarkMap {
     /// are lost; without it that rescue is not possible and the epoch is
     /// declared metadata-unavailable.
     pub sidecar_directory: Option<SidecarEpochDirectory>,
+    /// Where the validated map's structural rows came from. REM-PARITY 13.3's
+    /// "Tail rescue from the terminal index" applies only to a map whose rows
+    /// come from a validated terminal replica; a catalog map and a walked map
+    /// do not qualify.
+    pub(crate) map_source: MapSource,
+}
+
+/// The authority that supplied a [`ScopedFilemarkMap`]'s structural rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapSource {
+    /// A committed catalog map (Layer 5), or a map built by the caller.
+    Catalog,
+    /// The structural rows of a validated terminal replica (REM-PARITY 8.4,
+    /// 8.5). Obtained only through `scoped_map_from_terminal_replica`.
+    TerminalReplica,
+    /// A map reconstructed by the Section 8.4.1 BOT walk, validated against
+    /// the tape's final ParityMap or, without one, the bootstrap's digest.
+    Walk,
 }
 
 impl ScopedFilemarkMap {
@@ -769,6 +787,7 @@ impl ScopedFilemarkMap {
                 highest_protected_ordinal,
             },
             sidecar_directory: None,
+            map_source: MapSource::Catalog,
         }
     }
 
@@ -780,7 +799,24 @@ impl ScopedFilemarkMap {
         self
     }
 
-    /// Validate a scan-reconstructed map against digest authority.
+    /// The authority that supplied the map's structural rows.
+    pub fn map_source(&self) -> MapSource {
+        self.map_source
+    }
+
+    /// Record which authority supplied the map's structural rows. Crate-only:
+    /// a map is a terminal replica's only through
+    /// `scoped_map_from_terminal_replica`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_map_source(mut self, map_source: MapSource) -> Self {
+        self.map_source = map_source;
+        self
+    }
+
+    /// Validate a scan-reconstructed map against digest authority. The result
+    /// is a [`MapSource::Walk`] map; a map from a validated terminal
+    /// replica's rows comes from `scoped_map_from_terminal_replica` instead.
     pub fn validate_against_digest(
         full_map: FilemarkMap,
         digest: &FilemarkMapDigest,
@@ -823,6 +859,7 @@ impl ScopedFilemarkMap {
             validated_prefix_tape_files,
             scope,
             sidecar_directory: None,
+            map_source: MapSource::Walk,
         })
     }
 
