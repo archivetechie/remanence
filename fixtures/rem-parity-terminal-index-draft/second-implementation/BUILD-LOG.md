@@ -24,6 +24,8 @@ No change to the builder may follow a failed comparison without a row here.
 | 14 | after the resume case-id fix and the Section 14 quote fix: `resume` on `tape-images/resume/*/inputs.json` and on the same inputs under their opaque ids, and `negatives`, each equal to its committed file with the one quote replaced; then `build`, `decide`, `negatives-supplement` and the three new commands reproduced their committed files byte for byte | 146 + 9 files | 0 |
 | 15 | everything, after the changes for the revised text (F0, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks` byte-identical; `decide`, `resume`, `negatives`, `negatives-supplement`, `mutations` and `selection` regenerated, each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md), and reproduced byte for byte on a second run; the blind `decisions.json` and `resume-decisions.json` equal the real-id files under the mappings (25 and 8 cases); every self-check agrees | 146 + 11 files | 0 |
 | 16 | the e1 damage cases and the E1 negative (F1): the 15 cases' record edits against my build of a4-minimal (every stated old byte, every edited record's SHA-256, and my own CRC for the nine edits that say they recompute one); e1-16's mutated bootstrap against `tape-images/negatives/MANIFEST.tsv`; then every other decision file regenerated, byte-identical (`resume`, `negatives`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide`, blind and real ids, and their traces; `negative-block-digests.json`) | 15 records, 23 byte edits, 9 CRCs, 1 block | 0 |
+| 17 | everything, after the changes for the owner's rulings (F-T1b, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
+| 18 | everything, after the narrowed rescue and the revised Section 2.2 (F-T1c, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
 
 ## Failed comparisons
 
@@ -226,6 +228,55 @@ file, and run 16 confirms that.
   `negative-e1-decisions.json`. `negative-blocks` now includes that case, by
   default from `blind-inputs/negatives-e1-blind.json`.
 - `blind-mapping.json` maps the e1 ids to themselves.
+
+## Changes for the owner's rulings (F-T1b)
+
+These changes follow two rulings the text now states. No byte-producing code
+changed.
+
+- Quotes. The Appendix D sentence "Whether a full verification checks every
+  data block and parity shard, or only structure and metadata, is to be
+  decided…" no longer occurs. It is replaced by Section 2.2's two sentences
+  (`full_verification`, `structure_not_full`) and the revised Appendix D
+  sentence (`full_verification_d`). The unused quote `tail_route_open`,
+  whose sentence also no longer occurs, is removed. Section 13.3's new
+  sentences are added (`map_rescue`, `map_rescue_position`,
+  `map_rescue_requires`, `map_rescue_valid`, `map_rescue_fails`,
+  `map_rescue_not_walk`).
+- Section 2.2: the Verifier's findings on data blocks and parity shards are
+  decided, so the `undecided` entry for them is gone. The findings themselves
+  were already computed and are unchanged.
+- Section 13.3 step 3 (`acquire_index`). When the footer and the primary have
+  both failed and no directory entry is available, the Recoverer tries the
+  tail copy at `H + P`, with `H = (total − 1 − P) / 2` from the map entry. It
+  requires `total − 1 − P` to be even and `H > 0`, and uses the copy only if
+  the copy is valid on its own, records `H`, and agrees with the map entry in
+  epoch and range. It is not used on the walk route. The Verifier acquires
+  the index the same way, with the walk route passed through, and locates
+  the tail copy from the map entry when neither the footer nor the primary
+  gives `H`.
+- The negatives table re-decides neg-33 (a, b and c), and the supplement
+  table sup-16 and sup-17 (DECISION-LOG).
+
+## Changes for the narrowed rescue and the revised Section 2.2 (F-T1c)
+
+- Quotes. The F-T1b rescue sentences and the first §2.2 sentence no longer
+  occur. They are replaced by the paragraph "Tail rescue from the terminal
+  index" (`map_rescue`, `map_rescue_position`, `map_rescue_requires`,
+  `map_rescue_valid`, `map_rescue_fails`, `map_rescue_not_walk`,
+  `map_rescue_not_directory`) and by §2.2's new sentences
+  (`full_verification`, `report_by_address`, `opaque_bytes`).
+- `acquire_index` applies the rescue only when no final ParityMap validates,
+  and never on the walk route. The first condition is new: before, an entry
+  that failed a precondition of a validated directory also let the rescue
+  run.
+- The Verifier addresses each data finding (`address`). A data block is
+  named by its tape file and block, and a parity shard by its epoch, stripe
+  and parity index. It skips data blocks that no sidecar protects. It
+  locates each sidecar's tail copy as Section 13.3 does, through an available
+  directory entry or, under the rescue's conditions, through the map entry.
+- The negatives table re-decides neg-33/a and neg-33/b, and the supplement
+  table sup-16 and sup-17, back to `SidecarMetadataUnavailable`.
 
 ## Known divergences, not changed
 

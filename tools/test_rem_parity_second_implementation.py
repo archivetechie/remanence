@@ -1018,5 +1018,88 @@ class NegativeE1Tests(unittest.TestCase):
         self.assertEqual(out["table_entries_without_a_case"], [])
 
 
+# ---------------------------------------------------------------------------
+# F-T1b: the tail rescue from the map entry, and full verification.
+# ---------------------------------------------------------------------------
+
+
+class MapEntryRescueTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+
+    def context(self, unreadable, route="replica", entries=None):
+        tape = impl.DamagedTape(self.image.records(), set(unreadable))
+        entries = entries or self.image.prefix_entries
+        return impl.RecoveryContext(tape, self.image.tape_uuid, self.image.block_size, self.image.scheme, entries,
+                                    len(entries), impl.derived_watermark(entries), None, route)
+
+    def sidecar_lbas(self):
+        start = self.image.file_start_lba(2)
+        return start, start + len(self.image.files[2].blocks) - 1
+
+    def test_the_tail_copy_is_tried_from_the_map_entry(self) -> None:
+        # 13.3: "a Recoverer MUST try the tail copy that the map entry locates ... H = (total − 1 − P) / 2".
+        primary, footer = self.sidecar_lbas()
+        ctx = self.context({primary, footer})
+        sidecar = next(e for e in ctx.entries if e.tape_file_number == 2)
+        index, note = impl.acquire_index(ctx, sidecar, [])
+        self.assertIsNotNone(index)
+        self.assertIn("rescue from the map entry, H = 1", note)
+        self.assertEqual(impl.recover_address(ctx, [1, 0])["result"], "recovered")
+
+    def test_a_walked_map_does_not_qualify(self) -> None:
+        # 13.3: "A walked map does not qualify: it gains a validated scope only through a final ParityMap".
+        primary, footer = self.sidecar_lbas()
+        ctx = self.context({primary, footer}, route="walk")
+        sidecar = next(e for e in ctx.entries if e.tape_file_number == 2)
+        self.assertIsNone(impl.acquire_index(ctx, sidecar, [])[0])
+
+    def test_a_validated_final_parity_map_excludes_the_rescue(self) -> None:
+        # 13.3: "When a final ParityMap validates but the sidecar's entry fails a precondition of the
+        # directory-assisted rescue, this rescue does not apply either".
+        primary, footer = self.sidecar_lbas()
+        ctx = self.context({primary, footer})
+        directory, _ = impl.load_parity_map_directory(ctx.tape, ctx.entries, self.image.tape_uuid, self.image.block_size)
+        self.assertIsNotNone(directory)
+        directory = {key: dict(value, H=7) for key, value in directory.items()}  # the entry fails 2H + P + 1
+        ctx = dataclasses.replace(ctx, directory=directory)
+        sidecar = next(e for e in ctx.entries if e.tape_file_number == 2)
+        index, note = impl.acquire_index(ctx, sidecar, [])
+        self.assertIsNone(index)
+        self.assertIn("a final ParityMap validates", note)
+
+    def test_the_rescue_requires_an_even_remainder_and_an_unreadable_tail_fails_it(self) -> None:
+        # 13.3: "This rescue requires that `total − 1 − P` is even"; "If this rescue fails, the epoch is
+        # metadata-unavailable (step 4)."
+        primary, footer = self.sidecar_lbas()
+        ctx = self.context({primary, footer, primary + 5})
+        sidecar = next(e for e in ctx.entries if e.tape_file_number == 2)
+        index, note = impl.acquire_index(ctx, sidecar, [])
+        self.assertIsNone(index)
+        self.assertIn("tail copy unreadable", note)
+        odd = [dataclasses.replace(e, block_count=8) if e.tape_file_number == 2 else e for e in self.image.prefix_entries]
+        ctx = self.context({primary, footer}, entries=odd)
+        index, note = impl.acquire_index(ctx, next(e for e in odd if e.tape_file_number == 2), [])
+        self.assertIsNone(index)
+        self.assertIn("is not even", note)
+
+    def test_parity_map_and_sidecar_recovers_epoch_0_and_the_verifier_is_decided(self) -> None:
+        # The case's fault map as the repository gives it, when it is present.
+        path = impl.FIXTURE_ROOT / "tape-images" / "cases" / "parity-map-and-sidecar" / "fault-map.json"
+        if not path.exists():
+            self.skipTest("the repository's damage case is not present")
+        out = impl.run_decide([path], SCRATCH / "pms" / "decisions.json")
+        decision = out["cases"]["parity-map-and-sidecar"]
+        epoch0 = next(a for a in decision["recoverer"]["addresses"] if a["epoch"] == 0)
+        self.assertEqual((epoch0["result"], epoch0["error"]), ("recovered", None))
+        self.assertEqual(decision["undecided"], [])
+        data = [f for f in decision["verifier"]["outside_terminal_suffix"] if f["checks"] == "data"]
+        self.assertTrue(data)
+        # 2.2: "a data block's tape-file position, or a parity shard's epoch, stripe and parity index".
+        for finding in data:
+            self.assertIn(sorted(finding["address"]), (["block", "tape_file"], ["epoch", "parity_index", "stripe"]))
+
+
 if __name__ == "__main__":
     unittest.main()
