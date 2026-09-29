@@ -28,6 +28,7 @@ No change to the builder may follow a failed comparison without a row here.
 | 18 | everything, after the narrowed rescue and the revised Section 2.2 (F-T1c, below): `build` reproduced 146 with a byte-identical `build-report.json`; `negative-blocks`, `negative-e1`, `resume`, `mutations` and `selection` byte-identical; `decide` (blind and real ids), `negatives` and `negatives-supplement` regenerated, and each compared leaf by leaf with its predecessor (every change is in DECISION-LOG.md); every self-check agrees; the blind `decisions.json` equals the real-id file under the mapping | 146 + 12 files | 0 |
 | 19 | the e2 cases and the R2 manifest (F2): the record edits of e2-01 to e2-05 against my builds (every stated length and the SHA-256 of each result); the nine overflow-3.2-lba blocks against `tape-images/negatives/MANIFEST.tsv`; then every decision file regenerated, byte-identical (`negatives`, `negative-e1`, `negatives-supplement`, `mutations`, `selection`), or with every earlier entry unchanged and the new entries added (`decide` and `resume`, blind and real ids, and the traces; `negative-block-digests.json`) | 5 records, 9 blocks | 0 |
 | 20 | the e2-08 to e2-13 and e3-01 to e3-07 damage cases, the full verification and S4 (F3): the record edits of e2-08 to e2-13 against my builds (10 records, 28 byte edits: every stated old byte and the SHA-256 of each result), the 24 edits that say they recompute a hash or CRC against mine (all 24 agree), the inserted record of e3-01, and the 10 derivable appended records of e3-02 to e3-06 (the 3 `second_edition_replica` records of e3-07 cannot be checked); then every decision file regenerated: `build`, `resume` (blind and real ids), `negatives`, `negative-e1`, `negatives-supplement`, `negative-blocks` and `mutations` byte-identical; `decide` (blind and real ids, and the traces) with every earlier leaf unchanged and the new cases, `verifier-full` and `walk.map` added; `selection` re-decided for sel-08, sel-10, sel-11 and sel-13 only; the blind `decisions.json` equals the real-id file under the mapping (57 cases); every self-check agrees | 10 records, 28 edits, 24 recomputations, 11 record digests | 1 (the foreign record's digest, below) |
+| 21 | the fixtures' answers to GAPS M-3 and M-4 (F3b): the foreign `fill` (5 files, 9 records), and e3-07's three second-edition records built from `base` and `fields`, each SHA-256 checked (all 3 agree, and the 5 e3 files' other records are unchanged), the `replica` key's layout tuples, edition, planned position and EOD against the built header and footer (agree), my frame CRCs and the footer's header hash (agree); then every decision file regenerated: only `decisions.json`, `decisions-real-ids.json` and their traces change, and only in e3-07 | 12 records | 0 |
 
 ## Failed comparisons
 
@@ -351,6 +352,19 @@ confirms that.
 - The unit tests replace the foreign-replica test with second-edition tests and
   add the new fault keys, the artifact and torn-tail decisions, the undecidable
   records and the full verification (95 tests).
+
+## Changes for the e3 fixtures' answers (F3b)
+
+- The fault reader requires `fill` on a foreign record, and it must be the sentence
+  "first_byte, then zeros to the stated length". A `second_edition_replica` record
+  needs `base`, `fields` and `role`; an appended file may carry `replica`. Every
+  level is checked and an unknown key still fails the run.
+- A second-edition record is my build of the base record with each field's hex
+  written at its offset. Its SHA-256 is checked. The `replica` key is
+  cross-checked (layout tuples, edition, planned position, EOD); my frame CRCs
+  and the footer's header hash are reported.
+- e3-07 is decided. The undecidable-record mechanism stays, and no case uses it.
+  The unit tests replace the three undecidable-record tests.
 
 ## Known divergences, not changed
 

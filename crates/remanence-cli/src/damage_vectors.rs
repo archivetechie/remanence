@@ -148,6 +148,31 @@ fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
         .cloned()
         .unwrap_or_default()
     {
+        for key in appended.as_object().expect("appended file object").keys() {
+            assert!(
+                matches!(key.as_str(), "records" | "trailing_filemark" | "replica"),
+                "unknown appended file key {key}"
+            );
+        }
+        if let Some(stated) = appended.get("replica") {
+            // The stated plan must agree with the bytes the executor builds.
+            let first = &appended["records"][0];
+            let built = crate::tape_image_vectors::second_edition_replica_a(
+                first["planned_tape_file_number"].as_u64().unwrap(),
+                first["planned_start_lba"].as_u64().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                *stated,
+                crate::tape_image_vectors::replica_summary(
+                    &built,
+                    first["planned_tape_file_number"].as_u64().unwrap(),
+                    first["planned_start_lba"].as_u64().unwrap(),
+                    stated["base"]["tape_file"].as_u64().unwrap() as usize,
+                ),
+                "second-edition replica plan"
+            );
+        }
         for record in appended["records"].as_array().unwrap() {
             tape.records.push(Record::Block(
                 crate::tape_image_vectors::appended_record_bytes(record, &vector.image),

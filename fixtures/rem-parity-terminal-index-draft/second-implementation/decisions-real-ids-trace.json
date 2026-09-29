@@ -2198,8 +2198,8 @@
   },
   "e3-02": {
     "fault_notes": [
-      "appended file 0 record 0 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
-      "appended file 0 record 1 at LBA 40: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 0 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
+      "appended file 0 record 1 at LBA 40: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
       "appended file 0: no trailing filemark; the tape ends after LBA 40"
     ],
     "bootstrap_attempts": [
@@ -2362,8 +2362,8 @@
   "e3-03": {
     "fault_notes": [
       "filemark at LBA 34 removed; later records move down by one",
-      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros",
-      "appended file 0 record 1 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
+      "appended file 0 record 1 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
       "appended file 0: trailing filemark at LBA 40"
     ],
     "bootstrap_attempts": [
@@ -2510,8 +2510,8 @@
   "e3-04": {
     "fault_notes": [
       "filemark at LBA 26 removed; later records move down by one",
-      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros",
-      "appended file 0 record 1 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
+      "appended file 0 record 1 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
       "appended file 0: trailing filemark at LBA 40"
     ],
     "bootstrap_attempts": [
@@ -2658,7 +2658,7 @@
   "e3-05": {
     "fault_notes": [
       "filemark at LBA 26 removed; later records move down by one",
-      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 0 at LBA 38: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
       "appended file 0 record 1 at LBA 39: copy_of, 262144 bytes, a copy of my build's tape file 8 record 2",
       "appended file 0: trailing filemark at LBA 40"
     ],
@@ -2805,8 +2805,8 @@
   },
   "e3-06": {
     "fault_notes": [
-      "appended file 0 record 0 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros",
-      "appended file 0 record 1 at LBA 40: foreign, 262144 bytes, first byte as stated, the rest zeros",
+      "appended file 0 record 0 at LBA 39: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
+      "appended file 0 record 1 at LBA 40: foreign, 262144 bytes, first byte as stated, the rest zeros (as `fill` states)",
       "appended file 0: trailing filemark at LBA 41"
     ],
     "bootstrap_attempts": [
@@ -2967,15 +2967,19 @@
   "e3-07": {
     "fault_notes": [
       "filemark at LBA 38 removed; later records move down by one",
-      "appended file 0 record 0 at LBA 38: second_edition_replica, 262144 bytes, bytes not derivable from the file and the text (GAPS.md)",
-      "appended file 0 record 1 at LBA 39: second_edition_replica, 262144 bytes, bytes not derivable from the file and the text (GAPS.md)",
-      "appended file 0 record 2 at LBA 40: second_edition_replica, 262144 bytes, bytes not derivable from the file and the text (GAPS.md)",
+      "appended file 0 record 0 at LBA 38: second_edition_replica, 262144 bytes, my build of tape file 4 record 0 with 10 stated field(s) replaced (header)",
+      "appended file 0 record 1 at LBA 39: second_edition_replica, 262144 bytes, my build of tape file 4 record 1 with 0 stated field(s) replaced (payload)",
+      "appended file 0 record 2 at LBA 40: second_edition_replica, 262144 bytes, my build of tape file 4 record 2 with 14 stated field(s) replaced (footer)",
+      "appended_files[0].replica: the layout tuples, edition, planned position and EOD agree with the built header and footer",
+      "appended_files[0].replica: header frame CRC agrees with mine",
+      "appended_files[0].replica: footer frame CRC agrees with mine",
+      "appended_files[0].replica: footer's header-record SHA-256 agrees with mine",
       "appended file 0: trailing filemark at LBA 41"
     ],
     "bootstrap_attempts": [
       "read size 262144: bootstrap parses"
     ],
-    "layout_source": "undecidable: the record at LBA 40 is not derivable",
+    "layout_source": "replica footer at LBA 40 (replica ordinal 1)",
     "walk": [
       {
         "tape_file_number": 0,
@@ -3108,8 +3112,8 @@
     "walk_map": "walked map validated against the final ParityMap",
     "directory": "final ParityMap found by the walk",
     "separations": {
-      "A-B": "walk: separation header matches the plan",
-      "B-C": "walk: separation header matches the plan"
+      "A-B": "TapeIo: LBA 42: expected a data block, found end of data",
+      "B-C": "TapeIo: LBA 50: expected a data block, found end of data"
     },
     "verifier_prefix_findings": []
   },

@@ -185,3 +185,20 @@ Checked and unchanged:
 - Section 8.4 step 1's spacing back now crosses records to the nearest filemark
   (GAPS M-5). Every earlier tape ends in a filemark, so no earlier layout
   discovery changed.
+
+## The e3-07 replica and the foreign fill (F3b)
+
+The fault maps of e3-02 to e3-07 now state what F3 could not derive. Each foreign
+record carries `fill`; each e3-07 record carries `role`, `base` and `fields`; e3-07
+carries a file-level `replica`. F3b builds those bytes from them. The e3-01 to
+e3-06 decisions are identical to F3's, as are the resume, negative, mutation and
+selection files. Only e3-07 changed, and no row follows an expected outcome.
+
+| Case | Aspect | Old value (F3) | New value | Sentence |
+| --- | --- | --- | --- | --- |
+| e3-07 | `scanner.result` | `undecided` | `BotStructuralRecoveryRequired`. The last record before EOD is the second-edition replica's footer; it records LBA 40, where it is read, and plans EOD 58, at or after the tape's EOD 42, so it supplies the layout (replicas at files 9, 11 and 13; extents at 10 and 12). Replica A of that layout is not locally eligible, and B, C and both extents are absent, so no replica validates | 8.4: "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD." 10.6: "`covered_prefix_tape_file_count`, `structural_row_count`, and replica A's planned tape-file number are equal." (4, 4, 9). 8.3: "Planned future components never prove their existence." 8.4: "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1." |
+| e3-07 | `scanner.replicas` | `undecided` | A: payload fails the covered-count condition; B and C: EOD where the plan puts their records | The same |
+| e3-07 | `verifier.result`, `verifier.separations` | `undecided` | `recovery_required`; both extents invalid (EOD where their records should be) | 12.6: "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition." 10.6: "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete." |
+| e3-07 | `verifier-full.terminal_suffix.complete` | `undecided` | `false`: replicas A, B and C invalid, both extents invalid, EOD at 42 not the planned EOD | 10.6 and 12.6, as above |
+| e3-07 | `undecided` | scanner, verifier | none | |
+| e3-07 | `walk` | classes as F3, with a note that it holds either way | the same classes; the walk is offered because no replica validates (the note is gone) | 8.4.1: "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT." |

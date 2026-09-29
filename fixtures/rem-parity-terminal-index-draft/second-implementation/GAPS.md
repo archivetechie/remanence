@@ -950,7 +950,10 @@ record, index 2). Every later record and filemark moves up by one LBA. The
 file's `unreadable_records` and `removed_filemark_after_tape_file` are read as
 positions of the undamaged image; no case combines them with an insertion.
 
-**M-3. `foreign` records state only their first byte (e3-02 to e3-06).** The
+**M-3. `foreign` records state only their first byte (e3-02 to e3-06).
+*Closed by F3b:* each record now carries `fill`, "first_byte, then zeros to the
+stated length", which is the reading below, and this Reader requires exactly that
+sentence. The stated SHA-256 still agrees. Earlier text follows.** The
 file gives `first_byte`, `length` and a SHA-256. It does not say what the
 other bytes are. *Decided:* zeros. Four fills were tried against the stated
 digest (every byte the first byte; the first byte then 0xFF; a ramp from 1; the
@@ -961,7 +964,13 @@ content (Section 12.3 item 7), and the first byte 0x58 begins none of the tape's
 role magics (bootstrap `52 45 4D 00...`; the HMAC-derived magics are 8 bytes
 that the case's tape UUID fixes, and none begins with 0x58 for these tapes).
 
-**M-4. `second_edition_replica` records cannot be derived (e3-07). *Undecided.***
+**M-4. `second_edition_replica` records cannot be derived (e3-07). *Undecided.*
+*Closed by F3b:* each record now names its `base` (the same-indexed record of tape
+file 4) and its replaced `fields`, and the file carries a `replica` key with the
+ordinal, edition, planned position, expected EOD and layout tuples. My build of
+each record reproduces its stated SHA-256, and my own frame CRCs, the footer's
+header hash and the layout tuples agree. e3-07 is decided (DECISION-LOG F3b). The
+entry below is kept as the record of the earlier state.**
 The file states each record's length, SHA-256, `planned_tape_file_number` (9)
 and `planned_start_lba` (38). It does not state the replica ordinal, the
 planned layout its five tuples carry, its planned EOD or any digest. Sections
@@ -1067,3 +1076,15 @@ which the directory contradicts, so no copy remains and the epoch is
 metadata-unavailable. The text says nothing about an entry whose hash is wrong
 because of a Writer or media fault rather than a copy's; the decision follows the
 sentence as written.
+
+**M-12. e3-07's replica is planned at tape file 9 (F3b).** Its footer records its
+own position (LBA 40) and plans EOD 58, so it supplies a layout (Section 8.4
+step 1). The layout plans replicas at files 9, 11 and 13 and extents at 10 and 12,
+none of which exists after the tape's EOD (42). Section 10.6 requires "covered_prefix_tape_file_count,
+structural_row_count, and replica A's planned tape-file number" to be equal; here
+they are 4, 4 and 9. The text does not say whether the replica's payload is then
+validated at all. *Decided:* the replica fails that condition and is not locally
+eligible, and B and C are absent (the device reports EOD where their records
+should be). The name a missing component gets is the one this implementation
+gives every such case, `TerminalIndexReplicaParse` (a filemark or EOD where the plan puts a
+data record is a validity failure, Section 10.6).

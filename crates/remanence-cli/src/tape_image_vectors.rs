@@ -947,21 +947,71 @@ fn record_insertions(case: &Value, extra: &Value, image: &ExportedTapeImage) -> 
 pub(crate) fn appended_record_bytes(record: &Value, image: &ExportedTapeImage) -> Vec<u8> {
     let bytes = match record["source"].as_str().expect("appended record source") {
         "foreign" => {
+            check_keys(
+                record,
+                &["source", "length", "first_byte", "fill", "sha256"],
+                "foreign record",
+            );
+            assert_eq!(record["fill"], FOREIGN_FILL, "foreign record fill");
             // Bytes that match no structure of the document: zeros, with the
             // stated first byte.
             let mut bytes = vec![0u8; record["length"].as_u64().unwrap() as usize];
             bytes[0] = unhex(record["first_byte"].as_str().unwrap())[0];
             bytes
         }
-        "copy_of" => file_records(image, record["tape_file"].as_u64().unwrap() as usize)
-            [record["record_index"].as_u64().unwrap() as usize]
+        "copy_of" => file_records(image, {
+            check_keys(
+                record,
+                &["source", "tape_file", "record_index", "length", "sha256"],
+                "copy_of record",
+            );
+            record["tape_file"].as_u64().unwrap() as usize
+        })[record["record_index"].as_u64().unwrap() as usize]
             .clone(),
-        "second_edition_replica" => second_edition_replica_a(
-            record["planned_tape_file_number"].as_u64().unwrap(),
-            record["planned_start_lba"].as_u64().unwrap(),
-        )
-        .expect("second-edition replica")[record["record_index"].as_u64().unwrap() as usize]
-            .clone(),
+        "second_edition_replica" => {
+            check_keys(
+                record,
+                &[
+                    "source",
+                    "planned_tape_file_number",
+                    "planned_start_lba",
+                    "record_index",
+                    "length",
+                    "sha256",
+                    "role",
+                    "base",
+                    "fields",
+                ],
+                "second_edition_replica record",
+            );
+            let blocks = second_edition_replica_a(
+                record["planned_tape_file_number"].as_u64().unwrap(),
+                record["planned_start_lba"].as_u64().unwrap(),
+            )
+            .expect("second-edition replica");
+            let index = record["record_index"].as_u64().unwrap() as usize;
+            // The stated construction must agree with the bytes built: the
+            // base record, patched with the stated fields and nothing else.
+            let base = file_records(
+                image,
+                record["base"]["tape_file"].as_u64().unwrap() as usize,
+            )[record["base"]["record_index"].as_u64().unwrap() as usize]
+                .clone();
+            assert_eq!(
+                replica_record_description(&blocks, index, blocks.len()),
+                json!({"role": record["role"], "base": record["base"], "fields": record["fields"]}),
+                "second-edition replica record construction"
+            );
+            let mut patched = base;
+            for field in record["fields"].as_object().unwrap().values() {
+                let at = field["offset"].as_u64().unwrap() as usize;
+                let value = unhex(field["hex"].as_str().unwrap());
+                assert_eq!(value.len() as u64, field["length"].as_u64().unwrap());
+                patched[at..at + value.len()].copy_from_slice(&value);
+            }
+            assert_eq!(patched, blocks[index], "base plus the stated fields");
+            blocks[index].clone()
+        }
         other => panic!("unknown appended record source {other}"),
     };
     assert_eq!(
@@ -1004,7 +1054,7 @@ fn appended_files(case: &Value, appended: &Value, image: &ExportedTapeImage) -> 
                             assert_eq!(key, "first_byte", "{id}: unknown foreign record key");
                         }
                         json!({"source": "foreign", "length": BLOCK,
-                            "first_byte": foreign["first_byte"]})
+                            "first_byte": foreign["first_byte"], "fill": FOREIGN_FILL})
                     } else if let Some(copy) = record.get("copy_of") {
                         for key in copy.as_object().unwrap().keys() {
                             assert!(
@@ -1069,16 +1119,133 @@ fn second_edition_replica_file(case: &Value, replica: &Value, image: &ExportedTa
     let start = last + 1;
     let records =
         second_edition_replica_a(planned_tape_file, start).expect("second-edition replica");
+    let base_file = REPLICA_BASE_TAPE_FILE;
+    let base = file_records(image, base_file);
+    assert_eq!(base.len(), records.len(), "{id}: replica and base sizes");
     let resolved: Vec<_> = records
         .iter()
         .enumerate()
         .map(|(i, bytes)| {
-            json!({"source": "second_edition_replica", "planned_tape_file_number": planned_tape_file,
+            let mut record = json!({"source": "second_edition_replica",
+                "planned_tape_file_number": planned_tape_file,
                 "planned_start_lba": start, "record_index": i, "length": bytes.len(),
-                "sha256": hex(&Sha256::digest(bytes))})
+                "sha256": hex(&Sha256::digest(bytes))});
+            record.as_object_mut().unwrap().extend(
+                replica_record_description(&records, i, records.len())
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+            record
         })
         .collect();
-    json!([{"records": resolved, "trailing_filemark": true}])
+    let replica = replica_summary(&records, planned_tape_file, start, base_file);
+    json!([{"records": resolved, "trailing_filemark": true, "replica": replica}])
+}
+
+/// The replica's stated plan, read back from the bytes of its header.
+pub(crate) fn replica_summary(
+    records: &[Vec<u8>],
+    planned_tape_file: u64,
+    start: u64,
+    base_file: usize,
+) -> Value {
+    let header = &records[0];
+    let read_u64 = |at: usize| u64::from_le_bytes(header[at..at + 8].try_into().unwrap());
+    let components: Vec<_> = (0..5)
+        .map(|c| {
+            let at = 0x148 + c * 32;
+            let kind = u16::from_le_bytes(header[at..at + 2].try_into().unwrap());
+            json!({"kind": kind,
+                "kind_name": match kind { 4 => "TapeIndexReplica", 5 => "IndexSeparationExtent", _ => unreachable!() },
+                "ordinal": u16::from_le_bytes(header[at + 2..at + 4].try_into().unwrap()),
+                "filemark_count": u32::from_le_bytes(header[at + 4..at + 8].try_into().unwrap()),
+                "planned_tape_file_number": read_u64(at + 8),
+                "planned_start_lba": read_u64(at + 16),
+                "record_count": read_u64(at + 24)})
+        })
+        .collect();
+    json!({
+        "replica": "A",
+        "replica_ordinal": u16::from_le_bytes(header[0x38..0x3a].try_into().unwrap()),
+        "edition_id": hex(&header[0x20..0x30]),
+        "edition_sequence": read_u64(0x30),
+        "base_edition_sequence": read_u64(0x30) - 1,
+        "planned_tape_file_number": planned_tape_file,
+        "planned_start_lba": start,
+        "expected_eod_lba": read_u64(0xa0),
+        "planned_layout": components,
+        "header_record_index": 0,
+        "payload_record_index": 1,
+        "footer_record_index": records.len() - 1,
+        "base": {"tape_file": base_file, "meaning": "the image's own replica A (tape file 4 of the unmodified image); the second-edition replica is that tape file with only the listed fields of its header and footer replaced and its payload record byte for byte the same"},
+    })
+}
+
+/// Tape file of the unmodified image that holds its replica A; the
+/// second-edition replica is derived from it.
+const REPLICA_BASE_TAPE_FILE: usize = 4;
+
+/// The stated fill of a foreign record's bytes after its first byte.
+pub(crate) const FOREIGN_FILL: &str = "first_byte, then zeros to the stated length";
+
+/// Fail on any key of `value` that is not listed.
+#[cfg(test)]
+fn check_keys(value: &Value, allowed: &[&str], what: &str) {
+    for key in value.as_object().expect("object").keys() {
+        assert!(allowed.contains(&key.as_str()), "unknown {what} key {key}");
+    }
+}
+
+/// How one record of the second-edition replica differs from its base record
+/// (the same-indexed record of the image's own replica A): its role, the base,
+/// and the named fields replaced, each with offset, length and new bytes.
+/// The payload record replaces nothing.
+fn replica_record_description(records: &[Vec<u8>], index: usize, count: usize) -> Value {
+    let role = if index == 0 {
+        "header"
+    } else if index == count - 1 {
+        "footer"
+    } else {
+        "payload"
+    };
+    let mut fields: Vec<(&str, usize, usize)> = Vec::new();
+    if role != "payload" {
+        fields.extend([
+            ("edition_id", 0x20, 16),
+            ("edition_sequence", 0x30, 8),
+            ("planned_tape_file_number", 0x88, 8),
+            ("planned_start_lba", 0x90, 8),
+            ("expected_eod_lba", 0xa0, 8),
+            ("edition_digest", 0xe8, 32),
+            ("layout_digest", 0x108, 32),
+            ("descriptor_digest", 0x128, 32),
+            ("planned_layout_components", 0x148, 160),
+        ]);
+    }
+    if role == "footer" {
+        fields.extend([
+            ("header_sha256", 0x2b8, 32),
+            ("observed_tape_file", 0x2d8, 8),
+            ("observed_start_lba", 0x2e0, 8),
+            ("observed_footer_lba", 0x2f0, 8),
+        ]);
+    }
+    if role != "payload" {
+        fields.push(("frame_crc64", 0x3f8, 8));
+    }
+    let fields: serde_json::Map<String, Value> = fields
+        .into_iter()
+        .map(|(name, offset, length)| {
+            (
+                name.to_string(),
+                json!({"offset": offset, "length": length,
+                    "hex": hex(&records[index][offset..offset + length])}),
+            )
+        })
+        .collect();
+    json!({"role": role, "base": {"tape_file": REPLICA_BASE_TAPE_FILE, "record_index": index},
+        "fields": fields})
 }
 
 /// The records of replica A of a second edition of `a4-minimal` (edition id
