@@ -1,0 +1,9 @@
+{
+  "artifact": "unit level",
+  "case": "overflow-3.3-stripe-mapping-inverse",
+  "edits": [],
+  "entry_points": [
+    "mapping::stripe_data_shard_in_epoch (unit level; the one inverse every Recoverer caller uses)"
+  ],
+  "target_role": "InverseMapping"
+}

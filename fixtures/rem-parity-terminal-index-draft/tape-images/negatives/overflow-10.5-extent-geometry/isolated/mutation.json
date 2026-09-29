@@ -7,7 +7,7 @@
   "commit_record_inputs": null,
   "edits": [],
   "entry_points": [
-    "index_separation::checked_index_separation_bytes"
+    "index_separation::index_separation_records (asserted to be 2^46) -> index_separation::plan_index_separation (the production separation validator)"
   ],
   "faults": [],
   "unit_inputs": {

@@ -23,6 +23,22 @@ pub fn data_shards_per_epoch(scheme: &ParityScheme) -> Result<u64, ParityError> 
     Ok(count)
 }
 
+/// REM-PARITY 14 step 2's version-1 bound, `T − W < S × k`: the unprotected
+/// ordinals of a committed prefix lie in at most one open epoch.
+///
+/// The product `S × k` is only compared, so it is compared exactly (Section
+/// 2.4) and is never too large: for any u64 `T − W` a product beyond u64 holds
+/// the bound, and a wrapped product would wrongly fail it. Every Resumer bound
+/// check uses this one comparison.
+pub fn unprotected_ordinals_within_one_epoch(
+    unprotected_ordinals: u64,
+    stripes_per_epoch: u64,
+    data_blocks_per_stripe: u64,
+) -> bool {
+    u128::from(unprotected_ordinals)
+        < u128::from(stripes_per_epoch) * u128::from(data_blocks_per_stripe)
+}
+
 /// Map a global `ParityDataOrdinal` to its epoch-local stripe coordinates.
 ///
 /// [`StripeAddress::neighborhood`] carries the v0.4.4 parity epoch id.
@@ -85,17 +101,35 @@ pub fn ordinal_to_stripe_in_epoch(
     })
 }
 
-/// Map epoch-local data coordinates back to an ordinal using the descriptor
-/// range start rather than deriving the start from the epoch id.
+/// What one data position of an epoch's stripe holds (REM-PARITY 3.3, 13.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpochDataShard {
+    /// A real data shard at this absolute ordinal, inside `[start, end)`.
+    Real {
+        /// The shard's absolute object-data ordinal.
+        ordinal: u64,
+    },
+    /// An all-zero shard supplied without tape I/O: the position's exact
+    /// ordinal `start + data_index·S + stripe` is at or past the protected end.
+    /// It is not an erasure (Section 6.4).
+    ImplicitZero,
+}
+
+/// Decide, by Section 3.3's inverse, whether an epoch-local data position holds
+/// a real shard or an implicit zero, using the descriptor's explicit range
+/// rather than deriving it from the epoch id.
 ///
-/// The returned ordinal can be beyond the descriptor's real shard count; that
-/// coordinate represents an implicit zero in a short epoch. Callers compare it
-/// with the descriptor end before attempting an object-data read.
-pub fn stripe_data_to_ordinal_in_epoch(
+/// The decision compares the exact ordinal with the protected end, as Section
+/// 2.4 requires: it compares the epoch-local offset `data_index·S + stripe`
+/// with `end − start`, and forms an absolute ordinal only for a real shard,
+/// which then lies below `end` and fits. A position whose ordinal would not
+/// fit in u64 is therefore an implicit zero, never a rejection.
+pub fn stripe_data_shard_in_epoch(
     addr: &StripeAddress,
     protected_ordinal_start: u64,
+    protected_ordinal_end_exclusive: u64,
     scheme: &ParityScheme,
-) -> Result<u64, ParityError> {
+) -> Result<EpochDataShard, ParityError> {
     let stripes = u64::from(scheme.stripes_per_neighborhood);
     if u64::from(addr.stripe_index) >= stripes {
         return Err(ParityError::Invariant("stripe_index outside scheme"));
@@ -111,15 +145,20 @@ pub fn stripe_data_to_ordinal_in_epoch(
             return Err(ParityError::Invariant("parity shard has no data ordinal"));
         }
     };
-
-    protected_ordinal_start
-        .checked_add(
-            data_index
-                .checked_mul(stripes)
-                .and_then(|offset| offset.checked_add(u64::from(addr.stripe_index)))
-                .ok_or(ParityError::Invariant("epoch-local data offset overflows"))?,
-        )
-        .ok_or(ParityError::Invariant("data ordinal overflows"))
+    let real_data_shards = protected_ordinal_end_exclusive
+        .checked_sub(protected_ordinal_start)
+        .ok_or(ParityError::Invariant(
+            "epoch protected range ends before it starts",
+        ))?;
+    // Bounded width: data_index < k <= u16::MAX and stripe_index < S <=
+    // u32::MAX, so the epoch-local offset is below 2^49 and fits.
+    let offset = data_index * stripes + u64::from(addr.stripe_index);
+    if offset >= real_data_shards {
+        return Ok(EpochDataShard::ImplicitZero);
+    }
+    Ok(EpochDataShard::Real {
+        ordinal: protected_ordinal_start + offset,
+    })
 }
 
 /// Reverse [`ordinal_to_stripe`] for a data shard.
@@ -363,5 +402,70 @@ mod tests {
         };
         let err = stripe_data_to_ordinal(&bad_data_index, &s).unwrap_err();
         assert!(format!("{err}").contains("data index"), "{err}");
+    }
+
+    /// REM-PARITY 3.3 and 2.4: the implicit-zero decision compares the exact
+    /// ordinal with the protected end. With start = 2^64 − 2 and end = 2^64 − 1
+    /// (the `overflow-3.3-stripe-mapping-inverse` descriptor, S = 2, k = 2),
+    /// every position but (stripe 0, data 0) has an ordinal at or past the end,
+    /// including ordinals 2^64 and 2^64 + 1 that do not fit in u64: each is an
+    /// implicit zero, never a rejection and never a wrapped real ordinal.
+    #[test]
+    fn inverse_decides_implicit_zero_by_exact_comparison() {
+        let mut s = small_scheme();
+        s.data_blocks_per_stripe = 2;
+        s.stripes_per_neighborhood = 2;
+        let start = u64::MAX - 1;
+        let end = u64::MAX;
+        let at = |stripe_index: u32, index: u16| StripeAddress {
+            neighborhood: 0,
+            stripe_index,
+            position: StripePosition::Data { index },
+        };
+        assert_eq!(
+            stripe_data_shard_in_epoch(&at(0, 0), start, end, &s).unwrap(),
+            EpochDataShard::Real { ordinal: start }
+        );
+        for (stripe, index) in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                stripe_data_shard_in_epoch(&at(stripe, index), start, end, &s).unwrap(),
+                EpochDataShard::ImplicitZero,
+                "stripe {stripe} data {index}"
+            );
+        }
+        // Inside an ordinary short epoch, real and implicit shards split at the
+        // real data-shard count, whatever the absolute start.
+        let s = small_scheme();
+        for start in [0, 100, u64::MAX - 12] {
+            let end = start + 5;
+            for index in 0..s.data_blocks_per_stripe {
+                for stripe in 0..s.stripes_per_neighborhood {
+                    let offset = u64::from(index) * 3 + u64::from(stripe);
+                    let expected = if offset < 5 {
+                        EpochDataShard::Real {
+                            ordinal: start + offset,
+                        }
+                    } else {
+                        EpochDataShard::ImplicitZero
+                    };
+                    assert_eq!(
+                        stripe_data_shard_in_epoch(&at(stripe, index), start, end, &s).unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    /// sup-23 (`overflow-9.2-SxK/isolated`): S × k = 2^63 × 2 = 2^64 is only
+    /// compared, so the bound holds for every u64 T − W; a wrapped product (0)
+    /// would fail it.
+    #[test]
+    fn epoch_bound_compares_the_exact_product() {
+        assert!(unprotected_ordinals_within_one_epoch(u64::MAX, 1 << 63, 2));
+        assert!(unprotected_ordinals_within_one_epoch(0, 1 << 63, 2));
+        assert!(unprotected_ordinals_within_one_epoch(3, 2, 2));
+        assert!(!unprotected_ordinals_within_one_epoch(4, 2, 2));
+        assert!(!unprotected_ordinals_within_one_epoch(0, 0, 2));
     }
 }

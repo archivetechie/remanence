@@ -157,6 +157,7 @@ fn terminal_mutation_section15() {
             roles: vec![role],
             targets: vec![target],
             block: 0,
+            injected: true,
         };
         let tape_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut drive = tape(&resolved.files, &input, row[1] == "event");

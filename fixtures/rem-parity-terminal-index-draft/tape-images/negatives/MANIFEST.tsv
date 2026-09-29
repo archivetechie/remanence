@@ -65,6 +65,15 @@ terminal-replica-role-magic/b-header-carries-footer-magic	terminal profile minim
 terminal-replica-role-magic/b-header-carries-footer-magic	terminal profile minimal-256k	1	2	262144	f1fff4709f8a3d8c08d7159b52a2930e1edec26f4210ef5cbb41298cf0602510
 separation-extent-role-magic	terminal profile minimal-256k	2	0	262144	04576ec852020cd29586767af93c31f0ad2fd95059a42a7a176fe211ec9f7eb4
 separation-extent-role-magic	terminal profile minimal-256k	2	2	262144	83dc73f891480a7125250a096f3993f66c12d9f27d29d34deddcb6eb87801de0
+overflow-3.2-lba	terminal profile multi-256k	6	0	262144	bd0f0bd4d7c2e3076742ac3327e071ab4ae3ecc3d8276b2f3809a2b4129b727e
+overflow-3.2-lba	terminal profile multi-256k	6	1	262144	c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e
+overflow-3.2-lba	terminal profile multi-256k	6	2	262144	691aae9af60c6fa872c87eb01b0820f726dddb0678be3907f28a9956bc8ddaf2
+overflow-3.2-lba	terminal profile multi-256k	8	0	262144	43a581d7efe48130a487ef72ef1dc39cad02a83de051e3479caa03b60c8e3188
+overflow-3.2-lba	terminal profile multi-256k	8	1	262144	c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e
+overflow-3.2-lba	terminal profile multi-256k	8	2	262144	9d901ca0963ccd2578f168b31dfda10ead1964dc6e62c8094fbf8ac075536457
+overflow-3.2-lba	terminal profile multi-256k	10	0	262144	eed34d674d3ec166b66effbfd839f88d73914a50be82aaf911a220d68bc6882e
+overflow-3.2-lba	terminal profile multi-256k	10	1	262144	c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e
+overflow-3.2-lba	terminal profile multi-256k	10	2	262144	9c65c0bca928057410b79fae3518d0013422574c16e3342396b8e964cc90d762
 overflow-3.3-stripe-mapping-forward	tape-image a4-minimal	2	0	262144	9403eb45721efbbb01becec1057652de39fcacf9bfb639daf7ee22d9e2e1190a
 overflow-6.6-scheme-product	tape-image a4-minimal	0	0	262144	ae1d8f9632534d108d619503253be2a5dd2e81725c2269b87dc327f5d05d2ce0
 overflow-7.2-T	terminal profile multi-256k	6	0	262144	b33f5b5552488ffa08c38f00713e042be93965358645d8c8f8ebfad69152c2fd

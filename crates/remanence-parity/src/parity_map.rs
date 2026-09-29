@@ -861,7 +861,7 @@ pub(crate) fn read_final_parity_map(
     block_size: u32,
 ) -> Result<Option<DecodedParityMapTapeFile>, ParityError> {
     use crate::filemark_map::{TapeFileKind, TapeFilePosition};
-    use crate::raw::{tape_error_is_current_medium_damage, RawReadOutcome};
+    use crate::raw::{read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead};
 
     let Some(entry) = map
         .entries()
@@ -878,8 +878,10 @@ pub(crate) fn read_final_parity_map(
             block_within_file,
         })?)?;
         let mut block = vec![0; block_size as usize];
-        let block = match source.read_record(&mut block) {
-            Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block.len() => Some(block),
+        // A record of the wrong length (REM-PARITY 3.5), like a boundary or a
+        // medium error, is an absent block of this control file's copies.
+        let block = match read_fixed_record(source, &mut block) {
+            Ok(FixedRecordRead::Block { .. }) => Some(block),
             Ok(_) => None,
             Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => None,
             Err(error) => return Err(error),
@@ -1529,10 +1531,11 @@ fn parse_copy_at(
         ParityMapCopyKind::Primary => footer.primary_copy_start_block,
         ParityMapCopyKind::Tail => footer.tail_copy_start_block,
     };
-    let start = usize::try_from(start)
-        .map_err(|_| parity_map_parse("parity-map copy start overflows usize"))?;
-    let header_block = blocks
-        .get(start)
+    // Compared exactly with the file's blocks (REM-PARITY 2.4): a start that
+    // does not fit the host lies outside the file like any other.
+    let (start, header_block) = usize::try_from(start)
+        .ok()
+        .and_then(|start| Some((start, blocks.get(start)?)))
         .ok_or_else(|| parity_map_parse("parity-map copy start lies outside tape file"))?;
     let header = parse_parity_map_header_block(header_block, &footer.tape_uuid)?;
     if header.copy_kind != expected_kind {
@@ -1573,15 +1576,8 @@ fn parse_available_copy_at(
         validate_header_matches_footer(&header, footer)?;
     }
 
-    let copy_block_count = usize::try_from(header.copy_block_count)
-        .map_err(|_| parity_map_parse("parity-map copy block count overflows usize"))?;
-    let end = start
-        .checked_add(copy_block_count)
-        .ok_or_else(|| parity_map_parse("parity-map copy end overflows"))?;
-    let available = blocks
-        .get(start..end)
-        .ok_or_else(|| parity_map_parse("parity-map copy range outside tape file"))?;
-    let mut copy_blocks = Vec::with_capacity(copy_block_count);
+    let available = copy_range(blocks, start, header.copy_block_count)?;
+    let mut copy_blocks = Vec::with_capacity(available.len());
     for (offset, block) in available.iter().enumerate() {
         let block = block.as_ref().ok_or_else(|| {
             parity_map_parse(format!(
@@ -1618,30 +1614,31 @@ fn read_payload_from_copy(
     header: &ParityMapHeader,
 ) -> Result<Vec<u8>, ParityError> {
     let block_size = validate_block_size(header.block_size)?;
-    let copy_block_count = usize::try_from(header.copy_block_count)
-        .map_err(|_| parity_map_parse("parity-map copy block count overflows usize"))?;
-    let end = start
-        .checked_add(copy_block_count)
-        .ok_or_else(|| parity_map_parse("parity-map copy end overflows"))?;
-    let copy_blocks = blocks
-        .get(start..end)
-        .ok_or_else(|| parity_map_parse("parity-map copy range outside tape file"))?;
+    let copy_blocks = copy_range(blocks, start, header.copy_block_count)?;
     if copy_blocks.iter().any(|block| block.len() != block_size) {
         return Err(parity_map_parse(
             "parity-map copy contains a block with the wrong size",
         ));
     }
-    let payload_len = usize::try_from(header.payload_len)
-        .map_err(|_| parity_map_parse("parity-map payload length overflows usize"))?;
-    let copy_capacity = copy_block_count
+    // The copy's blocks are held in memory, so their total length fits usize;
+    // the product cannot fail.
+    let copy_capacity = copy_blocks
+        .len()
         .checked_mul(block_size)
-        .ok_or_else(|| parity_map_parse("parity-map copy capacity overflows"))?;
-    let payload_end = PARITY_MAP_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or_else(|| parity_map_parse("parity-map payload end overflows"))?;
-    if payload_end > copy_capacity {
+        .ok_or(ParityError::Invariant(
+            "in-memory parity-map copy capacity overflows usize",
+        ))?;
+    // `0xC8 + payload_len <= capacity` is only compared, so it is compared
+    // exactly (REM-PARITY 2.4) and never rejected for an intermediate sum. A
+    // payload length that passes fits usize, since it is below the capacity.
+    let fits = copy_capacity
+        .checked_sub(PARITY_MAP_HEADER_LEN)
+        .is_some_and(|room| u128::from(header.payload_len) <= room as u128);
+    if !fits {
         return Err(parity_map_parse("parity-map payload exceeds copy blocks"));
     }
+    let payload_len = header.payload_len as usize;
+    let payload_end = PARITY_MAP_HEADER_LEN + payload_len;
     let mut payload = Vec::with_capacity(payload_len);
     let mut remaining = payload_len;
     let mut offset = PARITY_MAP_HEADER_LEN;
@@ -1757,6 +1754,18 @@ fn validate_locator_counts(
         "parity-map",
     )
     .map_err(|error| parity_map_parse(error.to_string()))
+}
+
+/// The blocks of one copy: `count` blocks from `start`, compared exactly with
+/// the tape file's blocks (REM-PARITY 2.4). A range that does not fit the host
+/// lies outside the file like any other, so this is a format error.
+fn copy_range<T>(blocks: &[T], start: usize, count: u64) -> Result<&[T], ParityError> {
+    let available = blocks.len().saturating_sub(start);
+    if start > blocks.len() || u128::from(count) > available as u128 {
+        return Err(parity_map_parse("parity-map copy range outside tape file"));
+    }
+    // count <= available <= blocks.len(), so it fits usize.
+    Ok(&blocks[start..start + count as usize])
 }
 
 fn validate_block_size(block_size: u32) -> Result<usize, ParityError> {
@@ -1884,6 +1893,136 @@ mod tests {
 
     const TAPE_UUID: [u8; 16] = [0x5A; 16];
     const BLOCK_SIZE: u32 = 256;
+
+    /// REM-PARITY 2.4: a copy's range and its payload end are only compared
+    /// with the blocks the Reader holds, so a recorded count or length beyond
+    /// the host, or beyond u64 arithmetic, is a format error of the copy
+    /// (ParityMapParse), never an overflow or a host limit.
+    #[test]
+    fn copy_range_and_payload_end_are_compared_exactly() {
+        let encoded = encode_parity_map_tape_file(&sample_payload(), BLOCK_SIZE).unwrap();
+        let blocks = &encoded.blocks;
+        read_payload_from_copy(blocks, 0, &encoded.header).expect("the primary copy reads");
+        for (label, mutate) in [
+            (
+                "copy count u64::MAX",
+                (|h: &mut ParityMapHeader| h.copy_block_count = u64::MAX)
+                    as fn(&mut ParityMapHeader),
+            ),
+            ("payload length u64::MAX", |h| h.payload_len = u64::MAX),
+            ("payload one past the copy", |h| {
+                h.payload_len =
+                    h.copy_block_count * u64::from(BLOCK_SIZE) - PARITY_MAP_HEADER_LEN as u64 + 1
+            }),
+        ] {
+            let mut header = encoded.header.clone();
+            mutate(&mut header);
+            let error = read_payload_from_copy(blocks, 0, &header).unwrap_err();
+            assert!(
+                matches!(&error, ParityError::ParityMapParse(m) if !m.contains("overflow")),
+                "{label}: {error:?}"
+            );
+        }
+        assert!(copy_range(blocks, blocks.len() + 1, 0).is_err());
+        assert_eq!(copy_range(blocks, blocks.len(), 0).unwrap().len(), 0);
+    }
+
+    /// REM-PARITY 3.5: a ParityMap block of the wrong length is an absent
+    /// block of its copy, never TapeIo; the other copy still validates.
+    #[test]
+    fn final_parity_map_block_of_the_wrong_length_is_absent() {
+        use crate::filemark_map::{FilemarkMap, TapeFileMapEntry};
+        let encoded = encode_parity_map_tape_file(&sample_payload(), BLOCK_SIZE).unwrap();
+        // Files 0..=3 precede the ParityMap at tape file 4, as the sample
+        // directory's scope of five tape files requires.
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, 1, 0),
+            TapeFileMapEntry::object(2, 1, 1),
+            TapeFileMapEntry::object(3, 1, 2),
+            TapeFileMapEntry::parity_map(4, encoded.blocks.len() as u64),
+        ])
+        .unwrap();
+        for length in [BLOCK_SIZE as usize / 2, 2 * BLOCK_SIZE as usize] {
+            // The primary copy's first block has the wrong length.
+            let mut parity_map = encoded.blocks.clone();
+            parity_map[0].resize(length, 0);
+            let mut files = vec![vec![vec![0; BLOCK_SIZE as usize]]; 4];
+            files.push(parity_map);
+            let mut source = LengthSource::new(files);
+            let decoded = read_final_parity_map(&mut source, &map, &TAPE_UUID, BLOCK_SIZE)
+                .unwrap_or_else(|e| panic!("length {length}: {e:?}"))
+                .expect("the tail copy validates");
+            assert_eq!(decoded.payload, sample_payload(), "length {length}");
+        }
+    }
+
+    /// Tape files of records of stated lengths, each followed by a filemark,
+    /// reporting an over-length record as a drive does.
+    struct LengthSource {
+        records: Vec<Option<Vec<u8>>>,
+        cursor: usize,
+    }
+    impl LengthSource {
+        fn new(files: Vec<Vec<Vec<u8>>>) -> Self {
+            let mut records = Vec::new();
+            for file in files {
+                records.extend(file.into_iter().map(Some));
+                records.push(None);
+            }
+            Self { records, cursor: 0 }
+        }
+    }
+    impl crate::raw::RawTapeSource for LengthSource {
+        fn configure_fixed_block_size(&mut self, _: u32) -> Result<(), ParityError> {
+            Ok(())
+        }
+        fn locate_physical(
+            &mut self,
+            hint: crate::raw::PhysicalPositionHint,
+        ) -> Result<(), ParityError> {
+            self.cursor = hint.lba as usize;
+            Ok(())
+        }
+        fn locate_end_of_data(&mut self) -> Result<crate::raw::PhysicalPositionHint, ParityError> {
+            Ok(crate::raw::PhysicalPositionHint::new(
+                self.records.len() as u64
+            ))
+        }
+        fn space_filemarks(
+            &mut self,
+            _: i64,
+        ) -> Result<crate::raw::SpaceFilemarksOutcome, ParityError> {
+            Err(ParityError::Invariant("not used"))
+        }
+        fn read_record(
+            &mut self,
+            buf: &mut [u8],
+        ) -> Result<crate::raw::RawReadOutcome, ParityError> {
+            let record = self.records[self.cursor].clone();
+            self.cursor += 1;
+            let position_after = crate::raw::PhysicalPositionHint::new(self.cursor as u64);
+            match record {
+                None => Ok(crate::raw::RawReadOutcome::Filemark { position_after }),
+                Some(block) if block.len() > buf.len() => Err(ParityError::TapeIo(
+                    remanence_library::TapeIoError::ReadBufferTooSmall {
+                        actual: block.len() as u32,
+                        provided: buf.len() as u32,
+                    },
+                )),
+                Some(block) => {
+                    buf[..block.len()].copy_from_slice(&block);
+                    Ok(crate::raw::RawReadOutcome::Block {
+                        bytes: block.len(),
+                        position_after,
+                    })
+                }
+            }
+        }
+        fn position(&mut self) -> Result<crate::raw::PhysicalPositionHint, ParityError> {
+            Ok(crate::raw::PhysicalPositionHint::new(self.cursor as u64))
+        }
+    }
 
     fn sample_directory() -> SidecarEpochDirectory {
         SidecarEpochDirectory {

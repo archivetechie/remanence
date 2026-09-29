@@ -1,0 +1,19 @@
+{
+  "failed_data_addresses": [],
+  "hints": null,
+  "image": "a4-minimal",
+  "record_edits": [
+    {
+      "construction": "the original record followed by 262144 zero bytes",
+      "edits": [],
+      "lba": 37,
+      "length": 524288,
+      "original_length": 262144,
+      "record_index": 2,
+      "sha256": "21242948eeb00e8971a4a9e7d552484f7132c6518191bc438024a3c42bfb4512",
+      "tape_file": 8
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": []
+}

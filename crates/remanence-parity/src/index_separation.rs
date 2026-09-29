@@ -260,21 +260,21 @@ pub fn index_separation_records(
     extent_bytes: u64,
 ) -> Result<u64, IndexSeparationError> {
     validate_terminal_index_block_size(block_size)?;
-    let block_size = u64::from(block_size);
-    let adjusted = extent_bytes.checked_add(block_size - 1).ok_or(
-        IndexSeparationError::ArithmeticOverflow {
-            context: "extent byte ceiling division",
-        },
-    )?;
-    let records = adjusted / block_size;
+    // total_records = ceil(E / B) denotes its exact value (REM-PARITY 2.4); it
+    // is formed without the intermediate E + B − 1, which may exceed u64.
+    let records = extent_bytes.div_ceil(u64::from(block_size));
     if records < 2 {
         return Err(IndexSeparationError::TooShort { records });
     }
     Ok(records)
 }
 
-/// Calculate the represented extent bytes with the same checked geometry used
-/// during separation planning. The nominal byte target need not be block-aligned.
+/// Calculate `actual_bytes = total_records × B` (REM-PARITY 10.5) exactly,
+/// from the exact ceiling `total_records = ceil(E / B)`. The separation
+/// validator, [`plan_index_separation`], requires it: Section 10.6, read against
+/// Section 10.5, requires every size formula to evaluate without overflow,
+/// meaning its exact value fits in u64 (Section 2.4), although no field records
+/// `actual_bytes`. The nominal byte target need not be block-aligned.
 pub fn checked_index_separation_bytes(
     block_size: u32,
     extent_bytes: u64,
@@ -307,9 +307,14 @@ pub fn plan_index_separation(
             records: descriptor.total_records,
         });
     }
-    let expected_records =
-        checked_index_separation_bytes(descriptor.block_size, descriptor.nominal_extent_bytes)?
-            / u64::from(descriptor.block_size);
+    // Section 10.6 read against Section 10.5: every size formula evaluates
+    // without overflow, `actual_bytes` included. The ceiling is exact, so only a
+    // size whose exact value does not fit rejects, never an intermediate
+    // (REM-PARITY 2.4). `actual_bytes` is an exact multiple of B, so dividing
+    // it back recovers `total_records` exactly.
+    let actual_bytes =
+        checked_index_separation_bytes(descriptor.block_size, descriptor.nominal_extent_bytes)?;
+    let expected_records = actual_bytes / u64::from(descriptor.block_size);
     if descriptor.total_records != expected_records {
         return Err(IndexSeparationError::RecordCountMismatch {
             planned: expected_records,
@@ -1343,5 +1348,52 @@ mod tests {
                 actual: 1
             }
         ));
+    }
+
+    /// REM-PARITY 2.4, 10.5 and 10.6: total_records = ceil(E / B) is exact, so
+    /// a nominal extent near u64::MAX gives its exact record count; the
+    /// validator then rejects only because actual_bytes = total_records × B
+    /// does not fit, never at the ceiling's intermediate.
+    #[test]
+    fn extent_geometry_is_exact() {
+        let block_size = 256 * 1024;
+        assert_eq!(
+            index_separation_records(block_size, u64::MAX).unwrap(),
+            1 << 46
+        );
+        let error = checked_index_separation_bytes(block_size, u64::MAX).unwrap_err();
+        assert!(error.to_string().contains("actual extent bytes"), "{error}");
+        assert_eq!(
+            index_separation_records(block_size, u64::MAX - u64::from(block_size) + 2).unwrap(),
+            1 << 46
+        );
+        // The production validator: with the recorded count equal to the exact
+        // ceiling 2^46, the one violation is actual_bytes = 2^64.
+        let descriptor =
+            |nominal_extent_bytes: u64, total_records: u64| IndexSeparationDescriptor {
+                tape_uuid: [0x11; 16],
+                edition_id: [0x54; 16],
+                gap_ordinal: 1,
+                block_size,
+                nominal_extent_bytes,
+                total_records,
+                compression_enabled: false,
+                terminal_layout: TerminalTailLayout::new(0, block_size, 1, 2, 3, total_records)
+                    .expect("layout fits"),
+            };
+        let error = plan_index_separation(descriptor(u64::MAX, 1 << 46)).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                IndexSeparationError::ArithmeticOverflow {
+                    context: "actual extent bytes"
+                }
+            ),
+            "{error:?}"
+        );
+        // Just below, the exact size fits and the extent's geometry validates.
+        let fits = u64::MAX - u64::from(block_size) + 1;
+        plan_index_separation(descriptor(fits, (1 << 46) - 1))
+            .expect("actual_bytes = 2^64 − 2^18 fits");
     }
 }

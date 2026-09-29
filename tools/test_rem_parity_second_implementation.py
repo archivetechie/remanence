@@ -676,7 +676,10 @@ class NegativeBlockTests(unittest.TestCase):
             self.assertIn(row["field"].split(": ")[1].split(" ")[0], ("canonical_metadata_hash", "payload_sha256"))
 
     def test_unpinned_and_unit_cases(self) -> None:
-        self.assertTrue(all(row["result"] == "missing_from_manifest" for row in self.rows("overflow-3.2-lba")))
+        # R2's manifest pins the nine replica blocks of overflow-3.2-lba (neg-44); my blocks match each of them.
+        rows = self.rows("overflow-3.2-lba")
+        self.assertEqual(len(rows), 9)
+        self.assertTrue(all(row["result"] == "matched" for row in rows), rows)
         self.assertEqual(self.out["entries"]["neg-26"]["vector"], "none")
         self.assertEqual(self.out["entries"]["sup-01"]["vector"], "unit")
 
@@ -1099,6 +1102,63 @@ class MapEntryRescueTests(unittest.TestCase):
         # 2.2: "a data block's tape-file position, or a parity shard's epoch, stripe and parity index".
         for finding in data:
             self.assertIn(sorted(finding["address"]), (["block", "tape_file"], ["epoch", "parity_index", "stripe"]))
+
+
+# ---------------------------------------------------------------------------
+# F2: read requests, resume tape faults and strict resume inputs.
+# ---------------------------------------------------------------------------
+
+
+class ReadRequestTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+        cls.dir = SCRATCH / "read-requests"
+        cls.dir.mkdir(parents=True, exist_ok=True)
+
+    def case(self, record=None, length=None):
+        case = {"failed_data_addresses": [], "hints": None, "image": "a4-minimal", "read_data_addresses": [[1, 0]],
+                "removed_filemark_after_tape_file": None, "unreadable_records": []}
+        if length is not None:
+            original = self.image.files[1].blocks[0]
+            new = original[:length] + bytes(max(0, length - len(original)))
+            case["record_edits"] = [{"construction": f"the first {length} bytes of the original record", "edits": [],
+                                     "lba": 2, "length": length, "original_length": len(original), "record_index": 0,
+                                     "sha256": hashlib.sha256(new).hexdigest(), "tape_file": 1}]
+        return case
+
+    def run_case(self, name, case):
+        path = self.dir / f"{name}.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        return impl.run_decide([path], self.dir / f"{name}-out.json")["cases"][name]
+
+    def test_a_block_that_reads_returns_as_read(self) -> None:
+        outcome = self.run_case("intact", self.case())["recoverer"]["addresses"][0]
+        self.assertEqual((outcome["request"], outcome["result"], outcome["bytes_match"]), ("read", "read", True))
+
+    def test_a_short_record_is_a_read_failure_and_is_recovered(self) -> None:
+        # 13.4: "A record shorter or longer than one block is a read failure (Section 3.5)."
+        outcome = self.run_case("short", self.case(length=1000))["recoverer"]["addresses"][0]
+        self.assertEqual((outcome["result"], outcome["bytes_match"]), ("recovered", True))
+        self.assertIn("1000-byte record", outcome["read"])
+
+
+class ResumeInputTests(unittest.TestCase):
+    def test_an_unknown_resume_key_fails_the_run(self) -> None:
+        case = dict(synthetic_resume_cases()["synthetic-accepted"], surprise=True)
+        path = SCRATCH / "resume-unknown.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        with self.assertRaises(impl.FaultMapError):
+            impl.run_resume([path], SCRATCH / "resume-unknown-out.json")
+
+    def test_a_medium_error_in_step_3_is_tape_io(self) -> None:
+        # 14 step 3: "a medium or transport failure is `TapeIo`".
+        case = dict(synthetic_resume_cases()["synthetic-accepted"],
+                    tape_faults={"record_edits": [], "unreadable_records": [{"lba": 15, "record_index": 0, "tape_file": 3}]})
+        path = SCRATCH / "resume-medium.json"
+        path.write_text(json.dumps(case), encoding="utf-8")
+        decision = impl.run_resume([path], SCRATCH / "resume-medium-out.json")["cases"]["resume-medium"]["decision"]
+        self.assertEqual((decision["result"], decision["error"], decision["refused_at"]), ("refused", "TapeIo", "step 3"))
 
 
 if __name__ == "__main__":

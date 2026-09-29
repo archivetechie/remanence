@@ -3581,6 +3581,69 @@ def acquire_index(ctx: RecoveryContext, sidecar: MapEntry, citations: list) -> t
     return unavailable()
 
 
+def recovery_requests(case: Mapping[str, Any]) -> list[tuple[list[int], str | None]]:
+    """The addresses a case gives the Recoverer: failed addresses, then addresses to read."""
+    return [(a, None) for a in case.get("failed_data_addresses", [])] + \
+           [(a, "read") for a in case.get("read_data_addresses", [])]
+
+
+def not_run_outcomes(requests: list[tuple[list[int], str | None]]) -> list[dict[str, Any]]:
+    return [dict({"address": list(a), "epoch": None, "result": "not_run", "error": None, "stripe": None,
+                  "lost": None, "limit": None, "bytes_match": None, "citations": [cite("recoverer_inputs")]},
+                 **({"request": "read"} if kind == "read" else {}))
+            for a, kind in requests]
+
+
+def read_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
+    """A data address the Recoverer is asked to read (Sections 3.5, 13.4).
+
+    The block is read and judged as a stripe position is. A read that
+    succeeds, whose CRC matches the sidecar index, returns the block as read.
+    A read failure, a record that is not one block long, or a CRC mismatch
+    makes it a failed block, which is then recovered as a failed address is.
+    """
+    tape_file, block_index = address
+    status = None
+    if tape_file < min(ctx.scope, len(ctx.entries)) and ctx.entries[tape_file].kind == KIND_OBJECT \
+            and block_index < ctx.entries[tape_file].block_count:
+        entry = ctx.entries[tape_file]
+        lba = lba_of_file(ctx.entries, tape_file) + block_index
+        try:
+            value = ctx.tape.read(lba)
+        except MediumError:
+            status = f"read failure: a medium error at LBA {lba}"
+        else:
+            if not isinstance(value, bytes):
+                status = f"read failure: {value} at LBA {lba} where a data block is placed"
+            elif len(value) != ctx.block_size:
+                status = (f"read failure: a {len(value)}-byte record at LBA {lba}, not one block "
+                          f"(Sections 3.5 and 13.4)")
+            else:
+                ordinal = entry.first_parity_data_ordinal + block_index
+                sidecars = [e for e in ctx.entries[: ctx.scope] if e.kind == KIND_SIDECAR
+                            and e.protected_ordinal_start <= ordinal < e.protected_ordinal_end_exclusive]
+                if ordinal < ctx.watermark and len(sidecars) == 1:
+                    citations: list = []
+                    index, _ = acquire_index(ctx, sidecars[0], citations)
+                    if index is not None and crc64_xz(value) != index["data_crcs"][ordinal - index["start"]]:
+                        status = f"CRC mismatch at LBA {lba} (an erasure, Section 13.4)"
+                    elif index is not None:
+                        return {"address": list(address), "request": "read", "read": "one block; its CRC matches the "
+                                "sidecar index", "epoch": sidecars[0].epoch_id, "result": "read", "error": None,
+                                "stripe": None, "lost": None, "limit": None, "bytes_match": None, "_block": value,
+                                "citations": [cite("trusted")]}
+                return {"address": list(address), "request": "read", "read": "one block; no sidecar index checks it",
+                        "epoch": None, "result": "read", "error": None, "stripe": None, "lost": None, "limit": None,
+                        "bytes_match": None, "_block": value, "citations": [cite("recoverer_inputs")]}
+    outcome = recover_address(ctx, address)
+    outcome["request"] = "read"
+    if status is not None:
+        outcome["read"] = status
+        outcome["citations"][:0] = [cite("wrong_length"), cite("short_read_failure")] if "record" in status \
+            else [cite("erasure")]
+    return outcome
+
+
 def recover_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
     tape_file, block_index = address
     result: dict[str, Any] = {"address": list(address), "epoch": None, "result": None, "error": None,
@@ -3654,6 +3717,10 @@ def recover_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
             positions.append((row, None, f"erasure (read failure at LBA {lba})"))
             erasures += 1
             continue
+        if len(shard) != ctx.block_size:
+            positions.append((row, None, f"erasure (read failure: a {len(shard)}-byte record at LBA {lba})"))
+            erasures += 1
+            continue
         if crc64_xz(shard) != index["data_crcs"][peer - index["start"]]:
             positions.append((row, None, f"erasure (CRC mismatch at LBA {lba})"))
             erasures += 1
@@ -3666,6 +3733,10 @@ def recover_address(ctx: RecoveryContext, address: list[int]) -> dict[str, Any]:
             shard = ctx.tape.read_data(lba)
         except (MediumError, ReadFailure):
             positions.append((row, None, f"erasure (read failure at LBA {lba})"))
+            erasures += 1
+            continue
+        if len(shard) != ctx.block_size:
+            positions.append((row, None, f"erasure (read failure: a {len(shard)}-byte record at LBA {lba})"))
             erasures += 1
             continue
         if crc64_xz(shard) != index["parity_crcs"][(stripe, parity_index)]:
@@ -3791,7 +3862,19 @@ def resume_case(case: Mapping[str, Any], image: ImageBuild,
                 trace: dict[str, Any]) -> tuple[dict[str, Any], ImageBuild | None]:
     """Act as a Resumer on the undamaged image with the given prefix as commit authority."""
     decision = empty_resume_decision(case["image"])
-    tape = DamagedTape(image.records(), set())
+    records = image.records()
+    unreadable: set[int] = set()
+    if "tape_faults" in case:
+        # The tape the Resumer re-reads, damaged as the case states (the fault
+        # model is given, not derived).
+        applied = apply_record_edits(image, records, case["tape_faults"])
+        for item in case["tape_faults"]["unreadable_records"]:
+            if not (0 <= item["tape_file"] < len(image.files)) or \
+                    image.file_start_lba(item["tape_file"]) + item["record_index"] != item["lba"]:
+                raise FaultMapError(f"tape_faults: unreadable record {item} does not match the image layout")
+            unreadable.add(item["lba"])
+        decision["tape_faults"] = {"record_edits": applied, "unreadable_lbas": sorted(unreadable)}
+    tape = DamagedTape(records, unreadable)
     reads: list[int] = []
 
     def read(lba: int) -> Any:
@@ -3840,6 +3923,7 @@ def resume_case(case: Mapping[str, Any], image: ImageBuild,
             step2["citations"].append(cite("epoch_ids"))
         if any("finalization has begun" in v for v in violations):
             step2["citations"].append(cite("resume_finalizing"))
+            return refuse("step 2", "ResumeAppend", ["resume_step2_rules", "resume_finalizing", "err_resume"])
         return refuse("step 2", "ResumeAppend", ["resume_step2_rules", "err_resume"])
 
     # The step-2 bound needs S and k, which the prefix does not carry. The text
@@ -3899,6 +3983,8 @@ def resume_case(case: Mapping[str, Any], image: ImageBuild,
     step4.update(result="run", append_point_lba=append_point)
     step4["citations"].extend([cite("resume_step4"), cite("resume_first_block"), cite("resume_superseded")])
     block_size = boot["block_size"]
+    if "append_object" not in case:
+        raise FaultMapError("the resume case reaches step 4 but gives no append_object to write")
     stored, layout = build_rem_object(case["append_object"], block_size, 0)
     new_blocks = [stored[i : i + block_size] for i in range(0, len(stored), block_size)]
     data = dict(open_blocks)
@@ -3990,8 +4076,9 @@ def compare_tapes(resumed: ImageBuild, other: ImageBuild) -> list[str]:
 def run_resume(case_paths: list[pathlib.Path], out_path: pathlib.Path) -> dict[str, Any]:
     images: dict[str, ImageBuild] = {}
     cases: dict[str, Any] = {}
+    loaded = {path: load_resume_case(path) for path in case_paths}
     for path in sorted(case_paths, key=case_id_of):
-        case = load_json(path)
+        case = loaded[path]
         name = case["image"]
         if name not in images:
             images[name] = build_image(load_image_inputs(name), name)
@@ -6566,7 +6653,7 @@ class FaultMapError(Exception):
 
 # Every key a damage case's fault map may carry, at every level. Any other key
 # fails the run: an ignored key would decide a damaged tape as an intact one.
-FAULT_MAP_KEYS = {"failed_data_addresses", "hints", "image", "observations", "record_edits",
+FAULT_MAP_KEYS = {"failed_data_addresses", "hints", "image", "observations", "read_data_addresses", "record_edits",
                   "removed_filemark_after_tape_file", "unreadable_records"}
 FAULT_MAP_REQUIRED = {"failed_data_addresses", "image", "removed_filemark_after_tape_file", "unreadable_records"}
 HINT_KEYS = {"block_size", "scheme", "tape_uuid"}
@@ -6617,10 +6704,61 @@ def validate_fault_map(case: Any, where: str) -> None:
             _check_hints(observation["hints"], f"{where}.observations[{index}].hints")
     for index, item in enumerate(case["unreadable_records"]):
         _exact_keys(item, UNREADABLE_KEYS, UNREADABLE_KEYS, f"{where}.unreadable_records[{index}]")
-    for index, item in enumerate(case.get("record_edits", [])):
-        _exact_keys(item, RECORD_EDIT_KEYS, RECORD_EDIT_KEYS, f"{where}.record_edits[{index}]")
+    for key in ("failed_data_addresses", "read_data_addresses"):
+        for index, address in enumerate(case.get(key, [])):
+            if not (isinstance(address, list) and len(address) == 2 and all(is_uint(v) for v in address)):
+                raise FaultMapError(f"{where}.{key}[{index}]: expected a [tape_file, block] pair")
+    _check_record_edits(case.get("record_edits", []), where + ".record_edits")
+
+
+def _check_record_edits(edits: Any, where: str) -> None:
+    if not isinstance(edits, list):
+        raise FaultMapError(f"{where}: expected a list")
+    for index, item in enumerate(edits):
+        _exact_keys(item, RECORD_EDIT_KEYS, RECORD_EDIT_KEYS, f"{where}[{index}]")
         for position, edit in enumerate(item["edits"]):
-            _exact_keys(edit, BYTE_EDIT_KEYS, BYTE_EDIT_KEYS, f"{where}.record_edits[{index}].edits[{position}]")
+            _exact_keys(edit, BYTE_EDIT_KEYS, BYTE_EDIT_KEYS, f"{where}[{index}].edits[{position}]")
+
+
+# Every key a resume case's inputs may carry. `append_object` is needed only
+# by a case that reaches step 4; `tape_faults` damages the tape it re-reads.
+RESUME_KEYS = {"T", "W", "append_object", "committed_prefix", "image", "tape_faults"}
+RESUME_REQUIRED = {"T", "W", "committed_prefix", "image"}
+PREFIX_ENTRY_KEYS = {"block_count", "epoch_id", "first_parity_data_ordinal", "kind", "protected_ordinal_end_exclusive",
+                     "protected_ordinal_start", "tape_file_number"}
+TAPE_FAULT_KEYS = {"record_edits", "unreadable_records"}
+RESUME_UNREADABLE_KEYS = {"lba", "record_index", "tape_file"}
+APPEND_OBJECT_KEYS = {"files", "options"}
+APPEND_OPTION_KEYS = {"caller_object_id", "chunk_size", "encryption", "extensions", "manifest_file_id",
+                      "metadata_preservation", "object_id", "write_timestamp"}
+
+
+def validate_resume_case(case: Any, where: str) -> None:
+    """Refuse resume inputs with any key this Resumer does not know, at any level."""
+    _exact_keys(case, RESUME_KEYS, RESUME_REQUIRED, where)
+    if not isinstance(case["committed_prefix"], list):
+        raise FaultMapError(f"{where}.committed_prefix: expected a list")
+    for index, entry in enumerate(case["committed_prefix"]):
+        _exact_keys(entry, PREFIX_ENTRY_KEYS, PREFIX_ENTRY_KEYS, f"{where}.committed_prefix[{index}]")
+    if "append_object" in case:
+        _exact_keys(case["append_object"], APPEND_OBJECT_KEYS, APPEND_OBJECT_KEYS, f"{where}.append_object")
+        _exact_keys(case["append_object"]["options"], APPEND_OPTION_KEYS, APPEND_OPTION_KEYS,
+                    f"{where}.append_object.options")
+        if case["append_object"]["files"]:
+            raise FaultMapError(f"{where}.append_object.files: this Resumer knows only an Object with no files")
+    if "tape_faults" in case:
+        faults = case["tape_faults"]
+        _exact_keys(faults, TAPE_FAULT_KEYS, TAPE_FAULT_KEYS, f"{where}.tape_faults")
+        for index, item in enumerate(faults["unreadable_records"]):
+            _exact_keys(item, RESUME_UNREADABLE_KEYS, RESUME_UNREADABLE_KEYS,
+                        f"{where}.tape_faults.unreadable_records[{index}]")
+        _check_record_edits(faults["record_edits"], f"{where}.tape_faults.record_edits")
+
+
+def load_resume_case(path: pathlib.Path) -> dict[str, Any]:
+    case = load_json(path)
+    validate_resume_case(case, str(path))
+    return case
 
 
 def load_fault_map(path: pathlib.Path) -> dict[str, Any]:
@@ -7081,7 +7219,11 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                     component = (f"parity shard epoch {index['epoch_id']} stripe {key[0]} parity index {key[1]} "
                                  f"(LBA {start + block})")
                     try:
-                        if crc64_xz(tape.read_data(start + block)) != index["parity_crcs"][key]:
+                        shard = tape.read_data(start + block)
+                        if len(shard) != block_size:
+                            add(component, f"a {len(shard)}-byte record, not one block (a read failure, Sections 3.5 "
+                                "and 13.4)", None, "data", address)
+                        elif crc64_xz(shard) != index["parity_crcs"][key]:
                             add(component, "CRC mismatch (an erasure, Section 13.4)", None, "data", address)
                     except MediumError:
                         add(component, "unreadable (medium error)", "TapeIo", "data", address)
@@ -7113,6 +7255,10 @@ def verifier_prefix_findings(tape: DamagedTape, entries: list[MapEntry], scope: 
                 data = tape.read_data(start + block)
             except MediumError:
                 add(component, "unreadable (medium error)", "TapeIo", "data", address)
+                continue
+            if len(data) != block_size:
+                add(component, f"a {len(data)}-byte record, not one block (a read failure, Sections 3.5 and 13.4)",
+                    None, "data", address)
                 continue
             if covering[0].tape_file_number in indexes:
                 index = indexes[covering[0].tape_file_number]
@@ -7153,11 +7299,8 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         verifier = decision["verifier"]
         verifier.update(result="error", error=error)
         verifier["citations"].extend([cite("verifier_role")] + [cite(key) for key in error_cites])
-        if case.get("failed_data_addresses"):
-            decision["recoverer"]["addresses"] = [
-                {"address": list(a), "epoch": None, "result": "not_run", "error": None, "stripe": None,
-                 "lost": None, "limit": None, "bytes_match": None, "citations": [cite("recoverer_inputs")]}
-                for a in case["failed_data_addresses"]]
+        if recovery_requests(case):
+            decision["recoverer"]["addresses"] = not_run_outcomes(recovery_requests(case))
         return decision
 
     # ----- Scanner: terminal discovery and authoritative selection -----
@@ -7288,17 +7431,15 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         trace["directory"] = "final ParityMap found by the walk"
         context = RecoveryContext(tape, tape_uuid, block_size, scheme, walk_map["entries"], parity_map["scope"],
                                   parity_map["watermark"], directory, "walk")
-    if case.get("failed_data_addresses"):
+    requests = recovery_requests(case)
+    if requests:
         if context is None:
             recoverer["result"] = "not_run"
-            recoverer["addresses"] = [
-                {"address": list(a), "epoch": None, "result": "not_run", "error": None, "stripe": None,
-                 "lost": None, "limit": None, "bytes_match": None, "citations": [cite("recoverer_inputs")]}
-                for a in case["failed_data_addresses"]]
+            recoverer["addresses"] = not_run_outcomes(requests)
         else:
             recoverer["result"] = "run"
-            for address in case["failed_data_addresses"]:
-                outcome = recover_address(context, address)
+            for address, kind in requests:
+                outcome = recover_address(context, address) if kind is None else read_address(context, address)
                 trace.setdefault("recoveries", []).append(
                     {key: value for key, value in outcome.items() if key not in ("citations", "_block")})
                 recoverer["addresses"].append(outcome)
@@ -7421,7 +7562,7 @@ def reporting_only(decision: dict[str, Any], image: ImageBuild, trace: dict[str,
     """Compute bytes_match and inventory_equals_true_prefix after every decision is made."""
     for outcome in decision["recoverer"]["addresses"]:
         block = outcome.pop("_block", None)
-        if outcome["result"] == "recovered" and block is not None:
+        if outcome["result"] in ("recovered", "read") and block is not None:
             tape_file, block_index = outcome["address"]
             outcome["bytes_match"] = block == image.files[tape_file].blocks[block_index]
         for extra in ("index_acquisition", "peers"):
@@ -8818,7 +8959,11 @@ def main(argv: list[str] | None = None) -> int:
         print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())
         return 0
     if args.command == "resume":
-        output = run_resume(args.cases, args.out)
+        try:
+            output = run_resume(args.cases, args.out)
+        except FaultMapError as error:
+            print(f"error: resume input refused: {error}", file=sys.stderr)
+            return 2
         for case_id, decision in output["cases"].items():
             print(case_id, resume_summary(decision))
         print("sha256", hashlib.sha256(args.out.read_bytes()).hexdigest())

@@ -52,6 +52,10 @@ pub fn portable_input(id: &str, vector: &VectorImage) -> Value {
         "resume-boundary-read" => prefix[3].block_count = 3,
         "resume-noncontiguous-sidecars" => prefix[3].protected_ordinal_start = Some(5),
         "resume-nonconsecutive-epochs" => prefix[3].epoch_id = Some(2),
+        // Erratum set E2: the true committed prefix, with a tape fault (e2-05,
+        // e2-06), or the prefix through the final ParityMap (e2-07).
+        "e2-05" | "e2-06" => {}
+        "e2-07" => prefix.truncate(4),
         _ => panic!("unknown portable case {id}"),
     }
     let w = prefix
@@ -74,19 +78,62 @@ pub fn portable_input(id: &str, vector: &VectorImage) -> Value {
         "two-epoch"
     } else if matches!(
         id,
-        "resume-open" | "resume-final-object-not-at-t" | "resume-boundary-read"
+        "resume-open" | "resume-final-object-not-at-t" | "resume-boundary-read" | "e2-05" | "e2-06"
     ) {
         "unfinalized-open"
+    } else if id == "e2-07" {
+        "a4-minimal"
     } else {
         "unfinalized-closed"
     };
     let mut result = json!({"image":name,"committed_prefix":rows,"W":w,"T":t});
+    if let Some(fault) = frozen_case(id).and_then(|case| case.get("tape_fault").cloned()) {
+        result["tape_faults"] = resolve_tape_fault(id, &fault, vector);
+    }
     if matches!(id, "resume-closed" | "resume-open") {
         let mut appended = inputs(name);
         appended.objects = vec![object(2, if id == "resume-open" { 2 } else { 1 })];
         result["append_object"] = recipe(&appended)["objects"][0].clone();
     }
     result
+}
+
+fn frozen_case(id: &str) -> Option<Value> {
+    let source: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    source["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .cloned()
+}
+
+/// Resolve a case's tape fault against the image once: a record fault through
+/// the tape-image record-fault vocabulary (a record of a stated length, or byte
+/// edits), and a medium error by address. The model applies only this.
+fn resolve_tape_fault(id: &str, fault: &Value, vector: &VectorImage) -> Value {
+    for key in fault.as_object().expect("tape fault object").keys() {
+        assert!(
+            matches!(key.as_str(), "record_faults" | "unreadable_records"),
+            "{id}: unknown tape fault key {key}"
+        );
+    }
+    let record_edits = fault.get("record_faults").map_or(json!([]), |_| {
+        crate::tape_image_vectors::record_edits(&json!({"id": id, "fault": fault}), &vector.image)
+    });
+    let unreadable: Vec<_> = fault
+        .get("unreadable_records")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let file = &vector.image.files[r["tape_file"].as_u64().unwrap() as usize];
+            let index = r["record_index"].as_u64().unwrap() as usize;
+            assert!(index < file.record_offsets.len(), "{id}: unreadable record outside its file");
+            json!({"lba": file.start_record + index, "tape_file": r["tape_file"], "record_index": index})
+        })
+        .collect();
+    json!({"record_edits": record_edits, "unreadable_records": unreadable})
 }
 
 /// Encode v4 reference journal frames, including contradictory claims. This is
@@ -122,22 +169,35 @@ pub fn adapt(
             "Bootstrap" => (2, 1),
             "Object" => (0, 0),
             "ParitySidecar" => (1, 3),
+            // The final ParityMap commits in the reference's TerminalPrefix
+            // bundle, its hash the payload SHA-256 of its header.
+            "ParityMap" => (3, 5),
             other => panic!("unsupported resume row {other}"),
         };
         if let Some(first) = row["first_parity_data_ordinal"].as_u64() {
-            t = t.max(first + row["block_count"].as_u64().unwrap());
+            // A hostile claim whose end does not fit the journal's u64
+            // watermark leaves the watermark at the last claim that fits; the
+            // row's own block count is recorded unchanged. Honest claims
+            // always fit.
+            if let Some(end) = first.checked_add(row["block_count"].as_u64().unwrap()) {
+                t = t.max(end);
+            }
         }
         if let Some(end) = row["protected_ordinal_end_exclusive"].as_u64() {
             w = w.max(end);
         }
-        let hash = vector
-            .written
-            .sidecars
-            .iter()
-            .find(|s| s.tape_file_number == f)
-            .map_or(Cbor::Null, |s| {
-                Cbor::Bytes(s.canonical_metadata_hash.to_vec())
-            });
+        let hash = if kind == 3 {
+            Cbor::Bytes(vector.image.files[f as usize].bytes[0x38..0x58].to_vec())
+        } else {
+            vector
+                .written
+                .sidecars
+                .iter()
+                .find(|s| s.tape_file_number == f)
+                .map_or(Cbor::Null, |s| {
+                    Cbor::Bytes(s.canonical_metadata_hash.to_vec())
+                })
+        };
         let entry = Cbor::Map(vec![
             (uint(1), uint(f)),
             (uint(2), uint(kind)),
@@ -206,12 +266,20 @@ pub fn model(
     input: &Value,
 ) -> (DriveHandle, SharedVirtualWorld, FaultEngine) {
     let mut tape = VirtualTape::empty(64 * 1024 * 1024, BLOCK);
-    for file in &vector.image.files {
-        tape.records.extend(
-            file.bytes
-                .chunks_exact(BLOCK as usize)
-                .map(|b| Record::Block(b.to_vec())),
-        );
+    let edits = input["tape_faults"]["record_edits"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for (i, file) in vector.image.files.iter().enumerate() {
+        for (index, block) in file.bytes.chunks_exact(BLOCK as usize).enumerate() {
+            let edited = edits
+                .iter()
+                .find(|e| e["tape_file"] == json!(i) && e["record_index"] == json!(index));
+            tape.records.push(Record::Block(match edited {
+                Some(resolved) => crate::tape_image_vectors::apply_record_edits(block, resolved),
+                None => block.to_vec(),
+            }));
+        }
         if file.filemark_record.is_some() {
             tape.records.push(Record::Filemark);
         }
@@ -222,17 +290,29 @@ pub fn model(
         .iter()
         .map(|f| f.bytes.len() as u64)
         .sum();
-    let append: u64 = input["committed_prefix"]
+    // A hostile claim may describe an append point that does not fit; there is
+    // then no tail to guard, since the Resumer must refuse before any read.
+    let append = input["committed_prefix"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| e["block_count"].as_u64().unwrap() + 1)
-        .sum();
-    let lbas: Vec<_> = if input["append_object"].is_null() {
-        (append..=vector.image.eod_record as u64 + 16).collect()
-    } else {
-        vec![]
+        .try_fold(0u64, |acc, e| {
+            acc.checked_add(e["block_count"].as_u64().unwrap())?
+                .checked_add(1)
+        });
+    let mut lbas: Vec<_> = match append {
+        Some(append) if input["append_object"].is_null() => {
+            (append..=vector.image.eod_record as u64 + 16).collect()
+        }
+        _ => vec![],
     };
+    lbas.extend(
+        input["tape_faults"]["unreadable_records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| r["lba"].as_u64().unwrap()),
+    );
     let engine = FaultEngine::for_read_medium_errors(lbas).unwrap();
     let mut world = VirtualWorld::single_drive("RESUME-LIB", 0x100, "RESUME-DRV", 0x400, 1);
     world.put_tape_in_drive(0x100, "RESUME001", None, tape);
@@ -251,13 +331,27 @@ pub fn model(
     (drive, world, engine)
 }
 
-/// Record actual read addresses while delegating every operation to the drive.
+/// Record actual read and locate addresses while delegating every operation
+/// to the drive.
 struct ReadTrace<'a> {
     raw: DriveHandleRawSource<'a>,
     lbas: Vec<u64>,
+    locates: Vec<u64>,
+    end_of_data_locates: usize,
+}
+impl<'a> ReadTrace<'a> {
+    fn new(raw: DriveHandleRawSource<'a>) -> Self {
+        Self {
+            raw,
+            lbas: Vec::new(),
+            locates: Vec::new(),
+            end_of_data_locates: 0,
+        }
+    }
 }
 impl RawTapeSource for ReadTrace<'_> {
     fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.end_of_data_locates += 1;
         self.raw.locate_end_of_data()
     }
     fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
@@ -267,6 +361,7 @@ impl RawTapeSource for ReadTrace<'_> {
         self.raw.configure_fixed_block_size(size)
     }
     fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        self.locates.push(hint.lba);
         self.raw.locate_physical(hint)
     }
     fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
@@ -374,10 +469,7 @@ pub fn execute_positive(input: &Value, vector: &VectorImage) -> Result<Resumed, 
     let summary = checked_bounded_resume_summary(&snapshot).map_err(|e| e.to_string())?;
     let append = summary.append_position.lba;
     let (mut drive, world, _) = model(vector, input);
-    let mut trace = ReadTrace {
-        raw: DriveHandleRawSource::new(&mut drive),
-        lbas: Vec::new(),
-    };
+    let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive));
     let rebuild = rebuild_open_epoch_from_bounded_summary(
         &mut trace,
         &summary,
@@ -679,6 +771,321 @@ mod tests {
         println!("INFORMATIVE resume-open: {}", case["informative"]);
     }
 
+    /// SSC commands that write or erase the medium: WRITE(6), (10), (12),
+    /// (16), WRITE FILEMARKS(6), (16), ERASE(6), (16).
+    const WRITE_COMMANDS: &[u8] = &[0x0a, 0x2a, 0xaa, 0x8a, 0x10, 0x80, 0x19, 0x93];
+    /// Commands that read the medium or move it: READ(6), (10), (12), (16),
+    /// LOCATE(10), (16), SPACE(6), (16), REWIND, LOAD UNLOAD.
+    const READ_OR_POSITION_COMMANDS: &[u8] =
+        &[0x08, 0x28, 0xa8, 0x88, 0x2b, 0x92, 0x11, 0x91, 0x01, 0x1b];
+    /// Commands that neither read, write nor move the medium. A command in
+    /// none of the three sets fails the case, so the forbidden sets cannot be
+    /// passed by a command they forgot.
+    const STATIONARY_COMMANDS: &[u8] = &[
+        0x00, 0x03, 0x05, 0x12, 0x15, 0x55, 0x1a, 0x5a, 0x34, 0x4d, 0x16, 0x17, 0x5e, 0x5f, 0xa2,
+        0xb5, 0xa3, 0xa0,
+    ];
+
+    /// The E2 author's result vocabulary for a refused resume: the leading
+    /// clause of each result, the drive commands it forbids, and whether it
+    /// forbids positioning to the append point. An unknown clause fails the
+    /// case.
+    fn e2_forbidden_commands(id: &str, result: &str) -> (Vec<u8>, bool) {
+        if result.starts_with("refused before any re-read, positioning or write.") {
+            let mut any = WRITE_COMMANDS.to_vec();
+            any.extend_from_slice(READ_OR_POSITION_COMMANDS);
+            (any, true)
+        } else if result.starts_with("refused before positioning or writing") {
+            // Step 3's re-reads position to committed blocks; the clause
+            // forbids step 4's positioning to the append point.
+            (WRITE_COMMANDS.to_vec(), true)
+        } else {
+            panic!("{id}: no E2 vocabulary for result {result}")
+        }
+    }
+
+    #[test]
+    fn e2_command_sets_are_disjoint() {
+        for (index, op) in WRITE_COMMANDS
+            .iter()
+            .chain(READ_OR_POSITION_COMMANDS)
+            .chain(STATIONARY_COMMANDS)
+            .enumerate()
+        {
+            let all: Vec<_> = WRITE_COMMANDS
+                .iter()
+                .chain(READ_OR_POSITION_COMMANDS)
+                .chain(STATIONARY_COMMANDS)
+                .collect();
+            assert!(
+                !all[..index].contains(&op),
+                "opcode {op:#04x} is in two sets"
+            );
+        }
+    }
+
+    /// Erratum set E2's resume cases: a record of the wrong length where the
+    /// committed prefix places data (e2-05), a medium error there (e2-06), and
+    /// a committed prefix that records the final ParityMap (e2-07).
+    #[test]
+    fn resume_vectors_e2() {
+        let source: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+        let mut disagreements = Vec::new();
+        let mut ran = 0;
+        for case in source["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|c| c["erratum"] == "E2")
+        {
+            ran += 1;
+            let id = case["id"].as_str().unwrap();
+            let expected = &case["expected"];
+            for key in expected.as_object().unwrap().keys() {
+                assert!(
+                    matches!(key.as_str(), "result" | "error" | "sections" | "quotes"),
+                    "{id}: unknown E2 expectation key {key}"
+                );
+            }
+            for quote in expected["quotes"].as_array().unwrap() {
+                let quote = quote.as_str().unwrap();
+                assert!(
+                    crate::tape_image_vectors::specification_quote_holds(quote),
+                    "{id}: quote not in the specification: {quote}"
+                );
+            }
+            let (forbidden, no_append_positioning) =
+                e2_forbidden_commands(id, expected["result"].as_str().unwrap());
+            let vector = generate(case["image"].as_str().unwrap()).unwrap();
+            let input = recorded_input(id);
+            let temp = tempfile::tempdir().unwrap();
+            let (mut drive, world, engine) = model(&vector, &input);
+            let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive));
+            let mut append_lba = None;
+            let actual = (|| -> Result<(), ParityError> {
+                let journal = adapt(&input, &vector, &temp.path().join("resume.journal"))?;
+                let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;
+                let summary = checked_bounded_resume_summary(&snapshot)?;
+                append_lba = Some(summary.append_position.lba);
+                rebuild_open_epoch_from_bounded_summary(
+                    &mut trace,
+                    &summary,
+                    &vector.written.inputs.scheme,
+                    vector.written.inputs.tape_uuid,
+                    BLOCK,
+                )?;
+                Ok(())
+            })();
+            let commands: Vec<u8> = world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .map(|c| c.opcode)
+                .collect();
+            let unclassified: Vec<_> = commands
+                .iter()
+                .filter(|op| {
+                    !WRITE_COMMANDS.contains(op)
+                        && !READ_OR_POSITION_COMMANDS.contains(op)
+                        && !STATIONARY_COMMANDS.contains(op)
+                })
+                .collect();
+            assert!(
+                unclassified.is_empty(),
+                "{id}: unclassified drive commands {unclassified:02x?}"
+            );
+            let mut issued: Vec<String> = commands
+                .iter()
+                .filter(|op| forbidden.contains(op))
+                .map(|op| format!("{op:#04x}"))
+                .collect();
+            if no_append_positioning {
+                if let Some(lba) = append_lba.filter(|lba| trace.locates.contains(lba)) {
+                    issued.push(format!("locate to the append LBA {lba}"));
+                }
+                if trace.end_of_data_locates > 0 {
+                    issued.push("locate to end-of-data".into());
+                }
+            }
+            let observed = match &actual {
+                Ok(()) => "accepted".to_string(),
+                Err(ParityError::ResumeAppend(_)) => "ResumeAppend".into(),
+                Err(ParityError::TapeIo(_)) => "TapeIo".into(),
+                Err(other) => format!("{other:?}"),
+            };
+            let agrees = expected["error"] == observed.as_str() && issued.is_empty();
+            println!(
+                "{} {id}: expected {} ({}); observed {observed}; forbidden commands issued {issued:?}; reread_lbas={:?}; locate_lbas={:?}; append_lba={append_lba:?}; medium_error_lbas={:?}; detail={actual:?}",
+                if agrees { "PASS" } else { "DISAGREEMENT" },
+                expected["error"],
+                expected["result"].as_str().unwrap().split('.').next().unwrap(),
+                trace.lbas,
+                trace.locates,
+                engine.observed_medium_error_lbas()
+            );
+            if !agrees {
+                disagreements.push(format!(
+                    "{id}: expected {}; observed {observed}; issued {issued:?}",
+                    expected["error"]
+                ));
+            }
+            // The refusal must be the rule the case isolates, not a framing
+            // artifact of the reference adapter.
+            let detail = actual.err().map(|e| e.to_string()).unwrap_or_default();
+            let isolated = match id {
+                "e2-05" => detail.contains("is a 1000-byte record, not one 262144-byte block"),
+                "e2-06" => {
+                    engine.observed_medium_error_lbas().contains(&15)
+                        && trace.lbas.last() == Some(&15)
+                }
+                "e2-07" => detail.contains("finalization has begun"),
+                _ => panic!("{id}: no isolation check"),
+            };
+            assert!(
+                isolated,
+                "{id}: the refusal is not the case's rule: {detail}"
+            );
+        }
+        assert_eq!(ran, 3, "E2 resume cases");
+        assert!(disagreements.is_empty(), "{}", disagreements.join("\n"));
+    }
+
+    /// A drive whose LOCATE to one address fails, delegating every other
+    /// operation to the drive.
+    struct LocateFault<'a> {
+        trace: ReadTrace<'a>,
+        fail_at: u64,
+        error: fn() -> ParityError,
+    }
+    impl RawTapeSource for LocateFault<'_> {
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.trace.locate_end_of_data()
+        }
+        fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+            self.trace.space_filemarks(count)
+        }
+        fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+            self.trace.configure_fixed_block_size(size)
+        }
+        fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            if hint.lba == self.fail_at {
+                self.trace.locates.push(hint.lba);
+                return Err((self.error)());
+            }
+            self.trace.locate_physical(hint)
+        }
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            self.trace.read_record(buf)
+        }
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.trace.position()
+        }
+    }
+
+    fn locate_timeout() -> ParityError {
+        ParityError::TapeIo(remanence_library::TapeIoError::Transport(
+            remanence_library::scsi::ScsiError::InvalidInput("LOCATE timed out"),
+        ))
+    }
+
+    /// BLANK CHECK, end-of-data detected (sense 08/00/05): the drive found
+    /// end-of-data before the requested address.
+    fn locate_past_end_of_data() -> ParityError {
+        let mut sense = vec![0u8; 18];
+        sense[0] = 0x70;
+        sense[2] = 0x08;
+        sense[7] = 10;
+        sense[13] = 0x05;
+        ParityError::TapeIo(remanence_library::TapeIoError::CheckCondition(
+            remanence_library::scsi::ScsiError::CheckCondition {
+                sense,
+                bytes_transferred: 0,
+            },
+        ))
+    }
+
+    /// REM-PARITY 14 steps 3 and 4 and E-1, through the production Resumer on
+    /// resume-open: a LOCATE that fails during step 3's re-read of a committed
+    /// block, or while positioning to the append point, is a device failure
+    /// (TapeIo). Only the drive reporting end-of-data before a committed block
+    /// contradicts the commit record (ResumeAppend). Neither is followed by a
+    /// read of that block or by any write.
+    #[test]
+    fn resume_vectors_locate_failures_are_classified_by_cause() {
+        let vector = generate("unfinalized-open").unwrap();
+        let input = recorded_input("resume-open");
+        let run = |fail_at: Option<(u64, fn() -> ParityError)>| {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut drive, world, _) = model(&vector, &input);
+            let journal = adapt(&input, &vector, &temp.path().join("resume.journal")).unwrap();
+            let snapshot = resume_record_result(journal.committed_snapshot_bounded()).unwrap();
+            let summary = checked_bounded_resume_summary(&snapshot).unwrap();
+            let (fail_at, error) = fail_at.unwrap_or((u64::MAX, locate_timeout));
+            let mut source = LocateFault {
+                trace: ReadTrace::new(DriveHandleRawSource::new(&mut drive)),
+                fail_at,
+                error,
+            };
+            let result = rebuild_open_epoch_from_bounded_summary(
+                &mut source,
+                &summary,
+                &vector.written.inputs.scheme,
+                vector.written.inputs.tape_uuid,
+                BLOCK,
+            )
+            .map(|_| ());
+            let wrote = world
+                .lock()
+                .unwrap()
+                .command_log
+                .iter()
+                .any(|c| WRITE_COMMANDS.contains(&c.opcode));
+            (
+                result,
+                source.trace.locates,
+                source.trace.lbas,
+                summary.append_position.lba,
+                wrote,
+            )
+        };
+        let (result, locates, reads, append, wrote) = run(None);
+        result.expect("resume-open rebuilds without a fault");
+        assert!(!wrote);
+        assert_eq!(
+            locates.last(),
+            Some(&append),
+            "step 4 locates the append point"
+        );
+        let reread = locates[0];
+        assert_ne!(reread, append, "resume-open re-reads committed blocks");
+        assert_eq!(reads.first(), Some(&reread));
+
+        let (result, locates, reads, _, wrote) = run(Some((reread, locate_timeout)));
+        assert!(
+            matches!(result, Err(ParityError::TapeIo(_))),
+            "a LOCATE timeout during the re-read is a device failure: {result:?}"
+        );
+        assert_eq!(locates, vec![reread]);
+        assert!(reads.is_empty() && !wrote);
+
+        let (result, locates, reads, _, wrote) = run(Some((reread, locate_past_end_of_data)));
+        assert!(
+            matches!(&result, Err(ParityError::ResumeAppend(m)) if m.contains("past end-of-data")),
+            "end-of-data before a committed block contradicts the commit record: {result:?}"
+        );
+        assert_eq!(locates, vec![reread]);
+        assert!(reads.is_empty() && !wrote);
+
+        let (result, locates, _, append, wrote) = run(Some((append, locate_timeout)));
+        assert!(
+            matches!(result, Err(ParityError::TapeIo(_))),
+            "a LOCATE timeout at the append point is a device failure: {result:?}"
+        );
+        assert_eq!(locates.last(), Some(&append));
+        assert!(!wrote);
+    }
+
     #[test]
     fn resume_vectors_portable_refusals() {
         let source: Value = serde_json::from_str(EXPECTATIONS).unwrap();
@@ -694,10 +1101,7 @@ mod tests {
             let input = recorded_input(id);
             let temp = tempfile::tempdir().unwrap();
             let (mut drive, world, engine) = model(&vector, &input);
-            let mut trace = ReadTrace {
-                raw: DriveHandleRawSource::new(&mut drive),
-                lbas: Vec::new(),
-            };
+            let mut trace = ReadTrace::new(DriveHandleRawSource::new(&mut drive));
             let actual = (|| -> Result<(), ParityError> {
                 let journal = adapt(&input, &vector, &temp.path().join("resume.journal"))?;
                 let snapshot = resume_record_result(journal.committed_snapshot_bounded())?;

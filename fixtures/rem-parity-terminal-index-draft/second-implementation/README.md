@@ -83,7 +83,7 @@ as the repository lays them out), its directory's name. For each case it builds
 the named image, applies the case's faults, and then acts as a Reader.
 
 The fault reader knows these keys and no others: `image`,
-`failed_data_addresses`, `unreadable_records`,
+`failed_data_addresses`, `read_data_addresses`, `unreadable_records`,
 `removed_filemark_after_tape_file`, `record_edits`, and exactly one of
 `hints` or `observations`. It checks every level, including each hint,
 observation, record edit and byte edit. An unknown or missing key fails the
@@ -99,6 +99,13 @@ intact one.
   equal the stated one; otherwise the run fails. An edit whose reason says a
   CRC was recomputed is also checked against my own CRC, and the result is
   recorded, though it is not enforced.
+- `read_data_addresses` lists data addresses the Recoverer is asked to
+  read. Each block is read and judged as Section 13.4 judges a stripe
+  position. A read that succeeds, with a CRC that matches the sidecar index,
+  returns the block (`result` `read`). A read failure (a medium error, or a
+  record that is not one block long) or a CRC mismatch makes it a failed
+  block, which is recovered as a failed address is. Each such outcome has
+  `request: "read"` and the `read` it met (GAPS L-1).
 - `observations` lists separate decisions on the same damaged tape, each
   with its own `hints` (or `null` for none). The case's entry in the
   decision file then holds `image`, `record_edits` (the checks, per record)
@@ -112,11 +119,16 @@ It writes two files here:
 - `decisions-trace.json`, which records what the Reader read and why each
   step ended as it did.
 
-`resume` takes resume-case files. Each names an image, gives a committed
-prefix as Section 7.1 entries with its `W` and `T`, and gives an Object to
-append. For each case, the program acts as a Resumer under Section 14 on
-the undamaged image, treating the prefix as the off-tape commit authority.
-It writes `resume-decisions.json`; see "The resume schema" below.
+`resume` takes resume-case files. Each names an image and gives a committed
+prefix as Section 7.1 entries with its `W` and `T`. A case that reaches step
+4 also gives an Object to append (`append_object`). A case may damage the
+tape with `tape_faults`: `record_edits`, applied and checked as in `decide`,
+and `unreadable_records`, each a tape file, record index and LBA. For each
+case, the program acts as a Resumer under Section 14 on that tape, treating
+the prefix as the off-tape commit authority. Every key is checked, at every
+level. An unknown or missing key fails the run with exit status 2, and so
+does a case that reaches step 4 with no `append_object`. It writes
+`resume-decisions.json`; see "The resume schema" below.
 
 `negatives` takes a negative-case file. For each case and variant it does
 three things:
@@ -336,6 +348,7 @@ and a `cases` map keyed by case id. Every case has the same aspects:
 | `scheme` | `k`, `m`, `S` and their `source`, or nulls when step 2 refused before the scheme was needed |
 | `step2` | `result` (`pass`, `violation`, `undecided` or `not_run`), `violations`, `citations` |
 | `step3` | `result` (`run`, `fatal` or `not_run`), the `ordinals` re-read and their `lbas`, the `failure`, `citations` |
+| `tape_faults` | Present only when the case damages the tape: the record-edit checks and the unreadable LBAs |
 | `step4` | `result` (`run` or `not_run`), `append_point_lba`, `citations` |
 | `decision` | `result` (`accepted` or `refused`), `error` (a Section 15 name, or `undecided`), `refused_at`, `before_any_tape_read` (`true`, `false` or `undecided`), `before_any_write`, `records_read` (LBAs, in order), `citations` |
 | `append` | `null` for a refusal. Otherwise: `object_tape_file`, `object_first_lba`, `object_blocks`, `object_first_ordinal`, `object_row` (Section 10.3 keys as strings, byte strings as hex), `sidecars` (each with `tape_file`, `first_lba`, `epoch_id`, the protected range, `total_blocks` and `closed_by`), `tape_files` (every tape file of the resulting tape and `ALL`, in the `tape-images/MANIFEST.tsv` convention), `eod`, `uninterrupted_equal`, `uninterrupted_differences` and the `session_end_citations` |

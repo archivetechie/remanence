@@ -7,11 +7,11 @@
     "manifest": "tape-images/negatives/MANIFEST.tsv"
   },
   "counts": {
-    "matched": 341,
+    "matched": 350,
     "mismatched": 19,
     "missing_from_mine": 28,
-    "missing_from_manifest": 13,
-    "manifest_rows": 388,
+    "missing_from_manifest": 4,
+    "manifest_rows": 397,
     "emitted_blocks": 373
   },
   "entries": {
@@ -1535,10 +1535,11 @@
       "tape_file": 6,
       "block_within_file": 0,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "bd0f0bd4d7c2e3076742ac3327e071ab4ae3ecc3d8276b2f3809a2b4129b727e",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "bd0f0bd4d7c2e3076742ac3327e071ab4ae3ecc3d8276b2f3809a2b4129b727e"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1546,10 +1547,11 @@
       "tape_file": 6,
       "block_within_file": 1,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1557,10 +1559,11 @@
       "tape_file": 6,
       "block_within_file": 2,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "691aae9af60c6fa872c87eb01b0820f726dddb0678be3907f28a9956bc8ddaf2",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "691aae9af60c6fa872c87eb01b0820f726dddb0678be3907f28a9956bc8ddaf2"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1568,10 +1571,11 @@
       "tape_file": 8,
       "block_within_file": 0,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "43a581d7efe48130a487ef72ef1dc39cad02a83de051e3479caa03b60c8e3188",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "43a581d7efe48130a487ef72ef1dc39cad02a83de051e3479caa03b60c8e3188"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1579,10 +1583,11 @@
       "tape_file": 8,
       "block_within_file": 1,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1590,10 +1595,11 @@
       "tape_file": 8,
       "block_within_file": 2,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "9d901ca0963ccd2578f168b31dfda10ead1964dc6e62c8094fbf8ac075536457",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "9d901ca0963ccd2578f168b31dfda10ead1964dc6e62c8094fbf8ac075536457"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1601,10 +1607,11 @@
       "tape_file": 10,
       "block_within_file": 0,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "eed34d674d3ec166b66effbfd839f88d73914a50be82aaf911a220d68bc6882e",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "eed34d674d3ec166b66effbfd839f88d73914a50be82aaf911a220d68bc6882e"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1612,10 +1619,11 @@
       "tape_file": 10,
       "block_within_file": 1,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "c7ed0e0bf53080f236173aad3338ea7fb2f2d73238584e06c657a1f89b0abe0e"
     },
     {
       "case": "overflow-3.2-lba",
@@ -1623,10 +1631,11 @@
       "tape_file": 10,
       "block_within_file": 2,
       "entry": "neg-44",
-      "result": "missing_from_manifest",
+      "result": "matched",
       "bytes": 262144,
       "sha256": "9c65c0bca928057410b79fae3518d0013422574c16e3342396b8e964cc90d762",
-      "detail": "the manifest pins no block for this case"
+      "pinned_bytes": 262144,
+      "pinned_sha256": "9c65c0bca928057410b79fae3518d0013422574c16e3342396b8e964cc90d762"
     },
     {
       "case": "overflow-3.3-stripe-mapping-forward",

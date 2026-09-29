@@ -277,6 +277,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         check,
         &mut emitted,
     )?;
+    // Erratum set E2 overrides pinned expectations without editing the frozen
+    // sources; it also makes the cases it unblocks executable.
+    let erratum_bytes_e2 = fs::read(root.join("negatives/erratum-e2.json"))?;
+    let errata = negatives::erratum::parse(&erratum_bytes_e2)?;
+    artifact(
+        &root,
+        "negatives/erratum-e2.json",
+        &erratum_bytes_e2,
+        check,
+        &mut emitted,
+    )?;
     let negative_source = parsed_negatives;
     let mut negative_manifest =
         String::from("case\tartifact\ttape_file\tblock_within_file\tbytes\tsha256\n");
@@ -290,7 +301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             check,
             &mut emitted,
         )?;
-        if let Some(reason) = negatives::not_executable(case) {
+        if let Some(reason) = errata.not_executable(case) {
             println!("NOT-EXECUTABLE {path}: {reason}");
             continue;
         }
@@ -315,6 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         supplement_path.unwrap_or_else(|| root.join("negatives/negative-cases-supplement.json")),
     )?;
     let supplement = negatives::supplement::parse_source(&supplement_bytes)?;
+    errata.check_against_sources(&negative_source, &supplement)?;
     artifact(
         &root,
         "negatives/negative-cases-supplement.json",
@@ -409,11 +421,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "{}: all six image digests, {} damage descriptors and nine resume cases; all 7a/7b/7c negative descriptors, {} supplement variants and {} erratum E1 negative cases",
+        "{}: all six image digests, {} damage descriptors and {} resume cases; all 7a/7b/7c negative descriptors, {} supplement variants, {} erratum E1 negative cases and erratum E2's {} overrides",
         if check { "CHECK PASS" } else { "GENERATED" },
         source["cases"].as_array().unwrap().len(),
+        resume_source["cases"].as_array().unwrap().len(),
         supplement["variants"].as_array().unwrap().len(),
-        erratum["cases"].as_array().unwrap().len()
+        erratum["cases"].as_array().unwrap().len(),
+        errata
+            .entries
+            .iter()
+            .map(|e| e.observations.len())
+            .sum::<usize>()
     );
     Ok(())
 }

@@ -554,6 +554,259 @@
       }
     }
   },
+  "e2-01": {
+    "fault_notes": [
+      "record at LBA 2 (tape file 1 record 0) replaced: the first 1000 bytes of the original record, 1000 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          0
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 0,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ],
+        "request": "read",
+        "read": "read failure: a 1000-byte record at LBA 2, not one block (Sections 3.5 and 13.4)"
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "a 1000-byte record, not one block (a read failure, Sections 3.5 and 13.4)",
+        "error": null,
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
+  "e2-02": {
+    "fault_notes": [
+      "record at LBA 3 (tape file 1 record 1) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "directory": "final ParityMap validates",
+    "recoveries": [
+      {
+        "address": [
+          1,
+          1
+        ],
+        "epoch": 0,
+        "result": "recovered",
+        "error": null,
+        "stripe": 1,
+        "lost": null,
+        "limit": null,
+        "bytes_match": null,
+        "index_acquisition": "footer valid; primary copy used",
+        "peers": [
+          "erasure (the failed block)",
+          "trusted",
+          "trusted",
+          "trusted"
+        ],
+        "request": "read",
+        "read": "read failure: a 524288-byte record at LBA 3, not one block (Sections 3.5 and 13.4)"
+      }
+    ],
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "Object tape file 1 block 1 (LBA 3)",
+        "finding": "a 524288-byte record, not one block (a read failure, Sections 3.5 and 13.4)",
+        "error": null,
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 1
+        }
+      }
+    ]
+  },
+  "e2-03": {
+    "fault_notes": [
+      "record at LBA 37 (tape file 8 record 2) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 29 (replica ordinal 2)",
+    "directory": "final ParityMap validates",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "e2-04": {
+    "fault_notes": [
+      "record at LBA 2 (tape file 1 record 0) replaced: the original record followed by 262144 zero bytes, 524288 bytes, 0 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap validates",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 19); last block unreadable",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 27); last block unreadable",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 0,
+        "note": "Object candidate: head unreadable (medium error at LBA 35); last block unreadable",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "Object tape file 1 block 0 (LBA 2)",
+        "finding": "a 524288-byte record, not one block (a read failure, Sections 3.5 and 13.4)",
+        "error": null,
+        "checks": "data",
+        "address": {
+          "tape_file": 1,
+          "block": 0
+        }
+      }
+    ]
+  },
   "editions-conflict": {
     "fault_notes": [],
     "bootstrap_attempts": [

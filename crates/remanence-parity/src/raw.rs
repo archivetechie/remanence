@@ -55,6 +55,126 @@ pub fn tape_error_is_current_medium_damage(error: &TapeIoError) -> bool {
     }
 }
 
+/// A position that a device reports is the device's fact, not the tape's: when
+/// it does not fit in u64, or goes backwards, the device is at fault and the
+/// error is `TapeIo` (REM-PARITY 2.4). Every device-derived position and count
+/// that Layer 3c computes reports through this one constructor.
+pub(crate) fn device_position_error(detail: impl std::fmt::Display) -> ParityError {
+    ParityError::TapeIo(TapeIoError::OperationFailed(format!(
+        "device-reported position {detail}"
+    )))
+}
+
+/// The position `records` records after a device-reported position. A sum that
+/// does not fit in u64 is a device fault (REM-PARITY 2.4), never a saturated or
+/// wrapped position.
+pub(crate) fn device_position_after(
+    position: PhysicalPositionHint,
+    records: u64,
+    context: &'static str,
+) -> Result<PhysicalPositionHint, ParityError> {
+    let lba = position.lba.checked_add(records).ok_or_else(|| {
+        device_position_error(format_args!(
+            "{} + {records} does not fit in u64 ({context})",
+            position.lba
+        ))
+    })?;
+    Ok(PhysicalPositionHint {
+        lba,
+        partition: position.partition,
+    })
+}
+
+/// One fixed-block read as the Reader roles judge it (REM-PARITY 3.5).
+///
+/// A record shorter or longer than one block is a fact about the tape, not a
+/// failure of the device. The raw layer reports it with its measured length,
+/// as an outcome distinct from both boundary outcomes and from a transport or
+/// medium failure. Its caller decides what the record means for its component:
+/// an invalid candidate for a control component, or an erasure for the
+/// Recoverer. It is never `TapeIo`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedRecordRead {
+    /// Exactly one block filled the caller's buffer.
+    Block {
+        /// Physical position immediately after the record.
+        position_after: PhysicalPositionHint,
+    },
+    /// A record shorter or longer than one block.
+    WrongLength {
+        /// The record's measured length in bytes.
+        measured_bytes: u64,
+    },
+    /// A filemark was encountered and consumed.
+    Filemark {
+        /// Physical position immediately after the filemark.
+        position_after: PhysicalPositionHint,
+    },
+    /// End-of-data was encountered.
+    EndOfData {
+        /// Physical position at EOD.
+        position_after: PhysicalPositionHint,
+    },
+}
+
+/// Read one record and classify its length against the one-block buffer.
+pub fn read_fixed_record(
+    source: &mut dyn RawTapeSource,
+    buf: &mut [u8],
+) -> Result<FixedRecordRead, ParityError> {
+    let block_len = buf.len();
+    classify_fixed_record(source.read_record(buf), block_len)
+}
+
+/// The measured length of a record that is not one `block_len`-byte block,
+/// when the read found one (REM-PARITY 3.5): a delivered length other than
+/// `block_len`, or the drive's consumed over-length record
+/// (`ReadBufferTooSmall` whose `actual` is not `block_len`). `None` for one
+/// block, a boundary, or any other failure. A `ReadBufferTooSmall` whose
+/// `actual` is `block_len` reports a caller buffer smaller than one block, not
+/// a record of the wrong length. This is the one place the Reader roles judge
+/// a record's length.
+pub fn wrong_record_length(
+    read: &Result<RawReadOutcome, ParityError>,
+    block_len: usize,
+) -> Option<u64> {
+    match read {
+        // usize is at most 64 bits on every supported target, so the delivered
+        // length converts exactly.
+        Ok(RawReadOutcome::Block { bytes, .. }) if *bytes != block_len => Some(*bytes as u64),
+        Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { actual, .. }))
+            if *actual as usize != block_len =>
+        {
+            Some(u64::from(*actual))
+        }
+        _ => None,
+    }
+}
+
+/// Classify a completed raw read against one `block_len`-byte block. A record
+/// of the wrong length, judged by [`wrong_record_length`], is its own outcome;
+/// the leading bytes of an over-length record are never used. Every other
+/// error passes through unchanged.
+pub fn classify_fixed_record(
+    read: Result<RawReadOutcome, ParityError>,
+    block_len: usize,
+) -> Result<FixedRecordRead, ParityError> {
+    if let Some(measured_bytes) = wrong_record_length(&read, block_len) {
+        return Ok(FixedRecordRead::WrongLength { measured_bytes });
+    }
+    match read? {
+        RawReadOutcome::Block { position_after, .. } => {
+            Ok(FixedRecordRead::Block { position_after })
+        }
+        RawReadOutcome::Filemark { position_after } => {
+            Ok(FixedRecordRead::Filemark { position_after })
+        }
+        RawReadOutcome::EndOfData { position_after } => {
+            Ok(FixedRecordRead::EndOfData { position_after })
+        }
+    }
+}
+
 pub(crate) fn locate_physical_exact(
     source: &mut dyn RawTapeSource,
     hint: PhysicalPositionHint,
@@ -70,9 +190,11 @@ fn validate_locate_position(
     observed: PhysicalPositionHint,
     adapter: &'static str,
 ) -> Result<PhysicalPositionHint, ParityError> {
+    // A position reported after LOCATE is a device report: one that differs
+    // from the located position faults the device (REM-PARITY 2.4).
     if observed != expected {
-        return Err(ParityError::SessionOpen(format!(
-            "{adapter} locate returned partition {} lba {}, expected partition {} lba {}",
+        return Err(device_position_error(format_args!(
+            "after {adapter} locate is partition {} lba {}, expected partition {} lba {}",
             observed.partition, observed.lba, expected.partition, expected.lba
         )));
     }
@@ -746,7 +868,10 @@ impl RawTapeSource for BlockSourceRawTapeSource<'_> {
 
     fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
         let bytes = self.inner.read_block(buf)?;
-        self.cursor_hint.lba = self.cursor_hint.lba.saturating_add(1);
+        // The cursor follows the device's reported position; one past it must
+        // fit (REM-PARITY 2.4), never saturate.
+        self.cursor_hint =
+            device_position_after(self.cursor_hint, 1, "block-source adapter after a read")?;
         Ok(RawReadOutcome::Block {
             bytes,
             position_after: self.cursor_hint,
@@ -794,15 +919,8 @@ impl<'a> DriveHandleRawSource<'a> {
         &mut self,
         position_before: PhysicalPositionHint,
     ) -> Result<PhysicalPositionHint, ParityError> {
-        let position_after = PhysicalPositionHint {
-            lba: position_before
-                .lba
-                .checked_add(1)
-                .ok_or(ParityError::Invariant(
-                    "raw source physical position overflow after block read",
-                ))?,
-            partition: position_before.partition,
-        };
+        let position_after =
+            device_position_after(position_before, 1, "drive raw source after a block read")?;
         self.cursor_hint = Some(position_after);
         Ok(position_after)
     }
@@ -911,15 +1029,8 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
                 },
             ));
         }
-        let position_after = PhysicalPositionHint {
-            lba: position_before
-                .lba
-                .checked_add(1)
-                .ok_or(ParityError::Invariant(
-                    "raw sink physical position overflow after block write",
-                ))?,
-            partition: position_before.partition,
-        };
+        let position_after =
+            device_position_after(position_before, 1, "drive raw sink after a block write")?;
         self.cursor_hint = Some(position_after);
         Ok(raw_unpositioned_block_outcome(outcome, position_after))
     }
@@ -929,14 +1040,11 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
             let position_before = self.current_or_seed_position()?;
             self.drive.write_filemarks_immediate(count)?;
             RawWriteOutcome::WroteFilemark {
-                position_after: PhysicalPositionHint {
-                    lba: position_before.lba.checked_add(u64::from(count)).ok_or(
-                        ParityError::Invariant(
-                            "raw sink physical position overflow after immediate filemarks",
-                        ),
-                    )?,
-                    partition: position_before.partition,
-                },
+                position_after: device_position_after(
+                    position_before,
+                    u64::from(count),
+                    "drive raw sink after immediate filemarks",
+                )?,
                 early_warning: false,
                 end_of_medium: false,
             }
@@ -1069,6 +1177,12 @@ fn raw_filemark_outcome(outcome: WriteFilemarksOutcome) -> RawWriteOutcome {
 enum RawReadBoundary {
     Filemark,
     EndOfData,
+}
+
+/// Whether the drive reports end-of-data (BLANK CHECK, 08/00/05): for a
+/// LOCATE, the requested position lies past the recorded data.
+pub(crate) fn tape_error_is_end_of_data(err: &TapeIoError) -> bool {
+    classify_read_boundary(err) == Some(RawReadBoundary::EndOfData)
 }
 
 fn classify_read_boundary(err: &TapeIoError) -> Option<RawReadBoundary> {
@@ -2141,5 +2255,160 @@ mod tests {
     fn classify_read_boundary_rejects_medium_error() {
         let err = check_condition(fixed_sense(0x03, 0x11, 0x00));
         assert_eq!(classify_read_boundary(&err), None);
+    }
+}
+
+#[cfg(test)]
+mod record_length_tests {
+    use super::*;
+
+    #[test]
+    fn a_position_that_differs_after_locate_is_a_device_fault() {
+        let err = validate_locate_position(
+            PhysicalPositionHint::new(18),
+            PhysicalPositionHint::new(17),
+            "drive raw source",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParityError::TapeIo(_)), "{err:?}");
+        assert!(validate_locate_position(
+            PhysicalPositionHint::new(18),
+            PhysicalPositionHint::new(18),
+            "drive raw source",
+        )
+        .is_ok());
+    }
+
+    fn block(bytes: usize) -> Result<RawReadOutcome, ParityError> {
+        Ok(RawReadOutcome::Block {
+            bytes,
+            position_after: PhysicalPositionHint::new(8),
+        })
+    }
+
+    /// REM-PARITY 3.5: the raw layer reports a record of the wrong length, with
+    /// its measured length, as an outcome of its own, distinct from both
+    /// boundary outcomes and from a device failure.
+    #[test]
+    fn fixed_record_classification_reports_the_measured_length() {
+        let position = PhysicalPositionHint::new(8);
+        assert_eq!(
+            classify_fixed_record(block(512), 512).unwrap(),
+            FixedRecordRead::Block {
+                position_after: position
+            }
+        );
+        assert_eq!(
+            classify_fixed_record(block(40), 512).unwrap(),
+            FixedRecordRead::WrongLength { measured_bytes: 40 }
+        );
+        let longer = Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
+            actual: 1024,
+            provided: 512,
+        }));
+        assert_eq!(
+            classify_fixed_record(longer, 512).unwrap(),
+            FixedRecordRead::WrongLength {
+                measured_bytes: 1024
+            }
+        );
+        assert_eq!(
+            classify_fixed_record(
+                Ok(RawReadOutcome::Filemark {
+                    position_after: position
+                }),
+                512
+            )
+            .unwrap(),
+            FixedRecordRead::Filemark {
+                position_after: position
+            }
+        );
+        assert_eq!(
+            classify_fixed_record(
+                Ok(RawReadOutcome::EndOfData {
+                    position_after: position
+                }),
+                512
+            )
+            .unwrap(),
+            FixedRecordRead::EndOfData {
+                position_after: position
+            }
+        );
+        // A buffer smaller than the one-block record is the caller's error.
+        let small_buffer = Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall {
+            actual: 512,
+            provided: 256,
+        }));
+        assert!(matches!(
+            classify_fixed_record(small_buffer, 512),
+            Err(ParityError::TapeIo(TapeIoError::ReadBufferTooSmall { .. }))
+        ));
+        let transport = Err(ParityError::TapeIo(TapeIoError::OperationFailed(
+            "transport".into(),
+        )));
+        assert!(matches!(
+            classify_fixed_record(transport, 512),
+            Err(ParityError::TapeIo(TapeIoError::OperationFailed(_)))
+        ));
+    }
+
+    /// REM-PARITY 2.4: a device-reported position that does not fit is
+    /// `TapeIo`, never `Invariant`, never saturated.
+    #[test]
+    fn device_positions_that_do_not_fit_fault_the_device() {
+        let near_end = PhysicalPositionHint::new(u64::MAX);
+        let error = device_position_after(near_end, 1, "test").unwrap_err();
+        assert!(
+            matches!(error, ParityError::TapeIo(TapeIoError::OperationFailed(ref m)) if m.starts_with("device-reported position"))
+        );
+        assert_eq!(
+            device_position_after(PhysicalPositionHint::new(u64::MAX - 1), 1, "test").unwrap(),
+            PhysicalPositionHint::new(u64::MAX)
+        );
+    }
+
+    /// A block source whose device reports the last representable position.
+    struct AtLastPosition;
+    impl remanence_library::BlockRead for AtLastPosition {
+        fn read_block(&mut self, buf: &mut [u8]) -> Result<usize, TapeIoError> {
+            buf.fill(0);
+            Ok(buf.len())
+        }
+    }
+    impl BlockSource for AtLastPosition {
+        fn locate(&mut self, lba: u64) -> Result<TapePosition, TapeIoError> {
+            Ok(TapePosition {
+                lba,
+                partition: 0,
+                beginning_of_partition: lba == 0,
+                end_of_partition: false,
+                block_position_end_of_warning: false,
+            })
+        }
+        fn space(
+            &mut self,
+            _count: i64,
+            _kind: SpaceKind,
+        ) -> Result<remanence_library::SpaceResult, TapeIoError> {
+            Err(TapeIoError::OperationFailed("not used".into()))
+        }
+        fn position(&mut self) -> Result<TapePosition, TapeIoError> {
+            self.locate(u64::MAX)
+        }
+    }
+
+    /// The block-source adapter must not saturate its cursor (REM-PARITY 2.4).
+    #[test]
+    fn block_source_adapter_does_not_saturate_its_cursor() {
+        let mut inner = AtLastPosition;
+        let mut raw = BlockSourceRawTapeSource::new(&mut inner);
+        raw.locate_physical(PhysicalPositionHint::new(u64::MAX))
+            .expect("the device is at its last position");
+        let error = raw
+            .read_record(&mut [0; 4])
+            .expect_err("a position after u64::MAX does not fit");
+        assert!(matches!(error, ParityError::TapeIo(_)), "{error:?}");
     }
 }

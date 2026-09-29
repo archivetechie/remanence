@@ -1,0 +1,59 @@
+{
+  "artifact": "tape-image unfinalized-open",
+  "case": "overflow-3.2-14-append-point",
+  "edits": [],
+  "entry_points": [
+    "FileTapeFileJournal replay -> checked_bounded_resume_summary -> rebuild_open_epoch_from_bounded_summary"
+  ],
+  "injection": {
+    "commit_record_inputs": {
+      "T": 4,
+      "W": 4,
+      "committed_prefix": [
+        {
+          "block_count": 1,
+          "epoch_id": null,
+          "first_parity_data_ordinal": null,
+          "kind": "Bootstrap",
+          "physical_start_override": 0,
+          "protected_ordinal_end_exclusive": null,
+          "protected_ordinal_start": null,
+          "tape_file_number": 0
+        },
+        {
+          "block_count": 4,
+          "epoch_id": null,
+          "first_parity_data_ordinal": 0,
+          "kind": "Object",
+          "physical_start_override": 2,
+          "protected_ordinal_end_exclusive": null,
+          "protected_ordinal_start": null,
+          "tape_file_number": 1
+        },
+        {
+          "block_count": 7,
+          "epoch_id": 0,
+          "first_parity_data_ordinal": null,
+          "kind": "ParitySidecar",
+          "physical_start_override": 7,
+          "protected_ordinal_end_exclusive": 4,
+          "protected_ordinal_start": 0,
+          "tape_file_number": 2
+        },
+        {
+          "block_count": 18446744073709551615,
+          "epoch_id": null,
+          "first_parity_data_ordinal": 4,
+          "kind": "Object",
+          "physical_start_override": 15,
+          "protected_ordinal_end_exclusive": null,
+          "protected_ordinal_start": null,
+          "tape_file_number": 3
+        }
+      ],
+      "image": "unfinalized-open"
+    },
+    "framing": "the claimed T = 4 + (2^64 − 1) does not fit the reference journal's u64 watermark field, so the watermarks keep the last claims that fit (T = W = 4, the end of every claim before tape file 3); tape file 3's record keeps its claimed block count, and every row keeps its measured start, so the adapter does no arithmetic on the claimed count. The §14 step-2 bound T − W < S × k therefore passes, and the refusal is the commit record's own"
+  },
+  "target_role": "Resumer"
+}

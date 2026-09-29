@@ -264,7 +264,10 @@ fn check_layout(
 pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
     // No key of a case may be ignored silently. `sections`, `construction` and
     // `note` describe the case and are not read; `object_authority` names the
-    // one authority the executor supplies, which is none.
+    // one authority the executor supplies, which is none. `read_data_addresses`
+    // are Object addresses the Reader reads through the production object
+    // source, which meets the fault itself; `erratum` names the erratum set
+    // whose author wrote the case's expected outcome.
     for key in case.as_object().expect("case object").keys() {
         assert!(
             matches!(
@@ -280,10 +283,15 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
                     | "construction"
                     | "note"
                     | "object_authority"
+                    | "read_data_addresses"
+                    | "erratum"
             ),
             "{}: unknown case key {key}",
             case["id"]
         );
+    }
+    if let Some(erratum) = case.get("erratum") {
+        assert_eq!(erratum, "E2", "{}: erratum set", case["id"]);
     }
     if let Some(authority) = case.get("object_authority") {
         assert_eq!(
@@ -320,8 +328,14 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
             "all three replica header records; the sidecar's primary header and footer" |
             "all three replica header records; epoch 0 sidecar primary header, tail copy and footer" |
             "both ParityMap copies (tape file 3)" |
-            "both ParityMap copies; epoch 0 sidecar primary header and footer"
+            "both ParityMap copies; epoch 0 sidecar primary header and footer" |
+            "every record of all three terminal replicas"
         ), "unrecognized fault description: {description}");
+        if description == "every record of all three terminal replicas" {
+            for replica in [map_file + 1, map_file + 3, map_file + 5] {
+                lbas.extend(start(replica)..=last(replica));
+            }
+        }
         if description.contains("all three replica header") {
             lbas.extend([
                 start(map_file + 1),
@@ -364,6 +378,29 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
         json!({"lba": lba, "tape_file": f, "record_index": lba - file.start_record as u64, "filemark": file.filemark_record == Some(*lba as usize)})
     }).collect();
     let mut map = json!({"image": case["image"], "unreadable_records": records, "removed_filemark_after_tape_file": case["fault"]["removed_filemark_after_tape_file"], "failed_data_addresses": addresses});
+    if let Some(reads) = case.get("read_data_addresses") {
+        // The Reader meets the fault itself: these addresses are not made
+        // unreadable, and no recovery is invoked for them directly.
+        let reads = reads.as_array().expect("read_data_addresses is a list");
+        for pair in reads {
+            let pair = pair.as_array().expect("an address is a pair");
+            assert!(
+                pair.len() == 2 && pair.iter().all(Value::is_u64),
+                "{}: an address is (tape file, block within file)",
+                case["id"]
+            );
+            let (file, block) = (
+                pair[0].as_u64().unwrap() as usize,
+                pair[1].as_u64().unwrap(),
+            );
+            assert!(
+                (block as usize) < image.files[file].record_offsets.len(),
+                "{}: read address outside its tape file",
+                case["id"]
+            );
+        }
+        map["read_data_addresses"] = json!(reads);
+    }
     if let Some(faults) = case["fault"].get("record_faults") {
         assert!(faults.is_array(), "{}: record_faults is a list", case["id"]);
         map["record_edits"] = record_edits(case, image);
@@ -468,7 +505,7 @@ const BOOTSTRAP_PAYLOAD_START: usize = 0x38;
 ///   bootstrap's header CRC and payload CRC recomputed or left stale as stated.
 ///
 /// The executor applies only the resolved edits, checking each edit's old bytes.
-fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
+pub(crate) fn record_edits(case: &Value, image: &ExportedTapeImage) -> Value {
     const KEYS: [&str; 7] = [
         "tape_file",
         "record_index",
