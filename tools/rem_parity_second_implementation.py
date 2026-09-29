@@ -6715,11 +6715,20 @@ APPENDED_FILE_KEYS = {"records", "trailing_filemark"}
 # The keys of an appended record, by its source. A source this Reader does not
 # know fails the run, as an unknown key does.
 APPENDED_RECORD_KEYS = {
-    "foreign": {"first_byte", "length", "sha256", "source"},
+    "foreign": {"fill", "first_byte", "length", "sha256", "source"},
     "copy_of": {"length", "record_index", "sha256", "source", "tape_file"},
-    "second_edition_replica": {"length", "planned_start_lba", "planned_tape_file_number", "record_index", "sha256",
-                               "source"},
+    "second_edition_replica": {"base", "fields", "length", "planned_start_lba", "planned_tape_file_number",
+                               "record_index", "role", "sha256", "source"},
 }
+FOREIGN_FILL = "first_byte, then zeros to the stated length"
+BASE_KEYS = {"record_index", "tape_file"}
+FIELD_KEYS = {"hex", "length", "offset"}
+REPLICA_KEYS = {"base", "base_edition_sequence", "edition_id", "edition_sequence", "expected_eod_lba",
+                "footer_record_index", "header_record_index", "payload_record_index", "planned_layout",
+                "planned_start_lba", "planned_tape_file_number", "replica", "replica_ordinal"}
+REPLICA_BASE_KEYS = {"meaning", "tape_file"}
+LAYOUT_ITEM_KEYS = {"filemark_count", "kind", "kind_name", "ordinal", "planned_start_lba", "planned_tape_file_number",
+                    "record_count"}
 
 
 HEX_DIGITS = set("0123456789abcdefABCDEF")
@@ -6793,7 +6802,14 @@ def _check_appended_files(files: Any, where: str) -> None:
     if not isinstance(files, list):
         raise FaultMapError(f"{where}: expected a list")
     for index, item in enumerate(files):
-        _exact_keys(item, APPENDED_FILE_KEYS, APPENDED_FILE_KEYS, f"{where}[{index}]")
+        _exact_keys(item, APPENDED_FILE_KEYS | {"replica"}, APPENDED_FILE_KEYS, f"{where}[{index}]")
+        replica = item.get("replica")
+        if replica is not None:
+            here = f"{where}[{index}].replica"
+            _exact_keys(replica, REPLICA_KEYS, REPLICA_KEYS, here)
+            _exact_keys(replica["base"], REPLICA_BASE_KEYS, REPLICA_BASE_KEYS, here + ".base")
+            for position, entry in enumerate(replica["planned_layout"]):
+                _exact_keys(entry, LAYOUT_ITEM_KEYS, LAYOUT_ITEM_KEYS, f"{here}.planned_layout[{position}]")
         if not isinstance(item["trailing_filemark"], bool):
             raise FaultMapError(f"{where}[{index}].trailing_filemark: expected true or false")
         if not isinstance(item["records"], list) or not item["records"]:
@@ -6808,10 +6824,24 @@ def _check_appended_files(files: Any, where: str) -> None:
                 raise FaultMapError(f"{here}.length: expected a positive integer")
             if not (isinstance(record["sha256"], str) and len(record["sha256"]) == 64 and set(record["sha256"]) <= HEX_DIGITS):
                 raise FaultMapError(f"{here}.sha256: expected 64 hex digits")
-            if record["source"] == "foreign" and not (
-                    isinstance(record["first_byte"], str) and len(record["first_byte"]) == 2
-                    and set(record["first_byte"]) <= HEX_DIGITS):
-                raise FaultMapError(f"{here}.first_byte: expected one byte as two hex digits")
+            if record["source"] == "foreign":
+                if not (isinstance(record["first_byte"], str) and len(record["first_byte"]) == 2
+                        and set(record["first_byte"]) <= HEX_DIGITS):
+                    raise FaultMapError(f"{here}.first_byte: expected one byte as two hex digits")
+                if record["fill"] != FOREIGN_FILL:
+                    raise FaultMapError(f"{here}.fill: {record['fill']!r} is not a fill this Reader knows")
+            if record["source"] == "second_edition_replica":
+                _exact_keys(record["base"], BASE_KEYS, BASE_KEYS, here + ".base")
+                if not isinstance(record["fields"], dict):
+                    raise FaultMapError(f"{here}.fields: expected an object")
+                for name, field in record["fields"].items():
+                    _exact_keys(field, FIELD_KEYS, FIELD_KEYS, f"{here}.fields.{name}")
+                    if not (is_uint(field["offset"]) and is_uint(field["length"])
+                            and isinstance(field["hex"], str) and set(field["hex"]) <= HEX_DIGITS
+                            and len(field["hex"]) == 2 * field["length"]):
+                        raise FaultMapError(f"{here}.fields.{name}: offset, length and hex must agree")
+                if record["role"] not in ("header", "payload", "footer"):
+                    raise FaultMapError(f"{here}.role: expected header, payload or footer")
 
 
 def _check_record_edits(edits: Any, where: str) -> None:
@@ -6995,10 +7025,9 @@ def _appended_record(image: ImageBuild, record: Mapping[str, Any], records: list
     """
     source, length = record["source"], record["length"]
     if source == "foreign":
-        # The file states only the first byte; the rest is taken as zeros, the
-        # simplest reading, and the stated SHA-256 is checked against it.
+        # `fill` says: the stated first byte, then zeros to the stated length.
         data = bytes.fromhex(record["first_byte"]) + bytes(length - 1)
-        note = "first byte as stated, the rest zeros"
+        note = "first byte as stated, the rest zeros (as `fill` states)"
     elif source == "copy_of":
         tape_file, record_index = record["tape_file"], record["record_index"]
         if not (0 <= tape_file < len(image.files)) or not (0 <= record_index < len(image.files[tape_file].blocks)):
@@ -7008,14 +7037,71 @@ def _appended_record(image: ImageBuild, record: Mapping[str, Any], records: list
         if len(data) != length:
             raise FaultMapError(f"{where}: the copied record is {len(data)} bytes, the case states {length}")
     else:
-        # A replica "of a second edition" planned at the stated file and LBA.
-        # Its ordinal, planned layout and digests are not stated, so its
-        # bytes cannot be derived; the stated SHA-256 is all there is.
-        return None, "bytes not derivable from the file and the text (GAPS.md)"
+        # A record of a second-edition replica: my build of the same-indexed
+        # record of the stated tape file, with only the listed fields replaced.
+        base = record["base"]
+        if not (0 <= base["tape_file"] < len(image.files)) or not (
+                0 <= base["record_index"] < len(image.files[base["tape_file"]].blocks)):
+            raise FaultMapError(f"{where}: tape file {base['tape_file']} has no data record {base['record_index']}")
+        buffer = bytearray(image.files[base["tape_file"]].blocks[base["record_index"]])
+        if len(buffer) != length:
+            raise FaultMapError(f"{where}: the base record is {len(buffer)} bytes, the case states {length}")
+        for name, field in record["fields"].items():
+            end = field["offset"] + field["length"]
+            if end > len(buffer):
+                raise FaultMapError(f"{where}.fields.{name}: runs past the record")
+            buffer[field["offset"]:end] = bytes.fromhex(field["hex"])
+        data = bytes(buffer)
+        note = (f"my build of tape file {base['tape_file']} record {base['record_index']} with {len(record['fields'])} "
+                f"stated field(s) replaced ({record['role']})")
     digest = hashlib.sha256(data).hexdigest()
     if digest != record["sha256"]:
         raise FaultMapError(f"{where}: my {source} record's SHA-256 is {digest}, the case states {record['sha256']}")
     return data, note
+
+
+def _check_replica_key(image: ImageBuild, item: Mapping[str, Any], records: list[Any], first: int,
+                       where: str) -> list[str]:
+    """Cross-check an appended file's `replica` key against the records built from it.
+
+    The planned layout tuples (Section 8.3), the edition ID and sequence, the
+    planned position and the expected EOD must agree with the header and
+    footer built from the record fields. My own frame CRCs and the footer's
+    header hash are compared and reported, not enforced.
+    """
+    replica = item["replica"]
+    notes = []
+    layout = replica["planned_layout"]
+    tuples = b"".join(component_tuple(e["kind"], e["ordinal"], e["planned_tape_file_number"], e["planned_start_lba"],
+                                      e["record_count"]) for e in layout)
+    header_index, footer_index = replica["header_record_index"], replica["footer_record_index"]
+    header, footer = records[first + header_index], records[first + footer_index]
+    problems = []
+    for name, record in (("header", header), ("footer", footer)):
+        if record[0x148:0x1E8] != tuples:
+            problems.append(f"{name}'s five planned tuples differ from the stated layout")
+        if record[0x20:0x30] != bytes.fromhex(replica["edition_id"]):
+            problems.append(f"{name}'s edition ID differs from the stated one")
+        if rd64(record, 0x30) != replica["edition_sequence"]:
+            problems.append(f"{name}'s edition sequence differs from the stated one")
+        if rd64(record, 0x088) != replica["planned_tape_file_number"] or rd64(record, 0x090) != replica["planned_start_lba"]:
+            problems.append(f"{name}'s planned position differs from the stated one")
+        if rd64(record, 0x0A0) != replica["expected_eod_lba"]:
+            problems.append(f"{name}'s planned EOD differs from the stated one")
+        if record[0x0A:0x0C] != le16(1 if name == "header" else 2):
+            problems.append(f"{name}'s role differs")
+    base = image.files[replica["base"]["tape_file"]].blocks[header_index]
+    if rd64(base, 0x30) != replica["base_edition_sequence"]:
+        problems.append("the base replica's edition sequence differs from the stated one")
+    if problems:
+        raise FaultMapError(f"{where}: " + "; ".join(problems))
+    notes.append(f"{where}: the layout tuples, edition, planned position and EOD agree with the built header and footer")
+    for name, record in (("header", header), ("footer", footer)):
+        notes.append(f"{where}: {name} frame CRC " + ("agrees with mine" if crc64_xz(record[:0x3F8]) == rd64(record, 0x3F8)
+                                                      else "differs from mine"))
+    notes.append(f"{where}: footer's header-record SHA-256 " + ("agrees with mine" if footer[0x2B8:0x2D8] == digest(header)
+                                                                else "differs from mine"))
+    return notes
 
 
 def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[DamagedTape, list[str]]:
@@ -7076,6 +7162,8 @@ def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[Damage
             origin.append(None)
             notes.append(f"appended file {index} record {position} at LBA {len(records) - 1}: {record['source']}, "
                          f"{record['length']} bytes, {note}")
+        if item.get("replica") is not None:
+            notes.extend(_check_replica_key(image, item, records, first, f"{where}.replica"))
         if item["trailing_filemark"]:
             records.append(None)
             origin.append(None)

@@ -118,13 +118,17 @@ and record) is a position of the undamaged image.
   lists its records and says whether a trailing filemark follows (`false` ends
   the tape in the file's last record). A record's `source` says how its bytes
   are built:
-  - `foreign`: the stated first byte, then zeros (GAPS M-3). Its SHA-256 is
-    checked.
+  - `foreign`: the stated first byte, then zeros, as its `fill` states (the
+    `fill` must be that sentence). Its SHA-256 is checked.
   - `copy_of`: my build of the stated record of the stated tape file. Its
     SHA-256 is checked.
-  - `second_edition_replica`: bytes this Reader cannot derive from the file
-    and the text (GAPS M-4). The record is never read: a decision that needs its
-    bytes is `undecided`.
+  - `second_edition_replica`: my build of the same-indexed record of the
+    stated `base` tape file, with each entry of `fields` (offset, length, hex)
+    written over it. Its SHA-256 is checked. A file-level `replica` key
+    (ordinal, edition, planned position and EOD, the five layout tuples, the
+    record indexes) is cross-checked against the built header and footer, and
+    my own frame CRCs and the footer's header hash are compared and reported.
+
 - `read_data_addresses` lists data addresses the Recoverer is asked to
   read. Each block is read and judged as Section 13.4 judges a stripe
   position. A read that succeeds, with a CRC that matches the sidecar index,
@@ -370,9 +374,8 @@ the outcome for each case: a Scanner's degraded flag is `per reads`, with
 payload and for one that does not (Section 12.6).
 
 A decision that needs a record whose bytes the case states but the file and the
-text do not determine (`second_edition_replica`) is `undecided`, with the
-readings. Only the observations that read that record are undecided; the walk
-is decided wherever it never reads it (GAPS M-4).
+text do not determine is `undecided`, with the readings (the mechanism stays;
+no case in the set now needs it, GAPS M-4).
 
 ## How the Resumer works
 

@@ -14833,25 +14833,25 @@
         ]
       },
       "scanner": {
-        "result": "undecided",
+        "result": "BotStructuralRecoveryRequired",
         "error": null,
         "acceptable_selections": [],
         "degraded": null,
         "replicas": {
           "A": {
-            "valid": "undecided",
-            "reason": "the record at LBA 40, which the Scanner reads first when it spaces back from EOD, is not derivable"
+            "valid": false,
+            "reason": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
           },
           "B": {
-            "valid": "undecided",
-            "reason": "the record at LBA 40, which the Scanner reads first when it spaces back from EOD, is not derivable"
+            "valid": false,
+            "reason": "TapeIo: LBA 46: expected a data block, found end of data"
           },
           "C": {
-            "valid": "undecided",
-            "reason": "the record at LBA 40, which the Scanner reads first when it spaces back from EOD, is not derivable"
+            "valid": false,
+            "reason": "TapeIo: LBA 54: expected a data block, found end of data"
           }
         },
-        "inventory_equals_true_prefix": null,
+        "inventory_equals_true_prefix": true,
         "citations": [
           {
             "section": "8.4",
@@ -14863,15 +14863,11 @@
           },
           {
             "section": "8.4",
-            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
           },
           {
-            "section": "8.4",
-            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
-          },
-          {
-            "section": "8.4",
-            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+            "section": "10.6",
+            "quote": "The declared locations, the counts, and the trailing filemark agree with the device's measurements."
           },
           {
             "section": "8.4",
@@ -14929,7 +14925,6 @@
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
         ],
-        "note": "performed only if no replica validates, which the Scanner's undecided outcome leaves open; the classification below is a function of the tape and holds either way",
         "map": {
           "produced": true,
           "validated": true
@@ -14940,11 +14935,11 @@
         "addresses": []
       },
       "verifier": {
-        "result": "undecided",
+        "result": "recovery_required",
         "error": null,
         "separations": {
-          "A-B": "undecided",
-          "B-C": "undecided"
+          "A-B": "invalid",
+          "B-C": "invalid"
         },
         "citations": [
           {
@@ -14954,52 +14949,26 @@
           {
             "section": "8.5",
             "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
           }
         ]
       },
-      "undecided": [
-        {
-          "aspect": "scanner",
-          "readings": [
-            "the record at LBA 40 parses as a replica footer, records its own position (LBA 40) and plans an EOD at or after the tape's EOD (42): it supplies the layout, and the Scanner validates the replicas that layout plans; the outcome then depends on the rest of that footer, which the case does not state",
-            "the record at LBA 40 does not parse, records another position, or plans an EOD before 42: the footers of the tape's own replicas plan an EOD before 42, so no footer supplies a layout, no replica validates, and the Scanner returns BotStructuralRecoveryRequired"
-          ],
-          "citations": [
-            {
-              "section": "8.4",
-              "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
-            },
-            {
-              "section": "8.4",
-              "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
-            },
-            {
-              "section": "8.4",
-              "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
-            },
-            {
-              "section": "8.4",
-              "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
-            }
-          ]
-        },
-        {
-          "aspect": "verifier",
-          "readings": [
-            "the terminal suffix is complete, degraded, an error or recovery-required as the Scanner's outcome (undecided above) falls: the Verifier's terminal checks begin with the Scanner's"
-          ],
-          "citations": [
-            {
-              "section": "2.2",
-              "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
-            },
-            {
-              "section": "8.5",
-              "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
-            }
-          ]
-        }
-      ],
+      "undecided": [],
       "verifier-full": {
         "citations": [
           {
@@ -15013,6 +14982,14 @@
           {
             "section": "2.2",
             "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "12.6",
+            "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
           }
         ],
         "data_blocks_failed": [],
@@ -15026,13 +15003,49 @@
           "parity_shards_read_but_not_checkable": 0,
           "parity_shards_not_locatable": 0
         },
-        "other_findings": [],
+        "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": "TerminalIndexReplicaParse",
+            "finding": "payload: TerminalIndexReplicaParse: covered count, structural_row_count and A's tape-file number differ"
+          },
+          {
+            "component": "terminal replica B",
+            "error": "TerminalIndexReplicaParse",
+            "finding": "TapeIo: LBA 46: expected a data block, found end of data"
+          },
+          {
+            "component": "terminal replica C",
+            "error": "TerminalIndexReplicaParse",
+            "finding": "TapeIo: LBA 54: expected a data block, found end of data"
+          },
+          {
+            "component": "separation extent A-B",
+            "error": "TerminalIndexSeparationParse",
+            "finding": "TapeIo: LBA 42: expected a data block, found end of data"
+          },
+          {
+            "component": "separation extent B-C",
+            "error": "TerminalIndexSeparationParse",
+            "finding": "TapeIo: LBA 50: expected a data block, found end of data"
+          },
+          {
+            "component": "tape",
+            "error": null,
+            "finding": "EOD at LBA 42 is not the planned EOD immediately after C's trailing filemark"
+          }
+        ],
         "terminal_suffix": {
-          "complete": "undecided",
+          "complete": false,
           "reasons": [
-            "the Scanner's terminal discovery is undecided, so the Verifier's terminal checks are"
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid",
+            "separation extent A-B is invalid",
+            "separation extent B-C is invalid",
+            "EOD is not where the plan puts it"
           ],
-          "replicas_valid": "undecided"
+          "replicas_valid": []
         }
       }
     }

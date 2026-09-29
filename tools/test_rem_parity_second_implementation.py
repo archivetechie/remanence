@@ -1196,7 +1196,8 @@ class InsertionAndAppendTests(unittest.TestCase):
 
     def foreign(self, length=262144):
         data = b"X" + bytes(length - 1)
-        return {"first_byte": "58", "length": length, "sha256": hashlib.sha256(data).hexdigest(), "source": "foreign"}
+        return {"fill": impl.FOREIGN_FILL, "first_byte": "58", "length": length,
+                "sha256": hashlib.sha256(data).hexdigest(), "source": "foreign"}
 
     def run_case(self, name, case):
         path = self.dir / f"{name}.json"
@@ -1255,16 +1256,6 @@ class InsertionAndAppendTests(unittest.TestCase):
         tape, _ = impl.damaged_tape_for(self.image, self.base(appended_files=[{"records": [copy_of], "trailing_filemark": True}]))
         self.assertEqual(tape.read(len(self.image.records())), record)
 
-    def test_a_record_whose_bytes_cannot_be_derived_is_not_read(self) -> None:
-        # GAPS: a second-edition replica's ordinal, layout and digests are not stated.
-        replica = {"length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9, "record_index": 0,
-                   "sha256": "00" * 32, "source": "second_edition_replica"}
-        case = self.base(appended_files=[{"records": [replica], "trailing_filemark": True}])
-        tape, _ = impl.damaged_tape_for(self.image, case)
-        self.assertEqual(tape.underivable, {len(self.image.records())})
-        with self.assertRaises(impl.Underivable):
-            tape.read(len(self.image.records()))
-
     def test_spacing_back_from_eod_crosses_records_to_the_nearest_filemark(self) -> None:
         # 8.4 step 1: a tape whose last file lacks its filemark still spaces back over one filemark,
         # crossing the records after it, and reads the record before it.
@@ -1298,28 +1289,70 @@ class InsertionAndAppendTests(unittest.TestCase):
         decision = self.run_case("broken", case)
         self.assertEqual(decision["walk"]["classes"]["8"], "Object")
 
-    def test_a_record_the_scanner_reads_first_and_cannot_derive_leaves_it_undecided(self) -> None:
-        replica = {"length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9, "record_index": 0,
-                   "sha256": "00" * 32, "source": "second_edition_replica"}
-        case = self.base(appended_files=[{"records": [replica], "trailing_filemark": True}])
-        decision = self.run_case("underivable", case)
-        self.assertEqual((decision["scanner"]["result"], decision["verifier"]["result"]), ("undecided", "undecided"))
-        self.assertEqual(decision["verifier-full"]["terminal_suffix"]["complete"], "undecided")
-        self.assertEqual(sorted(u["aspect"] for u in decision["undecided"]), ["scanner", "verifier"])
-        # A file whose head the walk must read, and cannot derive, has no classification: the walk's result is undecided.
-        self.assertEqual((decision["walk"]["classes"]["9"], decision["walk"]["result"]), ("undecided", "undecided"))
 
-    def test_a_walk_that_never_reads_the_underivable_records_is_decided(self) -> None:
-        # The file's head is C's own header; its count already differs from the plan (12.3 item 2), so the file keeps
-        # its control type, damaged, whatever the underivable records hold.
-        records = [{"length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9, "record_index": index,
-                    "sha256": "00" * 32, "source": "second_edition_replica"} for index in range(3)]
-        case = self.base(appended_files=[{"records": records, "trailing_filemark": True}],
-                         removed_filemark_after_tape_file=8)
-        decision = self.run_case("merged", case)
-        self.assertEqual(decision["scanner"]["result"], "undecided")
-        self.assertEqual(decision["walk"]["classes"]["8"], "TapeIndexReplica")
-        self.assertEqual(decision["walk"]["result"], "run")
+    def second_edition(self):
+        """A second-edition replica built as e3-07 states it: base record 0/1/2 of tape file 4, fields replaced."""
+        base = self.image.files[4].blocks
+        edition_id = bytes([0x55] * 16)
+        layout = [(4, 1, 9, 38, 3), (5, 1, 10, 42, 3), (4, 2, 11, 46, 3), (5, 2, 12, 50, 3), (4, 3, 13, 54, 3)]
+        tuples = b"".join(impl.component_tuple(*t) for t in layout)
+        header = bytearray(base[0])
+        footer = bytearray(base[2])
+        for record in (header, footer):
+            record[0x20:0x30] = edition_id
+            record[0x30:0x38] = impl.le64(8)
+            record[0x88:0x90] = impl.le64(9)
+            record[0x90:0x98] = impl.le64(38)
+            record[0xA0:0xA8] = impl.le64(58)
+            record[0x148:0x1E8] = tuples
+        fields = lambda record, names: {n: {"hex": bytes(record[o:o + l]).hex(), "length": l, "offset": o}
+                                        for n, (o, l) in names.items()}
+        names = {"edition_id": (0x20, 16), "edition_sequence": (0x30, 8), "planned_tape_file_number": (0x88, 8),
+                 "planned_start_lba": (0x90, 8), "expected_eod_lba": (0xA0, 8), "planned_layout_components": (0x148, 160)}
+        records = []
+        for index, (role, record) in enumerate((("header", header), ("payload", bytearray(base[1])), ("footer", footer))):
+            records.append({"base": {"record_index": index, "tape_file": 4},
+                            "fields": fields(record, names) if role != "payload" else {},
+                            "length": 262144, "planned_start_lba": 38, "planned_tape_file_number": 9,
+                            "record_index": index, "role": role, "sha256": hashlib.sha256(bytes(record)).hexdigest(),
+                            "source": "second_edition_replica"})
+        replica = {"base": {"meaning": "replica A", "tape_file": 4}, "base_edition_sequence": 7,
+                   "edition_id": edition_id.hex(), "edition_sequence": 8, "expected_eod_lba": 58,
+                   "footer_record_index": 2, "header_record_index": 0, "payload_record_index": 1,
+                   "planned_layout": [{"filemark_count": 1, "kind": k, "kind_name": "x", "ordinal": o,
+                                       "planned_start_lba": st, "planned_tape_file_number": tf, "record_count": c}
+                                      for k, o, tf, st, c in layout],
+                   "planned_start_lba": 38, "planned_tape_file_number": 9, "replica": "A", "replica_ordinal": 1}
+        return {"records": records, "replica": replica, "trailing_filemark": True}
+
+    def test_a_second_edition_replica_is_built_from_its_fields_and_checked(self) -> None:
+        # The frame CRC is not among these fields, so the digests here are of records built with stale CRCs;
+        # the stated SHA-256 is of whatever the fields yield, and a wrong digest is refused.
+        appended = self.second_edition()
+        case = self.base(appended_files=[appended], removed_filemark_after_tape_file=8)
+        # the test's records carry the base CRC, so the reported comparison says so and the run still proceeds
+        tape, notes = impl.damaged_tape_for(self.image, case)
+        self.assertTrue(any("header frame CRC differs from mine" in n for n in notes))
+        self.assertEqual(tape.underivable, set())
+        bad = copy.deepcopy(appended)
+        bad["records"][0]["sha256"] = "00" * 32
+        with self.assertRaises(impl.FaultMapError):
+            impl.damaged_tape_for(self.image, self.base(appended_files=[bad], removed_filemark_after_tape_file=8))
+        wrong = copy.deepcopy(appended)
+        wrong["replica"]["edition_sequence"] = 9
+        with self.assertRaises(impl.FaultMapError):
+            impl.damaged_tape_for(self.image, self.base(appended_files=[wrong], removed_filemark_after_tape_file=8))
+
+    def test_a_second_edition_replica_with_stale_footer_fields_supplies_no_layout(self) -> None:
+        # 8.4: a footer supplies a layout only "when its recorded footer position equals the position at which it was read".
+        case = self.base(appended_files=[self.second_edition()], removed_filemark_after_tape_file=8)
+        decision = self.run_case("second-edition", case)
+        self.assertEqual(decision["scanner"]["result"], "BotStructuralRecoveryRequired")
+
+    def test_an_unreadable_underivable_position_is_not_read(self) -> None:
+        tape = impl.DamagedTape([b"x", None], set(), {0})
+        with self.assertRaises(impl.Underivable):
+            tape.read(0)
 
 
 class FullVerificationTests(unittest.TestCase):
