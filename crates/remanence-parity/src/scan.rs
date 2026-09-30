@@ -448,6 +448,8 @@ pub struct ScanBootstrapCandidate {
     pub tape_file_number: u64,
     /// Fully parsed bootstrap payload.
     pub payload: BootstrapPayload,
+    /// Nonzero trailing fill: accepted by Readers, reported only by Verifiers.
+    pub nonzero_fill: bool,
 }
 
 /// Scanner-observed physical damage or bootstrap validation failure.
@@ -787,12 +789,35 @@ pub fn scan_reconstruct_filemark_map_with_control_mode<F>(
 where
     F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
 {
-    match scan_reconstruct_filemark_map_with_provenance(
+    scan_with_bootstrap_observer(
         source,
         tape_uuid,
         block_size,
         mode,
         &mut control,
+        &mut |_| {},
+    )
+}
+
+/// Expose bootstrap evidence as it is classified, including when a later read fails.
+pub(crate) fn scan_with_bootstrap_observer<F>(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+    control: &mut F,
+    bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
+) -> Result<ControlledScanWalkOutcome, ParityError>
+where
+    F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
+{
+    match scan_reconstruct_filemark_map_with_provenance(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        control,
+        bootstrap_observer,
     )? {
         ScanReconstructionOutcome::Complete(mut reconstructed) => {
             let final_parity_map =
@@ -898,6 +923,7 @@ fn scan_reconstruct_filemark_map_with_provenance<F>(
     block_size: u32,
     mode: ScanMode<'_>,
     control: &mut F,
+    bootstrap_observer: &mut dyn FnMut(&ScanBootstrapCandidate),
 ) -> Result<ScanReconstructionOutcome, ParityError>
 where
     F: FnMut(&ScanWalkProgress) -> ScanWalkControl,
@@ -1036,6 +1062,7 @@ where
                     measured.block_count,
                     &mut damaged_regions,
                 )? {
+                    bootstrap_observer(&candidate);
                     bootstrap_candidates.push(candidate);
                 }
                 source.locate_physical(measured.position_after)?;
@@ -1299,8 +1326,8 @@ fn append_classified_entry(
         return Ok(None);
     }
     if builder.next_tape_file_number()? == 0 && file_start.lba == 0 && has_bootstrap_magic(block0) {
-        match parse_bootstrap_block(block0) {
-            Ok(payload) => {
+        match crate::bootstrap::parse_bootstrap_block_with_fill(block0) {
+            Ok((payload, nonzero_fill)) => {
                 if payload.block_size_bytes == block_size && payload.tape_uuid == *tape_uuid {
                     if block_count != 1 {
                         note_count_mismatch(damaged_regions);
@@ -1312,6 +1339,7 @@ fn append_classified_entry(
                     return Ok(Some(ScanBootstrapCandidate {
                         tape_file_number,
                         payload,
+                        nonzero_fill,
                     }));
                 }
             }
@@ -2103,6 +2131,7 @@ mod tests {
                 BLOCK_SIZE,
                 ScanMode::Standard,
                 &mut |_| ScanWalkControl::Continue,
+                &mut |_| {},
             )
             .unwrap()
         else {
@@ -2639,7 +2668,8 @@ mod tests {
                 &TAPE_UUID,
                 BLOCK_SIZE,
                 ScanMode::Standard,
-                &mut { control }
+                &mut { control },
+                &mut |_| {},
             )
             .unwrap(),
             ScanReconstructionOutcome::Aborted(_)

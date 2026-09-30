@@ -289,6 +289,13 @@ pub fn write_bootstrap_block(
 /// - [`ParityError::BootstrapParse`] on unsupported schema
 ///   version, malformed CBOR, or missing required fields.
 pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError> {
+    parse_bootstrap_block_with_fill(buf).map(|(payload, _)| payload)
+}
+
+/// Parse once and retain §8.1 fill evidence without making it an acceptance rule.
+pub(crate) fn parse_bootstrap_block_with_fill(
+    buf: &[u8],
+) -> Result<(BootstrapPayload, bool), ParityError> {
     if buf.len() < BOOTSTRAP_HEADER_LEN + BOOTSTRAP_PAYLOAD_CRC_LEN {
         return Err(ParityError::BootstrapParse(format!(
             "buffer too short: got {} bytes, need at least {}",
@@ -383,17 +390,20 @@ pub fn parse_bootstrap_block(buf: &[u8]) -> Result<BootstrapPayload, ParityError
             .map_err(|message| ParityError::BootstrapParse(message.to_string()))?;
     }
 
-    Ok(BootstrapPayload {
-        scheme: decoded.scheme_record,
-        no_parity_flag: no_parity,
-        filemark_map_digest: decoded.filemark_map_digest,
-        tape_uuid,
-        written_by_version: decoded.written_by_version,
-        written_at: decoded.written_at,
-        sequence,
-        block_size_bytes,
-        drive_compression: decoded.drive_compression,
-    })
+    Ok((
+        BootstrapPayload {
+            scheme: decoded.scheme_record,
+            no_parity_flag: no_parity,
+            filemark_map_digest: decoded.filemark_map_digest,
+            tape_uuid,
+            written_by_version: decoded.written_by_version,
+            written_at: decoded.written_at,
+            sequence,
+            block_size_bytes,
+            drive_compression: decoded.drive_compression,
+        },
+        buf[crc_end..].iter().any(|byte| *byte != 0),
+    ))
 }
 
 fn validate_sole_bot_map_digest(digest: &FilemarkMapDigest) -> Result<(), &'static str> {

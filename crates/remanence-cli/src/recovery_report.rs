@@ -12,13 +12,13 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use remanence_aead::{KeyFrame, RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 use remanence_parity::{
-    bootstrap::discover_bootstrap_with_recovery_hints, read_terminal_index_inventory,
+    bootstrap::discover_bootstrap_with_recovery_hints, read_terminal_index_inventory_streamed,
     scan_reconstruct_filemark_map_with_report_mode, FilemarkMap, FixedRecordRead,
     ImageDirectoryRawSource, ObjectRecoveryRepresentation, ParityError, RawTapeSource,
     ScanDamageKind, ScanDamagedRegion, ScanMode, ScanRecoveryHints, ScanTailTruncation,
     ScanTailTruncationKind, TapeFileKind, TapeFileMapEntry, TapeFilePosition,
     TapeIndexReplicaFileKind, TapeIndexReplicaMapEntry, TapeIndexReplicaObjectRow,
-    TerminalInventoryOutcome,
+    TerminalInventoryOutcome, TerminalInventoryStreamEvent,
 };
 use serde::{Serialize, Serializer};
 use serde_json::Value;
@@ -324,31 +324,31 @@ fn build_recovery_report(
     let mode = scan_hints
         .as_ref()
         .map_or(ScanMode::Standard, ScanMode::Recovery);
-    let scan = scan_reconstruct_filemark_map_with_report_mode(source, &tape_uuid, block_size, mode)
-        .map_err(|error| format!("scan filemark map: {error}"))?;
-    let bootstrap_treated_as_unreadable = scan.bootstrap_recovery_hints.is_some();
-    // A retry in the structural walk can recover a bootstrap that discovery
-    // could not read. Preserve that validated evidence in the report as well.
-    let first_bootstrap = first_bootstrap.or_else(|| {
-        scan.authoritative_bootstrap()
-            .map(|candidate| candidate.payload.clone())
-    });
+    // Like the API inventory path, discover and stream terminal authority first.
+    // A surviving replica needs no BOT walk (which can fail on a BOT filemark).
+    let mut bootstrap_treated_as_unreadable = first_bootstrap.is_none();
+    let mut first_bootstrap = first_bootstrap;
     let mut terminal_entries = Vec::new();
     let mut terminal_rows = Vec::new();
-    let inventory = read_terminal_index_inventory(
-        source,
-        &tape_uuid,
-        block_size,
-        |entry| {
-            terminal_entries.push(entry.clone());
+    let inventory =
+        read_terminal_index_inventory_streamed(source, &tape_uuid, block_size, |event| {
+            match event {
+                TerminalInventoryStreamEvent::ReplicaAttemptStarted { .. } => {
+                    terminal_entries.clear();
+                    terminal_rows.clear();
+                }
+                TerminalInventoryStreamEvent::StructuralEntry { entry, .. } => {
+                    terminal_entries.push(entry)
+                }
+                TerminalInventoryStreamEvent::ObjectRow { row, .. } => terminal_rows.push(row),
+                TerminalInventoryStreamEvent::ReplicaAttemptRejected { .. } => {
+                    terminal_entries.clear();
+                    terminal_rows.clear();
+                }
+            }
             Ok(())
-        },
-        |row| {
-            terminal_rows.push(row.clone());
-            Ok(())
-        },
-    )
-    .map_err(|error| format!("read terminal tape index: {error}"))?;
+        })
+        .map_err(|error| format!("read terminal tape index: {error}"))?;
     let recovered = match inventory {
         TerminalInventoryOutcome::Inventory(selection) => {
             let map = FilemarkMap::new(
@@ -367,20 +367,34 @@ fn build_recovery_report(
                     .map(|bootstrap| bootstrap.sequence),
                 overlay_source: selected_terminal_replica_name(selection.selected_replica_ordinal),
                 terminal_authority: true,
+                damaged_regions: Vec::new(),
+                truncation: None,
+            }
+        }
+        TerminalInventoryOutcome::BotStructuralRecoveryRequired(_) => {
+            let scan = scan_reconstruct_filemark_map_with_report_mode(
+                source, &tape_uuid, block_size, mode,
+            )
+            .map_err(|error| format!("scan filemark map: {error}"))?;
+            bootstrap_treated_as_unreadable = scan.bootstrap_recovery_hints.is_some();
+            // A retry during the fallback walk may recover bootstrap evidence.
+            first_bootstrap = first_bootstrap.or_else(|| {
+                scan.authoritative_bootstrap()
+                    .map(|candidate| candidate.payload.clone())
+            });
+            RecoveredMap {
+                scope_tape_file_count: scan.map.tape_file_count(),
+                map: scan.map,
+                object_rows: Vec::new(),
+                bootstrap_generation_used: first_bootstrap
+                    .as_ref()
+                    .map(|bootstrap| bootstrap.sequence),
+                overlay_source: "structural_walk_no_terminal_authority",
+                terminal_authority: false,
                 damaged_regions: scan.damaged_regions,
                 truncation: scan.truncation,
             }
         }
-        TerminalInventoryOutcome::BotStructuralRecoveryRequired(_) => RecoveredMap {
-            scope_tape_file_count: scan.map.tape_file_count(),
-            map: scan.map,
-            object_rows: Vec::new(),
-            bootstrap_generation_used: first_bootstrap.as_ref().map(|bootstrap| bootstrap.sequence),
-            overlay_source: "structural_walk_no_terminal_authority",
-            terminal_authority: false,
-            damaged_regions: scan.damaged_regions,
-            truncation: scan.truncation,
-        },
     };
 
     let mut totals = RecoveryTotals {
@@ -1359,6 +1373,97 @@ mod tests {
         }
     }
 
+    /// A filemark at BOT must not prevent the same fast inventory the API obtains.
+    #[test]
+    fn recovery_report_bot_filemark_with_hints_matches_api_inventory() {
+        // Replace the image's BOT block by a filemark without shifting the
+        // terminal records' physical addresses.
+        struct BotFilemark(ImageDirectoryRawSource);
+        impl RawTapeSource for BotFilemark {
+            fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+                self.0.configure_fixed_block_size(size)
+            }
+            fn locate_physical(
+                &mut self,
+                hint: remanence_parity::PhysicalPositionHint,
+            ) -> Result<(), ParityError> {
+                self.0.locate_physical(hint)
+            }
+            fn locate_end_of_data(
+                &mut self,
+            ) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+                self.0.locate_end_of_data()
+            }
+            fn space_filemarks(
+                &mut self,
+                count: i64,
+            ) -> Result<remanence_parity::SpaceFilemarksOutcome, ParityError> {
+                self.0.space_filemarks(count)
+            }
+            fn position(&mut self) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+                self.0.position()
+            }
+            fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+                let bot = self.0.position()?.lba == 0;
+                let outcome = self.0.read_record(buf)?;
+                if bot {
+                    Ok(RawReadOutcome::Filemark {
+                        position_after: self.0.position()?,
+                    })
+                } else {
+                    Ok(outcome)
+                }
+            }
+        }
+        let files = plaintext_image(false);
+        let mut source = BotFilemark(
+            ImageDirectoryRawSource::from_tape_files(files, BLOCK_SIZE).expect("image"),
+        );
+        let mut api_rows = Vec::new();
+        let api =
+            read_terminal_index_inventory_streamed(&mut source, &TAPE_UUID, BLOCK_SIZE, |event| {
+                match event {
+                    TerminalInventoryStreamEvent::ReplicaAttemptStarted { .. } => api_rows.clear(),
+                    TerminalInventoryStreamEvent::ObjectRow { row, .. } => api_rows.push(row),
+                    _ => {}
+                }
+                Ok(())
+            })
+            .expect("API library entry accepts BOT filemark");
+        let TerminalInventoryOutcome::Inventory(selection) = api else {
+            panic!("terminal inventory survives BOT filemark");
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let exit = run_raw_recovery_report(
+            &mut source,
+            &[BLOCK_SIZE],
+            Some(RecoveryHints {
+                tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                block_size_bytes: BLOCK_SIZE,
+                scheme: "none".to_string(),
+            }),
+            true,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(exit, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+        assert!(err.is_empty());
+        let report: Value = serde_json::from_slice(&out).expect("CLI JSON report");
+        assert_eq!(
+            report["scan"]["overlay_source"],
+            selected_terminal_replica_name(selection.selected_replica_ordinal)
+        );
+        assert_eq!(report["scan"]["bootstrap_treated_as_unreadable"], true);
+        assert_eq!(report["scan"]["identity_and_geometry_from_hints"], true);
+        assert_eq!(report["objects"].as_array().unwrap().len(), api_rows.len());
+        assert_eq!(report["totals"]["verified"], "1");
+        assert_eq!(
+            report["objects"][0]["object_id"],
+            String::from_utf8(api_rows[0].object_id.clone()).unwrap()
+        );
+    }
+
     /// Physical BOT read damage also uses supplied authority without inventing bootstrap evidence.
     #[test]
     fn recovery_report_medium_error_at_bootstrap_uses_hints() {
@@ -1381,7 +1486,8 @@ mod tests {
         assert_eq!(report.totals.verified, 1);
         assert!(report.tape_uuid.is_none());
         assert!(report.scan.bootstrap_generation_used.is_none());
-        assert_eq!(report.scan.damaged_regions.len(), 1);
+        // Fast terminal inventory does not walk the damaged prefix.
+        assert!(report.scan.damaged_regions.is_empty());
         let mut human = Vec::new();
         print_human_report(&report, &mut human).expect("human report");
         let human = String::from_utf8(human).expect("UTF-8 report");
@@ -1456,52 +1562,87 @@ mod tests {
         assert_eq!(report["scan"]["identity_and_geometry_from_hints"], false);
     }
 
-    /// A readable bootstrap found on the walk takes precedence after failed probes.
+    struct FailedProbes {
+        inner: ImageDirectoryRawSource,
+        probes_left: usize,
+        fail_after_discovery: bool,
+    }
+    impl RawTapeSource for FailedProbes {
+        fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+            self.inner.configure_fixed_block_size(size)
+        }
+        fn locate_physical(
+            &mut self,
+            hint: remanence_parity::PhysicalPositionHint,
+        ) -> Result<(), ParityError> {
+            self.inner.locate_physical(hint)
+        }
+        fn locate_end_of_data(
+            &mut self,
+        ) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+            self.inner.locate_end_of_data()
+        }
+        fn space_filemarks(
+            &mut self,
+            count: i64,
+        ) -> Result<remanence_parity::SpaceFilemarksOutcome, ParityError> {
+            self.inner.space_filemarks(count)
+        }
+        fn position(&mut self) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
+            self.inner.position()
+        }
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            if self.fail_after_discovery && self.probes_left == 0 {
+                self.inner.mark_unreadable(0, 0).expect("BOT exists");
+            }
+            let outcome = self.inner.read_record(buf)?;
+            if self.probes_left > 0 {
+                self.probes_left -= 1;
+                if !self.fail_after_discovery {
+                    buf.fill(0);
+                }
+            }
+            Ok(outcome)
+        }
+    }
+
+    /// With no terminal tail, the fallback walk recovers BOT evidence missed by discovery.
     #[test]
-    fn recovery_report_keeps_bootstrap_evidence_recovered_during_scan() {
-        struct FailedProbes {
-            inner: ImageDirectoryRawSource,
-            probes_left: usize,
-            fail_after_discovery: bool,
-        }
-        impl RawTapeSource for FailedProbes {
-            fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
-                self.inner.configure_fixed_block_size(size)
-            }
-            fn locate_physical(
-                &mut self,
-                hint: remanence_parity::PhysicalPositionHint,
-            ) -> Result<(), ParityError> {
-                self.inner.locate_physical(hint)
-            }
-            fn locate_end_of_data(
-                &mut self,
-            ) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
-                self.inner.locate_end_of_data()
-            }
-            fn space_filemarks(
-                &mut self,
-                count: i64,
-            ) -> Result<remanence_parity::SpaceFilemarksOutcome, ParityError> {
-                self.inner.space_filemarks(count)
-            }
-            fn position(&mut self) -> Result<remanence_parity::PhysicalPositionHint, ParityError> {
-                self.inner.position()
-            }
-            fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
-                if self.fail_after_discovery && self.probes_left == 0 {
-                    self.inner.mark_unreadable(0, 0).expect("BOT exists");
-                }
-                let outcome = self.inner.read_record(buf)?;
-                if self.probes_left > 0 {
-                    self.probes_left -= 1;
-                    if !self.fail_after_discovery {
-                        buf.fill(0);
-                    }
-                }
-                Ok(outcome)
-            }
-        }
+    fn recovery_report_fallback_walk_recovers_bootstrap_on_retry() {
+        let mut files = plaintext_image(false);
+        files.truncate(2); // Keep only BOT and the Object: terminal discovery must fail.
+        let temp = write_image_directory(&files);
+        let mut source = FailedProbes {
+            inner: ImageDirectoryRawSource::open(temp.path()).expect("image"),
+            probes_left: 2,
+            fail_after_discovery: false,
+        };
+        let report = build_recovery_report(
+            &mut source,
+            &[BLOCK_SIZE],
+            Some(RecoveryHints {
+                tape_uuid: uuid::Uuid::from_bytes(TAPE_UUID).to_string(),
+                block_size_bytes: BLOCK_SIZE,
+                scheme: "none".to_string(),
+            }),
+        )
+        .expect("fallback walk recovers the bootstrap");
+        assert_eq!(source.probes_left, 0);
+        assert_eq!(
+            report.scan.overlay_source,
+            "structural_walk_no_terminal_authority"
+        );
+        assert_eq!(report.tape_uuid, Some(hex(&TAPE_UUID)));
+        assert_eq!(report.block_size_bytes, Some(BLOCK_SIZE));
+        assert_eq!(report.scan.bootstrap_generation_used, Some(0));
+        assert!(!report.scan.bootstrap_treated_as_unreadable);
+        assert!(!report.scan.identity_and_geometry_from_hints);
+        assert_eq!(report.totals.objects_seen, 1);
+    }
+
+    /// Fast inventory preserves only bootstrap evidence from discovery; it does not retry BOT.
+    #[test]
+    fn recovery_report_fast_inventory_preserves_discovery_provenance() {
         for fail_after_discovery in [false, true] {
             let temp = write_image_directory(&plaintext_image(false));
             let mut source = FailedProbes {
@@ -1518,23 +1659,35 @@ mod tests {
                     scheme: "none".to_string(),
                 }),
             )
-            .expect("the structural scan reads a valid bootstrap");
+            .expect("terminal inventory does not need a BOT walk");
             assert!(report.success);
             assert_eq!(source.probes_left, 0);
-            assert_eq!(report.tape_uuid.as_deref(), Some(hex(&TAPE_UUID).as_str()));
-            assert_eq!(report.block_size_bytes, Some(BLOCK_SIZE));
-            assert_eq!(report.scan.bootstrap_generation_used, Some(0));
+            assert_eq!(
+                report.tape_uuid,
+                fail_after_discovery.then(|| hex(&TAPE_UUID))
+            );
+            assert_eq!(
+                report.block_size_bytes,
+                fail_after_discovery.then_some(BLOCK_SIZE)
+            );
+            assert_eq!(
+                report.scan.bootstrap_generation_used,
+                fail_after_discovery.then_some(0)
+            );
             assert_eq!(
                 report.scan.bootstrap_treated_as_unreadable,
-                fail_after_discovery
+                !fail_after_discovery
             );
-            assert!(!report.scan.identity_and_geometry_from_hints);
+            assert_eq!(
+                report.scan.identity_and_geometry_from_hints,
+                !fail_after_discovery
+            );
             let mut human = Vec::new();
             print_human_report(&report, &mut human).expect("human report");
-            if fail_after_discovery {
-                assert!(String::from_utf8_lossy(&human)
-                    .contains("identity and geometry supplied by validated bootstrap"));
-            }
+            assert_eq!(
+                String::from_utf8_lossy(&human).contains("bootstrap treated as unreadable"),
+                !fail_after_discovery
+            );
         }
     }
 

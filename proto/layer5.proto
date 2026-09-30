@@ -1098,7 +1098,8 @@ enum ProtectedContentFindingKind {
   PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD = 2;
   // A finding about a sidecar's metadata (a copy, the footer, the index).
   PROTECTED_CONTENT_FINDING_KIND_SIDECAR = 3;
-  // Physical damage the walk found inside the pre-tail prefix.
+  // Damage or nonconformity found inside the pre-tail prefix, including
+  // nonzero bootstrap trailing fill (REM-PARITY 8.1; no Section 15 name).
   PROTECTED_CONTENT_FINDING_KIND_PREFIX_DAMAGE = 4;
   // The protected-content pass could not be performed.
   PROTECTED_CONTENT_FINDING_KIND_NOT_PERFORMED = 5;

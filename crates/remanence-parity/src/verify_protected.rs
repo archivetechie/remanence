@@ -225,9 +225,21 @@ pub struct ProtectedContentVerification {
     /// Why the pass could not be performed, when it was not. A pass that was
     /// not performed is never clean.
     pub not_performed: Option<String>,
-    /// Physical damage the walk found inside the pre-tail prefix, reported as
-    /// findings when the terminal replicas' rows scope the pass.
+    /// Damage or nonconformity (including bootstrap trailing fill) found inside
+    /// the pre-tail prefix, retained even when the protected pass cannot run.
     pub prefix_damage: Vec<String>,
+}
+
+/// Report fill evidence from the scanner's existing bootstrap parse.
+pub(crate) fn bootstrap_fill_finding(
+    candidate: &crate::scan::ScanBootstrapCandidate,
+) -> Option<String> {
+    candidate.nonzero_fill.then(|| {
+        format!(
+            "bootstrap at tape_file {} has nonzero trailing fill (REM-PARITY 8.1)",
+            candidate.tape_file_number
+        )
+    })
 }
 
 impl ProtectedContentVerification {
