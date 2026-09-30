@@ -1,0 +1,226 @@
+{
+  "api_base": "https://zenodo.org/api",
+  "publish_order": [
+    "vectors",
+    "companion",
+    "object",
+    "encrypt",
+    "parity"
+  ],
+  "records": {
+    "vectors": {
+      "draft_id": 900002,
+      "version_doi": "10.5281/zenodo.900002",
+      "concept_doi": "10.5281/zenodo.900001",
+      "kind": "dataset",
+      "metadata": {
+        "title": "Example vectors",
+        "version": "0.1-test",
+        "creators": [
+          {
+            "name": "Example Project"
+          }
+        ],
+        "license": "cc0-1.0",
+        "upload_type": "dataset",
+        "keywords": [
+          "example",
+          "offline"
+        ],
+        "language": "eng",
+        "related_identifiers": [
+          {
+            "identifier": "https://example.org/reference",
+            "relation": "references",
+            "scheme": "url"
+          }
+        ],
+        "description": "<P>Small &amp; entirely <B>invented</B> example.</P>"
+      },
+      "files": [
+        {
+          "path": "input/vectors.txt",
+          "name": "vectors.txt"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "vectors.txt",
+          "version": "0.1-test"
+        }
+      ]
+    },
+    "companion": {
+      "draft_id": 900004,
+      "version_doi": "10.5281/zenodo.900004",
+      "concept_doi": "10.5281/zenodo.900003",
+      "kind": "document",
+      "metadata": {
+        "title": "Example companion",
+        "version": "0.1-test",
+        "creators": [
+          {
+            "name": "Example Project"
+          }
+        ],
+        "license": "cc-by-4.0",
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "keywords": [
+          "example",
+          "offline"
+        ],
+        "language": "eng",
+        "related_identifiers": [
+          {
+            "identifier": "https://example.org/reference",
+            "relation": "references",
+            "scheme": "url"
+          }
+        ],
+        "description": "<P>Small &amp; entirely <B>invented</B> example.</P>"
+      },
+      "files": [
+        {
+          "path": "input/companion.txt",
+          "name": "companion.txt"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "companion.txt",
+          "version": "0.1-test"
+        }
+      ]
+    },
+    "object": {
+      "draft_id": 900006,
+      "version_doi": "10.5281/zenodo.900006",
+      "concept_doi": "10.5281/zenodo.900005",
+      "kind": "document",
+      "metadata": {
+        "title": "Example object",
+        "version": "0.1-test",
+        "creators": [
+          {
+            "name": "Example Project"
+          }
+        ],
+        "license": "cc-by-4.0",
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "keywords": [
+          "example",
+          "offline"
+        ],
+        "language": "eng",
+        "related_identifiers": [
+          {
+            "identifier": "https://example.org/reference",
+            "relation": "references",
+            "scheme": "url"
+          }
+        ],
+        "description": "<P>Small &amp; entirely <B>invented</B> example.</P>"
+      },
+      "files": [
+        {
+          "path": "input/object.txt",
+          "name": "object.txt"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "object.txt",
+          "version": "0.1-test"
+        }
+      ]
+    },
+    "encrypt": {
+      "draft_id": 900008,
+      "version_doi": "10.5281/zenodo.900008",
+      "concept_doi": "10.5281/zenodo.900007",
+      "kind": "document",
+      "metadata": {
+        "title": "Example encrypt",
+        "version": "0.1-test",
+        "creators": [
+          {
+            "name": "Example Project"
+          }
+        ],
+        "license": "cc-by-4.0",
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "keywords": [
+          "example",
+          "offline"
+        ],
+        "language": "eng",
+        "related_identifiers": [
+          {
+            "identifier": "https://example.org/reference",
+            "relation": "references",
+            "scheme": "url"
+          }
+        ],
+        "description": "<P>Small &amp; entirely <B>invented</B> example.</P>"
+      },
+      "files": [
+        {
+          "path": "input/encrypt.txt",
+          "name": "encrypt.txt"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "encrypt.txt",
+          "version": "0.1-test"
+        }
+      ]
+    },
+    "parity": {
+      "draft_id": 900010,
+      "version_doi": "10.5281/zenodo.900010",
+      "concept_doi": "10.5281/zenodo.900009",
+      "kind": "document",
+      "metadata": {
+        "title": "Example parity",
+        "version": "0.1-test",
+        "creators": [
+          {
+            "name": "Example Project"
+          }
+        ],
+        "license": "cc-by-4.0",
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "keywords": [
+          "example",
+          "offline"
+        ],
+        "language": "eng",
+        "related_identifiers": [
+          {
+            "identifier": "https://example.org/reference",
+            "relation": "references",
+            "scheme": "url"
+          }
+        ],
+        "description": "<P>Small &amp; entirely <B>invented</B> example.</P>"
+      },
+      "files": [
+        {
+          "path": "input/parity.txt",
+          "name": "parity.txt"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "parity.txt",
+          "version": "0.1-test"
+        }
+      ]
+    }
+  }
+}
