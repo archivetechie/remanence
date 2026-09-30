@@ -1384,11 +1384,13 @@ therefore leaves the tape recoverable, and a bootstrap that contradicts them
 is refused. A value can still be decoded when the payload is a well-formed
 CBOR map from which the value can be read, whether or not the payload meets
 the canonical-encoding rules of Section 5.3. A breach of those rules is one of
-the later rules of Section 8 in the fourth row of the second table. A parity
-scheme record in the payload of a no-parity bootstrap is a value that
-disagrees in this sense: the Scanner refuses the bootstrap (`BootstrapParse`,
-naming the scheme), as Section 8.2 requires. A refusal ends discovery with
-that error, and no inventory is returned. A bootstrap that is treated as
+the later rules of Section 8 in the fourth row of the second table. When the
+supplied scheme is no parity, a parity scheme record in the payload of a
+no-parity bootstrap is a value that disagrees in this sense: the Scanner
+refuses the bootstrap (`BootstrapParse`, naming the scheme), as Section 8.2
+requires. When the supplied scheme is a parity scheme, the second row of the
+second table has already refused such a bootstrap. A refusal ends discovery
+with that error, and no inventory is returned. A bootstrap that is treated as
 unreadable does not end discovery: the Scanner continues on the supplied
 values. In the second table, a field is impossible when it breaks its
 constraint in Section 8.1: a major other than 2 or a sequence other than 0.
@@ -1798,7 +1800,10 @@ A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the
 footer, and MUST NOT rely on a block whose CRC does not verify. Such a header
 copy or footer is invalid. When one header copy is invalid and the other is
 valid, the valid copy is used; when both are valid they MUST agree
-(Section 10.1.4).
+(Section 10.1.4). A footer that reads and is invalid rejects the ParityMap
+(`ParityMapParse`). A footer that cannot be read, or that is a record of the
+wrong length, does not reject it: the header copies are used as above, and
+Section 2.2 says how a Verifier reports each case.
 
 #### 10.1.4. Payload (CBOR)
 
@@ -2300,10 +2305,10 @@ additional relationships hold:
   `total_data_ordinals`, so finalization left no Object ordinal unprotected;
   both are the recorded fields, and Section 7.4 separately requires each to
   equal the value recomputed from the map;
+- replica A's planned start LBA equals the end of the covered prefix,
+  `Σ(block_count + 1)` over its structural rows (Section 3.2);
 - `covered_prefix_tape_file_count`, `structural_row_count`, and replica A's
   planned tape-file number are equal.
-- replica A's planned start LBA equals the end of the covered prefix,
-  `Σ(block_count + 1)` over its structural rows (Section 3.2).
 
 A replica whose header breaks the covered-count relationship is not eligible,
 and a Reader need not read its payload.
@@ -2451,7 +2456,10 @@ with two exceptions: the one for items 5 and 6 stated below, and the footer rule
 items 2 and 3, which applies only when no rung of items 1, 4 or 5 parses the
 file. Items 1 to 6 recognise
 kinds that are disjoint by magic; items 5 and 6 are two ways of recognising a
-sidecar.
+sidecar. Disjoint magics do not make the rungs exclusive: under the footer
+rule, a file whose head can be read but which no rung of items 1, 4 or 5
+parses can take its control type from its footer magic, as items 2 and 3
+state.
 
 Items 2 and 3 commit a tape file to its control type as soon as its magic
 matches, as they state. For items 1, 4, 5 and 6, a rung *recognises* a tape
@@ -2685,8 +2693,8 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    that fails them the location is not evaluated.
    An entry is available whenever the tape's final ParityMap validates and is
    marked `is_final_directory`, reached through a validated replica's
-   structural rows or found by the Section 8.4.1 walk. That is necessary and
-   not sufficient: the entry is available only if it also meets the
+   structural rows or found by the Section 8.4.1 walk. That condition is
+   necessary but not sufficient: the entry is available only if it also meets the
    preconditions that follow. A Recoverer MUST NOT
    place a read from a directory entry unless the entry agrees with the
    sidecar's map entry in tape file, epoch, protected range and block count.
@@ -2720,13 +2728,12 @@ Locate the epoch's sidecar tape file via the map, then, in order:
    validated scope only through a final ParityMap (Section 13.1), which this
    case lacks. When a final ParityMap validates but the sidecar's entry fails
    a precondition of the directory-assisted rescue, this rescue does not
-   apply either, since the directory then contradicts the map entry. Here, as
-   in the directory-assisted rescue, a final ParityMap validates only when it
-   validates and is marked `is_final_directory`. A final ParityMap that
-   validates excludes this rescue whatever its entry for the sidecar says,
-   including an entry that agrees with the map entry and fails only `total =
-   2H + P + 1`. A final ParityMap validates when it validates under Section
-   10.1 (at least one copy is valid, and the two agree when both are valid),
+   apply either, since the directory then contradicts the map entry. A final
+   ParityMap that validates excludes this rescue whether or not it has an
+   entry for the sidecar and whatever that entry says, including an entry
+   that agrees with the map entry and fails only `total = 2H + P + 1`. A final
+   ParityMap validates when it validates under Section 10.1 (at least one copy
+   is valid, and the two agree when both are valid),
    its directory meets Section 10.1.5 and fits the scope of the map, and it is
    marked `is_final_directory`. A ParityMap that is `ParityMapParse` or
    `DirectoryInvalid` in every copy does not validate: the Recoverer continues
@@ -3023,16 +3030,19 @@ a torn tail, one after a closed epoch and one with an epoch still open.
 each torn tail and of the whole stream. The image bytes are regenerated from
 the inputs, not stored.
 
-The damage matrix, `tape-images/cases/`, holds 25 cases. All but one make
-stated records of an image unreadable or remove a filemark; the other reads
-the second-edition image undamaged. Each gives the outcome it expects under
-this document: the inventory a Scanner reports, the result of the walk, or
-each failed address's recovery or error, and in one case what a Verifier
-reports. One of them (`replicas-all`) expects a Scanner to run the walk that
-Section 8.4.1 requires it to offer. Two (`bootstrap-hinted` and
+The damage matrix, `tape-images/cases/`, holds 57 cases, and 55 of them are
+pinned; `parity-map-and-sidecar` and `e1-07` are not. Each case gives the
+outcome it expects under this document: the inventory a Scanner reports, the
+result of the walk, each failed address's recovery or error, or what a
+Verifier reports. The matrix grew in four groups.
+
+Of the first 25 cases, all but one make stated records of an image
+unreadable or remove a filemark; the other reads the second-edition image
+undamaged. One of them (`replicas-all`) expects a Scanner to run the walk
+that Section 8.4.1 requires it to offer. Two (`bootstrap-hinted` and
 `bootstrap-wrong-scheme`) expect the discovery with supplied values that
-Section 8.4 requires. The outcomes were written from this document before any
-reader was run on them. Of the 25 cases, 24 are pinned. The outcome pinned for
+Section 8.4 requires. Their outcomes were written from this document before
+any reader was run on them, and 24 of the 25 are pinned. The outcome pinned for
 `filemark-prefix` follows Section 12.3's rule that a rung which fails its
 count does not recognise the file. `parity-map-and-sidecar` is informative
 because this document did not decide part of it when its outcome was
@@ -3044,16 +3054,15 @@ The outcomes of the burst cases (`burst-m`, `burst-m-plus-one`,
 pinned loss counts are Section 13.5's `lost_count`: the number of erasures in
 the stripe, including the failed block.
 
-The paragraph above describes the first 25 cases of the damage matrix, which
-now holds 57. Fifteen (`e1-01` to `e1-15`) judge the first record with
-supplied values under Section 8.4. Ten (`e2-01` to `e2-04` and `e2-08` to
-`e2-13`) cover wrong-length records, the acquisition of the sidecar index and
-the walk (Sections 3.5, 8.4.1, 13.3), and seven (`e3-01` to `e3-07`) cover the
-walk after damage to or beside the terminal suffix (Sections 8.4, 8.4.1, 12.3,
-12.6). Of the 57 cases, 55 are pinned; `parity-map-and-sidecar` and `e1-07`
-are not. An overlay, `tape-images/expected-e4.json`, gives the outcome of the
-tail rescue of Section 13.3 for `parity-map-and-sidecar`, and what a Verifier
-reports for 14 cases.
+The other 32 cases were added later, in three groups. Fifteen (`e1-01` to
+`e1-15`) judge the first record with supplied values under Section 8.4. Ten
+(`e2-01` to `e2-04` and `e2-08` to `e2-13`) cover wrong-length records, the
+acquisition of the sidecar index and the walk (Sections 3.5, 8.4.1, 13.3),
+and seven (`e3-01` to `e3-07`) cover the walk after damage to or beside the
+terminal suffix (Sections 8.4, 8.4.1, 12.3, 12.6). An overlay,
+`tape-images/expected-e4.json`, gives the outcome of the tail rescue of
+Section 13.3 for `parity-map-and-sidecar`, and what a Verifier reports for 14
+cases.
 
 The resume vectors, `tape-images/resume/`, give a committed prefix over an
 image as Section 7.1 entries, with `W` and `T`. Two resumes of unfinalized
@@ -3783,6 +3792,21 @@ an errata revision of draft.1.
   - Sections 15 and 17 and Appendix D item TT-2 record these changes. TT-2
     also records what the second implementation now re-derives and what
     remains open.
+  - A wording pass over the text of that revision then changed no
+    requirement. Section 8.4 says that a scheme record that can still be
+    decoded, in a no-parity bootstrap, is refused naming the scheme when the
+    supplied scheme is no parity, and that the second row of its second table
+    refuses the bootstrap when the supplied scheme is a parity scheme. Section
+    10.1.3 repeats Section 2.2's rule for a ParityMap footer that cannot be
+    read and for one that reads and is invalid. Section 10.6 ends its second
+    list with the covered-count relationship. Section 12.3 says that disjoint
+    magics do not make its rungs exclusive. Section 13.3
+    drops a sentence that defined a final ParityMap's validation by itself,
+    and says that a validated final ParityMap excludes the tail rescue from
+    the terminal index also when it has no entry for the sidecar. Section 17
+    states the damage matrix as it now stands before it describes the first
+    25 cases. Appendix D item TT-2 no longer lists two reference gaps that
+    the reference has closed. No tape byte and no vector outcome changes.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -4152,11 +4176,6 @@ This is the live preparing-copy snapshot for generation 2.
    - A claim in `fixtures/rem-parity-1/vectors.json` still names the
      authoritative directory overlays that generation 2 removed; nothing reads
      the file.
-   - Two reference gaps remain. No code outside the tests checks the
-     bootstrap's trailing fill, which Section 8.1 requires a Verifier to
-     report. The command-line report walks the tape before terminal discovery,
-     so a filemark at BOT fails there, while the API continues on the supplied
-     values.
 
    The generation-1 REM-PARITY cases of the pinned archive were read against
    generation 2. Most of the properties they test are kept. The reference
