@@ -21,7 +21,10 @@ For `c > 0` and `s + c ≤ u64::MAX` (no overflow):
 - `st = Partial   ↔ s < W < s + c`
 
 and the three cases are exhaustive and mutually exclusive (given `c > 0`).
-This is `docs/layer3c-design.md` §7.2.1 / §10.1 verbatim.
+These implementation classifications follow from REM-PARITY §2.3
+(`specs/in-progress/rem-parity-1-specification.md`): "**Watermark `W`**
+(`highest_protected_ordinal`): ordinals `< W` are covered by emitted sidecars." The specification defines the watermark;
+it does not prescribe these three object-state names.
 
 ## T2 — error completeness (`from_ordinals_err_iff`)
 

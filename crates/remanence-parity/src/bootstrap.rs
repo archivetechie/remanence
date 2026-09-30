@@ -1,11 +1,11 @@
-//! Bootstrap block — the canonical root of trust per tape.
+//! Bootstrap block — the tape's UUID-independent entry point at BOT.
 //!
-//! The bootstrap is the first block a reader finds on tape
-//! mount. It tells the reader the parity scheme (so a
-//! [`ObjectParitySource`](crate::ObjectParitySource) can be constructed),
-//! the tape UUID (which derives the per-tape parity magic), and
-//! the filemark-map digest that validates catalog-less
-//! reconstruction.
+//! REM-PARITY §8: "The bootstrap is the tape's UUID-independent entry point: a single block at
+//! tape file 0, findable by magic, that records the tape's identity, block size,
+//! and parity scheme."
+//!
+//! "Payload key 2 carries only the BOT-only digest record of
+//! Section 8.2 and is not terminal inventory authority."
 //!
 //! The on-tape layout is a
 //! fixed header with `cbor_payload_len` covered by the header
@@ -61,10 +61,9 @@ const LEGACY_OBJECT_ROWS_KEY: i128 = 30;
 
 /// Decoded bootstrap-block payload.
 ///
-/// `scheme` is `Option<...>` because a `FLAG_NO_PARITY` bootstrap
-/// MUST omit the scheme record (REM-PARITY 8.2): "all other fields
-/// except magic, schema version, tape UUID, block size, sequence,
-/// and header CRC may be absent."
+/// `scheme` is `Option<...>` because REM-PARITY §8.2 says of a
+/// no-parity bootstrap: "It MUST omit the scheme record (key 1) and MAY omit the digest
+/// record (key 2)."
 ///
 /// Invariant: `scheme` is `Some` only on a parity bootstrap, whose
 /// record's `no_parity_flag` is false; if `scheme` is `None`, the

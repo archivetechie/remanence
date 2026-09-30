@@ -330,7 +330,8 @@ pub struct TapeGeometryHint {
     pub configured_block_size: Option<u32>,
     /// Candidate fixed block sizes to try when the configured size is unknown.
     pub candidate_block_sizes: Vec<u32>,
-    /// Physical positions to probe for bootstrap copies.
+    /// Physical position hints for bootstrap discovery. REM-PARITY §8.3:
+    /// "Exactly one bootstrap is mandatory at BOT, with sequence 0."
     pub probe_positions: Vec<PhysicalPositionHint>,
 }
 

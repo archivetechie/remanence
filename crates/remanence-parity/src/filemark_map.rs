@@ -735,8 +735,10 @@ pub enum MapSource {
     /// The structural rows of a validated terminal replica (REM-PARITY 8.4,
     /// 8.5). Obtained only through `scoped_map_from_terminal_replica`.
     TerminalReplica,
-    /// A map reconstructed by the Section 8.4.1 BOT walk, validated against
-    /// the tape's final ParityMap or, without one, the bootstrap's digest.
+    /// A map reconstructed by the Section 8.4.1 BOT walk, whose recovery scope
+    /// is validated against the final ParityMap under REM-PARITY §13.1:
+    /// "Without a validated final ParityMap, the walked map gives no validated
+    /// scope beyond the bootstrap's."
     Walk,
 }
 

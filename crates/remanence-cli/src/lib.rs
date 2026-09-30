@@ -11954,8 +11954,9 @@ fn resolve_foreign_format(
 ///
 /// This is the local-file half of the REM-OBJECT work order: it writes exactly one
 /// REM-OBJECT object byte string to `--out` using the same `BlockSink` contract as
-/// tape writers, but without tape-only filemarks, bootstrap rows, or parity
-/// sidecars.
+/// tape writers, but without tape-only filemarks, the BOT bootstrap, or parity
+/// sidecars. REM-PARITY §8: "Every generation-2 bootstrap is Object-count independent:
+/// its payload contains no Object recovery rows, including on a no-parity tape."
 fn run_archive_build(
     args: &ArchiveBuildArgs,
     out: &mut dyn Write,

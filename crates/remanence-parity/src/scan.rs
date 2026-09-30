@@ -376,8 +376,9 @@ pub struct ScanWalkResult {
     /// first block. Recognisable terminal control magic is always preserved as
     /// control evidence and never falls through to Object.
     pub truncation_candidate_kind: Option<TapeFileKind>,
-    /// Valid bootstrap copies encountered and structurally classified by the
-    /// walk, in physical tape-file order.
+    /// The valid BOT bootstrap, if encountered and structurally classified by
+    /// the walk. REM-PARITY §8.3: "Exactly one bootstrap is mandatory at BOT,
+    /// with sequence 0. No intermediate or final bootstrap is permitted."
     pub bootstrap_candidates: Vec<ScanBootstrapCandidate>,
     /// Physical damage or bootstrap validation failure encountered by the scanner.
     pub damaged_regions: Vec<ScanDamagedRegion>,
@@ -441,7 +442,8 @@ impl ScanWalkResult {
     }
 }
 
-/// One valid bootstrap copy encountered during the structural walk.
+/// The valid BOT bootstrap encountered during the structural walk.
+/// REM-PARITY §8.3: "Exactly one bootstrap is mandatory at BOT, with sequence 0."
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanBootstrapCandidate {
     /// Dense tape-file number containing the bootstrap.
