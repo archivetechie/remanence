@@ -366,3 +366,17 @@ the Scanner returns `BotStructuralRecoveryRequired` (heads of A, B and C are unr
 New key: `walk.damaged` (tape file to reason) for a file typed a control type and reported damaged. 12.3 item 2: "A file that fails
 the check is reported as damage, not raised as an error, and is not an Object."
 
+
+## The two ParityMap head cases (Step 6, F-s6b)
+
+`decisions.json` and `decisions-real-ids.json` (and their traces) gain s6-13 and s6-14 under their own ids (`blind-mapping.json`
+maps them to themselves). Every earlier case is byte-identical (each case's value compared leaf for leaf with the committed
+files; only the two new keys appear). `resume`, `negatives`, `negatives-supplement`, `negative-e1`, `negative-blocks`,
+`mutations`, `selection` and `build-report.json` are untouched. Both cases are decided from the text, and no expected outcome was
+read. Both are the a4-minimal image with the heads of A, B and C unreadable; in both the Scanner returns
+`BotStructuralRecoveryRequired` and the Verifier `recovery_required`. Both damage the ParityMap (tape file 3, 3 blocks).
+
+| Case | Fault | Walk decision | Deciding sentences |
+| --- | --- | --- | --- |
+| s6-13 | The ParityMap's head block (LBA 15) unreadable; nothing else in the file changed | `0` Bootstrap, `1` Object, `2` ParitySidecar, `3` ParityMap (by the tail route), `4` TapeIndexReplica, `5` IndexSeparationExtent, `6` TapeIndexReplica, `7` IndexSeparationExtent, `8` TapeIndexReplica; map produced and validated; the Verifier lists file 3's primary copy as a medium error, with no Section 15 name (Section 2.2) | 12.3 item 4: "Away from tape file 0, when the first block is unreadable, or no rung of items 1 or 5 parses it and it is not a ParityMap header that parses, the walk reads the file's last block. If that block is a footer whose magic matches and that parses (Section 10.1.3), the footer locates the tail header copy at its `tail_copy_start_block`, and the file is a ParityMap if that tail header parses and agrees with the footer and the footer's `parity_map_total_block_count` equals the measured block count." The footer and tail copy are intact and the count is 3, so the file is a ParityMap. "Unreadable head block": "a file that item 4 recognises by that route is a ParityMap and not an object candidate." Validation: 10.1.3 "When one header copy is invalid and the other is valid, the valid copy is used", and item 4's "This is the copy fallback of Section 10.1.3, applied to the walk"; the payload is untouched, so 13.1 validates the map (GAPS P-5 for the reading of "invalid") |
+| s6-14 | The ParityMap's head block unreadable, and its footer's CRC-covered byte edited (CRC left stale) | As s6-11: `3` Object, no failed classification; the other files as s6-13; map produced, not validated | 12.3 item 4: the footer is read on the tail route, and the route needs a footer "whose magic matches and that parses"; this footer does not parse, so the tail route recognises nothing. "A file that neither route recognises is not recognised by this item, and the later rungs try it." The count rule does not apply: "If the footer parses and its total differs from the measured count, the failed classification is reported". Items 2 and 3 do not take it: the footer's magic is the ParityMap's, not a replica's or an extent's. Nothing later parses it, so "Object, by elimination". No ParityMap is recognised, so 13.1's "when that ParityMap validates" is not met and the map is not validated (GAPS P-6 for the Verifier's silence about file 3) |

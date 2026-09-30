@@ -1,0 +1,51 @@
+{
+  "failed_data_addresses": [],
+  "hints": null,
+  "image": "a4-minimal",
+  "record_edits": [
+    {
+      "construction": "the original record's length",
+      "edits": [
+        {
+          "new_bytes": "13",
+          "offset": 16,
+          "old_bytes": "12",
+          "reason": "ParityMap footer CRC-covered byte (CRC left stale): xor 01"
+        }
+      ],
+      "lba": 17,
+      "length": 262144,
+      "original_length": 262144,
+      "record_index": 2,
+      "sha256": "07660ceaa33559ba254e6ab3abd0702c7bdf8cf1bb0f6fbe9c49cafff8c099ec",
+      "tape_file": 3
+    }
+  ],
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 15,
+      "record_index": 0,
+      "tape_file": 3
+    },
+    {
+      "filemark": false,
+      "lba": 19,
+      "record_index": 0,
+      "tape_file": 4
+    },
+    {
+      "filemark": false,
+      "lba": 27,
+      "record_index": 0,
+      "tape_file": 6
+    },
+    {
+      "filemark": false,
+      "lba": 35,
+      "record_index": 0,
+      "tape_file": 8
+    }
+  ]
+}
