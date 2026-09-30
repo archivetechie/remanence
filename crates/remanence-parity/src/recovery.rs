@@ -1,12 +1,15 @@
-//! Sidecar-aware recovery primitives for Layer 3c v0.4.4.
+//! Sidecar-aware recovery primitives for Layer 3c.
 //!
-//! The public helper in this module reconstructs one protected
-//! `ParityDataOrdinal` from the digest-validated filemark map, the epoch sidecar,
-//! verified data peers, and verified parity shards. It is intentionally below
-//! the future object-scoped `ObjectParitySource` surface: callers provide the
-//! failed ordinal directly, and this code performs the core sidecar/CRC/RS work
-//! that `ObjectParitySource::recover_block_at` will later drive from
-//! `(tape_file_number, body_lba)`.
+//! REM-PARITY §13.1 defines the inputs: "A validated, scoped map (Section 12); the bootstrap's
+//! scheme record, or the scheme supplied out of band when the bootstrap is unreadable
+//! (Section 8.4.1); and the failed addresses — `(tape_file_number, object_block_index)` pairs or
+//! ordinals."
+//!
+//! These helpers acquire the epoch sidecar index and reconstruct protected blocks
+//! from verified data peers and parity shards. They underpin the object-scoped
+//! [`ObjectParitySource`](crate::ObjectParitySource), including its `recover_block_at` method.
+//! REM-PARITY §13.5: "Every reconstructed data block MUST be verified against its sidecar data CRC
+//! before release."
 
 use std::collections::{BTreeMap, BTreeSet};
 

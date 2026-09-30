@@ -38,12 +38,15 @@
 //!
 //! Writes one small parity-protected epoch through `ParitySink`
 //! over `DriveHandleRawSink`, rewinds, reconstructs the filemark map
-//! through `DriveHandleRawSource`, validates the final bootstrap
-//! digest, and reads the object back through `ObjectParitySource`.
-//! The restart/append tests then reopen through the production resume path:
-//! one appends after a clean finalized bootstrap tail, and two rebuild open
-//! `W<T` epochs from catalog-committed object-only prefixes before appending
-//! (single-epoch and multi-epoch rebuild). The recovery test wraps the real
+//! through `DriveHandleRawSource`, checks the structural rows and ordinal counts,
+//! and reads the object back through `ObjectParitySource` using a caller-supplied
+//! catalog scope. This does not validate a final inventory digest.
+//! REM-PARITY §8: "Payload key 2 carries only the BOT-only digest record of
+//! Section 8.2 and is not terminal inventory authority."
+//! The bounded resume test reopens a checkpointed prefix with no open epoch and
+//! appends through the production resume path. REM-PARITY §14:
+//! "A later session appends **after the last committed tape file** — not after
+//! the last object, and not at the watermark." The recovery test wraps the real
 //! hardware source with a single synthetic transport read failure to prove
 //! `ObjectParitySource`
 //! reconstructs the protected block from the sidecar.

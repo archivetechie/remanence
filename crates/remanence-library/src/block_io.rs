@@ -601,7 +601,9 @@ impl BlockSource for DriveHandleSource<'_> {
 /// [`BlockSink::write_block`] must supply exactly `block_size` bytes, and
 /// nonzero filemark writes are rejected. The resulting file is just the
 /// object's stored byte string; tape-only framing such as filemarks,
-/// bootstrap rows, and REM-PARITY sidecars is not included.
+/// the BOT bootstrap, and REM-PARITY sidecars is not included.
+/// REM-PARITY §8: "Every generation-2 bootstrap is Object-count independent:
+/// its payload contains no Object recovery rows, including on a no-parity tape."
 #[derive(Debug)]
 pub struct FileBlockSink {
     file: File,
