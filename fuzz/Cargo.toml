@@ -14,7 +14,7 @@ remanence-aead = { path = "../crates/remanence-aead" }
 remanence-format = { path = "../crates/remanence-format", features = ["fuzzing"] }
 remanence-library = { path = "../crates/remanence-library" }
 remanence-parity  = { path = "../crates/remanence-parity" }
-sha2 = "0.10"
+sha2 = "0.11"
 
 [[bin]]
 name = "rem_object_envelope_header"
