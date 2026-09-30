@@ -54,7 +54,7 @@ fn write_recipients(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
         recovery.public_key(1).unwrap().serialize().unwrap(),
     )
     .unwrap();
-    fs::write(&primary_private, primary.serialize()).unwrap();
+    fs::write(&primary_private, primary.serialize().as_slice()).unwrap();
     (primary_public, recovery_public, primary_private)
 }
 

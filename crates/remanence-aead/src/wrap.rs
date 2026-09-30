@@ -181,7 +181,7 @@ impl hpke::Kem for XWingHpkeKem {
         let (encapped_key, mut secret) =
             xwing::encapsulate(&recipient_public_key.0, rng).map_err(|_| HpkeError::EncapError)?;
         let mut shared_secret = SharedSecret::<Self>::default();
-        shared_secret.0.copy_from_slice(&secret);
+        shared_secret.0.copy_from_slice(&secret[..]);
         secret.zeroize();
         Ok((shared_secret, XWingHpkeEncappedKey(encapped_key)))
     }
@@ -198,7 +198,7 @@ impl hpke::Kem for XWingHpkeKem {
         let mut secret =
             xwing::decapsulate(&seed, &encapped_key.0).map_err(|_| HpkeError::DecapError)?;
         let mut shared_secret = SharedSecret::<Self>::default();
-        shared_secret.0.copy_from_slice(&secret);
+        shared_secret.0.copy_from_slice(&secret[..]);
         secret.zeroize();
         Ok(shared_secret)
     }
@@ -401,14 +401,15 @@ impl RecipientPrivateKey {
         epoch_label: impl Into<String>,
         private_key: [u8; XWING_SEED_LEN],
     ) -> Result<Self> {
+        let private_key = Zeroizing::new(private_key);
         let epoch_label = epoch_label.into();
         validate_label(&epoch_label)?;
-        <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&private_key)
+        <<Kem as hpke::Kem>::PrivateKey as Deserializable>::from_bytes(&private_key[..])
             .map_err(|_| RemObjectAeadError::HpkeFailed)?;
         Ok(Self {
             recipient_epoch_id,
             epoch_label,
-            private_key,
+            private_key: *private_key,
         })
     }
 
@@ -432,8 +433,10 @@ impl RecipientPrivateKey {
     }
 
     /// Serialize the standalone recovery-key file format (`REMP`, id, label, secret).
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(RECIPIENT_PRIVATE_FILE_FIXED_LEN + self.epoch_label.len());
+    pub fn serialize(&self) -> Zeroizing<Vec<u8>> {
+        let mut out = Zeroizing::new(Vec::with_capacity(
+            RECIPIENT_PRIVATE_FILE_FIXED_LEN + self.epoch_label.len(),
+        ));
         out.extend_from_slice(b"REMP");
         out.extend_from_slice(&self.recipient_epoch_id);
         out.push(self.epoch_label.len() as u8);
@@ -461,10 +464,12 @@ impl RecipientPrivateKey {
         }
         let epoch_label = std::str::from_utf8(&bytes[21..21 + label_len])
             .map_err(|_| RemObjectAeadError::InvalidInput("invalid recipient label".to_string()))?;
-        let private_key = bytes[21 + label_len..]
-            .try_into()
-            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
-        Self::new(recipient_epoch_id, epoch_label, private_key)
+        let private_key = Zeroizing::new(
+            bytes[21 + label_len..]
+                .try_into()
+                .map_err(|_| RemObjectAeadError::HpkeFailed)?,
+        );
+        Self::new(recipient_epoch_id, epoch_label, *private_key)
     }
 }
 
@@ -569,15 +574,19 @@ pub fn unwrap_dek(
     let info = wrap_info(object_id, &slot.recipient_epoch_id, slot.slot_index)?;
     let mut context = setup_receiver::<Aead, Kdf, Kem>(&OpModeR::Base, &secret, &enc, &info)
         .map_err(|_| RemObjectAeadError::HpkeFailed)?;
-    let mut plaintext = context
-        .open(&slot.ciphertext, &[])
-        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
-    let bytes = plaintext
-        .as_slice()
-        .try_into()
-        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
+    let mut plaintext = Zeroizing::new(
+        context
+            .open(&slot.ciphertext, &[])
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?,
+    );
+    let bytes = Zeroizing::new(
+        plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?,
+    );
     plaintext.zeroize();
-    Ok(DataEncryptionKey::from_bytes(bytes))
+    Ok(DataEncryptionKey::from_bytes(*bytes))
 }
 
 fn validate_label(label: &str) -> Result<()> {

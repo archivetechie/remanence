@@ -5,6 +5,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305,
 };
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::error::{RemObjectAeadError, Result};
 use crate::header::{REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
@@ -13,12 +14,21 @@ use crate::header::{REM_OBJECT_FOOTER, REM_OBJECT_HEADER_LEN};
 pub const CHACHA20POLY1305_TAG_LEN: u64 = 16;
 
 /// Size and digest of plaintext processed by the STREAM layer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlaintextStats {
     /// Number of plaintext bytes processed.
     pub size: u64,
     /// SHA-256 over exactly the processed plaintext bytes.
     pub digest: [u8; 32],
+}
+
+impl std::fmt::Debug for PlaintextStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaintextStats")
+            .field("size", &self.size)
+            .field("digest", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Encrypt one metadata frame with zero nonce and empty AAD.
@@ -35,7 +45,7 @@ pub fn encrypt_metadata(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Decrypt one metadata frame with zero nonce and empty AAD.
-pub fn decrypt_metadata(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
+pub fn decrypt_metadata(key: &[u8; 32], ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     cipher_from_key(key)
         .decrypt(
             &[0u8; 12].into(),
@@ -44,6 +54,7 @@ pub fn decrypt_metadata(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
                 aad: &[],
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| RemObjectAeadError::AeadAuthenticationFailed)
 }
 
@@ -71,7 +82,7 @@ pub fn decrypt_chunk(
     counter: u64,
     final_chunk: bool,
     ciphertext: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     cipher_from_key(key)
         .decrypt(
             &stream_nonce(counter, final_chunk).into(),
@@ -80,6 +91,7 @@ pub fn decrypt_chunk(
                 aad: &[],
             },
         )
+        .map(Zeroizing::new)
         .map_err(|_| RemObjectAeadError::AeadAuthenticationFailed)
 }
 
@@ -202,7 +214,7 @@ mod tests {
         let key = [9u8; 32];
         let chunk = vec![7u8; 512];
         let encrypted = encrypt_chunk(&key, 0, true, &chunk).unwrap();
-        assert_eq!(decrypt_chunk(&key, 0, true, &encrypted).unwrap(), chunk);
+        assert_eq!(*decrypt_chunk(&key, 0, true, &encrypted).unwrap(), chunk);
         assert!(matches!(
             decrypt_chunk(&key, 0, false, &encrypted),
             Err(RemObjectAeadError::AeadAuthenticationFailed)

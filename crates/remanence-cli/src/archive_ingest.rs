@@ -608,8 +608,9 @@ pub(crate) fn verify_blob_member_bytes(
     bytes: &[u8],
 ) -> Result<(), String> {
     if let Some(expected) = expected_sha256 {
-        let actual = bytes_to_hex(&sha256_bytes_local(bytes));
-        if actual != expected {
+        let actual = sha256_bytes_local(bytes);
+        if !crate::sha256_matches_hex(&actual, expected) {
+            let actual = bytes_to_hex(&actual);
             return Err(format!(
                 "blob member {member_path:?} digest mismatch: expected {expected}, got {actual}"
             ));

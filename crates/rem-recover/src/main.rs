@@ -475,7 +475,7 @@ mod tests {
         let out = temp.path().join("out");
         fs::create_dir(&out).unwrap();
         fs::write(&object, &sealed).unwrap();
-        fs::write(&private_key, safe.serialize()).unwrap();
+        fs::write(&private_key, safe.serialize().as_slice()).unwrap();
         let summary = recover(&Args {
             object: object.clone(),
             private_key,
@@ -491,7 +491,7 @@ mod tests {
 
         let wrong = RecipientPrivateKey::new([3; 16], "wrong-2026", [9; 32]).unwrap();
         let wrong_path = temp.path().join("wrong.remp");
-        fs::write(&wrong_path, wrong.serialize()).unwrap();
+        fs::write(&wrong_path, wrong.serialize().as_slice()).unwrap();
         let error = recover(&Args {
             object: object.clone(),
             private_key: wrong_path,
@@ -531,7 +531,7 @@ mod tests {
         // indistinguishable at this layer from the damaged-slot case above.
         let wrong_seed = RecipientPrivateKey::new([1; 16], "safe-2026", [9; 32]).unwrap();
         let wrong_seed_path = temp.path().join("wrong-seed.remp");
-        fs::write(&wrong_seed_path, wrong_seed.serialize()).unwrap();
+        fs::write(&wrong_seed_path, wrong_seed.serialize().as_slice()).unwrap();
         let ambiguous_error = recover(&Args {
             object,
             private_key: wrong_seed_path,
@@ -617,7 +617,7 @@ mod tests {
         let out = temp.path().join("out");
         fs::create_dir(&out).unwrap();
         fs::write(&object, sealed).unwrap();
-        fs::write(&private_key, key.serialize()).unwrap();
+        fs::write(&private_key, key.serialize().as_slice()).unwrap();
 
         let summary = recover(&Args {
             object,

@@ -20,6 +20,8 @@ cipher           = { version = "0.5", features = ["zeroize"] }
 hybrid-array     = { version = "0.4", features = ["extra-sizes"] }
 subtle           = "2.6"
 hkdf             = { workspace = true }
+# Enable wiping for HKDF/HPKE HMAC state even when building this crate alone.
+hmac             = { workspace = true }
 hpke             = { workspace = true }
 getrandom        = { workspace = true }
 rand_core        = { workspace = true }
@@ -27,7 +29,7 @@ libcrux-ml-kem   = { version = "=0.0.10", default-features = false, features = [
 # SHAKE moved out of sha3 0.12; use the same vetted backend as ML-KEM.
 libcrux-sha3      = "=0.0.10"
 sha2             = { workspace = true }
-sha3             = "=0.12.0"
+sha3             = { version = "=0.12.0", features = ["zeroize"] }
 thiserror        = { workspace = true }
 x25519-dalek     = { version = "=3.0.0", features = ["static_secrets"] }
 zeroize          = { workspace = true }
