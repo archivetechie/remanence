@@ -44,6 +44,25 @@ impl BootstrapRefusedField {
     }
 }
 
+/// The evidence behind a compression refusal; both contexts retain the
+/// REM-PARITY `DriveCompressionEnabled` classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionRefusalContext {
+    /// The drive or outgoing bootstrap would enable compression for a write.
+    Write,
+    /// The bootstrap read from tape records compression on a parity tape.
+    Bootstrap,
+}
+
+impl std::fmt::Display for CompressionRefusalContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Write => "LTO hardware compression is enabled; parity-protected writes require it disabled",
+            Self::Bootstrap => "tape's bootstrap records drive compression; a parity tape must not record drive compression",
+        })
+    }
+}
+
 /// Errors a Layer 3c operation can return.
 #[derive(Debug, thiserror::Error)]
 pub enum ParityError {
@@ -114,7 +133,7 @@ pub enum ParityError {
     /// A readable first record refused under supplied values (REM-PARITY 8.4).
     /// Section 15 names it `BootstrapParse`. It is never a reason to continue
     /// discovery: supplied values never replace a bootstrap that contradicts them.
-    #[error("filemark map could not be reconstructed: {detail}")]
+    #[error("bootstrap refused: {detail}")]
     BootstrapRefused {
         /// The field Section 8.4 names for the refusal.
         field: BootstrapRefusedField,
@@ -282,10 +301,12 @@ pub enum ParityError {
     #[error("write session cannot open: {0}")]
     SessionOpen(String),
 
-    /// LTO hardware compression is enabled for a parity-protected write
-    /// session.
-    #[error("LTO hardware compression is enabled; parity-protected writes require it disabled")]
-    DriveCompressionEnabled,
+    /// Compression is enabled for a parity write or recorded in a parity bootstrap.
+    #[error("{context}")]
+    DriveCompressionEnabled {
+        /// Distinguishes a write refusal from invalid recorded bootstrap evidence.
+        context: CompressionRefusalContext,
+    },
 
     /// Layer 3a could not read back the drive's effective compression mode.
     #[error("could not verify the drive's effective compression mode")]

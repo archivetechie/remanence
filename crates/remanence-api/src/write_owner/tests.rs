@@ -7797,7 +7797,7 @@ fn catalog_recovery_paths_refuse_compressed_bootstrap() {
                 index,
                 cfg,
                 drive,
-                &ParityError::DriveCompressionEnabled.to_string(),
+                "tape's bootstrap records drive compression; a parity tape must not record drive compression",
             );
         },
     );

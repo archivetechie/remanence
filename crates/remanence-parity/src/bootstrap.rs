@@ -199,7 +199,9 @@ pub fn write_bootstrap_block(
         validate_sole_bot_map_digest(digest).map_err(ParityError::Invariant)?;
     }
     if !payload.no_parity_flag && payload.drive_compression {
-        return Err(ParityError::DriveCompressionEnabled);
+        return Err(ParityError::DriveCompressionEnabled {
+            context: crate::error::CompressionRefusalContext::Write,
+        });
     }
     if payload.sequence != 0 {
         return Err(ParityError::Invariant(
@@ -583,8 +585,8 @@ fn try_read_bootstrap_at(
                             }
                             return Ok(bp);
                         }
-                        Err(ParityError::DriveCompressionEnabled) => {
-                            return Err(ParityError::DriveCompressionEnabled);
+                        Err(error @ ParityError::DriveCompressionEnabled { .. }) => {
+                            return Err(error);
                         }
                         Err(_) => {}
                     }
@@ -786,7 +788,9 @@ fn decode_cbor_payload(
     }
 
     if !no_parity_flag && drive_compression {
-        return Err(ParityError::DriveCompressionEnabled);
+        return Err(ParityError::DriveCompressionEnabled {
+            context: crate::error::CompressionRefusalContext::Bootstrap,
+        });
     }
 
     Ok(DecodedBootstrapCbor {
@@ -1484,7 +1488,11 @@ mod tests {
 
         let err = write_bootstrap_block(&payload, &mut buf).unwrap_err();
 
-        assert!(matches!(err, ParityError::DriveCompressionEnabled));
+        assert!(matches!(err, ParityError::DriveCompressionEnabled { .. }));
+        assert_eq!(
+            err.to_string(),
+            "LTO hardware compression is enabled; parity-protected writes require it disabled"
+        );
     }
 
     #[test]
@@ -1495,7 +1503,8 @@ mod tests {
 
         let err = parse_bootstrap_block(&block).unwrap_err();
 
-        assert!(matches!(err, ParityError::DriveCompressionEnabled));
+        assert!(matches!(err, ParityError::DriveCompressionEnabled { .. }));
+        assert_eq!(err.to_string(), "tape's bootstrap records drive compression; a parity tape must not record drive compression");
     }
 
     #[test]
@@ -2133,7 +2142,8 @@ mod tests {
         let err = discover_bootstrap_with_block_size(&mut source, None, payload.block_size_bytes)
             .expect_err("compressed parity bootstrap must stop discovery");
 
-        assert!(matches!(err, ParityError::DriveCompressionEnabled));
+        assert!(matches!(err, ParityError::DriveCompressionEnabled { .. }));
+        assert_eq!(err.to_string(), "tape's bootstrap records drive compression; a parity tape must not record drive compression");
     }
 
     #[test]
@@ -2453,7 +2463,7 @@ mod tests {
                 (Some(field), ParityError::BootstrapRefused { field: actual, .. }) => {
                     assert_eq!(*actual, field)
                 }
-                (None, ParityError::DriveCompressionEnabled) => {}
+                (None, ParityError::DriveCompressionEnabled { .. }) => {}
                 _ => panic!("unexpected refusal {error:?}"),
             }
             assert_eq!(reads(&source.calls).len(), 1, "one probe only: {error}");
