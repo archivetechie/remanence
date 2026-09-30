@@ -1180,15 +1180,31 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
           },
           {
             "section": "12.3",
             "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "8.4.1",
@@ -2412,15 +2428,31 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
           },
           {
             "section": "12.3",
             "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "12.3",
@@ -2887,15 +2919,31 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
           },
           {
             "section": "12.3",
             "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "12.3",
@@ -5415,6 +5463,26 @@
           {
             "section": "12.2",
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "A rung parses a file when the file passes every check of that rung except its measured block count."
           },
           {
             "section": "12.3",
@@ -11660,6 +11728,22 @@
             "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
           },
           {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
             "section": "8.4.1",
             "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
           },
@@ -13425,6 +13509,26 @@
           },
           {
             "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "A rung parses a file when the file passes every check of that rung except its measured block count."
+          },
+          {
+            "section": "12.3",
             "quote": "After the walk, when the tape's final ParityMap validates and is marked `is_final_directory`, the Scanner MUST perform a second pass that identifies as a sidecar each Object candidate at a tape file a directory entry names whose measured length equals the entry's `sidecar_total_block_count`."
           },
           {
@@ -13708,6 +13812,22 @@
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
           },
           {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
             "section": "8.4.1",
             "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
           },
@@ -13953,6 +14073,22 @@
             "quote": "A file whose trailing filemark is missing before EOD is not a tape file of the map. The walk reports structural damage, classifies the file by its head, when the head can be read, as a torn candidate (an incomplete Object candidate when nothing else fits, Section 8.4.1), and ends there."
           },
           {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
             "section": "8.4.1",
             "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
           },
@@ -14189,6 +14325,22 @@
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
           },
           {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
             "section": "8.4.1",
             "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
           },
@@ -14411,6 +14563,22 @@
           {
             "section": "12.2",
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "8.4.1",
@@ -14638,15 +14806,27 @@
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."
+            "quote": "In items 2 and 3 a footer whose magic matches establishes the type also when the head is readable, is not a header of that type, and no rung of items 1, 4 or 5 parses it."
           },
           {
             "section": "12.3",
-            "quote": "When the head is unreadable, a matching, fully parsed footer establishes the type."
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
           },
           {
             "section": "12.3",
-            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "8.4.1",
@@ -14761,7 +14941,7 @@
           {
             "component": "tape file 8 (terminal replica)",
             "error": "TerminalIndexReplicaParse",
-            "finding": "damaged terminal replica: type established by its footer, measured 2 blocks, the planned component has 3"
+            "finding": "damaged terminal replica: the head is not its header; type established by its footer, measured 2 blocks, the planned component has 3"
           }
         ],
         "tape_complete": false,
@@ -14889,6 +15069,22 @@
           {
             "section": "12.6",
             "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "8.4.1",
@@ -15113,6 +15309,22 @@
           {
             "section": "12.2",
             "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
           },
           {
             "section": "8.4.1",

@@ -1436,6 +1436,193 @@ class ParityMapConstructionTests(unittest.TestCase):
         self.assertIn("differs from mine", impl._recomputed_check(bytes(broken), 0x38, bytes(broken[0x38:0x58]), image))
 
 
+class F0TextTests(unittest.TestCase):
+    """Section 12.3 as revised for F0: tape file 0, a rung that parses, the footer route, the ParityMap."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+        cls.size = cls.image.block_size
+
+    def test_a_one_block_file_zero_is_a_bootstrap_when_the_supplied_bootstrap_is_unreadable(self) -> None:
+        # 12.3: "In that case a tape file 0 that measures exactly one block is typed a bootstrap".
+        tape = impl.DamagedTape([b"X" * self.size, None], {0})
+        files, _ = impl.bot_walk(tape, self.image.tape_uuid, self.size, True)
+        self.assertEqual(files[0].kind, impl.KIND_BOOTSTRAP)
+        self.assertIn("do not authenticate", files[0].note)
+        # Without supplied values the ladder reads the head, which is unreadable: an Object candidate.
+        files, _ = impl.bot_walk(tape, self.image.tape_uuid, self.size, False)
+        self.assertEqual(files[0].kind, impl.KIND_OBJECT)
+
+    def test_a_readable_but_unusable_file_zero_is_typed_by_length_too(self) -> None:
+        # 12.3: "... because its content is not a usable bootstrap, the walk ... types tape file 0 by its measured length".
+        tape = impl.DamagedTape([b"X" * self.size, None], set())
+        files, _ = impl.bot_walk(tape, self.image.tape_uuid, self.size, True)
+        self.assertEqual(files[0].kind, impl.KIND_BOOTSTRAP)
+
+    def test_a_multi_block_file_zero_ends_the_walk_with_filemark_map_reconstruct(self) -> None:
+        # 12.3: "cannot be a bootstrap (Sections 3.1 and 8.1), and the walk ends with `FilemarkMapReconstruct`".
+        for unreadable in (set(), {0}):
+            tape = impl.DamagedTape([b"X" * self.size, b"X" * self.size, None], unreadable)
+            files, _ = impl.bot_walk(tape, self.image.tape_uuid, self.size, True)
+            self.assertIsNone(files[0].kind)
+            self.assertEqual(impl.second_pass_and_map(files)["error"], "FilemarkMapReconstruct")
+
+    def test_the_footer_sentences_do_not_apply_to_file_zero_in_that_case(self) -> None:
+        # 12.3: "neither the paragraph headed 'Unreadable head block' ... nor the footer sentences of items 2 and 3 apply".
+        footer = self.image.files[8].blocks[2]
+        tape = impl.DamagedTape([b"X" * self.size, b"X" * self.size, footer, None], {0})
+        files, _ = impl.bot_walk(tape, self.image.tape_uuid, self.size, True)
+        self.assertIsNone(files[0].kind)
+
+    def test_an_empty_tape_leaves_no_tape_file_zero(self) -> None:
+        self.assertEqual(impl.second_pass_and_map([])["error"], "FilemarkMapReconstruct")
+
+    def test_a_footer_whose_magic_matches_types_the_file_when_it_does_not_parse(self) -> None:
+        # 12.3 item 2: "a terminal footer whose magic matches establishes the same type, whether or not the footer parses".
+        records = self.image.records()
+        footer = bytearray(self.image.files[8].blocks[2])
+        footer[0x40] ^= 1
+        tape = impl.DamagedTape(records + [b"X" * self.size, b"X" * self.size, bytes(footer), None], {len(records)})
+        walked = impl.classify_file(tape, 9, len(records), 3, self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_REPLICA)
+        self.assertIn("does not parse", walked.note)
+        self.assertTrue(walked.note.startswith("damaged terminal replica"))
+
+    def test_a_count_that_disagrees_keeps_the_type_damaged_when_the_head_is_unreadable(self) -> None:
+        records = self.image.records()
+        footer = self.image.files[8].blocks[2]
+        tape = impl.DamagedTape(records + [b"X" * self.size, footer, None], {len(records)})
+        walked = impl.classify_file(tape, 9, len(records), 2, self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_REPLICA)
+        self.assertTrue(walked.note.startswith("damaged terminal replica"))
+
+    def test_a_bootstrap_that_parses_but_measures_two_blocks_is_not_recognised_and_the_footer_rule_does_not_apply(self) -> None:
+        # 12.3: a rung parses a file when it passes every check except its measured block count.
+        footer = self.image.files[8].blocks[2]
+        boot = self.image.files[0].blocks[0]
+        tape = impl.DamagedTape([boot, footer, None], set())
+        walked = impl.classify_file(tape, 0, 0, 2, self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_OBJECT)
+        self.assertIsNotNone(walked.failed_classification)
+
+    def test_a_bootstrap_magic_at_another_tape_file_is_not_parsed_by_item_1(self) -> None:
+        boot = self.image.files[0].blocks[0]
+        tape = impl.DamagedTape([b"X" * self.size, None, boot, None], set())
+        walked = impl.classify_file(tape, 1, 2, 1, self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_OBJECT)
+        self.assertIsNone(walked.failed_classification)
+        # The later rungs try it: a foreign head with a replica footer as its only block takes the footer's type.
+        footer = self.image.files[8].blocks[2]
+        tape = impl.DamagedTape([b"X" * self.size, None, boot, footer, None], set())
+        self.assertEqual(impl.classify_file(tape, 1, 2, 2, self.image.tape_uuid, self.size).kind, impl.KIND_REPLICA)
+
+    def test_a_parity_map_is_recognised_from_block_zero_alone(self) -> None:
+        # 12.3 item 4: "This item reads neither the payload nor the footer", and a ParityMap that fails Sections
+        # 10.1.3 and 10.1.4 "is still the ParityMap of the walk".
+        blocks = list(self.image.files[3].blocks)
+        broken = list(blocks)
+        broken[-1] = b"\xff" * self.size  # the footer
+        first = bytearray(blocks[0])
+        first[0xC8] ^= 1  # a payload byte: payload_sha256 fails, the header still parses
+        broken[0] = bytes(first)
+        tape = impl.DamagedTape(broken + [None], set())
+        walked = impl.classify_file(tape, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_PARITY_MAP)
+        self.assertIsNone(walked.parity_map)
+        self.assertIsNone(walked.failed_classification)
+        good = impl.DamagedTape(blocks + [None], set())
+        walked = impl.classify_file(good, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_PARITY_MAP)
+        self.assertTrue(walked.parity_map["final"])
+
+    def test_a_parity_map_whose_count_disagrees_is_a_failed_classification(self) -> None:
+        blocks = list(self.image.files[3].blocks)
+        tape = impl.DamagedTape(blocks + [b"X" * self.size, None], set())
+        walked = impl.classify_file(tape, 3, 0, len(blocks) + 1, self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_OBJECT)
+        self.assertIn("item 4", walked.failed_classification)
+
+    def _pm(self):
+        return list(self.image.files[3].blocks)
+
+    def test_a_parity_map_whose_header_does_not_parse_is_found_by_the_tail_route(self) -> None:
+        # 12.3 item 4: away from tape file 0 the walk reads the last block; a parsing footer locates the tail header.
+        blocks = self._pm()
+        first = bytearray(blocks[0])
+        first[0xC0] ^= 1  # the header CRC
+        tape = impl.DamagedTape([bytes(first)] + blocks[1:] + [None], set())
+        walked = impl.classify_file(tape, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_PARITY_MAP)
+        self.assertIn("tail route", walked.note)
+        # At tape file 0 the route is not used.
+        walked = impl.classify_file(tape, 0, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_OBJECT)
+
+    def test_an_unreadable_first_block_takes_the_tail_route(self) -> None:
+        blocks = self._pm()
+        tape = impl.DamagedTape(blocks + [None], {0})
+        walked = impl.classify_file(tape, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_PARITY_MAP)
+        self.assertIn("first block is unreadable", walked.note)
+
+    def test_neither_route_leaves_an_object_candidate(self) -> None:
+        blocks = self._pm()
+        first = bytearray(blocks[0])
+        first[0xC0] ^= 1
+        tail = bytearray(blocks[-1])
+        tail[0xC0] ^= 1  # the footer's CRC: it does not parse
+        tape = impl.DamagedTape([bytes(first)] + blocks[1:-1] + [bytes(tail), None], set())
+        walked = impl.classify_file(tape, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_OBJECT)
+        self.assertIsNone(walked.failed_classification)
+
+    def test_a_footer_count_mismatch_is_reported_whether_or_not_the_tail_header_parses(self) -> None:
+        blocks = self._pm()
+        for damage_tail in (False, True):
+            copy = list(blocks)
+            if damage_tail:
+                tail_block = bytearray(copy[len(copy) // 2])
+                tail_block[0xC0] ^= 1
+                copy[len(copy) // 2] = bytes(tail_block)
+            first = bytearray(copy[0])
+            first[0xC0] ^= 1
+            copy[0] = bytes(first)
+            tape = impl.DamagedTape(copy[:-1] + [b"X" * self.size] + copy[-1:] + [None], set())
+            walked = impl.classify_file(tape, 3, 0, len(blocks) + 1, self.image.tape_uuid, self.size)
+            self.assertEqual(walked.kind, impl.KIND_OBJECT)
+            self.assertIn("tail route", walked.failed_classification)
+
+    def test_a_tail_header_that_disagrees_with_the_footer_is_not_recognised(self) -> None:
+        blocks = self._pm()
+        middle = len(blocks) // 2
+        tail_block = bytearray(blocks[middle])
+        tail_block[0x20] ^= 1  # sequence, then the header CRC is recomputed
+        tail_block[0xC0:0xC8] = impl.le64(impl.crc64_xz(bytes(tail_block[0:0xC0])))
+        first = bytearray(blocks[0])
+        first[0xC0] ^= 1
+        copy = [bytes(first)] + blocks[1:middle] + [bytes(tail_block)] + blocks[middle + 1:]
+        tape = impl.DamagedTape(copy + [None], set())
+        walked = impl.classify_file(tape, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_OBJECT)
+
+    def test_either_copy_kind_parses_as_the_header(self) -> None:
+        blocks = self._pm()
+        middle = len(blocks) // 2
+        # The tail copy's first block, as tape file 3's block 0.
+        tape = impl.DamagedTape([blocks[middle]] + blocks[1:] + [None], set())
+        walked = impl.classify_file(tape, 3, 0, len(blocks), self.image.tape_uuid, self.size)
+        self.assertEqual(walked.kind, impl.KIND_PARITY_MAP)
+        self.assertIn("first block", walked.note)
+
+    def test_a_sidecar_primary_header_parses_from_block_zero_on_its_own(self) -> None:
+        # 12.3: "A primary header parses when its block satisfies Section 9.2 on its own".
+        sidecar = next(f for f in self.image.files if f.kind == impl.KIND_SIDECAR)
+        blocks = list(sidecar.blocks)
+        header = impl.parse_sidecar_copy([blocks[0]], self.image.tape_uuid, self.size, 1, header_only=True)
+        self.assertEqual(header["total"], len(blocks))
+
+
 class F4TextTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

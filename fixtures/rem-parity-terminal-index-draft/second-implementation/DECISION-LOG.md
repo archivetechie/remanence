@@ -235,3 +235,94 @@ Checked and unchanged:
   prefix, adds a failing rule to neg-03, neg-44 and sup-15's replica A; their decisions and
   self-checks are unchanged, and sup-15's dispute count rises from 2 rules to 3.
 - e3-07's Scanner, walk and Verifier results, and e3-01's Scanner and walk kinds, are as in F3b.
+
+## The staged text of Section 12.3 (Step 6, F0)
+
+The staged text rewrites four points of the classification ladder: how tape file 0 is
+typed when the bootstrap is unreadable on supplied values, what it means for a rung to
+"parse" a file, the footer route of items 2 and 3 when the head is unreadable, and how a
+ParityMap is recognised (from block 0 alone). Each existing decision whose deciding
+sentence changed was re-decided from the new sentence, and no row follows an expected
+outcome. The resume, negative, negative-e1, negative-supplement, negative-block, mutation and
+selection files are byte-identical to the previous ones. `decisions.json`,
+`decisions-real-ids.json` and their traces change only as listed. No `classes`, `error`,
+`outcome`, `map` or `verifier.*` value of any damage case changes: none of the 57 cases has a
+walk over an unreadable bootstrap, a ParityMap that fails its payload with a parsing header, or
+a file that a rung parses but does not recognise, other than the ones already decided in F4.
+
+### The three quotes
+
+| Quote | Old text | New text (Section 12.3) |
+| --- | --- | --- |
+| `replica_footer_type` | "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked." | "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses." (item 2) |
+| `separation_footer_type` | "When the head is unreadable, a matching, fully parsed footer establishes the type." | "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says." (item 3) |
+| `ladder_parity_map` | "**ParityMap**: a complete copy/header and payload validate, and the measured block count agrees with its locator footer." | "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`." (item 4) |
+
+New quotes, for the sentences that now decide: `parse_def`, `footer_readable_head`,
+`footer_rule_scope`, `file0_by_length`, `file0_one_block`, `file0_many_blocks`,
+`file0_no_footer_rule`, `item1_file0`, `pm_block0`, `pm_still_the_map`, `pm_header_unparsed`.
+`tail_probe_serves` is no longer cited for a file whose head is readable (e3-05): it belongs
+to the unreadable-head paragraph only.
+
+### Decisions revised (the rule, and the effect on the 57 cases)
+
+| Point | Old outcome (my F4 walk) | New outcome | Deciding sentence | Effect on the cases |
+| --- | --- | --- | --- | --- |
+| Tape file 0, bootstrap unreadable on supplied values | Read like any file: an unreadable head gave an Object candidate (a foreign or unusable head, an Object by elimination). Nothing said the walk ends for a multi-block file 0 | Typed by measured length, no bootstrap read: one block is a bootstrap (the supplied values classify it, they do not authenticate it); more than one block gives no class and the walk ends with `FilemarkMapReconstruct`; a filemark or EOD first gives no tape file 0 and the same error; the unreadable-head paragraph and the footer sentences of items 2 and 3 do not apply to file 0 | 12.3: "In that case a tape file 0 that measures exactly one block is typed a bootstrap: the supplied values classify it and do not authenticate it, and no value is taken from its bytes." "In that case a tape file 0 that measures more than one block cannot be a bootstrap (Sections 3.1 and 8.1), and the walk ends with `FilemarkMapReconstruct` (Section 15), because it cannot produce a valid map." "A filemark or EOD where the first record should be leaves no tape file 0 to type, and the walk ends with `FilemarkMapReconstruct` for the same reason." | none: bootstrap-hinted, bootstrap-wrong-scheme and the other unreadable-bootstrap cases have valid replicas, so the walk is `not_run`. Unit tests only |
+| Item 1 at another tape file | A bootstrap magic at any file with a parsing frame, this tape's UUID and one block was typed a bootstrap | Not parsed by item 1; the later rungs try it (footer rule, item 6, item 7) | 12.3: "Item 1 checks that the file is tape file 0: a block that carries the bootstrap magic at any other tape file is not parsed by item 1, and the later rungs try the file." | none |
+| A rung that parses, item 1 | A bootstrap magic whose frame or UUID failed was `unrecognised` at once, so the footer rule never ran for it | It does not parse, so the footer rule and the later rungs try the file. A frame that parses on this tape but a count other than 1 still gives the failed classification and item 7, and the footer rule does not apply | 12.3: "A rung parses a file when the file passes every check of that rung except its measured block count." "... and no rung of items 1, 4 or 5 parses it." | none |
+| ParityMap recognition | Item 4 read and validated both copies, the payload and the footer; a failure gave an Object with a failed classification, and the walk's map held an Object entry | Item 4 reads block 0 only. A parsing header and an equal count give a ParityMap even when the payload, tail copy or footer fail; it then does not validate, so the second pass and Section 13.1 take no final ParityMap from it. A header that does not parse is not recognised and the later rungs try the file. A parsing header with another count is the failed classification, and item 7 | 12.3: "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`." "This item reads neither the payload nor the footer." "... and a ParityMap that fails them is still the ParityMap of the walk." "A block that carries the magic and whose header does not parse is not recognised by this item, and the later rungs try the file." | none: every ParityMap in the cases validates (the note in the trace changes; the citations gain the three sentences) |
+| Item 5 header | The primary "parses" only when the whole copy (every index block, the payload hash) verified | The primary header parses from block 0 alone: the magic, the tape UUID, both CRCs, every constraint of the table, `copy_kind` 1 and the zero fill of block 0. The count is then the only further check | 12.3: "A primary header parses when its block satisfies Section 9.2 on its own: the magic, the tape UUID, both CRCs, every constraint of the table, `copy_kind` 1 and the zero fill." | none: a primary whose later index block is damaged and whose header parses is not in the cases |
+| Footer route, head unreadable | The footer had to parse and its count agree to establish the type; anything else gave an Object candidate (or the sidecar probe) | A footer whose magic matches establishes the type whether or not it parses. If it does not parse, or its count differs from the measured count, the file is reported as a damaged terminal replica (or separation extent); otherwise it is the type, not reported as damaged | 12.3 item 2: "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses. The footer takes the header's place in the check below: a footer that does not parse, or whose record count differs from the measured count, is reported as a damaged terminal replica." Item 3: "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says." | Kinds unchanged. The trace note for the three unreadable-head replicas of replicas-all, walk-sidecar-isolation, walk-directory-rescue no longer says "damaged terminal replica": their footers parse and the counts agree. No `walk.classes`, `error` or verifier value changes |
+| Footer route, head readable | The same rule, cited with the unreadable-head sentences | The rule of items 2 and 3 for a readable, foreign head when no rung of items 1, 4 or 5 parses the file; the citations are now the readable-head sentences, and e3-05's `verifier-full` finding names the head ("the head is not its header") | 12.3: "In items 2 and 3 a footer whose magic matches establishes the type also when the head is readable, is not a header of that type, and no rung of items 1, 4 or 5 parses it. If the footer does not parse or the count disagrees, the file keeps its control type, damaged." | e3-05 `verifier-full.other_findings[2].finding` (a reason string) |
+
+### Rows of the decision files that change
+
+- `decisions.json`, `decisions-real-ids.json`: the `walk.citations` of e2-04, e2-13, e3-01 to e3-07, filemark-prefix, replicas-all,
+  walk-directory-rescue and walk-sidecar-isolation (three ParityMap sentences added; the two
+  footer sentences replaced with the new ones where the head is unreadable; `parse_def` added to e2-13 and filemark-prefix,
+  which report a failed classification; e3-05 drops `tail_probe_serves` and gains the readable-head sentences), and the
+  reason string of e3-05's `verifier-full` finding of file 8.
+- The traces: the note of each ParityMap ("ParityMap by its first block: header parses, measured count agrees") and of each
+  unreadable-head replica ("terminal replica established by its footer ...").
+
+Checked and unchanged: the bootstrap path of Section 8.4 (`judge_supplied_bootstrap`); the counts of files in e3-01 to e3-07;
+Section 12.6's exact-suffix test, which reads "none of them damaged" and counts a replica reported by the two conditions of item 2
+as damaged (GAPS O-4).
+
+## The staged text of Section 12.3, again (Step 6, F0b)
+
+Item 4 now also recognises a ParityMap by a tail route, the tape-file-0 carve-out excludes that
+route, and Appendix D TT-2 was reworded. Every decision file was regenerated. `resume`,
+`negatives`, `negatives-supplement`, `negative-e1`, `negative-blocks`, `mutations`, `selection` and
+`build-report.json` are byte-identical to F0's. In the walk decisions only `walk.citations` change
+(the four re-quoted sentences and the new ones). The traces are byte-identical to F0's. No `classes`,
+`error`, `outcome`, `map` or verifier value of any case changes: no damage case has a ParityMap that
+the head route does not take, and none has a walk over an unreadable bootstrap.
+
+### The four quotes
+
+| Quote | Old text | New text |
+| --- | --- | --- |
+| `pm_block0` | "This item reads neither the payload nor the footer." | "This item reads no payload, and reads a footer only on that route." (12.3 item 4) |
+| `pm_header_unparsed` | "A block that carries the magic and whose header does not parse is not recognised by this item, and the later rungs try the file." | "A file that neither route recognises is not recognised by this item, and the later rungs try it." (12.3 item 4) |
+| `tt2_walk_pm` | "The walk route cannot find a ParityMap whose block 0 is unreadable; the replica route survives that damage by locating it through structural rows." | "Section 12.3 (item 4) finds a ParityMap whose block 0 is unreadable, or damaged so that no head rung takes it, through its footer and tail header copy, and the replica route survives that damage by locating it through structural rows." (Appendix D TT-2) |
+| `file0_no_footer_rule` | "In that case, of one block or more, neither the paragraph headed \u201cUnreadable head block\u201d, below, nor the footer sentences of items 2 and 3 apply to tape file 0." | The same, "... nor the footer sentences of items 2 and 3, nor the tail route of item 4 apply to tape file 0." |
+
+New quotes: `pm_either_kind`, `pm_either_route`, `pm_tail_route`, `pm_tail_footer`, `pm_tail_mismatch`, `pm_tail_serves`, `file0_zero_block`.
+
+### Decisions revised
+
+| Point | Old outcome (F0 walk) | New outcome | Deciding sentence | Effect on the cases |
+| --- | --- | --- | --- | --- |
+| ParityMap whose first block is unreadable, or is not taken by any head rung, away from tape file 0 | An Object candidate (the head rung failed; nothing else read the last block) | The walk reads the last block. A footer that parses (10.1.3) with the ParityMap magic locates the tail header copy at its `tail_copy_start_block`; the file is a ParityMap if that tail header parses and agrees with the footer and the footer's total equals the measured count. No payload is read | 12.3 item 4: "Away from tape file 0, when the first block is unreadable, or no rung of items 1 or 5 parses it and it is not a ParityMap header that parses, the walk reads the file's last block. If that block is a footer whose magic matches and that parses (Section 10.1.3), the footer locates the tail header copy at its `tail_copy_start_block`, and the file is a ParityMap if that tail header parses and agrees with the footer and the footer's `parity_map_total_block_count` equals the measured block count." | none |
+| The same, when the footer parses and its total differs from the measured count | (not reached) | The failed classification is reported, whether or not the tail header parses; the file is not recognised, so item 7 applies | "If the footer parses and its total differs from the measured count, the failed classification is reported whether or not the tail header parses, and the file is not recognised." | none |
+| Header route | Only a copy-kind-1 header parsed | Either copy kind, 1 or 2, parses | "The header may be either copy kind, 1 or 2." | none |
+| A file no route recognises | (same) | Not recognised; the later rungs (item 6, the footer sentences of items 2 and 3, item 7) try it | "A file that neither route recognises is not recognised by this item, and the later rungs try it." | none |
+| Where the route applies | (new) | Not at tape file 0, and never in the unreadable-bootstrap carve-out | "... neither the paragraph headed \u201cUnreadable head block\u201d, below, nor the footer sentences of items 2 and 3, nor the tail route of item 4 apply to tape file 0." | none |
+| Unreadable head paragraph | The last block served the footer probe of items 2 and 3 | It also serves the tail route; a file item 4 recognises by it is a ParityMap, not an object candidate | "It also serves the tail route of item 4, and a file that item 4 recognises by that route is a ParityMap and not an object candidate." | none |
+| Reading of "parse" for item 4 | The header route only | Either route may be the one that parses, so the footer rule of items 2 and 3 does not run for a file the tail route parses | "For item 4 either route of that item may be the one that parses." | none |
+
+Checked and unchanged: the sequence of the rungs (items 2 and 3's header magics commit first, as they state; the
+tail route is tried where the footer rule was, before it).
+

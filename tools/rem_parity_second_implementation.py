@@ -2095,12 +2095,12 @@ QUOTES: dict[str, tuple[str, str]] = {
     "authority_not_recovered": ("8.4.1", "The Scanner MUST report that terminal authority was not recovered."),
     "walk_file": ("12.2", "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."),
     "unreadable_head": ("12.3", "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."),
-    "replica_footer_type": ("12.3", "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked."),
-    "separation_footer_type": ("12.3", "When the head is unreadable, a matching, fully parsed footer establishes the type."),
+    "replica_footer_type": ("12.3", "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."),
+    "separation_footer_type": ("12.3", "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."),
     "ladder_bootstrap": ("12.3", "**Bootstrap**: the fixed magic matches, the full frame parses, the frame's `block_size_bytes` equals the read size, the frame's `tape_uuid` equals the tape identity of Section 12.1, and the file measures exactly 1 block."),
     "ladder_replica": ("12.3", "**TapeIndexReplica**: matching terminal-replica header magic commits the tape file to this control type."),
     "ladder_separation": ("12.3", "**IndexSeparationExtent**: matching separation-header magic commits the tape file to this control type under the same malformed-control and measured count rules."),
-    "ladder_parity_map": ("12.3", "**ParityMap**: a complete copy/header and payload validate, and the measured block count agrees with its locator footer."),
+    "ladder_parity_map": ("12.3", "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."),
     "ladder_sidecar": ("12.3", "**Sidecar (primary)**: the primary header parses, and the measured block count MUST equal the header's `sidecar_total_block_count`."),
     "footer_probe": ("12.3", "If it parses as a sidecar footer, the footer's total MUST equal the measured block count, and the Scanner verifies the tail header copy against the footer, field for field."),
     "ladder_object": ("12.3", "**Object, by elimination** — never by reading object content."),
@@ -2146,7 +2146,7 @@ QUOTES: dict[str, tuple[str, str]] = {
     "parity_locator": ("9.1", "A Reader MUST locate a parity shard by computing `block(stripe, parity_index)` from its explicit fields, never by the position of its index entry."),
     "pm_copies": ("10.1.3", "When one header copy is invalid and the other is valid, the valid copy is used; when both are valid they MUST agree (Section 10.1.4)."),
     "pm_crc": ("10.1.3", "A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the footer, and MUST NOT rely on a block whose CRC does not verify."),
-    "tt2_walk_pm": ("D", "The walk route cannot find a ParityMap whose block 0 is unreadable; the replica route survives that damage by locating it through structural rows."),
+    "tt2_walk_pm": ("D", "Section 12.3 (item 4) finds a ParityMap whose block 0 is unreadable, or damaged so that no head rung takes it, through its footer and tail header copy, and the replica route survives that damage by locating it through structural rows."),
     "selection_guide": ("C", "the selection order among agreeing replicas"),
     "bootstrap_supplied_refused": ("8.4", "A readable bootstrap whose values disagree with the supplied ones is refused; the supplied values never take its place."),
     "hint_walk_accept": ("8.4.1", "A Scanner MUST accept an expected tape UUID,"),
@@ -2192,6 +2192,24 @@ QUOTES.update({
     'first_record_scheme': ('8.4', '| a decodable parity scheme disagrees with the supplied scheme | refuses it (`BootstrapParse`, naming the scheme) |'),
     'unreadable_untrusted': ('8.4', 'A bootstrap that is treated as unreadable is not trusted for any value.'),
     'recognises': ('12.3', 'For items 1, 4, 5 and 6, a rung *recognises* a tape file only when the file passes every check of that rung, its measured block count included; a file that fails one of them is not recognised.'),
+    'parse_def': ('12.3', 'A rung parses a file when the file passes every check of that rung except its measured block count.'),
+    'footer_readable_head': ('12.3', 'In items 2 and 3 a footer whose magic matches establishes the type also when the head is readable, is not a header of that type, and no rung of items 1, 4 or 5 parses it.'),
+    'footer_rule_scope': ('12.3', 'If the footer does not parse or the count disagrees, the file keeps its control type, damaged.'),
+    'file0_by_length': ('12.3', 'When Section 8.4 treats that record as unreadable because of a medium error, or because its content is not a usable bootstrap, the walk continues on the supplied values and types tape file 0 by its measured length, without reading a bootstrap from it.'),
+    'file0_one_block': ('12.3', 'In that case a tape file 0 that measures exactly one block is typed a bootstrap: the supplied values classify it and do not authenticate it, and no value is taken from its bytes.'),
+    'file0_many_blocks': ('12.3', 'In that case a tape file 0 that measures more than one block cannot be a bootstrap (Sections 3.1 and 8.1), and the walk ends with `FilemarkMapReconstruct` (Section 15), because it cannot produce a valid map.'),
+    'file0_no_footer_rule': ('12.3', 'In that case, of one block or more, neither the paragraph headed \u201cUnreadable head block\u201d, below, nor the footer sentences of items 2 and 3, nor the tail route of item 4 apply to tape file 0.'),
+    'file0_zero_block': ('12.3', 'A filemark or EOD where the first record should be is a zero-block file, or EOD at a file start (Section 12.2); it leaves no tape file 0 to type, and the walk ends with `FilemarkMapReconstruct` for the same reason.'),
+    'item1_file0': ('12.3', 'Item 1 checks that the file is tape file 0: a block that carries the bootstrap magic at any other tape file is not parsed by item 1, and the later rungs try the file.'),
+    'pm_block0': ('12.3', 'This item reads no payload, and reads a footer only on that route.'),
+    'pm_either_kind': ('12.3', 'The header may be either copy kind, 1 or 2.'),
+    'pm_either_route': ('12.3', 'For item 4 either route of that item may be the one that parses.'),
+    'pm_tail_route': ('12.3', "Away from tape file 0, when the first block is unreadable, or no rung of items 1 or 5 parses it and it is not a ParityMap header that parses, the walk reads the file's last block."),
+    'pm_tail_footer': ('12.3', "If that block is a footer whose magic matches and that parses (Section 10.1.3), the footer locates the tail header copy at its `tail_copy_start_block`, and the file is a ParityMap if that tail header parses and agrees with the footer and the footer's `parity_map_total_block_count` equals the measured block count."),
+    'pm_tail_mismatch': ('12.3', 'If the footer parses and its total differs from the measured count, the failed classification is reported whether or not the tail header parses, and the file is not recognised.'),
+    'pm_tail_serves': ('12.3', 'It also serves the tail route of item 4, and a file that item 4 recognises by that route is a ParityMap and not an object candidate.'),
+    'pm_still_the_map': ('12.3', 'a ParityMap that fails them is still the ParityMap of the walk.'),
+    'pm_header_unparsed': ('12.3', 'A file that neither route recognises is not recognised by this item, and the later rungs try it.'),
     'failed_reports': ('12.3', 'A rung that parses a file but fails its measured count reports the failed classification.'),
     'item5_decides': ('12.3', "When a sidecar's primary header parses, item 5 decides the sidecar rung for that file: if its count fails, item 6 is not tried."),
     'not_recognised_item7': ('12.3', 'Under items 2 and 3 the file keeps its control type, damaged; under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies.'),
@@ -2941,8 +2959,14 @@ def discover_layout(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tup
 # ----- sidecars and ParityMaps ---------------------------------------------
 
 
-def parse_sidecar_copy(blocks: list[bytes], tape_uuid: bytes, block_size: int, copy_kind: int) -> dict[str, Any]:
-    """Validate one header/index copy (Sections 9.2-9.5)."""
+def parse_sidecar_copy(blocks: list[bytes], tape_uuid: bytes, block_size: int, copy_kind: int,
+                       header_only: bool = False) -> dict[str, Any]:
+    """Validate one header/index copy (Sections 9.2-9.5).
+
+    With `header_only`, `blocks` is block 0 alone and the check is the one Section 12.3 calls a header that
+    "parses": Section 9.2 on its own (the magic, the tape UUID, both CRCs, every constraint of the table,
+    `copy_kind` and the zero fill), with no index block read and no hash verified.
+    """
     head = blocks[0]
     if head[0:8] != role_magic(tape_uuid, LABEL_SIDECAR):
         raise ReadFailure("SidecarParse", "sidecar magic")
@@ -2988,6 +3012,16 @@ def parse_sidecar_copy(blocks: list[bytes], tape_uuid: bytes, block_size: int, c
         problems.append("copy_kind, reserved or copy_generation")
     if problems:
         raise ReadFailure("SidecarParse", ", ".join(problems))
+    if header_only:
+        used = bytearray(head[: block_size - 8])
+        used[0:0xC8] = bytes(0xC8)
+        parity_count = fields["S"] * fields["m"]
+        for number, offset in enumerate(placements[0]):
+            length = 16 if number < parity_count else 8
+            used[offset : offset + length] = bytes(length)
+        if any(used):
+            raise ReadFailure("SidecarParse", "block 0 zero fill nonzero")
+        return fields
     if len(blocks) != header_blocks:
         raise ReadFailure("SidecarParse", "wrong number of copy blocks supplied")
     stream = bytearray()
@@ -3050,32 +3084,44 @@ def read_blocks(tape: DamagedTape, start: int, count: int) -> list[bytes]:
     return [tape.read_data(start + index) for index in range(count)]
 
 
+def parity_map_header_fields(block: bytes, copy_kind: int, tape_uuid: bytes, block_size: int) -> dict[str, Any]:
+    """A ParityMap header (or footer) block that satisfies Section 10.1.3 on its own.
+
+    The magic, the tape UUID, the block size, the CRC, every constraint of the
+    table, and the locator counts, which agree with the values Section 10.1.2
+    derives from `payload_len` and the block size. It reads neither the
+    payload nor the footer; Sections 10.1.3 and 10.1.4 check those when the
+    ParityMap is read.
+    """
+    if block[0:8] != role_magic(tape_uuid, LABEL_PARITY_MAP):
+        raise ReadFailure("ParityMapParse", "magic")
+    if crc64_xz(block[0:0xC0]) != rd64(block, 0xC0):
+        raise ReadFailure("ParityMapParse", "CRC")
+    fields = {
+        "version": rd16(block, 0x08), "copy_kind": rd16(block, 0x0A), "uuid": block[0x10:0x20],
+        "sequence": rd64(block, 0x20), "block_size": rd32(block, 0x28), "payload_len": rd64(block, 0x30),
+        "payload_sha": block[0x38:0x58], "digest": block[0x58:0x78], "scope": rd64(block, 0x78),
+        "total": rd64(block, 0x80), "watermark": rd64(block, 0x88), "final": block[0x90],
+        "M": rd64(block, 0x98), "total_blocks": rd64(block, 0xA0), "primary": rd64(block, 0xA8),
+        "tail": rd64(block, 0xB0), "footer": rd64(block, 0xB8),
+    }
+    copy_blocks = ceil_div(0xC8 + fields["payload_len"], block_size)
+    if fields["version"] != 2 or fields["copy_kind"] != copy_kind or rd32(block, 0x0C) or rd32(block, 0x2C) \
+            or any(block[0x91:0x98]) or fields["uuid"] != tape_uuid or fields["block_size"] != block_size:
+        raise ReadFailure("ParityMapParse", "fixed fields")
+    if fields["final"] not in (0, 1):
+        raise ReadFailure("ParityMapParse", "is_final_directory byte")
+    if (fields["M"], fields["total_blocks"], fields["primary"], fields["tail"], fields["footer"]) != (
+            copy_blocks, 2 * copy_blocks + 1, 0, copy_blocks, 2 * copy_blocks):
+        raise ReadFailure("ParityMapParse", "locator arithmetic")
+    return fields
+
+
 def parse_parity_map(tape: DamagedTape, start: int, count: int, tape_uuid: bytes, block_size: int) -> dict[str, Any]:
     """Read and validate a final ParityMap tape file (Section 10.1)."""
 
     def header_fields(block: bytes, copy_kind: int) -> dict[str, Any]:
-        if block[0:8] != role_magic(tape_uuid, LABEL_PARITY_MAP):
-            raise ReadFailure("ParityMapParse", "magic")
-        if crc64_xz(block[0:0xC0]) != rd64(block, 0xC0):
-            raise ReadFailure("ParityMapParse", "CRC")
-        fields = {
-            "version": rd16(block, 0x08), "copy_kind": rd16(block, 0x0A), "uuid": block[0x10:0x20],
-            "sequence": rd64(block, 0x20), "block_size": rd32(block, 0x28), "payload_len": rd64(block, 0x30),
-            "payload_sha": block[0x38:0x58], "digest": block[0x58:0x78], "scope": rd64(block, 0x78),
-            "total": rd64(block, 0x80), "watermark": rd64(block, 0x88), "final": block[0x90],
-            "M": rd64(block, 0x98), "total_blocks": rd64(block, 0xA0), "primary": rd64(block, 0xA8),
-            "tail": rd64(block, 0xB0), "footer": rd64(block, 0xB8),
-        }
-        copy_blocks = ceil_div(0xC8 + fields["payload_len"], block_size)
-        if fields["version"] != 2 or fields["copy_kind"] != copy_kind or rd32(block, 0x0C) or rd32(block, 0x2C) \
-                or any(block[0x91:0x98]) or fields["uuid"] != tape_uuid or fields["block_size"] != block_size:
-            raise ReadFailure("ParityMapParse", "fixed fields")
-        if fields["final"] not in (0, 1):
-            raise ReadFailure("ParityMapParse", "is_final_directory byte")
-        if (fields["M"], fields["total_blocks"], fields["primary"], fields["tail"], fields["footer"]) != (
-                copy_blocks, 2 * copy_blocks + 1, 0, copy_blocks, 2 * copy_blocks):
-            raise ReadFailure("ParityMapParse", "locator arithmetic")
-        return fields
+        return parity_map_header_fields(block, copy_kind, tape_uuid, block_size)
 
     def parse_copy(first_block: int, copy_kind: int) -> dict[str, Any]:
         head = tape.read_data(start + first_block)
@@ -3185,25 +3231,38 @@ class WalkedFile:
 
 
 def classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, tape_uuid: bytes,
-                  block_size: int) -> WalkedFile:
+                  block_size: int, bootstrap_unreadable: bool = False) -> WalkedFile:
     """The ladder for one file; undecidable when it must read a record whose bytes are not derivable (GAPS.md)."""
     try:
-        return _classify_file(tape, tape_file, start, count, tape_uuid, block_size)
+        return _classify_file(tape, tape_file, start, count, tape_uuid, block_size, bootstrap_unreadable)
     except Underivable as failure:
         return WalkedFile(tape_file, start, count, None, f"undecidable: the record at LBA {failure.args[0]} is not "
                           "derivable", undecidable=True)
 
 
 def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, tape_uuid: bytes,
-                   block_size: int) -> WalkedFile:
+                   block_size: int, bootstrap_unreadable: bool = False) -> WalkedFile:
     """Section 12.3's ladder for one measured tape file.
 
     Items 2 and 3 commit a file to its control type as soon as its magic
     matches. Items 1, 4, 5 and 6 recognise a file only when it passes every
-    check of the rung, its measured count included; a file that one of them
-    parses but does not recognise has its failed classification reported,
-    and item 7 then makes it an Object candidate.
+    check of the rung, its measured count included; a rung *parses* a file when
+    it passes every check but that count. A file that one of them parses but
+    does not recognise has its failed classification reported, and item 7 then
+    makes it an Object candidate. A file that none of items 1, 4 or 5 parses
+    can take its control type from its footer (items 2 and 3).
     """
+    if tape_file == 0 and bootstrap_unreadable:
+        # Section 12.3: with supplied values, when Section 8.4 treats the first record as unreadable, the walk
+        # types tape file 0 by its measured length, reads no bootstrap from it, and neither the unreadable-head
+        # paragraph nor the footer sentences of items 2 and 3 apply to it.
+        if count == 1:
+            return WalkedFile(tape_file, start, count, KIND_BOOTSTRAP,
+                              "bootstrap by measured length (one block): the supplied values classify it and do not "
+                              "authenticate it; no value is taken from its bytes")
+        return WalkedFile(tape_file, start, count, None,
+                          f"a tape file 0 of {count} blocks cannot be a bootstrap (Sections 3.1 and 8.1); "
+                          "FilemarkMapReconstruct (Section 15)")
     try:
         head = tape.read_data(start)
         head_error = None
@@ -3238,17 +3297,79 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
             return unrecognised(f"sidecar tail copy: {failure.reason} (Section 12.3 item 6)")
         return WalkedFile(tape_file, start, count, KIND_SIDECAR, note, footer["epoch_id"], footer["start"], footer["end"])
 
+    def parity_map_tail_route(last_block: bytes | None) -> WalkedFile | None:
+        """Item 4's tail route (away from tape file 0): the last block, a parsing footer whose magic matches, and
+        the tail header copy that footer locates. Reads no payload."""
+        if tape_file == 0 or last_block is None or last_block[0:8] != role_magic(tape_uuid, LABEL_PARITY_MAP):
+            return None
+        try:
+            footer = parity_map_header_fields(last_block, 0, tape_uuid, block_size)
+        except ReadFailure:
+            return None
+        if footer["total_blocks"] != count:
+            return unrecognised(f"ParityMap footer total {footer['total_blocks']} differs from the measured {count} "
+                                "blocks (Section 12.3 item 4, tail route)")
+        try:
+            if not footer["tail"] < count:
+                return None
+            tail = parity_map_header_fields(tape.read_data(start + footer["tail"]), 2, tape_uuid, block_size)
+        except (MediumError, ReadFailure):
+            return None
+        if any(tail[key] != footer[key] for key in footer if key != "copy_kind"):
+            return None
+        walked = WalkedFile(tape_file, start, count, KIND_PARITY_MAP,
+                            "ParityMap by its tail route: the footer parses, and the tail header copy it locates parses "
+                            "and agrees with it" + ("; the first block is unreadable" if head is None else ""))
+        try:
+            walked.parity_map = parse_parity_map(tape, start, count, tape_uuid, block_size)  # type: ignore[attr-defined]
+        except ReadFailure as failure:
+            walked.parity_map = None  # type: ignore[attr-defined]
+            walked.note += f"; it fails Section 10.1 when read ({failure.reason}), so it does not validate"
+        return walked
+
+    def footer_type(last_block: bytes, head_note: str) -> WalkedFile | None:
+        """Items 2 and 3: a footer whose magic matches establishes the control type, whether or not it parses.
+
+        The footer takes the header's place in the check: a footer that does not parse, or whose record count
+        differs from the measured count, is reported as damaged.
+        """
+        for label, kind, role_label, parse_footer, index_map in (
+                (LABEL_REPLICA_FOOTER, KIND_REPLICA, "terminal replica", parse_replica_frame, {1: 0, 2: 2, 3: 4}),
+                (LABEL_SEPARATION_FOOTER, KIND_SEPARATION, "separation extent", parse_separation_frame, {1: 1, 2: 3})):
+            if last_block[0:8] != role_magic(tape_uuid, label):
+                continue
+            try:
+                footer = parse_footer(last_block, tape_uuid, block_size, 2)
+            except ReadFailure as failure:
+                return WalkedFile(tape_file, start, count, kind,
+                                  f"damaged {role_label}: {head_note}; type established by its footer's magic; "
+                                  f"the footer does not parse ({failure.reason})")
+            planned = footer["tuples"][index_map[footer["ordinal"]]][5]
+            if planned != count:
+                return WalkedFile(tape_file, start, count, kind,
+                                  f"damaged {role_label}: {head_note}; type established by its footer, measured "
+                                  f"{count} blocks, the planned component has {planned}")
+            return WalkedFile(tape_file, start, count, kind,
+                              f"{role_label} established by its footer ({head_note})")
+        return None
+
     if head is not None:
         magic = head[0:8]
-        if magic == BOOTSTRAP_MAGIC_BYTES:
+        if magic == BOOTSTRAP_MAGIC_BYTES and tape_file == 0:
+            # Item 1 parses the file when the magic, the frame, the block size and the tape UUID all check.
             try:
                 boot = parse_bootstrap(head, block_size)
-                if boot["tape_uuid"] == tape_uuid and count == 1:
-                    return WalkedFile(tape_file, start, count, KIND_BOOTSTRAP, "bootstrap")
-                failure = "bootstrap magic, but the tape UUID differs or the file is not one block"
+                parsed = boot["tape_uuid"] == tape_uuid
+                failure = "bootstrap magic, but the tape UUID differs"
             except ReadFailure as failure_detail:
+                parsed = False
                 failure = f"bootstrap magic, frame invalid ({failure_detail.reason})"
-            return unrecognised(failure + " (Section 12.3 item 1)")
+            if parsed:
+                if count == 1:
+                    return WalkedFile(tape_file, start, count, KIND_BOOTSTRAP, "bootstrap")
+                return unrecognised(f"bootstrap parses, but the file measures {count} blocks, not 1 "
+                                    "(Section 12.3 item 1)")
+            # Not parsed: the later rungs try the file.
         if magic == role_magic(tape_uuid, LABEL_REPLICA_HEADER):
             try:
                 header = parse_replica_frame(head, tape_uuid, block_size, 1)
@@ -3272,54 +3393,55 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
             except ReadFailure as failure:
                 return WalkedFile(tape_file, start, count, KIND_SEPARATION, f"damaged separation extent: {failure.reason}")
         if magic == role_magic(tape_uuid, LABEL_PARITY_MAP):
-            try:
-                parity_map = parse_parity_map(tape, start, count, tape_uuid, block_size)
-                walked = WalkedFile(tape_file, start, count, KIND_PARITY_MAP, "ParityMap validates")
-                walked.parity_map = parity_map  # type: ignore[attr-defined]
+            # Item 4 recognises a ParityMap from block 0 alone: the header parses and the measured count equals its
+            # `parity_map_total_block_count`. Neither the payload nor the footer is read; a ParityMap that fails
+            # Sections 10.1.3 and 10.1.4 is still the ParityMap of the walk.
+            header = None  # not parsed: the later rungs try the file
+            for kind in (1, 2):
+                try:
+                    header = parity_map_header_fields(head, kind, tape_uuid, block_size)
+                    break
+                except ReadFailure:
+                    continue
+            if header is not None:
+                if header["total_blocks"] != count:
+                    return unrecognised(f"ParityMap header total {header['total_blocks']} differs from the measured "
+                                        f"{count} blocks (Section 12.3 item 4)")
+                walked = WalkedFile(tape_file, start, count, KIND_PARITY_MAP,
+                                    "ParityMap by its first block: header parses, measured count agrees")
+                try:
+                    walked.parity_map = parse_parity_map(tape, start, count, tape_uuid, block_size)  # type: ignore[attr-defined]
+                except ReadFailure as failure:
+                    walked.parity_map = None  # type: ignore[attr-defined]
+                    walked.note += f"; it fails Section 10.1 when read ({failure.reason}), so it does not validate"
                 return walked
-            except ReadFailure as failure:
-                probe = sidecar_footer_probe()
-                if probe is not None:
-                    return probe
-                return unrecognised(f"ParityMap: {failure.reason} (Section 12.3 item 4)")
         if magic == role_magic(tape_uuid, LABEL_SIDECAR):
+            # Item 5 parses the primary header from block 0 on its own (Section 9.2).
             try:
-                header_blocks_guess = rd64(head, 0x60)
-                if 1 <= header_blocks_guess <= count:
-                    primary = parse_sidecar_copy(read_blocks(tape, start, header_blocks_guess), tape_uuid, block_size, 1)
-                    if primary["total"] != count:
-                        # Item 5 decides the sidecar rung when the primary parses.
-                        return unrecognised(f"primary header total {primary['total']} differs from the measured "
-                                            f"{count} blocks (Section 12.3 item 5; item 6 is not tried)")
-                    return WalkedFile(tape_file, start, count, KIND_SIDECAR, "sidecar by primary header",
-                                      primary["epoch_id"], primary["start"], primary["end"])
-            except (MediumError, ReadFailure):
-                pass
-        # Items 2 and 3: a footer whose magic matches establishes the type also when the head is readable,
-        # is not a header of that type, and no rung of items 1, 4 or 5 parses it. If the footer does not
-        # parse or the count disagrees, the file keeps its control type, damaged.
+                primary = parse_sidecar_copy([head], tape_uuid, block_size, 1, header_only=True)
+            except ReadFailure:
+                primary = None
+            if primary is not None:
+                if primary["total"] != count:
+                    # Item 5 decides the sidecar rung when the primary header parses.
+                    return unrecognised(f"primary header total {primary['total']} differs from the measured "
+                                        f"{count} blocks (Section 12.3 item 5; item 6 is not tried)")
+                return WalkedFile(tape_file, start, count, KIND_SIDECAR, "sidecar by primary header",
+                                  primary["epoch_id"], primary["start"], primary["end"])
+        # Items 2 and 3: no rung of items 1, 4 or 5 parsed the file, so a footer whose magic matches establishes
+        # the type also when the head is readable and is not a header of that type. If the footer does not parse
+        # or the count disagrees, the file keeps its control type, damaged.
         try:
             last_block = tape.read_data(start + count - 1)
         except (MediumError, ReadFailure):
             last_block = None
-        for label, kind, role_label, parse_footer, index_map, name in (
-                (LABEL_REPLICA_FOOTER, KIND_REPLICA, "terminal replica", parse_replica_frame, {1: 0, 2: 2, 3: 4}, "replica"),
-                (LABEL_SEPARATION_FOOTER, KIND_SEPARATION, "separation extent", parse_separation_frame, {1: 1, 2: 3},
-                 "separation")):
-            if last_block is not None and last_block[0:8] == role_magic(tape_uuid, label):
-                try:
-                    footer = parse_footer(last_block, tape_uuid, block_size, 2)
-                except ReadFailure as failure:
-                    return WalkedFile(tape_file, start, count, kind,
-                                      f"damaged {role_label}: the head is not its header; its footer does not parse "
-                                      f"({failure.reason})")
-                planned = footer["tuples"][index_map[footer["ordinal"]]][5]
-                if planned != count:
-                    return WalkedFile(tape_file, start, count, kind,
-                                      f"damaged {role_label}: type established by its footer, measured {count} blocks, "
-                                      f"the planned component has {planned}")
-                return WalkedFile(tape_file, start, count, kind,
-                                  f"{role_label} established by its footer (the head is not its header)")
+        typed = parity_map_tail_route(last_block)
+        if typed is not None:
+            return typed
+        if last_block is not None:
+            typed = footer_type(last_block, "the head is not its header")
+            if typed is not None:
+                return typed
         probe = sidecar_footer_probe()
         if probe is not None:
             return probe
@@ -3333,31 +3455,21 @@ def _classify_file(tape: DamagedTape, tape_file: int, start: int, count: int, ta
                           f"Object candidate: {head_error}; last block unreadable")
     except ReadFailure:
         last = None
-    if last is not None and last[0:8] == role_magic(tape_uuid, LABEL_REPLICA_FOOTER):
-        try:
-            footer = parse_replica_frame(last, tape_uuid, block_size, 2)
-            local = footer["tuples"][{1: 0, 2: 2, 3: 4}[footer["ordinal"]]]
-            if local[5] == count:
-                return WalkedFile(tape_file, start, count, KIND_REPLICA,
-                                  f"damaged terminal replica: {head_error}; type established by its footer")
-        except ReadFailure:
-            pass
-    if last is not None and last[0:8] == role_magic(tape_uuid, LABEL_SEPARATION_FOOTER):
-        try:
-            footer = parse_separation_frame(last, tape_uuid, block_size, 2)
-            local = footer["tuples"][{1: 1, 2: 3}[footer["ordinal"]]]
-            if local[5] == count:
-                return WalkedFile(tape_file, start, count, KIND_SEPARATION,
-                                  f"damaged separation extent: {head_error}; type established by its footer")
-        except ReadFailure:
-            pass
+    typed = parity_map_tail_route(last)
+    if typed is not None:
+        return typed
+    if last is not None:
+        typed = footer_type(last, head_error)
+        if typed is not None:
+            return typed
     probe = sidecar_footer_probe()
     if probe is not None:
         return probe
     return WalkedFile(tape_file, start, count, KIND_OBJECT, f"Object candidate: {head_error}")
 
 
-def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list[WalkedFile], list[str]]:
+def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int,
+             bootstrap_unreadable: bool = False) -> tuple[list[WalkedFile], list[str]]:
     files: list[WalkedFile] = []
     damage: list[str] = []
     position = 0
@@ -3373,7 +3485,7 @@ def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int) -> tuple[list
             damage.append(f"tape file {tape_file}: zero-block file")
             files.append(WalkedFile(tape_file, position, 0, None, "structural damage: zero-block file"))
         else:
-            walked = classify_file(tape, tape_file, position, count, tape_uuid, block_size)
+            walked = classify_file(tape, tape_file, position, count, tape_uuid, block_size, bootstrap_unreadable)
             if filemark is None:
                 # Section 12.2: a file whose trailing filemark is missing before EOD is not a tape file of the
                 # map; the walk classifies it by its head, as a torn candidate, and ends there.
@@ -3411,7 +3523,11 @@ def mark_artifacts(files: list[WalkedFile]) -> None:
 
 def second_pass_and_map(files: list[WalkedFile]) -> dict[str, Any]:
     """Section 12.3 second pass, then the Section 13.1 validation of the walked map."""
-    parity_maps = [f for f in files if f.kind == KIND_PARITY_MAP and getattr(f, "parity_map", {}).get("final")]
+    if not files:
+        # Section 12.3: EOD where the first record should be leaves no tape file 0 to type.
+        return {"parity_map": None, "identified": [], "validated": False, "entries": None,
+                "reason": "no tape file 0: EOD where the first record should be", "error": "FilemarkMapReconstruct"}
+    parity_maps = [f for f in files if f.kind == KIND_PARITY_MAP and (getattr(f, "parity_map", None) or {}).get("final")]
     identified = []
     result: dict[str, Any] = {"parity_map": None, "identified": identified, "validated": False,
                               "entries": None, "reason": ""}
@@ -7973,7 +8089,7 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         walk["citations"].append(cite("no_replica_walk"))
     if walk_needed:
         walk["citations"].extend([cite("walk_offer"), cite("walk_file")])
-        files, damage = bot_walk(tape, tape_uuid, block_size)
+        files, damage = bot_walk(tape, tape_uuid, block_size, bootstrap_unreadable is not None)
         walk_files = files
         walk_map = second_pass_and_map(files)
         trace["walk"] = [dataclasses.asdict(f) | {"parity_map": None} for f in files]
@@ -7999,9 +8115,30 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
         notes_text = " ".join(f.note for f in files)
         if "head unreadable" in notes_text:
             walk["citations"].append(cite("unreadable_head"))
-        if "type established by its footer" in notes_text:
+        if any("established by its footer" in f.note and ("head unreadable" in f.note or "head is not one block" in f.note)
+               for f in files):
             walk["citations"].extend([cite("replica_footer_type"), cite("separation_footer_type"),
                                       cite("tail_probe_serves")])
+        if "the head is not its header" in notes_text:
+            walk["citations"].extend([cite("footer_readable_head"), cite("footer_rule_scope")])
+        if "bootstrap by measured length" in notes_text or "cannot be a bootstrap" in notes_text:
+            walk["citations"].extend([cite("file0_by_length"), cite("file0_no_footer_rule")])
+            walk["citations"].append(cite("file0_one_block" if "bootstrap by measured length" in notes_text
+                                          else "file0_many_blocks"))
+        if "ParityMap by its first block" in notes_text or "ParityMap header total" in notes_text:
+            walk["citations"].extend([cite("ladder_parity_map"), cite("pm_either_kind"), cite("pm_block0"),
+                                      cite("pm_still_the_map")])
+        if "tail route" in notes_text:
+            walk["citations"].extend([cite("pm_tail_route"), cite("pm_tail_footer"), cite("pm_either_route"),
+                                      cite("pm_block0"), cite("pm_still_the_map")])
+            if "ParityMap footer total" in notes_text:
+                walk["citations"].append(cite("pm_tail_mismatch"))
+            if "the first block is unreadable" in notes_text:
+                walk["citations"].append(cite("pm_tail_serves"))
+        if "failed classification" in notes_text:
+            walk["citations"].append(cite("parse_def"))
+        if any(item.startswith("tape file 0: zero-block") for item in damage):
+            walk["citations"].append(cite("file0_zero_block"))
         if walk_map["identified"]:
             walk["citations"].append(cite("second_pass"))
         if failed:

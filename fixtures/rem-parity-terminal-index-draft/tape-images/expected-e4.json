@@ -735,7 +735,7 @@
    "quotes": [
     "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk;",
     "The Scanner MUST report that terminal authority was not recovered.",
-    "When the head is unreadable, a matching, fully parsed terminal footer establishes the same type, after its measured count is checked.",
+    "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses. The footer takes the header's place in the check below: a footer that does not parse, or whose record count differs from the measured count, is reported as a damaged terminal replica.",
     "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate.",
     "After the walk, when the tape's final ParityMap validates and is marked `is_final_directory`, the Scanner MUST perform a second pass that identifies as a sidecar each Object candidate at a tape file a directory entry names whose measured length equals the entry's `sidecar_total_block_count`.",
     "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`.",

@@ -2466,8 +2466,31 @@ matches, as they state. For items 1, 4, 5 and 6, a rung *recognises* a tape
 file only when the file passes every check of that rung, its measured block
 count included; a file that fails one of them is not recognised. A rung that
 parses a file but fails its measured count reports the failed classification.
+A rung parses a file when the file passes every check of that rung except its
+measured block count. For item 4 either route of that item may be the one
+that parses. Item 1 checks that the file is tape file 0: a block that
+carries the bootstrap magic at any other tape file is not parsed by item 1, and
+the later rungs try the file.
+
 At tape file 0 with supplied values, the first record is judged by
-Section 8.4 before item 1. When a sidecar's
+Section 8.4 before item 1.
+When Section 8.4 treats that record as unreadable because of a medium error, or
+because its content is not a usable bootstrap, the walk continues on the
+supplied values and types tape file 0 by its measured length, without reading a
+bootstrap from it. In that case a tape file 0 that measures exactly one block is
+typed a bootstrap: the supplied values classify it and do not authenticate it,
+and no value is taken from its bytes. In that case a tape file 0 that measures
+more than one block cannot be a bootstrap (Sections 3.1 and 8.1), and the walk
+ends with `FilemarkMapReconstruct` (Section 15), because it cannot produce a
+valid map. In that case, of one block or more, neither the paragraph headed
+“Unreadable head block”, below, nor the footer sentences of items 2 and 3, nor
+the tail route of item 4 apply to tape file 0. A filemark or EOD where the first
+record should be is a zero-block file, or EOD at a file start (Section 12.2); it
+leaves no tape file 0 to type, and the walk ends with `FilemarkMapReconstruct`
+for the same reason. A first record of the wrong length is refused, as Section
+8.4 requires, and is not typed.
+
+When a sidecar's
 primary header parses, item 5 decides the sidecar rung for that file: if its
 count fails, item 6 is not tried. Item 7 applies to a tape file that none of
 items 1 to 6 recognises. A primary header parses when its block satisfies
@@ -2483,8 +2506,11 @@ tries the file.
    tape file to this control type. The header and measured block count are
    checked against the encoded component plan. A malformed frame or count
    mismatch is reported as a damaged terminal replica; it MUST NOT fall through
-   to Object. When the head is unreadable, a matching, fully parsed terminal
-   footer establishes the same type, after its measured count is checked. For
+   to Object. When the head is unreadable, the file's last block is read, and a
+   terminal footer whose magic matches establishes the same type, whether or not
+   the footer parses. The footer takes the header's place in the check below: a
+   footer that does not parse, or whose record count differs from the measured
+   count, is reported as a damaged terminal replica. For
    items 2 and 3 the walk checks that the header parses and that the measured
    count equals the record count of the planned component. It does not compare
    the planned tape-file number or start position with the file's measured
@@ -2493,15 +2519,35 @@ tries the file.
    not raised as an error, and is not an Object.
 3. **IndexSeparationExtent**: matching separation-header magic commits the
    tape file to this control type under the same malformed-control and measured
-   count rules. When the head is unreadable, a matching, fully parsed footer
-   establishes the type. In items 2 and 3 a footer whose magic matches
+   count rules. When the head is unreadable, a footer whose magic matches
+   establishes the type, and is checked and reported as item 2 says. In items
+   2 and 3 a footer whose magic matches
    establishes the type also when the head is readable, is not a header of
    that type, and no rung of items 1, 4 or 5 parses it. If the footer does not
    parse or the count disagrees, the file keeps its control type, damaged.
-4. **ParityMap**: a complete copy/header and payload validate, and the
-   measured block count agrees with its locator footer. It is classified as
-   parity-closeout metadata written before the terminal suffix, not selected
-   as terminal inventory authority.
+4. **ParityMap**: the first block carries the ParityMap magic and its header
+   parses, and the measured block count equals the header's
+   `parity_map_total_block_count`. A header parses when its block satisfies
+   Section 10.1.3 on its own: the magic, the tape UUID, the block size, the CRC,
+   every constraint of the table, and the locator counts, which agree with the
+   values Section 10.1.2 derives from `payload_len` and the block size. The
+   header may be either copy kind, 1 or 2. Away from tape file 0, when the first
+   block is unreadable, or no rung of items 1 or 5 parses it and it is not a
+   ParityMap header that parses, the walk reads the file's last block. If that
+   block is a footer whose magic matches and that parses (Section 10.1.3), the
+   footer locates the tail header copy at its `tail_copy_start_block`, and the
+   file is a ParityMap if that tail header parses and agrees with the footer
+   and the footer's `parity_map_total_block_count` equals the measured block
+   count. If the footer parses and its total differs from the measured count,
+   the failed classification is reported whether or not the tail header parses,
+   and the file is not recognised. This is the copy fallback of Section 10.1.3, applied
+   to the walk. This item reads no payload, and reads a footer only on that
+   route. Sections 10.1.3 and 10.1.4 check the rest when the ParityMap is
+   read, and a ParityMap that fails them is still the ParityMap of
+   the walk. A file that neither route recognises is not recognised by this
+   item, and the later rungs try it. It is classified as parity-closeout
+   metadata written before the terminal suffix, not selected as terminal
+   inventory authority.
 5. **Sidecar (primary)**: the primary header parses, and the measured block
    count MUST equal the header's `sidecar_total_block_count`. On a mismatch the
    file is not recognised, and item 6 is not tried.
@@ -2523,7 +2569,9 @@ not recognised, and item 7 applies.
 **Unreadable head block:** the Scanner MUST NOT abort. It MUST measure the
 file by filemark spacing, run the footer/tail sidecar probe, and otherwise
 classify the file as an object candidate. The last block it reads for that
-probe also serves the terminal footer probe of items 2 and 3.
+probe also serves the terminal footer probe of items 2 and 3. It also serves the
+tail route of item 4, and a file that item 4 recognises by that route is a
+ParityMap and not an object candidate.
 
 *Rationale.* This is the no-circular-failure rule in action: the block needing
 recovery may be the very block that would have classified the file.
@@ -3807,6 +3855,62 @@ an errata revision of draft.1.
     states the damage matrix as it now stands before it describes the first
     25 cases. Appendix D item TT-2 no longer lists two reference gaps that
     the reference has closed. No tape byte and no vector outcome changes.
+  - A further revision of Section 12.3 changes four requirements, where the
+    text left a point open or disagreed with the reference implementation. It
+    is a change of requirements and not of wording. No tape byte changes. The
+    reference implementation already follows the first three changes, and the
+    fourth is covered below.
+    - The walk with supplied values types tape file 0 by its measured length
+      when its first record is unreadable: one block is a bootstrap that the
+      supplied values classify and do not authenticate, and more than one block
+      ends the walk with `FilemarkMapReconstruct`, because no map can hold
+      anything else at tape file 0. A filemark or EOD where the first record
+      should be ends the walk in the same way, and a first record of the wrong
+      length is refused and not typed. The rule is stated as an exception for
+      tape file 0, beside the paragraph on an unreadable head block, whose text
+      is kept; that paragraph gains one sentence, for the fourth change.
+    - A rung parses a file when the file passes every check of that rung except
+      its measured block count, and item 1 checks that the file is tape file 0.
+      A bootstrap magic at any other tape file no longer classifies the file
+      as a bootstrap.
+    - On the footer route, a footer whose magic matches establishes the
+      control type of items 2 and 3 whether or not the footer parses. A footer
+      that does not parse, or whose count differs, is reported as damage. The
+      two sentences that required a fully parsed footer are rewritten, because they contradicted the rest of Section 12.3
+      and Section 10.6.
+    - A ParityMap is recognised by its first block and its header, or, when
+      the first block is unreadable or is no other rung's kind and not a
+      ParityMap header that parses, through the footer and the tail header copy
+      that the footer locates. Its payload is checked when the ParityMap is
+      read. A ParityMap with an intact header and a damaged payload is no
+      longer an Object candidate, so it no longer changes the data ordinals of
+      the Objects after it. The route through the tail copy applies the copy
+      fallback of Section 10.1.3 in the walk. For a first block that reads but
+      is damaged, the earlier text already recognised the ParityMap through
+      that fallback, and this text keeps that outcome. For a first block that
+      cannot be read, the earlier text made the file an Object candidate, and
+      Appendix D recorded that the walk could not find such a ParityMap; this
+      text widens recognition to that case. The paragraph on an unreadable
+      head block gains the sentence that its last-block read serves this
+      route.
+
+    The reference implementation does not yet follow the tail route of the
+    fourth change: it types such a file an Object candidate. A later commit
+    changes it, and until then the reference and this text differ there.
+    An implementation written from the earlier text agrees with this text when
+    a ParityMap's first block reads but is damaged and the tail copy is intact.
+    It differs when the first block cannot be read; when the first block is
+    damaged and the payload is damaged too, since the tail route reads no
+    payload and the earlier fallback needed one copy's payload to validate;
+    and when a ParityMap's payload or footer is damaged and its first
+    header is intact. It differs on the third change when a terminal footer
+    does not parse, and on the first and second when tape file 0 is unreadable
+    or a bootstrap magic appears at a later tape file. One open point remains, and it is recorded
+    for a later revision: a readable, valid bootstrap at tape file 0 that
+    measures more than one block ends the reference's walk. Section 12.3 makes
+    such a file, which item 1 does not recognise, an Object candidate (item 7),
+    and the 1.0.0-draft.1 entry of this appendix records the reading that a
+    Scanner does not abort a whole catalog-less walk for a count mismatch.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -4137,9 +4241,33 @@ This is the live preparing-copy snapshot for generation 2.
      `GAPS.md` and the notes in `tape-images/negatives/` list these and the
      other places where this document is silent or ambiguous. Each is to be
      decided, or listed here, before freeze.
-   - The walk route cannot find a ParityMap whose block 0 is unreadable; the
-     replica route survives that damage by locating it through structural
-     rows.
+   - Section 12.3 (item 4) finds a ParityMap whose block 0 is unreadable, or
+     damaged so that no head rung takes it, through its footer and tail header
+     copy, and the replica route survives that damage by locating it through
+     structural rows. A ParityMap for which neither the header nor the footer
+     route works is an Object candidate. The reference implementation does not
+     yet follow the footer route and types such a file an Object candidate;
+     a later commit changes it.
+   - Section 12.3 leaves one point open. A readable, valid bootstrap at tape
+     file 0 that measures more than one block is not recognised by item 1, and
+     the reference implementation's walk ends at once with
+     `FilemarkMapReconstruct`, because a map cannot hold anything but a
+     one-block bootstrap at tape file 0. That differs from Section 12.3, which
+     makes such a file an Object candidate (item 7), and from the 1.0.0-draft.1
+     entry of Appendix C, which reads that a Scanner does not abort a whole
+     catalog-less walk for a count mismatch. No vector pins it.
+   - For item 6, a footer whose tail copy disagrees with it is reported and the
+     file falls through, although the definition of "parses" would make that
+     footer not parsed. No outcome turns on it, because item 6 is not part of
+     the footer rule's gate.
+   - Section 12.3's rule for tape file 0 speaks only of the walk with supplied
+     values. Without them, the reference types an unreadable one-block tape
+     file 0 a bootstrap as well, and this document leaves that mode
+     unspecified.
+   - Section 12.3 reports as damage a terminal footer that does not parse or
+     whose count differs. Whether a replica whose head is unreadable but whose
+     footer is good counts as damaged for Section 12.6's test of the exact
+     terminal suffix is not stated.
    - A bootstrap of another `schema_major` is refused by name
      (`BootstrapParse`, format major) only when values are supplied. Without
      them, discovery reports `NoBootstrapFound`, because Section 15 gives
