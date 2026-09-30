@@ -160,34 +160,48 @@ pub fn derive_keypair(seed: &XWingSeed) -> (XWingPublicKey, XWingExpandedSecret)
 
     let mut mlkem_seed = Zeroizing::new([0u8; MLKEM768_KEY_GENERATION_SEED_LEN]);
     mlkem_seed.copy_from_slice(&expanded[..MLKEM768_KEY_GENERATION_SEED_LEN]);
-    let (mlkem_private, mlkem_public) = mlkem768::generate_key_pair(*mlkem_seed).into_parts();
-    let mlkem_private_key = mlkem_private.into();
+    let (mut mlkem_private, mlkem_public) = mlkem768::generate_key_pair(*mlkem_seed).into_parts();
+    let mlkem_private = MlKemPrivateKeyGuard(&mut mlkem_private);
+    mlkem_seed.zeroize();
     let mlkem_public_key: [u8; MLKEM768_PUBLIC_KEY_LEN] = mlkem_public.into();
 
-    let x25519_private_key: [u8; X25519_KEY_LEN] =
-        expanded[64..96].try_into().expect("fixed expansion");
-    let x25519_secret = X25519Secret::from(x25519_private_key);
-    let x25519_public_key = X25519PublicKey::from(&x25519_secret).to_bytes();
+    let mut secret = XWingExpandedSecret {
+        mlkem_private_key: [0; MLKEM768_PRIVATE_KEY_LEN],
+        x25519_private_key: [0; X25519_KEY_LEN],
+        x25519_public_key: [0; X25519_KEY_LEN],
+    };
+    secret
+        .mlkem_private_key
+        .copy_from_slice(mlkem_private.0.as_ref());
+    drop(mlkem_private);
+    let mut x25519_private_key = Zeroizing::new([0; X25519_KEY_LEN]);
+    x25519_private_key.copy_from_slice(&expanded[64..96]);
+    expanded.zeroize();
+    let x25519_secret = X25519Secret::from(*x25519_private_key);
+    secret
+        .x25519_private_key
+        .copy_from_slice(&*x25519_private_key);
+    x25519_private_key.zeroize();
+    secret.x25519_public_key = X25519PublicKey::from(&x25519_secret).to_bytes();
 
     let mut public_key = [0u8; XWING_PUBLIC_KEY_LEN];
     public_key[..MLKEM768_PUBLIC_KEY_LEN].copy_from_slice(&mlkem_public_key);
-    public_key[MLKEM768_PUBLIC_KEY_LEN..].copy_from_slice(&x25519_public_key);
+    public_key[MLKEM768_PUBLIC_KEY_LEN..].copy_from_slice(&secret.x25519_public_key);
 
-    (
-        XWingPublicKey(public_key),
-        XWingExpandedSecret {
-            mlkem_private_key,
-            x25519_private_key: x25519_secret.to_bytes(),
-            x25519_public_key,
-        },
-    )
+    (XWingPublicKey(public_key), secret)
 }
 
 /// Encapsulate to a validated X-Wing public key using caller-supplied CSPRNG.
 pub fn encapsulate<R>(
     public_key: &XWingPublicKey,
     rng: &mut R,
-) -> Result<([u8; XWING_CIPHERTEXT_LEN], [u8; XWING_SHARED_SECRET_LEN]), XWingError>
+) -> Result<
+    (
+        [u8; XWING_CIPHERTEXT_LEN],
+        Zeroizing<[u8; XWING_SHARED_SECRET_LEN]>,
+    ),
+    XWingError,
+>
 where
     R: CryptoRng,
 {
@@ -200,16 +214,17 @@ where
 pub fn decapsulate(
     seed: &XWingSeed,
     ciphertext: &[u8; XWING_CIPHERTEXT_LEN],
-) -> Result<[u8; XWING_SHARED_SECRET_LEN], XWingError> {
+) -> Result<Zeroizing<[u8; XWING_SHARED_SECRET_LEN]>, XWingError> {
     let (_, expanded_secret) = derive_keypair(seed);
 
     let mlkem_ciphertext = MlKem768Ciphertext::from(
         <[u8; MLKEM768_CIPHERTEXT_LEN]>::try_from(&ciphertext[..MLKEM768_CIPHERTEXT_LEN])
             .expect("fixed ciphertext"),
     );
-    let mlkem_private = MlKem768PrivateKey::from(&expanded_secret.mlkem_private_key);
-    let ss_m = Zeroizing::new(mlkem768::decapsulate(&mlkem_private, &mlkem_ciphertext));
-    wipe_mlkem_private_key(mlkem_private);
+    let mut mlkem_private = MlKem768PrivateKey::from(&expanded_secret.mlkem_private_key);
+    let mlkem_private = MlKemPrivateKeyGuard(&mut mlkem_private);
+    let ss_m = Zeroizing::new(mlkem768::decapsulate(mlkem_private.0, &mlkem_ciphertext));
+    drop(mlkem_private);
 
     let x25519_secret = X25519Secret::from(expanded_secret.x25519_private_key);
     let ct_x_bytes: [u8; X25519_KEY_LEN] = ciphertext[MLKEM768_CIPHERTEXT_LEN..]
@@ -234,7 +249,13 @@ pub fn decapsulate(
 fn encapsulate_deterministic(
     public_key: &XWingPublicKey,
     randomness: &[u8; XWING_ENCAPSULATION_RANDOMNESS_LEN],
-) -> Result<([u8; XWING_CIPHERTEXT_LEN], [u8; XWING_SHARED_SECRET_LEN]), XWingError> {
+) -> Result<
+    (
+        [u8; XWING_CIPHERTEXT_LEN],
+        Zeroizing<[u8; XWING_SHARED_SECRET_LEN]>,
+    ),
+    XWingError,
+> {
     let pk_m_bytes: [u8; MLKEM768_PUBLIC_KEY_LEN] = public_key.0[..MLKEM768_PUBLIC_KEY_LEN]
         .try_into()
         .expect("fixed public key");
@@ -300,9 +321,19 @@ fn validate_x25519_public_key(public_key: &[u8; XWING_PUBLIC_KEY_LEN]) -> Result
     }
 }
 
-fn wipe_mlkem_private_key(private_key: MlKem768PrivateKey) {
-    let mut bytes: [u8; MLKEM768_PRIVATE_KEY_LEN] = private_key.into();
-    bytes.zeroize();
+/// Borrow the library key so cleanup wipes its owning storage, even on unwind.
+struct MlKemPrivateKeyGuard<'a>(&'a mut MlKem768PrivateKey);
+
+impl Drop for MlKemPrivateKeyGuard<'_> {
+    fn drop(&mut self) {
+        wipe_mlkem_private_key(self.0);
+    }
+}
+
+impl ZeroizeOnDrop for MlKemPrivateKeyGuard<'_> {}
+
+fn wipe_mlkem_private_key(private_key: &mut MlKem768PrivateKey) {
+    private_key[0..MLKEM768_PRIVATE_KEY_LEN].zeroize();
 }
 
 fn combine(
@@ -310,14 +341,18 @@ fn combine(
     ss_x: &[u8; XWING_SHARED_SECRET_LEN],
     ct_x: &[u8; X25519_KEY_LEN],
     pk_x: &[u8; X25519_KEY_LEN],
-) -> [u8; XWING_SHARED_SECRET_LEN] {
+) -> Zeroizing<[u8; XWING_SHARED_SECRET_LEN]> {
     let mut hasher = Sha3_256::new();
     Digest::update(&mut hasher, ss_m);
     Digest::update(&mut hasher, ss_x);
     Digest::update(&mut hasher, ct_x);
     Digest::update(&mut hasher, pk_x);
     Digest::update(&mut hasher, XWING_LABEL);
-    hasher.finalize_reset().into()
+    let mut digest = hasher.finalize();
+    let mut shared_secret = Zeroizing::new([0; XWING_SHARED_SECRET_LEN]);
+    shared_secret.copy_from_slice(&digest);
+    digest.zeroize();
+    shared_secret
 }
 
 #[cfg(test)]
@@ -387,6 +422,22 @@ mod tests {
             self.bytes.zeroize();
             self.offset.zeroize();
         }
+    }
+
+    #[test]
+    fn library_key_guard_wipes_the_original_storage() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<MlKemPrivateKeyGuard<'_>>();
+        let mut key = MlKem768PrivateKey::from([0x5a; MLKEM768_PRIVATE_KEY_LEN]);
+        drop(MlKemPrivateKeyGuard(&mut key));
+        assert!(key.as_ref().iter().all(|byte| *byte == 0));
+        let mut key = MlKem768PrivateKey::from([0x5a; MLKEM768_PRIVATE_KEY_LEN]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = MlKemPrivateKeyGuard(&mut key);
+            panic!("exercise key guard unwinding");
+        }));
+        assert!(result.is_err());
+        assert!(key.as_ref().iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -461,9 +512,9 @@ mod tests {
         let (ciphertext, shared_secret) =
             encapsulate(&public_key, &mut rng).expect("official KAT key must encapsulate");
         assert_eq!(ciphertext, expected_ciphertext);
-        assert_eq!(shared_secret, expected_shared_secret);
+        assert_eq!(*shared_secret, expected_shared_secret);
         assert_eq!(
-            decapsulate(&seed, &ciphertext).expect("official KAT must decapsulate"),
+            *decapsulate(&seed, &ciphertext).expect("official KAT must decapsulate"),
             expected_shared_secret
         );
     }
@@ -490,13 +541,13 @@ mod tests {
             .encapsulate_derand(&encapsulation_seed)
             .expect("reference encapsulation must succeed");
         assert_eq!(reference_ciphertext.encode(), ciphertext);
-        assert_eq!(reference_secret.encode(), shared_secret);
+        assert_eq!(reference_secret.encode(), *shared_secret);
         assert_eq!(
             reference_ciphertext
                 .decapsulate(&reference_private)
                 .expect("reference decapsulation must succeed")
                 .encode(),
-            shared_secret
+            *shared_secret
         );
     }
 

@@ -12,9 +12,10 @@ use crate::header::{RemObjectHeader, REM_OBJECT_HEADER_LEN};
 use crate::metadata::RemObjectMetadata;
 use crate::stream::{cipher_offset, decrypt_chunk, decrypt_metadata, CHACHA20POLY1305_TAG_LEN};
 use std::io::{Read, Write};
+use zeroize::Zeroizing;
 
 /// Report returned after successfully opening a plaintext subrange.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RangeOpenReport {
     /// Parsed plaintext header.
     pub header: RemObjectHeader,
@@ -34,13 +35,28 @@ pub struct RangeOpenReport {
     pub stored_range_len: u64,
 }
 
+impl std::fmt::Debug for RangeOpenReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeOpenReport")
+            .field("header", &self.header)
+            .field("metadata", &self.metadata)
+            .field("plaintext_start", &self.plaintext_start)
+            .field("plaintext_len", &self.plaintext_len)
+            .field("first_chunk", &self.first_chunk)
+            .field("chunk_count", &self.chunk_count)
+            .field("stored_range_start", &self.stored_range_start)
+            .field("stored_range_len", &self.stored_range_len)
+            .finish()
+    }
+}
+
 /// Authenticated geometry for a requested plaintext range.
 ///
 /// This is the query surface used by callers that must fetch only the stored
 /// payload frames covering a plaintext member. The mapping is deliberately
 /// produced here, beside [`cipher_offset`], so consumers never
 /// duplicate the envelope geometry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CoveringStoredRange {
     /// Parsed and authenticated envelope header.
     pub header: RemObjectHeader,
@@ -58,6 +74,21 @@ pub struct CoveringStoredRange {
     pub stored_range_start: Option<u64>,
     /// Length of the contiguous covering stored range.
     pub stored_range_len: u64,
+}
+
+impl std::fmt::Debug for CoveringStoredRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoveringStoredRange")
+            .field("header", &self.header)
+            .field("metadata", &self.metadata)
+            .field("plaintext_start", &self.plaintext_start)
+            .field("plaintext_len", &self.plaintext_len)
+            .field("first_chunk", &self.first_chunk)
+            .field("chunk_count", &self.chunk_count)
+            .field("stored_range_start", &self.stored_range_start)
+            .field("stored_range_len", &self.stored_range_len)
+            .finish()
+    }
 }
 
 /// Open and authenticate an envelope plaintext range with per-frame semantics.
@@ -158,18 +189,19 @@ fn open_plaintext_range_from_slice_with_context(
         .get(stored_start..stored_end)
         .ok_or(RemObjectAeadError::UnexpectedEof)?;
     let mut ranged_input = std::io::Cursor::new(encrypted_range);
-    let mut bytes = Vec::new();
+    let capacity = usize::try_from(plaintext_len).map_err(|_| RemObjectAeadError::SizeOverflow)?;
+    let mut bytes = Zeroizing::new(Vec::with_capacity(capacity));
     let report = open_plaintext_range_from_reader_with_context(
         &mut ranged_input,
         stored_range_start,
-        &mut bytes,
+        &mut *bytes,
         geometry.header,
         geometry.metadata,
         keys,
         plaintext_start,
         plaintext_len,
     )?;
-    Ok((bytes, report))
+    Ok((std::mem::take(&mut *bytes), report))
 }
 
 fn range_geometry(
@@ -358,9 +390,7 @@ fn open_authenticated_metadata(
         &metadata.plaintext_digest,
         &metadata_plaintext,
     )?;
-    if expected_salt != header.hkdf_salt {
-        return Err(RemObjectAeadError::SaltDerivationMismatch);
-    }
+    crate::kdf::verify_salt(&expected_salt, &header.hkdf_salt)?;
     Ok((header, metadata, keys))
 }
 

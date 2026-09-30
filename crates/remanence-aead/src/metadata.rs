@@ -13,12 +13,21 @@ const MAX_DEPTH: usize = 32;
 const MAX_ITEMS: usize = 65_536;
 
 /// Decrypted REM-OBJECT metadata fields required by version 1.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RemObjectMetadata {
     /// Length of the canonical plaintext object in bytes.
     pub plaintext_size: u64,
     /// SHA-256 of the canonical plaintext object.
     pub plaintext_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for RemObjectMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemObjectMetadata")
+            .field("plaintext_size", &self.plaintext_size)
+            .field("plaintext_digest", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RemObjectMetadata {

@@ -3,6 +3,8 @@
 use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::error::{RemObjectAeadError, Result};
 use crate::header::{validate_chunk_size, RemObjectHeader, REM_OBJECT_FOOTER};
@@ -28,7 +30,7 @@ pub struct SealOptions {
 }
 
 /// Report returned after successful sealing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SealReport {
     /// Serialized header used for this object.
     pub header: RemObjectHeader,
@@ -46,6 +48,21 @@ pub struct SealReport {
     pub stored_digest: [u8; 32],
     /// Plaintext size and digest observed while sealing.
     pub plaintext: PlaintextStats,
+}
+
+impl std::fmt::Debug for SealReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealReport")
+            .field("header", &self.header)
+            .field("key_frame", &self.key_frame)
+            .field("metadata_plaintext_len", &self.metadata_plaintext_len)
+            .field("metadata_frame_len", &self.metadata_frame_len)
+            .field("stored_size_bytes", &self.stored_size_bytes)
+            .field("stored_size_blocks", &self.stored_size_blocks)
+            .field("stored_digest", &self.stored_digest)
+            .field("plaintext", &self.plaintext)
+            .finish()
+    }
 }
 
 /// Inputs unique to an envelope-mode seal.
@@ -123,6 +140,7 @@ pub fn seal_deterministic_for_test_vectors<R: Read, W: Write>(
     dek: DataEncryptionKey,
     hpke_rng_seed: [u8; 32],
 ) -> Result<SealReport> {
+    let hpke_rng_seed = Zeroizing::new(hpke_rng_seed);
     validate_recipient_set(&options.recipients)?;
     let mut rng = EphemeralRng::from_seed(&hpke_rng_seed);
     seal_with_material(plaintext, output, options, &dek, &mut rng)
@@ -166,7 +184,7 @@ where
         options.common.plaintext_digest,
         options.common.chunk_size,
     )?;
-    let metadata_plaintext = metadata.to_cbor_bytes(options.common.chunk_size)?;
+    let metadata_plaintext = Zeroizing::new(metadata.to_cbor_bytes(options.common.chunk_size)?);
     let metadata_frame_len = (metadata_plaintext.len() as u64)
         .checked_add(16)
         .ok_or(RemObjectAeadError::SizeOverflow)?;
@@ -204,7 +222,11 @@ where
     if plaintext_stats.size != options.common.plaintext_size {
         return Err(RemObjectAeadError::PlaintextSizeMismatch);
     }
-    if plaintext_stats.digest != options.common.plaintext_digest {
+    if !bool::from(
+        plaintext_stats
+            .digest
+            .ct_eq(&options.common.plaintext_digest),
+    ) {
         return Err(RemObjectAeadError::PlaintextDigestMismatch);
     }
     ensure_eof(&mut plaintext)?;
@@ -256,7 +278,7 @@ fn encrypt_payload<R: Read, W: Write>(
     let chunk_count = options.plaintext_size / u64::from(options.chunk_size);
     let mut hasher = Sha256::new();
     let mut count = 0u64;
-    let mut buf = vec![0u8; chunk_size];
+    let mut buf = Zeroizing::new(vec![0u8; chunk_size]);
 
     for index in 0..chunk_count {
         read_exact(plaintext, &mut buf)?;
@@ -276,9 +298,9 @@ fn encrypt_payload<R: Read, W: Write>(
 }
 
 fn ensure_eof<R: Read>(reader: &mut R) -> Result<()> {
-    let mut byte = [0u8; 1];
+    let mut byte = Zeroizing::new([0u8; 1]);
     loop {
-        match reader.read(&mut byte) {
+        match reader.read(&mut byte[..]) {
             Ok(0) => return Ok(()),
             Ok(_) => return Err(RemObjectAeadError::PlaintextSizeMismatch),
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
@@ -351,6 +373,37 @@ mod tests {
         REM_OBJECT_HEADER_LEN, REM_OBJECT_WRAP_SUITE_XWING,
     };
     use std::io;
+
+    #[test]
+    fn reports_redact_plaintext_digests_in_debug() {
+        let plaintext = vec![0x5a; 1024];
+        let recipient = RecipientPrivateKey::new([1; 16], "primary", [7; 32]).unwrap();
+        let (stored, sealed) =
+            seal_to_vec(&plaintext, &envelope_options(options(&plaintext))).unwrap();
+        let (_, opened) = open_to_vec(&stored, &recipient).unwrap();
+        let (_, ranged) = open_plaintext_range_to_vec(&stored, &recipient, 1, 512).unwrap();
+        let covering = crate::covering_stored_range(&stored, &recipient, 1, 512).unwrap();
+        let digest = format!("{:?}", opened.metadata.plaintext_digest);
+        for debug in [
+            format!("{sealed:?}"),
+            format!("{opened:?}"),
+            format!("{ranged:?}"),
+            format!("{covering:?}"),
+            format!("{:?}", opened.metadata),
+            format!("{:?}", opened.plaintext),
+        ] {
+            assert!(debug.contains("<redacted>"));
+            assert!(!debug.contains(&digest));
+        }
+        assert_eq!(
+            format!("{:?}", opened.metadata),
+            "RemObjectMetadata { plaintext_size: 1024, plaintext_digest: \"<redacted>\" }"
+        );
+        assert_eq!(
+            format!("{:?}", opened.plaintext),
+            "PlaintextStats { size: 1024, digest: \"<redacted>\" }"
+        );
+    }
 
     fn options(plaintext: &[u8]) -> SealOptions {
         options_with_object_id(plaintext, "object-1")

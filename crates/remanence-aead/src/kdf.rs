@@ -4,7 +4,8 @@ use std::fmt;
 
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{RemObjectAeadError, Result};
 
@@ -32,6 +33,17 @@ impl Drop for DerivedKeys {
         self.object_secret.zeroize();
         self.metadata_key.zeroize();
         self.payload_key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for DerivedKeys {}
+
+/// Verify the derived salt identically in whole-object and range opening.
+pub(crate) fn verify_salt(expected: &[u8; 16], actual: &[u8; 16]) -> Result<()> {
+    if bool::from(expected.ct_eq(actual)) {
+        Ok(())
+    } else {
+        Err(RemObjectAeadError::SaltDerivationMismatch)
     }
 }
 
@@ -80,7 +92,7 @@ fn derive_salt_bytes(
         Hkdf::<Sha256>::new(Some(&[]), ikm)
             .expand(&info, &mut salt)
             .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
-        if salt != [0; 16] {
+        if !bool::from(salt.ct_eq(&[0; 16])) {
             return Ok(salt);
         }
     }
@@ -110,28 +122,52 @@ fn derive_keys_bytes(
     let mut object_info = Vec::with_capacity(object_label.len() + header_hash.len());
     object_info.extend_from_slice(object_label);
     object_info.extend_from_slice(header_hash);
-    let mut object_secret = [0u8; 32];
+    let mut keys = DerivedKeys {
+        object_secret: [0; 32],
+        metadata_key: [0; 32],
+        payload_key: [0; 32],
+    };
     Hkdf::<Sha256>::new(Some(salt), ikm)
-        .expand(&object_info, &mut object_secret)
+        .expand(&object_info, &mut keys.object_secret)
         .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
-    let mut metadata_key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(&[]), &object_secret)
-        .expand(metadata_label, &mut metadata_key)
+    Hkdf::<Sha256>::new(Some(&[]), &keys.object_secret)
+        .expand(metadata_label, &mut keys.metadata_key)
         .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
-    let mut payload_key = [0u8; 32];
-    Hkdf::<Sha256>::new(Some(&[]), &object_secret)
-        .expand(payload_label, &mut payload_key)
+    Hkdf::<Sha256>::new(Some(&[]), &keys.object_secret)
+        .expand(payload_label, &mut keys.payload_key)
         .map_err(|_| RemObjectAeadError::KdfExpansionFailed)?;
-    Ok(DerivedKeys {
-        object_secret,
-        metadata_key,
-        payload_key,
-    })
+    Ok(keys)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn salt_verification_rejects_each_single_byte_difference() {
+        let expected = [0x42; 16];
+        verify_salt(&expected, &expected).unwrap();
+        for index in 0..expected.len() {
+            let mut changed = expected;
+            changed[index] ^= 1;
+            assert!(matches!(
+                verify_salt(&expected, &changed),
+                Err(RemObjectAeadError::SaltDerivationMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn secret_owners_and_hash_states_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<DerivedKeys>();
+        assert_zeroize_on_drop::<sha2::Sha256>();
+        assert_zeroize_on_drop::<sha3::Sha3_256>();
+        // HMAC 0.13 has no ZeroizeOnDrop marker; its SHA-256 states wipe on drop.
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 32]>>();
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 1]>>();
+        assert_zeroize_on_drop::<zeroize::Zeroizing<Vec<u8>>>();
+    }
 
     #[test]
     fn salt_is_deterministic_and_input_sensitive() {

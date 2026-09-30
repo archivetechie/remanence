@@ -22,6 +22,9 @@ pub mod stream;
 pub mod wrap;
 pub mod xwing;
 
+/// Constant-time comparison for consumers of envelope plaintext digests.
+pub use subtle::ConstantTimeEq;
+
 pub use error::{RemObjectAeadError, Result};
 pub use header::{
     RemObjectHeader, REM_OBJECT_FOOTER, REM_OBJECT_FORMAT_VERSION, REM_OBJECT_HEADER_LEN,

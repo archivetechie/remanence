@@ -7081,6 +7081,32 @@ fn bytes_to_text_or_uuid(bytes: &[u8]) -> String {
     String::from_utf8(bytes.to_vec()).unwrap_or_else(|_| bytes_to_uuid_text(bytes))
 }
 
+/// Compare a binary SHA-256 with its canonical lowercase index encoding.
+pub(crate) fn sha256_matches_hex(actual: &[u8; 32], expected: &str) -> bool {
+    use remanence_aead::ConstantTimeEq;
+
+    // Preserve the index's canonical encoding requirement, including case.
+    if expected.len() != 64
+        || !expected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return false;
+    }
+    let mut decoded = [0u8; 32];
+    for (byte, pair) in decoded.iter_mut().zip(expected.as_bytes().chunks_exact(2)) {
+        let nibble = |value: u8| {
+            if value <= b'9' {
+                value - b'0'
+            } else {
+                value - b'a' + 10
+            }
+        };
+        *byte = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    bool::from(actual.ct_eq(&decoded))
+}
+
 pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -13348,8 +13374,9 @@ fn verify_locator_sha256(
     label: &str,
 ) -> Result<(), String> {
     if let Some(expected) = &entry.file_sha256 {
-        let actual = bytes_to_hex(&sha256_bytes(bytes));
-        if &actual != expected {
+        let actual = sha256_bytes(bytes);
+        if !sha256_matches_hex(&actual, expected) {
+            let actual = bytes_to_hex(&actual);
             return Err(format!(
                 "REM-OBJECT entry {label:?} digest mismatch: expected {expected}, got {actual}"
             ));
@@ -15906,6 +15933,27 @@ fn format_warning(w: &DiscoveryWarning) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256_binary_comparison_preserves_canonical_hex_matching() {
+        let digest = [0xab; 32];
+        let expected = bytes_to_hex(&digest);
+        assert!(sha256_matches_hex(&digest, &expected));
+        for index in 0..digest.len() {
+            let mut changed = digest;
+            changed[index] ^= 1;
+            assert!(!sha256_matches_hex(&changed, &expected));
+        }
+        for invalid in [
+            expected.to_uppercase(),
+            "a".repeat(63),
+            "a".repeat(66),
+            "g".repeat(64),
+        ] {
+            assert!(!sha256_matches_hex(&digest, &invalid));
+        }
+    }
+
     use clap::CommandFactory;
     use remanence_library::{
         scsi, DriveBay, ElementLayout, FixtureTransport, IdentitySource, InstalledDrive, Library,
@@ -16446,7 +16494,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let private = RecipientPrivateKey::new([0x41; 16], "archive", [0x51; 32]).unwrap();
         let private_path = root.path().join("archive.remp");
-        fs::write(&private_path, private.serialize()).unwrap();
+        fs::write(&private_path, private.serialize().as_slice()).unwrap();
 
         let cli = Cli::try_parse_from([
             "rem",
@@ -16678,7 +16726,7 @@ mod tests {
         let staging = temp.path().join("plaintext-staging");
         fs::create_dir(&staging).unwrap();
         fs::write(&object, source_object).unwrap();
-        fs::write(&source_private_path, source_primary.serialize()).unwrap();
+        fs::write(&source_private_path, source_primary.serialize().as_slice()).unwrap();
         fs::write(
             &next_primary_path,
             next_primary.public_key(0).unwrap().serialize().unwrap(),
@@ -19911,7 +19959,7 @@ tape_catalog_dir = "{0}/cache/tapes"
             recovery.public_key(1).unwrap().serialize().unwrap(),
         )
         .unwrap();
-        fs::write(&primary_private_path, primary.serialize()).unwrap();
+        fs::write(&primary_private_path, primary.serialize().as_slice()).unwrap();
         (
             primary,
             primary_public_path,
@@ -22833,7 +22881,7 @@ blob Project/Render Files/
             recovery.public_key(1).unwrap().serialize().unwrap(),
         )
         .unwrap();
-        fs::write(&primary_private_path, primary.serialize()).unwrap();
+        fs::write(&primary_private_path, primary.serialize().as_slice()).unwrap();
         let out_path = temp.path().join("encrypted.rem-object");
 
         let (code, stdout, stderr) = invoke_without_discovery(&[

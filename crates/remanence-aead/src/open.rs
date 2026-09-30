@@ -3,6 +3,8 @@
 use std::io::{Read, Write};
 
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::error::{RemObjectAeadError, Result};
 use crate::header::{
@@ -16,7 +18,7 @@ use crate::stream::{
 use crate::wrap::{unwrap_dek, RecipientPrivateKey};
 
 /// Report returned after successfully opening a REM-OBJECT encrypted object.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OpenReport {
     /// Parsed plaintext header.
     pub header: RemObjectHeader,
@@ -28,6 +30,18 @@ pub struct OpenReport {
     pub stored_size_bytes: u64,
     /// Plaintext stats observed while decrypting.
     pub plaintext: PlaintextStats,
+}
+
+impl std::fmt::Debug for OpenReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenReport")
+            .field("header", &self.header)
+            .field("key_frame", &self.key_frame)
+            .field("metadata", &self.metadata)
+            .field("stored_size_bytes", &self.stored_size_bytes)
+            .field("plaintext", &self.plaintext)
+            .finish()
+    }
 }
 
 /// Open an envelope object with a matching recipient private key.
@@ -67,14 +81,12 @@ pub fn open<R: Read, W: Write>(
         &metadata.plaintext_digest,
         &metadata_plaintext,
     )?;
-    if expected_salt != header.hkdf_salt {
-        return Err(RemObjectAeadError::SaltDerivationMismatch);
-    }
+    crate::kdf::verify_salt(&expected_salt, &header.hkdf_salt)?;
     let plaintext_stats = decrypt_payload(&mut input, &mut output, &header, &metadata, &keys)?;
     if plaintext_stats.size != metadata.plaintext_size {
         return Err(RemObjectAeadError::PlaintextSizeMismatch);
     }
-    if plaintext_stats.digest != metadata.plaintext_digest {
+    if !bool::from(plaintext_stats.digest.ct_eq(&metadata.plaintext_digest)) {
         return Err(RemObjectAeadError::PlaintextDigestMismatch);
     }
     read_footer(&mut input)?;
@@ -104,9 +116,11 @@ pub fn open<R: Read, W: Write>(
 
 /// Open an envelope into a vector.
 pub fn open_to_vec(input: &[u8], recipient: &RecipientPrivateKey) -> Result<(Vec<u8>, OpenReport)> {
-    let mut out = Vec::new();
-    let report = open(input, &mut out, recipient)?;
-    Ok((out, report))
+    // Stored input bounds all plaintext emitted by the existing streaming funnel.
+    // Reserve before writing so no allocation containing plaintext is abandoned.
+    let mut out = Zeroizing::new(Vec::with_capacity(input.len()));
+    let report = open(input, &mut *out, recipient)?;
+    Ok((std::mem::take(&mut *out), report))
 }
 
 fn decrypt_payload<R: Read, W: Write>(
