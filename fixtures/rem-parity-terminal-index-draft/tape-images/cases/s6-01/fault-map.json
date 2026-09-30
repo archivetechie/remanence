@@ -1,0 +1,40 @@
+{
+  "failed_data_addresses": [],
+  "hints": {
+    "block_size": 262144,
+    "scheme": {
+      "S": 2,
+      "k": 2,
+      "m": 2
+    },
+    "tape_uuid": "the image's"
+  },
+  "image": "a4-minimal",
+  "removed_filemark_after_tape_file": null,
+  "unreadable_records": [
+    {
+      "filemark": false,
+      "lba": 0,
+      "record_index": 0,
+      "tape_file": 0
+    },
+    {
+      "filemark": false,
+      "lba": 19,
+      "record_index": 0,
+      "tape_file": 4
+    },
+    {
+      "filemark": false,
+      "lba": 27,
+      "record_index": 0,
+      "tape_file": 6
+    },
+    {
+      "filemark": false,
+      "lba": 35,
+      "record_index": 0,
+      "tape_file": 8
+    }
+  ]
+}

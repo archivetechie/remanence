@@ -7875,6 +7875,10 @@
           },
           {
             "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
             "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
           },
           {
@@ -7906,6 +7910,9 @@
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
         ],
+        "damaged": {
+          "5": "damaged separation extent: measured 4 blocks, the planned component has 3"
+        },
         "map": {
           "produced": true,
           "validated": true
@@ -8388,6 +8395,10 @@
           },
           {
             "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
             "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
           },
           {
@@ -8419,6 +8430,9 @@
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
         ],
+        "damaged": {
+          "7": "damaged separation extent: measured 6 blocks, the planned component has 3"
+        },
         "map": {
           "produced": true,
           "validated": true
@@ -8628,6 +8642,10 @@
           },
           {
             "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
             "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
           },
           {
@@ -8659,6 +8677,9 @@
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
         ],
+        "damaged": {
+          "5": "damaged separation extent: measured 6 blocks, the planned component has 3"
+        },
         "map": {
           "produced": true,
           "validated": true
@@ -8868,6 +8889,10 @@
           },
           {
             "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
             "quote": "In items 2 and 3 a footer whose magic matches establishes the type also when the head is readable, is not a header of that type, and no rung of items 1, 4 or 5 parses it."
           },
           {
@@ -8907,6 +8932,10 @@
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
         ],
+        "damaged": {
+          "5": "damaged separation extent: measured 6 blocks, the planned component has 3",
+          "8": "damaged terminal replica: the head is not its header; type established by its footer, measured 2 blocks, the planned component has 3"
+        },
         "map": {
           "produced": true,
           "validated": true
@@ -9374,6 +9403,10 @@
           },
           {
             "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
             "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
           },
           {
@@ -9405,6 +9438,9 @@
             "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
           }
         ],
+        "damaged": {
+          "8": "damaged terminal replica: measured 6 blocks, the planned component has 3"
+        },
         "map": {
           "produced": true,
           "validated": true
@@ -12467,6 +12503,3228 @@
           "parity_shards_not_locatable": 0
         },
         "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-01": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "not_found",
+        "block_size": 262144,
+        "used_hints": true,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+          },
+          {
+            "section": "8.4",
+            "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+          },
+          {
+            "section": "8.4",
+            "quote": "| a medium error, or a filemark or EOD where the record should be | treats the bootstrap as unreadable and continues on the supplied values |"
+          },
+          {
+            "section": "8.4",
+            "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+          },
+          {
+            "section": "8.4",
+            "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+          },
+          {
+            "section": "12.1",
+            "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+          },
+          {
+            "section": "8.4",
+            "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+          },
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "When Section 8.4 treats that record as unreadable because of a medium error, or because its content is not a usable bootstrap, the walk continues on the supplied values and types tape file 0 by its measured length, without reading a bootstrap from it."
+          },
+          {
+            "section": "12.3",
+            "quote": "In that case, of one block or more, neither the paragraph headed “Unreadable head block”, below, nor the footer sentences of items 2 and 3, nor the tail route of item 4 apply to tape file 0."
+          },
+          {
+            "section": "12.3",
+            "quote": "In that case a tape file 0 that measures exactly one block is typed a bootstrap: the supplied values classify it and do not authenticate it, and no value is taken from its bytes."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "bootstrap",
+            "finding": "unreadable (medium error)",
+            "error": null,
+            "checks": "structure"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "bootstrap",
+            "finding": "unreadable (medium error)",
+            "error": null
+          },
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-02": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "not_found",
+        "block_size": 262144,
+        "used_hints": true,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+          },
+          {
+            "section": "8.4",
+            "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+          },
+          {
+            "section": "8.4",
+            "quote": "| the magic is missing, or the header CRC fails | treats the bootstrap as unreadable |"
+          },
+          {
+            "section": "8.4",
+            "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+          },
+          {
+            "section": "8.4",
+            "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+          },
+          {
+            "section": "12.1",
+            "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+          },
+          {
+            "section": "8.4",
+            "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+          },
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "When Section 8.4 treats that record as unreadable because of a medium error, or because its content is not a usable bootstrap, the walk continues on the supplied values and types tape file 0 by its measured length, without reading a bootstrap from it."
+          },
+          {
+            "section": "12.3",
+            "quote": "In that case, of one block or more, neither the paragraph headed “Unreadable head block”, below, nor the footer sentences of items 2 and 3, nor the tail route of item 4 apply to tape file 0."
+          },
+          {
+            "section": "12.3",
+            "quote": "In that case a tape file 0 that measures exactly one block is typed a bootstrap: the supplied values classify it and do not authenticate it, and no value is taken from its bytes."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          },
+          {
+            "section": "15",
+            "quote": "A parser given one block as the bootstrap reports a breach of Section 8 as `BootstrapParse`, including a missing magic and a failed CRC, except that a parity bootstrap recording drive compression is `DriveCompressionEnabled`."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "bootstrap",
+            "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+            "error": "BootstrapParse",
+            "checks": "structure"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "bootstrap",
+            "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+            "error": "BootstrapParse"
+          },
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-03": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "not_found",
+        "block_size": 262144,
+        "used_hints": true,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "A block-size hint makes the size known and is applied as a configured read size under the Section 8.4 hint path, suppressing candidate rotation."
+          },
+          {
+            "section": "8.4",
+            "quote": "With supplied values, the Scanner judges the first record in two stages: the physical read first and then, for a record of the right length, its content."
+          },
+          {
+            "section": "8.4",
+            "quote": "| a medium error, or a filemark or EOD where the record should be | treats the bootstrap as unreadable and continues on the supplied values |"
+          },
+          {
+            "section": "8.4",
+            "quote": "A bootstrap that is treated as unreadable is not trusted for any value."
+          },
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+          },
+          {
+            "section": "8.4",
+            "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+          },
+          {
+            "section": "12.1",
+            "quote": "The mounted tape's identity comes from the bootstrap or, when the bootstrap is unreadable, from the tape UUID supplied under Section 8.4.1, and a finalized tape's selected terminal replica supplies the authoritative inventory."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
+          },
+          "B": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
+          },
+          "C": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
+          }
+        },
+        "inventory_equals_true_prefix": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner that cannot read the bootstrap, and is given the three values Section 8.4.1 names, MUST perform the discovery above with them."
+          },
+          {
+            "section": "8.4",
+            "quote": "It then uses the supplied tape UUID as the key of the role magics (Section 5.2)."
+          },
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "error",
+        "error": "FilemarkMapReconstruct",
+        "classes": {
+          "0": "classification failed"
+        },
+        "object_identity": null,
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "When Section 8.4 treats that record as unreadable because of a medium error, or because its content is not a usable bootstrap, the walk continues on the supplied values and types tape file 0 by its measured length, without reading a bootstrap from it."
+          },
+          {
+            "section": "12.3",
+            "quote": "In that case, of one block or more, neither the paragraph headed “Unreadable head block”, below, nor the footer sentences of items 2 and 3, nor the tail route of item 4 apply to tape file 0."
+          },
+          {
+            "section": "12.3",
+            "quote": "In that case a tape file 0 that measures more than one block cannot be a bootstrap (Sections 3.1 and 8.1), and the walk ends with `FilemarkMapReconstruct` (Section 15), because it cannot produce a valid map."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "15",
+            "quote": "FilemarkMapReconstruct BOT recovery walk could not produce a valid map"
+          }
+        ],
+        "failed_classifications": {
+          "0": "tape file 0 measures 5 blocks and cannot be a bootstrap (Sections 3.1 and 8.1)"
+        },
+        "map": {
+          "produced": false,
+          "validated": false
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "not_run",
+          "B-C": "not_run"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": null,
+        "parity_shards_failed": null,
+        "coverage": {
+          "performed": false,
+          "why": "no validated map says which blocks a sidecar protects: neither a replica validates nor does the walked map validate against a final ParityMap (Sections 12.1 and 13.1)"
+        },
+        "other_findings": [
+          {
+            "component": "terminal replicas",
+            "error": "BotStructuralRecoveryRequired",
+            "finding": "no footer supplies a planned layout, so no replica validates"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "no replica validates: the Verifier reports the tape as recovery-required"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-04": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 37 plans EOD 39, before the tape's EOD 41; footer at LBA 29 plans EOD 39, before the tape's EOD 41)"
+          },
+          "B": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 37 plans EOD 39, before the tape's EOD 41; footer at LBA 29 plans EOD 39, before the tape's EOD 41)"
+          },
+          "C": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 37 plans EOD 39, before the tape's EOD 41; footer at LBA 29 plans EOD 39, before the tape's EOD 41)"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica",
+          "9": "Object"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.6",
+            "quote": "A structural artifact after the exact terminal suffix is nonconformant and MUST NOT be admitted as an Object."
+          },
+          {
+            "section": "12.6",
+            "quote": "A structural artifact is any tape file, complete or torn, that follows the last of the five files of the terminal suffix, whatever it contains. The suffix is exact when the walk recognises, in order, replica, separation extent, replica, separation extent and replica, none of them damaged. The rule is one of scope: an artifact is not an Object of any inventory. The walk may report it as it reports any file beyond the validated scope, as an Object candidate of unknown identity or, when torn, as an incomplete candidate (Section 8.4.1), so that an operator sees it."
+          },
+          {
+            "section": "12.6",
+            "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "artifacts": [
+          "9"
+        ],
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "not_run",
+          "B-C": "not_run"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "12.6",
+            "quote": "A structural artifact after the exact terminal suffix is nonconformant and MUST NOT be admitted as an Object."
+          },
+          {
+            "section": "12.6",
+            "quote": "A normal finalized tape has the exact terminal suffix of Section 8.3 and EOD immediately after C's trailing filemark."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "terminal replicas",
+            "error": "BotStructuralRecoveryRequired",
+            "finding": "no footer supplies a planned layout, so no replica validates"
+          },
+          {
+            "component": "tape file 9",
+            "error": null,
+            "finding": "a structural artifact after the exact terminal suffix: nonconformant, in no inventory (the walk lists it as a candidate)"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "no replica validates: the Verifier reports the tape as recovery-required",
+            "tape file 9 follows the exact terminal suffix"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-05": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
+          },
+          "B": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
+          },
+          "C": {
+            "valid": false,
+            "reason": "no planned layout: no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)"
+          }
+        },
+        "inventory_equals_true_prefix": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "the Scanner spaces back over up to five filemarks from EOD and reads the record before each, stopping early when a backspace does not cross exactly one filemark or leaves the partition."
+          },
+          {
+            "section": "8.4",
+            "quote": "A terminal replica's footer that parses supplies a planned layout only when its recorded footer position equals the position at which it was read, and the layout's planned EOD is at or after the tape's EOD."
+          },
+          {
+            "section": "8.4",
+            "quote": "A layout whose planned EOD lies before the tape's EOD may be followed by later tape files, so it is not used, and when no footer supplies a layout, no replica validates;"
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "Object",
+          "4": "IndexSeparationExtent",
+          "5": "TapeIndexReplica",
+          "6": "IndexSeparationExtent",
+          "7": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "A rung parses a file when the file passes every check of that rung except its measured block count."
+          },
+          {
+            "section": "12.3",
+            "quote": "For items 1, 4, 5 and 6, a rung *recognises* a tape file only when the file passes every check of that rung, its measured block count included; a file that fails one of them is not recognised."
+          },
+          {
+            "section": "12.3",
+            "quote": "A rung that parses a file but fails its measured count reports the failed classification."
+          },
+          {
+            "section": "12.3",
+            "quote": "In items 2 through 6, a count-mismatch “hard error” is scoped to that rung and that tape file's classification: the Scanner reports the failed classification and continues the walk with the next tape file."
+          },
+          {
+            "section": "12.3",
+            "quote": "Under items 2 and 3 the file keeps its control type, damaged; under items 4, 5 and 6, as under item 1, the file is not recognised, and item 7 applies."
+          },
+          {
+            "section": "12.3",
+            "quote": "Item 7 applies to a tape file that none of items 1 to 6 recognises."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          }
+        ],
+        "failed_classifications": {
+          "3": "ParityMap header total 3 differs from the measured 6 blocks (Section 12.3 item 4)"
+        },
+        "map": {
+          "produced": true,
+          "validated": false
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "not_run",
+          "B-C": "not_run"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": null,
+        "parity_shards_failed": null,
+        "coverage": {
+          "performed": false,
+          "why": "no validated map says which blocks a sidecar protects: neither a replica validates nor does the walked map validate against a final ParityMap (Sections 12.1 and 13.1)"
+        },
+        "other_findings": [
+          {
+            "component": "terminal replicas",
+            "error": "BotStructuralRecoveryRequired",
+            "finding": "no footer supplies a planned layout, so no replica validates"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "no replica validates: the Verifier reports the tape as recovery-required"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-06": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "damaged": {
+          "4": "damaged terminal replica: head unreadable (medium error at LBA 19); type established by its footer's magic; the footer does not parse (frame CRC does not verify)"
+        },
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-07": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "If the footer does not parse or the count disagrees, the file keeps its control type, damaged."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "damaged": {
+          "5": "damaged separation extent: head unreadable (medium error at LBA 23); type established by its footer's magic; the footer does not parse (frame CRC does not verify)"
+        },
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "unreadable",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          },
+          {
+            "component": "separation extent A-B",
+            "error": "TapeIo",
+            "finding": "medium error at LBA 23"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid",
+            "separation extent A-B is unreadable"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-08": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": false
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": null,
+        "parity_shards_failed": null,
+        "coverage": {
+          "performed": false,
+          "why": "no validated map says which blocks a sidecar protects: neither a replica validates nor does the walked map validate against a final ParityMap (Sections 12.1 and 13.1)"
+        },
+        "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-09": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "**ParityMap**: the first block carries the ParityMap magic and its header parses, and the measured block count equals the header's `parity_map_total_block_count`."
+          },
+          {
+            "section": "12.3",
+            "quote": "The header may be either copy kind, 1 or 2."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": false
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": null,
+        "parity_shards_failed": null,
+        "coverage": {
+          "performed": false,
+          "why": "no validated map says which blocks a sidecar protects: neither a replica validates nor does the walked map validate against a final ParityMap (Sections 12.1 and 13.1)"
+        },
+        "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-10": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "Away from tape file 0, when the first block is unreadable, or no rung of items 1 or 5 parses it and it is not a ParityMap header that parses, the walk reads the file's last block."
+          },
+          {
+            "section": "12.3",
+            "quote": "If that block is a footer whose magic matches and that parses (Section 10.1.3), the footer locates the tail header copy at its `tail_copy_start_block`, and the file is a ParityMap if that tail header parses and agrees with the footer and the footer's `parity_map_total_block_count` equals the measured block count."
+          },
+          {
+            "section": "12.3",
+            "quote": "For item 4 either route of that item may be the one that parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "ParityMap tape file 3",
+            "finding": "primary copy: CRC",
+            "error": "ParityMapParse",
+            "checks": "structure"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "ParityMap tape file 3",
+            "finding": "primary copy: CRC",
+            "error": "ParityMapParse"
+          },
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-11": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "Object",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": false
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": null,
+        "parity_shards_failed": null,
+        "coverage": {
+          "performed": false,
+          "why": "no validated map says which blocks a sidecar protects: neither a replica validates nor does the walked map validate against a final ParityMap (Sections 12.1 and 13.1)"
+        },
+        "other_findings": [
+          {
+            "component": "terminal replica A",
+            "error": null,
+            "finding": "medium error at LBA 19"
+          },
+          {
+            "component": "terminal replica B",
+            "error": null,
+            "finding": "medium error at LBA 27"
+          },
+          {
+            "component": "terminal replica C",
+            "error": null,
+            "finding": "medium error at LBA 35"
+          }
+        ],
+        "tape_complete": false,
+        "terminal_suffix": {
+          "complete": false,
+          "reasons": [
+            "replica A is not valid",
+            "replica B is not valid",
+            "replica C is not valid"
+          ],
+          "replicas_valid": []
+        }
+      }
+    },
+    "s6-12": {
+      "image": "a4-minimal",
+      "image_unreproduced": [],
+      "discovery": {
+        "result": "found",
+        "block_size": 262144,
+        "used_hints": false,
+        "error": null,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "A Scanner with no off-tape state first reads the bootstrap at BOT to establish tape identity, block size, and parity geometry."
+          },
+          {
+            "section": "8.4",
+            "quote": "When the block size is unknown, a Scanner MUST apply each discovery candidate (256 KiB, 512 KiB, 1 MiB) as a real drive reconfiguration before reading."
+          },
+          {
+            "section": "8.4",
+            "quote": "It accepts a parsed bootstrap only if its `block_size_bytes` equals the configured read size."
+          }
+        ]
+      },
+      "scanner": {
+        "result": "BotStructuralRecoveryRequired",
+        "error": null,
+        "acceptable_selections": [],
+        "degraded": null,
+        "replicas": {
+          "A": {
+            "valid": false,
+            "reason": "medium error at LBA 19"
+          },
+          "B": {
+            "valid": false,
+            "reason": "medium error at LBA 27"
+          },
+          "C": {
+            "valid": false,
+            "reason": "medium error at LBA 35"
+          }
+        },
+        "inventory_equals_true_prefix": true,
+        "citations": [
+          {
+            "section": "8.4",
+            "quote": "locate, from EOD, the local footer of a terminal replica, and from it the planned terminal layout (Section 8.3);"
+          },
+          {
+            "section": "8.4",
+            "quote": "validate the header, footer and trailing filemark of every replica that layout plans; a replica's payload need be validated only for the replica to be accepted, or when two replica envelopes differ in an edition-common field;"
+          },
+          {
+            "section": "8.4",
+            "quote": "A Reader locates the frame from the immutable planned tuple, checks device-reported post-read positions for the addressed records and trailing filemark, and cross-checks the footer observation against that tuple."
+          },
+          {
+            "section": "8.4",
+            "quote": "A medium error invalidates the affected candidate, while a non-medium transport error aborts discovery."
+          },
+          {
+            "section": "8.4",
+            "quote": "if no replica validates, perform the BOT structural recovery walk in Section 8.4.1."
+          },
+          {
+            "section": "8.5",
+            "quote": "If no replica validates, selection yields the explicit BOT structural recovery path of Section 8.4.1."
+          },
+          {
+            "section": "12.4",
+            "quote": "If A, B, and C all fail, the Scanner returns an explicit `BotStructuralRecoveryRequired` outcome and performs the Section 8.4.1 walk; BOT Object classifications are likewise streamed before their terminal summary."
+          }
+        ]
+      },
+      "walk": {
+        "result": "run",
+        "error": null,
+        "classes": {
+          "0": "Bootstrap",
+          "1": "Object",
+          "2": "ParitySidecar",
+          "3": "ParityMap",
+          "4": "TapeIndexReplica",
+          "5": "IndexSeparationExtent",
+          "6": "TapeIndexReplica",
+          "7": "IndexSeparationExtent",
+          "8": "TapeIndexReplica"
+        },
+        "object_identity": "unknown",
+        "terminal_authority_recovered": false,
+        "citations": [
+          {
+            "section": "8.4.1",
+            "quote": "When A, B, and C are all absent or invalid, the Scanner MUST offer a full structural walk from BOT."
+          },
+          {
+            "section": "12.2",
+            "quote": "Per tape file: read the head block; measure the file's length by filemark spacing (space to the next filemark; the file's block count is the position delta minus one); a zero-block file or a missing trailing filemark is structural damage; EOD at a file start ends the walk."
+          },
+          {
+            "section": "12.3",
+            "quote": "It MUST measure the file by filemark spacing, run the footer/tail sidecar probe, and otherwise classify the file as an object candidate."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, the file's last block is read, and a terminal footer whose magic matches establishes the same type, whether or not the footer parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "When the head is unreadable, a footer whose magic matches establishes the type, and is checked and reported as item 2 says."
+          },
+          {
+            "section": "12.3",
+            "quote": "The last block it reads for that probe also serves the terminal footer probe of items 2 and 3."
+          },
+          {
+            "section": "12.3",
+            "quote": "Away from tape file 0, when the first block is unreadable, or no rung of items 1 or 5 parses it and it is not a ParityMap header that parses, the walk reads the file's last block."
+          },
+          {
+            "section": "12.3",
+            "quote": "If that block is a footer whose magic matches and that parses (Section 10.1.3), the footer locates the tail header copy at its `tail_copy_start_block`, and the file is a ParityMap if that tail header parses and agrees with the footer and the footer's `parity_map_total_block_count` equals the measured block count."
+          },
+          {
+            "section": "12.3",
+            "quote": "For item 4 either route of that item may be the one that parses."
+          },
+          {
+            "section": "12.3",
+            "quote": "This item reads no payload, and reads a footer only on that route."
+          },
+          {
+            "section": "12.3",
+            "quote": "a ParityMap that fails them is still the ParityMap of the walk."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "It reports each candidate's identity as unknown unless a separate exact Object-recovery authority succeeds."
+          },
+          {
+            "section": "8.4.1",
+            "quote": "The Scanner MUST report that terminal authority was not recovered."
+          },
+          {
+            "section": "13.1",
+            "quote": "A map produced by the Section 8.4.1 walk, after the second pass of Section 12.3, is validated against the tape's final ParityMap when that ParityMap validates and is marked `is_final_directory`, and the map's canonical projection (Section 7.3) through the ParityMap's own entry hashes to its `canonical_map_digest`."
+          },
+          {
+            "section": "13.1",
+            "quote": "The validated scope and durable boundary are the first `directory_scope_tape_file_count` tape files, ending with that ParityMap's entry; `W` is `directory_scope_highest_protected_ordinal`."
+          }
+        ],
+        "map": {
+          "produced": true,
+          "validated": true
+        }
+      },
+      "recoverer": {
+        "result": "not_run",
+        "addresses": []
+      },
+      "verifier": {
+        "result": "recovery_required",
+        "error": null,
+        "separations": {
+          "A-B": "valid",
+          "B-C": "valid"
+        },
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "8.5",
+            "quote": "A terminal replica is *fully valid* when it is locally eligible under Section 10.6."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier performing full verification MUST check that every interior byte of both separation extents is zero."
+          },
+          {
+            "section": "10.6",
+            "quote": "A Verifier that finds a separation extent invalid MUST report it and MUST NOT report the terminal suffix as complete."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "10.6",
+            "quote": "Its edition ID MUST equal the replicas'."
+          },
+          {
+            "section": "12.6",
+            "quote": "No valid replica invokes the explicit BOT structural walk, whose result is recovery evidence rather than a fabricated terminal edition."
+          },
+          {
+            "section": "15",
+            "quote": "BotStructuralRecoveryRequired no terminal replica validates; explicit BOT walk required"
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports damage it finds before the terminal suffix with the error a Reader reports for that component."
+          }
+        ],
+        "outside_terminal_suffix": [
+          {
+            "component": "ParityMap tape file 3",
+            "finding": "primary copy: magic",
+            "error": "ParityMapParse",
+            "checks": "structure"
+          }
+        ]
+      },
+      "undecided": [],
+      "verifier-full": {
+        "citations": [
+          {
+            "section": "2.2",
+            "quote": "**Verifier**: validates a tape's structures and digests end to end without recovering payload — the Scanner's checks plus the Recoverer's index and CRC validation."
+          },
+          {
+            "section": "2.2",
+            "quote": "A Verifier's validation is a full verification: it reads every data block that a sidecar protects and every parity shard, and checks each against its sidecar's index (Section 13.4)."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports each block or shard that fails by its address: a data block's tape-file position, or a parity shard's epoch, stripe and parity index."
+          },
+          {
+            "section": "2.2",
+            "quote": "It reports the tape as complete when the terminal suffix is complete, the full verification was performed, and it finds no failed data block, no failed parity shard and no finding about a sidecar or about the prefix."
+          }
+        ],
+        "data_blocks_failed": [],
+        "parity_shards_failed": [],
+        "coverage": {
+          "performed": true,
+          "data_blocks_read": 4,
+          "parity_shards_read": 4,
+          "epochs_without_index": [],
+          "data_blocks_read_but_not_checkable": 0,
+          "parity_shards_read_but_not_checkable": 0,
+          "parity_shards_not_locatable": 0
+        },
+        "other_findings": [
+          {
+            "component": "ParityMap tape file 3",
+            "finding": "primary copy: magic",
+            "error": "ParityMapParse"
+          },
           {
             "component": "terminal replica A",
             "error": null,

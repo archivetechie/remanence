@@ -1711,7 +1711,7 @@ fn read_payload_from_copy(
     Ok(payload)
 }
 
-fn validate_header_matches_footer(
+pub(crate) fn validate_header_matches_footer(
     header: &ParityMapHeader,
     footer: &ParityMapFooter,
 ) -> Result<(), ParityError> {
