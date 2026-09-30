@@ -1,0 +1,343 @@
+{
+  "api_base": "https://zenodo.org/api",
+  "publish_order": [
+    "vectors",
+    "companion",
+    "object",
+    "encrypt",
+    "parity"
+  ],
+  "records": {
+    "vectors": {
+      "draft_id": 21719166,
+      "version_doi": "10.5281/zenodo.21719166",
+      "concept_doi": "10.5281/zenodo.21719165",
+      "kind": "dataset",
+      "metadata": {
+        "upload_type": "dataset",
+        "title": "Remanence Conformance Vectors",
+        "version": "draft-set-1",
+        "description": "<p>These are the test vectors for the REM-OBJECT, REM-ENCRYPT and REM-PARITY specifications. They let an independent implementation check itself against byte-exact expected results, and let a reader confirm a specification's statements.</p><p>The record holds two archives. remanence-test-vectors.tar is the generation-1 archive, the pinned baseline that the published specification text cites by hash. It is deposited here unchanged. remanence-draft-test-vectors.tar holds the review vectors for the current drafts: REM-OBJECT and REM-ENCRYPT vectors, generation-2 REM-PARITY tape images, damage, resume and negative cases, independent verifiers, and a second implementation with its decision files.</p><p>The draft archive is for review only. It is not a conformance set, and the frozen set, published when the specifications freeze on 31 July 2027, replaces it. Generation-2 tapes are not readable by generation-1 tooling.</p>",
+        "keywords": [
+          "digital preservation",
+          "archival storage",
+          "LTO tape",
+          "file format",
+          "erasure coding",
+          "tar",
+          "HPKE",
+          "post-quantum cryptography",
+          "ML-KEM",
+          "X-Wing"
+        ],
+        "language": "eng",
+        "license": "cc-zero",
+        "creators": [
+          {
+            "name": "The ArchiveTech Project"
+          }
+        ],
+        "related_identifiers": [
+          {
+            "relation": "isSupplementTo",
+            "identifier": "10.5281/zenodo.21719158",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementTo",
+            "identifier": "10.5281/zenodo.21719161",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementTo",
+            "identifier": "10.5281/zenodo.21719156",
+            "resource_type": "publication-technicalnote"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "specs/publication/remanence-test-vectors.tar",
+          "name": "remanence-test-vectors.tar"
+        },
+        {
+          "path": "dist/remanence-draft-test-vectors.tar",
+          "name": "remanence-draft-test-vectors.tar"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "remanence-test-vectors.tar",
+          "version": "draft-set-1"
+        },
+        {
+          "name": "remanence-draft-test-vectors.tar",
+          "version": "draft-set-1"
+        }
+      ]
+    },
+    "companion": {
+      "draft_id": 21719164,
+      "version_doi": "10.5281/zenodo.21719164",
+      "concept_doi": "10.5281/zenodo.21719163",
+      "kind": "document",
+      "metadata": {
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "title": "The Remanence Formats, Explained",
+        "version": "1.2",
+        "description": "<p>This is a plain-language companion to the REM-OBJECT Core Format, REM-ENCRYPT and REM-PARITY specifications. It sets out the problem of keeping a large archive readable for decades, and explains why the formats are shaped as they are. It is informative only. Where it and a specification disagree, the specification governs.</p><p>The companion does not freeze. It is revised whenever a passage can be made clearer or a specification changes. Revision 1.2 follows the review draft of REM-PARITY that describes generation 2 of the tape layout. The specifications it explains are review drafts, to be frozen on 31 July 2027.</p><p>Generation-2 tapes are not readable by generation-1 tooling, and the companion says so in its maturity note.</p><p>It is written for readers in digital preservation who want the reasoning before the byte tables.</p>",
+        "keywords": [
+          "digital preservation",
+          "archival storage",
+          "LTO tape",
+          "file format",
+          "erasure coding",
+          "tar"
+        ],
+        "language": "eng",
+        "license": "cc-by-4.0",
+        "creators": [
+          {
+            "name": "The ArchiveTech Project"
+          }
+        ],
+        "related_identifiers": [
+          {
+            "relation": "documents",
+            "identifier": "10.5281/zenodo.21719158",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "documents",
+            "identifier": "10.5281/zenodo.21719161",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "documents",
+            "identifier": "10.5281/zenodo.21719156",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21551570",
+            "resource_type": "software"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "specs/publication/formats-explained.md",
+          "name": "formats-explained.md"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "formats-explained.md",
+          "version": "1.2"
+        }
+      ]
+    },
+    "object": {
+      "draft_id": 21719159,
+      "version_doi": "10.5281/zenodo.21719159",
+      "concept_doi": "10.5281/zenodo.21719158",
+      "kind": "document",
+      "metadata": {
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "title": "REM-OBJECT Core Format 1.0: Specification",
+        "version": "1.0.0-draft.4",
+        "description": "<p>This is the specification of the REM-OBJECT Core Format: a backend-independent byte format for large archival objects. An object bundles named file payloads into one self-describing unit, a constrained POSIX pax tar stream with a SHA-256 identity for each file, addressing of byte ranges by calculation, and a deterministic CBOR manifest.</p><p>This is a review draft and not the frozen revision. Comments close on 30 April 2027, and the specifications are to be frozen on 31 July 2027.</p><p>The generation distinction concerns the tape layout of REM-PARITY. It does not change this format: revision 1.0.0-draft.4 changes no byte of a valid object relative to 1.0.0-draft.3.</p><p>The document is intended to let a digital preservation reader read an archived object with ordinary tools and verify its contents. No standards body has reviewed it.</p>",
+        "keywords": [
+          "digital preservation",
+          "archival storage",
+          "file format",
+          "tar",
+          "LTO tape"
+        ],
+        "language": "eng",
+        "license": "cc-by-4.0",
+        "creators": [
+          {
+            "name": "The ArchiveTech Project"
+          }
+        ],
+        "related_identifiers": [
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21719161",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21719156",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementedBy",
+            "identifier": "10.5281/zenodo.21719165",
+            "resource_type": "dataset"
+          },
+          {
+            "relation": "isDocumentedBy",
+            "identifier": "10.5281/zenodo.21719163",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21551570",
+            "resource_type": "software"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "specs/publication/rem-object-core-1-specification.md",
+          "name": "rem-object-core-1-specification.md"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "rem-object-core-1-specification.md",
+          "version": "1.0.0-draft.4"
+        }
+      ]
+    },
+    "encrypt": {
+      "draft_id": 21719162,
+      "version_doi": "10.5281/zenodo.21719162",
+      "concept_doi": "10.5281/zenodo.21719161",
+      "kind": "document",
+      "metadata": {
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "title": "REM-ENCRYPT 1.0: Specification",
+        "version": "1.0.0-draft.4",
+        "description": "<p>This is the specification of REM-ENCRYPT, an authenticated, confidential envelope around the canonical plaintext object of the REM-OBJECT Core Format. It hides the object's member names, sizes, count, manifest and payload. A plaintext and an encrypted copy of an object share one logical identity.</p><p>This is a review draft and not the frozen revision. Comments close on 30 April 2027, and the specifications are to be frozen on 31 July 2027.</p><p>The generation distinction concerns the tape layout of REM-PARITY. It does not change this format: revision 1.0.0-draft.4 changes no byte of a valid envelope relative to 1.0.0-draft.3.</p><p>Key wrapping uses HPKE with the X-Wing hybrid KEM (ML-KEM-768 with X25519). No standards body has reviewed the document.</p>",
+        "keywords": [
+          "digital preservation",
+          "archival storage",
+          "file format",
+          "HPKE",
+          "post-quantum cryptography",
+          "ML-KEM",
+          "X-Wing"
+        ],
+        "language": "eng",
+        "license": "cc-by-4.0",
+        "creators": [
+          {
+            "name": "The ArchiveTech Project"
+          }
+        ],
+        "related_identifiers": [
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21719158",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21719156",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementedBy",
+            "identifier": "10.5281/zenodo.21719165",
+            "resource_type": "dataset"
+          },
+          {
+            "relation": "isDocumentedBy",
+            "identifier": "10.5281/zenodo.21719163",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21551570",
+            "resource_type": "software"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "specs/publication/rem-encrypt-1-specification.md",
+          "name": "rem-encrypt-1-specification.md"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "rem-encrypt-1-specification.md",
+          "version": "1.0.0-draft.4"
+        }
+      ]
+    },
+    "parity": {
+      "draft_id": 21719157,
+      "version_doi": "10.5281/zenodo.21719157",
+      "concept_doi": "10.5281/zenodo.21719156",
+      "kind": "document",
+      "metadata": {
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "title": "Rem Tape Parity (REM-PARITY) Format 1.0: Specification",
+        "version": "1.0.0-draft.5",
+        "description": "<p>This is the specification of the REM-PARITY tape layout: how an archive is laid out on LTO tape with sidecar erasure-coded parity, a bootstrap block and a terminal index, so that a tape can be scanned, checked and repaired without any catalog. It defines what a writer, scanner, recoverer, resumer and verifier do.</p><p>This is a review draft and not the frozen revision. Comments close on 30 April 2027, and the specifications are to be frozen on 31 July 2027.</p><p>Generation-2 tapes, which current Remanence software writes, are not readable by generation-1 tooling, and generation-1 tapes are not readable by generation-2 readers. This revision governs generation 2 only.</p><p>The document is intended to let a digital preservation reader recover data from a damaged tape from the text alone. No standards body has reviewed it.</p>",
+        "keywords": [
+          "digital preservation",
+          "archival storage",
+          "LTO tape",
+          "file format",
+          "erasure coding",
+          "tar"
+        ],
+        "language": "eng",
+        "license": "cc-by-4.0",
+        "creators": [
+          {
+            "name": "The ArchiveTech Project"
+          }
+        ],
+        "related_identifiers": [
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21719158",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21719161",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementedBy",
+            "identifier": "10.5281/zenodo.21719165",
+            "resource_type": "dataset"
+          },
+          {
+            "relation": "isDocumentedBy",
+            "identifier": "10.5281/zenodo.21719163",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21551570",
+            "resource_type": "software"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "specs/publication/rem-parity-1-specification.md",
+          "name": "rem-parity-1-specification.md"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "rem-parity-1-specification.md",
+          "version": "1.0.0-draft.5"
+        }
+      ]
+    }
+  }
+}
