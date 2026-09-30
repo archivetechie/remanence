@@ -3078,11 +3078,11 @@ a torn tail, one after a closed epoch and one with an epoch still open.
 each torn tail and of the whole stream. The image bytes are regenerated from
 the inputs, not stored.
 
-The damage matrix, `tape-images/cases/`, holds 57 cases, and 55 of them are
+The damage matrix, `tape-images/cases/`, holds 71 cases, and 69 of them are
 pinned; `parity-map-and-sidecar` and `e1-07` are not. Each case gives the
 outcome it expects under this document: the inventory a Scanner reports, the
 result of the walk, each failed address's recovery or error, or what a
-Verifier reports. The matrix grew in four groups.
+Verifier reports. The matrix grew in five groups.
 
 Of the first 25 cases, all but one make stated records of an image
 unreadable or remove a filemark; the other reads the second-edition image
@@ -3102,12 +3102,17 @@ The outcomes of the burst cases (`burst-m`, `burst-m-plus-one`,
 pinned loss counts are Section 13.5's `lost_count`: the number of erasures in
 the stripe, including the failed block.
 
-The other 32 cases were added later, in three groups. Fifteen (`e1-01` to
+The other 46 cases were added later, in four groups. Fifteen (`e1-01` to
 `e1-15`) judge the first record with supplied values under Section 8.4. Ten
 (`e2-01` to `e2-04` and `e2-08` to `e2-13`) cover wrong-length records, the
 acquisition of the sidecar index and the walk (Sections 3.5, 8.4.1, 13.3),
 and seven (`e3-01` to `e3-07`) cover the walk after damage to or beside the
-terminal suffix (Sections 8.4, 8.4.1, 12.3, 12.6). An overlay,
+terminal suffix (Sections 8.4, 8.4.1, 12.3, 12.6). Fourteen (`s6-01` to
+`s6-14`) cover how Section 12.3 types a walked tape file: tape file 0 whose
+record is unreadable or does not parse, a bootstrap's record at a later tape
+file, a file that runs into the next when a filemark is lost, a control file
+whose footer matches and does not parse, and a ParityMap whose payload, footer
+or first block is damaged or whose first block cannot be read. An overlay,
 `tape-images/expected-e4.json`, gives the outcome of the tail rescue of
 Section 13.3 for `parity-map-and-sidecar`, and what a Verifier reports for 14
 cases.
@@ -3911,6 +3916,13 @@ an errata revision of draft.1.
     such a file, which item 1 does not recognise, an Object candidate (item 7),
     and the 1.0.0-draft.1 entry of this appendix records the reading that a
     Scanner does not abort a whole catalog-less walk for a count mismatch.
+  - The reference implementation then gained the tail route of the fourth
+    change, and fourteen damage cases (`s6-01` to `s6-14`) pin the four
+    changes; `s6-10`, `s6-12` and `s6-13` pin the tail route, and `s6-11` and
+    `s6-14` a ParityMap that neither route recognises. Section 17 counts
+    them, and Appendix D item TT-2 no longer lists the tail route as a
+    reference gap. No tape byte, requirement or earlier vector outcome
+    changes.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -4245,9 +4257,14 @@ This is the live preparing-copy snapshot for generation 2.
      damaged so that no head rung takes it, through its footer and tail header
      copy, and the replica route survives that damage by locating it through
      structural rows. A ParityMap for which neither the header nor the footer
-     route works is an Object candidate. The reference implementation does not
-     yet follow the footer route and types such a file an Object candidate;
-     a later commit changes it.
+     route works is an Object candidate. The reference implementation follows
+     both routes; the damage cases `s6-10`, `s6-12` and `s6-13` pin the footer
+     route.
+   - Section 10.1.3 calls a header copy invalid when its CRC does not verify,
+     and says how a footer that cannot be read is treated, but not a header
+     copy that cannot be read. `s6-13` pins the reading that the other copy is
+     then used, which the reference implementation and the second
+     implementation share.
    - Section 12.3 leaves one point open. A readable, valid bootstrap at tape
      file 0 that measures more than one block is not recognised by item 1, and
      the reference implementation's walk ends at once with
