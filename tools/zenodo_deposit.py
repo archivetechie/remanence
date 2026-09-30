@@ -166,8 +166,17 @@ def normalized_metadata(metadata):
     parser.feed(metadata.get("description", ""))
     parser.close()
     result["description"] = " ".join("".join(parser.parts).split())
-    for key in ("keywords", "related_identifiers"):
-        result[key] = sorted({canonical(item) for item in metadata.get(key, [])})
+    # Zenodo stores what it is sent and adds fields of its own: a null
+    # `affiliation` on each creator and a `scheme` on each related identifier.
+    # Compare only what the record supplies, so server-added noise is not a
+    # difference, while a changed name, relation, identifier or order still is.
+    def supplied(item):
+        return {k: v for k, v in item.items() if v is not None and k != "scheme"}
+
+    result["creators"] = [supplied(item) for item in metadata.get("creators", [])]
+    result["keywords"] = sorted({canonical(item) for item in metadata.get("keywords", [])})
+    result["related_identifiers"] = sorted({canonical(supplied(item))
+                                            for item in metadata.get("related_identifiers", [])})
     if isinstance(result["license"], dict):
         result["license"] = result["license"].get("id")
     return result

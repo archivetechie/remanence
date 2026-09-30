@@ -149,6 +149,12 @@ class FakeZenodo(z.Transport):
                 # Zenodo normalizes HTML without changing rendered prose.
                 r["metadata"]["description"] = r["metadata"]["description"].replace("<P>", "<p>").replace("</P>", "</p>").replace("<B>", "<strong>").replace("</B>", "</strong>")
                 r["metadata"]["keywords"].reverse()
+                # As the real service does: a null affiliation on each creator, a scheme on each
+                # related identifier.
+                for creator in r["metadata"].get("creators", []):
+                    creator.setdefault("affiliation", None)
+                for related in r["metadata"].get("related_identifiers", []):
+                    related.setdefault("scheme", "doi")
                 r["metadata"]["license"] = {"id": r["metadata"]["license"]}
                 r["metadata"]["prereserve_doi"] = reserved
                 r["title"] = r["metadata"]["title"]
@@ -1178,6 +1184,42 @@ class UrllibTests(unittest.TestCase):
                     z.atomic_write(target, "new")
             self.assertEqual(target.read_text(), "old")
             self.assertEqual(list(Path(directory).iterdir()), [target])
+
+
+class ServerAddedMetadataTests(unittest.TestCase):
+    """Zenodo adds a null affiliation and a scheme; real differences must still show."""
+
+    SENT = {"title": "T", "version": "1", "license": "cc-by-4.0", "upload_type": "publication",
+            "publication_type": "technicalnote", "language": "eng", "description": "<p>D</p>",
+            "creators": [{"name": "The ArchiveTech Project"}],
+            "related_identifiers": [{"relation": "references", "identifier": "10.5281/zenodo.1",
+                                     "resource_type": "dataset"}]}
+
+    def stored(self, **changes):
+        remote = copy.deepcopy(self.SENT)
+        remote["creators"][0]["affiliation"] = None
+        remote["related_identifiers"][0]["scheme"] = "doi"
+        remote.update(changes)
+        return remote
+
+    def test_server_added_fields_are_not_a_difference(self):
+        self.assertEqual(z.normalized_metadata(self.SENT), z.normalized_metadata(self.stored()))
+
+    def test_a_changed_creator_is_a_difference(self):
+        other = self.stored(creators=[{"name": "Someone Else", "affiliation": None}])
+        self.assertNotEqual(z.normalized_metadata(self.SENT), z.normalized_metadata(other))
+
+    def test_a_changed_relation_or_identifier_is_a_difference(self):
+        for field, value in (("relation", "cites"), ("identifier", "10.5281/zenodo.2"),
+                             ("resource_type", "software")):
+            other = self.stored()
+            other["related_identifiers"][0][field] = value
+            self.assertNotEqual(z.normalized_metadata(self.SENT), z.normalized_metadata(other), field)
+
+    def test_a_real_value_in_an_added_field_is_still_compared(self):
+        other = self.stored()
+        other["creators"][0]["affiliation"] = "An Institution"
+        self.assertNotEqual(z.normalized_metadata(self.SENT), z.normalized_metadata(other))
 
 
 if __name__ == "__main__":
