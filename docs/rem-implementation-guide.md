@@ -1,6 +1,6 @@
 # REM Implementation and Operations Guide
 
-This revision: 27 September 2026. The history at the end records what each
+This revision: 30 September 2026. The history at the end records what each
 revision changed.
 
 ## 1. About this guide
@@ -840,8 +840,36 @@ A verifier should report every nonconformity it finds, in every
 representation, rather than only the first. The same holds for a tape
 verifier, which checks a tape's structures and digests end to end.
 
+A tape verifier has a second obligation of the same kind. A check that reads a
+tape's structures (the bootstrap, the terminal replicas, the sidecar headers
+and footers) but never reads a data block or a parity shard cannot say that
+the tape's protected content is intact, and a tool that reports such a tape as
+verified misleads its operator. The specification says so: "A check of
+structure and metadata alone, which reads no data block or parity shard, is
+not a full verification." (REM-PARITY §2.2).
+
+The specification defines the verifier's validation as a full verification: "A
+Verifier's validation is a full verification: it reads every data block that a
+sidecar protects and every parity shard, and checks each against its sidecar's
+index" (REM-PARITY §2.2). It also fixes how a failure is named: "It reports each
+block or shard that fails by its address: a data block's tape-file position, or
+a parity shard's epoch, stripe and parity index." (REM-PARITY §2.2). The
+definition goes on to say when a tape is complete: the terminal suffix is
+complete, the full verification was performed, and no failed block or shard and
+no finding about a sidecar, a copy of the ParityMap or its footer, or the prefix
+was found.
+
+The specification leaves some things open, and we recommend the following. A
+tool that has not read the blocks should say that it has not, and should not
+present the tape as clean. An operator should be told which check was run,
+because a full verification costs the drive's read of the whole written tape,
+which for a full cartridge is many hours, where a check of structure alone takes
+minutes. Remanence, for example, reports a tape's protected content as verified
+only from its full verification. Section 10.9 gives the practice for a sidecar
+whose index cannot be acquired.
+
 Serves REM-OBJECT §7.4, Verifier Profile; REM-ENCRYPT §7.4, Encrypted Verifier
-Profiles; and REM-PARITY §2.2, Conformance Roles.
+Profiles; and REM-PARITY §2.2, Conformance Roles, and §13.4, Erasure Taxonomy.
 
 ### 7.4. Make restore the default, and salvage a deliberate choice
 
@@ -1359,7 +1387,10 @@ When all three replicas are lost, the only way to a map is a structural walk of
 the whole tape from BOT (REM-PARITY §8.4.1). It can take hours. An operator who
 cannot see it progress, or stop it, cannot plan around it, and a tool that keeps
 commanding motion against a drive or medium that refuses it can make the damage
-worse.
+worse. The walk is also taken when the replicas are intact but the tape has
+tape files after its terminal suffix, unless a later suffix whose replicas validate
+supplies a layout of its own, because discovery then does not use the first suffix's layout.
+Section 10.10 explains that case.
 
 We recommend that a tool:
 
@@ -1417,6 +1448,174 @@ bounds a planning window at 1024 stripes and its recovery cache at 8 GiB.
 
 Serves REM-PARITY §13.6, Bulk Recovery (Informative).
 
+### 10.9. Acquire a sidecar's index through one path
+
+A sidecar's index is what lets a tool tell a good data block or parity shard
+from a bad one, and the specification gives several ways to find it when the
+footer or one copy is damaged. A Verifier that acquires the index by a routine
+of its own, and a Recoverer that acquires it by another, will sooner or later
+disagree about the same tape. The Verifier will call sound a tape whose index
+the Recoverer cannot use, or the reverse. A verification that does not follow
+the recovery's path also cannot show whether recovery would work.
+
+We recommend one acquisition, used by both roles, and that the Verifier pins
+the index it obtains exactly as the Recoverer pins it. Remanence, for example,
+has its Verifier call the Recoverer's acquisition and pin, and adds no path of
+its own. The steps are those of REM-PARITY §13.3, taken in order, after the
+sidecar's tape file has been located through the map:
+
+1. Read the footer first. Read the file's last block. If it parses as the
+   epoch's footer and its total matches the map entry, read and verify both
+   header copies against the footer's locator, including the canonical metadata
+   hash. Use the primary if it is valid, and the tail copy otherwise, and
+   record which copies were usable. Such a footer decides unless an available
+   directory entry (defined in step 3) disagrees with it on the canonical
+   metadata hash or on the tail copy's position. Then neither decides, a copy
+   that either contradicts is not used, and if no copy remains the epoch's
+   metadata is unavailable. After a valid footer the directory-assisted rescue
+   of step 3 is not tried.
+2. If the footer is unreadable, unparseable or contradicts the map entry, use
+   the primary copy at block 0, and apply the checks of its copy kind and of
+   its block count against the map entry. When a directory entry is available,
+   it decides as the footer would: the primary is used only if its canonical
+   metadata hash equals the entry's, and otherwise step 3 applies. When none is
+   available and the primary validates, the tail copy must still be read. The
+   specification requires it: "a Recoverer whose primary copy validates MUST also read the
+   tail copy at block `H + P`" (REM-PARITY §13.3). A reader that stops at a
+   valid primary never sees a tail that disagrees with it. An unreadable or
+   invalid tail leaves the primary in use. A valid tail whose canonical
+   metadata hash differs from the primary's leaves nothing to decide between
+   them, and the epoch's metadata is unavailable.
+3. If the primary fails and a directory entry is available, or the primary is
+   valid but its hash differs from an available entry's, locate the tail copy from the entry's counts and check its canonical
+   metadata hash against the entry before using it. An entry is available only
+   when the tape's final ParityMap validates and the entry passes two
+   preconditions. The specification states the first: "A Recoverer MUST NOT
+   place a read from a directory entry unless the entry agrees with the
+   sidecar's map entry in tape file, epoch, protected range and block count."
+   (REM-PARITY §13.3). The second is that the entry's total block count equals
+   `2H + P + 1` with `H` greater than zero. An entry that fails either
+   precondition is not available, and affects only its own epoch.
+4. If the footer and the primary have both failed, no final ParityMap
+   validates, and the sidecar's map entry comes from a validated terminal
+   replica, try the tail copy that the map entry locates. The specification
+   requires this too: "a Recoverer MUST try the tail copy that the map entry
+   locates" (REM-PARITY §13.3). The tail starts at block `H + P`, where
+   `H = (total − 1 − P) / 2` and `P = S × m`. A tool should check that
+   `total − 1 − P` is even and that `H` is greater than zero before it
+   computes a position from them. A map found by the BOT walk does not
+   qualify for this rescue, because it gains a validated scope only through a
+   final ParityMap.
+
+Nothing outside a copy found in step 4 vouches for it, so the copy is used only
+if it is valid on its own, records the `H` that was computed, and agrees with
+the map entry in epoch and protected range. Whatever copy is acquired is then
+pinned against the bootstrap's scheme record and block size, or against the
+supplied scheme and block size when the bootstrap is unreadable, and against
+the map entry's ordinal range. The specification fixes the outcome of a
+disagreement: "disagreement is `SchemeMismatch`" (REM-PARITY §13.3).
+
+A tool that reports outcomes has to tell four kinds apart, because they call
+for different actions:
+
+- `SidecarParse`: a sidecar copy or footer that reads and violates the sidecar
+  structure, and a divergence between two copies that both validate. The
+  divergence is reported even when the footer or the directory decides
+  between the copies: a Verifier "MUST report a divergence between the copies
+  as `SidecarParse`, even when the footer or the directory decides it"
+  (REM-PARITY §9.1).
+- `SidecarMetadataUnavailable`, for that epoch only: no header/index copy
+  validated. A copy that the footer or the directory contradicts, or that step 2
+  leaves undecided, counts as not validated. It is reported whatever each copy's own failure was, and it does
+  not affect the recovery of other epochs.
+- `SchemeMismatch`: an index that was acquired but disagrees with the scheme
+  and block size, or with the map entry's ordinal range. Remanence, for example,
+  reports an index whose epoch differs from the map entry's as `SidecarParse`.
+- Findings that carry no name from the specification's list of errors. A
+  Verifier reports damage that a Reader survives without an error, and the
+  specification says how: "Damage that a Reader survives without reporting an
+  error is still damage, and the Verifier reports it without a Section 15
+  name" (REM-PARITY §2.2). Examples are a sidecar copy or footer that cannot
+  be read even though another copy was used, and a copy of the ParityMap or a
+  terminal replica whose records cannot be read. A medium error on such a
+  component is reported as an unreadable component. A fault of the transport
+  that is not medium damage stays `TapeIo`, and says nothing about the
+  component.
+
+When no header/index copy of an epoch validates, there is no index to check
+against, and the Verifier still has work to do. It reads every data block that
+the map says the sidecar protects and every parity shard that the map entry
+locates, reports each read failure, and says that what it read could not be
+checked against a CRC. With no index, the shards start at block `H`, computed
+from the map entry's total as in step 4. When that total gives no valid `H`, the
+map entry locates no shard, and none is read. The specification states each part: "The Verifier still
+reads every data block that the map says the sidecar protects and every parity
+shard that the map entry locates" (REM-PARITY §2.2), and it "reports each read
+failure, and states that the blocks and shards it read could not be checked
+against a CRC" (REM-PARITY §2.2). It must not turn the missing CRC into a failure: "It does not
+report a block as failed for lack of a CRC." (REM-PARITY §2.2). The same holds
+for an index that fails the pin above: "An index that fails the pin of Section
+13.3 is likewise not used for CRC checks" (REM-PARITY §2.2). The tool reports
+the pin's error and the read failures, and takes the parity shards from the
+acquired index.
+
+We recommend that a tool keep the two states distinct in what it shows, an
+epoch whose blocks were all checked against an index and an epoch whose blocks
+were only read. Remanence, for example, records for each sidecar whether every
+block and shard was checked against an acquired, pinned index, and does not
+count a sidecar as verified when they were not.
+
+Serves REM-PARITY §13.3, Acquiring the Sidecar Index; REM-PARITY §2.2,
+Conformance Roles; and REM-PARITY §9.1, Structure.
+
+### 10.10. Explain a walk that the tape did not seem to need
+
+An operator who sees a tape with three good replicas walked from BOT will reasonably think the tool has done something wrong. It has not,
+and the reason is in how discovery chooses a layout.
+
+Discovery starts at the end of data and reads the footers of the terminal
+replicas. A footer supplies a planned layout only when its recorded position
+matches where it was read and the layout's planned end of data is at or after
+the tape's end of data (REM-PARITY §8.4). A tape file written after the
+terminal suffix, a second terminal suffix, or any structural artifact after
+replica C, moves the tape's end of data past the planned end of data. The
+specification says what follows: a tape file written after a suffix "moves the
+tape's EOD past the planned EOD of the first suffix, so that layout is not
+used" (REM-PARITY §8.4). The exception is a later terminal suffix whose own replicas validate: its
+footer supplies a layout of its own, and discovery uses it without a walk.
+Otherwise no replica validates and the Scanner takes the walk, although A, B
+and C may be intact.
+
+What the walk reports then is fixed. The intact replicas are tape files of the
+walk and not Object authority: "A terminal replica that the walk finds intact
+is a tape file of the walk and is not Object authority: it supplies no Object
+identity." (REM-PARITY §8.4.1). The trailing artifact is not an Object of any
+inventory, and the walk reports it "as an Object candidate of unknown identity
+or, when torn, as an incomplete candidate" (REM-PARITY §12.6), so that an
+operator sees it. In Remanence the walk's start notice gives the reason as
+`no_usable_terminal_layout` when no footer supplied a usable layout, and
+`all_members_invalid` when a layout was found and no replica of it validated.
+A walk over intact replicas that were followed by later tape files usually
+shows `no_usable_terminal_layout`. It shows `all_members_invalid` when a layout
+was found and none of its replicas validated. That includes a later, fully
+written suffix whose replicas are invalid, even though the first suffix's
+replicas are intact.
+
+We recommend that a tool say this in its own words when it announces the walk,
+and that it tell the operator to look for what was written after the suffix
+before assuming that the replicas were lost.
+
+The opposite case also needs a sentence. When replicas validate and disagree
+in an edition-common field, discovery ends without a walk. The Scanner returns
+`TerminalIndexReplicaConflict` and no inventory, and the specification says
+that "this document does not require the walk after it" (REM-PARITY §8.5). A
+tool should report the conflict as a conflict. It should not start a walk
+because a walk seems the natural response to damage, since a walk cannot
+decide which edition is right.
+
+Serves REM-PARITY §8.4, Discovery (Reader); REM-PARITY §8.5, Authoritative
+Selection; and REM-PARITY §12.6, Terminal Completeness.
+
 ### In plain terms
 
 Start from the end of the tape. Compare the three replica envelopes before
@@ -1424,15 +1623,22 @@ reading a body. Read further bodies only when needed. Keep a consumer from
 trusting rows until the reader has chosen them. When the index is gone and the
 whole tape must be walked, tell the operator before starting. Show progress
 during the walk. Let the operator stop between tape files. Refuse what cannot
-be recovered before moving the tape. Recover in tape order.
+be recovered before moving the tape. Recover in tape order. Find a sidecar's
+index the same way whoever asks, and say which blocks were checked against it
+and which were only read. When a tape with good replicas is walked, say that
+something was written after the suffix.
 
 ## 11. Capacity admission
 
-A REM-PARITY tape is finished by writing a terminal suffix at its end: the final
-ParityMap when there are sidecars, three replicas and two separation extents
-(REM-PARITY §8.3). A tape that runs out of room before its suffix is written can
+A REM-PARITY tape is finished by its final parity closeout (the final ParityMap
+when there are sidecars) and a terminal suffix of three replicas and two
+separation extents (REM-PARITY §8.3). A tape that runs out of room before its suffix is written can
 still be read, but only by a structural walk from BOT, and it never gains its
-catalog-less index. This chapter is about keeping that room.
+catalog-less index. This chapter is about keeping that room. A tape with no
+parity has no sidecars and no parity closeout, but it keeps the complete
+terminal suffix, so the suffix's share of the reserve is computed the same way
+as for a parity tape. The [on-tape layout reference](reference-tape-layout.md#parity-scheme)
+describes the no-parity bootstrap.
 
 ### 11.1. Admit an Object only if the tape can still be finalized
 
@@ -1617,7 +1823,7 @@ intention, and the tape is the result.
 We recommend that a writer record its identity in bootstrap key 3 and in
 ParityMap key 6, in the form `<implementation>/<version>`, optionally followed
 by a space and a parenthesised build identifier, for example
-`remanence/1.0.0 (v1.0.0-12-g874b111)`. The implementation part names the
+`remanence/0.1.0 (<build>)`. The implementation part names the
 software, not the format, so two conformant implementations will not agree on
 it, and are not expected to. A ParityMap is written by software too, and can be
 written by a different version of it than the bootstrap it accompanies, so each
@@ -1678,9 +1884,23 @@ identity at random.
 
 ## 14. Revision history
 
-- **27 September 2026.** Fifth revision. Section 9's recommendation on walk
-  hints names the parity scheme (or no parity) as the third hint REM-PARITY
-  §8.4.1 now requires when the bootstrap is unreadable.
+- **30 September 2026.** Sixth revision. Section 7.3 gains the practice of a
+  full verification: a check of structure alone is not one, and each failed
+  block or shard is reported by its address. Chapter 10 gains sections 10.9
+  (acquiring a sidecar's index through one path, the outcomes to tell apart,
+  and what a Verifier does when no index validates) and 10.10 (why a tape with
+  intact replicas can still be walked, and why a conflict is not walked).
+  Section 10.6 points to 10.10, and chapter 11 notes that a tape with no parity
+  keeps the complete terminal suffix and no longer counts the final ParityMap
+  as part of the suffix. The example writer identity in section
+  13.2 now uses a software version that exists. The fifth revision's entry
+  below named the wrong chapter and is corrected there.
+
+- **27 September 2026.** Fifth revision. Section 10.6's recommendation on walk
+  hints (the entry first said section 9, which is finalization; the
+  recommendation has always been in chapter 10) names the parity scheme (or no
+  parity) as the third hint REM-PARITY §8.4.1 now requires when the bootstrap
+  is unreadable.
 
 - **27 September 2026.** Fourth revision. Sections 13.2 and 13.3 qualify the
   diagnostic recommendations for implementations that plan a ParityMap's bytes
