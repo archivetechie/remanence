@@ -24,8 +24,7 @@ use crate::raw::{
     RawTapeSource,
 };
 use crate::scan::{
-    scan_reconstruct_filemark_map_with_report_mode, validate_scan_reconstruction_with_report,
-    ScanDamageKind, ScanMode, ScanWalkResult,
+    validate_scan_reconstruction_with_report, ScanDamageKind, ScanMode, ScanWalkResult,
 };
 use crate::tape_index_replica::{
     parse_tape_index_bootstrap_footer, parse_tape_index_replica_header,
@@ -38,7 +37,9 @@ use crate::terminal_tail::{
     validate_terminal_index_block_size_hint, TerminalTailLayout, TERMINAL_INDEX_REPLICA_COUNT,
     TERMINAL_TAIL_COMPONENT_COUNT,
 };
-use crate::verify_protected::{verify_protected_content, ProtectedContentVerification};
+use crate::verify_protected::{
+    bootstrap_fill_finding, verify_protected_content, ProtectedContentVerification,
+};
 #[cfg(test)]
 use remanence_library::TapeIoError;
 use std::cell::RefCell;
@@ -988,11 +989,7 @@ fn verify_terminal_index_after_damage(
             mode,
         );
     }
-    let walked =
-        scan_reconstruct_filemark_map_with_report_mode(source, tape_uuid, block_size, mode)
-            .map_err(|error| TerminalIndexVerificationError::PrefixWalk {
-                message: error.to_string(),
-            })?;
+    let walked = scan_verification_prefix(source, tape_uuid, block_size, mode)?;
     let prefix_count = layout.components[0].planned_tape_file_number;
     if walked
         .truncation
@@ -1303,11 +1300,18 @@ fn verify_protected_prefix(
     replica_rows: &[TapeIndexReplicaMapEntry],
     prefix_damage: Vec<String>,
 ) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
-    let mut protected =
-        verify_protected_prefix_rows(source, tape_uuid, block_size, walked, edition, replica_rows)?;
+    let mut findings = prefix_damage;
+    findings.extend(
+        walked
+            .bootstrap_candidates
+            .iter()
+            .filter_map(bootstrap_fill_finding),
+    );
     // The damage is a finding whatever the pass could read.
-    protected.prefix_damage = prefix_damage;
-    Ok(protected)
+    retain_prefix_findings(
+        verify_protected_prefix_rows(source, tape_uuid, block_size, walked, edition, replica_rows),
+        findings,
+    )
 }
 
 fn verify_protected_prefix_rows(
@@ -1394,11 +1398,89 @@ fn verify_protected_walk(
     block_size: u32,
     mode: ScanMode<'_>,
 ) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
-    let walked =
-        scan_reconstruct_filemark_map_with_report_mode(source, tape_uuid, block_size, mode)
-            .map_err(|error| TerminalIndexVerificationError::PrefixWalk {
+    let walked = scan_verification_prefix(source, tape_uuid, block_size, mode)?;
+    let findings = walked
+        .bootstrap_candidates
+        .iter()
+        .filter_map(bootstrap_fill_finding)
+        .collect();
+    retain_prefix_findings(
+        verify_protected_walk_rows(source, tape_uuid, block_size, walked),
+        findings,
+    )
+}
+
+/// Retain bootstrap observations even when scanning or directory reconciliation fails.
+fn scan_verification_prefix(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+) -> Result<ScanWalkResult, TerminalIndexVerificationError> {
+    let mut findings = Vec::new();
+    let result = crate::scan::scan_with_bootstrap_observer(
+        source,
+        tape_uuid,
+        block_size,
+        mode,
+        &mut |_| crate::scan::ScanWalkControl::Continue,
+        &mut |candidate| findings.extend(bootstrap_fill_finding(candidate)),
+    );
+    match result {
+        Ok(crate::scan::ControlledScanWalkOutcome::Complete(walked)) => Ok(walked),
+        Ok(crate::scan::ControlledScanWalkOutcome::Aborted(_)) => {
+            unreachable!("an unconditional scan controller cannot abort")
+        }
+        Err(error) => Err(attach_prefix_findings(
+            TerminalIndexVerificationError::PrefixWalk {
                 message: error.to_string(),
-            })?;
+            },
+            findings,
+        )),
+    }
+}
+
+/// Preserve observed prefix findings on success and in operational error diagnostics.
+/// Keep the error variant so callers retain their existing failure classification.
+fn retain_prefix_findings(
+    result: Result<ProtectedContentVerification, TerminalIndexVerificationError>,
+    findings: Vec<String>,
+) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
+    match result {
+        Ok(mut protected) => {
+            protected.prefix_damage.extend(findings);
+            Ok(protected)
+        }
+        Err(error) => Err(attach_prefix_findings(error, findings)),
+    }
+}
+
+/// Append findings without replacing the operational failure or its classification.
+fn attach_prefix_findings(
+    mut error: TerminalIndexVerificationError,
+    findings: Vec<String>,
+) -> TerminalIndexVerificationError {
+    match &mut error {
+        TerminalIndexVerificationError::Source { message, .. }
+        | TerminalIndexVerificationError::PrefixWalk { message } => {
+            for finding in findings {
+                message.push_str("; ");
+                message.push_str(&finding);
+            }
+        }
+        _ => unreachable!("protected pass returns only source or prefix-walk errors"),
+    }
+    error
+}
+
+/// Validate the walked scope and read protected blocks; the caller retains fill findings
+/// even when no parity is present or this pass cannot be performed.
+fn verify_protected_walk_rows(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    walked: ScanWalkResult,
+) -> Result<ProtectedContentVerification, TerminalIndexVerificationError> {
     let scheme = match walked_verification_scheme(&walked) {
         Ok(Some(scheme)) => scheme,
         Ok(None) => return Ok(ProtectedContentVerification::none_protected()),
@@ -1559,11 +1641,7 @@ fn verify_terminal_index_strict(
         }
     };
 
-    let walked =
-        scan_reconstruct_filemark_map_with_report_mode(source, tape_uuid, block_size, mode)
-            .map_err(|error| TerminalIndexVerificationError::PrefixWalk {
-                message: error.to_string(),
-            })?;
+    let walked = scan_verification_prefix(source, tape_uuid, block_size, mode)?;
     if let Some(truncation) = walked.truncation {
         return Err(TerminalIndexVerificationError::PrefixTruncated {
             tape_file_number: truncation.tape_file_number,
@@ -3069,6 +3147,144 @@ mod tests {
         let mut other = rows.clone();
         other[0].block_count = 2;
         assert!(scoped_map_from_terminal_replica(&edition, &other).is_err());
+    }
+
+    /// Fill is Reader-tolerated, but is a Verifier finding on both terminal and BOT routes.
+    #[test]
+    fn full_verify_bootstrap_fill_is_a_nonconformity_without_rejecting_bootstrap() {
+        for terminal in [true, false] {
+            for nonzero in [false, true] {
+                let mut fixture = triple_fixture();
+                let Record::Block(block) = &mut fixture.records[0] else {
+                    panic!("fixture starts with bootstrap");
+                };
+                // The last byte is fill, beyond the validated payload and its CRC.
+                *block.last_mut().unwrap() = u8::from(nonzero);
+                crate::bootstrap::parse_bootstrap_block(block).expect("Reader accepts fill");
+                if !terminal {
+                    fixture.records.truncate(2);
+                }
+                let mut source = RecordingSource::new(fixture.records);
+                let outcome = verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE)
+                    .expect("full verification retains fill evidence");
+                assert_eq!(
+                    outcome.protected().prefix_damage.len(),
+                    usize::from(nonzero)
+                );
+                assert_eq!(outcome.protected().is_clean(), !nonzero);
+                assert_eq!(outcome.is_complete_tape(), terminal && !nonzero);
+                if nonzero {
+                    assert_eq!(
+                        outcome.protected().prefix_damage[0],
+                        "bootstrap at tape_file 0 has nonzero trailing fill (REM-PARITY 8.1)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A failed protected row pass still reports fill and earlier prefix damage.
+    #[test]
+    fn protected_prefix_failure_retains_bootstrap_fill() {
+        let mut fixture = triple_fixture();
+        let edition = edition_plan(fixture.layout, [0x72; 16]);
+        let Record::Block(block) = &mut fixture.records[0] else {
+            panic!("BOT block")
+        };
+        let mut payload = crate::bootstrap::parse_bootstrap_block(block).unwrap();
+        payload.no_parity_flag = false;
+        payload.filemark_map_digest =
+            Some(crate::filemark_map::sole_bot_filemark_map_digest().unwrap());
+        payload.scheme = Some(crate::bootstrap::ParitySchemeRecord {
+            id: "rs-cauchy-gf256-v1".to_string(),
+            data_blocks_per_stripe: 128,
+            parity_blocks_per_stripe: 4,
+            stripes_per_neighborhood: 64,
+            no_parity_flag: false,
+        });
+        crate::bootstrap::write_bootstrap_block(&payload, block).unwrap();
+        *block.last_mut().unwrap() = 1;
+        let mut source = RecordingSource::new(fixture.records);
+        let walked =
+            scan_verification_prefix(&mut source, &TAPE_UUID, BLOCK_SIZE, ScanMode::Standard)
+                .unwrap();
+        let error = verify_protected_prefix(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &walked,
+            &edition,
+            &[], // Missing canonical rows force the protected row pass to fail.
+            vec!["earlier prefix damage".to_string()],
+        )
+        .expect_err("invalid protected scope must fail");
+        assert!(matches!(
+            error,
+            TerminalIndexVerificationError::PrefixWalk { .. }
+        ));
+        let detail = error.to_string();
+        assert!(detail.contains("earlier prefix damage"), "{detail}");
+        assert!(
+            detail.contains("bootstrap at tape_file 0 has nonzero trailing fill"),
+            "{detail}"
+        );
+    }
+
+    /// A later walk read failure cannot erase an already classified bootstrap finding.
+    #[test]
+    fn failed_verification_walk_retains_bootstrap_fill() {
+        for terminal in [false, true] {
+            let mut fixture = triple_fixture();
+            let Record::Block(block) = &mut fixture.records[0] else {
+                panic!("BOT block")
+            };
+            *block.last_mut().unwrap() = 1;
+            let mut source =
+                RecordingSource::new(fixture.records).with_read_fault(2, TestReadFault::Hardware);
+            let error = if terminal {
+                verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap_err()
+            } else {
+                verify_protected_walk(&mut source, &TAPE_UUID, BLOCK_SIZE, ScanMode::Standard)
+                    .unwrap_err()
+            };
+            assert!(matches!(
+                error,
+                TerminalIndexVerificationError::PrefixWalk { .. }
+            ));
+            let detail = error.to_string();
+            assert!(
+                detail.contains("bootstrap at tape_file 0 has nonzero trailing fill"),
+                "{detail}"
+            );
+        }
+    }
+
+    /// Supplied values cannot establish anything about unreadable fill bytes.
+    #[test]
+    fn full_verify_unreadable_bootstrap_is_not_a_fill_failure() {
+        let fixture = triple_fixture();
+        let mut source =
+            RecordingSource::new(fixture.records).with_read_fault(0, TestReadFault::Medium);
+        let hints = crate::ScanRecoveryHints {
+            tape_uuid: TAPE_UUID,
+            block_size: BLOCK_SIZE,
+            scheme: crate::ParityConfig::None,
+        };
+        let outcome = verify_terminal_index_full_with_scan_mode(
+            &mut source,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            None,
+            ScanMode::Recovery(&hints),
+        )
+        .expect("supplied values permit verification");
+        assert!(!outcome.is_complete_tape());
+        assert!(!outcome.protected().prefix_damage.is_empty());
+        assert!(outcome
+            .protected()
+            .prefix_damage
+            .iter()
+            .all(|detail| !detail.contains("fill")));
     }
 
     #[test]

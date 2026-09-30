@@ -1267,7 +1267,10 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
             detail: "the tail ParityMap copy is not usable".to_string(),
         }],
         not_performed: None,
-        prefix_damage: vec!["UnreadableTapeFileHead at LBA 2".to_string()],
+        prefix_damage: vec![
+            "UnreadableTapeFileHead at LBA 2".to_string(),
+            "bootstrap at tape_file 0 has nonzero trailing fill (REM-PARITY 8.1)".to_string(),
+        ],
     };
     let verified = TerminalIndexVerification {
         edition: converter_edition_plan(counts),
@@ -1300,6 +1303,11 @@ fn verification_names_every_protected_content_failure_and_is_never_complete() {
     assert!(addresses.contains(&(Kind::ParityShard as i32, Some("epoch 0 stripe 1 parity 0"))));
     // Prefix damage has no address, and every finding states its reason.
     assert!(addresses.contains(&(Kind::PrefixDamage as i32, None)));
+    assert!(projected.protected_content_findings.iter().any(|f| f.kind
+        == Kind::PrefixDamage as i32
+        && f.address.is_none()
+        && f.detail.as_deref()
+            == Some("bootstrap at tape_file 0 has nonzero trailing fill (REM-PARITY 8.1)")));
     // A ParityMap copy that was not used is a finding at its tape file.
     assert!(addresses.contains(&(Kind::ParityMap as i32, Some("tape_file 3"))));
     assert!(projected
