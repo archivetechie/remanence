@@ -257,7 +257,7 @@
             ],
             "quotes": [
               "If the footer and the primary copy have both failed, no final ParityMap validates (so the sidecar has no directory entry), and the sidecar's map entry comes from a validated terminal replica's structural rows, a Recoverer MUST try the tail copy that the map entry locates.",
-              "Here, as in the directory-assisted rescue, a final ParityMap validates only when it validates and is marked `is_final_directory`.",
+              "A final ParityMap validates when it validates under Section 10.1 (at least one copy is valid, and the two agree when both are valid), its directory meets Section 10.1.5 and fits the scope of the map, and it is marked `is_final_directory`.",
               "The tail copy is used only if it is valid on its own (step 2's sense), its recorded `sidecar_header_block_count` equals `H`, and its epoch and protected range agree with the map entry.",
               "a final `ParityMap` is present if and only if at least one `ParitySidecar` row is present;",
               "Every reconstructed data block MUST be verified against its sidecar data CRC before release."
