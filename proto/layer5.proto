@@ -1027,7 +1027,8 @@ enum TapeIndexVerificationState {
   TAPE_INDEX_VERIFICATION_STATE_UNSPECIFIED = 0;
   // Retained for older daemons that truthfully lacked the physical verifier.
   TAPE_INDEX_VERIFICATION_STATE_DEFERRED_FULL_PHYSICAL_VERIFY = 1;
-  // Every physical prefix row and all five terminal components validated.
+  // Every physical prefix row and all five terminal components validated,
+  // and the protected content verified clean (no protected-content findings).
   TAPE_INDEX_VERIFICATION_STATE_VERIFIED_COMPLETE = 2;
   // The canonical physical prefix has a valid survivor, but one or more
   // redundant replicas/separations are damaged or incomplete.
