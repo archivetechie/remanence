@@ -296,6 +296,28 @@ fn walk_extras(scan: &ScanWalkResult) -> serde_json::Map<String, Value> {
         .collect();
     let mut extras = serde_json::Map::new();
     extras.insert(
+        "walk_total_data_ordinals".into(),
+        json!(scan.map.total_data_ordinals()),
+    );
+    extras.insert(
+        "walk_entries".into(),
+        json!(scan
+            .map
+            .entries()
+            .iter()
+            .map(|entry| (
+                entry.tape_file_number.to_string(),
+                json!({
+                    "block_count": entry.block_count,
+                    "first_parity_data_ordinal": entry.first_parity_data_ordinal,
+                    "epoch_id": entry.epoch_id,
+                    "protected_ordinal_start": entry.protected_ordinal_start,
+                    "protected_ordinal_end_exclusive": entry.protected_ordinal_end_exclusive,
+                }),
+            ))
+            .collect::<BTreeMap<_, _>>()),
+    );
+    extras.insert(
         "walk_bootstrap_candidates".into(),
         json!(scan.bootstrap_candidates.len()),
     );
@@ -2015,6 +2037,14 @@ fn compare_s6(id: &str, expected: &Value, checks: &Value, actual: &Value) -> Vec
                     | "sections"
                     | "quotes"
                     | "open"
+                    | "path"
+                    | "walk_ends"
+                    | "tape_files"
+                    | "map_produced"
+                    | "map_validates_against_final_parity_map"
+                    | "validation_detail"
+                    | "damage_reported_by_walk"
+                    | "sections_and_sentences"
             ),
             "{id}: unknown S6 author key {key}"
         );
@@ -2059,7 +2089,27 @@ fn compare_s6(id: &str, expected: &Value, checks: &Value, actual: &Value) -> Vec
                 .expect("permitted set")
                 .contains(&walk[key]),
             "outcome" | "terminal_authority_recovered" => actual[key] == *wanted,
-            "object_identity" => walk[key] == *wanted,
+            "object_identity"
+            | "walk_tape_file_count"
+            | "walk_truncated"
+            | "torn_object_candidates"
+            | "walk_validated_prefix"
+            | "walk_watermark"
+            | "walk_total_data_ordinals" => walk[key] == *wanted,
+            // Compare only fields supplied by the author, not entire map rows.
+            "walk_entries" => wanted.as_object().unwrap().iter().all(|(file, fields)| {
+                fields.as_object().unwrap().iter().all(|(field, value)| {
+                    assert!(
+                        matches!(field.as_str(), "block_count" | "first_parity_data_ordinal"
+                            | "epoch_id" | "protected_ordinal_start" | "protected_ordinal_end_exclusive"),
+                        "{id}: unknown S6 map field {field}"
+                    );
+                    walk[key][file].get(field) == Some(value)
+                })
+            }),
+            "forbidden_damage_kinds" => walk["walk_damaged"].as_array().is_some_and(|reported| {
+                reported.iter().all(|damage| !wanted.as_array().unwrap().contains(&damage["kind"]))
+            }),
             "parity_map_validation" => wanted.as_array().expect("permitted pairs").contains(
                 &json!({"validated": walk["walked_map_validated"], "error": walk["parity_map_error"]}),
             ),
@@ -2071,10 +2121,19 @@ fn compare_s6(id: &str, expected: &Value, checks: &Value, actual: &Value) -> Vec
             other => panic!("{id}: unknown S6 check {other}"),
         };
         if !agrees {
-            failures.push(format!("{key}: expected {wanted}, observed {}", walk[key]));
+            let observed = match key.as_str() {
+                "outcome" | "terminal_authority_recovered" => &actual[key],
+                "required_damage" | "forbidden_damage_kinds" => &walk["walk_damaged"],
+                _ => &walk[key],
+            };
+            failures.push(format!("{key}: expected {wanted}, observed {observed}"));
         }
     }
-    if expected["produces_map"] != json!(walk["walk_classes"].is_object()) {
+    let produces_map = expected
+        .get("produces_map")
+        .or_else(|| expected.get("map_produced"))
+        .expect("S6 map presence expectation");
+    if *produces_map != json!(walk["walk_classes"].is_object()) {
         failures.push("walk map presence differs".into());
     }
     failures
@@ -2112,6 +2171,8 @@ cases! {
     s6_10 => "s6-10",
     s6_11 => "s6-11",
     s6_12 => "s6-12",
+    s6_13 => "s6-13",
+    s6_14 => "s6-14",
 
 }
 
@@ -2137,7 +2198,8 @@ fn e2_expectation_quotes_occur_in_the_specification() {
     assert!(quotes > 0, "no E2 quotes checked");
 }
 
-/// Every E3 and E4 expectation quotes the specification text verbatim.
+/// Check literal `quotes` in E3, E4 and S6. S6b instead preserves mixed
+/// citations and paraphrases in `sections_and_sentences`, not literal quotes.
 #[test]
 fn e3_and_e4_expectation_quotes_occur_in_the_specification() {
     let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
@@ -2146,7 +2208,20 @@ fn e3_and_e4_expectation_quotes_occur_in_the_specification() {
         let entries: Vec<&Value> = match case["erratum"].as_str() {
             Some("E3") => vec![&case["expected"]["scanner"], &case["expected"]["walk"]],
             Some("E4") => case["expected"].as_object().unwrap().values().collect(),
-            Some("S6") => vec![&case["expected"]],
+            Some("S6") => {
+                if case["expected"].get("quotes").is_some() {
+                    vec![&case["expected"]]
+                } else {
+                    let citations = case["expected"]["sections_and_sentences"]
+                        .as_array()
+                        .expect("S6b citations must be present");
+                    assert!(!citations.is_empty(), "S6b citations must not be empty");
+                    assert!(citations.iter().all(|citation| citation
+                        .as_str()
+                        .is_some_and(|text| !text.trim().is_empty())));
+                    Vec::new()
+                }
+            }
             _ => continue,
         };
         for entry in entries {
@@ -2880,5 +2955,59 @@ fn s6_09_validation_and_error_are_paired() {
             compare_s6("s6-09", &case["expected"], &case["checks"], &actual).is_empty(),
             allowed
         );
+    }
+}
+
+/// The S6b comparison rejects changed scope and map fields, but does not
+/// constrain unreadable-head findings where the independent author is silent.
+#[test]
+fn s6b_comparison_checks_only_pinned_claims() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    for id in ["s6-13", "s6-14"] {
+        let case = frozen["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["id"] == id)
+            .unwrap();
+        let checks = &case["checks"];
+        // Construct a comparison sample from the pinned claims, without
+        // executing the reference or deriving any expectation from it.
+        let mut actual = json!({"outcome": checks["outcome"],
+            "terminal_authority_recovered": checks["terminal_authority_recovered"],
+            "walk": checks.clone()});
+        for (file, permitted) in checks["walk_classes"].as_object().unwrap() {
+            actual["walk"]["walk_classes"][file] = permitted[0].clone();
+        }
+        for key in ["walked_map_validated", "parity_map_error"] {
+            actual["walk"][key] = checks[key][0].clone();
+        }
+        for damage in [
+            json!([]),
+            json!([{"tape_file": 3, "kind": "UnreadableTapeFileHead"}]),
+        ] {
+            actual["walk"]["walk_damaged"] = damage;
+            assert!(compare_s6(id, &case["expected"], checks, &actual).is_empty());
+        }
+        for pointer in [
+            "/walk/walk_validated_prefix",
+            "/walk/walk_watermark",
+            "/walk/walk_total_data_ordinals",
+            "/walk/walk_tape_file_count",
+            "/walk/walk_truncated",
+            "/walk/torn_object_candidates",
+            "/walk/walk_entries/1/first_parity_data_ordinal",
+            "/walk/walk_entries/2/epoch_id",
+            "/walk/walk_entries/3/block_count",
+        ] {
+            let mut changed = actual.clone();
+            *changed.pointer_mut(pointer).unwrap() = Value::Null;
+            assert!(
+                !compare_s6(id, &case["expected"], checks, &changed).is_empty(),
+                "{id}: {pointer}"
+            );
+        }
+        actual["walk"]["walk_damaged"] = json!([{"tape_file":4,"kind":"InvalidTerminalControl"}]);
+        assert!(!compare_s6(id, &case["expected"], checks, &actual).is_empty());
     }
 }

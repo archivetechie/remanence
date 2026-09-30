@@ -1210,3 +1210,21 @@ where in a walk's result. *Decided:* `walk.damaged` maps the tape file to the re
 counted as damage, file 9 would be an ordinary Object candidate in the map, and the map would then differ from the final
 ParityMap's scope. *Decided:* the first reading, as O-4.
 
+
+**P-5. An unreadable ParityMap header copy and "invalid" (s6-13).** Section 10.1.3 makes a header copy "invalid" when its CRC
+does not verify ("A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the footer, and MUST NOT rely on a block
+whose CRC does not verify. Such a header copy or footer is invalid."), and says "When one header copy is invalid and the other is
+valid, the valid copy is used". It says what an unreadable footer does, and does not say in so many words that an unreadable
+header copy is an invalid one. Section 12.3 item 4 calls the walk's tail route "the copy fallback of Section 10.1.3, applied to
+the walk", which treats an unreadable first block as the case the fallback covers. *Decided:* an unreadable primary header copy
+is a copy that cannot be relied on, so the valid tail copy is used and the ParityMap validates (so the walked map is validated
+under Section 13.1). Had an unreadable copy been a third state that blocks the ParityMap, s6-13's map would be produced and not
+validated. The text supports the first reading by the item 4 sentence and by the footer sentence's "the header copies are used as
+above"; it does not state the second.
+
+**P-6. The Verifier and a ParityMap the walk types Object (s6-14, as s6-11).** When the head is unreadable and the footer is
+edited, no route of item 4 recognises the file, and item 7 makes it an Object. Section 2.2 requires the Verifier to report a
+ParityMap footer that reads and is invalid (Section 10.1.3: `ParityMapParse`), but a Verifier that has not recognised tape file 3
+as the ParityMap has no ParityMap to report on, and the text does not say that it must look again. *Decided:* the Verifier's
+result stays `recovery_required` (no valid replica) and it lists no finding for file 3, as in s6-11. What the text leaves open
+is whether that file should be reported at all.
