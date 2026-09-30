@@ -6,6 +6,129 @@ per-release summaries.
 
 ## Unreleased
 
+- Wording pass over the REM-PARITY text that the recent clarifications touched.
+  No requirement changes. Section 17 opens with the damage matrix as it now
+  stands and treats its first 25 cases as history, and Appendix D item TT-2
+  drops the two reference gaps that are now closed.
+- Added the Implementation Guide checks to CI. `tools/check_guide.py` verifies
+  that every quotation the Guide attributes to a specification section is
+  verbatim in that section, that no capitalised requirement keyword appears
+  outside a quotation, that every title citation names an existing heading, and
+  that every REM-OBJECT, REM-ENCRYPT and REM-PARITY section citation in `docs/`
+  resolves. `make check-guide` runs it locally.
+- Implementation Guide revision 6. Section 7.3 quotes REM-PARITY §2.2's
+  definition of a full verification. New section 10.9 gives one acquisition for
+  a sidecar's index, in the order §13.3 sets, and what a Verifier does when no
+  index validates. New section 10.10 explains why a tape with intact replicas
+  can still be walked, and why a replica conflict is not walked.
+- Operator documentation follows the specifications as they now stand. Two new
+  pages, `guide-full-verification.md` and `guide-damaged-tapes.md`, explain what
+  a full verification reads and reports, and walk an operator from what they see
+  to what it means for each kind of damage. The reference pages, the glossary
+  and the import and recovery guide are corrected to the same text.
+- Code comments and test descriptions in the parity, library and CLI crates and
+  in `verif/parity-state` now describe REM-PARITY as it stands. No behaviour
+  changes.
+- A bootstrap refused under supplied values now renders as `bootstrap refused:
+  <reason>`, with the reason §8.4 gives for that row, instead of "filemark map
+  could not be reconstructed". A bootstrap read from tape that records drive
+  compression now says so, instead of telling the operator to change a drive
+  setting that does not matter for reading. The error classifications are
+  unchanged. `DriveCompressionEnabled` gains a context field, which changes the
+  variant's shape in `remanence-parity`'s public API.
+- `rem tape verify-index --json` now carries `protected_content_findings` in
+  both envelopes (verified and recovery-required): one object per finding, with
+  its kind, its address (or null) and its detail. REM-PARITY §2.2 requires a
+  Verifier to report each failed block or shard by its address, and the JSON
+  form gave only counts. The schema name is unchanged and the key is additive. A
+  result whose only degradation is protected content is now accepted as verified
+  and not complete; validation rejected it before.
+- A full verification now reports nonzero trailing fill after the bootstrap's
+  payload (REM-PARITY §8.1). The finding leaves the tape not complete and does
+  not change Reader acceptance; a bootstrap read on supplied values is not
+  reported as a fill failure, and the API carries the finding under the existing
+  `PrefixDamage` kind. `rem tape recovery-report` now performs terminal
+  discovery first, through the same library entry as the API, and walks only
+  when discovery produces no inventory; when discovery succeeds it no longer
+  lists the walk's prefix damage, which a full verification reports.
+- REM-PARITY clarifications. The text now states what the reference and the
+  pinned vectors already did: bootstrap discovery with supplied values, which
+  footers supply a layout, the walk's measurements and classification ladder,
+  the preconditions and order of the directory-assisted rescue, what makes a
+  final ParityMap valid, and what a full verification reports. Appendix D item
+  TT-2 records the limits that follow. Three points were decided. A structural
+  artifact after the exact terminal suffix is not an Object of any inventory
+  (§12.6). A footer whose magic matches commits a tape file to its control type
+  even when the head is readable and no head rung parses it (§12.3). A no-parity
+  bootstrap must omit the parity scheme record, and one that carries it is
+  `BootstrapParse` (§8.2, §8.4, §15). The reference follows: the bootstrap
+  parser, validation, salvage and Writer share one no-parity rule, and the
+  Verifier reports an unreadable or invalid ParityMap copy or footer, which
+  leaves the tape not complete (§2.2). No tape byte changes.
+  `ProtectedContentFindingKind` gains `PARITY_MAP`.
+- The damage cases' fault maps now state every byte a text-only Reader needs to
+  build the damaged tape: a foreign record states its fill, and the
+  second-edition replica of `e3-07` states, per record, its role, its base
+  record and each replaced field, and at file level its ordinal, edition,
+  planned position, end of data and layout tuples. No tape byte or digest
+  changes, and the damage executor checks that the stated fields reproduce the
+  bytes and refuses unknown keys. The second implementation decides `e3-07` from
+  the text: `BotStructuralRecoveryRequired`, within the outcomes the expectation
+  permits.
+- Sidecar acquisition and the tail rescue now follow REM-PARITY §9.1 and §13.3.
+  A valid footer decides; otherwise an available directory entry decides by
+  canonical metadata hash; otherwise the tail copy at H + S·m is read, and a
+  valid tail that differs leaves the epoch's metadata unavailable. The directory
+  rescue after a valid footer is removed. When no copy can be used the error is
+  `SidecarMetadataUnavailable`, and `SchemeMismatch` is reported only for a
+  usable copy. When the footer and primary have failed and no final ParityMap
+  validates, a Recoverer now rescues the tail copy from a map whose rows come
+  from a validated terminal replica, at H = (total − 1 − P) / 2. A walked map
+  does not qualify. The walk (§12.3 item 6) no longer aborts when a tail copy
+  disagrees with the footer; it falls through.
+- The Verifier now performs the full verification REM-PARITY §2.2 defines. It
+  reads every sidecar's primary, tail and footer, reports divergence as
+  `SidecarParse` and damaged copies as findings, and reads every protected data
+  block and parity shard, reporting each failure by address. Damage before the
+  terminal suffix keeps the terminal route when the walked prefix agrees with
+  the replica's rows. A tape with any finding is never reported complete.
+  Terminal verification results gain the `ProtectedContentFinding` message and
+  the `ProtectedContentFindingKind` enum; `remanence-parity` gains the
+  `verify_protected` module, `MapSource`, `scoped_map_from_terminal_replica` and
+  the `TailCopyNotRead` copy health.
+- Recorded values in the CBOR a Reader accepts are now treated as exact integers
+  (REM-PARITY §2.4). A recorded value, position, count or ordinal is rejected
+  only when its exact value does not fit, and a compared value is compared
+  exactly; a host limit is the new `ImplementationLimit` error. Commit-record
+  values that do not fit are `ResumeAppend`. A device position that does not
+  fit, goes backwards or differs after LOCATE is `TapeIo`, in every raw adapter,
+  and the block-source adapter no longer saturates. Records of the wrong length
+  (§3.5) are invalid control candidates or erasures in the Reader roles, never
+  `TapeIo`, and a caller buffer smaller than one block is `ReadBufferTooSmall`.
+  The Resumer refuses a committed final ParityMap, including through the legacy
+  planner. Map position validity (§7.2) is one accumulation shared by the
+  filemark map and replica payload validation. `remanence-parity` gains
+  `ParityError::ImplementationLimit`, `mapping::{EpochDataShard,
+  stripe_data_shard_in_epoch, unprotected_ordinals_within_one_epoch}` and
+  `raw::{FixedRecordRead, read_fixed_record, classify_fixed_record,
+  wrong_record_length}`.
+- The damage matrix now holds 57 cases, 55 pinned; `parity-map-and-sidecar` and
+  `e1-07` are the two that are not (`tape-images/cases/`, REM-PARITY §17). It
+  grew from the first 25 cases in three groups: fifteen cases (`e1-01` to
+  `e1-15`) judging the first record with supplied values, ten (`e2-01` to
+  `e2-04` and `e2-08` to `e2-13`) on wrong-length records, sidecar acquisition
+  and the walk, and seven (`e3-01` to `e3-07`) on the walk after damage to or
+  beside the terminal suffix. An overlay, `expected-e4.json`, gives the tail
+  rescue's outcome for `parity-map-and-sidecar` and what a Verifier reports for
+  14 cases, and every case carries a full-verification observation. The four
+  selection conflict rows were rebuilt as second-edition replicas, and the image
+  source now reports a LOCATE past its last record as end-of-data. Resume
+  vectors `e2-05` to `e2-07` and the erratum file that overrides named
+  observations of the frozen negative files came with them. The second
+  implementation decided every case, and its records show no disagreement with
+  the expected outcomes except on questions the specification leaves open. Its
+  records state an agreement count only for the first 25 cases (23 of the 24
+  pinned, below); none is stated for the 57, and none is claimed.
 - `MUTATIONS.tsv`, the table of hostile terminal-index mutations, gains a `section15` column: the
   REM-PARITY §15 error each row requires. An author working from the specification text wrote these
   names from byte-level descriptions of the mutations, without the reference or its verifier
@@ -64,29 +187,32 @@ per-release summaries.
   re-derives every pinned candidate byte from the recorded inputs: the six
   tape images, the six terminal profiles, the maximum artifacts, the
   Object-row extension slots and the million-row stream. All 146 comparisons
-  match. It also decided the 25 damage cases before seeing any expected
-  outcome, under opaque case ids. 23 of the 24 pinned cases agree. The
-  remaining case, a lost filemark that merges an Object with its sidecar,
-  turns on a question the text leaves open, and is recorded as such. Its
-  findings, including 29 places where the text is silent or ambiguous, are in
+  match. It also decided the first batch of 25 damage cases before seeing any
+  expected outcome, under opaque case ids. Of the 24 pinned cases in that
+  batch, 23 agree. The remaining case, a lost filemark that merges an
+  Object with its sidecar, turns on a question the text leaves open, and is
+  recorded as such. Its findings, including 29 places where the text is
+  silent or ambiguous, are in
   `fixtures/rem-parity-terminal-index-draft/second-implementation/`. CI
   rebuilds everything and re-decides every case.
 - Added review-only full-tape candidates for REM-PARITY generation 2
   (`fixtures/rem-parity-terminal-index-draft/tape-images/`). There are six
   tape images: Appendix A.4's minimal tape, a short epoch, two epochs, a
-  second edition, and two unfinalized tapes that stop in a torn tail. There
-  are 25 damage cases, each of which makes stated records unreadable or
-  removes a filemark. One builder regenerates the images from recorded inputs,
+  second edition, and two unfinalized tapes that stop in a torn tail. The
+  first batch of damage cases has 25, each of which makes stated records
+  unreadable or removes a filemark. One builder regenerates the images from recorded inputs,
   and `MANIFEST.tsv` pins the size and SHA-256 of every tape file; no image
   bytes are checked in. Each case's expected outcome was written from the
   specification text, not taken from the reference. The workspace tests run
   every case through the production Scanner, BOT walk, Recoverer and Verifier.
-  24 cases are pinned. The remaining one, whose outcome the text does not yet
-  decide, is reported but not asserted.
+  Of those 25 cases, 24 are pinned. The remaining one, whose outcome the text
+  did not yet decide, is reported but not asserted. The entry at the top
+  extends the matrix.
 - The Recoverer can now rescue a parity sidecar whose primary header and
-  footer are both unreadable, as REM-PARITY §13.3 step 3 describes, by finding
-  its tail copy through the sidecar epoch directory of the tape's final
-  ParityMap. Before, the directory was never attached on a generation-2 tape,
+  footer are both unreadable, by finding its tail copy through the sidecar
+  epoch directory of the tape's final ParityMap (the directory-assisted
+  rescue; the sidecar acquisition entry above gives the order now in force
+  and the second rescue, from the terminal index). Before, the directory was never attached on a generation-2 tape,
   so the rescue could not run. It works both when the inventory comes from a
   terminal replica and after a BOT walk. After a walk, a file is taken to be a
   sidecar only when the reconciled map matches the ParityMap's recorded
