@@ -12,15 +12,24 @@ repository  .workspace = true
 [dependencies]
 chacha20poly1305 = { workspace = true }
 chacha20         = { workspace = true }
+# ChaCha20 0.10 no longer forwards zeroize to its buffered cipher wrapper. Keep
+# this `cipher` on the version chacha20 links (`cargo tree -i cipher`), or the
+# feature lands on a second copy and the wrapper stops zeroizing.
+cipher           = { version = "0.5", features = ["zeroize"] }
+# `extra-sizes` provides the U1216 array of the X-Wing public key (XWING_PUBLIC_KEY_LEN).
+hybrid-array     = { version = "0.4", features = ["extra-sizes"] }
+subtle           = "2.6"
 hkdf             = { workspace = true }
 hpke             = { workspace = true }
 getrandom        = { workspace = true }
 rand_core        = { workspace = true }
 libcrux-ml-kem   = { version = "=0.0.10", default-features = false, features = ["mlkem768"] }
+# SHAKE moved out of sha3 0.12; use the same vetted backend as ML-KEM.
+libcrux-sha3      = "=0.0.10"
 sha2             = { workspace = true }
-sha3             = "=0.10.9"
+sha3             = "=0.12.0"
 thiserror        = { workspace = true }
-x25519-dalek     = { version = "=2.0.1", features = ["static_secrets"] }
+x25519-dalek     = { version = "=3.0.0", features = ["static_secrets"] }
 zeroize          = { workspace = true }
 
 [dev-dependencies]

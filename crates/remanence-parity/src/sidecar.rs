@@ -8,7 +8,7 @@
 //! packing that never splits a parity or data-CRC entry across block
 //! boundaries.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 pub use remanence_crc::{crc64_xz, CRC64_XZ_CHECK_VALUE};
 use sha2::{Digest, Sha256};
 

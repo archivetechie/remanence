@@ -707,7 +707,12 @@ mod tests {
             for file in &first_bytes.files {
                 digest.update(&file.bytes);
             }
-            assert_eq!(format!("{:x}", digest.finalize()), expected_sha256);
+            let actual_sha256: String = digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            assert_eq!(actual_sha256, expected_sha256);
             assert_eq!(first.terminal_plan, second.terminal_plan);
             assert_eq!(first.sidecars, second.sidecars);
             assert_eq!(first.sidecars.len(), 1);
