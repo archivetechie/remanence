@@ -1798,7 +1798,8 @@ block read, as the sidecar header's `block_size` must (Section 9.2).
 
 A Reader MUST verify the CRC-64/XZ at 0xC0 of each header copy and of the
 footer, and MUST NOT rely on a block whose CRC does not verify. Such a header
-copy or footer is invalid. When one header copy is invalid and the other is
+copy or footer is invalid. A header copy whose block cannot be read is invalid
+in the same way. When one header copy is invalid and the other is
 valid, the valid copy is used; when both are valid they MUST agree
 (Section 10.1.4). A footer that reads and is invalid rejects the ParityMap
 (`ParityMapParse`). A footer that cannot be read, or that is a record of the
@@ -3923,6 +3924,13 @@ an errata revision of draft.1.
     them, and Appendix D item TT-2 no longer lists the tail route as a
     reference gap. No tape byte, requirement or earlier vector outcome
     changes.
+  - Section 10.1.3 now says that a ParityMap header copy whose block cannot
+    be read is invalid, as one whose CRC does not verify is, so the other
+    copy is used when it is valid. The text had said how a footer that cannot
+    be read is treated and not a header copy. It is a change of requirements
+    that states what the reference implementation and the second
+    implementation already did; `s6-13` pins it. No tape byte and no vector
+    outcome changes.
 - **2026-08-11 — 1.0.0-draft.4 — replacement review draft.** Replaces the
   geometric/checkpoint-bootstrap design with one BOT Bootstrap and exactly
   three complete terminal index replicas separated by two typed extents.
@@ -4260,11 +4268,6 @@ This is the live preparing-copy snapshot for generation 2.
      route works is an Object candidate. The reference implementation follows
      both routes; the damage cases `s6-10`, `s6-12` and `s6-13` pin the footer
      route.
-   - Section 10.1.3 calls a header copy invalid when its CRC does not verify,
-     and says how a footer that cannot be read is treated, but not a header
-     copy that cannot be read. `s6-13` pins the reading that the other copy is
-     then used, which the reference implementation and the second
-     implementation share.
    - Section 12.3 leaves one point open. A readable, valid bootstrap at tape
      file 0 that measures more than one block is not recognised by item 1, and
      the reference implementation's walk ends at once with
