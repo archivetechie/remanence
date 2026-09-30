@@ -14,7 +14,7 @@ mod readiness;
 mod reconcile;
 mod restore;
 mod robotics;
-mod terminal_inventory;
+pub(crate) mod terminal_inventory;
 pub(crate) use restore::{status_from_pinned_tape_error, status_from_select_tape_error};
 
 pub(crate) use crate::write_admission::{

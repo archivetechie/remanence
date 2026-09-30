@@ -72,6 +72,7 @@ pub async fn connect_unix(socket_path: PathBuf) -> Result<Channel, tonic::transp
 }
 
 pub use remanence_parity::ParityConfig;
+pub use write_owner::terminal_inventory::terminal_verification_to_proto;
 
 mod api_state;
 mod append_request;

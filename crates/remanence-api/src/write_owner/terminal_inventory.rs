@@ -571,7 +571,9 @@ pub(crate) fn handle_drive_verify_tape_index(
     Ok(report)
 }
 
-pub(crate) fn terminal_verification_to_proto(
+/// Project physical verification into the daemon's wire report, including all
+/// protected-content findings and their effect on tape completeness.
+pub fn terminal_verification_to_proto(
     tape_uuid: TapeUuid,
     outcome: remanence_parity::TerminalIndexVerificationOutcome,
 ) -> pb::TapeIndexVerification {

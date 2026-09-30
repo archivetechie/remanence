@@ -74,7 +74,7 @@ impl<T: SgTransport> SgTransport for OverlengthReads<T> {
     }
 }
 
-fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
+pub(crate) fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
     // No key of the fault map may be ignored silently.
     for key in faults.as_object().expect("fault map object").keys() {
         assert!(

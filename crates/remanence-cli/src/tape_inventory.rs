@@ -810,7 +810,11 @@ fn validate_full_verification(
             }
         }
     }
-    if require_complete && (!all_replicas_valid || !all_separations_valid) {
+    if require_complete
+        && (!all_replicas_valid
+            || !all_separations_valid
+            || !verification.protected_content_findings.is_empty())
+    {
         return Err("verified-complete response carried degraded component evidence".to_string());
     }
     let verified_prefix_tape_file_count = require_present(
@@ -845,6 +849,7 @@ fn validate_full_verification(
         && all_replicas_valid
         && all_separations_valid
         && verification.measured_tape_file_count == expected_file_count
+        && verification.protected_content_findings.is_empty()
     {
         return Err("verified-degraded response carried no degraded physical evidence".to_string());
     }
@@ -1411,6 +1416,26 @@ fn print_inventory(
     writeln!(out, "detail: {}", inventory.detail).map_err(|error| error.to_string())
 }
 
+/// Shared presentation of daemon findings for human and JSON verification output.
+#[derive(serde::Serialize)]
+struct ProtectedContentFinding<'a> {
+    kind: &'static str,
+    address: Option<&'a str>,
+    detail: &'a str,
+}
+
+impl<'a> From<&'a pb::ProtectedContentFinding> for ProtectedContentFinding<'a> {
+    fn from(finding: &'a pb::ProtectedContentFinding) -> Self {
+        Self {
+            kind: pb::ProtectedContentFindingKind::try_from(finding.kind)
+                .map(|kind| kind.as_str_name())
+                .unwrap_or("UNRECOGNISED"),
+            address: finding.address.as_deref(),
+            detail: finding.detail.as_deref().unwrap_or(""),
+        }
+    }
+}
+
 fn print_verification(
     verification: &pb::TapeIndexVerification,
     fast_inventory: Option<&pb::TapeInventory>,
@@ -1450,6 +1475,11 @@ fn print_verification(
         return print_inventory(inventory, outcome, false, out);
     }
 
+    let protected_content_findings = verification
+        .protected_content_findings
+        .iter()
+        .map(ProtectedContentFinding::from)
+        .collect::<Vec<_>>();
     let mut replicas = verification.replica_health.iter().collect::<Vec<_>>();
     replicas.sort_by_key(|row| row.replica_ordinal);
     let replica_json = replicas
@@ -1501,6 +1531,7 @@ fn print_verification(
                     "replica_health": replica_json,
                     "separation_health": separation_json,
                     "recovery_inventory": inventory_json(recovery, outcome)?,
+                    "protected_content_findings": protected_content_findings,
                     "detail": verification.detail,
                 }),
                 out,
@@ -1545,6 +1576,7 @@ fn print_verification(
                 "layout_digest": digest_json(verification.layout_digest.as_deref()),
                 "payload_digest": digest_json(verification.payload_digest.as_deref()),
                 "canonical_map_digest": digest_json(verification.canonical_map_digest.as_deref()),
+                "protected_content_findings": protected_content_findings,
                 "replica_health": replica_json,
                 "separation_health": separation_json,
                 "detail": verification.detail,
@@ -1562,15 +1594,13 @@ fn print_verification(
         verification.verification_basis
     )
     .map_err(|error| error.to_string())?;
-    for finding in &verification.protected_content_findings {
+    for finding in &protected_content_findings {
         writeln!(
             out,
             "protected_content_finding: {} [{}] {}",
-            pb::ProtectedContentFindingKind::try_from(finding.kind)
-                .map(|kind| kind.as_str_name())
-                .unwrap_or("UNRECOGNISED"),
-            finding.address.as_deref().unwrap_or(""),
-            finding.detail.as_deref().unwrap_or("")
+            finding.kind,
+            finding.address.unwrap_or(""),
+            finding.detail
         )
         .map_err(|error| error.to_string())?;
     }
@@ -1954,6 +1984,62 @@ mod tests {
         assert_eq!(envelope["data"]["verified"], false);
     }
 
+    /// Exercise image reads, the daemon's production protobuf projection, and
+    /// the verify-index JSON renderer together, without requiring a socket.
+    #[test]
+    fn verify_index_json_reports_unreadable_parity_shard_from_tape_image() {
+        use crate::tape_image_vectors::{generate, BLOCK};
+        use remanence_parity::{verify_terminal_index_full, DriveHandleRawSource};
+
+        let vector = generate("a4-minimal").expect("generate tape image");
+        let tape_uuid = vector.written.inputs.tape_uuid;
+        // Sidecar file 2: one index record, then stripe 0's parity shard 0.
+        let shard_lba = vector.image.files[2].start_record + 1;
+        for damaged in [false, true] {
+            let faults = json!({
+                "unreadable_records": if damaged {
+                    json!([{"lba": shard_lba}])
+                } else {
+                    json!([])
+                }
+            });
+            let (mut drive, _) = crate::damage_vectors::source(&vector, &faults);
+            let outcome = verify_terminal_index_full(
+                &mut DriveHandleRawSource::new(&mut drive),
+                &tape_uuid,
+                BLOCK,
+            )
+            .expect("verify tape image");
+            let mut verification =
+                remanence_api::terminal_verification_to_proto(tape_uuid, outcome);
+            let inventory = validate_verification(&verification, tape_uuid).unwrap();
+            let mut out = Vec::new();
+            print_verification(&verification, inventory, true, &mut out).unwrap();
+            let envelope: Value = serde_json::from_slice(&out).expect("CLI JSON envelope");
+            assert_eq!(envelope["schema"], VERIFY_INDEX_JSON_SCHEMA);
+            assert_eq!(envelope["data"]["complete"], !damaged);
+            assert_eq!(
+                envelope["data"]["protected_content_findings"],
+                if damaged {
+                    json!([{
+                        "kind": "PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD",
+                        "address": "epoch 0 stripe 0 parity 0",
+                        "detail": "unreadable"
+                    }])
+                } else {
+                    json!([])
+                }
+            );
+            // The opposite state contradicts the physical evidence in both cases.
+            verification.state = if damaged {
+                pb::TapeIndexVerificationState::VerifiedComplete as i32
+            } else {
+                pb::TapeIndexVerificationState::VerifiedDegraded as i32
+            };
+            assert!(validate_verification(&verification, tape_uuid).is_err());
+        }
+    }
+
     #[test]
     fn verify_index_json_reports_full_measured_evidence() {
         let complete = pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete as i32;
@@ -1998,6 +2084,7 @@ mod tests {
         print_verification(&verification, fast_inventory, true, &mut out).unwrap();
         let envelope: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(envelope["data"]["verification_state"], "verified_complete");
+        assert_eq!(envelope["data"]["protected_content_findings"], json!([]));
         assert_eq!(envelope["data"]["verified"], true);
         assert_eq!(
             envelope["data"]["verification_basis"],
@@ -2068,12 +2155,41 @@ mod tests {
     }
 
     #[test]
+    fn verify_index_json_reports_parity_shard_address_and_matches_human_output() {
+        let mut verification = verified_degraded_with_invalid_bc();
+        verification.protected_content_findings = vec![pb::ProtectedContentFinding {
+            kind: pb::ProtectedContentFindingKind::ParityShard as i32,
+            address: Some("epoch 2 stripe 3 parity 1".to_string()),
+            detail: Some("CRC mismatch".to_string()),
+        }];
+        let inventory =
+            validate_verification(&verification, *Uuid::from_u128(1).as_bytes()).unwrap();
+        let mut out = Vec::new();
+        print_verification(&verification, inventory, true, &mut out).unwrap();
+        let envelope: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(envelope["schema"], VERIFY_INDEX_JSON_SCHEMA);
+        assert_eq!(
+            envelope["data"]["protected_content_findings"],
+            json!([{
+                "kind": "PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD",
+                "address": "epoch 2 stripe 3 parity 1",
+                "detail": "CRC mismatch",
+            }])
+        );
+        out.clear();
+        print_verification(&verification, inventory, false, &mut out).unwrap();
+        assert!(String::from_utf8(out).unwrap().contains(
+            "protected_content_finding: PROTECTED_CONTENT_FINDING_KIND_PARITY_SHARD [epoch 2 stripe 3 parity 1] CRC mismatch\n"
+        ));
+    }
+
+    #[test]
     fn verify_index_json_reports_real_bot_recovery_evidence() {
         let invalid = pb::tape_index_replica_health::State::TapeIndexReplicaStateInvalid as i32;
         let unknown_gap =
             pb::tape_index_separation_health::State::TapeIndexSeparationStateUnknown as i32;
         let recovery = bot_recovered_inventory();
-        let verification = pb::TapeIndexVerification {
+        let mut verification = pb::TapeIndexVerification {
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
             state: pb::TapeIndexVerificationState::RecoveryRequired as i32,
             detail: "no canonical survivor".to_string(),
@@ -2102,6 +2218,7 @@ mod tests {
         print_verification(&verification, inventory, true, &mut out).unwrap();
         let envelope: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(envelope["data"]["verification_state"], "recovery_required");
+        assert_eq!(envelope["data"]["protected_content_findings"], json!([]));
         assert_eq!(envelope["data"]["verified"], false);
         assert_eq!(envelope["data"]["measured_eod_lba"], "12300");
         assert_eq!(
@@ -2115,6 +2232,25 @@ mod tests {
                 Value::Null
             );
         }
+        // Addressless findings must survive the recovery envelope as explicit nulls.
+        verification.protected_content_findings = vec![pb::ProtectedContentFinding {
+            kind: pb::ProtectedContentFindingKind::NotPerformed as i32,
+            address: None,
+            detail: Some("protected content could not be checked".to_string()),
+        }];
+        let inventory =
+            validate_verification(&verification, *Uuid::from_u128(1).as_bytes()).unwrap();
+        out.clear();
+        print_verification(&verification, inventory, true, &mut out).unwrap();
+        let envelope: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            envelope["data"]["protected_content_findings"],
+            json!([{
+                "kind": "PROTECTED_CONTENT_FINDING_KIND_NOT_PERFORMED",
+                "address": null,
+                "detail": "protected content could not be checked",
+            }])
+        );
     }
 
     fn verified_degraded_with_invalid_bc() -> pb::TapeIndexVerification {
