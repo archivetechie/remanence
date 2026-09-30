@@ -1190,3 +1190,23 @@ implementation, not this Reader. No damage case has a ParityMap that only the ta
 changed; the unit tests cover the route, its count mismatch with a damaged and an intact tail header, its
 disagreement, an unreadable first block, and its exclusion at tape file 0.
 
+## P. The s6 fault maps (Step 6, F)
+
+**P-1. Stated positions after a removed filemark.** s6-03 and s6-05 state each unreadable record's `tape_file`,
+`record_index` and `lba` on the modified tape. *Decided:* with a removed filemark those three values are checked against the
+modified stream and no longer against the image; without one they are still the image's. A case with both a removal and record
+edits would state its edits on the image (edits are applied first, as in F3); none has both.
+
+**P-2. "The walk ends" at tape file 0.** Section 12.3 says a multi-block file 0 (unreadable bootstrap, supplied values)
+"ends" the walk with `FilemarkMapReconstruct`; a zero-block file 0 likewise. *Decided:* the walk stops there and types no
+later tape file (s6-03), where a zero-block file elsewhere leaves the walk to go on (12.2). The failed classification names file 0.
+
+**P-3. Reporting a damaged control file.** The text says a damaged terminal replica or separation extent "is reported" but not
+where in a walk's result. *Decided:* `walk.damaged` maps the tape file to the reason; the class stays `TapeIndexReplica` or
+`IndexSeparationExtent`. e3-01, e3-03, e3-04, e3-05 and e3-07 gain it; no other value of them changed.
+
+**P-4. s6-04 and the exact suffix.** File 9 is a copy of the bootstrap block after A, B, C with unreadable heads. Item 2's
+"damaged" is only the two conditions it names (GAPS O-4), so the suffix is exact and file 9 is an artifact. Had an unreadable head
+counted as damage, file 9 would be an ordinary Object candidate in the map, and the map would then differ from the final
+ParityMap's scope. *Decided:* the first reading, as O-4.
+

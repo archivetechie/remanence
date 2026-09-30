@@ -1,7 +1,7 @@
 //! Catalog-less filemark-map reconstruction for Layer 3c v0.4.4.
 //!
 //! The scanner walks physical tape files from BOT, reads only the first block
-//! of each file for structural classification, and measures file length by
+//! of each file and eligible footer/tail fallbacks for classification, and measures file length by
 //! spacing to the next filemark. Bootstrap, parity-map, and sidecar tape files
 //! are classified on the first pass after magic plus CRC/header validation.
 //! A final directory can identify sidecars by file number and measured length;
@@ -22,7 +22,8 @@ use crate::index_separation::{
 #[cfg(test)]
 use crate::parity_map::read_final_sidecar_directory;
 use crate::parity_map::{
-    classify_parity_map_header_block, read_final_parity_map, DecodedParityMapTapeFile,
+    classify_parity_map_header_block, parse_parity_map_footer_block, parse_parity_map_header_block,
+    read_final_parity_map, validate_header_matches_footer, DecodedParityMapTapeFile,
 };
 use crate::raw::{
     classify_fixed_record, device_position_error, read_fixed_record,
@@ -1383,11 +1384,29 @@ fn append_classified_entry(
         return Ok(None);
     }
 
+    // §12.3 shares this last-block read between items 2/3, 4 and 6,
+    // including an unreadable result: do not retry a medium error per probe.
+    let footer_block =
+        read_optional_fixed_block_at(source, file_start, block_count - 1, block_size)?;
+    if builder.next_tape_file_number()? != 0
+        && classify_parity_map_from_footer_tail(
+            footer_block.as_deref(),
+            source,
+            file_start,
+            tape_uuid,
+            block_size,
+            block_count,
+            damaged_regions,
+        )?
+    {
+        builder.push_parity_map(block_count)?;
+        return Ok(None);
+    }
+
     if let Some(kind) = classify_terminal_from_footer_tail(
-        source,
+        footer_block.as_deref(),
         file_start,
         tape_uuid,
-        block_size,
         block_count,
         damaged_regions,
     )? {
@@ -1403,6 +1422,7 @@ fn append_classified_entry(
     }
 
     if let Some(header) = classify_sidecar_from_footer_tail(
+        footer_block.as_deref(),
         source,
         file_start,
         tape_uuid,
@@ -1444,11 +1464,29 @@ fn append_entry_with_unreadable_head(
         builder.push_bootstrap()?;
         return Ok(false);
     }
+    // §12.3 shares this last-block read between items 2/3, 4 and 6,
+    // including an unreadable result: do not retry a medium error per probe.
+    let footer_block =
+        read_optional_fixed_block_at(source, file_start, block_count - 1, block_size)?;
+    if builder.next_tape_file_number()? != 0
+        && classify_parity_map_from_footer_tail(
+            footer_block.as_deref(),
+            source,
+            file_start,
+            tape_uuid,
+            block_size,
+            block_count,
+            damaged_regions,
+        )?
+    {
+        builder.push_parity_map(block_count)?;
+        return Ok(false);
+    }
+
     if let Some(kind) = classify_terminal_from_footer_tail(
-        source,
+        footer_block.as_deref(),
         file_start,
         tape_uuid,
-        block_size,
         block_count,
         damaged_regions,
     )? {
@@ -1463,6 +1501,7 @@ fn append_entry_with_unreadable_head(
         return Ok(false);
     }
     if let Some(header) = classify_sidecar_from_footer_tail(
+        footer_block.as_deref(),
         source,
         file_start,
         tape_uuid,
@@ -1483,6 +1522,46 @@ fn append_entry_with_unreadable_head(
     }
 }
 
+/// Item 4's fallback reads only the footer and the located tail header. Count
+/// disagreement is damage even when no tail header can be parsed.
+#[allow(clippy::too_many_arguments)]
+fn classify_parity_map_from_footer_tail(
+    footer_block: Option<&[u8]>,
+    source: &mut dyn RawTapeSource,
+    file_start: PhysicalPositionHint,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    block_count: u64,
+    damaged_regions: &mut Vec<ScanDamagedRegion>,
+) -> Result<bool, ParityError> {
+    let Some(block) = footer_block else {
+        return Ok(false);
+    };
+    let Ok(footer) = parse_parity_map_footer_block(block, tape_uuid) else {
+        return Ok(false);
+    };
+    if footer.parity_map_total_block_count != block_count {
+        damaged_regions.push(ScanDamagedRegion {
+            start: file_start,
+            block_count,
+            kind: ScanDamageKind::ClassificationCountMismatch,
+        });
+        return Ok(false);
+    }
+    let Some(block) =
+        read_optional_fixed_block_at(source, file_start, footer.tail_copy_start_block, block_size)?
+    else {
+        return Ok(false);
+    };
+    Ok(
+        parse_parity_map_header_block(&block, tape_uuid).is_ok_and(|header| {
+            // This route locates the tail copy; the primary route accepts either kind.
+            header.copy_kind == crate::ParityMapCopyKind::Tail
+                && validate_header_matches_footer(&header, &footer).is_ok()
+        }),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalControlScanClassification {
     Replica,
@@ -1490,22 +1569,19 @@ enum TerminalControlScanClassification {
 }
 
 fn classify_terminal_from_footer_tail(
-    source: &mut dyn RawTapeSource,
+    footer_block: Option<&[u8]>,
     file_start: PhysicalPositionHint,
     tape_uuid: &[u8; 16],
-    block_size: u32,
     block_count: u64,
     damaged_regions: &mut Vec<ScanDamagedRegion>,
 ) -> Result<Option<TerminalControlScanClassification>, ParityError> {
-    let Some(footer_block) =
-        read_optional_fixed_block_at(source, file_start, block_count - 1, block_size)?
-    else {
+    let Some(footer_block) = footer_block else {
         return Ok(None);
     };
     let magic = footer_block.get(..8);
     let replica_magic = derive_tape_index_replica_footer_magic(tape_uuid);
     if magic.is_some_and(|prefix| prefix == replica_magic) {
-        let valid_count = parse_tape_index_bootstrap_footer(&footer_block, tape_uuid)
+        let valid_count = parse_tape_index_bootstrap_footer(footer_block, tape_uuid)
             .is_ok_and(|footer| footer.plan.component.record_count == block_count);
         if !valid_count {
             damaged_regions.push(ScanDamagedRegion {
@@ -1518,7 +1594,7 @@ fn classify_terminal_from_footer_tail(
     }
     let separation_magic = derive_index_separation_footer_magic(tape_uuid);
     if magic.is_some_and(|prefix| prefix == separation_magic) {
-        let valid_count = parse_index_separation_footer(&footer_block, tape_uuid)
+        let valid_count = parse_index_separation_footer(footer_block, tape_uuid)
             .is_ok_and(|footer| footer.plan.component.record_count == block_count);
         if !valid_count {
             damaged_regions.push(ScanDamagedRegion {
@@ -1532,7 +1608,9 @@ fn classify_terminal_from_footer_tail(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_sidecar_from_footer_tail(
+    footer_block: Option<&[u8]>,
     source: &mut dyn RawTapeSource,
     file_start: PhysicalPositionHint,
     tape_uuid: &[u8; 16],
@@ -1540,12 +1618,10 @@ fn classify_sidecar_from_footer_tail(
     block_count: u64,
     damaged_regions: &mut Vec<ScanDamagedRegion>,
 ) -> Result<Option<SidecarScanClassification>, ParityError> {
-    let Some(footer_block) =
-        read_optional_fixed_block_at(source, file_start, block_count - 1, block_size)?
-    else {
+    let Some(footer_block) = footer_block else {
         return Ok(None);
     };
-    let footer = match parse_sidecar_footer_block(&footer_block, tape_uuid) {
+    let footer = match parse_sidecar_footer_block(footer_block, tape_uuid) {
         Ok(footer) => footer,
         Err(_) => return Ok(None),
     };
@@ -2126,6 +2202,235 @@ mod tests {
         records.extend(parity_map.blocks.into_iter().map(Record::Block));
         records.push(Record::Filemark);
         (RecordingRawSource::new(records), map, payload)
+    }
+
+    /// Exercise item 4 on a real encoded file, retaining the recording source
+    /// so the tests also prove the fallback reads only the footer and header.
+    fn parity_map_tail_case(
+        head_offset: Option<usize>,
+        bad_footer: bool,
+        extra: bool,
+        bad_tail: bool,
+    ) -> (ScanWalkResult, RecordingRawSource, u64) {
+        let (mut source, map, _) = directory_scan_source();
+        let start = map
+            .physical_position(TapeFilePosition {
+                tape_file_number: 3,
+                block_within_file: 0,
+            })
+            .unwrap()
+            .lba;
+        let end = source.records.len() - 2;
+        if let Some(offset) = head_offset {
+            let Record::Block(block) = &mut source.records[start as usize] else {
+                panic!("header fixture")
+            };
+            block[offset] ^= 1;
+        } else {
+            source.records[start as usize] = Record::ReadFault(TestReadFault::Medium);
+        }
+        if bad_footer {
+            let Record::Block(block) = &mut source.records[end] else {
+                panic!("footer fixture")
+            };
+            block[0xc0] ^= 1;
+        }
+        if bad_tail {
+            let Record::Block(block) = &mut source.records[start as usize + 1] else {
+                panic!("tail fixture")
+            };
+            block[0xc0] ^= 1;
+        }
+        if extra {
+            source.records.insert(end, Record::Block(block(0x55)));
+        }
+        // Use the first pass: directory reconciliation must not conceal which
+        // rung classified the file or add payload reads to this observation.
+        let ScanReconstructionOutcome::Complete(walked) =
+            scan_reconstruct_filemark_map_with_provenance(
+                &mut source,
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                ScanMode::Standard,
+                &mut |_| ScanWalkControl::Continue,
+                &mut |_| {},
+            )
+            .unwrap()
+        else {
+            panic!("walk aborted")
+        };
+        let report = ScanWalkResult {
+            final_parity_map: None,
+            map: walked.map,
+            truncation: walked.truncation,
+            truncation_candidate_kind: walked.truncation_candidate_kind,
+            bootstrap_candidates: walked.bootstrap_candidates,
+            damaged_regions: walked.damaged_regions,
+            bootstrap_recovery_hints: walked.bootstrap_recovery_hints,
+        };
+        (report, source, start)
+    }
+
+    #[test]
+    fn parity_map_tail_route_unreadable_head() {
+        let (walked, source, start) = parity_map_tail_case(None, false, false, false);
+        assert_eq!(walked.map.entries()[3].kind, TapeFileKind::ParityMap);
+        let reads: Vec<_> = source
+            .calls
+            .iter()
+            .filter_map(|c| match c {
+                ScanCall::ReadRecord(lba) if *lba >= start => Some(*lba),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![start, start + 2, start + 1, start + 4]);
+    }
+
+    #[test]
+    fn parity_map_tail_route_damaged_magic() {
+        let (walked, _, _) = parity_map_tail_case(Some(0), false, false, false);
+        assert_eq!(walked.map.entries()[3].kind, TapeFileKind::ParityMap);
+    }
+
+    #[test]
+    fn parity_map_tail_route_damaged_header_crc() {
+        let (walked, _, _) = parity_map_tail_case(Some(0xc0), false, false, false);
+        assert_eq!(walked.map.entries()[3].kind, TapeFileKind::ParityMap);
+    }
+
+    #[test]
+    fn parity_map_tail_route_count_mismatch_even_with_invalid_tail() {
+        for (head, bad_tail) in [None, Some(0xc0)]
+            .into_iter()
+            .flat_map(|head| [false, true].map(|tail| (head, tail)))
+        {
+            let (walked, _, start) = parity_map_tail_case(head, false, true, bad_tail);
+            assert_eq!(walked.map.entries()[3].kind, TapeFileKind::Object);
+            assert!(walked
+                .damaged_regions
+                .iter()
+                .any(|d| d.start.lba == start
+                    && d.kind == ScanDamageKind::ClassificationCountMismatch));
+        }
+    }
+
+    #[test]
+    fn parity_map_tail_route_unusable_footer() {
+        for head in [None, Some(0xc0)] {
+            let (walked, _, _) = parity_map_tail_case(head, true, false, false);
+            assert_eq!(walked.map.entries()[3].kind, TapeFileKind::Object);
+        }
+    }
+
+    #[test]
+    fn parity_map_tail_route_never_at_tape_file_zero() {
+        let (_, _, payload) = directory_scan_source();
+        let encoded = crate::encode_parity_map_tape_file(&payload, BLOCK_SIZE).unwrap();
+        for count in [1, encoded.blocks.len() as u64] {
+            let mut source = RecordingRawSource::new(
+                encoded.blocks.iter().cloned().map(Record::Block).collect(),
+            );
+            let result = append_entry_with_unreadable_head(
+                &mut source,
+                &mut FilemarkMapBuilder::new(),
+                &TAPE_UUID,
+                BLOCK_SIZE,
+                PhysicalPositionHint::new(0),
+                count,
+                &mut Vec::new(),
+            );
+            if count == 1 {
+                assert!(!result.unwrap());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ParityError::FilemarkMapReconstruct(_))
+                ));
+            }
+            assert!(
+                source.calls.is_empty(),
+                "BOT must not probe any footer or tail"
+            );
+        }
+    }
+
+    /// A readable but invalid head at BOT must not enter item 4's tail route.
+    #[test]
+    fn parity_map_tail_route_readable_head_never_at_tape_file_zero() {
+        let (_, _, payload) = directory_scan_source();
+        let encoded = crate::encode_parity_map_tape_file(&payload, BLOCK_SIZE).unwrap();
+        let mut head = encoded.blocks[0].clone();
+        head[0] ^= 1;
+        let mut source =
+            RecordingRawSource::new(encoded.blocks.iter().cloned().map(Record::Block).collect());
+        let mut builder = FilemarkMapBuilder::new();
+        let result = append_classified_entry(
+            &mut source,
+            &mut builder,
+            &head,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            PhysicalPositionHint::new(0),
+            encoded.blocks.len() as u64,
+            &mut Vec::new(),
+        );
+        assert!(matches!(
+            result,
+            Err(ParityError::FilemarkMapReconstruct(_))
+        ));
+        let reads: Vec<_> = source
+            .calls
+            .iter()
+            .filter_map(|call| match call {
+                ScanCall::ReadRecord(lba) => Some(*lba),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reads, vec![encoded.blocks.len() as u64 - 1]);
+    }
+
+    /// Even a rejected footer is read just once across all fallback probes.
+    #[test]
+    fn fallback_probes_share_last_block() {
+        for head in [None, Some(0xc0)] {
+            let (_, source, start) = parity_map_tail_case(head, true, false, false);
+            assert_eq!(
+                source
+                    .calls
+                    .iter()
+                    .filter(|call| matches!(call, ScanCall::ReadRecord(lba) if *lba == start + 2))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn parity_map_tail_route_rejects_header_footer_disagreement() {
+        let (mut source, map, _) = directory_scan_source();
+        let start = map
+            .physical_position(TapeFilePosition {
+                tape_file_number: 3,
+                block_within_file: 0,
+            })
+            .unwrap();
+        let Record::Block(tail) = &mut source.records[start.lba as usize + 1] else {
+            panic!("tail fixture")
+        };
+        tail[0x20] ^= 1; // sequence, with a valid CRC
+        let crc = crate::crc64_xz(&tail[..0xc0]);
+        tail[0xc0..0xc8].copy_from_slice(&crc.to_le_bytes());
+        let footer = read_optional_fixed_block_at(&mut source, start, 2, BLOCK_SIZE).unwrap();
+        assert!(!classify_parity_map_from_footer_tail(
+            footer.as_deref(),
+            &mut source,
+            start,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            3,
+            &mut Vec::new()
+        )
+        .unwrap());
     }
 
     /// Return the baseline walk independently of the directory reconciliation pass.

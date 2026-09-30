@@ -186,7 +186,8 @@ pub(crate) fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, Faul
         let file = &vector.image.files[resolved["tape_file"].as_u64().unwrap() as usize];
         assert_eq!(
             resolved["lba"].as_u64().unwrap() as usize,
-            file.start_record + resolved["record_index"].as_u64().unwrap() as usize,
+            file.start_record + resolved["record_index"].as_u64().unwrap() as usize
+                - usize::from(removed.is_some_and(|r| resolved["tape_file"].as_u64().unwrap() > r)),
             "record edit address"
         );
     }
@@ -239,6 +240,9 @@ fn parity_error(error: ParityError) -> Value {
         } => {
             json!({"error":"Unrecoverable", "stripe":stripe.stripe_index, "lost":lost_count, "limit":limit})
         }
+        ParityError::FilemarkMapReconstruct(_) => json!({"error":"FilemarkMapReconstruct"}),
+        ParityError::ParityMapParse(_) => json!({"error":"ParityMapParse"}),
+        ParityError::DirectoryInvalid(_) => json!({"error":"DirectoryInvalid"}),
         ParityError::NoBootstrapFound => json!({"error":"NoBootstrapFound"}),
         // Section 15's names, applied after every continuation decision.
         ParityError::BootstrapRefused { field, .. } => {
@@ -292,6 +296,21 @@ fn walk_extras(scan: &ScanWalkResult) -> serde_json::Map<String, Value> {
         .collect();
     let mut extras = serde_json::Map::new();
     extras.insert(
+        "walk_bootstrap_candidates".into(),
+        json!(scan.bootstrap_candidates.len()),
+    );
+    extras.insert(
+        "walk_object_blocks".into(),
+        json!(scan
+            .map
+            .entries()
+            .iter()
+            .filter(|e| e.kind == TapeFileKind::Object)
+            .map(|e| e.block_count)
+            .collect::<Vec<_>>()),
+    );
+
+    extras.insert(
         "walk_tape_file_count".into(),
         json!(scan.map.tape_file_count()),
     );
@@ -310,12 +329,10 @@ fn walk_extras(scan: &ScanWalkResult) -> serde_json::Map<String, Value> {
     extras
 }
 
-/// Reader inputs come only from discovered bootstrap bytes or declared hints.
-fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value {
-    let (mut drive, engine) = source(vector, faults);
-    let mut raw = DriveHandleRawSource::new(&mut drive);
+/// Decode only the explicitly supplied values, shared by both walk paths.
+fn recovery_hints(vector: &VectorImage, hints: &Value) -> Option<ScanRecoveryHints> {
     check_hints(hints);
-    let hints = if hints.is_object() {
+    if hints.is_object() {
         let h = hints;
         Some(ScanRecoveryHints {
             tape_uuid: vector.written.inputs.tape_uuid,
@@ -328,7 +345,17 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
         })
     } else {
         None
-    };
+    }
+}
+
+/// Reader inputs come only from discovered bootstrap bytes or declared hints.
+fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value {
+    let (mut drive, engine) = source(vector, faults);
+    let mut raw = DriveHandleRawSource::new(&mut drive);
+    let hints = recovery_hints(vector, hints);
+    let mode = hints
+        .as_ref()
+        .map_or(ScanMode::Standard, ScanMode::Recovery);
     let mut candidates = DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES.to_vec();
     if let Some(hints) = &hints {
         candidates.push(hints.block_size);
@@ -501,8 +528,9 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
                 .replicas
                 .iter()
                 .all(|r| matches!(r, TerminalReplicaEvidence::Invalid(_))));
-            let scan = match scan_reconstruct_filemark_map_with_report(&mut raw, &uuid, block_size)
-            {
+            let scan = match scan_reconstruct_filemark_map_with_report_mode(
+                &mut raw, &uuid, block_size, mode,
+            ) {
                 Ok(scan) => scan,
                 Err(e) => {
                     out["error"] = parity_error(e)["error"].clone();
@@ -524,10 +552,17 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
                 .collect::<Vec<_>>());
             out.as_object_mut().unwrap().extend(walk_extras(&scan));
             let mut bot_objects = Vec::new();
-            match recover_terminal_inventory_from_bot(&mut raw, &uuid, block_size, |o| {
-                bot_objects.push(o.clone());
-                Ok(())
-            }) {
+            match recover_terminal_inventory_from_bot_controlled_mode(
+                &mut raw,
+                &uuid,
+                block_size,
+                mode,
+                |_| ScanWalkControl::Continue,
+                |o| {
+                    bot_objects.push(o.clone());
+                    Ok(())
+                },
+            ) {
                 Ok(_) => {
                     out["object_identity"] = json!(if !bot_objects.is_empty()
                         && bot_objects
@@ -546,7 +581,11 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
                 }
             }
             let Some(bootstrap) = bootstrap.as_ref() else {
-                out["error"] = json!("NoBootstrapFound");
+                // §8.4.1 continues structural recovery with supplied UUID,
+                // block size and scheme when the bootstrap is unreadable.
+                // No authenticated bootstrap is required for that walk, so
+                // NoBootstrapFound would contradict the supplied-values path.
+                observe_parity_map(&mut raw, &scan, &uuid, block_size, &mut out);
                 return out;
             };
             match validate_scan_reconstruction_with_report(&mut raw, bootstrap, scan) {
@@ -1040,15 +1079,20 @@ fn run(id: &str) {
         return;
     }
     let mut actual = execute(&vector, &faults, &faults["hints"]);
-    if case["erratum"] == "E3" {
+    if case["erratum"] == "E3" || case["erratum"] == "S6" {
         // The walk is an observation of its own: it runs whatever the Scanner
         // returned.
         actual["walk"] = walk_observation(&vector, &faults);
+    }
+    if case["erratum"] == "S6" {
+        println!("S6 {id} expected={}", case["checks"]);
     }
     let failures = if case["erratum"] == "E2" {
         compare_e2(id, &case["expected"], &actual)
     } else if case["erratum"] == "E3" {
         compare_e3(id, &case["expected"], &actual)
+    } else if case["erratum"] == "S6" {
+        compare_s6(id, &case["expected"], &case["checks"], &actual)
     } else if case["erratum"] == "E4" {
         compare_e4(id, &case["expected"], &actual)
     } else if pinned {
@@ -1499,6 +1543,61 @@ fn compare_e4_overlay(
     failures
 }
 
+/// Observe directory validation separately from classification, including the
+/// parser's error class. This also validates scope without authenticating BOT
+/// bytes when supplied values were used.
+fn observe_parity_map(
+    raw: &mut dyn RawTapeSource,
+    scan: &ScanWalkResult,
+    uuid: &[u8; 16],
+    block_size: u32,
+    out: &mut Value,
+) {
+    out["walked_map_validated"] = json!(false);
+    let Some(entry) = scan
+        .map
+        .entries()
+        .iter()
+        .rev()
+        .find(|e| e.kind == TapeFileKind::ParityMap)
+    else {
+        return;
+    };
+    let mut blocks = Vec::new();
+    for block_within_file in 0..entry.block_count {
+        raw.locate_physical(
+            scan.map
+                .physical_position(TapeFilePosition {
+                    tape_file_number: entry.tape_file_number,
+                    block_within_file,
+                })
+                .unwrap(),
+        )
+        .unwrap();
+        let mut block = vec![0; block_size as usize];
+        let block = match raw.read_record(&mut block) {
+            Ok(RawReadOutcome::Block { bytes, .. }) if bytes == block.len() => Some(block),
+            Ok(_) => None,
+            Err(ParityError::TapeIo(error)) if tape_error_is_current_medium_damage(&error) => None,
+            Err(error) => panic!("ParityMap observation read failed: {error}"),
+        };
+        blocks.push(block);
+    }
+    match parse_parity_map_tape_file_with_unreadable_blocks(&blocks, uuid) {
+        Ok(decoded) => {
+            match ScopedFilemarkMap::validate_against_final_parity_map(scan.map.clone(), &decoded) {
+                Ok(scoped) => {
+                    out["walked_map_validated"] = json!(true);
+                    out["walk_validated_prefix"] = json!(scoped.validated_prefix_tape_files);
+                    out["walk_watermark"] = json!(scoped.scope.watermark());
+                }
+                Err(error) => out["walk_validation_error"] = parity_error(error)["error"].clone(),
+            }
+        }
+        Err(error) => out["parity_map_error"] = parity_error(error)["error"].clone(),
+    }
+}
+
 /// The BOT walk of REM-PARITY 8.4.1 as an observation of its own: the walk's
 /// classification of each tape file, how it ended, which tape files it found
 /// damaged, whether a walked map validates against the final ParityMap, and the
@@ -1508,14 +1607,19 @@ fn walk_observation(vector: &VectorImage, faults: &Value) -> Value {
     let mut raw = DriveHandleRawSource::new(&mut drive);
     let uuid = vector.written.inputs.tape_uuid;
     let block_size = vector.written.inputs.block_size;
+    let hints = recovery_hints(vector, &faults["hints"]);
+    let mode = hints
+        .as_ref()
+        .map_or(ScanMode::Standard, ScanMode::Recovery);
     let mut out = json!({});
-    let scan = match scan_reconstruct_filemark_map_with_report(&mut raw, &uuid, block_size) {
-        Ok(scan) => scan,
-        Err(error) => {
-            out["walk_error"] = json!(format!("{error:?}"));
-            return out;
-        }
-    };
+    let scan =
+        match scan_reconstruct_filemark_map_with_report_mode(&mut raw, &uuid, block_size, mode) {
+            Ok(scan) => scan,
+            Err(error) => {
+                out["walk_error"] = parity_error(error)["error"].clone();
+                return out;
+            }
+        };
     out["walk_classes"] = json!(scan
         .map
         .entries()
@@ -1524,10 +1628,17 @@ fn walk_observation(vector: &VectorImage, faults: &Value) -> Value {
         .collect::<BTreeMap<_, _>>());
     out.as_object_mut().unwrap().extend(walk_extras(&scan));
     let mut bot_objects = Vec::new();
-    match recover_terminal_inventory_from_bot(&mut raw, &uuid, block_size, |o| {
-        bot_objects.push(o.clone());
-        Ok(())
-    }) {
+    match recover_terminal_inventory_from_bot_controlled_mode(
+        &mut raw,
+        &uuid,
+        block_size,
+        mode,
+        |_| ScanWalkControl::Continue,
+        |o| {
+            bot_objects.push(o.clone());
+            Ok(())
+        },
+    ) {
         Ok(_) => {
             // The identity of every structurally complete Object candidate is
             // unknown. A torn candidate at EOD is reported as incomplete and
@@ -1549,10 +1660,14 @@ fn walk_observation(vector: &VectorImage, faults: &Value) -> Value {
         }
         Err(error) => out["walk_error"] = json!(format!("{error:?}")),
     }
+    observe_parity_map(&mut raw, &scan, &uuid, block_size, &mut out);
+    if hints.is_some() && scan.authoritative_bootstrap().is_none() {
+        return out;
+    }
     let bootstrap = discover_bootstrap_with_recovery_hints(
         &mut raw,
         DEFAULT_BOOTSTRAP_CANDIDATE_BLOCK_SIZES,
-        None,
+        hints.as_ref(),
     );
     match bootstrap {
         Ok(bootstrap) => match validate_scan_reconstruction_with_report(&mut raw, &bootstrap, scan)
@@ -1884,6 +1999,87 @@ fn compare_e4(id: &str, expected: &Value, actual: &Value) -> Vec<String> {
     failures
 }
 
+/// Compare the independent S6 author's pinned executable transcription. Sets
+/// are explicit, and unknown keys fail rather than silently losing coverage.
+fn compare_s6(id: &str, expected: &Value, checks: &Value, actual: &Value) -> Vec<String> {
+    for key in expected.as_object().expect("S6 author entry").keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "error"
+                    | "classification"
+                    | "produces_map"
+                    | "map_validated_against_final_parity_map"
+                    | "damage_reported"
+                    | "outcome"
+                    | "sections"
+                    | "quotes"
+                    | "open"
+            ),
+            "{id}: unknown S6 author key {key}"
+        );
+    }
+    let required: &[&str] = if expected["error"].is_null() {
+        &["walk_error", "walk_classes", "required_damage"]
+    } else {
+        &["walk_error"]
+    };
+    for key in required {
+        assert!(checks.get(*key).is_some(), "{id}: missing S6 check {key}");
+    }
+    if expected["error"].is_null() {
+        assert!(
+            checks.get("parity_map_validation").is_some()
+                || (checks.get("walked_map_validated").is_some()
+                    && checks.get("parity_map_error").is_some()),
+            "{id}: missing directory validation checks"
+        );
+    }
+    assert_eq!(
+        checks["walk_error"], expected["error"],
+        "{id}: error transcription"
+    );
+    let walk = &actual["walk"];
+    let mut failures = Vec::new();
+    for (key, wanted) in checks.as_object().expect("S6 checks") {
+        let agrees = match key.as_str() {
+            "walk_error" => walk[key] == *wanted && actual["error"] == *wanted,
+            "walk_classes" => {
+                let observed = walk[key].as_object();
+                observed.is_some_and(|observed| {
+                    observed.keys().all(|k| wanted.get(k).is_some())
+                        && wanted.as_object().unwrap().iter().all(|(file, permitted)| {
+                            let kind = observed.get(file).cloned().unwrap_or(json!("absent"));
+                            permitted.as_array().unwrap().contains(&kind)
+                        })
+                })
+            }
+            "walked_map_validated" | "parity_map_error" => wanted
+                .as_array()
+                .expect("permitted set")
+                .contains(&walk[key]),
+            "outcome" | "terminal_authority_recovered" => actual[key] == *wanted,
+            "object_identity" => walk[key] == *wanted,
+            "parity_map_validation" => wanted.as_array().expect("permitted pairs").contains(
+                &json!({"validated": walk["walked_map_validated"], "error": walk["parity_map_error"]}),
+            ),
+            "required_damage" => wanted.as_array().unwrap().iter().all(|damage| {
+                walk["walk_damaged"]
+                    .as_array()
+                    .is_some_and(|reported| reported.contains(damage))
+            }),
+            other => panic!("{id}: unknown S6 check {other}"),
+        };
+        if !agrees {
+            failures.push(format!("{key}: expected {wanted}, observed {}", walk[key]));
+        }
+    }
+    if expected["produces_map"] != json!(walk["walk_classes"].is_object()) {
+        failures.push("walk map presence differs".into());
+    }
+    failures
+}
+
 macro_rules! cases { ($($name:ident => $id:literal),+ $(,)?) => { const CASE_IDS: &[&str] = &[$($id),+]; $(#[test] fn $name() { run($id); })+ }; }
 cases! {
     object_head => "object-head", burst_m => "burst-m", burst_m_plus_one => "burst-m-plus-one",
@@ -1904,6 +2100,19 @@ cases! {
     e2_13 => "e2-13",
     e3_01 => "e3-01", e3_02 => "e3-02", e3_03 => "e3-03", e3_04 => "e3-04", e3_05 => "e3-05",
     e3_06 => "e3-06", e3_07 => "e3-07",
+    s6_01 => "s6-01",
+    s6_02 => "s6-02",
+    s6_03 => "s6-03",
+    s6_04 => "s6-04",
+    s6_05 => "s6-05",
+    s6_06 => "s6-06",
+    s6_07 => "s6-07",
+    s6_08 => "s6-08",
+    s6_09 => "s6-09",
+    s6_10 => "s6-10",
+    s6_11 => "s6-11",
+    s6_12 => "s6-12",
+
 }
 
 /// Every E2 expectation quotes the specification text verbatim.
@@ -1937,6 +2146,7 @@ fn e3_and_e4_expectation_quotes_occur_in_the_specification() {
         let entries: Vec<&Value> = match case["erratum"].as_str() {
             Some("E3") => vec![&case["expected"]["scanner"], &case["expected"]["walk"]],
             Some("E4") => case["expected"].as_object().unwrap().values().collect(),
+            Some("S6") => vec![&case["expected"]],
             _ => continue,
         };
         for entry in entries {
@@ -2291,15 +2501,19 @@ fn prefix_damage_with_agreeing_rows_keeps_the_terminal_route() {
         &merged,
         TerminalIndexVerificationOutcome::RecoveryRequired(_)
     ));
-    // The guard applies per file: an undamaged file keeps the kind comparison.
-    // The head of the ParityMap (tape file 3) is corrupted but readable, so the
-    // walk types it as an Object and flags no damage there, while the Object's
-    // unreadable head is damage elsewhere. Counts agree at every file, yet the
-    // ParityMap row's kind does not: the replicas are refused, not accepted.
+    // The tail route now preserves a ParityMap whose first magic byte is
+    // damaged. Break its footer too to retain this test of the per-file kind
+    // guard: damage to an Object elsewhere cannot excuse a kind mismatch.
     let corrupt_map_head = json!({"tape_file": 3, "record_index": 0,
         "byte_edits": [{"offset": "0x00", "field": "ParityMap magic byte", "xor": "01"}]});
-    let kind_mismatch =
-        verify(json!({"unreadable_lbas": [2], "record_faults": [corrupt_map_head]}));
+    let corrupt_map_footer = json!({"tape_file": 3, "record_index": 2,
+        "byte_edits": [{"offset": "0xc0", "field": "ParityMap footer CRC", "xor": "01"}]});
+    let rescued =
+        verify(json!({"unreadable_lbas": [2], "record_faults": [corrupt_map_head.clone()]}));
+    assert!(rescued.is_terminal_suffix_complete(), "{rescued:?}");
+    assert!(!rescued.is_complete_tape());
+    let kind_mismatch = verify(json!({"unreadable_lbas": [2],
+        "record_faults": [corrupt_map_head, corrupt_map_footer]}));
     assert!(
         matches!(
             &kind_mismatch,
@@ -2541,4 +2755,130 @@ fn frozen_matrix_has_a_test_for_every_case() {
     let declared: std::collections::BTreeSet<_> =
         cases.iter().map(|c| c["id"].as_str().unwrap()).collect();
     assert_eq!(registered, declared);
+}
+
+/// Combined faults use modified physical LBAs while edits retain source
+/// coordinates. Check both the pinned descriptor and the actual tape bytes.
+#[test]
+fn removed_filemark_combines_unreadable_records_and_edits() {
+    let vector = generate("a4-minimal").unwrap();
+    let case = json!({"id":"combined", "image":"a4-minimal", "fault": {
+        "removed_filemark_after_tape_file":0, "unreadable_lbas":[18,26,34],
+        "record_faults":[{"tape_file":4,"record_index":1,"byte_edits":[
+            {"offset":"0x0","field":"payload byte","xor":"01"}]}]}});
+    let faults = crate::tape_image_vectors::fault_map(&case, &vector.image);
+    assert_eq!(
+        faults["unreadable_records"],
+        json!([
+        {"lba":18,"tape_file":3,"record_index":0,"filemark":false},
+        {"lba":26,"tape_file":5,"record_index":0,"filemark":false},
+        {"lba":34,"tape_file":7,"record_index":0,"filemark":false}])
+    );
+    assert_eq!(faults["record_edits"][0]["lba"], 19);
+    let (mut drive, _) = source(&vector, &faults);
+    let mut raw = DriveHandleRawSource::new(&mut drive);
+    raw.configure_fixed_block_size(BLOCK).unwrap();
+    raw.locate_physical(PhysicalPositionHint::new(18)).unwrap();
+    let mut block = vec![0; BLOCK as usize];
+    assert!(
+        matches!(raw.read_record(&mut block), Err(ParityError::TapeIo(error))
+        if tape_error_is_current_medium_damage(&error))
+    );
+    raw.locate_physical(PhysicalPositionHint::new(19)).unwrap();
+    assert!(
+        matches!(raw.read_record(&mut block), Ok(RawReadOutcome::Block {bytes, ..}) if bytes == BLOCK as usize)
+    );
+    assert_eq!(
+        block,
+        apply_record_edits(
+            &vector.image.files[4].bytes[BLOCK as usize..2 * BLOCK as usize],
+            &faults["record_edits"][0]
+        )
+    );
+}
+
+/// The comparison must reject missing observations and unknown vocabulary,
+/// including the error-only s6-03 case, rather than silently passing coverage.
+#[test]
+fn s6_comparison_fails_closed() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    for case in frozen["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["erratum"] == "S6")
+    {
+        assert!(!compare_s6(
+            case["id"].as_str().unwrap(),
+            &case["expected"],
+            &case["checks"],
+            &json!({})
+        )
+        .is_empty());
+    }
+    let case = frozen["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "s6-03")
+        .unwrap();
+    let actual =
+        json!({"error":"FilemarkMapReconstruct", "walk":{"walk_error":"FilemarkMapReconstruct"}});
+    assert!(compare_s6("s6-03", &case["expected"], &case["checks"], &actual).is_empty());
+    let mut unknown = case["checks"].clone();
+    unknown["surprise"] = json!(true);
+    assert!(
+        std::panic::catch_unwind(|| compare_s6("s6-03", &case["expected"], &unknown, &actual))
+            .is_err()
+    );
+}
+
+/// The walk validates hints even when invoked without the reader executor.
+#[test]
+fn walk_observation_rejects_unknown_hint() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let case = frozen["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "s6-01")
+        .unwrap();
+    let vector = generate(case["image"].as_str().unwrap()).unwrap();
+    let mut faults = fault_map_of(case, &vector);
+    faults["hints"]["unknown"] = json!(true);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk_observation(
+            &vector, &faults
+        )))
+        .is_err()
+    );
+}
+
+/// Only the author's paired rejection or validation outcomes are permitted.
+#[test]
+fn s6_09_validation_and_error_are_paired() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let case = frozen["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "s6-09")
+        .unwrap();
+    let vector = generate(case["image"].as_str().unwrap()).unwrap();
+    let faults = fault_map_of(case, &vector);
+    let mut actual = execute(&vector, &faults, &faults["hints"]);
+    actual["walk"] = walk_observation(&vector, &faults);
+    for (validated, error, allowed) in [
+        (false, json!("ParityMapParse"), true),
+        (true, Value::Null, true),
+        (false, Value::Null, false),
+        (true, json!("ParityMapParse"), false),
+    ] {
+        actual["walk"]["walked_map_validated"] = json!(validated);
+        actual["walk"]["parity_map_error"] = error;
+        assert_eq!(
+            compare_s6("s6-09", &case["expected"], &case["checks"], &actual).is_empty(),
+            allowed
+        );
+    }
 }

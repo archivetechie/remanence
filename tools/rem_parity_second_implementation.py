@@ -3495,6 +3495,10 @@ def bot_walk(tape: DamagedTape, tape_uuid: bytes, block_size: int,
                 else:
                     walked.note += "; torn: no trailing filemark before EOD"
             files.append(walked)
+        if bootstrap_unreadable and tape_file == 0 and files[-1].kind is None:
+            # Section 12.3: a tape file 0 that cannot be a bootstrap, or a zero-block file 0, "ends" the walk with
+            # `FilemarkMapReconstruct`: no later tape file is typed.
+            break
         if filemark is None:
             break
         position = filemark + 1
@@ -7349,6 +7353,19 @@ def damaged_tape_for(image: ImageBuild, case: Mapping[str, Any]) -> tuple[Damage
     unreadable = set()
     for item in case.get("unreadable_records", []):
         lba = item["lba"]
+        if removed is not None:
+            # A case with a removed filemark states each unreadable record's tape file, record index and LBA on the
+            # tape as it now stands: every later record has moved down by one and the two files are one.
+            if not 0 <= lba < len(records):
+                raise ValueError(f"case record {item} is past the modified tape's EOD")
+            file_number = sum(1 for record in records[:lba] if record is None)
+            first = max((i for i in range(lba) if records[i] is None), default=-1) + 1
+            if (file_number, lba - first, records[lba] is None) != (item["tape_file"], item["record_index"],
+                                                                     bool(item["filemark"])):
+                raise ValueError(f"case record {item} does not match the modified tape's layout "
+                                 f"(tape file {file_number}, record {lba - first})")
+            unreadable.add(lba)
+            continue
         tape_file = image.files[item["tape_file"]]
         start = image.file_start_lba(item["tape_file"])
         expected_filemark = item["record_index"] == len(tape_file.blocks)
@@ -8110,8 +8127,16 @@ def decide_case(case: Mapping[str, Any], image: ImageBuild, trace: dict[str, Any
             walk["note"] = ("performed only if no replica validates, which the Scanner's undecided outcome leaves open; "
                             "the classification below is a function of the tape and holds either way")
         failed = {str(f.tape_file_number): f.failed_classification for f in files if f.failed_classification}
-        if failed:
-            walk["failed_classifications"] = failed
+        file0_failed = {str(f.tape_file_number): (f"tape file 0 measures {f.count} blocks and cannot be a bootstrap "
+                                                  "(Sections 3.1 and 8.1)")
+                        for f in files if f.kind is None and "cannot be a bootstrap" in f.note}
+        damaged = {str(f.tape_file_number): f.note for f in files if f.kind is not None and f.note.startswith("damaged")}
+        if damaged:
+            walk["damaged"] = damaged
+            walk["citations"].append(cite("footer_rule_scope") if any("does not parse" in n or "measured" in n
+                                                                      for n in damaged.values()) else cite("hard_error_scope"))
+        if failed or file0_failed:
+            walk["failed_classifications"] = failed | file0_failed
         notes_text = " ".join(f.note for f in files)
         if "head unreadable" in notes_text:
             walk["citations"].append(cite("unreadable_head"))

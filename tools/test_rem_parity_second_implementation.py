@@ -1623,6 +1623,45 @@ class F0TextTests(unittest.TestCase):
         self.assertEqual(header["total"], len(blocks))
 
 
+class F6CaseTests(unittest.TestCase):
+    """Step 6's fault maps: stated positions on the modified tape, and the walk that ends at file 0."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.image = impl.build_image(impl.load_image_inputs("a4-minimal"), "a4-minimal")
+
+    def base(self, **extra):
+        case = {"failed_data_addresses": [], "hints": None, "image": "a4-minimal",
+                "removed_filemark_after_tape_file": None, "unreadable_records": []}
+        case.update(extra)
+        return case
+
+    def test_stated_positions_refer_to_the_modified_tape_after_a_removed_filemark(self) -> None:
+        # Tape file 0 and 1 become one file of 5 blocks; the replica A head, LBA 19 on the image, is LBA 18 of tape file 3.
+        item = {"filemark": False, "lba": 18, "record_index": 0, "tape_file": 3}
+        tape, _ = impl.damaged_tape_for(self.image, self.base(removed_filemark_after_tape_file=0, unreadable_records=[item]))
+        self.assertEqual(tape._unreadable, {18})
+        with self.assertRaises(ValueError):
+            impl.damaged_tape_for(self.image, self.base(removed_filemark_after_tape_file=0,
+                                                        unreadable_records=[dict(item, lba=19)]))
+        with self.assertRaises(ValueError):
+            impl.damaged_tape_for(self.image, self.base(removed_filemark_after_tape_file=0,
+                                                        unreadable_records=[dict(item, tape_file=4)]))
+
+    def test_positions_without_a_removed_filemark_still_refer_to_the_image(self) -> None:
+        item = {"filemark": False, "lba": 19, "record_index": 0, "tape_file": 4}
+        tape, _ = impl.damaged_tape_for(self.image, self.base(unreadable_records=[item]))
+        self.assertEqual(tape._unreadable, {19})
+
+    def test_the_walk_ends_at_a_file_zero_that_cannot_be_a_bootstrap(self) -> None:
+        tape, _ = impl.damaged_tape_for(self.image, self.base(
+            removed_filemark_after_tape_file=0,
+            unreadable_records=[{"filemark": False, "lba": 0, "record_index": 0, "tape_file": 0}]))
+        files, _ = impl.bot_walk(tape, self.image.tape_uuid, self.image.block_size, True)
+        self.assertEqual(len(files), 1)
+        self.assertIsNone(files[0].kind)
+
+
 class F4TextTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

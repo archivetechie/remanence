@@ -4750,5 +4750,1924 @@
       "B-C": "TapeIo: LBA 50: expected a data block, found end of data"
     },
     "verifier_prefix_findings": []
+  },
+  "s6-01": {
+    "fault_notes": [],
+    "bootstrap_attempts": [
+      "supplied block size 262144: medium error at LBA 0"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap by measured length (one block): the supplied values classify it and do not authenticate it; no value is taken from its bytes",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "bootstrap",
+        "finding": "unreadable (medium error)",
+        "error": null,
+        "checks": "structure"
+      }
+    ]
+  },
+  "s6-02": {
+    "fault_notes": [
+      "record at LBA 0 (tape file 0 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 0,
+        "record_index": 0,
+        "lba": 0,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 0,
+            "bytes": 1,
+            "reason": "bootstrap magic: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "supplied block size 262144: the magic is missing or the header CRC fails"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap by measured length (one block): the supplied values classify it and do not authenticate it; no value is taken from its bytes",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "bootstrap",
+        "finding": "the magic is missing or the header CRC fails, so with supplied values it is treated as unreadable",
+        "error": "BootstrapParse",
+        "checks": "structure"
+      }
+    ]
+  },
+  "s6-03": {
+    "fault_notes": [
+      "filemark at LBA 1 removed; later records move down by one"
+    ],
+    "bootstrap_attempts": [
+      "supplied block size 262144: medium error at LBA 0"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 5,
+        "kind": null,
+        "note": "a tape file 0 of 5 blocks cannot be a bootstrap (Sections 3.1 and 8.1); FilemarkMapReconstruct (Section 15)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "tape file(s) 0 could not be classified"
+  },
+  "s6-04": {
+    "fault_notes": [
+      "appended file 0 record 0 at LBA 39: copy_of, 262144 bytes, a copy of my build's tape file 0 record 0",
+      "appended file 0: trailing filemark at LBA 40"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 37 plans EOD 39, before the tape's EOD 41; footer at LBA 29 plans EOD 39, before the tape's EOD 41)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 9,
+        "start": 39,
+        "count": 1,
+        "kind": 0,
+        "note": "Object by elimination; follows the exact terminal suffix: an artifact, in no inventory (Section 12.6)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": true,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    },
+    "verifier_prefix_findings": []
+  },
+  "s6-05": {
+    "fault_notes": [
+      "filemark at LBA 18 removed; later records move down by one"
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "no terminal-replica footer supplies a layout from EOD (footer at LBA 36 records its position as 37; footer at LBA 28 records its position as 29; footer at LBA 20 records its position as 21)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 6,
+        "kind": 0,
+        "note": "failed classification: ParityMap header total 3 differs from the measured 6 blocks (Section 12.3 item 4); not recognised, so item 7 applies: Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": "ParityMap header total 3 differs from the measured 6 blocks (Section 12.3 item 4)",
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 22,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 26,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 26))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 30,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 34,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 34))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "no final ParityMap validates; no validated scope beyond the bootstrap's",
+    "separations": {
+      "A-B": "walk: separation header matches the plan",
+      "B-C": "walk: separation header matches the plan"
+    }
+  },
+  "s6-06": {
+    "fault_notes": [
+      "record at LBA 21 (tape file 4 record 2) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 4,
+        "record_index": 2,
+        "lba": 21,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 32,
+            "bytes": 1,
+            "reason": "replica footer CRC-covered byte: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "damaged terminal replica: head unreadable (medium error at LBA 19); type established by its footer's magic; the footer does not parse (frame CRC does not verify)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "s6-07": {
+    "fault_notes": [
+      "record at LBA 25 (tape file 5 record 2) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 5,
+        "record_index": 2,
+        "lba": 25,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 32,
+            "bytes": 1,
+            "reason": "separation footer CRC-covered byte: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "damaged separation extent: head unreadable (medium error at LBA 23); type established by its footer's magic; the footer does not parse (frame CRC does not verify)",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "medium error at LBA 23",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": []
+  },
+  "s6-08": {
+    "fault_notes": [
+      "record at LBA 15 (tape file 3 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 16 (tape file 3 record 1) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 3,
+        "record_index": 0,
+        "lba": 15,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 200,
+            "bytes": 1,
+            "reason": "ParityMap payload byte: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 3,
+        "record_index": 1,
+        "lba": 16,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 200,
+            "bytes": 1,
+            "reason": "ParityMap payload byte: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees; it fails Section 10.1 when read (no header copy validates (primary: payload_sha256; tail: payload_sha256)), so it does not validate",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "no final ParityMap validates; no validated scope beyond the bootstrap's",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    }
+  },
+  "s6-09": {
+    "fault_notes": [
+      "record at LBA 17 (tape file 3 record 2) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 3,
+        "record_index": 2,
+        "lba": 17,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 32,
+            "bytes": 1,
+            "reason": "ParityMap footer CRC-covered byte: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its first block: header parses, measured count agrees; it fails Section 10.1 when read (CRC), so it does not validate",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "no final ParityMap validates; no validated scope beyond the bootstrap's",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    }
+  },
+  "s6-10": {
+    "fault_notes": [
+      "record at LBA 15 (tape file 3 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 3,
+        "record_index": 0,
+        "lba": 15,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 192,
+            "bytes": 1,
+            "reason": "ParityMap header CRC: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its tail route: the footer parses, and the tail header copy it locates parses and agrees with it",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "ParityMap tape file 3",
+        "finding": "primary copy: CRC",
+        "error": "ParityMapParse",
+        "checks": "structure"
+      }
+    ]
+  },
+  "s6-11": {
+    "fault_notes": [
+      "record at LBA 15 (tape file 3 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree",
+      "record at LBA 17 (tape file 3 record 2) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 3,
+        "record_index": 0,
+        "lba": 15,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 192,
+            "bytes": 1,
+            "reason": "ParityMap header CRC: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      },
+      {
+        "tape_file": 3,
+        "record_index": 2,
+        "lba": 17,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 32,
+            "bytes": 1,
+            "reason": "ParityMap footer CRC-covered byte: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "no final ParityMap validates; no validated scope beyond the bootstrap's",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    }
+  },
+  "s6-12": {
+    "fault_notes": [
+      "record at LBA 15 (tape file 3 record 0) replaced: the original record's length, 262144 bytes, 1 byte edit(s); every stated old byte and the SHA-256 agree"
+    ],
+    "record_edit_checks": [
+      {
+        "tape_file": 3,
+        "record_index": 0,
+        "lba": 15,
+        "length": 262144,
+        "construction": "the original record's length",
+        "edits": [
+          {
+            "offset": 0,
+            "bytes": 1,
+            "reason": "ParityMap magic: xor 01",
+            "old_bytes_agree": true
+          }
+        ],
+        "sha256_agrees": true
+      }
+    ],
+    "bootstrap_attempts": [
+      "read size 262144: bootstrap parses"
+    ],
+    "layout_source": "replica footer at LBA 37 (replica ordinal 3)",
+    "walk": [
+      {
+        "tape_file_number": 0,
+        "start": 0,
+        "count": 1,
+        "kind": 2,
+        "note": "bootstrap",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 1,
+        "start": 2,
+        "count": 4,
+        "kind": 0,
+        "note": "Object by elimination",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 2,
+        "start": 7,
+        "count": 7,
+        "kind": 1,
+        "note": "sidecar by primary header",
+        "epoch_id": 0,
+        "start_ordinal": 0,
+        "end_ordinal": 4,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 3,
+        "start": 15,
+        "count": 3,
+        "kind": 3,
+        "note": "ParityMap by its tail route: the footer parses, and the tail header copy it locates parses and agrees with it",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 4,
+        "start": 19,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 19))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 5,
+        "start": 23,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 6,
+        "start": 27,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 27))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 7,
+        "start": 31,
+        "count": 3,
+        "kind": 5,
+        "note": "separation header matches the plan",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      },
+      {
+        "tape_file_number": 8,
+        "start": 35,
+        "count": 3,
+        "kind": 4,
+        "note": "terminal replica established by its footer (head unreadable (medium error at LBA 35))",
+        "epoch_id": null,
+        "start_ordinal": null,
+        "end_ordinal": null,
+        "failed_classification": null,
+        "artifact": false,
+        "undecidable": false,
+        "torn": false,
+        "parity_map": null
+      }
+    ],
+    "walk_damage": [],
+    "walk_map": "walked map validated against the final ParityMap",
+    "directory": "final ParityMap found by the walk",
+    "separations": {
+      "A-B": "header, footer, zero interior and trailing filemark validate",
+      "B-C": "header, footer, zero interior and trailing filemark validate"
+    },
+    "verifier_prefix_findings": [
+      {
+        "component": "ParityMap tape file 3",
+        "finding": "primary copy: magic",
+        "error": "ParityMapParse",
+        "checks": "structure"
+      }
+    ]
   }
 }

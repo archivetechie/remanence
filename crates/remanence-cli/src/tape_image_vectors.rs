@@ -273,6 +273,7 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
             matches!(
                 key.as_str(),
                 "id" | "image"
+                    | "checks"
                     | "fault"
                     | "failed_data_addresses"
                     | "hints"
@@ -292,11 +293,16 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
     }
     if let Some(erratum) = case.get("erratum") {
         assert!(
-            matches!(erratum.as_str(), Some("E2" | "E3" | "E4")),
+            matches!(erratum.as_str(), Some("E2" | "E3" | "E4" | "S6")),
             "{}: erratum set",
             case["id"]
         );
     }
+    assert_eq!(
+        case.get("checks").is_some(),
+        case["erratum"] == "S6",
+        "S6 requires explicit checks; other sets do not accept them"
+    );
     if let Some(authority) = case.get("object_authority") {
         assert_eq!(
             authority, "none supplied",
@@ -382,11 +388,30 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
     }
     lbas.sort_unstable();
     lbas.dedup();
-    let records: Vec<_> = lbas.iter().map(|lba| {
-        let (f, file) = image.files.iter().enumerate().rev().find(|(_, f)| f.start_record as u64 <= *lba).expect("fault within image");
-        assert!(*lba < image.eod_record as u64);
-        json!({"lba": lba, "tape_file": f, "record_index": lba - file.start_record as u64, "filemark": file.filemark_record == Some(*lba as usize)})
-    }).collect();
+    // Resolve the stated physical LBAs on the tape after filemark removal.
+    let removed = case["fault"]["removed_filemark_after_tape_file"].as_u64();
+    let mut physical_records = Vec::new();
+    let (mut tape_file, mut record_index) = (0, 0);
+    for (original_file, file) in image.files.iter().enumerate() {
+        for _ in &file.record_offsets {
+            physical_records.push((tape_file, record_index, false));
+            record_index += 1;
+        }
+        if file.filemark_record.is_some() && removed != Some(original_file as u64) {
+            physical_records.push((tape_file, record_index, true));
+            tape_file += 1;
+            record_index = 0;
+        }
+    }
+    let records: Vec<_> = lbas
+        .iter()
+        .map(|lba| {
+            let &(f, index, filemark) = physical_records
+                .get(*lba as usize)
+                .expect("fault within modified image");
+            json!({"lba": lba, "tape_file": f, "record_index": index, "filemark": filemark})
+        })
+        .collect();
     let mut map = json!({"image": case["image"], "unreadable_records": records, "removed_filemark_after_tape_file": case["fault"]["removed_filemark_after_tape_file"], "failed_data_addresses": addresses});
     if let Some(reads) = case.get("read_data_addresses") {
         // The Reader meets the fault itself: these addresses are not made
@@ -421,6 +446,17 @@ pub fn fault_map(case: &Value, image: &ExportedTapeImage) -> Value {
         let mut resolved = map["record_edits"].as_array().cloned().unwrap_or_default();
         resolved.extend(parity_map_edits(case, edits, image));
         map["record_edits"] = json!(resolved);
+    }
+    if let Some(removed) = removed {
+        let removed_lba = image.files[removed as usize]
+            .filemark_record
+            .expect("removed filemark exists") as u64;
+        if let Some(edits) = map.get_mut("record_edits").and_then(Value::as_array_mut) {
+            for edit in edits {
+                let lba = edit["lba"].as_u64().unwrap();
+                edit["lba"] = json!(lba - u64::from(lba > removed_lba));
+            }
+        }
     }
     if let Some(extra) = case["fault"].get("extra_records") {
         map["record_insertions"] = record_insertions(case, extra, image);
