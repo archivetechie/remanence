@@ -46,6 +46,7 @@ Checked:
 Exit 0 clean; exit 1 with findings on stderr.
 """
 
+import argparse
 import hashlib
 import re
 import sys
@@ -629,7 +630,60 @@ def structural_findings(root: pathlib.Path = ROOT) -> list[str]:
     return errors
 
 
-def main() -> int:
+def read_deposited(deposited_path: pathlib.Path) -> tuple[dict[tuple[str, str], str], list[str]]:
+    """Read immutable filename/version/digest records for documents or archives."""
+    deposited: dict[tuple[str, str], str] = {}
+    errors = []
+    if deposited_path.is_file():
+        for lineno, line in enumerate(deposited_path.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 3:
+                errors.append(f"DEPOSITED.sha256 line {lineno}: expected "
+                     f"'<filename> <version> <sha256>', got {line!r}")
+                continue
+            name, version, digest = parts
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                errors.append(f"DEPOSITED.sha256 line {lineno}: {digest!r} is not a sha256")
+                continue
+            if (name, version) in deposited and deposited[(name, version)] != digest:
+                errors.append(f"DEPOSITED.sha256: {name} {version} recorded twice with "
+                     "different digests — a published revision is immutable")
+            deposited[(name, version)] = digest
+
+    return deposited, errors
+
+
+def deposited_archive_findings(root: pathlib.Path, deposited: dict[tuple[str, str], str],
+                               overrides: dict[str, pathlib.Path] | None = None,
+                               require_archives: bool = False) -> tuple[list[str], list[str]]:
+    """Check recorded archives when built; leave the frozen archive in publication."""
+    errors, notes = [], []
+    for (name, version), digest in deposited.items():
+        if name in SPECS or name == COMPANION:
+            continue
+        if pathlib.PurePosixPath(name).name != name or "\\" in name or not name.endswith(".tar"):
+            errors.append(f"DEPOSITED.sha256: unsupported archive name {name!r}")
+            continue
+        path = (overrides or {}).get(name)
+        if path is None:
+            path = (root / "specs/publication" if name == "remanence-test-vectors.tar" else root / "dist") / name
+        if not path.is_file():
+            if require_archives:
+                errors.append(f"{name} {version}: recorded archive absent (--require-archives)")
+            else:
+                notes.append(f"NOTE {name} {version}: archive absent; deposited digest check skipped")
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            errors.append(f"{name}: version {version} differs from deposited digest {digest}; deposited bytes are immutable")
+    return errors, notes
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--require-archives", action="store_true", help="fail if a recorded archive is absent")
+    args = parser.parse_args(argv)
     findings.clear()
     texts = {name: (PUB / name).read_text() for name in SPECS}
 
@@ -724,25 +778,12 @@ def main() -> int:
     # whether you are holding the deposit, the repository, or a copy unpacked
     # from a source release years later.
     deposited_path = PUB / "DEPOSITED.sha256"
-    deposited: dict[tuple[str, str], str] = {}
-    if deposited_path.is_file():
-        for lineno, line in enumerate(deposited_path.read_text().splitlines(), 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) != 3:
-                fail(f"DEPOSITED.sha256 line {lineno}: expected "
-                     f"'<filename> <version> <sha256>', got {line!r}")
-                continue
-            name, version, digest = parts
-            if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                fail(f"DEPOSITED.sha256 line {lineno}: {digest!r} is not a sha256")
-                continue
-            if (name, version) in deposited and deposited[(name, version)] != digest:
-                fail(f"DEPOSITED.sha256: {name} {version} recorded twice with "
-                     "different digests — a published revision is immutable")
-            deposited[(name, version)] = digest
+    deposited, record_errors = read_deposited(deposited_path)
+    findings.extend(record_errors)
+    archive_errors, archive_notes = deposited_archive_findings(ROOT, deposited, require_archives=args.require_archives)
+    findings.extend(archive_errors)
+    for note in archive_notes:
+        print(note)
 
     for name in list(SPECS) + [COMPANION]:
         path = PUB / name

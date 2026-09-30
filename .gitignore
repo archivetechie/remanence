@@ -58,3 +58,6 @@ AGENTS.md
 # execution counts, coverage before/after, and any artifact analysis.
 # Files already tracked before this rule stay tracked; this stops the growth.
 fuzz/corpus/
+
+# Reproducible draft deposit archives.
+/dist/

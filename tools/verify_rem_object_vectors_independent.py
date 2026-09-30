@@ -38,14 +38,23 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
-from cryptography.exceptions import InvalidTag
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import (
-    X25519PrivateKey,
-    X25519PublicKey,
-)
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
-from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+# Plaintext reconstruction also serves the standard-library-only parity verifier.
+# Encryption commands still require the dependencies in the requirements file.
+CRYPTOGRAPHY_AVAILABLE = True
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+except ModuleNotFoundError as error:
+    if error.name != "cryptography":
+        raise
+    CRYPTOGRAPHY_AVAILABLE = False
+
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -195,6 +204,12 @@ def assert_eq(actual: Any, expected: Any, label: str) -> None:
         raise AssertionError(f"{label}: got {actual!r}, expected {expected!r}")
 
 
+def require_cryptography() -> None:
+    """Fail at entry to encrypted paths while allowing plaintext-only imports."""
+    if not CRYPTOGRAPHY_AVAILABLE:
+        raise RuntimeError("cryptography is required; install tools/requirements-rem-object-independent.txt")
+
+
 def ml_kem_768() -> Any:
     """Return the pinned independent ML-KEM-768 primitive or fail loudly."""
     try:
@@ -203,7 +218,7 @@ def ml_kem_768() -> Any:
         raise RuntimeError(
             "independent X-Wing verification requires "
             f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}; install it with "
-            f"`python3 -m pip install {KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION}`"
+            "tools/requirements-rem-object-independent.txt (package kyber_py)"
         ) from exc
     if installed != KYBER_PY_VERSION:
         raise RuntimeError(
@@ -215,7 +230,8 @@ def ml_kem_768() -> Any:
     except ImportError as exc:
         raise RuntimeError(
             f"{KYBER_PY_DISTRIBUTION}=={KYBER_PY_VERSION} is installed "
-            "but kyber_py.ml_kem.ML_KEM_768 is unavailable"
+            "but kyber_py.ml_kem.ML_KEM_768 is unavailable; install "
+            "tools/requirements-rem-object-independent.txt"
         ) from exc
     for method in ("_keygen_internal", "_encaps_internal", "_decaps_internal"):
         if not callable(getattr(ML_KEM_768, method, None)):
@@ -227,6 +243,7 @@ def ml_kem_768() -> Any:
 
 def x25519_public(private_bytes: bytes) -> bytes:
     """Derive a canonical raw X25519 public key from 32 private bytes."""
+    require_cryptography()
     private = X25519PrivateKey.from_private_bytes(private_bytes)
     return private.public_key().public_bytes(
         serialization.Encoding.Raw,
@@ -265,6 +282,7 @@ def xwing_combine(
 
 def xwing_encapsulate(public_key: bytes, randomness: bytes) -> tuple[bytes, bytes]:
     """Deterministically encapsulate with independent ML-KEM and X25519 code."""
+    require_cryptography()
     assert_eq(len(public_key), XWING_PUBLIC_KEY_LEN, "X-Wing public-key length")
     assert_eq(len(randomness), 64, "X-Wing encapsulation randomness length")
     pk_m = public_key[:MLKEM768_PUBLIC_KEY_LEN]
@@ -283,6 +301,7 @@ def xwing_encapsulate(public_key: bytes, randomness: bytes) -> tuple[bytes, byte
 
 def xwing_decapsulate(seed: bytes, enc: bytes) -> tuple[bytes, bytes]:
     """Decapsulate draft-10 X-Wing and return its shared and public keys."""
+    require_cryptography()
     assert_eq(len(enc), XWING_CIPHERTEXT_LEN, "X-Wing ciphertext length")
     public_key, dk_m, sk_x, pk_x = xwing_keypair(seed)
     ss_m = ml_kem_768()._decaps_internal(dk_m, enc[:MLKEM768_CIPHERTEXT_LEN])
@@ -1709,6 +1728,7 @@ def hpke_unwrap_dek(
     recipient: dict[str, Any],
     wrap_suite: int,
 ) -> tuple[bytes, dict[str, bytes]]:
+    require_cryptography()
     private_bytes = bytes.fromhex(recipient["private_key"])
     expected_public = bytes.fromhex(recipient["public_key"])
     if wrap_suite != REM_OBJECT_WRAP_SUITE_XWING:
@@ -1766,6 +1786,7 @@ def load_hex_kat(path: pathlib.Path) -> dict[str, bytes]:
 
 def verify_xwing_kats(kat_directory: pathlib.Path) -> None:
     """Reproduce draft-10 and REM-OBJECT wrap KATs with the independent stack."""
+    require_cryptography()
     draft10 = load_hex_kat(kat_directory / "xwing-draft10-kat.txt")
     public_key, _dk_m, _sk_x, _pk_x = xwing_keypair(draft10["seed"])
     assert_eq(public_key, draft10["pk"], "draft-10 X-Wing public key")
@@ -1873,6 +1894,7 @@ def open_encrypted_with_generic_crypto(
     expected: dict[str, Any],
     expected_dek: bytes,
 ) -> tuple[bytes, EncryptedHeader, dict[str, Any]]:
+    require_cryptography()
     header = parse_encrypted_header(stored)
     key_frame_start = REM_OBJECT_HEADER_LEN
     key_frame_end = key_frame_start + header.key_frame_len
@@ -2265,6 +2287,7 @@ def check_cross_layer_binding_and_range_vectors(
     d1_fixture: dict[str, Any],
 ) -> None:
     """Independently verify the C1 bootstrap and M1 final-chunk range vectors."""
+    require_cryptography()
     object_id_root = (
         publication_root
         / "rem-parity-1"
@@ -2662,7 +2685,7 @@ def write_core_plaintext_fixture_pins(fixture_directory: pathlib.Path) -> None:
         )
 
 
-def verify_supplement_manifest(directory: pathlib.Path) -> dict[str, Any]:
+def verify_supplement_manifest(directory: pathlib.Path, published_vector_index: pathlib.Path | None = None) -> dict[str, Any]:
     """Check exact file coverage, sizes, hashes, index artifacts and per-case sums."""
     lines = (directory / "MANIFEST.tsv").read_text().splitlines()
     assert_eq(lines[0], "path\tbytes\tsha256", "supplement manifest header")
@@ -2688,8 +2711,11 @@ def verify_supplement_manifest(directory: pathlib.Path) -> dict[str, Any]:
     index = load(directory, "vectors.json")
     assert_eq(index["vector_set"], "REM-OBJECT-SUPPLEMENT-1-CANDIDATE", "vector set")
     assert_eq(index["status"], "review-only-candidate", "candidate status")
-    with tarfile.open(ROOT / "specs/publication/remanence-test-vectors.tar", "r") as tar:
-        published = json.load(tar.extractfile("rem-object/vectors.json"))
+    if published_vector_index is None:
+        with tarfile.open(ROOT / "specs/publication/remanence-test-vectors.tar", "r") as tar:
+            published = json.load(tar.extractfile("rem-object/vectors.json"))
+    else:
+        published = json.loads(published_vector_index.read_text())
     assert_eq(index["checksum_definition"], published["checksum_definition"], "checksum definition")
     for vector in index["vectors"]:
         if not vector["spec_section"].startswith("REM-"):
@@ -2719,6 +2745,7 @@ def verify_supplement_manifest(directory: pathlib.Path) -> dict[str, Any]:
 
 def rederive_supplement_object(inputs: dict[str, Any], plaintext: bytes) -> bytes:
     """Rebuild a defective-Sealer object from recorded secrets with independent crypto."""
+    require_cryptography()
     dek = bytes.fromhex(inputs["deterministic_dek"])
     seed = bytes.fromhex(inputs["deterministic_hpke_rng_seed"])
     # At counter zero and nonce zero, the original/IETF ChaCha20 layouts coincide
@@ -2766,10 +2793,11 @@ def rederive_supplement_object(inputs: dict[str, Any], plaintext: bytes) -> byte
     return bytes(stored)
 
 
-def check_supplement(directory: pathlib.Path) -> None:
+def check_supplement(directory: pathlib.Path, fixture_directory: pathlib.Path = FIXTURES,
+                     published_vector_index: pathlib.Path | None = None) -> None:
     """Re-derive every candidate, require the precise negative cause and open the control."""
-    index = verify_supplement_manifest(directory)
-    p1 = load(FIXTURES, "rem-object-tv-p1.json")
+    index = verify_supplement_manifest(directory, published_vector_index)
+    p1 = load(fixture_directory, "rem-object-tv-p1.json")
     plaintext, _ = build_plaintext(p1["inputs"], p1_file_specs())
     assert_eq(hx(sha256(plaintext)), p1["expected"]["stored_digest"], "supplement P1")
     ran = []
@@ -2880,6 +2908,8 @@ def check_supplement(directory: pathlib.Path) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plaintext-only", action="store_true", help="rederive plaintext fixtures with only the standard library")
+    parser.add_argument("--published-vector-index", type=pathlib.Path, help="extracted frozen REM-OBJECT vectors.json for supplement checks")
     parser.add_argument("--supplement", type=pathlib.Path, help="verify a review-only REM-OBJECT supplement")
     parser.add_argument(
         "--check-plaintext-interop",
@@ -2951,7 +2981,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.supplement is not None:
-        check_supplement(args.supplement)
+        check_supplement(args.supplement, args.fixture_directory, args.published_vector_index)
         return 0
     fixture_directory = args.fixture_directory
     if args.write_new_plaintext_fixtures:
@@ -2980,7 +3010,6 @@ def main(argv: list[str] | None = None) -> int:
         print("wrote four REM-OBJECT metadata/extension publication fixtures")
         return 0
 
-    verify_xwing_kats(args.kat_directory)
     p1 = load(fixture_directory, "rem-object-tv-p1.json")
     e2 = load(fixture_directory, "rem-object-tv-e2.json")
     d1 = load(fixture_directory, "rem-object-tv-d1.json")
@@ -3053,6 +3082,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"{vector.vector_id} Rust deterministic export",
             )
 
+    if args.plaintext_only:
+        print("verified REM-OBJECT plaintext fixture rederivation independently")
+        return 0
+    verify_xwing_kats(args.kat_directory)
     encrypted_directory = args.encrypted_object_directory
     e2_stored = (encrypted_directory / "rem-object-tv-e2.rem-object").read_bytes()
     d1_encrypted_stored = (encrypted_directory / "rem-object-tv-d1-encrypted.rem-object").read_bytes()

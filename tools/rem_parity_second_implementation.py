@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
 
 # REM-PARITY Sections 5.1, 5.3 and 6. The functions below are called by name;
 # gf_pow, _crc64_table_entry, the CRC table and the CBOR head and item decoders
@@ -75,6 +76,11 @@ from verify_rem_object_vectors_independent import FileSpec, build_plaintext_with
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "fixtures" / "rem-parity-terminal-index-draft"
 OUTPUT_ROOT = FIXTURE_ROOT / "second-implementation"
+# The deposit relocates fixtures but runs this same implementation.
+ARCHIVE_LAYOUT = (REPO_ROOT / "ARCHIVE-LAYOUT").is_file()
+if ARCHIVE_LAYOUT:
+    FIXTURE_ROOT = REPO_ROOT / "rem-parity-generation-2"
+    OUTPUT_ROOT = REPO_ROOT / "rem-parity-second-implementation"
 SPEC_PATH = REPO_ROOT / "specs" / "in-progress" / "rem-parity-1-specification.md"
 
 # REM-PARITY Section 2.5 constants.

@@ -76,6 +76,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return export_objects(Path::new(&args[1]));
     }
+    if args.first().is_some_and(|arg| arg == "--export-images") {
+        if args.len() != 2 || args[1].starts_with('-') {
+            return Err("usage: generate_tape_images --export-images <directory>".into());
+        }
+        let root = Path::new(&args[1]);
+        for name in IMAGE_NAMES {
+            let vector = generate(name)?;
+            let directory = root.join(name);
+            fs::create_dir_all(&directory)?;
+            for (index, file) in vector.image.files.iter().enumerate() {
+                let suffix = if file.filemark_record.is_some() {
+                    ""
+                } else {
+                    "-torn"
+                };
+                fs::write(
+                    directory.join(format!("tape-file-{index:03}{suffix}.bin")),
+                    &file.bytes,
+                )?;
+            }
+        }
+        println!("exported {} tape images", IMAGE_NAMES.len());
+        return Ok(());
+    }
     let (check, source_path) = match args
         .iter()
         .map(String::as_str)

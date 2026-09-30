@@ -2,6 +2,12 @@
 """Regression tests for the publication specification guard."""
 
 import unittest
+import hashlib
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_spec_versioning import unresolved_section_references
 
@@ -551,6 +557,49 @@ class PreparingCopyRuleTests(unittest.TestCase):
     def test_an_unrelated_document_digest_is_not_an_archive_pin(self):
         text = self.copy() + "\nThe published revision (SHA-256 `" + "c" * 64 + "`) governs.\n"
         self.assertEqual(self.findings(text), [])
+
+
+class DepositedArchiveTests(unittest.TestCase):
+    def test_recorded_archive_present_absent_and_changed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            name = "remanence-draft-test-vectors.tar"
+            record = {(name, "draft.5"): hashlib.sha256(b"archive").hexdigest()}
+            errors, notes = lint.deposited_archive_findings(root, record)
+            self.assertFalse(errors)
+            self.assertEqual(len(notes), 1)
+            errors, notes = lint.deposited_archive_findings(root, record, require_archives=True)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("recorded archive absent", errors[0])
+            self.assertFalse(notes)
+            (root / "dist").mkdir()
+            (root / "dist" / name).write_bytes(b"archive")
+            self.assertEqual(lint.deposited_archive_findings(root, record), ([], []))
+            self.assertEqual(lint.deposited_archive_findings(root, record, require_archives=True), ([], []))
+            (root / "dist" / name).write_bytes(b"changed")
+            self.assertTrue(lint.deposited_archive_findings(root, record)[0])
+
+    def test_frozen_archive_stays_in_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pub = root / "specs/publication"
+            pub.mkdir(parents=True)
+            name = "remanence-test-vectors.tar"
+            (pub / name).write_bytes(b"frozen")
+            record = {(name, "gen1"): hashlib.sha256(b"frozen").hexdigest()}
+            self.assertEqual(lint.deposited_archive_findings(root, record), ([], []))
+
+    def test_parser_preserves_document_and_archive_records_and_rejects_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "DEPOSITED.sha256"
+            path.write_text("# header\nrem-object-core-1-specification.md 1.0.0 " + "a" * 64
+                            + "\nremanence-draft-test-vectors.tar draft.5 " + "b" * 64 + "\n")
+            records, errors = lint.read_deposited(path)
+            self.assertFalse(errors)
+            self.assertEqual(len(records), 2)
+            path.write_text(path.read_text() + "remanence-draft-test-vectors.tar draft.5 " + "c" * 64 + "\n")
+            self.assertTrue(lint.read_deposited(path)[1])
+            self.assertTrue(lint.deposited_archive_findings(Path(tmp), {("../escape.tar", "v1"): "a" * 64})[0])
 
 
 if __name__ == "__main__":
