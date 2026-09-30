@@ -111,7 +111,11 @@ jobs:
       - name: Build and verify the draft vector archive
         timeout-minutes: 20
         run: |
-          python3 -m pip install -r tools/requirements-rem-object-independent.txt
+          # A virtual environment, because the verifier runs the archive's claims with a scrubbed
+          # environment (no home directory), which hides packages installed in a user site.
+          python3 -m venv "$RUNNER_TEMP/draft-venv"
+          export PATH="$RUNNER_TEMP/draft-venv/bin:$PATH"
+          python3 -m pip install -q -r tools/requirements-rem-object-independent.txt
           python3 tools/build_draft_vector_archive.py --images "$RUNNER_TEMP/w2-images"
           python3 tools/verify_draft_vector_archive.py --archive dist/remanence-draft-test-vectors.tar
           python3 tools/verify_draft_vector_archive.py --rebuild-compare
