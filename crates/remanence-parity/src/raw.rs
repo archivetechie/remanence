@@ -983,7 +983,9 @@ impl<'a> DriveHandleRawSink<'a> {
             .read_config()
             .map_err(|_| ParityError::DriveCompressionModeUnknown)?;
         if verified.compression {
-            return Err(ParityError::DriveCompressionEnabled);
+            return Err(ParityError::DriveCompressionEnabled {
+                context: crate::error::CompressionRefusalContext::Write,
+            });
         }
         if verified.block_size != desired_block_size {
             return Err(ParityError::SessionOpen(format!(
@@ -1771,7 +1773,11 @@ mod compat_tests {
                 .expect_err("compression-enabled read-back must be refused")
         };
 
-        assert!(matches!(err, ParityError::DriveCompressionEnabled));
+        assert!(matches!(err, ParityError::DriveCompressionEnabled { .. }));
+        assert_eq!(
+            err.to_string(),
+            "LTO hardware compression is enabled; parity-protected writes require it disabled"
+        );
         assert!(
             log.borrow().iter().any(|cdb| cdb[0] == 0x15),
             "the adapter should attempt MODE SELECT before rejecting the read-back"

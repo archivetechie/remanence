@@ -150,7 +150,7 @@ impl ScanRecoveryHints {
         self.refuse_record_length(measured_usize, || {
             if measured_usize < read_size {
                 format!(
-                    "short fixed-block bootstrap read: got {measured} bytes, expected {}",
+                    "short fixed-block bootstrap read: got {measured} bytes, supplied block size is {}",
                     self.block_size
                 )
             } else {
@@ -266,7 +266,9 @@ impl ScanRecoveryHints {
                             *key == Value::Integer(5.into()) && *value == Value::Bool(true)
                         })
                     {
-                        return Err(ParityError::DriveCompressionEnabled);
+                        return Err(ParityError::DriveCompressionEnabled {
+                            context: crate::error::CompressionRefusalContext::Bootstrap,
+                        });
                     }
                     for (key, value) in &entries {
                         if *key != Value::Integer(1.into()) {
@@ -572,7 +574,9 @@ pub fn acquire_filemark_map_with_report(
     catalog_map: Option<CatalogFilemarkMapInput>,
 ) -> Result<FilemarkMapScanResult, ParityError> {
     if !authoritative_bootstrap.no_parity_flag && authoritative_bootstrap.drive_compression {
-        return Err(ParityError::DriveCompressionEnabled);
+        return Err(ParityError::DriveCompressionEnabled {
+            context: crate::error::CompressionRefusalContext::Bootstrap,
+        });
     }
 
     if let Some(catalog) = catalog_map {
@@ -1345,8 +1349,8 @@ fn append_classified_entry(
                     }));
                 }
             }
-            Err(ParityError::DriveCompressionEnabled) => {
-                return Err(ParityError::DriveCompressionEnabled);
+            Err(error @ ParityError::DriveCompressionEnabled { .. }) => {
+                return Err(error);
             }
             Err(_) => {}
         }
@@ -2962,7 +2966,8 @@ mod tests {
         let err = acquire_filemark_map(&mut source, &payload, None)
             .expect_err("compressed parity bootstrap must disable 3c recovery");
 
-        assert!(matches!(err, ParityError::DriveCompressionEnabled));
+        assert!(matches!(err, ParityError::DriveCompressionEnabled { .. }));
+        assert_eq!(err.to_string(), "tape's bootstrap records drive compression; a parity tape must not record drive compression");
         assert!(
             source.calls.is_empty(),
             "compression rejection must happen before scan I/O"
@@ -3410,7 +3415,7 @@ mod tests {
         compressed[end..end + 8].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             scan(compressed, &hints),
-            Err(ParityError::DriveCompressionEnabled)
+            Err(ParityError::DriveCompressionEnabled { .. })
         ));
         for field in ["identity", "block size"] {
             for failure in ["payload", "schema"] {
@@ -3538,7 +3543,10 @@ mod tests {
                         assert!(reason.contains("readable but nonconformant"), "{reason}");
                     }
                     "compression" => {
-                        assert!(matches!(result, Err(ParityError::DriveCompressionEnabled)))
+                        assert!(matches!(
+                            result,
+                            Err(ParityError::DriveCompressionEnabled { .. })
+                        ))
                     }
                     _ => assert!(result
                         .expect_err("scheme conflict")
@@ -3770,6 +3778,10 @@ mod tests {
                 BootstrapRefusedField::BlockSize
             );
         }
+        let error = hints
+            .check_bootstrap_read_length(&read(40), size)
+            .expect_err("short record");
+        assert_eq!(error.to_string(), format!("bootstrap refused: short fixed-block bootstrap read: got 40 bytes, supplied block size is {BLOCK_SIZE}"));
         // At another candidate size, a record of the supplied length only rules
         // that candidate out; one of any other length is still refused.
         hints
@@ -3924,10 +3936,19 @@ mod tests {
             (vec![size, uuid], BootstrapRefusedField::TapeUuid),
         ] {
             for damaged_payload in [false, true] {
-                assert_eq!(
-                    refused_field(hints.classify_bootstrap(&edit(&edits, damaged_payload))),
-                    field
-                );
+                let error = hints
+                    .classify_bootstrap(&edit(&edits, damaged_payload))
+                    .expect_err("header refusal");
+                let detail = match field {
+                    BootstrapRefusedField::FormatMajor => "unsupported bootstrap schema major version: got 3, accept 2",
+                    BootstrapRefusedField::TapeUuid => "tape identity mismatch: readable bootstrap header differs from supplied hints",
+                    BootstrapRefusedField::BlockSize => "readable bootstrap block size differs from supplied hints",
+                    BootstrapRefusedField::Sequence => "schema-major 2 permits only the sequence-0 BOT Bootstrap: got sequence 1",
+                    BootstrapRefusedField::NoParityFlag => "readable bootstrap parity scheme differs from supplied hints: no-parity flag contradicts scheme",
+                    BootstrapRefusedField::Scheme => unreachable!(),
+                };
+                assert_eq!(error.to_string(), format!("bootstrap refused: {detail}"));
+                assert_eq!(refused_field::<RecoveryBootstrap>(Err(error)), field);
             }
         }
         let mut other_scheme = hints.clone();
@@ -3999,10 +4020,11 @@ mod tests {
         };
         scheme.data_blocks_per_stripe += 1;
         for supplied in [&hints, &other_scheme] {
-            assert!(matches!(
-                supplied.classify_bootstrap(&build(false, true)),
-                Err(ParityError::DriveCompressionEnabled)
-            ));
+            let error = supplied
+                .classify_bootstrap(&build(false, true))
+                .expect_err("recorded compression");
+            assert!(matches!(error, ParityError::DriveCompressionEnabled { .. }));
+            assert_eq!(error.to_string(), "tape's bootstrap records drive compression; a parity tape must not record drive compression");
         }
         // No-parity tape: recorded compression is not a refusal.
         let no_parity = ScanRecoveryHints {

@@ -485,7 +485,9 @@ fn section15(error: &ObservedError) -> &'static str {
         ObservedError::Parity(ParityError::DirectoryInvalid(_)) => "DirectoryInvalid",
         ObservedError::Parity(ParityError::BootstrapParse(_))
         | ObservedError::Parity(ParityError::BootstrapRefused { .. }) => "BootstrapParse",
-        ObservedError::Parity(ParityError::DriveCompressionEnabled) => "DriveCompressionEnabled",
+        ObservedError::Parity(ParityError::DriveCompressionEnabled { .. }) => {
+            "DriveCompressionEnabled"
+        }
         ObservedError::Parity(ParityError::BootstrapPayloadTooLarge { .. }) => {
             "BootstrapPayloadTooLarge"
         }
@@ -1540,10 +1542,17 @@ mod tests {
             })),
             "BootstrapParse"
         );
-        assert_eq!(
-            section15(&ObservedError::Parity(ParityError::DriveCompressionEnabled)),
-            "DriveCompressionEnabled"
-        );
+        for context in [
+            remanence_parity::error::CompressionRefusalContext::Write,
+            remanence_parity::error::CompressionRefusalContext::Bootstrap,
+        ] {
+            assert_eq!(
+                section15(&ObservedError::Parity(
+                    ParityError::DriveCompressionEnabled { context }
+                )),
+                "DriveCompressionEnabled"
+            );
+        }
     }
     #[test]
     fn healthy_roles_and_repairs() {

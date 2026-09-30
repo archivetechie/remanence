@@ -244,7 +244,7 @@ fn parity_error(error: ParityError) -> Value {
         ParityError::BootstrapRefused { field, .. } => {
             json!({"error":"BootstrapParse", "field":field.section_8_4_name()})
         }
-        ParityError::DriveCompressionEnabled => json!({"error":"DriveCompressionEnabled"}),
+        ParityError::DriveCompressionEnabled { .. } => json!({"error":"DriveCompressionEnabled"}),
         ParityError::SchemeMismatch { .. } => json!({"error":"SchemeMismatch"}),
         ParityError::SidecarMetadataUnavailable { epoch_id } => {
             json!({"error":"SidecarMetadataUnavailable", "epoch":epoch_id})
@@ -344,9 +344,8 @@ fn execute_reader(vector: &VectorImage, faults: &Value, hints: &Value) -> Value 
             }
             Err(e) => {
                 let discovery = match &e {
-                    ParityError::BootstrapRefused { .. } | ParityError::DriveCompressionEnabled => {
-                        "refused"
-                    }
+                    ParityError::BootstrapRefused { .. }
+                    | ParityError::DriveCompressionEnabled { .. } => "refused",
                     ParityError::NoBootstrapFound => "no bootstrap found",
                     _ => "failed",
                 };

@@ -1713,10 +1713,7 @@ mod tests {
             }),
         )
         .expect_err("compression refusal");
-        assert!(
-            error.contains(&ParityError::DriveCompressionEnabled.to_string()),
-            "{error}"
-        );
+        assert_eq!(error, "discover bootstrap: tape's bootstrap records drive compression; a parity tape must not record drive compression");
     }
 
     /// Header evidence remains binding when a later payload or schema check fails.
