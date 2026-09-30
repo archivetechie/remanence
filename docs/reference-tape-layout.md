@@ -16,7 +16,7 @@ to Remanence's host state. Everything the catalog knows is either written
 to the tape itself or rebuildable from journals; the SQLite index is a
 cache, never the truth.
 
-<!-- code-anchor: crates/remanence-parity/src/terminal_tail.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/index_separation.rs @ 244bc6de -->
+<!-- code-anchor: crates/remanence-parity/src/terminal_tail.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/index_separation.rs @ a7fee789 -->
 ## Tape files and filemarks
 
 A cartridge is a sequence of tape files separated by filemarks, written in
@@ -79,7 +79,7 @@ HMAC-SHA-256 keyed by the tape UUID, so blocks from one tape cannot
 masquerade as another's. All parity-layer structures carry CRC-64/XZ
 checksums.
 
-<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ bc2f9f90 -->
+<!-- code-anchor: crates/remanence-parity/src/lib.rs crates/remanence-parity/src/sidecar.rs @ a7fee789 -->
 ## Parity scheme
 
 Erasure coding is Reed-Solomon over GF(2^8) with a Cauchy matrix; the
@@ -91,7 +91,7 @@ neighborhood). The defaults at the standard 256 KiB block size:
 |---|---|---|---|---|
 | `default` | 128 | 4 | 512 | ~512 MiB of loss per neighborhood |
 | `conservative` | 64 | 6 | 256 | ~384 MiB, higher parity overhead |
-| `none` | — | — | — | bootstrap written with a no-parity flag |
+| `none` | — | — | — | bootstrap written with a no-parity flag and no scheme record; a no-parity bootstrap whose payload carries a scheme record is refused; the line `recovery-report` prints is described in the [CLI reference](reference-cli.md#recovery-report-and-verification-output) (the specification's `BootstrapParse`) |
 | `custom:k,m,S` | k | m | S | operator-chosen |
 
 Parity-protected writes require LTO hardware compression disabled on the
@@ -128,7 +128,7 @@ a promise, it is the format.
 
 *Fig. 2 — A rem-object-v1 stored object in stream order: identity in the pax global header, one chunk-aligned member per file, the CBOR manifest as the last member, then tar end-of-archive records padded to a chunk multiple.*
 
-<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ 1dd451b2 -->
+<!-- code-anchor: crates/remanence-aead/src/header.rs crates/remanence-aead/src/stream.rs crates/remanence-aead/src/kdf.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs @ a7fee789 -->
 ## The encrypted envelope: REMO
 
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
@@ -254,10 +254,19 @@ or two complete replicas. Nothing in Remanence produces it yet. There is no
 operation that accepts a degraded replica set. A tape whose finalization
 cannot complete therefore stays in `RecoveryRequired`.
 
-Healthy inventory reads BOT identity, positions to EOD, and validates C
-without walking an Object. If C is missing or invalid it tries B, then A, and
-reports degraded redundancy. Surviving replicas must agree on tape, edition,
-scope, counts, canonical payload/map digests, block/compression facts, writer
+Healthy inventory reads the bootstrap at BOT, positions to EOD, and finds the
+planned terminal layout from the footer of a terminal replica read back from
+EOD. It validates the header, footer and trailing filemark of every replica
+that layout plans, without walking an Object. It reads a replica's payload
+only for the replica it accepts, or when two replica envelopes differ in a
+field that every replica of an edition shares (REM-PARITY Section 8.4, steps 1
+and 2). Among agreeing replicas it reads C first, then B, then A, and reports
+degraded redundancy when a replica fails. A footer supplies a layout only when
+the layout's planned EOD is at or after the tape's EOD; a tape file written
+after the terminal suffix therefore makes that layout unusable, and unless
+another footer supplies a layout the reader walks from BOT (see
+[Damaged tapes](guide-damaged-tapes.md)). Surviving replicas must agree on
+tape, edition, scope, counts, canonical payload/map digests, block/compression facts, writer
 facts, and the planned layout. If none survives, the truthful fallback is a
 structural scan from BOT; missing terminal authority is never an empty
 inventory. When a matching fsynced checkpoint journal survives, the BOT walk
@@ -265,20 +274,24 @@ can recover exact Object identifiers only for its measured committed prefix;
 complete Objects beyond that boundary remain unknown and a torn tail remains
 incomplete. A foreign tape without local authority stays unknown rather than
 causing Remanence to invent a journal. Full verification is a separate
-operation that walks the measured prefix and checks every surviving replica
-and both separation extents.
+operation. It reads every data block that a sidecar protects and every parity
+shard, checks each against its sidecar's index, and reports each failure by its
+address. It also walks the measured prefix and checks every surviving replica
+and both separation extents. A check of structure and metadata alone, which
+reads no data block or parity shard, is not a full verification (REM-PARITY
+Section 2.2). See [Full verification](guide-full-verification.md).
 
 The catalog inventory RPC is server-streamed. It emits the complete structural
 map and Object recovery rows from each attempted member under a bounded
 `attempt_id`; those rows are provisional until the final summary selects that
 attempt. A rejected attempt is named explicitly before fallback continues.
 Consumers therefore commit only the selected attempt. On the ordinary
-newest-to-oldest path the drive reads each attempted capsule body once and
+newest-to-oldest path the drive reads each attempted replica body once and
 remains backpressured by the receiver; independently valid conflicting
 candidates may require one bounded replay before the reader can fail closed or
 emit a selected authority.
 
-<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ 7f39930d -->
+<!-- code-anchor: crates/remanence-parity/src/bootstrap.rs crates/remanence-state/src/index.rs @ c80a553a -->
 ## Tape identity
 
 A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
@@ -291,7 +304,7 @@ recycle-skew issue when something outside Remanence rewrites a cartridge
 under an existing barcode (see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
-<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ 6ed03ef0 -->
+<!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ a7fee789 -->
 ## On disk: durable records and rebuildable state
 
 The host-side state, for completeness (paths are operator-configured; see

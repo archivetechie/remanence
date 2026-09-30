@@ -92,8 +92,8 @@ documents and published artifacts themselves.
   The set of assigned numbers is a vocabulary that can grow.
 - **Where.** REM-PARITY §10.3.
 - **Current values.** Row keys 1–4, 10–13 and 21–23 are assigned; key 4
-  (`object_id`) is required. Bootstrap payload key 30 is prohibited by the
-  replacement draft.
+  (`object_id`) is required. Bootstrap payload keys 20, 21 and 30 are reserved and MUST
+  be absent (REM-PARITY §8.2).
 - **Unknown value.** Readers MUST ignore unknown integer keys — this is
   the format's main extension mechanism.
 - **How it changes.** A minor revision may assign new keys. A new key MUST
@@ -107,7 +107,7 @@ documents and published artifacts themselves.
   carries a `footer_version`.
 - **Where.** Header offset 0x2C; footer offset 0x08. Normative: REM-PARITY
   §9.2, §9.6.
-- **Current values.** 2 and 2 in the clean-break replacement draft.
+- **Current values.** 2 and 2 in the clean-break draft.
 - **Unknown value.** Readers MUST reject any value other than 2 —
   fail-closed, unlike the bootstrap's `schema_minor`. The sidecar is
   recovery machinery; guessing about an unknown sidecar layout could
