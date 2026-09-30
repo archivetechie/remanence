@@ -181,6 +181,17 @@ but no implementation source. That is technical independence, not the social
 independence of a second institution; a human or institutional reproduction
 remains explicitly invited under RP-4.
 
+The drill has been run twice. The first run, on 2026-07-29, used the
+generation-1 minimal image. The second run, on 2026-09-30, used the
+generation-2 minimal tape of REM-PARITY Appendix A.4 and the text of
+1.0.0-draft.5, and the implementer's programs ran confined, with no access to
+any implementation source. It classified all nine tape files, gave the map's
+canonical digest, found the one damaged block, and rebuilt that block exactly
+by the parity of Section 6. It also checked the Object's manifest against the
+rebuilt block, and it recorded no point where the document needed a guess.
+Every replica of that tape was intact, so the drill found the map through the
+terminal index and did not exercise the BOT structural walk.
+
 RP-4 is the open item "An independent implementation from the prose alone" of
 the published revision 1.0.0-draft.2, in its Appendix E. It asks anyone outside
 the project to build a reader from the text and to report where it disagrees
