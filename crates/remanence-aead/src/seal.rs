@@ -138,7 +138,7 @@ fn seal_with_material<R, W, G>(
 where
     R: Read,
     W: Write,
-    G: rand_core::CryptoRng + rand_core::RngCore,
+    G: rand_core::CryptoRng,
 {
     validate_chunk_size(options.common.chunk_size)?;
     crate::header::object_id_field(&options.common.object_id)?;

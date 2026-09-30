@@ -9,11 +9,8 @@
 use std::fmt;
 
 use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext, MlKem768PrivateKey, MlKem768PublicKey};
-use rand_core::{CryptoRng, RngCore};
-use sha3::{
-    digest::{ExtendableOutput, Update, XofReader},
-    Digest, Sha3_256, Shake256,
-};
+use rand_core::CryptoRng;
+use sha3::{Digest, Sha3_256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -159,9 +156,7 @@ impl fmt::Debug for XWingExpandedSecret {
 /// Derive the X-Wing public key and ephemeral expanded secret from a seed.
 pub fn derive_keypair(seed: &XWingSeed) -> (XWingPublicKey, XWingExpandedSecret) {
     let mut expanded = Zeroizing::new([0u8; 96]);
-    let mut shake = Shake256::default();
-    Update::update(&mut shake, seed.as_bytes());
-    shake.finalize_xof().read(&mut expanded[..]);
+    libcrux_sha3::shake256_ema(&mut expanded[..], seed.as_bytes());
 
     let mut mlkem_seed = Zeroizing::new([0u8; MLKEM768_KEY_GENERATION_SEED_LEN]);
     mlkem_seed.copy_from_slice(&expanded[..MLKEM768_KEY_GENERATION_SEED_LEN]);
@@ -194,7 +189,7 @@ pub fn encapsulate<R>(
     rng: &mut R,
 ) -> Result<([u8; XWING_CIPHERTEXT_LEN], [u8; XWING_SHARED_SECRET_LEN]), XWingError>
 where
-    R: CryptoRng + RngCore,
+    R: CryptoRng,
 {
     let mut randomness = Zeroizing::new([0u8; XWING_ENCAPSULATION_RANDOMNESS_LEN]);
     rng.fill_bytes(&mut randomness[..]);
@@ -329,6 +324,8 @@ fn combine(
 mod tests {
     use std::mem::size_of;
 
+    use rand_core::{Infallible, Rng, TryCryptoRng, TryRng};
+
     use libcrux_kem::{key_gen_derand, Algorithm};
 
     use super::*;
@@ -348,20 +345,25 @@ mod tests {
         }
     }
 
-    impl<const N: usize> RngCore for FixedRng<N> {
-        fn next_u32(&mut self) -> u32 {
+    impl<const N: usize> TryRng for FixedRng<N> {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
             let mut bytes = [0u8; 4];
             self.fill_bytes(&mut bytes);
-            u32::from_le_bytes(bytes)
+            Ok(u32::from_le_bytes(bytes))
         }
 
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
             let mut bytes = [0u8; 8];
             self.fill_bytes(&mut bytes);
-            u64::from_le_bytes(bytes)
+            Ok(u64::from_le_bytes(bytes))
         }
 
-        fn fill_bytes(&mut self, destination: &mut [u8]) {
+        fn try_fill_bytes(
+            &mut self,
+            destination: &mut [u8],
+        ) -> std::result::Result<(), Self::Error> {
             let end = self
                 .offset
                 .checked_add(destination.len())
@@ -374,10 +376,11 @@ mod tests {
             );
             destination.copy_from_slice(&self.bytes[self.offset..end]);
             self.offset = end;
+            Ok(())
         }
     }
 
-    impl<const N: usize> CryptoRng for FixedRng<N> {}
+    impl<const N: usize> TryCryptoRng for FixedRng<N> {}
 
     impl<const N: usize> Drop for FixedRng<N> {
         fn drop(&mut self) {

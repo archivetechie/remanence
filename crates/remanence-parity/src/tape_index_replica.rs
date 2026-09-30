@@ -5,7 +5,7 @@
 //! by the caller. A/B/C are separate tape files so every filemark and barrier
 //! can advance durable five-component progress independently.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::diagnostic_text::{

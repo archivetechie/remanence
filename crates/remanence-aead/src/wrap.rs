@@ -8,17 +8,14 @@ use chacha20::{
 };
 use hpke::{
     aead::ChaCha20Poly1305,
-    generic_array::typenum::{Sum, U1024, U192, U32, U96},
+    hybrid_array::typenum::{Sum, U1024, U192, U32, U96},
     kdf::HkdfSha256,
     kem::SharedSecret,
-    setup_receiver, setup_sender, Deserializable, HpkeError, Kem as _, OpModeR, OpModeS,
+    setup_receiver, setup_sender_with_rng, Deserializable, HpkeError, Kem as _, OpModeR, OpModeS,
     Serializable,
 };
-use rand_core::{CryptoRng, RngCore};
-use sha3::{
-    digest::{ExtendableOutput, Update, XofReader},
-    Shake256,
-};
+use rand_core::{CryptoRng, Infallible, Rng, TryCryptoRng, TryRng};
+use subtle::{Choice, ConstantTimeEq};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{RemObjectAeadError, Result};
@@ -50,8 +47,23 @@ const RECIPIENT_PRIVATE_FILE_FIXED_LEN: usize = 4 + 16 + 1 + XWING_SEED_LEN;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct XWingHpkePublicKey(XWingPublicKey);
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct XWingHpkePrivateKey([u8; XWING_SEED_LEN]);
+
+impl ConstantTimeEq for XWingHpkePrivateKey {
+    fn ct_eq(&self, other: &Self) -> Choice {
+        self.0.ct_eq(&other.0)
+    }
+}
+
+// Equality of secret key bytes is constant-time; there is no variable-time path.
+impl PartialEq for XWingHpkePrivateKey {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(self.ct_eq(other))
+    }
+}
+
+impl Eq for XWingHpkePrivateKey {}
 
 impl Zeroize for XWingHpkePrivateKey {
     fn zeroize(&mut self) {
@@ -140,9 +152,7 @@ impl hpke::Kem for XWingHpkeKem {
         // X-Wing draft-10 §5.6 derives its canonical 32-byte seed from
         // variable-length HPKE IKM with SHAKE256 before running key generation.
         let mut seed_bytes = Zeroizing::new([0u8; XWING_SEED_LEN]);
-        let mut shake = Shake256::default();
-        shake.update(ikm);
-        shake.finalize_xof().read(&mut seed_bytes[..]);
+        libcrux_sha3::shake256_ema(&mut seed_bytes[..], ikm);
 
         let seed = XWingSeed::from_bytes(*seed_bytes);
         let (public_key, expanded_secret) = xwing::derive_keypair(&seed);
@@ -160,10 +170,10 @@ impl hpke::Kem for XWingHpkeKem {
         XWingHpkePublicKey(public_key)
     }
 
-    fn encap<R: CryptoRng + RngCore>(
+    fn encap_with_rng(
         recipient_public_key: &Self::PublicKey,
         sender_identity: Option<(&Self::PrivateKey, &Self::PublicKey)>,
-        rng: &mut R,
+        rng: &mut impl CryptoRng,
     ) -> std::result::Result<(SharedSecret<Self>, Self::EncappedKey), HpkeError> {
         if sender_identity.is_some() {
             return Err(HpkeError::EncapError);
@@ -232,8 +242,9 @@ impl EphemeralRng {
     }
 
     pub(crate) fn from_seed(seed: &[u8; 32]) -> Self {
-        // The zeroize-enabled ChaCha20 core and its buffered wrapper both wipe
-        // their state on drop. A random key with this fixed nonce defines an
+        // `ChaCha20` is the buffered `StreamCipherCoreWrapper`; it wipes its core
+        // and buffer on drop because `cipher`'s zeroize feature is enabled
+        // (remanence-aead's Cargo.toml), which chacha20 0.10 no longer forwards. A random key with this fixed nonce defines an
         // independent stream for each ephemeral generator.
         Self {
             inner: ChaCha20::new(seed.into(), &[0u8; 12].into()),
@@ -241,26 +252,29 @@ impl EphemeralRng {
     }
 }
 
-impl RngCore for EphemeralRng {
-    fn next_u32(&mut self) -> u32 {
+impl TryRng for EphemeralRng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
         let mut bytes = [0u8; 4];
         self.fill_bytes(&mut bytes);
-        u32::from_le_bytes(bytes)
+        Ok(u32::from_le_bytes(bytes))
     }
 
-    fn next_u64(&mut self) -> u64 {
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
         let mut bytes = [0u8; 8];
         self.fill_bytes(&mut bytes);
-        u64::from_le_bytes(bytes)
+        Ok(u64::from_le_bytes(bytes))
     }
 
-    fn fill_bytes(&mut self, destination: &mut [u8]) {
+    fn try_fill_bytes(&mut self, destination: &mut [u8]) -> std::result::Result<(), Self::Error> {
         destination.fill(0);
         self.inner.apply_keystream(destination);
+        Ok(())
     }
 }
 
-impl CryptoRng for EphemeralRng {}
+impl TryCryptoRng for EphemeralRng {}
 
 /// Frozen prefix in the fixed-width HPKE info transcript.
 pub const WRAP_INFO_PREFIX: &[u8; 20] = b"rem-encrypt-wrap-v1\0";
@@ -487,7 +501,7 @@ pub fn wrap_info(
 }
 
 /// Wrap one DEK to all recipients, failing closed if any slot fails.
-pub fn wrap_dek<R: CryptoRng + RngCore>(
+pub fn wrap_dek<R: CryptoRng>(
     dek: &DataEncryptionKey,
     object_id: &str,
     recipients: &[RecipientPublicKey],
@@ -500,7 +514,7 @@ pub fn wrap_dek<R: CryptoRng + RngCore>(
     KeyFrame::new(slots)
 }
 
-fn wrap_recipient<R: CryptoRng + RngCore>(
+fn wrap_recipient<R: CryptoRng>(
     dek: &DataEncryptionKey,
     object_id: &str,
     recipient: &RecipientPublicKey,
@@ -515,8 +529,9 @@ fn wrap_recipient<R: CryptoRng + RngCore>(
         &recipient.recipient_epoch_id,
         recipient.slot_index,
     )?;
-    let (enc, mut context) = setup_sender::<Aead, Kdf, Kem, _>(&OpModeS::Base, &public, &info, rng)
-        .map_err(|_| RemObjectAeadError::HpkeFailed)?;
+    let (enc, mut context) =
+        setup_sender_with_rng::<Aead, Kdf, Kem>(&OpModeS::Base, &public, &info, rng)
+            .map_err(|_| RemObjectAeadError::HpkeFailed)?;
     let ciphertext = context
         .seal(dek.as_bytes(), &[])
         .map_err(|_| RemObjectAeadError::HpkeFailed)?;
@@ -583,26 +598,32 @@ mod tests {
         bytes_generated: usize,
     }
 
-    impl RngCore for CountingByteRng {
-        fn next_u32(&mut self) -> u32 {
+    impl TryRng for CountingByteRng {
+        type Error = Infallible;
+
+        fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
             let mut bytes = [0u8; 4];
             self.fill_bytes(&mut bytes);
-            u32::from_le_bytes(bytes)
+            Ok(u32::from_le_bytes(bytes))
         }
 
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
             let mut bytes = [0u8; 8];
             self.fill_bytes(&mut bytes);
-            u64::from_le_bytes(bytes)
+            Ok(u64::from_le_bytes(bytes))
         }
 
-        fn fill_bytes(&mut self, destination: &mut [u8]) {
+        fn try_fill_bytes(
+            &mut self,
+            destination: &mut [u8],
+        ) -> std::result::Result<(), Self::Error> {
             destination.fill(self.byte);
             self.bytes_generated += destination.len();
+            Ok(())
         }
     }
 
-    impl CryptoRng for CountingByteRng {}
+    impl TryCryptoRng for CountingByteRng {}
 
     fn decode_hex(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0);

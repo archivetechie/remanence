@@ -6,7 +6,7 @@
 //! terminal-tail plan counts it once for logical positioning while the
 //! capacity model applies its separate conservative charge.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::sidecar::crc64_xz;

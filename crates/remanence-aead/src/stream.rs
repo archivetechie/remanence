@@ -2,7 +2,7 @@
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
+    ChaCha20Poly1305,
 };
 use sha2::{Digest, Sha256};
 
@@ -25,7 +25,7 @@ pub struct PlaintextStats {
 pub fn encrypt_metadata(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
     cipher_from_key(key)
         .encrypt(
-            Nonce::from_slice(&[0u8; 12]),
+            &[0u8; 12].into(),
             Payload {
                 msg: plaintext,
                 aad: &[],
@@ -38,7 +38,7 @@ pub fn encrypt_metadata(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
 pub fn decrypt_metadata(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>> {
     cipher_from_key(key)
         .decrypt(
-            Nonce::from_slice(&[0u8; 12]),
+            &[0u8; 12].into(),
             Payload {
                 msg: ciphertext,
                 aad: &[],
@@ -56,7 +56,7 @@ pub fn encrypt_chunk(
 ) -> Result<Vec<u8>> {
     cipher_from_key(key)
         .encrypt(
-            Nonce::from_slice(&stream_nonce(counter, final_chunk)),
+            &stream_nonce(counter, final_chunk).into(),
             Payload {
                 msg: plaintext,
                 aad: &[],
@@ -74,7 +74,7 @@ pub fn decrypt_chunk(
 ) -> Result<Vec<u8>> {
     cipher_from_key(key)
         .decrypt(
-            Nonce::from_slice(&stream_nonce(counter, final_chunk)),
+            &stream_nonce(counter, final_chunk).into(),
             Payload {
                 msg: ciphertext,
                 aad: &[],
@@ -168,7 +168,7 @@ pub(crate) fn round_up(value: u64, multiple: u64) -> Result<u64> {
 }
 
 fn cipher_from_key(key: &[u8; 32]) -> ChaCha20Poly1305 {
-    ChaCha20Poly1305::new(Key::from_slice(key))
+    ChaCha20Poly1305::new(key.into())
 }
 
 #[cfg(test)]
