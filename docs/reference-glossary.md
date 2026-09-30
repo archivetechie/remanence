@@ -61,7 +61,11 @@ Published as the REM-PARITY 1.0 specification.
 
 **bootstrap** — the Object-count-independent self-description block at LBA 0:
 tape UUID, block size, and parity scheme. It contains no Object recovery rows
-and is not repeated at checkpoints or finalization.
+and is not repeated at checkpoints or finalization. On a tape written without
+parity the bootstrap carries the no-parity flag and no parity scheme record; a
+no-parity bootstrap whose payload carries one is refused
+(REM-PARITY Section 8.2, where the error is `BootstrapParse`). The CLI reference
+gives the line the tool prints.
 
 **parity sidecar** — a tape file of Reed-Solomon parity shards covering
 the data blocks written since the previous sidecar.

@@ -23,6 +23,11 @@ format specifications — and their plain-language companion — live in
   terms and the operational tradeoffs for Object and bundle size.
 - [guide-troubleshooting.md](guide-troubleshooting.md) — failure modes
   and their remedies.
+- [guide-full-verification.md](guide-full-verification.md) — what
+  `rem tape verify-index` checks, what "complete" means, how to read its
+  findings, and how long it takes.
+- [guide-damaged-tapes.md](guide-damaged-tapes.md) — what an operator sees
+  when a tape's index or bootstrap is damaged, and what each refusal means.
 - [importing-and-recovering-remanence-tapes.md](importing-and-recovering-remanence-tapes.md)
   — safely reconstruct a locally unknown Remanence tape identity before
   inventory and catalog recovery.

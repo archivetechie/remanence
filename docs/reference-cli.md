@@ -145,7 +145,7 @@ local SCSI discovery.
 |---|---|
 | `rem-debug --allow <SERIAL> tape bot-probe <BARCODE> --library <SERIAL> --expected-home-slot <ADDR> --json [--config <PATH>]` | Advisory identity-only BOT probe. Under one stable drive handle it verifies readiness, temporarily selects fixed 1 MiB/compression-off read mode, issues exactly one LOCATE(0) and at most one READ, restores the prior drive mode, and parks the cartridge in the exact expected home slot. It never reads past BOT or consults/mutates the catalog. JSON schema is `rem.tape.bot-probe.v1`; a valid native identity uses `physical_disposition="bootstrap_valid"`. See [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md). |
 | `rem-debug --allow <SERIAL> tape adopt-bootstrap <BARCODE> --library <SERIAL> --expected-home-slot <ADDR> --expected-existing-tape-uuid <UUID> --json [--config <PATH>]` | Re-read and adopt one checksum-valid existing native bootstrap without writing tape. The command holds the exclusive `StateHandle`, performs fresh discovery, verifies the exact UUID/home/library and canonical 1 MiB default-parity geometry, restores drive mode, parks the medium, then records a durable `TapeIdentityAdopted` event and an identity-only catalog row. Exactly bootstrap→filemark→EOD becomes `ready`; every other tail after a valid bootstrap becomes `recovery_required`. The command generates its internal operation UUID; a retry may no-op only while the replayed row remains the exact same identity-only state. JSON schema is `rem.tape.adopt-bootstrap.v1`. See [Importing and recovering Remanence tapes](importing-and-recovering-remanence-tapes.md). |
-| `rem-debug tape recovery-report <SOURCE> [--json] [--tape-uuid UUID --block-size BYTES --scheme k,m,S\|none]` | Produce a read-only catalogless recovery report from a published image directory or discovered `/dev/sgN` drive. Supply all three hints or none; `--block-size` accepts the same units as elsewhere (including KiB/MiB); `--scheme` accepts a `k,m,S` triple for `rs-cauchy-gf256-v1` or `none` for a tape written without parity. An absent or unparseable bootstrap requires all three hints. A readable, valid bootstrap remains authoritative; UUID, block-size, and scheme disagreements are refused. Bootstrap-derived report fields are null when unreadable; hints are recorded separately under `supplied`, and the scan records when they provided identity and geometry because the bootstrap was treated as unreadable. A valid terminal replica can supply Object identifiers, while BOT fallback without separate host authority reports complete candidates as unknown. It does not adopt the tape or rebuild SQLite. |
+| `rem-debug tape recovery-report <SOURCE> [--json] [--tape-uuid UUID --block-size BYTES --scheme k,m,S\|none]` | Produce a read-only catalogless recovery report from a published image directory or discovered `/dev/sgN` drive. Supply all three hints or none; `--block-size` accepts the same units as elsewhere (including KiB/MiB); `--scheme` accepts a `k,m,S` triple for `rs-cauchy-gf256-v1` or `none` for a tape written without parity. The report performs terminal discovery first, through the same library entry as the daemon's inventory, and walks from BOT only when discovery yields no inventory. What the command prints when it cannot use the bootstrap is under [Recovery report and verification output](#recovery-report-and-verification-output). Bootstrap-derived report fields are null when unreadable; hints are recorded separately under `supplied`, and the scan records when they provided identity and geometry because the bootstrap was treated as unreadable. A valid terminal replica can supply Object identifiers, while BOT fallback without separate host authority reports complete candidates as unknown. It does not adopt the tape or rebuild SQLite. |
 | `rem tape init <TARGET> [--dry-run] [--force] [--clobber-data] [--block-size <BYTES>] [--parity <none\|default>] [--library <SERIAL>]` | Initialize one tape (by barcode or element address) or an inclusive slot range like `0x0400..0x0407`. `--dry-run` runs every check and writes nothing. `--force` overrides only decisions classified as `RequireForce`; `--clobber-data` is the separate, stronger override for tapes that hold data, and is rejected for dry-run and batch init. Fresh media defaults to parity-off; `--parity default` writes the block-size-aware default parity geometry. An idempotent initialization preserves the geometry already recorded at BOT. |
 | `rem tape wait-ready [--barcode <BC> \| --drive-element <ADDR>] [--already-loaded] [--wait] [--timeout 2.5h] [--poll 30s] [--resume <UUID>]` | Poll TEST UNIT READY until already-loaded media is usable. LTO-9 first loads can take hours (media optimization); the 2.5h default timeout exists for that. `--resume` continues a durable readiness operation without moving media. |
 | `rem tape quarantine list [--library <SERIAL>]` | List active media-readiness fences. |
@@ -154,7 +154,93 @@ local SCSI discovery.
 | `rem tape retire <TARGET> --reason <TEXT> --i-understand-copies-become-unreadable [--dry-run]` | Permanently retire a tape identity in the local catalog. Every copy on that tape becomes unreadable through the catalog. |
 | `rem tape finalize --tape-uuid <UUID> [--expected-pool <ID>] --reason <EXACT> --idempotency-key <UUID> --ack-tape-uuid <UUID> [--wait] [--json] [--endpoint <URI>]` | Irreversibly finalize one exact reconciled tape, including below the automatic low watermark. Voltags are not accepted, the acknowledgement must name the same UUID, and a pooled tape requires its canonical current pool id. The reason is sent exactly as supplied. Without `--wait`, the command submits once and prints the current status; with it, the command polls the read-only status RPC across daemon reconnects until a terminal outcome and never resubmits finalization. JSON uses schema `rem.tape.finalization.v2`; `replica_progress` is historical barrier evidence, not a current media-health observation. A value the daemon does not have is `null`, never `0`: `operation_id` is `null` for a finalization an automatic trigger started, and a BUSY response has `null` `operation_id`, `completed_replicas` and digests. `completed_replicas` `0` is a real value (before replica A). |
 | `rem tape inventory --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Stream the complete bounded terminal inventory by locating EOD and selecting C, then B, then A. Human output labels every pre-summary row `provisional`; the final summary names the authoritative `attempt_id`. `--json` emits NDJSON events under `rem.tape.inventory.stream.v1` and ends with exactly one `summary` event. Consumers must commit only that summary's selected attempt. Rejected attempts make fallback evidence explicit; no surviving replica triggers a `bot_recovery_started` notice followed by per-tape-file `bot_recovery_progress` events and streamed BOT classifications rather than empty success. Cancellation is honored at those between-file boundaries. During BOT fallback, an exact surviving checkpoint journal can classify matching complete Objects as recovered; later or foreign Objects without that authority remain unknown. In the summary, a selection, count or digest the outcome does not carry is `null`, never `"0"`: BOT-recovery-required has no counts, fast outcomes have no BOT classification counts, and a torn BOT Object's `stored_block_count` is `null`. |
-| `rem tape verify-index --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Perform the distinct full physical verification: measure EOD, walk the prefix, compare the canonical map, and validate all three replicas and both separation extents. Its all-replicas-invalid BOT outcome applies the same checkpoint-assisted recovered/unknown/incomplete classification as inventory. `verified_interior_record_count` is present only for a valid separation extent (`"0"` for a two-record extent) and `null` for an invalid or unknown one; the verified-prefix counts and digests are `null` when recovery is required. |
+| `rem tape verify-index --tape-uuid <UUID> [--json] [--endpoint <URI>]` | Perform a full verification in the sense of REM-PARITY Section 2.2: measure EOD, walk the prefix, compare the canonical map, validate all three replicas and both separation extents, and read every data block that a sidecar protects and every parity shard, checking each against its sidecar's index. A finding about any data block, parity shard, sidecar copy or footer, ParityMap copy or footer, or the bootstrap's trailing fill leaves the tape not complete: the state is `verified_degraded` and `complete` is `false`. `verified` says that the verification ran to the end; `complete` says whether the tape passed. The findings are printed as described under [Recovery report and verification output](#recovery-report-and-verification-output). See [Full verification](guide-full-verification.md) and [Damaged tapes](guide-damaged-tapes.md). Its all-replicas-invalid BOT outcome applies the same checkpoint-assisted recovered/unknown/incomplete classification as inventory. `verified_interior_record_count` is present only for a valid separation extent (`"0"` for a two-record extent) and `null` for an invalid or unknown one; the verified-prefix counts and digests are `null` when recovery is required. |
+
+<!-- code-anchor: crates/remanence-parity/src/scan.rs crates/remanence-parity/src/error.rs crates/remanence-parity/src/bootstrap.rs crates/remanence-cli/src/recovery_report.rs crates/remanence-cli/src/tape_inventory.rs crates/remanence-parity/src/verify_protected.rs @ c80a553a -->
+### Recovery report and verification output
+
+`rem-debug tape recovery-report` treats the bootstrap as described below,
+following REM-PARITY Section 8.4.
+
+A bootstrap that cannot be read is treated as unreadable, and the report then
+uses the three supplied values. The cases are a medium error, a filemark or EOD
+where the record should be, a missing magic, a failed header CRC, a failed
+payload CRC, a payload length that runs past the block, and a payload that
+breaks a later rule of Section 8 when no value that can still be decoded
+disagrees with the supplied ones. Nothing is printed for these cases beyond
+the report's own note that the bootstrap was treated as unreadable. Without the
+three values the command exits with status 1 after printing:
+
+```text
+error: catalog-less recovery report: discover bootstrap: bootstrap not found anywhere on tape; unreadable bootstrap requires --tape-uuid, --block-size and --scheme
+```
+
+The specification calls this outcome `NoBootstrapFound`. The same line is
+printed when the first record does not parse as a bootstrap and no values were
+supplied.
+
+A bootstrap that reads is refused when its first record has the wrong length
+for the supplied block size, when its header CRC is valid and a header field is
+impossible or contradicts the supplied values (even if its payload is damaged),
+or when a scheme record that can still be decoded disagrees. The refusal ends
+discovery, no report is produced, and the command exits with status 1
+after printing:
+
+```text
+error: catalog-less recovery report: discover bootstrap: bootstrap refused: DETAIL
+```
+
+DETAIL names what disagreed. The specification calls every such refusal
+`BootstrapParse`. The texts are:
+
+```text
+short fixed-block bootstrap read: got N bytes, supplied block size is M
+bootstrap block larger than supplied block size: got N bytes, expected M
+readable bootstrap block size differs from supplied hints: got N bytes, expected M
+unsupported bootstrap schema major version: got N, accept 2
+tape identity mismatch: readable bootstrap header differs from supplied hints
+readable bootstrap block size differs from supplied hints
+schema-major 2 permits only the sequence-0 BOT Bootstrap: got sequence N
+readable bootstrap parity scheme differs from supplied hints: no-parity flag contradicts scheme
+readable bootstrap parity scheme differs from supplied hints
+```
+
+A no-parity bootstrap whose payload carries a scheme record is refused in one
+of these two ways. If you supplied a parity scheme, DETAIL is `readable
+bootstrap parity scheme differs from supplied hints: no-parity flag contradicts
+scheme`. If you supplied `--scheme none` and the record can be decoded, DETAIL
+is `readable bootstrap parity scheme differs from supplied hints`. If the
+record cannot be decoded, the bootstrap is treated as unreadable.
+
+A decodable `drive_compression` of true in the bootstrap of a parity tape is
+refused with the following line, which the specification calls
+`DriveCompressionEnabled`:
+
+```text
+error: catalog-less recovery report: discover bootstrap: tape's bootstrap records drive compression; a parity tape must not record drive compression
+```
+
+When terminal discovery succeeds, the report does not list the walk's prefix
+damage: `scan.damaged_regions` is empty. A full verification (`rem tape
+verify-index`) reports that damage as `PREFIX_DAMAGE` findings.
+
+`rem tape verify-index` prints one `protected_content_finding: KIND [address]
+detail` line for each finding, after `verification_basis` and before
+`measured_eod_lba`, in the verified forms only. KIND is one of
+`PROTECTED_CONTENT_FINDING_KIND_DATA_BLOCK`, `_PARITY_SHARD`, `_SIDECAR`,
+`_PREFIX_DAMAGE`, `_NOT_PERFORMED` and `_PARITY_MAP`, each printed in full with
+the `PROTECTED_CONTENT_FINDING_KIND` prefix. The address is empty for
+`PREFIX_DAMAGE` and `NOT_PERFORMED`. With `--json`, the same findings are in
+`protected_content_findings`, an array of `{kind, address, detail}` objects
+with `address` `null` where there is none, in both the verified and the
+recovery-required envelope. The array is `[]` when the protected content
+verified clean.
+
+Nonzero trailing fill after the bootstrap payload is reported as a
+`PREFIX_DAMAGE` finding. A bootstrap that was treated as unreadable is not
+reported for fill, because its bytes were not read as a bootstrap; a bootstrap
+that validates, including under supplied or catalog values, is checked for
+fill.
 
 <!-- code-anchor: crates/remanence-cli/src/put.rs @ 244bc6de -->
 ## Writing to tape
@@ -395,7 +481,7 @@ journals):
 | `rem-debug archive verify --locator <JSON> --expected-sha256 <HEX> [--private-key <REMP>]` | Stream and hash an object on tape against an expected digest, restoring nothing; encrypted copies require the matching private key. |
 | `rem-debug archive probe/scan/restore/recover --format <ID> --tape <SERIAL> --bay <BAY> [--rewind]` | Run a registered foreign-format adapter directly against a mounted tape instead of a dump file. |
 | `rem-debug tape alerts --bay <BAY>` | Read the loaded drive's TapeAlert LOG SENSE page directly. |
-| `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --damage-plan <PLAN> [--full-verify] --report <PATH>` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. |
+| `rem-debug tape terminal-index-drill --device <SG> --tape-uuid <UUID> --block-size <BYTES> --damage-plan <PLAN> [--full-verify] --report <PATH>` | Run one read-only live-SG terminal-index verification leg and write schema `rem.tape.terminal-index-drill.v1`. Replica plans are `none`, `a`, `b`, `c`, `ab`, `ac`, `bc`, `abc`, and `disagreement`; the latter substitutes a locally valid conflicting A edition and requires the fail-closed typed `TerminalIndexReplicaConflict` refusal with no selected replica, while `abc` executes BOT structural recovery. Gap plans are `gap-ab-header`, `gap-ab-footer`, `gap-bc-header`, and `gap-bc-footer`; each replaces the named record with a fixed `0xd7` block above the transport, requires `--full-verify`, and reports typed degraded separation evidence. Reports name the mechanism and exact injected LBAs. All injection occurs in the reader above the transport and never rewrites media. Full verification otherwise requires `--damage-plan none`. In the report's `full_verify` object, `outcome` names what the terminal suffix did and `complete` names what the tape did: `outcome: "verified_complete"` with `complete: false` means that the terminal suffix validated and the protected content did not, and `complete` is `true` only when both hold. See [Full verification](guide-full-verification.md). |
 
 Destructive maintenance:
 

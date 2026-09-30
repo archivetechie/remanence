@@ -25,7 +25,7 @@ Import and recovery then happen in three separate stages:
 |---|---|---|
 | **Probe** | Whether BOT contains a valid Remanence bootstrap, plus its tape UUID and geometry | That the local catalog is correct or that the rest of the tape is healthy |
 | **Adopt** | The tape's identity, barcode, pool mapping, geometry, and a conservative lifecycle state | Which Objects are present or whether they were committed |
-| **Inventory/verify** | The contents and structural evidence that can be read from terminal indexes or a scan starting at BOT | That read-only inventory has rebuilt the site's writable catalog |
+| **Inventory/verify** | The contents and structural evidence that can be read from terminal indexes or a scan starting at BOT; a full verification also reads every protected data block and parity shard | That read-only inventory has rebuilt the site's writable catalog |
 
 This separation is intentional. It lets Remanence recognize and inspect a
 cartridge without inventing a history for it. A finalized tape normally offers
@@ -389,8 +389,14 @@ rem tape verify-index --tape-uuid TAPE_UUID --json
 ```
 
 Inventory attempts terminal replicas in the defined fallback order and reports
-BOT recovery explicitly if none survives. Full verification separately measures
-and validates the physical prefix and terminal structures.
+BOT recovery explicitly if none survives. Full verification is a separate
+operation. It reads every data block that a sidecar protects and every parity
+shard, checks each against its sidecar's index, and reports each failure by its
+address; it also measures and validates the physical prefix and the terminal
+structures. A check of structure and metadata alone, which reads no data block
+or parity shard, is not a full verification (REM-PARITY Section 2.2). Because
+it reads the whole written tape, it takes at least the written bytes divided
+by the drive's sustained read rate. See [Full verification](guide-full-verification.md).
 
 An all-indexes-invalid inventory can run for hours, so its stream announces
 `bot_recovery_started` before the full BOT walk. It then emits one
@@ -401,6 +407,14 @@ milliseconds. Human output presents the same facts as `bot_recovery:` and
 boundaries and stops before the next tape file is read. These are additive event
 types in `rem.tape.inventory.stream.v1`; use a daemon and CLI from the same draft
 build for the BOT progress surface.
+
+The walk can start on a tape whose three terminal replicas are intact. A tape
+file written after the terminal suffix, or a second terminal suffix, moves EOD
+past the planned EOD of the layout, so that layout is not used. The exception
+is a later suffix whose own replicas validate: its footer supplies its own
+layout, and no walk is needed (REM-PARITY Section 8.4). See
+[Damaged tapes](guide-damaged-tapes.md) for why a tape with intact replicas can
+still walk and how to read what the walk reports.
 
 Stop the daemon again before changing host state. Restore any surviving per-tape
 journals and audit material to their configured locations, then rebuild the

@@ -239,6 +239,14 @@ Strings worth grepping for, mapped to the sections above:
 | `remanence_read_diag` (as `target`) | read-pipeline reservoir/backpressure diagnostics, see above |
 
 <!-- code-anchor: none -->
+## A tape that will not verify or identify itself
+
+Two guides cover the tape-level cases. [Full verification](guide-full-verification.md)
+explains what `rem tape verify-index` checks and how to read its findings.
+[Damaged tapes](guide-damaged-tapes.md) covers a damaged terminal index, an
+unreadable bootstrap, and the refusals the tools print for each.
+
+<!-- code-anchor: none -->
 ## Known open issue
 
 Tape recycling outside Remanence (for example re-creating a virtual
