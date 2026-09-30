@@ -104,6 +104,23 @@ jobs:
       - name: Check full-tape parity image digests and damage descriptors
         run: cargo run -p remanence-cli --example generate_tape_images -- --check
 
+      - name: Export draft tape image streams
+        timeout-minutes: 5
+        run: cargo run --offline -q -p remanence-cli --example generate_tape_images -- --export-images "$RUNNER_TEMP/w2-images"
+
+      - name: Build and verify the draft vector archive
+        timeout-minutes: 20
+        run: |
+          python3 -m pip install -r tools/requirements-rem-object-independent.txt
+          python3 tools/build_draft_vector_archive.py --images "$RUNNER_TEMP/w2-images"
+          python3 tools/verify_draft_vector_archive.py --archive dist/remanence-draft-test-vectors.tar
+          python3 tools/verify_draft_vector_archive.py --rebuild-compare
+          python3 tools/verify_draft_vector_archive.py --privacy
+          python3 tools/verify_draft_vector_archive.py --check-recorded
+          python3 tools/check_spec_versioning.py --require-archives
+          python3 -m unittest tools/test_build_draft_vector_archive.py tools/test_check_spec_versioning.py
+          # The supervisor enables --check-text in the commit that pins the archive digest.
+
       - name: Check terminal-index candidates
         run: cargo run -p remanence-parity --example generate_terminal_index_vectors -- --check
 

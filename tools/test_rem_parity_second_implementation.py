@@ -177,6 +177,7 @@ class ArithmeticTests(unittest.TestCase):
         for name in ("build_plaintext_with_manifest", "FileSpec"):
             self.assertIs(getattr(impl, name), getattr(verify_rem_object_vectors_independent, name), name)
 
+    @unittest.skipIf(impl.ARCHIVE_LAYOUT, "deposit excludes specification text; quotation provenance is checked in the repository")
     def test_decision_quotes_occur_in_the_text(self) -> None:
         text = " ".join(impl.SPEC_PATH.read_text(encoding="utf-8").split())
         for key, (section, quote) in impl.QUOTES.items():
@@ -708,6 +709,7 @@ class MutationTests(unittest.TestCase):
                 self.assertTrue(entry["apply"]["resolved"], entry["apply"]["checks_failed"])
                 self.assertTrue(entry["self_check"]["agrees"], entry["self_check"]["detail"])
 
+    @unittest.skipIf(impl.ARCHIVE_LAYOUT, "deposit excludes specification text; quotation provenance is checked in the repository")
     def test_every_decision_cites_the_text(self) -> None:
         text = " ".join(impl.SPEC_PATH.read_text(encoding="utf-8").split())
         for entry_id, entry in self.out["entries"].items():
