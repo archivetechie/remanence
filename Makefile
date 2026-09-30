@@ -11,7 +11,7 @@ REM_BIN ?= target/debug/rem
 SETCAP ?= setcap
 SUDO ?= sudo
 
-.PHONY: check-spec-versioning rem-dev rem-dev-setcap rem-dev-libraries proof-inventory \
+.PHONY: check-guide check-spec-versioning rem-dev rem-dev-setcap rem-dev-libraries proof-inventory \
 	in-progress-parity-test-vectors verify-in-progress-parity-test-vectors \
 	publication-test-vectors verify-publication-test-vectors \
 	benchmark-terminal-index-stream benchmark-terminal-index-journal-replay
@@ -50,6 +50,10 @@ verify-publication-test-vectors:
 
 check-spec-versioning:
 	python3 tools/check_spec_versioning.py
+
+check-guide:
+	python3 tools/check_guide.py
+	python3 -m unittest tools/test_check_guide.py
 
 # Observational performance report; never writes unless --report is supplied
 # through TERMINAL_INDEX_BENCH_ARGS.
