@@ -17,7 +17,7 @@
         "upload_type": "dataset",
         "title": "Remanence Conformance Vectors",
         "version": "draft-set-1",
-        "description": "<p>These are the test vectors for the REM-OBJECT, REM-ENCRYPT and REM-PARITY specifications. They let an independent implementation check itself against byte-exact expected results, and let a reader confirm a specification's statements.</p><p>The record holds two archives. remanence-test-vectors.tar is the generation-1 archive, the pinned baseline that the published specification text cites by hash. It is deposited here unchanged. remanence-draft-test-vectors.tar holds the review vectors for the current drafts: REM-OBJECT and REM-ENCRYPT vectors, generation-2 REM-PARITY tape images, damage, resume and negative cases, independent verifiers, and a second implementation with its decision files.</p><p>The draft archive is for review only. It is not a conformance set, and the frozen set, published when the specifications freeze on 31 July 2027, replaces it. Generation-2 tapes are not readable by generation-1 tooling.</p>",
+        "description": "<p>These are the test vectors for the REM-OBJECT, REM-ENCRYPT and REM-PARITY specifications. They let an independent implementation check itself against byte-exact expected results, and let a reader confirm a specification's statements.</p><p>The record holds only remanence-draft-test-vectors.tar. The archive includes the REM-OBJECT and REM-ENCRYPT vectors of the frozen generation-1 archive remanence-test-vectors.tar unchanged. The generation-1 archive is kept in the project repository. remanence-draft-test-vectors.tar holds the review vectors for the current drafts: REM-OBJECT and REM-ENCRYPT vectors, generation-2 REM-PARITY tape images, damage, resume and negative cases, independent verifiers, and a second implementation with its decision files.</p><p>The draft archive is for review only. It is not a conformance set, and the frozen set, published when the specifications freeze on 31 July 2027, replaces it. Generation-2 tapes are not readable by generation-1 tooling.</p>",
         "keywords": [
           "digital preservation",
           "archival storage",
@@ -57,19 +57,11 @@
       },
       "files": [
         {
-          "path": "specs/publication/remanence-test-vectors.tar",
-          "name": "remanence-test-vectors.tar"
-        },
-        {
           "path": "dist/remanence-draft-test-vectors.tar",
           "name": "remanence-draft-test-vectors.tar"
         }
       ],
       "deposit_lines": [
-        {
-          "name": "remanence-test-vectors.tar",
-          "version": "draft-set-1"
-        },
         {
           "name": "remanence-draft-test-vectors.tar",
           "version": "draft-set-1"
