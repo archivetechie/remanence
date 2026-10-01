@@ -399,8 +399,8 @@ Generation 1 and generation 2 are different tape layouts, and neither reads the 
 generation-2 reader cannot read a generation-1 tape, and generation-1 tooling cannot read a
 generation-2 tape. REM-PARITY 1.0.0-draft.5 and the vectors here describe generation 2. A tape
 written under generation 1 is governed by the text of REM-PARITY 1.0.0-draft.2, and by the
-generation-1 archive `remanence-test-vectors.tar`, which is kept unchanged in the project repository,
-and its REM-OBJECT and REM-ENCRYPT vectors are included in this archive. The generation-1 archive contains vectors that generation-2 code must not accept.
+generation-1 archive `remanence-test-vectors.tar`, which is deposited unchanged in the same record as
+this archive. Its REM-OBJECT and REM-ENCRYPT vectors are also included in this archive. The generation-1 archive contains vectors that generation-2 code must not accept.
 
 ## What these vectors do not cover
 
