@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage and verify Remanence's five-record Zenodo milestone.
+"""Stage and verify Remanence's six-record Zenodo milestone.
 
 Publication is irreversible. This tool never creates, edits, or deletes a public
 record. Resume publication with the SAME records and digest; the external state
@@ -32,7 +32,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-ORDER = ["vectors", "companion", "object", "encrypt", "parity"]
+try:
+    from .check_spec_versioning import dated_version
+except ImportError:  # Direct script invocation.
+    from check_spec_versioning import dated_version
+
+ORDER = ["vectors", "companion", "guide", "object", "encrypt", "parity"]
 DOI = re.compile(r"10\.5281/zenodo\.([1-9][0-9]*)\Z")
 FIELDS = ("title", "version", "creators", "license", "upload_type",
           "publication_type", "keywords", "related_identifiers", "language",
@@ -271,7 +276,7 @@ class Deposit:
                 "Records configuration contains the authentication token")
         c = self.config
         require(c["publish_order"] == ORDER, f"publish_order must be {ORDER}")
-        require(set(c["records"]) == set(ORDER), "All five records are required, with no extra records")
+        require(set(c["records"]) == set(ORDER), "All six records are required, with no extra records")
         self.configure_api(c["api_base"])
         seen_ids, seen_concepts, lines = set(), set(), set()
         for key in ORDER:
@@ -294,6 +299,9 @@ class Deposit:
             require(isinstance(metadata.get("version"), str) and metadata["version"]
                     and not re.search(r"\s", metadata["version"]), f"{key}: missing or invalid metadata.version")
             normalized_metadata(metadata)
+            if key == "guide":
+                require(dated_version(metadata["version"]),
+                        "guide: metadata.version must be a valid date YYYY-MM-DD")
             require(isinstance(r["files"], list) and r["files"], f"{key}: at least one file is required")
             names = set()
             for f in r["files"]:
@@ -310,6 +318,9 @@ class Deposit:
                 pair = (line["name"], line["version"])
                 require(pair not in lines, "Duplicate deposit line in records")
                 lines.add(pair)
+                if key == "guide":
+                    require(line["version"] == metadata["version"],
+                            "guide: deposit version differs from metadata.version")
         require(not seen_ids & seen_concepts, "Concept ids must not be version ids")
 
     def configure_api(self, base):

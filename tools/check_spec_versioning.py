@@ -10,7 +10,8 @@ occur at the first future revision.
 
 Checked:
   1. Each document's Status `Version` row is three-part and extends the
-     major.minor line named by its Identifiers table / title.
+     major.minor line named by its Identifiers table / title. The informative
+     Guide instead carries one calendar date (YYYY-MM-DD) as its Version.
   2. The change-policy core is identical across the three specifications
      modulo the declared substitution table.
   3. The pinned vector-archive SHA is identical at every site that quotes it.
@@ -47,6 +48,7 @@ Exit 0 clean; exit 1 with findings on stderr.
 """
 
 import argparse
+from datetime import date
 import hashlib
 import re
 import sys
@@ -61,6 +63,26 @@ SPECS = {
     "rem-encrypt-1-specification.md": {"line": "1.0", "noun": "encrypted object"},
 }
 COMPANION = "formats-explained.md"
+GUIDE = "rem-implementation-guide.md"
+
+
+def dated_version(value: str) -> bool:
+    """The Guide identifies each revision by a calendar date, YYYY-MM-DD."""
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def guide_version_findings(text: str) -> list[str]:
+    """Require exactly one dated revision row in the informative Guide."""
+    versions = re.findall(r"^\| Version \| ([^|]*) \|$", text, re.M)
+    if len(versions) != 1 or not dated_version(versions[0]):
+        return [f"{GUIDE}: expected one Version row with a valid date YYYY-MM-DD"]
+    return []
 
 # Sites that must agree on the pinned archive SHA (repo-side; the site's two
 # pages are on the release checklist, not reachable from this repo).
@@ -662,7 +684,7 @@ def deposited_archive_findings(root: pathlib.Path, deposited: dict[tuple[str, st
     """Check recorded archives when built; leave the frozen archive in publication."""
     errors, notes = [], []
     for (name, version), digest in deposited.items():
-        if name in SPECS or name == COMPANION:
+        if name in SPECS or name in (COMPANION, GUIDE):
             continue
         if pathlib.PurePosixPath(name).name != name or "\\" in name or not name.endswith(".tar"):
             errors.append(f"DEPOSITED.sha256: unsupported archive name {name!r}")
@@ -686,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     findings.clear()
     texts = {name: (PUB / name).read_text() for name in SPECS}
+    findings.extend(guide_version_findings((PUB / GUIDE).read_text()))
 
     # 1. Version rows.
     for name, meta in SPECS.items():
@@ -785,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
     for note in archive_notes:
         print(note)
 
-    for name in list(SPECS) + [COMPANION]:
+    for name in list(SPECS) + [COMPANION, GUIDE]:
         path = PUB / name
         if not path.is_file():
             continue

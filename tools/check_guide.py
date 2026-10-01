@@ -135,7 +135,7 @@ def check(root):
     """Run all checks against a checkout; return a shell exit status."""
     specs = {doc: (root / "specs/in-progress" / name).read_text(encoding="utf-8")
              for doc, name in DOCS.items()}
-    guide_path = root / "docs/rem-implementation-guide.md"
+    guide_path = root / "specs/publication/rem-implementation-guide.md"
     guide = guide_path.read_text(encoding="utf-8")  # Missing inputs must fail.
     paths = [guide_path] + sorted((root / "docs").rglob("*.md"))
     documents = {str(path.relative_to(root)): path.read_text(encoding="utf-8")

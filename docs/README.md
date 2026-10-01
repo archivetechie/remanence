@@ -1,7 +1,8 @@
 # Remanence documentation
 
 This directory holds the user-facing guides and references. The published
-format specifications — and their plain-language companion — live in
+format specifications, their plain-language companion, and the REM Implementation
+and Operations Guide live in
 [../specs/publication](../specs/publication). The root
 [README.md](../README.md) is the project entry point.
 
@@ -42,6 +43,13 @@ format specifications — and their plain-language companion — live in
 
 ## Deeper background
 
+- [REM Implementation and Operations Guide](../specs/publication/rem-implementation-guide.md) — alongside the specifications in
+  `specs/publication/`: informative, tool-neutral practice for
+  tools that read or write the REM formats (hostile media, restoring onto a
+  host, staging and durability, catalogs, keys and secrets, verification,
+  writing, finalizing and reading tapes, capacity admission, ingest, descriptive
+  fields). The specifications point to it for everything outside
+  conformance.
 - [why-remanence.md](why-remanence.md) — the project's rationale and the
   bets behind the design.
 - [why-sg-passthrough.md](why-sg-passthrough.md) — why the stack
@@ -55,13 +63,6 @@ format specifications — and their plain-language companion — live in
 - [encryption-explained.md](encryption-explained.md) — why REM-ENCRYPT
   seals objects in software instead of relying on LTO drive-level
   encryption, and what an operator still has to manage themselves.
-- [rem-implementation-guide.md](rem-implementation-guide.md) — the REM
-  Implementation and Operations Guide: informative, tool-neutral practice for
-  tools that read or write the REM formats (hostile media, restoring onto a
-  host, staging and durability, catalogs, keys and secrets, verification,
-  writing, finalizing and reading tapes, capacity admission, ingest, descriptive
-  fields). The specifications point to it for everything outside
-  conformance.
 - [versioning-explained.md](versioning-explained.md) — the three-question
   change policy that governs every format revision, in plain language.
 - [versioning-register.md](versioning-register.md) — every versioned

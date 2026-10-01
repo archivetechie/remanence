@@ -7,7 +7,7 @@ restore, including the case where an archive is recovered decades later with
 nothing but a standard `tar`. The format rules live in the REM-OBJECT
 specification (§4.3, §4.7.3, §4.10), and §12.10 describes the restore hazards
 and what a restore must reproduce; recommended restore practice is in the
-[REM Implementation and Operations Guide](rem-implementation-guide.md), under
+[REM Implementation and Operations Guide](../specs/publication/rem-implementation-guide.md), under
 “Restoring onto a host”. This document is the operator's companion to both.
 
 ## What is preserved, and what is deliberately not

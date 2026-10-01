@@ -190,7 +190,7 @@ checksum. It does not call a block failed for lack of one. The other epochs are
 unaffected. The tape is not complete, because the epoch's sidecar has a
 finding. The Verifier's rule for this case is in REM-PARITY Section 2.2, and
 the way an implementation acquires the index is described in the
-[implementation guide](rem-implementation-guide.md).
+[implementation guide](../specs/publication/rem-implementation-guide.md).
 
 ## A tape written without parity
 
@@ -243,7 +243,7 @@ assumptions are these.
   sidecar's header and index copies are also read twice, once when the copy is
   checked and once when the index is acquired.
 
-The [implementation guide](rem-implementation-guide.md) says of the walk from
+The [implementation guide](../specs/publication/rem-implementation-guide.md) says of the walk from
 the beginning of the tape that it "can take hours". A full verification is of
 the same order or longer: on the scale of a working day for a full LTO-9
 cartridge, with the drive occupied throughout. Run it in a maintenance window.

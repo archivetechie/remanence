@@ -152,6 +152,8 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
 - [The formats, explained](specs/publication/formats-explained.md) —
   a plain-language companion to the specifications: the motivation and
   the design, without the normative terseness.
+- [REM Implementation and Operations Guide](specs/publication/rem-implementation-guide.md)
+  — informative, tool-neutral practice for implementing and operating the formats.
 - Published format specifications:
   [REM-OBJECT Core Format 1.0](specs/publication/rem-object-core-1-specification.md),
   [REM-ENCRYPT 1.0](specs/publication/rem-encrypt-1-specification.md), and

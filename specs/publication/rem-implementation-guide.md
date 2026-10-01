@@ -1,0 +1,2165 @@
+# REM Implementation and Operations Guide
+
+| | |
+| --- | --- |
+| Status | Informative guide |
+| Version | 2026-10-01 |
+| License | CC-BY-4.0 |
+| Concept DOI (all revisions of this document) | [10.5281/zenodo.23078223](https://doi.org/10.5281/zenodo.23078223) |
+
+This revision: 1 October 2026. The history at the end records what each
+revision changed.
+
+## 1. About this guide
+
+The REM specifications (REM-OBJECT, REM-ENCRYPT and REM-PARITY) define
+formats. Each says how its bytes are laid out, what they mean, and what may be
+concluded from them. Each also says, near its start, what it leaves out: how a
+tool should hold keys, stage and publish what it writes, protect the computer
+it restores onto, organise its work after a crash, and report progress to its
+operator. Those matters decide whether a tool is safe and dependable to run.
+They do not decide whether its bytes can be read, so they are not conformance
+requirements, and this guide collects what we recommend about them instead.
+
+This guide is informative. It is not a specification.
+
+**Which copy governs.** The concept DOI above is reserved, but this guide has not yet been deposited.
+Until the first deposit is published, this repository copy is the working text. Once a revision is
+deposited, under the concept DOI and with a DOI of its own, its deposited text governs over convenience
+copies.
+Conformance to REM-OBJECT, REM-ENCRYPT and REM-PARITY is defined by those
+documents alone, and a tool can conform without following anything written
+here. The guide is revised independently of the specifications; each revision
+is dated, and the history at the end records what changed.
+
+It is written for anyone who builds or operates a tool that reads or writes
+these formats. The reference implementation, Remanence, appears in examples,
+because it is the implementation we know best, but the recommendations do not
+depend on it. Where a recommendation describes what Remanence does, it says so.
+
+This revision holds the practice that REM-OBJECT 1.0.0-draft.4,
+REM-ENCRYPT 1.0.0-draft.4 and REM-PARITY 1.0.0-draft.5 moved out of those
+specifications.
+
+The chapter "Where REM concepts are documented" (section 2) says which document
+answers which question about a concept such as a copy, a pool or a deletion:
+the specifications, this guide, an implementation's documentation or the
+owner's policy. The chapter "Retiring and recycling media" (section 11) gives
+the practice for releasing and reusing a medium and for deleting on an archive.
+
+### How to read the recommendations
+
+Each recommendation starts with the risk it addresses, then gives the practice
+we recommend, and ends by naming the specification sections it serves, by
+number and title, for example "Serves REM-OBJECT §12.10, Path Traversal." The
+sections are named by their titles as well as their numbers so that the
+references still make sense if a later revision renumbers the sections. A
+"Serves" line names the specification sections whose requirements the practice
+supports or whose hazards it addresses. Where the rules themselves moved to
+this guide, those sections may hold only descriptions of the hazards, not rules.
+
+The guide's own advice is written with "should" and "we recommend", in lower
+case. It does not use the capitalised requirement keywords of the
+specifications, which are reserved for conformance requirements. Where a
+recommendation rests on a requirement of a specification, the guide quotes
+that requirement and cites it rather than restating it in its own words, so
+that nothing here can be mistaken for a new or changed requirement. A quoted
+requirement comes from the revision in preparation of the specification its
+citation names: REM-OBJECT 1.0.0-draft.4, REM-ENCRYPT 1.0.0-draft.4 or
+REM-PARITY 1.0.0-draft.5.
+
+Each chapter ends with a short summary in plain terms.
+
+### How chapters are named
+
+The specifications point to this guide by chapter title. A chapter title,
+once published, is therefore not renamed or removed without a note under the
+old title saying where its material went.
+
+## 2. Where REM concepts are documented
+
+A concept such as a copy, a pool or a deletion is rarely described in one document. The formats fix part of it, this guide gives practice for another part, an implementation documents what it does, and the owner of the archive decides the rest. A reader who opens the wrong one of these will find that the question is not answered there, and may conclude that it is not answered anywhere. This chapter says which document answers which question. It states the rule by which each assertion is placed, lists the concepts that cross the boundaries, and sorts out the words that mean different things in different places.
+
+Statuses. Each cell of the concept table says whether the text it names is published, preparing, implemented or not implemented. "Published" means that the text is in this guide as it stands. "Preparing" means that it is in a revision of a specification that is being prepared: REM-OBJECT 1.0.0-draft.4, REM-ENCRYPT 1.0.0-draft.4 or REM-PARITY 1.0.0-draft.5, the revisions this guide quotes. The project's release record says which revisions have been deposited. "Implemented" and "not implemented" describe Remanence, as it stands at the date of this revision.
+
+### 2.1. The rule
+
+The rule is applied to each assertion, and not to each concept. A concept usually has parts at several levels, and each part is written where its level is. There are four places.
+
+1. **The specification** holds an assertion if leaving it out would break the scope test that each specification states (REM-PARITY §1.5, What this document specifies, and what it does not; REM-OBJECT §1.6, What this document specifies, and what it does not; REM-ENCRYPT §1.6, What this document specifies, and what it does not). That is, a tool that ignored the assertion would write bytes that another reader cannot read or would misread, would let two readers reach different conclusions about what a medium holds, or would claim what the bytes do not support. Concretely, the specification holds legal values, encodings, interpretation, and the claims a tool may make. Choosing among legal values is not a specification matter, even though the choice changes the bytes. A block size, a separation extent size, a recipient set and a packing are such choices. A specification may still carry rationale and examples, marked as informative.
+2. **This guide** holds a practice if ignoring it causes data loss, or a wrong conclusion about a medium, in any architecture. That includes advice on choosing among legal values. It also holds the tool-neutral description of matters that the formats leave to a deployment: copies, retention, deletion, retirement and recycling of media, and custody of keys.
+3. **An implementation's documentation** holds what that implementation supports and does: its options, defaults, configuration, mechanisms and enforcement. Each implementation documents its own. The documents of Remanence cover Remanence, and the documents of an orchestrator cover that orchestrator.
+4. **Policy** is a decision about what is stored, how many copies of it exist, where they are, for how long they are kept, who may restore them and what may be disclosed. It also covers the limits on resources and the schedule of maintenance. Policy is documented by whoever owns the decision. The owner of a decision and the component that enforces it are different questions, and are recorded separately.
+
+**Precedence.** An assertion that a format defines has one home, the specification. This guide and an implementation's interface description cite it and never restate it. The guide adds the operational practice around it, and an interface description defines only what the implementation adds. For example, that a Writer does not report a tape as finalized with fewer than three complete replicas belongs to REM-PARITY alone (REM-PARITY §3.4, The Durable Boundary). The global encoding of `caller_object_id` belongs to REM-OBJECT, and idempotency over it belongs to the implementation.
+
+**States reached by a decision.** Finalization is a format state. The specification fixes what may be recorded and claimed about it, and that no object is admitted and nothing appended after it begins (REM-PARITY §11.3, Finalization). The decision to finalize is made above the format. Other tape states are not defined by any format: a tape closed to new writes before finalization, a retired tape, and the states of recycling. They are documented by the implementation, as mechanism, and by policy, as the decision of when to use them. As an example of the three levels, the room that a writer must keep to be able to finalize is a format invariant, how much allowance to add is advice in the chapter "Capacity admission", and the fill fractions at which Remanence stops choosing a tape are Remanence's configuration.
+
+**Contracts between layers.** An implementation adds contracts that no format defines. Examples are idempotency over `caller_object_id`, the locator that pins a copy to a medium, the mapping from a pool to its tapes, the rules of a write session, and the projection of copy health. An implementation should document each of them in its own documentation, under an "Interface" heading, written for "an orchestrator" in general. The orchestrator's documents then point to it. Remanence will publish interface sections; until then its reference documents hold the facts.
+
+### 2.2. The concept table
+
+One row for each concept that crosses a boundary. The columns are what the formats fix, which practice this guide gives, what an implementation documents (Remanence is the example), and what an orchestrator decides. An orchestrator here is whatever system sits above the implementation and decides what to archive. It is described in general terms in the table.
+
+| Concept | What the formats fix | Guide practice | What an implementation documents (Remanence) | What an orchestrator decides |
+| --- | --- | --- | --- | --- |
+| Copies and placement, with the identity chain | A copy is one stored representation of a canonical object, and copies of one object share a `plaintext_digest` (REM-OBJECT §3.3, Identities and Digests). The replicas A, B and C belong to a tape's index (REM-PARITY §11.3, Finalization). The formats do not say how many copies exist or where. Preparing. | "Catalogs and indexes": join copies by their shared identity. Published. | Remanence records each copy with its tape, position and pool, and labels pools with a copy class ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "copy class / content class"). Implemented. | How many copies, in which classes, and how many families of implementation. It keeps the whole identity chain of section 2.3. Published here. |
+| The four properties of independence | Nothing; no revision in preparation says anything. | This chapter, section 2.3. Published. | Pool ids and copy classes are labels that Remanence accepts as configured. It enforces none of the four properties. Implemented as labels; not implemented as enforcement. | Establishes each of the four (section 2.3). Published here. |
+| Tape pools | The specifications do not mention pools. REM-PARITY says it does not define placement policy (REM-PARITY §1.4, Non-Goals). Preparing. | No chapter. This one names pools so that they can be found. Published. | A pool is an operator-defined group of tapes. A write session names a pool, and Remanence picks the tape ([configuration reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-configuration.md#tape_pools-and-tape_pool_rules)). Implemented. | Which pools exist, what each is for, and which pool receives each copy. Published here. |
+| The tape lifecycle: finalize, close to writes, retire, recycle | Finalization only: what is written, that nothing is appended after it, and what may be claimed (REM-PARITY §11.3, Finalization; REM-PARITY §3.4, The Durable Boundary). Closing to writes, retiring and recycling are not defined. Preparing. | "Finalizing a tape and recovering from a crash"; "Retiring and recycling media". Published. | Remanence finalizes tapes, can close a tape to new writes (state `sealed`), and retires a tape identity in its catalog, which erases nothing ([lifecycle explainer](https://github.com/archivetechie/remanence/blob/main/docs/tape-identity-lifecycle-explainer.md)). Implemented. Recycling is not implemented. | When to finalize, when to stop writing to a tape, and when a medium may be released. Published here. |
+| Writer parameters | The legal values and their encodings: block sizes, `chunk_size`, parity scheme parameters (REM-PARITY §6.6, Scheme Parameters and Profiles; REM-OBJECT §4.2, Chunks and `chunk_size`). Choosing among them is not specified. Preparing. | "Ingest" (chunk size) and "Capacity admission" (separation extent, safety allowance). Published. | Defaults and keys are in the [configuration reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-configuration.md) (block size, watermarks, minimum object size) and the [sizing guide](https://github.com/archivetechie/remanence/blob/main/docs/guide-object-sizing.md). Implemented. | Which values suit which content, and the object size it promises. Published here. |
+| Catalog, locators and commit records | No catalog: every copy can be read without one. A durable off-tape commit record is required, in a form the implementation chooses (REM-PARITY §3.4, The Durable Boundary). Preparing. | "Catalogs and indexes"; "Writing tapes: sessions, commit and resume". Published. | Per-tape journals are the durable truth, and the SQLite index is a rebuildable projection. A locator is emitted after each write ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "catalog"). Implemented. | Its own catalog of assets and copies, reconciled with the implementation's. Published here. |
+| Object identity and `caller_object_id` | `object_id` and the four digests (REM-OBJECT §3.3, Identities and Digests). `REMANENCE.caller_object_id` is an opaque identifier assigned by the archiving system (REM-OBJECT §4.5.1, Keywords). Preparing. | "Catalogs and indexes", section 6.2. Published. | A repeat of the same pool, `caller_object_id` and content is idempotent, and different content under a reused id is a conflict ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "caller object id"). Implemented. | Assigns the id, and decides what a logical asset is. Published here. |
+| Keys | The encoding of a recipient epoch and the key frame (REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping), and the longevity of epochs (REM-ENCRYPT §12.8, Key Rotation and Epoch Longevity). No key registry and no custody. Preparing. | "Keys and secrets". Published. | Remanence is handed a key when it opens an object, unwraps, and stores nothing ([encryption explained](https://github.com/archivetechie/remanence/blob/main/docs/encryption-explained.md#6-key-custody-a-component-you-provide)). Implemented as a seam, with no key store. | The key store, who holds each key, and the rotation schedule (section 2.3). Published here. |
+| Fences, quarantine and copy health | Nothing; no revision in preparation says anything. | "Writing tapes: sessions, commit and resume" (stop the session when an outcome is unknown); "Verification, scrub and repair". Published. | A fence is a durable refusal record after an unproven outcome. A copy shows `OK` when its catalog status is `committed` and `SUSPECT` otherwise, and `OK` is not verification ([troubleshooting](https://github.com/archivetechie/remanence/blob/main/docs/guide-troubleshooting.md#media-readiness-fences-and-quarantine)). Implemented. | What to do about a suspect copy, and when to trust a copy. It decides from measured digests, and not from the projection. Published here. |
+| Verification and its kinds | Write-path verification, post-write re-verification and scrub (REM-OBJECT §7.2, Write-Path Verification (No Extra Reads); REM-OBJECT §7.3, Post-Write Re-Verification; REM-OBJECT §7.5, Scrub), and full verification (REM-PARITY §2.2, Conformance Roles). Preparing. | "Verification, scrub and repair"; "Staging, commit and durability". Published. | `rem tape verify-index` performs a full verification ([full verification](https://github.com/archivetechie/remanence/blob/main/docs/guide-full-verification.md)). Implemented. | How often to measure, and which measurement counts as proof. Published here. |
+| Packing and sizing | The alignment rule and an informative appendix on packing small files (REM-OBJECT §4.6.3, The Alignment Rule; REM-OBJECT Appendix E, Packing Many Small Files (Informative)). Whose decision packing is, is stated there. Preparing. | "Ingest" (when to wrap small files); "Capacity admission". Published. | Object sizing and the wrapper convention are in the [sizing guide](https://github.com/archivetechie/remanence/blob/main/docs/guide-object-sizing.md). Implemented. | What goes into one object, and the size it aims for. Published here. |
+| Labels | A tape's identity is the `tape_uuid` of its bootstrap, and the bootstrap's text keys are descriptive (REM-PARITY §8.1, Fixed Frame (One Block, Exactly); REM-PARITY §8.2, CBOR Payload). No volume label. Preparing. | "Handling hostile media" (escape text read from the medium); "Descriptive fields". Published. | Remanence has no separate label structure. The barcode is a label and not an identity, and pool rules match barcode prefixes ([glossary](https://github.com/archivetechie/remanence/blob/main/docs/reference-glossary.md), "volume label"). Implemented. | The barcode scheme, the printed label, and what a label means for custody. Published here. |
+| Retention and deletion | The formats define no deletion, and do not guarantee that recorded bytes are physically erased. This is stated in the scope paragraph that each specification is gaining. Preparing. | "Retiring and recycling media": a soft delete is a catalog tombstone, applied at migration. Published. | Remanence has no deletion of an object. Retiring a tape identity is not a deletion of files. Soft delete is not implemented. | How long anything is kept, who reviews a deletion, and when it is applied. Published here. |
+
+Everything in the right-hand column is a decision that Remanence does not make and does not check. **For example**, sutradhara, the ArchiveTech orchestrator, makes these decisions in its own policy. It implements placement under a copy policy with a floor of copies and of implementation families, the mapping of its pools to Remanence's, and a scrub by digest. It does not implement the recycling of media or the deletion of archive copies, and its documentation is not yet public.
+
+### 2.3. Two worked examples, and the properties of independence
+
+**Copies: from a logical asset to a physical copy.** Six identities are chained, and each has one owner.
+
+| Link | What it is | Who owns it |
+| --- | --- | --- |
+| Logical asset | The thing the archive is meant to keep, in the archive's own terms. | The orchestrator. |
+| Bundle member | One file inside an object, with its own `file_sha256`. | The format fixes the entry and its hash. A file's hash survives a rebuild of the object (REM-OBJECT §3.3, Identities and Digests). |
+| Canonical object | The bytes of one REM-OBJECT, identified by `object_id` and `plaintext_digest`. Rebuilding the object from the same files with a new `object_id` or timestamp gives a new `plaintext_digest`. | The format. |
+| Stored representation | The canonical object as plaintext or in an encrypted envelope, with its `stored_digest`. | The format fixes the digests. The catalog records them. |
+| Physical copy | One stored representation on one medium, at a tape UUID and a position. | The implementation, through its locator. |
+| Caller invocation | The `caller_object_id` that the archiving system supplied for the write. | The orchestrator assigns it, the format carries it, and the implementation makes retries idempotent over it. |
+
+The example runs in four steps. The format gives copies of one object their shared identity, so that a plaintext copy and an encrypted copy can be recognised as the same object. This guide recommends joining them by that identity (section 6.2). Remanence labels each pool with a copy class, so that redundant copies can be directed to separate pools. The orchestrator sets the floor: how many copies, in how many classes and families, are enough for a class of content.
+
+**Keys: four parts at four levels.** The format fixes the epoch: a 16-byte identifier of a recipient and a key frame that wraps the object's key to each recipient (REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping). This guide gives the practice of custody and resealing, which is to keep an epoch's private key while any object needs it, and to reseal alongside media migration (sections 7.9 and 7.11). Remanence documents a seam, in that it is handed a key, unwraps and stores nothing, and it leaves the key store to the deployment. The rotation schedule, with the roles that hold the keys and the drill that tests them, is policy. Rotation is costly, because the key frame is bound into the envelope's header hash and changing recipients means resealing the object.
+
+**The four properties of independence.** Copies are meant to fail separately. Four properties are involved, and they are different properties, each established at a different layer. Disjoint pool ids mean that two copies are not in the same pool. They are established by configuration in the implementation, and chosen by the orchestrator. Copy classes mean that the copies carry different class labels. They are labels in the implementation, and the orchestrator's policy gives them meaning. Physical separation means that the cartridges are not in the same library, room or site. It is established by the operator's custody of the media, and neither the format nor the implementation can see it. Independence of implementation families means that the copies were written, and can be read, by different software, so that one defect cannot affect all of them. Only the orchestrator knows which software wrote what. Counting the first two does not establish the last two.
+
+### 2.4. Words that mean different things
+
+Some words appear in more than one document with different meanings, and some carry more than one meaning inside a single system. This table gives each meaning and where it is used. Each document should say which meaning it intends. The table is the reference.
+
+| Word | Meanings, and where each is used |
+| --- | --- |
+| pool | A tape pool: an operator-defined group of tapes that a write targets (Remanence configuration). An orchestrator may also use the word for a set of resources that it schedules, such as drives. The specifications do not use the word. |
+| copy, replica | A copy is one stored representation of an object on a medium (REM-OBJECT §3.3, Identities and Digests). A replica is one of the three complete terminal inventories of a tape, A, B and C (REM-PARITY §11.3, Finalization). The sidecar and the ParityMap also have header copies and tail copies (REM-PARITY §9.2, The Header Block (Block 0 of Each Copy) — All Little-Endian; REM-PARITY §10.1.2, Copy Layout). Three replicas of the index are not three copies of the data. |
+| verify | Seven things go by the name. Write-path verification, post-write re-verification and scrub by `stored_digest` (REM-OBJECT §7.2, Write-Path Verification (No Extra Reads); REM-OBJECT §7.3, Post-Write Re-Verification; REM-OBJECT §7.5, Scrub). Full verification of a tape (REM-PARITY §2.2, Conformance Roles). The state `verified` that Remanence reports when a verification has run to its end, where `complete` says whether the tape passed. The health `OK` of a copy, which is not a verification. An orchestrator's comparison of a measured digest with a reference digest. |
+| seal | In REM-ENCRYPT, to wrap an object in an encrypted envelope (REM-ENCRYPT §5.9, Sealing). In Remanence, the state `sealed` of a tape that is closed to new writes before it is finalized, and the audit fact `TapeSealed` that is recorded when a tape is sealed. |
+| retire | In Remanence, to retire a tape identity in the catalog, or a drive from the fleet. In this guide, to stop using an epoch's key. An orchestrator may also retire a pool or a copy. |
+| epoch | A parity epoch: one protection unit of a tape (REM-PARITY §2.3, Definitions). A recipient epoch: one key pair and its 16-byte identifier (REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping). In Remanence, a daemon epoch, which detects a restarted daemon, and a write epoch, which is a counter in the media-write fence. |
+| suspect | In Remanence, the health `SUSPECT` of a copy whose catalog status is anything but `committed`. It says that nothing has been proved, and does not say that anything is wrong. An orchestrator may also use the word of an asset whose content it doubts, which is a different claim. |
+| session | The Writer's session, whose drive settings are fixed at its start (REM-PARITY §11.4, Session Preconditions), and the practice of chapter 9. In Remanence, the daemon's write or read transaction, with an identifier that never survives a restart. |
+| finalize | To write a tape's terminal replicas and separation extents, after which nothing is appended (REM-PARITY §11.3, Finalization). It differs from closing a tape to new writes, and an orchestrator may use "finalized" of an asset whose archiving is complete. |
+| catalog | Any record of what exists, kept outside an object. In Remanence, journals with a rebuildable SQLite projection. An orchestrator keeps its own, of assets and copies, and the two are reconciled. |
+| policy | In the specifications, the change policy that governs revisions. In Remanence, an operator's policy for extensions, a pool's selection policy and a medium's rewrite policy. For an archive, a decision about what is stored, how many copies, where, for how long, who may restore it and what may be disclosed. |
+| bundle | An orchestrator's bundle is files packed into one archive object, and REM-OBJECT uses the word in the same sense for the payloads that one object holds. REM-PARITY does not use it: what it commits as one atomic unit at an Object's close, the Object and the sidecars emitted at that close, is an *object-close commit group* (REM-PARITY §11.1, Commit Discipline (per Tape File)). |
+
+### In plain terms
+
+Four kinds of document answer four kinds of question. The specifications say what the bytes are and what may be concluded from them. This guide says what to do so that the bytes survive and the conclusions are right. An implementation's documents say what that software does. The people who run the archive decide what to keep, for how long and in how many places. The tables above list each concept with the document that answers each part of it, and say plainly which parts are not yet written or not yet built. When two documents seem to disagree about a word such as "copy" or "verified", check the last table first. They are often talking about different things.
+
+## 3. Handling hostile media
+
+A cartridge, a disk file or an object in a store can hold bytes that no
+conformant writer produced. Damage produces some of them; a person who wants
+to harm the machine that reads them produces others. The specifications
+define which inputs are valid and require a reader to reject the rest. They do
+not say how a reader should survive the attempt, because a reader that
+crashes on a hostile object still never misreads a valid one. This chapter
+collects the practice that keeps a reader running.
+
+### 3.1. Treat every stored byte as untrusted
+
+Stored bytes come off removable media and networks, in both representations.
+An encrypted copy's header and key frame are parsed before anything has been
+authenticated, and a plaintext copy is never authenticated at all (REM-OBJECT
+§12.6). Even `chunk_size` and the block count, which come from a catalog or,
+on tape, from the bootstrap and the Object recovery row (REM-OBJECT §4.2), are
+only as trustworthy as their source.
+
+We recommend that a reader treat every stored byte as untrusted input.
+`chunk_size` and the block count decide how the bytes are read, so a wrong
+value must lead to a rejection rather than to a wrong reading. The acceptance checks that REM-OBJECT §12.9 lists, each required by
+the section it cites, are the minimum. The rest of this chapter is about
+performing them safely.
+
+Serves REM-OBJECT §12.9, Hostile-Input Posture, and REM-ENCRYPT §12.9,
+Envelope Hostile-Input Discharge.
+
+### 3.2. Check a size before it drives an allocation
+
+A length read from the medium can claim anything up to 2^64 − 1. A reader
+that allocates a buffer of the declared size, or reserves room for a declared
+number of entries, before it has checked the value can be made to request
+more memory than the host has. The allocation fails or the process is killed,
+and the read ends without a result.
+
+We recommend checking every size read from the medium against the bytes that
+remain before it drives an allocation. A payload size should be checked
+against the remaining declared blocks before any buffer is sized from it. A
+manifest decoder should size its buffers from the manifest's declared length,
+and never from counts read out of the CBOR stream. It should enforce the entry
+and depth limits as it reads, rather than after it has built the whole
+structure. The limits themselves are a requirement of the specification:
+"Decoders MUST enforce both limits." (REM-OBJECT §4.7.1). Enforcing them
+incrementally changes no result. It only keeps the decoder's memory bounded
+while it reaches that result.
+
+An envelope parser meets the same risk in the key frame and the metadata
+frame. It should check the key-frame length and slot count before it
+allocates for the frame, and check the envelope's geometry before it seeks or
+allocates. It should enforce the metadata CBOR depth and item limits as it
+decodes. The bounds themselves are requirements, listed in REM-ENCRYPT §12.9;
+checking them early changes no result.
+
+A tape reader meets the same risk in the bootstrap's CBOR payload, in the
+sidecar index and in the terminal replicas and separation extents. Its CBOR
+decoder should size its buffers from the measured byte length of the input,
+never from counts read out of the stream. Every declared count or length, and
+every size formula of a replica or separation frame, should be checked against
+the measured physical extent before it drives an allocation or a seek. The
+check itself is a requirement: "Every declared count or length is validated
+against the measured physical extent." (REM-PARITY §16.2). Making it before the
+allocation, rather than after, changes no result.
+
+Serves REM-OBJECT §4.7.1, Deterministic CBOR; REM-OBJECT §12.9, Hostile-Input
+Posture; REM-ENCRYPT §12.9, Envelope Hostile-Input Discharge; REM-PARITY
+§10.6, Replica Validity Conditions; and REM-PARITY §16.2, Hostile-Input
+Posture.
+
+### 3.3. Read in a stream
+
+An object can be hundreds of gigabytes long. A reader that loads a whole
+object before parsing it needs memory in proportion to the object, and a
+hostile object can declare a size chosen to exhaust it. Some interfaces still
+need an object whole, and a reader that serves them has to hold one in memory.
+
+We recommend reading in a stream. A streaming reader needs memory in
+proportion to `chunk_size` plus one pax header, and allocates a constant
+amount per chunk, whatever the object's size. A streaming reader of an
+encrypted copy likewise needs a constant amount of memory per payload chunk.
+Remanence, for example, restores through its streaming reader.
+
+A reader that materializes the whole object should reserve its up-front
+allocation fallibly, so that an oversized declaration produces an error rather
+than an abort. It should also enforce a size ceiling set for the deployment.
+That ceiling is deployment policy, not a check of format validity: it can
+refuse an object that is valid and that a streaming reader would read. The
+choice of approach does not change which objects are valid, and a refusal for
+size should be reported as a resource limit, not as a format violation.
+
+A terminal replica carries a 256-byte row for every Object on the tape, and a
+tape can hold a million Objects. We recommend validating the structural and
+ordinal invariants of a replica's payload as its rows stream, so that reading
+or writing the inventory needs no allocation proportional to the whole tape.
+The invariants are the same either way.
+
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations; REM-OBJECT
+§12.9, Hostile-Input Posture; REM-ENCRYPT §12.9, Envelope Hostile-Input
+Discharge; and REM-PARITY §10.2, Structural Rows.
+
+### 3.4. Never panic on any byte sequence
+
+A reader that panics, crashes or invokes undefined behaviour on a malformed
+object produces no result. In an unattended restore, or a scrub over
+thousands of objects, one such object stops the whole run. In a language
+without memory safety, undefined behaviour on attacker-chosen bytes can become
+code execution on the reading machine.
+
+A reader should never panic, crash or invoke undefined behaviour on any byte
+sequence. We recommend enforcing this mechanically rather than by review. On
+every path that input bytes can reach, avoid operations that abort on bad data:
+in Rust, `unwrap`, unchecked indexing and unchecked arithmetic, and forbid
+`unsafe` where it can be avoided; the same discipline applies in other
+languages under other names. Arithmetic is the part the specification itself
+fixes, because a wrapped offset would misread the object: "implementations
+MUST use checked arithmetic and MUST NOT wrap silently" (REM-OBJECT §2.4).
+A tape reader is under the same discipline on every path that tape bytes
+reach, and REM-PARITY fixes its arithmetic in the same way: "Arithmetic on
+values read from tape MUST be checked; overflow is rejection, never
+wraparound" (REM-PARITY §2.4).
+
+Serves REM-OBJECT §12.9, Hostile-Input Posture; REM-PARITY §2.4, Integer,
+Byte, and Text Conventions; and REM-PARITY §16.2, Hostile-Input Posture.
+
+### 3.5. Test the parser with coverage-guided fuzzing
+
+Parsers fail on inputs that nobody thought to write down, and a test suite
+written by hand covers only the inputs its authors imagined.
+
+We recommend validating the property of section 3.4 with coverage-guided
+fuzzing. For REM-OBJECT, fuzz at least three targets: the pax record loop, the
+manifest CBOR decoder, and whole-object open and verify for plaintext inputs.
+For REM-ENCRYPT, fuzz at least four targets, separately from the plaintext
+ones: the scalar-header parser, the key-frame parser, the metadata CBOR
+decoder, and whole-object open and verify for encrypted inputs. For
+REM-PARITY, fuzz the bootstrap, sidecar, ParityMap, terminal-replica and
+separation parsers, and the scan walk. Each should run long enough for its
+coverage to stop growing. Remanence, for example, keeps these targets in the
+`fuzz/` directory of its repository. Its REM-PARITY targets cover the
+bootstrap, the ParityMap, the sidecar and the scan walk, but none yet covers
+the terminal-replica or separation parser. The project requires those before
+it freezes REM-PARITY: they are REM-PARITY freeze criterion 3, in the
+[release record](https://github.com/archivetechie/remanence/blob/main/specs/README.md#how-a-revision-is-frozen).
+
+Serves REM-OBJECT §12.9, Hostile-Input Posture; REM-ENCRYPT §12.9, Envelope
+Hostile-Input Discharge; and REM-PARITY §16.2, Hostile-Input Posture.
+
+### 3.6. Escape text read from the medium before showing it
+
+The bootstrap keys 3 and 4, and ParityMap keys 6 and 7, hold text chosen by
+whoever wrote the tape. They are the first human-readable text a diagnostic
+tool prints from an unknown cartridge, and the operator reading them is
+deciding whether the cartridge is damaged or hostile. Text that carries
+terminal control sequences or markup can change what the operator sees, or
+what a program that receives the output does.
+
+A tool that renders any of these values should escape it, so that no part of
+it can be interpreted as a control or formatting instruction by whatever
+receives the output. The specification bounds the text and fixes how a reader
+treats a value outside the bounds: "A Reader MUST tolerate the absence of
+either key, and MUST treat a value violating either rule exactly as it treats
+that key's absence, for every purpose." (REM-PARITY §8.2). Escaping is what
+keeps a value inside the bounds from doing harm.
+
+Serves REM-PARITY §8.2, CBOR Payload; REM-PARITY §10.1.4, Payload (CBOR); and
+REM-PARITY §16.2, Hostile-Input Posture.
+
+### In plain terms
+
+A reader has two jobs: read valid objects correctly, and stay standing when it
+is handed something that is not one. The specification takes care of the
+first. This chapter is about the second: check every number before you act on
+it, never hold more than you have checked, escape any text from the medium
+before you show it, and test the parser with inputs designed to break it.
+
+## 4. Restoring onto a host
+
+A restore writes files onto a computer that the object knows nothing about.
+The specification says what an object contains and what a restore may claim
+to have reproduced. It does not govern the destination, because the
+destination lies outside the object; REM-OBJECT §1.4 already places restore
+policy and restore-time path sanitisation with the tools above the format.
+This chapter recommends how a restoring tool should protect the host.
+
+The conformance vectors record what a restore that follows the defaults
+recommended in sections 4.3 to 4.6 reports, in their `expected.default_restore`
+fields (`skipped_xattrs`, `applied_privileged_xattrs`, `carried_extensions`
+and `reported_values`). These fields are informative for conformance: "A conformant Restoring Consumer need not
+reproduce them." (REM-OBJECT §13.1).
+
+### 4.1. Keep your own sanitisation, and never follow a symlink in the destination
+
+Entry paths in a conformant object are clean relative paths, but symlink
+targets are opaque strings that may be absolute or contain `..`. The classic
+archive attack uses that difference. An earlier symlink entry creates
+`dir -> /outside`, and a later regular entry writes through `dir/file`, so the
+file lands outside the restore root. The same thing happens when a symlink
+that was already present in the destination directory is followed.
+
+A restoring tool should keep its own sanitisation rather than rely on the
+format's path rules alone. While it materializes any entry, it should never
+follow a symlink that is already present in the destination tree, including
+one that an earlier entry of the same object created. We recommend opening
+each path component with `openat` and `O_NOFOLLOW`, or an equivalent
+component-by-component discipline that re-checks every component. The
+specification requires the fidelity half of this work: "A Restoring Consumer
+MUST create symlink entries as symlinks, without dereferencing their
+targets." and "A Restoring Consumer MUST materialize a hardlink's primary
+before creating the hardlink (`link(2)`) to the already-restored primary."
+(REM-OBJECT §12.10).
+
+Serves REM-OBJECT §12.10, Path Traversal.
+
+### 4.2. Map every path onto the native filesystem before writing anything
+
+The entry-path grammar is checked against POSIX semantics only. On Windows, a
+component such as `..\outside` contains a separator that the grammar never
+inspected, and a value like `C:\x` or `\\host\share\x` is a drive-relative or
+UNC absolute path. Case folding and Unicode normalisation can merge two
+distinct entries onto one native file.
+
+Before it materializes any entry, a tool restoring onto a non-POSIX or
+case-folding filesystem should resolve every entry's native destination,
+applying the target's separator, case-folding and Unicode-normalisation rules.
+It should reject or report, and never silently overwrite, any entry whose
+destination escapes the restore root or resolves to an absolute,
+drive-relative or UNC path. This preflight is in addition to the symlink
+discipline of section 4.1, not a replacement for it. The collision case is a
+requirement of the specification: "A Restoring Consumer that maps entry paths
+onto a native filesystem MUST reject or report, never silently overwrite, any
+entry whose native destination collides with a destination that another entry
+in the same object has already produced." (REM-OBJECT §12.10). Running the
+preflight before anything is written is the practical way to meet it.
+
+Serves REM-OBJECT §12.10, Path Traversal.
+
+### 4.3. Apply only `user.` attributes by default
+
+Extended attributes can carry privilege. A restored `security.capability`
+attribute turns an ordinary binary into a privileged one, and `security.*`,
+`trusted.*` and POSIX ACL attributes change access control. An object from an
+untrusted source can carry any of them.
+
+By default a restore should apply only the portable core, the `user.`
+namespace, and should leave the extension tier unapplied. That tier is every
+attribute that is not in the `user.` namespace, including one whose name has
+no namespace, and every extension. A tool should apply a
+further namespace prefix only when explicit operator policy names it.
+Attributes outside the effective allow-list should be skipped and reported by
+name, and never applied. No registered disposition and no external list
+should cause an extension-tier item to be applied by default. Remanence, for
+example, restores only `user.` attributes unless the operator names further
+prefixes with `--xattr-namespace`, and its restore report lists the
+attributes it skipped and the privileged attributes it applied.
+
+Serves REM-OBJECT §4.7.3, Extended-Attribute Preservation, and REM-OBJECT
+§12.10, Path Traversal.
+
+### 4.4. Hand preserved attributes to the caller, and treat a skip as an outcome
+
+A reader that preserves attributes but keeps them to itself leaves its caller
+unable to apply them, or to say that they were not applied.
+
+A reader that implements attribute preservation should hand the preserved
+attributes to its caller. When a restore then reapplies them, it should
+follow sections 4.3 and 4.5. A skip made under policy is an outcome of that
+policy, not an error, and it is reported as such. A genuine failure to apply
+an attribute is different, and the specification requires it to be visible:
+"A Restoring Consumer MUST surface any attribute application failure rather
+than silently declaring success." (REM-OBJECT §4.7.3).
+
+Serves REM-OBJECT §4.7.3, Extended-Attribute Preservation.
+
+### 4.5. Write attributes without following links
+
+An attribute written through an interface that follows symbolic links lands
+on the link's target, and the target is chosen by whoever wrote the object.
+
+A restoring tool should never write an attribute through an interface that
+follows a symbolic link at the final path component. For an entry that is
+itself a symbolic link, it should use a link-targeting interface, such as
+`lsetxattr` on Linux, or skip the attribute and report it.
+
+Serves REM-OBJECT §12.10, Path Traversal.
+
+### 4.6. Apply extensions only when operator policy names them
+
+An `ext` member can carry platform metadata, such as a record from another
+operating system's file model, whose application changes the host in the same
+ways that a privileged attribute does.
+
+A restoring tool should apply no extension to system state unless explicit
+operator policy names it. Every extension, recognised or not, should be
+carried, and when it is reported it should be reported by name only. An
+extension the tool does not recognise should always remain carry-only:
+carried, and not acted on. A short name recorded in the community list that
+REM-OBJECT §15 describes confers no default application on restore.
+
+Serves REM-OBJECT §4.7.5, Extension Containers; REM-OBJECT §12.10, Path
+Traversal; and REM-OBJECT §15, IANA Considerations.
+
+### In plain terms
+
+The format guarantees that an object's contents match its manifest. The
+destination computer is your responsibility: keep every write inside the
+restore root, do not follow symlinks that are already there, apply privileged
+metadata only when the operator has named it, and report what you did not
+apply.
+
+## 5. Staging, commit and durability
+
+A writer produces bytes that another tool may read decades later. The
+specification fixes what those bytes must be. This chapter is about the order
+of work that gets them onto the medium intact, and about when it is safe to
+say that a copy exists.
+
+### 5.1. Build an object in a fixed order, and verify as you go
+
+A writer that discovers a problem late, after tape has moved or a file has
+been published, leaves a partial object behind or reports one that is wrong.
+
+We recommend building each object in this order. First validate the options
+(`chunk_size`, `object_id`, `caller_object_id`, `write_timestamp` and the
+manifest entry's `file_id`, `manifest_file_id`) against the constraints of REM-OBJECT §4.2 and §4.5.1,
+and every member specification against REM-OBJECT §4.6.6. Then plan the complete layout from the member specifications
+alone, which serialises the manifest and computes `manifest_sha256` before any
+payload byte is read. Then emit the global header, each member entry and the
+manifest entry, passing every payload byte through a running SHA-256 check.
+Emit tar EOF and the final zero fill, and confirm that the number of blocks
+written equals the plan. Only then report the layout, for the catalog
+(section 6.1). The specification requires the plan and the output to agree,
+and requires honesty about failure: "The Planner and the Builder MUST share
+the sizing rules that make the planned layout byte-exact." and "A failed object
+MUST NOT be reported as complete." (REM-OBJECT §4.9).
+
+Every digest in the chain can be computed over bytes that are already flowing
+through the writer. We recommend computing `plaintext_digest` over the
+emitted stream as it is written; for a plaintext copy the same value is its
+`stored_digest`. The digest then costs arithmetic and no extra read. For an
+encrypted copy, we recommend computing its `stored_digest` in the same way,
+over the envelope bytes as the sealer emits them.
+
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations; REM-OBJECT
+§7.2, Write-Path Verification (No Extra Reads); and REM-ENCRYPT §7.2,
+Write-Path Verification.
+
+### 5.2. Write through a sink that reports every block
+
+A tape drive can accept fewer bytes than a full block, or reach the end of the
+medium part-way through an object. A writer that does not see this at once
+goes on writing an object that can never be read back whole.
+
+We recommend writing through a block sink that reports the outcome of every
+block write, and treating a short write or a hard end of medium as the end of
+that object. How the writer then recovers, for example by starting the object
+again on another tape, is its own choice. The failure itself is a requirement
+of the specification: "A Builder MUST fail the object when a block write
+commits fewer bytes than the full block or reports hard end-of-medium."
+(REM-OBJECT §4.9).
+
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations.
+
+### 5.3. Re-read each copy before recording it durable
+
+The checks in section 5.1 prove that the writer archived what it was given.
+They do not prove that the medium or the network kept it. A copy can be
+damaged in transmission, or by a drive that reports success on a bad write.
+
+After each copy is written, and before it is recorded as durable, we recommend
+re-reading it through the object read path and re-verifying it. A full
+verification checks every regular member's `file_sha256` together with the
+correspondence and hardlink checks of the Verifier profile (REM-OBJECT §7.4).
+At a minimum, the copy's `stored_digest` should be compared. This is the one
+deliberate extra read in the pipeline, and a conformant Verifier is the
+natural tool for it. REM-ENCRYPT §7.3 describes the corresponding check for
+an encrypted copy.
+
+Serves REM-OBJECT §7.3, Post-Write Re-Verification.
+
+### 5.4. Stage and publish a file-bound copy durably
+
+A file renamed into place without prior synchronisation can, after a crash,
+leave its final name pointing at data that was never fully written. A catalog
+that already refers to that name then claims a copy that does not exist.
+
+We recommend writing a file-bound copy to an exclusively created temporary
+path, for example `name.rem-object.partial`. Flush and fsync the file, rename
+it to its final name, and fsync the containing directory before reporting
+success. Partial outputs should be deleted or quarantined, and never referred
+to by a durable catalog.
+
+Serves REM-OBJECT §8.3, File Binding.
+
+### In plain terms
+
+Write in an order that finds problems before they cost anything, watch every
+block go down, read the copy back before believing in it, and never let a
+half-written file wear the name of a finished one.
+
+## 6. Catalogs and indexes
+
+The format defines no catalog, and every copy can be read without one. A
+catalog is nevertheless where most archives keep the facts that make copies
+findable, scrubbable and authenticated. This chapter recommends what to keep
+there and how to keep it.
+
+### 6.1. Record, for each copy, what a reader and a scrubber will need
+
+A reader needs `chunk_size` and the block count from outside the object; the
+specification requires that "A Reader is given the object's `chunk_size` and
+block count out of band and MUST process exactly that many blocks" (REM-OBJECT
+§4.2). A scrubber needs `stored_digest`, which is never stored inside the
+copy.
+
+We recommend recording, for each copy, its location, its representation, its
+`stored_digest`, its `stored_size_bytes` or block count, and its `chunk_size`.
+Record as well the layout the writer reports: `projected_size_blocks`, each
+file's `first_chunk_lba`, the manifest's geometry, `manifest_sha256` and
+`plaintext_digest`. The representation can be detected from the bytes, but
+detection is a convenience. A reader should cross-check detection against the
+recorded representation rather than rely on detection alone.
+
+For an encrypted copy, we recommend recording also its `format_version`,
+`metadata_frame_len` and `key_frame_len`, and the recipient epoch ids present
+in its key frame. These are public envelope geometry. They let a tool choose a
+key and plan reads without opening the object, but they do not replace
+parsing the envelope's own header and key frame, which is where a reader
+takes them from.
+
+Serves REM-OBJECT §8.1, The Byte-Format Contract; REM-OBJECT §3.4,
+Representation Detection; REM-OBJECT §4.9, Builder, Planner, and Reader
+Obligations; REM-OBJECT §7.2, Write-Path Verification (No Extra Reads); and
+REM-ENCRYPT §8.1, Backend Records for Encrypted Copies.
+
+### 6.2. Join copies by their shared identity
+
+A plaintext copy and an encrypted copy of one object have different stored
+bytes, and so different `stored_digest` values, but they wrap the same
+canonical object.
+
+An index should join the copies of one logical object by `plaintext_digest`.
+For a plaintext copy, `stored_digest` and `plaintext_digest` are the same
+value, so a catalog can store it once.
+
+Serves REM-OBJECT §3.3, Identities and Digests.
+
+### 6.3. Store per-file rows once per object, with plaintext offsets
+
+The per-file index, `first_chunk_lba` and `size_bytes` for each file, is the
+same for both representations, because both wrap the same canonical bytes.
+Offsets into stored bytes differ between representations, and can be
+recomputed from the per-file index whenever they are needed.
+
+We recommend storing per-file rows once per object, not once per copy, and
+keeping plaintext offsets (inner `BodyLba` and file byte ranges) as the
+source of truth. A catalog should not make representation-specific stored
+offsets canonical. REM-OBJECT §6.2 and REM-ENCRYPT §6.3 reproduce them.
+
+Serves REM-OBJECT §6, Partial File Restore.
+
+### 6.4. Keep hardlinks resolvable in a per-file index
+
+A hardlink entry holds none of its own content. Its size is 0 and its
+`first_chunk_lba` is `null`. A partial restore of a hardlinked name uses its
+primary's coordinates, as the specification requires: "For PFR on a
+hardlinked name, a Restorer MUST first resolve its `link_target` to the
+primary entry and then use the **primary's** `first_chunk_lba` and
+`size_bytes` for all arithmetic below." (REM-OBJECT §6).
+
+A per-file index that serves restores from catalog rows, rather than from the
+full manifest, should keep every hardlink resolvable. The hardlink's row
+should carry its `entry_type` and `link_target`, to be resolved at restore
+time, or a copy of the primary's `first_chunk_lba` and `size_bytes`. A row
+that stores only the hardlink's own `null` and `0` cannot restore that name.
+
+Serves REM-OBJECT §6, Partial File Restore.
+
+### 6.5. Protect the catalog
+
+The catalog is a separate trust domain. It holds the external anchors that
+authenticate plaintext copies, and it may hold cleartext paths and per-file
+rows even when every stored copy is encrypted.
+
+We recommend protecting the catalog's confidentiality, integrity and
+provenance at least as carefully as the copies themselves.
+
+Serves REM-OBJECT §12.6, Plaintext Copies Are Not Self-Authenticating.
+
+### 6.6. Keep a tape catalog rebuildable from the commit records
+
+A catalog of tapes records which files each tape holds, where they are, and
+what state each tape is in. It is quick to query and convenient to trust. After
+a crash it can disagree with the tape, and with the records that committed the
+tape's files, because it was updated after them.
+
+We recommend treating a tape catalog as a projection of the commit records:
+rebuild it from those records after a crash, never the reverse, and never let a
+catalog entry stand in for commit authority or for a finalized tape's terminal
+inventory. The specification fixes the part that concerns claims: "A record the
+implementation does not treat as commit authority, such as a rebuildable
+catalog or cache, does not commit a tape file." (REM-PARITY §3.4), and "An
+off-tape catalog is a cache." (REM-PARITY §12.1). Remanence, for example, can rebuild its SQLite catalog from
+its journals with `rem rebuild-catalog-from-journals`.
+
+Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.1, Inputs and
+Authority.
+
+### In plain terms
+
+The objects can always be read without the catalog, but the catalog is what
+lets an archive find, check and trust them quickly. Record enough to read and
+scrub every copy, store each fact once, keep hardlinks resolvable, rebuild a
+tape catalog from the commit records rather than the other way round, and
+guard the catalog as carefully as the archive it describes.
+
+## 7. Keys and secrets
+
+An encrypted copy stays readable only while a key that opens it survives, and
+stays confidential only while the secrets that went into it stay secret.
+REM-ENCRYPT fixes how the envelope binds its keys, and defines no key registry
+or custody protocol (REM-ENCRYPT §1.5). This chapter recommends how a tool
+should choose recipients, hold private keys, obtain randomness and handle
+secrets while it works, and how long to keep keys. Its first section, on
+attribute values, comes from REM-OBJECT; the rest from REM-ENCRYPT.
+
+### 7.1. Report attributes by name, never by value
+
+Attribute values and extension members can hold secrets: credentials kept in
+`user.` attributes, security labels, or the private metadata of another
+operating system. Logs are copied, shipped and retained far more widely than
+the data they describe.
+
+A restoring tool that reports skipped or applied attributes and extensions
+should report their names only, and should never log their values.
+
+Serves REM-OBJECT §12.10, Path Traversal.
+
+### 7.2. Seal to at least two independent recipients
+
+Any one matching private key opens an encrypted object, and an object whose
+every recipient key is lost cannot be opened by anyone. An archive that seals
+to a single recipient loses everything sealed to it when that one key is
+lost.
+
+We recommend sealing to at least two independent recipients, held in
+separate custody, or else protecting the sole recipient's secret
+independently, for example by splitting its seed with Shamir's secret
+sharing. A tool should default to at least two recipients, and should seal to
+one only when its operator opts in explicitly. The pinned vector
+`writer-one-slot` records what a sealer that follows this default does: it
+refuses a one-recipient seal made without that opt-in. It is an informative
+vector, as REM-ENCRYPT §13.4 says, because a single-recipient envelope is
+valid and "Readers accept any canonical frame with one through eight slots."
+(REM-ENCRYPT §5.3). Remanence, for example, refuses a one-recipient seal
+unless its caller sets `allow_single_recipient`.
+
+Serves REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping, and REM-ENCRYPT
+§13.4, Negative Vectors.
+
+### 7.3. Fail the whole seal when a recipient cannot be wrapped
+
+A sealer asked to seal to three recipients that quietly seals to two leaves
+the third without access, and nobody learns of it until that key is the one
+that is needed.
+
+A sealer that cannot wrap the data key to one of the recipients it was asked
+to seal to should fail the whole seal, rather than emit an envelope without
+that recipient. The specification fixes what may be reported: "A Sealer MUST
+NOT report a seal as successful unless the key frame contains a slot for
+every recipient it was asked to seal to." (REM-ENCRYPT §5.3). Failing the
+seal is the simplest way to meet it.
+
+Serves REM-ENCRYPT §5.3, The Key Frame and HPKE Wrapping.
+
+### 7.4. Keep each private key as its 32-byte seed
+
+A private key is useful only if some tool can load it when it is needed,
+perhaps decades later and in another program. The specification defines one
+form for it: a recipient epoch's "secret custody form is the 32-byte X-Wing
+seed" (REM-ENCRYPT §2.3). The expanded ML-KEM decapsulation key and the
+X25519 secret `sk_X` are derived from the seed, and no REM specification
+defines how to store them.
+
+We recommend storing each private key as its seed, and deriving the expanded
+decapsulation key and `sk_X` in memory only, when the key is used. A key file
+should contain the seed, not an expanded key. Thirty-two bytes can also be
+written on paper, stamped into metal or split among custodians, which an
+expanded key does not allow as easily.
+
+Serves REM-ENCRYPT §5.3.1, Frozen X-Wing Construction, and REM-ENCRYPT §5.4,
+Key Inputs and Identification.
+
+### 7.5. Pin recipient public keys
+
+A sealer that takes a recipient's public key from an untrusted channel can be
+given an attacker's key instead. The object is then sealed to the attacker,
+who can read it, and nothing in the envelope shows it.
+
+Where public keys could be substituted, we recommend pinning each recipient
+public key, or its fingerprint, through a channel independent of the one that
+delivers it, and checking the pin before every seal. Public keys and their
+fingerprints are inputs to custody, which the format does not define.
+
+Serves REM-ENCRYPT §5.4, Key Inputs and Identification, and REM-ENCRYPT
+§12.11, Threat Model and Secret Handling.
+
+### 7.6. Take randomness from the operating system, and fail when it is missing
+
+The confidentiality of every object rests on its data-encryption key and its
+encapsulation randomness being fresh and unpredictable. A tool that falls
+back to a weak source when the operating system's generator is unavailable
+produces objects that look sound and are not.
+
+We recommend obtaining the data key and the encapsulation randomness from the
+operating system's cryptographically secure generator, through an interface
+that reports failure, and failing the seal with `EntropyUnavailable` whenever
+that source cannot supply them. The specification requires the outcome:
+"For every seal, a Sealer MUST use a fresh uniformly random 32-byte DEK and
+fresh HPKE encapsulation randomness for every recipient ([RFC9180] §9.2.3).
+Entropy failure is fatal." (REM-ENCRYPT §12.1).
+
+Serves REM-ENCRYPT §5.4, Key Inputs and Identification, and REM-ENCRYPT
+§12.1, Per-Object Key Uniqueness.
+
+### 7.7. Derive the salt inside the sealer
+
+An interface that accepts a salt from its caller invites callers to supply
+one. An envelope sealed under any salt other than the one derived from its
+data key does not open: a reader rederives the salt and rejects a mismatch
+with `SaltDerivationMismatch`.
+
+A sealer's interface should derive the salt itself, as the specification
+requires ("A Sealer MUST derive the salt." REM-ENCRYPT §5.5), and should
+offer no way for a caller to supply one.
+
+Serves REM-ENCRYPT §5.5, Salt and Object-Key Derivation.
+
+### 7.8. Seal with the current suites
+
+A suite is superseded for a reason, usually because a better construction has
+replaced it. A new seal under a superseded suite extends that suite's life by
+the lifetime of the object.
+
+We recommend sealing new objects with the current `suite_id` and
+`wrap_suite` only. Objects already sealed under a superseded suite remain
+readable, because "Superseded suites remain valid for **opening**."
+(REM-ENCRYPT §10.4), and they keep that suite's protection until they are
+resealed (section 7.11). Today there is one current suite of each kind.
+
+Serves REM-ENCRYPT §10.4, Assignment and Deprecation Policy.
+
+### 7.9. Keep an epoch's private key while any object needs it
+
+A key frame cannot be rewritten without resealing the object, so a recipient
+cannot be added to an object once it is sealed. An object can be opened only
+while the private key of at least one of its recipient epochs survives, and a
+key destroyed too early cannot be replaced for the objects already sealed to
+it.
+
+We recommend never destroying a recipient epoch's private key while any live
+object references it. Retire a key only when the catalog shows that no live
+object depends on it, or once every object that did has been resealed to
+other recipients.
+
+Serves REM-ENCRYPT §12.8, Key Rotation and Epoch Longevity.
+
+### 7.10. Keep secrets few, short-lived and out of records
+
+A secret can leak from any place where a copy of it persists: memory that is
+swapped or dumped, logs and diagnostics, command lines that other users can
+see, core dumps, and plaintext staged during recovery. Section 7.1 applies the
+same reasoning to attribute values.
+
+We recommend keeping as few copies as possible of data keys, derived keys,
+private keys, HPKE ephemeral secrets and random-generator state, and zeroising
+the mutable buffers that hold them as soon as they are no longer needed. A
+tool should never write a secret to a log, a diagnostic, a command line or
+durable plaintext staging.
+
+A core dump needs more than care about what the tool writes, because it
+captures memory that the tool never chose to write out. We recommend
+disabling core dumps for processes that hold secrets, or excluding
+secret-bearing memory from dumps where the platform allows it, for example
+with `madvise` and `MADV_DONTDUMP` on Linux. Where neither can be assured, a
+dump file should be treated as secret-bearing.
+
+Serves REM-ENCRYPT §12.11, Threat Model and Secret Handling.
+
+### 7.11. Reseal alongside media migration
+
+Resealing an object, to new recipients or under a new suite, reads, opens and
+rewrites the whole object, and on append-only media produces a new copy.
+
+We recommend planning resealing together with media migration, which reads
+and rewrites the objects anyway. A resealed copy keeps the object's
+`object_id`, `chunk_size`, canonical bytes and `plaintext_digest`, and has new
+envelope bytes and a new `stored_digest` (REM-ENCRYPT §12.8), so a catalog
+should record it as a new copy of the same object.
+
+Serves REM-ENCRYPT §12.11, Threat Model and Secret Handling, and REM-ENCRYPT
+§12.8, Key Rotation and Epoch Longevity.
+
+### 7.12. Decide what an encrypted copy may reveal, and where provenance comes from
+
+Encryption hides an object's contents, not its existence. An encrypted copy
+reveals its identifier, its recipient epochs and their labels, and its size,
+among the public facts REM-ENCRYPT §12.5 lists. Because anyone who holds the
+recipient public keys can make a new, internally valid object, encryption
+also does not show who made an object.
+
+A deployment that treats an object's existence, identifier or approximate
+size as sensitive should add its own policy above the format, which defines
+no padding. A deployment that needs provenance should keep an independently
+authenticated or signed external manifest, because "REM-ENCRYPT claims
+confidentiality and self-consistency, not Sealer identity or provenance."
+(REM-ENCRYPT §12.7).
+
+A tape adds public facts of its own. REM-PARITY's structures are plaintext on
+the tape and reveal the number of objects, each object's block count, the write
+timeline and a CRC-64 of every stored block (REM-PARITY §16.4). An unkeyed CRC
+of a stored block can confirm a guess about that block's content. We recommend
+storing objects in the encrypted representation whenever their content is
+confidential, so that every stored block, and every CRC and parity block
+computed from it, is a function of ciphertext.
+
+Serves REM-ENCRYPT §12.5, Confidentiality Boundary, Public Facts, and Catalog
+Trust; REM-ENCRYPT §12.7, Non-Committing AEAD; and REM-PARITY §16.4, Structure
+Leakage and Confidential Payloads.
+
+### In plain terms
+
+Seal every object so that losing one key does not lose the object, keep each
+private key as its 32-byte seed, trust a public key only when it has been
+checked independently, and take randomness only from the operating system.
+While a tool works, it should hold secrets briefly and never write them where
+others can read them, attribute values included. Keep every key for as long
+as an object needs it.
+
+## 8. Verification, scrub and repair
+
+The specification defines what a Verifier checks and what a claim of validity
+rests on. This chapter covers the checks that other tools can usefully make,
+how to report what verification finds, and how to scrub and repair stored
+copies.
+
+### 8.1. Verify the manifest before decoding it
+
+An unverified manifest is untrusted input from removable media. A decoder
+that parses it before verifying it exposes itself to hostile bytes, and a
+tool that acts on a field before verification may act on a forged value.
+
+We recommend verifying the manifest bytes against their anchor digest before
+decoding any field. The specification fixes what a tool may rely on: "A
+Consumer MUST NOT rely on a manifest field unless it has verified the manifest
+bytes against an anchor digest." (REM-OBJECT §4.7.2).
+
+Serves REM-OBJECT §4.7.2, Schema.
+
+### 8.2. Make the cheap cross-checks
+
+Some inconsistencies can be found by any reader at almost no cost, and
+finding them early points to a writer defect or to damage before it causes
+anything worse.
+
+A reader should cross-check each entry's `REMANENCE.chunk_count` against the
+value recomputed from the entry's effective size, and should surface a
+mismatch as an inconsistency. When both the manifest and the archive entries
+are at hand, a consumer that is not acting as a Verifier should still check
+that they correspond: the same paths, entry types, link targets, sizes,
+hashes where present and chunk geometry, with nothing extra on either side.
+
+Serves REM-OBJECT §4.6.2, Per-Entry Keywords, and REM-OBJECT §4.7.2, Schema.
+
+### 8.3. Report every nonconformity
+
+A verifier that stops at the first fault gives an operator one problem to fix
+at a time, and hides how damaged a copy is.
+
+A verifier should report every nonconformity it finds, in every
+representation, rather than only the first. The same holds for a tape
+verifier, which checks a tape's structures and digests end to end.
+
+A tape verifier has a second obligation of the same kind. A check that reads a
+tape's structures (the bootstrap, the terminal replicas, the sidecar headers
+and footers) but never reads a data block or a parity shard cannot say that
+the tape's protected content is intact, and a tool that reports such a tape as
+verified misleads its operator. The specification says so: "A check of
+structure and metadata alone, which reads no data block or parity shard, is
+not a full verification." (REM-PARITY §2.2).
+
+The specification defines the verifier's validation as a full verification: "A
+Verifier's validation is a full verification: it reads every data block that a
+sidecar protects and every parity shard, and checks each against its sidecar's
+index" (REM-PARITY §2.2). It also fixes how a failure is named: "It reports each
+block or shard that fails by its address: a data block's tape-file position, or
+a parity shard's epoch, stripe and parity index." (REM-PARITY §2.2). The
+definition goes on to say when a tape is complete: the terminal suffix is
+complete, the full verification was performed, and no failed block or shard and
+no finding about a sidecar, a copy of the ParityMap or its footer, or the prefix
+was found.
+
+The specification leaves some things open, and we recommend the following. A
+tool that has not read the blocks should say that it has not, and should not
+present the tape as clean. An operator should be told which check was run,
+because a full verification costs the drive's read of the whole written tape,
+which for a full cartridge is many hours, where a check of structure alone takes
+minutes. Remanence, for example, reports a tape's protected content as verified
+only from its full verification. Section 12.9 gives the practice for a sidecar
+whose index cannot be acquired.
+
+Serves REM-OBJECT §7.4, Verifier Profile; REM-ENCRYPT §7.4, Encrypted Verifier
+Profiles; and REM-PARITY §2.2, Conformance Roles, and §13.4, Erasure Taxonomy.
+
+### 8.4. Make restore the default, and salvage a deliberate choice
+
+A damaged object can still hold most of its files intact. A salvage mode that
+delivers what it can, while reporting what failed verification, is valuable.
+Used by accident, the same mode delivers unverified bytes to someone who
+believes they were verified.
+
+We recommend making the integrity-verifying restore mode the default, and
+offering salvage only as a mode the operator selects deliberately and that is
+clearly labelled in every report. The specification forbids the silent case:
+"A Reader MUST NOT silently fall back to salvage." (REM-OBJECT §4.9).
+
+Serves REM-OBJECT §4.9, Builder, Planner, and Reader Obligations.
+
+### 8.5. Expose typed errors
+
+A caller that receives only a message string cannot tell a damaged object
+from a failing drive, and cannot act on either.
+
+We recommend that a tool expose typed errors equivalent to the taxonomy of
+REM-OBJECT §11. The specification makes one distinction a requirement: "I/O
+failures MUST remain distinguishable from format violations." (REM-OBJECT
+§11).
+
+A tape tool should likewise expose typed errors equivalent to the taxonomy of
+REM-PARITY §15. That specification makes the same distinction and one more:
+"Refusals (Section 13.2), parse failures, and reconstruction failures MUST
+remain distinguishable; I/O faults MUST remain distinct from format
+violations." (REM-PARITY §15).
+
+Serves REM-OBJECT §11, Errors, and REM-PARITY §15, Errors.
+
+### 8.6. Scrub by stored digest, without keys
+
+A copy that nobody reads can decay for years before anyone notices. The
+specification makes every copy checkable without keys: "Any stored copy MUST
+be scrubbable by `stored_digest` alone" (REM-OBJECT §3.3).
+
+We recommend scrubbing stored copies by `stored_digest` on a regular schedule,
+without keys and without interpreting the bytes. On tape, the parity layer
+also protects every stored block with a CRC, and can verify and repair at
+block granularity without reading the whole object. Both checks work on stored
+bytes and do not depend on the representation.
+
+Serves REM-OBJECT §7.5, Scrub.
+
+### 8.7. Repair stored blocks first, then open the encrypted copy again
+
+Parity repair of an encrypted object works on ciphertext and needs no keys.
+The envelope fails closed: a copy with damaged blocks does not open.
+
+We recommend repairing the damaged stored blocks from parity first, and then
+retrying decryption on the recovered stored bytes. A repair that did not
+succeed produces no plaintext, because REM-ENCRYPT requires that "When a
+metadata or chunk tag fails, the implementation that checks it MUST stop
+processing without releasing that chunk's plaintext." (REM-ENCRYPT §12.4).
+
+Serves REM-OBJECT §9, Relationship to the Parity Layer, and REM-ENCRYPT §12.4,
+Fail-Closed.
+
+### 8.8. Validate and stage recovered plaintext before publishing it
+
+Authentication shows that an envelope is intact and was sealed under its
+keys. It does not show that the plaintext inside is a valid REM-OBJECT, or
+that it is the object the header names: a defective sealer can seal the wrong
+stream. Members published from such a recovery, or published before the
+recovery has finished, may be wrong or incomplete.
+
+After whole-object authentication, we recommend validating the recovered
+inner stream under the Verifier profile of REM-OBJECT §7.4, staging the
+recovered plaintext on protected storage, and publishing restored members only
+after the whole recovery has succeeded. The specification fixes the part that
+concerns what a tool may claim: "A Keyed Reader MUST NOT publish restored
+members until it has compared the inner stream's `REMANENCE.object_id` and
+`REMANENCE.chunk_size` with the scalar header." (REM-ENCRYPT §5.10). Section
+6.10 explains why the staging area should be protected.
+
+Serves REM-ENCRYPT §5.10, Opening, Recovery, and Keyless Inspection, and
+REM-ENCRYPT §12.11, Threat Model and Secret Handling.
+
+### In plain terms
+
+Check the index before trusting it, look for the inexpensive signs of
+trouble, report everything you find, never pass off a rescue as a clean
+restore, and check every copy on a schedule. When a copy is damaged, mend its
+bytes first and open it afterwards. When you decrypt a copy, check what came
+out and keep it staged until the whole recovery has succeeded.
+
+## 9. Writing tapes: sessions, commit and resume
+
+REM-PARITY fixes what a committed tape file is, what the bytes of a tape must
+be, and where a resumed session appends. It does not say how a writer should
+keep its commit records, batch its synchronization, react to a failed write or
+seed a resumed session. Those choices decide whether a writer that crashes
+leaves a tape that can be continued safely. This chapter collects the practice.
+
+### 9.1. Put enough in each commit record to resume
+
+A commit record is what makes a tape file part of the committed prefix. A
+record that lacks the file's place in the map, or the state a resumed session
+needs, leaves a later session unable to find the true append point, and a write
+at the wrong point overwrites committed data.
+
+We recommend that each commit record hold the tape file's filemark-map entry
+(REM-PARITY §7.1) and enough state to seed a resumed writer (section 9.9). An
+object and the sidecars emitted at its close can share one durable
+transaction, because they are committed together. How the record is stored is
+the implementation's own choice: "The commit record's format is
+implementation-defined (a journal, a database row, a replicated log entry)."
+(REM-PARITY §3.4).
+
+Serves REM-PARITY §3.4, The Durable Boundary.
+
+### 9.2. If commit authority spans several records, name them and make them agree
+
+Some implementations spread one logical commit record over several durable
+records, for example a journal of tape files and a journal of checkpoints. If
+one of them is missing, or two of them disagree, a resumed session can derive
+the wrong prefix and write over committed data.
+
+We recommend naming which records are required commit authority, and, before
+positioning or writing, requiring every one of them to be present and their
+overlapping claims to agree. When they do not agree, a tool should stop, and
+restore one unambiguous commit record through a deliberate recovery procedure,
+rather than choose between them. Before finalization these records, not the
+tape, are the authority for the open prefix and the append position. The
+specification fixes the outcome: "Before a Resumer positions to an append point
+or writes, the validated combination of the records it relies on MUST determine
+exactly one committed prefix and its append point." (REM-PARITY §3.4); a resume that
+cannot establish one fails as `ResumeAppend`. Remanence, for example, keeps a
+tape-file journal and a checkpoint journal for each tape and compares their
+histories entry by entry before it appends; the
+[on-tape layout reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-tape-layout.md#on-disk-durable-records-and-rebuildable-state)
+describes them.
+
+Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.1, Inputs and
+Authority.
+
+### 9.3. Batch synchronization behind one barrier
+
+A synchronous filemark after every tape file makes the drive stop and wait for
+the medium each time, which costs it its streaming speed.
+
+Consecutive tape files can share one synchronizing barrier, and one commit
+record, or one durable transaction, can cover the whole batch. A writer usually
+keeps, in memory, a projection of the filemark map and a record of its durable
+boundary. We recommend adding a tape file's entry to that projection, and
+advancing the boundary past the file, only once the file's synchronization is
+proved: at its own synchronous filemark, or, under deferral, at the barrier,
+for every file the barrier covers. The specification fixes when the batch counts as committed. Of the
+barrier it says: "It MUST complete before the commit record of any file it
+covers takes effect." (REM-PARITY §11.1).
+
+Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
+
+### 9.4. Treat staged records as uncommitted until their barrier
+
+A writer that records files durably before their barrier completes can crash
+between the record and the barrier. A replay that trusts such a record counts a
+file as committed that may never have reached the medium.
+
+A writer can stage durable records for files that are written but not yet
+proved, but replay should disregard any staged record that is not followed by a
+commit marker written after its barrier. Remanence, for example, keeps such
+records as orphan evidence and refuses to append to the tape until they have
+been reconciled with the tape's physical tail.
+
+Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
+
+### 9.5. Stop the session when an outcome is unknown
+
+After a failed or completion-unknown barrier, or an end-of-medium report, a
+writer no longer knows exactly where the head is or which blocks reached the
+medium. A further write can land over data the writer believes is committed.
+
+We recommend poisoning the writer in each of these cases, and after any failure
+whose completion is unknown: a poisoned writer refuses every further operation
+in the session. A write failure whose completion is known, one that consumed no
+position, can leave the writer usable. The specification fixes what may be
+claimed: after such an outcome "every file the barrier would have covered
+remains uncommitted" (REM-PARITY §11.1), and "Failure at any step MUST abandon
+the in-flight file." (REM-PARITY §11.1). Remanence, for example, poisons its
+parity sink after a barrier error, an end-of-medium report or a failed position
+check, and keeps it usable after a block write that failed without consuming a
+position.
+
+Serves REM-PARITY §11.1, Commit Discipline (per Tape File).
+
+### 9.6. Write with memory bounded by the geometry
+
+An object can be far larger than a parity epoch, and an epoch far larger than a
+host's memory.
+
+Because parity accumulates incrementally (REM-PARITY §6.3), a writer needs to
+hold only `S × m` block-sized parity accumulators and one CRC per pending data
+block, whatever the sizes of the objects it writes. At the default geometry the
+accumulators take 512 MiB (REM-PARITY Appendix A.1). A sidecar that is complete
+but not yet written can wait in memory or in a spool file until the current
+object closes.
+
+Serves REM-PARITY §11.2, Epochs and Sidecars.
+
+### 9.7. Prove that compression is off before writing parity
+
+Hardware compression breaks the correspondence between logical blocks and
+media on which the damage model of parity rests, and it does so while appearing
+to work (REM-PARITY §16.3). A drive can also ignore a setting, or a later
+command can change it.
+
+We recommend setting the drive's compression off and then reading the setting
+back, before the first parity write of a session, and refusing to write if the
+read-back does not confirm it. The specification requires the outcome: "Drive
+hardware compression MUST be verified off before any parity write." (REM-PARITY
+§11.4). Remanence, for example, sends MODE SELECT, checks the result with MODE
+SENSE, and records the observed value as bootstrap key 5.
+
+Serves REM-PARITY §11.4, Session Preconditions.
+
+### 9.8. Know where the head is before writing
+
+Counting blocks as they are written, dead reckoning, is fast and usually right.
+After a filemark, the end of data, an unclassified error or a read that crossed
+tape files, the count can be wrong, and a write issued at a wrong position lands
+over committed data or short of the append point.
+
+Dead reckoning is fine between checks. We recommend resynchronizing with a
+positional query, for example SCSI READ POSITION, after any boundary or
+unclassified error, and verifying the append point by a positional query before
+the first block a resumed session writes. The specification fixes the outcome:
+"The first block written lands exactly at the append point" (REM-PARITY §14).
+Remanence, for example, locates to the append point on resume, reads the
+position back with READ POSITION, and refuses to write if the two differ.
+
+Serves REM-PARITY §3.5, Requirements on the Tape I/O Layer, and REM-PARITY §14,
+Resumer Obligations.
+
+### 9.9. Resume a tape from its commit records
+
+A resumed session has to continue the parity of the epoch that was open when
+the last session ended, and finalization has to describe the whole tape later.
+A writer that seeds itself from anything less than the committed prefix
+produces a sidecar or a terminal inventory that disagrees with the tape.
+
+We recommend seeding a resumed writer with the complete replayable prefix map,
+the Object recovery rows, one full directory entry for every committed sidecar,
+the durable boundary, `W`, the next epoch id, and the open epoch `[W, T)`
+rebuilt from the tape (REM-PARITY §14, step 3). That source should stay
+replayable, so that finalization can later emit the final ParityMap and stream
+the same snapshot into replicas A, B and C. A generation-2 tape carries at most
+one ParityMap, so its `sequence` counter has no consequence for a reader.
+
+At resume time the writer should not close `[W, T)` or emit a sidecar for it;
+the epoch closes later, through the ordinary cycle. When a sidecar is emitted,
+we recommend re-parsing its encoded bytes and comparing them with the planned
+header, index and shard bytes before committing it. A correct encoder never
+fails this check, and a defective one is caught before its bytes are committed.
+Remanence, for example, does not close `[W, T)` at resume, and re-parses a
+rebuilt sidecar before it writes it. The pinned vector `resume-round-trip`
+records the bytes of a writer that does not close `[W, T)` at resume.
+
+Serves REM-PARITY §10.3, Object Recovery Rows, and REM-PARITY §14, Resumer
+Obligations.
+
+### In plain terms
+
+A tape writer keeps a record, off the tape, of what it has committed. Put enough
+in that record to pick up where you left off, and if the record is spread over
+several places, make sure they agree before you write. Wait for the drive to
+confirm that data is on the medium before calling it committed, stop the
+session when you are unsure what happened, check the head's position before
+writing, and prove that compression is off before writing parity.
+
+## 10. Finalizing a tape and recovering from a crash
+
+Finalization writes five components at the end of a tape, in order: replica A,
+separation AB, replica B, separation BC and replica C (REM-PARITY §8.3). Each
+takes time, and a crash can come between any two of them. REM-PARITY fixes
+what a finalized tape contains and what a tool may report about it. This
+chapter is about getting there across crashes and failures.
+
+### 10.1. Make the decision to finalize durable before the first terminal write
+
+A tool can crash after beginning terminal writes but before durably recording
+its decision to finalize. On restart, it has no record of that decision. It
+can then append an Object after a partial terminal suffix. The tape then carries
+control structures among its Objects.
+
+We recommend recording the transition to `Finalizing` durably before any
+terminal media motion. From that moment, the tool should refuse every Object.
+The specification fixes the effect: "The accepted transition to `Finalizing`
+permanently disables Object admission." (REM-PARITY §3.4).
+
+Serves REM-PARITY §3.4, The Durable Boundary.
+
+### 10.2. Record progress after each barrier-proved component
+
+A replica's footer records where the writer believed it was, but it does not
+prove the replica's trailing filemark, its barrier or any host record
+(REM-PARITY §8.4). A tool that reads its progress back from the tape, or that
+records progress before a barrier completes, can skip a component or write one
+twice.
+
+We recommend recording durable progress at six points, before replica A and
+after each of the five components. Progress should advance only when a
+component's barrier has completed and the component agrees with the plan.
+A count of completed replicas is a convenient summary, but it is not enough to resume
+from: after a complete separation extent, only the six-point record says that
+the extent must not be written again.
+
+Serves REM-PARITY §3.4, The Durable Boundary; REM-PARITY §11.3, Finalization;
+and REM-PARITY §12.6, Terminal Completeness.
+
+### 10.3. Finish the host steps on restart without moving the tape
+
+When replica C has been proved, the tape is complete, but the tool may not yet
+have recorded that durably, or updated its catalog. A crash at that moment
+leaves the tape finished and the host unfinished.
+
+On restart, a tool in that state should finish its host records without further
+media motion: no terminal component is repeated, and nothing is written after
+C. If a completed record and a stale intent to finalize both survive and
+agree, the completed record should take precedence. If they disagree, the tool
+should stop rather than choose. Remanence, for example, keeps a sealed
+checkpoint and a companion intent. On the uninterrupted path it fsyncs the sealed
+checkpoint. It then retires the companion. The final catalog projection
+follows. When a crash leaves both behind, startup recovery projects the sealed
+checkpoint first. It retires the companion only after that projection succeeds. The
+[on-tape layout reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-tape-layout.md#finalization-and-catalog-less-recovery)
+describes the sequence.
+
+Serves REM-PARITY §3.4, The Durable Boundary.
+
+### 10.4. Keep a failure's classification across restarts
+
+A component that failed, or whose completion is unknown, leaves the medium in a
+state that must be reconciled before finalization continues. A restart that
+forgets the failure proceeds as if the component were intact.
+
+We recommend storing the classification durably with the finalization's
+progress. The tool should keep it across restarts at the same progress. It
+should clear it only when the next component succeeds or, after replica C,
+when a normal completed record has been made durable. The specification calls
+the state
+`RecoveryRequired` (REM-PARITY §3.4).
+
+Serves REM-PARITY §3.4, The Durable Boundary.
+
+### 10.5. Repair only what is missing, under the medium's rewrite policy
+
+A component whose header was written but whose payload was not is a torn terminal
+component, and it sits at a planned position that later components depend on. On
+rewritable media it can be rewritten. On WORM media, or where the tool cannot
+prove where the component starts, a further write risks damaging what is
+already there.
+
+We recommend first reconciling the medium with the recorded progress. A torn
+component should then be rewritten only where its start is proved and the
+medium allows rewriting. On WORM media or at a start that cannot be proved,
+the tool should stop with no further motion. A tool should never remove its
+own barrier against new Objects in order to recover. The specification fixes what a recovery may not
+do: "It MUST NOT write an Object or append a second terminal suffix."
+(REM-PARITY §3.4). Remanence, for example, classifies a header-only component
+that it finds on restart as a torn terminal component, never as an Object.
+
+Serves REM-PARITY §3.4, The Durable Boundary, and REM-PARITY §12.3, The
+Classification Ladder.
+
+### 10.6. Accept reduced redundancy only as a separate, deliberate decision
+
+If a component is torn on WORM media after one or two replicas were completed,
+those replicas are complete inventories, but the tape will never have three.
+Treating it as finished without saying so would hide, from later readers and
+operators, that one damaged region could now cost the whole index.
+
+We recommend that a tool remain in `RecoveryRequired` in that case. Accepting
+the reduced set should be a distinct operator decision, recorded in the tool's
+audit trail. The specification fixes what may be claimed in the
+meantime: "A Writer MUST NOT report a tape as `Finalized` while fewer than three
+complete replicas exist." (REM-PARITY §3.4). It allows the separate acceptance,
+as `FinalizedDegraded`, without defining it. Remanence does not yet offer that
+decision. Its catalog can represent a `finalized_degraded` outcome, but nothing
+produces it. Such a tape stays in `RecoveryRequired`.
+
+Serves REM-PARITY §3.4, The Durable Boundary.
+
+### 10.7. Check the position against the planned end of data
+
+A drive that reports success for every component can still leave the head
+somewhere other than planned, for example after a silent position error.
+
+After replica C's barrier, we recommend one read-only position check against
+the planned end of data, `expected_eod_lba` in the terminal layout (REM-PARITY
+§8.3). Remanence, for example, makes this check.
+
+Serves REM-PARITY §8.3, Placement (Writer).
+
+### 10.8. Stream the inventory into the replicas
+
+A tape can hold a million Objects, and each replica carries a 256-byte row for
+every one of them.
+
+Finalization can stream the complete row set from the writer's replayable
+source into A, B and C, and needs no allocation for the whole index. The three
+replicas should carry the same snapshot, fixed before replica A (REM-PARITY
+§8.3).
+
+Serves REM-PARITY §10.3, Object Recovery Rows.
+
+### In plain terms
+
+Finalizing a tape writes its index three times at its end. Decide durably
+before you start. Record progress only after each piece is proved on the
+medium. On restart, finish what the tape already shows rather than writing
+it again. When something breaks, repair only what is missing. Do not call a
+tape finished with fewer than three good copies of its index unless someone has
+decided, on the record, to accept that.
+
+## 11. Retiring and recycling media
+
+A finalized tape holds its data until someone decides that it need not. Two decisions of that kind are common. An archive wants to reuse a cartridge, for instance a tape that held a temporary second copy before the files were archived. Or it wants to remove a file that should no longer be kept. The formats decide neither. They define no deletion of an object and no erasure, and they do not say when a medium is retired or reused (REM-PARITY §1.5, What this document specifies, and what it does not). The decisions belong to the system above the formats, and the practice in this chapter is how to take them without losing the only copy of anything.
+
+### 11.1. What exists today, and who does what
+
+**Status.** The recycling workflow of this chapter is not yet implemented in Remanence, and the orchestrator that uses Remanence does not implement it either. The chapter describes the practice to build and the guarantees to ask for. Remanence today does one related thing. Retiring a tape identity (`rem tape retire`) changes only the catalog: the tape's row becomes retired, its copies are marked missing, and the history stays. It does not touch the medium, it does not check that the files are held elsewhere, and it is not a deletion of files. Initialising a retired cartridge again gives it a new identity. Soft deletion, the manifest of a medium's contents and the release of a medium described below do not exist in Remanence yet.
+
+**Who does what.** The practice assumes a division that holds for any implementation and any orchestrator. The implementation reports exactly what a medium holds, and it acts safely on a medium. The orchestrator proves, against its own policy, that nothing on the medium is needed. No archival policy crosses the boundary. The implementation does not know how many copies the archive requires, and the orchestrator does not reach into the implementation's internals. They meet at a small set of operations over a **reclamation unit**, the smallest thing that can be released and reused as a whole. For Remanence, a unit is one recording life of a tape, that is, one tape UUID. The operations are: a snapshot, which returns an immutable manifest of the unit's contents; a release, which accepts a unit at an exact revision of that manifest; a reclaim, which makes the unit reusable; and a query for the state of an operation.
+
+Serves REM-PARITY §1.5, What this document specifies, and what it does not.
+
+### 11.2. Release a medium only when every file on it is held elsewhere
+
+Releasing a tape ends the copies on it. If the tape held the only copy of a single file, that file is lost, and nothing on the tape will show it. A loose test, such as "the files are archived somewhere", hides the cases that matter: a file that belongs to more than one class of content, a file inside a container that the implementation cannot see into, a copy on the same cartridge under an older identity, and a copy that nobody has read since it was written.
+
+We recommend releasing a medium only when, for every file the medium's manifest reports, every applicable class's policy is met by copies that are not on the medium:
+
+- the required placements, the number of copies, the families of implementation and the separation of media, with separation counted by cartridge (its barcode and its hardware serial, and every identity the cartridge has had) and not by tape identity;
+- offsite confirmation, where the policy sets it;
+- a measured digest on every counted copy (section 11.3), no older than the policy allows.
+
+A file that belongs to several classes must pass the policy of each. Copies are not pooled across classes. The manifest does not see inside a payload that the implementation was handed as one container, so the orchestrator should expand it with a **coverage certificate** that binds the container's digest, the inventory of its inner members, the mapping of every transform from original hash to stored hash, the policy revisions in force and the locators of the surviving copies. The inventory should be reconciled against an independent source, such as the container's own member table, read back or recorded when the container was built. Each transform needs its own evidence: a recomputation from the measured original, or a measured hash of the stored member together with the transform's recorded deterministic recipe. Hashing the records into the certificate is not evidence. A mapping that is unknown, a member that cannot be classified, an entry that is not a regular file (a link, an empty directory, recorded metadata) and is not shown to be archived elsewhere, all block the release. The test fails closed.
+
+A lifecycle rule in an object store is a contrast to this practice. It deletes by elapsed time and does not ask whether another copy exists, so it gives no precedent for the test above.
+
+Serves REM-OBJECT §3.3, Identities and Digests, whose per-file `file_sha256` is what survives a rebuild of an object; and REM-PARITY §1.5, What this document specifies, and what it does not.
+
+### 11.3. Measure, do not count
+
+A catalog can show three rows for a file and be wrong about all of them. A row says that a copy was written. It does not say that the copy can be read today. A health flag derived from catalog status says even less: in Remanence a copy shows `OK` when its status is `committed`, which is no evidence that it was ever read back (section 2.2).
+
+We recommend that a copy counts toward a release only when it has been measured, that is, read back and its digest compared. The comparison should be with a reference hash for each file, taken when the file was first written and before the first copy was made, and so independent of every later copy. A copy counts once it has been verified at least once after it was written, has had no failed check since, and was verified within the archive's scrub interval. The verification may come from the implementation, including a read-only adapter for tapes written by other software, or from the writing system's own check, when that check records a hash that can be compared. Catalog cross-checks, witnesses, a health flag and a copy that has never been measured do not count.
+
+An encrypted copy can be checked by its `stored_digest` without any key (REM-OBJECT §3.3). That check shows that the stored bytes are intact. It ties them to the original files only through a link made when the copy was built, for example by reading back every member at that time. An archive that holds a copy it cannot open should record that link, and count the copy only through it.
+
+A workflow of backup before archiving, for example, can compute the SHA-256 of every file when it writes the backup tape. Those become the reference hashes. A read-only adapter reads the unencrypted archival copies written by other software and hashes each file. A match with the reference hash is then a measured verification, independent of the writer. An encrypted copy written by the implementation is verified by its stored digest, and is tied to the file hashes by the read-back at build. The backup tape is released when every archival copy of every file on it has been verified in this way, and the archival policy is met in full. Copies that are held unencrypted rely on physical custody for their confidentiality, and that includes any copy held offsite.
+
+Serves REM-OBJECT §7.5, Scrub; REM-OBJECT §3.3, Identities and Digests; and REM-PARITY §2.2, Conformance Roles.
+
+### 11.4. Bind the proof to an exact snapshot of the medium's contents, and check it again at the moment of action
+
+A proof is about the medium as it was when the proof was made. A tape can be appended to, a catalog can be rebuilt, and a recovery can replace a tail between a proof and a release. A release that rests on the earlier contents can then discard files that the proof never saw.
+
+We recommend that the implementation offer an immutable manifest of a medium's contents, and that a proof refer to it by a revision. The manifest should state its structural rows, the copy and object rows, every file the implementation knows inside each object (with path, size, hash and algorithm), and whether each object was built from files that the implementation saw or handed over as one payload it cannot see into. It should carry a **coverage statement**, which is either complete through the committed boundary or the exact list of gaps: object candidates of unknown identity, objects with no file inventory, a physical tail that is unresolved, a scan not yet run. An empty manifest never certifies an empty tape. The manifest ends with a trailer of counts and the revision, and a consumer uses it as proof only after it has the trailer and the stream has completed.
+
+The revision should be a digest over a canonical encoding of the recording's identity, a generation number, the committed boundary, and the ordered rows and gaps, with an explicit marker for every absent value and the digest algorithm named beside each digest. The generation number increases on every change that affects the manifest, so that a change followed by its reversal is still detected. Whether a tape is fenced is not an input, so installing a fence cannot invalidate the revision it protects.
+
+At the moment of release the implementation should take a consistent snapshot, install a durable fence against writes, appends, recovery of terminal files and initialisation (reads continue), recompute the revision, and compare it with the one in the request. It should refuse if coverage is not complete, if the revision differs, or if the proof has expired. It should refuse a medium with an open session or an unfinished operation that mutates it. A repeat of the same request returns the same receipt. A proof that expires before the recycle needs a renewal, tied to the receipt of the release. Remanence does not implement any of this yet.
+
+Serves REM-PARITY §3.4, The Durable Boundary; and REM-PARITY §11.3, Finalization.
+
+### 11.5. Reserve the copies the proof relies on
+
+A proof says that the files on the candidate are held by other copies. If one of those copies is released, migrated or retired by another process before the recycle, the proof is false by the time it is used. Two candidates can each rely on the other.
+
+We recommend that, before it asks for a release, the orchestrator durably reserves the copies that qualify, and excludes every pending or released candidate from every other proof. Every process that disposes of media should honour the reservations: release, retention and migration. The reservation is held until the recycle completes or the release is withdrawn, and the withdrawal should be possible before the recycle begins. The orchestrator should evaluate the proof again at the moment of release. An accepted release authorises the recycle that follows it, and a recycle later than the proof's expiry needs a fresh proof.
+
+Serves REM-PARITY §1.4, Non-Goals, which leaves placement policy to the system that uses the format.
+
+### 11.6. Keep the medium's history after recycling
+
+A catalog, a locator in an old report or a restored backup may still refer to a medium by its former identity. If the record of that former life is gone, those references look valid, and a recycled tape can seem to hold files that were written to it years before and no longer exist.
+
+We recommend retiring the old identity without deleting its rows. The record of each release and recycle (who asked, on what proof, with which identities) should be kept in a durable journal that the catalog is a projection of, and every rebuild should derive the availability of copies from it. Copies on a recording that was released should be marked as such, apart from their health, and ordinary enumeration should return only current copies, with history available when it is asked for. A rebuild that reads only the media cannot recover a release, because the decision is held only on the host, so this record is state to back up. A recording whose release history is missing after a restore needs recovery, and is not current. Remanence today keeps a retired tape's row and its audit record, and a rebuild marks the copies on a retired tape as missing ([lifecycle explainer](https://github.com/archivetechie/remanence/blob/main/docs/tape-identity-lifecycle-explainer.md)).
+
+Serves REM-PARITY §3.4, The Durable Boundary, which leaves the commit record to the implementation.
+
+### 11.7. Give a recycled medium a fresh identity
+
+A tape is attributed to its identity: the 16-byte `tape_uuid` of the bootstrap is the key from which the magics of every later structure on the tape are derived. A recycled tape that kept its identity would still carry a valid bootstrap, and any structure left from its earlier life would still look like this life's. The harm is not that a reader misreads the new bytes. It is that a catalog's belief about the earlier contents carries over.
+
+We recommend that every initialisation of a recycled medium assigns a new identity, a random version-4 UUID, as the specification recommends for each tape (REM-PARITY §8.1, Fixed Frame (One Block, Exactly)). The format does not require it, because a tape that reused its identity is still read correctly. After initialising, check the beginning of tape and the end of data, and attribute a block to a tape only by a magic derived from that tape's identity (REM-PARITY §5.2, HMAC-Derived Magics). Remanence's tape initialisation takes a fresh identity. Its freeze-drill test tool still reuses a marked identity when it overwrites its own scratch tape, and is to be changed to take a fresh one.
+
+Serves REM-PARITY §8.1, Fixed Frame (One Block, Exactly); and REM-PARITY §5.2, HMAC-Derived Magics.
+
+### 11.8. End of data is not erasure, and recycling is not sanitisation
+
+Initialising a tape again writes a new beginning and moves the end of data. Every reading procedure stops at the end of data: a walk from the beginning ends there (REM-PARITY §8.4.1, All-Replicas-Invalid BOT Walk), so conformant readers agree about what the tape holds. Bytes beyond the end of data are not read, and they may still be on the medium. Ciphertext remains too, and it stays readable by anyone who later gets the keys.
+
+We recommend treating recycling as reuse within the archive's custody, and never as sanitisation. A recycled tape stays in the archive's custody. Sanitisation is a separate and explicit operation, chosen by how the data was categorised. NIST SP 800-88 describes the choice among clearing, purging and destroying media, and an archive that must sanitise should follow it, and record what it did. The formats define no erasure, so they limit no claim about one, and a tool should not claim erasure on the strength of a recycle.
+
+Serves REM-PARITY §1.5, What this document specifies, and what it does not; and REM-PARITY §8.4.1, All-Replicas-Invalid BOT Walk.
+
+### 11.9. A torn re-initialisation needs recovery, never "blank"
+
+Initialising a tape writes a new beginning to the medium and then records the new identity in the catalog. If power fails in between, the cartridge has a new bootstrap, an old catalog, and possibly a half-written block. A tool that meets a tape it cannot recognise may treat it as blank and write to it, which can destroy a good recovery.
+
+We recommend that a recycle is a journalled transaction with fixed phases: intent, with the new identity chosen in advance; retire; write the beginning of tape; verify the beginning of tape and the end of data; provision; complete. The tool should hold the cartridge for all of it, excluding readers and every other initialisation. The rule at each crash boundary is as follows. A write of the beginning of tape that was interrupted makes the tape need recovery, and it is never classified as blank. A new beginning that is durable but not yet provisioned is checked against the planned identity and provisioned without allocating another. A new identity stays fenced until the completion is durable. Every other path that can overwrite or re-provision a tape (initialisation with a clobber, forced re-provisioning, developer tools that write a dump, a drill, recovery of terminal files) should refuse a medium that is released or being released, and a force flag should not override that.
+
+Serves REM-PARITY §8.4, Discovery (Reader); and REM-PARITY §8.1, Fixed Frame (One Block, Exactly).
+
+### 11.10. On an archive, delete softly: a catalog tombstone, reviewed, applied at migration
+
+Tape does not delete a file in place, and an attempt to do so either fails or damages what lies beside it. The formats define no deletion. An archive still needs to be able to decide that a file should go.
+
+We recommend that a deletion is a catalog-level soft delete, which does nothing to the tape. Each deletion is recorded as a durable tombstone that has been reviewed before it takes effect, and the tombstone survives a rebuild of the catalog and is protected against resurrection from a restored one. The deletion is applied at the next migration: the migration omits tombstoned files when it rewrites onto new media, and its output is compared with the expected set of files that are not tombstoned. The old medium is then released by the procedure above, with each of its files shown under one of two dispositions: preserved elsewhere, or deletion authorised by a reviewed tombstone. Then it is recycled. The implementation needs no delete operation. This workflow is not implemented in Remanence, and a release proof that records both dispositions is part of its design.
+
+Serves REM-OBJECT §1.6, What this document specifies, and what it does not; and REM-OBJECT §3.3, Identities and Digests.
+
+### 11.11. Destroying keys denies access and does not erase
+
+Destroying the keys that open an encrypted object makes the object unreadable to anyone who relies on those keys. It leaves the ciphertext on the medium, on every other copy of the object, and on any copy of the key that survives. Reporting key destruction as deletion or sanitisation overstates what happened. Destroying a key too early has a cost of its own: an object can be opened only while the private key of one of its recipients survives, and a destroyed key cannot be replaced for objects already sealed to it.
+
+We recommend that key destruction is recorded as a denial of access and never as an erasure. Before an epoch's private key is destroyed, check that no live object depends on it, or that every object that did has been resealed to other recipients (section 7.9). An archive that intends key destruction to serve as a sanitisation method should decide that explicitly, under the sanitisation standard it follows, and should be able to show that every copy of the key is gone. The format does not make that claim.
+
+Serves REM-ENCRYPT §12.8, Key Rotation and Epoch Longevity; and REM-ENCRYPT §12.5, Confidentiality Boundary, Public Facts, and Catalog Trust.
+
+### In plain terms
+
+A tape may be reused only when every file on it is certainly kept somewhere else. "Certainly" means that the other copies have been read and compared with a hash taken when the file was first written, that the proof refers to the medium as it was at that moment and is checked again just before the tape is touched, and that the copies it relies on cannot be released by someone else in the meantime. A reused tape gets a new identity, and the record of its old life is kept. Reuse is not erasure, and destroying a key is not erasure either. Deleting a file from an archive is a reviewed note in the catalog, carried out when the data is next moved to new media. At the date of this revision, Remanence does none of this except retire a tape's identity in its catalog, which changes nothing on the tape.
+
+## 12. Reading tapes
+
+REM-PARITY fixes what a reader must accept, reject and report. It leaves open
+how a reader should get there efficiently, and how it should present a long
+operation to its operator. This chapter covers those choices, for inventories
+and for recovery.
+
+### 12.1. Classify boundaries in both sense-data formats
+
+A read that meets a filemark or the end of data is reported through sense data,
+and a SCSI transport can report it in either of two formats, fixed and
+descriptor. A reader that understands only one of them misses boundaries, and
+builds a wrong map of the tape.
+
+We recommend handling both formats. The tool should be tested against both. The
+specification requires the outcome: "The tape I/O layer MUST distinguish the
+Filemark and EndOfData outcomes on every transport, and on a SCSI transport in
+both of its sense-data formats [LTO-SCSI]." (REM-PARITY §3.5).
+
+Serves REM-PARITY §3.5, Requirements on the Tape I/O Layer.
+
+### 12.2. Compare the envelopes first, and read a body only when needed
+
+A replica's body can run to gigabytes, and reading three bodies to compare them
+costs time and wear. But a replica that is valid on its own may still disagree
+with another, and accepting it without looking would hide the conflict.
+
+Every field that the replicas must share is in the replica envelope, the
+header and footer of each replica (REM-PARITY §8.5 and §10.4). We recommend
+reading all three replica envelopes first. On the healthy path, where they
+agree, the reader should read one body. It should replay bodies only for
+replica envelopes that disagree, to find which editions have payload-valid
+survivors. The specification fixes the rule that
+the comparison serves: "A Scanner MUST NOT accept a replica while another fully
+valid replica differs from it in any edition-common field" (REM-PARITY §8.5).
+Remanence, for example, reads all three replica envelopes on every
+inventory. It reads one body when they agree.
+
+Serves REM-PARITY §8.5, Authoritative Selection, and REM-PARITY §12.4, Terminal
+Replica Validation.
+
+### 12.3. Among agreeing replicas, read C, then B, then A
+
+Agreeing replicas give the same inventory whichever of them is read, so the
+choice is about cost.
+
+We recommend trying C first. If that attempt fails, the reader should try B.
+If B fails too, it should try A. Discovery starts from the end of
+data (REM-PARITY §8.4), and C is the last component on the tape, so on a healthy
+tape the reader reads the body nearest to where the head already is. Remanence
+follows this order.
+
+Serves REM-PARITY §8.5, Authoritative Selection.
+
+### 12.4. Stream the inventory as provisional attempts
+
+A consumer that stores inventory rows as they arrive, before the replica
+carrying them has been fully validated, can keep rows from a replica that later
+fails.
+
+We recommend giving each attempt at a replica its own identifier. Its rows
+should remain provisional until the terminal summary names the selected
+attempt. The reader should emit an explicit rejection for a failed attempt
+before trying the next.
+The stream can then be bounded and backpressured, with no buffer for the whole
+index and no second read of a body on the healthy path. When replica envelopes
+conflict, resolving them can need a bounded replay. The selected attempt can
+then be replayed for its consumer. The specification fixes the consumer's
+side: "An Inventory Consumer MUST commit only the attempt named by the terminal
+summary and MUST discard rejected or unselected attempts." (REM-PARITY §12.4).
+Remanence, for example, gives each attempt an `attempt_id` in its inventory
+stream. It names a rejected attempt before it falls back to the next.
+
+Serves REM-PARITY §12.4, Terminal Replica Validation.
+
+### 12.5. Check the role magic first
+
+A matching magic on a malformed control structure is a damaged index, not an
+Object. A reader that parses fields before it checks the magic can mistake
+damaged control for an Object, or spend its resources on a structure it would
+have rejected.
+
+We recommend checking a tape file's role magic before anything else. The
+reader should then check the frame's fixed fields. Next, it should check every
+size formula before it drives an allocation or a seek (section 3.2). Only then
+should it check the plan, the digests and the payload. The
+specification fixes the conditions but not their order, except that "a matching
+role magic commits the tape file to its control type, so malformed control
+never falls through to Object" (REM-PARITY §10.6).
+
+Serves REM-PARITY §10.6, Replica Validity Conditions, and REM-PARITY §12.3, The
+Classification Ladder.
+
+### 12.6. Walk a tape from BOT with a notice, progress and a way to stop
+
+When all three replicas are lost, the only way to a map is a structural walk of
+the whole tape from BOT (REM-PARITY §8.4.1). It can take hours. An operator who
+cannot see it progress, or stop it, cannot plan around it, and a tool that keeps
+commanding motion against a drive or medium that refuses it can make the damage
+worse. The walk is also taken when the replicas are intact but the tape has
+tape files after its terminal suffix, unless a later suffix whose replicas validate
+supplies a layout of its own, because discovery then does not use the first suffix's layout.
+Section 12.10 explains that case.
+
+We recommend that a tool:
+
+- say that it is falling back to the walk before it starts any BOT recovery
+  I/O;
+- report progress at least once per tape file crossed: the tape-file ordinal,
+  the position as a logical block address, the candidates found so far, and
+  the elapsed time;
+- let the operator abort between tape files;
+- on abort, report the last tape-file ordinal crossed, the candidates found
+  and the drive's position, or say that the position is not known;
+- once it has decided to abort, not read the first record of the next tape
+  file;
+- stop and report after a small number of consecutive positioning failures
+  between tape files, for example eight, rather than keep commanding motion;
+- count read failures separately; and
+- accept the hints it can use: the expected tape UUID, block size and parity
+  scheme (or no parity), which the specification requires when the bootstrap
+  is unreadable, and an expected tape-file count and capacity, which are
+  useful only for estimating progress.
+
+The specification fixes what a hint may not do: "Hints MUST NOT cause any tape
+file to be skipped." (REM-PARITY §8.4.1). Remanence, for example, emits one
+start notice and one progress event for every structurally complete tape file.
+It lets the operator abort between files. It has no positioning-failure
+budget: its walk stops at the first positioning failure.
+
+Serves REM-PARITY §8.4.1, All-Replicas-Invalid BOT Walk.
+
+### 12.7. Refuse an unrecoverable request before reading the tape
+
+A request to recover an ordinal outside the validated scope, in the pending
+epoch whose parity does not exist yet, or in a tape file beyond the durable
+boundary cannot succeed. Attempting it costs tape motion and ends in failure
+anyway.
+
+We recommend making those refusals before any tape read, so that a request
+that cannot succeed costs no motion. The specification fixes the refusals
+themselves: "The Recoverer MUST reject, as typed refusals distinct from
+recovery failures" each of those cases (REM-PARITY §13.2). Two of the pinned
+recovery vectors describe their cases as refused before I/O.
+
+Serves REM-PARITY §13.2, Typed Refusals.
+
+### 12.8. Plan bulk recovery by epoch, and read in tape order
+
+Recovering a damaged region can need every peer of many stripes. Read without a
+plan, the same peer is read again for each stripe, and the head moves back and
+forth across the tape.
+
+We recommend planning per epoch. Within each planning window, the reader
+should read each needed peer at most once. It should read in physical tape
+order. Window and cache sizes are choices of the implementation, not rules of the format. Remanence, for example,
+bounds a planning window at 1024 stripes and its recovery cache at 8 GiB.
+
+Serves REM-PARITY §13.6, Bulk Recovery (Informative).
+
+### 12.9. Acquire a sidecar's index through one path
+
+A sidecar's index is what lets a tool tell a good data block or parity shard
+from a bad one, and the specification gives several ways to find it when the
+footer or one copy is damaged. A Verifier that acquires the index by a routine
+of its own, and a Recoverer that acquires it by another, will sooner or later
+disagree about the same tape. The Verifier will call sound a tape whose index
+the Recoverer cannot use, or the reverse. A verification that does not follow
+the recovery's path also cannot show whether recovery would work.
+
+We recommend one acquisition, used by both roles, and that the Verifier pins
+the index it obtains exactly as the Recoverer pins it. Remanence, for example,
+has its Verifier call the Recoverer's acquisition and pin, and adds no path of
+its own. The steps are those of REM-PARITY §13.3, taken in order, after the
+sidecar's tape file has been located through the map:
+
+1. Read the footer first. Read the file's last block. If it parses as the
+   epoch's footer and its total matches the map entry, read and verify both
+   header copies against the footer's locator, including the canonical metadata
+   hash. Use the primary if it is valid, and the tail copy otherwise, and
+   record which copies were usable. Such a footer decides unless an available
+   directory entry (defined in step 3) disagrees with it on the canonical
+   metadata hash or on the tail copy's position. Then neither decides, a copy
+   that either contradicts is not used, and if no copy remains the epoch's
+   metadata is unavailable. After a valid footer the directory-assisted rescue
+   of step 3 is not tried.
+2. If the footer is unreadable, unparseable or contradicts the map entry, use
+   the primary copy at block 0, and apply the checks of its copy kind and of
+   its block count against the map entry. When a directory entry is available,
+   it decides as the footer would: the primary is used only if its canonical
+   metadata hash equals the entry's, and otherwise step 3 applies. When none is
+   available and the primary validates, the tail copy must still be read. The
+   specification requires it: "a Recoverer whose primary copy validates MUST also read the
+   tail copy at block `H + P`" (REM-PARITY §13.3). A reader that stops at a
+   valid primary never sees a tail that disagrees with it. An unreadable or
+   invalid tail leaves the primary in use. A valid tail whose canonical
+   metadata hash differs from the primary's leaves nothing to decide between
+   them, and the epoch's metadata is unavailable.
+3. If the primary fails and a directory entry is available, or the primary is
+   valid but its hash differs from an available entry's, locate the tail copy from the entry's counts and check its canonical
+   metadata hash against the entry before using it. An entry is available only
+   when the tape's final ParityMap validates and the entry passes two
+   preconditions. The specification states the first: "A Recoverer MUST NOT
+   place a read from a directory entry unless the entry agrees with the
+   sidecar's map entry in tape file, epoch, protected range and block count."
+   (REM-PARITY §13.3). The second is that the entry's total block count equals
+   `2H + P + 1` with `H` greater than zero. An entry that fails either
+   precondition is not available, and affects only its own epoch.
+4. If the footer and the primary have both failed, no final ParityMap
+   validates, and the sidecar's map entry comes from a validated terminal
+   replica, try the tail copy that the map entry locates. The specification
+   requires this too: "a Recoverer MUST try the tail copy that the map entry
+   locates" (REM-PARITY §13.3). The tail starts at block `H + P`, where
+   `H = (total − 1 − P) / 2` and `P = S × m`. A tool should check that
+   `total − 1 − P` is even and that `H` is greater than zero before it
+   computes a position from them. A map found by the BOT walk does not
+   qualify for this rescue, because it gains a validated scope only through a
+   final ParityMap.
+
+Nothing outside a copy found in step 4 vouches for it, so the copy is used only
+if it is valid on its own, records the `H` that was computed, and agrees with
+the map entry in epoch and protected range. Whatever copy is acquired is then
+pinned against the bootstrap's scheme record and block size, or against the
+supplied scheme and block size when the bootstrap is unreadable, and against
+the map entry's ordinal range. The specification fixes the outcome of a
+disagreement: "disagreement is `SchemeMismatch`" (REM-PARITY §13.3).
+
+A tool that reports outcomes has to tell four kinds apart, because they call
+for different actions:
+
+- `SidecarParse`: a sidecar copy or footer that reads and violates the sidecar
+  structure, and a divergence between two copies that both validate. The
+  divergence is reported even when the footer or the directory decides
+  between the copies: a Verifier "MUST report a divergence between the copies
+  as `SidecarParse`, even when the footer or the directory decides it"
+  (REM-PARITY §9.1).
+- `SidecarMetadataUnavailable`, for that epoch only: no header/index copy
+  validated. A copy that the footer or the directory contradicts, or that step 2
+  leaves undecided, counts as not validated. It is reported whatever each copy's own failure was, and it does
+  not affect the recovery of other epochs.
+- `SchemeMismatch`: an index that was acquired but disagrees with the scheme
+  and block size, or with the map entry's ordinal range. Remanence, for example,
+  reports an index whose epoch differs from the map entry's as `SidecarParse`.
+- Findings that carry no name from the specification's list of errors. A
+  Verifier reports damage that a Reader survives without an error, and the
+  specification says how: "Damage that a Reader survives without reporting an
+  error is still damage, and the Verifier reports it without a Section 15
+  name" (REM-PARITY §2.2). Examples are a sidecar copy or footer that cannot
+  be read even though another copy was used, and a copy of the ParityMap or a
+  terminal replica whose records cannot be read. A medium error on such a
+  component is reported as an unreadable component. A fault of the transport
+  that is not medium damage stays `TapeIo`, and says nothing about the
+  component.
+
+When no header/index copy of an epoch validates, there is no index to check
+against, and the Verifier still has work to do. It reads every data block that
+the map says the sidecar protects and every parity shard that the map entry
+locates, reports each read failure, and says that what it read could not be
+checked against a CRC. With no index, the shards start at block `H`, computed
+from the map entry's total as in step 4. When that total gives no valid `H`, the
+map entry locates no shard, and none is read. The specification states each part: "The Verifier still
+reads every data block that the map says the sidecar protects and every parity
+shard that the map entry locates" (REM-PARITY §2.2), and it "reports each read
+failure, and states that the blocks and shards it read could not be checked
+against a CRC" (REM-PARITY §2.2). It must not turn the missing CRC into a failure: "It does not
+report a block as failed for lack of a CRC." (REM-PARITY §2.2). The same holds
+for an index that fails the pin above: "An index that fails the pin of Section
+13.3 is likewise not used for CRC checks" (REM-PARITY §2.2). The tool reports
+the pin's error and the read failures, and takes the parity shards from the
+acquired index.
+
+We recommend that a tool keep the two states distinct in what it shows, an
+epoch whose blocks were all checked against an index and an epoch whose blocks
+were only read. Remanence, for example, records for each sidecar whether every
+block and shard was checked against an acquired, pinned index, and does not
+count a sidecar as verified when they were not.
+
+Serves REM-PARITY §13.3, Acquiring the Sidecar Index; REM-PARITY §2.2,
+Conformance Roles; and REM-PARITY §9.1, Structure.
+
+### 12.10. Explain a walk that the tape did not seem to need
+
+An operator who sees a tape with three good replicas walked from BOT will reasonably think the tool has done something wrong. It has not,
+and the reason is in how discovery chooses a layout.
+
+Discovery starts at the end of data and reads the footers of the terminal
+replicas. A footer supplies a planned layout only when its recorded position
+matches where it was read and the layout's planned end of data is at or after
+the tape's end of data (REM-PARITY §8.4). A tape file written after the
+terminal suffix, a second terminal suffix, or any structural artifact after
+replica C, moves the tape's end of data past the planned end of data. The
+specification says what follows: a tape file written after a suffix "moves the
+tape's EOD past the planned EOD of the first suffix, so that layout is not
+used" (REM-PARITY §8.4). The exception is a later terminal suffix whose own replicas validate: its
+footer supplies a layout of its own, and discovery uses it without a walk.
+Otherwise no replica validates and the Scanner takes the walk, although A, B
+and C may be intact.
+
+What the walk reports then is fixed. The intact replicas are tape files of the
+walk and not Object authority: "A terminal replica that the walk finds intact
+is a tape file of the walk and is not Object authority: it supplies no Object
+identity." (REM-PARITY §8.4.1). The trailing artifact is not an Object of any
+inventory, and the walk reports it "as an Object candidate of unknown identity
+or, when torn, as an incomplete candidate" (REM-PARITY §12.6), so that an
+operator sees it. In Remanence the walk's start notice gives the reason as
+`no_usable_terminal_layout` when no footer supplied a usable layout, and
+`all_members_invalid` when a layout was found and no replica of it validated.
+A walk over intact replicas that were followed by later tape files usually
+shows `no_usable_terminal_layout`. It shows `all_members_invalid` when a layout
+was found and none of its replicas validated. That includes a later, fully
+written suffix whose replicas are invalid, even though the first suffix's
+replicas are intact.
+
+We recommend that a tool say this in its own words when it announces the walk,
+and that it tell the operator to look for what was written after the suffix
+before assuming that the replicas were lost.
+
+The opposite case also needs a sentence. When replicas validate and disagree
+in an edition-common field, discovery ends without a walk. The Scanner returns
+`TerminalIndexReplicaConflict` and no inventory, and the specification says
+that "this document does not require the walk after it" (REM-PARITY §8.5). A
+tool should report the conflict as a conflict. It should not start a walk
+because a walk seems the natural response to damage, since a walk cannot
+decide which edition is right.
+
+Serves REM-PARITY §8.4, Discovery (Reader); REM-PARITY §8.5, Authoritative
+Selection; and REM-PARITY §12.6, Terminal Completeness.
+
+### In plain terms
+
+Start from the end of the tape. Compare the three replica envelopes before
+reading a body. Read further bodies only when needed. Keep a consumer from
+trusting rows until the reader has chosen them. When the index is gone and the
+whole tape must be walked, tell the operator before starting. Show progress
+during the walk. Let the operator stop between tape files. Refuse what cannot
+be recovered before moving the tape. Recover in tape order. Find a sidecar's
+index the same way whoever asks, and say which blocks were checked against it
+and which were only read. When a tape with good replicas is walked, say that
+something was written after the suffix.
+
+## 13. Capacity admission
+
+A REM-PARITY tape is finished by its final parity closeout (the final ParityMap
+when there are sidecars) and a terminal suffix of three replicas and two
+separation extents (REM-PARITY §8.3). A tape that runs out of room before its suffix is written can
+still be read, but only by a structural walk from BOT, and it never gains its
+catalog-less index. This chapter is about keeping that room. A tape with no
+parity has no sidecars and no parity closeout, but it keeps the complete
+terminal suffix, so the suffix's share of the reserve is computed the same way
+as for a parity tape. The [on-tape layout reference](https://github.com/archivetechie/remanence/blob/main/docs/reference-tape-layout.md#parity-scheme)
+describes the no-parity bootstrap.
+
+### 13.1. Admit an Object only if the tape can still be finalized
+
+We recommend refusing, before any tape motion for it, an Object that would
+leave less than the tape's close reserve after it. The specification defines
+the reserve: "A tape's close reserve is the space its finalization needs: parity
+closeout, the checked terminal payload `64 × structural_row_count + 256 ×
+object_row_count` in three rounded replica records, both separation extents,
+and five filemark charges." (REM-PARITY §10.3). The terminal payload grows with
+every Object, so the reserve should be recomputed for each admission, with
+checked arithmetic, and an overflow should refuse. Remanence, for example,
+refuses with `CapacityReserveExceeded` when the reserve would not remain, and
+with `ObjectTooLargeForEmptyTape` when the Object and the reserve could not fit
+even on an empty tape.
+
+Serves REM-PARITY §10.3, Object Recovery Rows, and REM-PARITY §11.4, Session
+Preconditions.
+
+### 13.2. Keep a safety allowance
+
+The capacity a drive reports is an estimate, and filemarks and rounding take
+space that a plan counts only approximately.
+
+We recommend adding a small safety allowance to the reserve. Remanence, for
+example, adds 4 blocks. Capacity charges, including a conservative charge for
+each filemark, are not on-media locations and have no part in the terminal
+layout digest (REM-PARITY §8.3).
+
+Serves REM-PARITY §11.4, Session Preconditions.
+
+### 13.3. Do not reapply caps after the tail is proved
+
+Once replica C is proved, the reserved tail is already on the medium. A capacity
+cap or watermark that changed since the tape was admitted can then only block
+the host's remaining steps; it cannot protect any space.
+
+We recommend skipping capacity checks on that host-only suffix. Remanence, for
+example, does so.
+
+Serves REM-PARITY §3.4, The Durable Boundary.
+
+### 13.4. Use the default separation extent unless there is a reason
+
+Each separation extent keeps two replicas physically apart, so that one damaged
+region cannot take both. The default size is 1 GiB (`DEFAULT_INDEX_SEPARATION_BYTES`,
+REM-PARITY §2.5). The format records the size in each extent's frame, so a tape
+written with another size is read correctly (REM-PARITY §10.5).
+
+We recommend the default unless a medium's damage profile argues for another
+size. Remanence uses the default.
+
+Serves REM-PARITY §10.5, Separation Extents.
+
+### In plain terms
+
+Always keep enough room at the end of a tape to write its index, and refuse
+anything that would eat into it, with a little extra to spare.
+
+## 14. Ingest
+
+Ingest is where files become objects. The decisions made here, about block
+size, metadata and packing, are fixed in the bytes and cannot be revisited
+without rewriting the object.
+
+### 14.1. Choose a chunk size the drives can handle
+
+The format sets no upper bound on `chunk_size`, and on tape `chunk_size` is the
+tape block size. A drive that cannot write or read blocks of that size cannot
+handle the object.
+
+We recommend choosing `chunk_size` within the block-size limits of every
+drive that will write or read the tape, now and in the foreseeable future.
+
+Serves REM-OBJECT §4.2, Chunks and `chunk_size`.
+
+### 14.2. Report attributes that could not be captured
+
+Some native attributes cannot be represented in the canonical wire form, for
+example a name with no namespace, or one that a case-folding store cannot
+round-trip without altering its case. The format does not capture them.
+
+An ingesting tool should report every attribute it could not capture, so that
+the omission is a recorded decision rather than a silent loss.
+
+Serves REM-OBJECT §4.7.3, Extended-Attribute Preservation.
+
+### 14.3. Carry unrecognised extensions forward when re-capturing
+
+A tree restored from an object and then captured again produces a new object.
+If the writer drops the extensions it does not understand, the new object
+silently loses metadata that the old one carried.
+
+A writer that re-captures an object from a previously restored tree should
+carry forward, unchanged, every `ext` member of the source object's manifest
+that it does not recognise.
+
+Serves REM-OBJECT §4.7.5, Extension Containers, and REM-OBJECT §4.9, Builder,
+Planner, and Reader Obligations.
+
+### 14.4. Decide deliberately when to wrap small files
+
+Every non-empty entry begins on a chunk boundary, so a tree of very small
+files spends most of its space on alignment. REM-OBJECT Appendix E describes
+a wrapper convention that packs a subtree into one member, at the cost of the
+inner files' individual identity.
+
+We recommend wrapping a subtree only for a stated reason: because an ingest
+rule names it, or because a file in it cannot be represented as a native
+entry. In the second case, that file, or the directory holding it, should be
+wrapped on its own. We recommend not wrapping by size alone. A scan may
+suggest candidates, but the suggestion should change nothing by itself.
+Remanence, for example, follows this rule. Its scan mode suggests a directory
+when at least ninety per cent of at least one hundred files under it cannot
+be represented natively.
+
+Serves REM-OBJECT Appendix E, Packing Many Small Files (Informative).
+
+### 14.5. Upload to an object store with integrity
+
+A copy can be damaged in transit to a store, and a store that accepted it may
+still hold something different.
+
+We recommend recording `stored_digest` as the object's integrity metadata,
+uploading with whatever integrity the store offers (for example checksum
+headers), and verifying the stored copy by digest after the upload. The
+encrypted representation is the one intended for copies on shared
+infrastructure. Whether to store plaintext copies there is a decision about
+the deployment, not about the format.
+
+Serves REM-OBJECT §8.4, Object-Store Binding.
+
+### 14.6. Review a plaintext object before publishing it
+
+A plaintext object discloses, to anyone who can read it, every path, the
+directory tree, sizes, times and every captured attribute value.
+
+We recommend reviewing a plaintext object before publishing it. The inventory
+that a Verifier has validated is a first-pass screen, because it names every
+non-`user.` namespace and extension present, but it does not bound what the
+values themselves disclose.
+
+Serves REM-OBJECT §12.12, Disclosure in Published Plaintext Objects.
+
+### In plain terms
+
+Decide the lasting things at ingest on purpose: a block size the drives can
+handle, a record of what could not be kept, no silent loss on re-capture,
+packing only for a reason, and a checked upload. Look at what a plaintext
+object reveals before anyone else can.
+
+## 15. Descriptive fields
+
+Some fields and entries describe an object without changing how any reader
+interprets it. Whether to record them is a writer's choice. This chapter says
+which we recommend, and why.
+
+### 15.1. Emit directory entries only when they carry information
+
+A directory that contains files is already implied by those files' paths. An
+empty directory has no files to imply it, and is lost unless it has an entry
+of its own. A directory entry can also carry metadata of its own, such as a
+modification time, preserved extended attributes or an extension, and that
+metadata is lost if the entry is left out.
+
+A writer should give a directory its own entry when the directory is empty or
+when the entry would carry metadata of its own. A writer can leave out the
+entry for a directory whose existence its child paths already imply and whose
+entry would carry nothing else. Leaving such an entry out loses nothing that
+the object would otherwise record.
+
+Serves REM-OBJECT §4.6.1, Entry Frame.
+
+### 15.2. Record the software that wrote each bootstrap and ParityMap
+
+A tape is produced by an implementation, not by a specification, and
+implementations have defects. When a cartridge does not decode as the
+specification says it should, the only thing that resolves the disagreement is
+knowing which software wrote it, so that its behaviour at that version can be
+established. A conformance claim does not do that job: the claim states an
+intention, and the tape is the result.
+
+We recommend that a writer record its identity in bootstrap key 3 and in
+ParityMap key 6, in the form `<implementation>/<version>`, optionally followed
+by a space and a parenthesised build identifier, for example
+`remanence/0.1.0 (<build>)`. The implementation part names the
+software, not the format, so two conformant implementations will not agree on
+it, and are not expected to. A ParityMap is written by software too, and can be
+written by a different version of it than the bootstrap it accompanies, so each
+should record the software responsible for its bytes. An implementation that
+fixes a ParityMap's bytes in a plan before writing them may record the planning
+software in key 6. This is a property of such implementations: REM-PARITY does
+not require a ParityMap's bytes to be planned (REM-PARITY §11.3). Readers
+tolerate the absence of both keys, as the specification requires: "A Reader
+MUST tolerate the absence of either key" (REM-PARITY §8.2). A tape written
+without them, or before this recommendation, therefore remains fully readable.
+Remanence, for example, writes bootstrap key 3 on every path, and writes
+ParityMap key 6 with the software that planned the tape's finalization. For an
+uninterrupted finalization, this is the software about to write it. A
+finalization completed after an interruption, even by a later version, keeps
+the planning software's identity.
+
+Serves REM-PARITY §8.2, CBOR Payload, and REM-PARITY §10.1.4, Payload (CBOR).
+
+### 15.3. Record when each bootstrap and ParityMap was written
+
+The time a structure was written helps an operator place a cartridge in its
+history, and it costs a few bytes.
+
+We recommend recording it in bootstrap key 4 and in ParityMap key 7, as an
+RFC 3339 `date-time` within the 64-byte bound. An implementation that fixes a
+ParityMap's bytes in a plan before writing them, as Section 15.2 describes, may
+record the time of that plan in key 7. Remanence, for example, writes bootstrap
+key 4 from the clock when each bootstrap is written, on every path. It writes
+ParityMap key 7 with the time at which the tape's finalization was planned. For
+an uninterrupted finalization, this is moments before the write. A finalization
+completed after an interruption, even by a later version, keeps that time,
+together with the planning software in key 6. These fields remain diagnostic:
+no reader decision depends on them.
+
+Serves REM-PARITY §8.2, CBOR Payload, and REM-PARITY §10.1.4, Payload (CBOR).
+
+### 15.4. Choose the edition identity at random
+
+The edition ID of a finalized tape binds its three replicas and its two
+separation extents to one another. A reader checks only that it is not zero and
+that it is equal across all five (REM-PARITY §10.4), so any nonzero value is
+valid.
+
+We recommend choosing it at random, for example as the bytes of a version-4
+UUID. A random value makes it unlikely that components of two different
+editions, for example after a defective tool rewrote part of a suffix, share an
+edition ID and so escape the agreement check. Remanence, for example, uses a
+version-4 UUID.
+
+Serves REM-PARITY §10.4, Terminal Replica Framing and Digests.
+
+### In plain terms
+
+Give a directory its own entry when it is empty or has metadata of its own;
+leave out entries that would only repeat what the file paths already say. Say
+on the tape which software wrote it, and when, and choose each edition's
+identity at random.
+
+## 16. Revision history
+
+- **1 October 2026.** Seventh revision. The guide moves beside the specifications, to
+  `specs/publication/`, with a reserved concept DOI, to be deposited by dated revision; it gains an
+  identifiers table, and its links into the project's other documents become repository URLs so that
+  they resolve from a deposited copy. Chapter 2, "Where REM concepts are
+  documented", is new. It states the rule that places each assertion in a
+  specification, this guide, an implementation's documentation or policy, and
+  holds a table of concepts and a table of words that mean different things in
+  different places. Chapter 11, "Retiring and recycling media", is new. It gives
+  the practice for releasing a medium only on proof that every file on it is
+  held elsewhere, for recycling it, and for soft deletion and key destruction;
+  Remanence does not yet implement the workflow. Chapters 2 to 9 of the sixth
+  revision are now chapters 3 to 10, and chapters 10 to 14 are now chapters 12
+  to 16. Earlier entries below keep the numbers of their time. Chapter titles
+  are unchanged.
+
+- **30 September 2026.** Sixth revision. Section 7.3 gains the practice of a
+  full verification: a check of structure alone is not one, and each failed
+  block or shard is reported by its address. Chapter 10 gains sections 10.9
+  (acquiring a sidecar's index through one path, the outcomes to tell apart,
+  and what a Verifier does when no index validates) and 10.10 (why a tape with
+  intact replicas can still be walked, and why a conflict is not walked).
+  Section 10.6 points to 10.10, and chapter 11 notes that a tape with no parity
+  keeps the complete terminal suffix and no longer counts the final ParityMap
+  as part of the suffix. The example writer identity in section
+  13.2 now uses a software version that exists. The fifth revision's entry
+  below named the wrong chapter and is corrected there.
+
+- **27 September 2026.** Fifth revision. Section 10.6's recommendation on walk
+  hints (the entry first said section 9, which is finalization; the
+  recommendation has always been in chapter 10) names the parity scheme (or no
+  parity) as the third hint REM-PARITY §8.4.1 now requires when the bootstrap
+  is unreadable.
+
+- **27 September 2026.** Fourth revision. Sections 13.2 and 13.3 qualify the
+  diagnostic recommendations for implementations that plan a ParityMap's bytes
+  before writing them. They describe Remanence's bootstrap identity on every
+  path and its preservation of the finalization planning software and time
+  through interrupted finalization.
+- **26 September 2026.** Third revision. Chapters 8 to 11 are new. They hold
+  the practice that REM-PARITY 1.0.0-draft.5 moved out of that specification:
+  commit records, barrier batching, writer poisoning, position tracking, the
+  compression check and resuming a tape (chapter 8); the finalization
+  lifecycle and crash recovery (chapter 9); replica comparison and selection,
+  the streaming inventory, check order, the BOT walk, recovery refusals and
+  bulk recovery (chapter 10); and capacity admission (chapter 11). Chapters 2,
+  5, 6, 7 and 13 gain REM-PARITY's practice on allocation, checked arithmetic,
+  fuzzing and escaping, tape catalogs, confidential payloads, reporting and
+  typed errors, and descriptive fields. Chapter 1 says the guide now holds the
+  practice of all three specifications.
+- **26 September 2026.** Second revision. Chapter 6 now holds the practice on
+  keys and secrets that REM-ENCRYPT 1.0.0-draft.4 moved out of that
+  specification: recipients and the two-recipient default, keeping private
+  keys as seeds, pinning public keys, randomness, the salt interface, current
+  suites, keeping epoch keys, handling secrets, resealing, and what encryption
+  neither hides nor proves. Chapters 2, 4, 5 and 7 gain REM-ENCRYPT's practice
+  on envelope parsing and fuzzing, computing an encrypted copy's
+  `stored_digest` as it is written, recording envelope fields, and validating
+  and staging recovered plaintext. Chapter 1 says which revisions the guide
+  now holds.
+- **26 September 2026.** First revision. Chapters 1 to 7, 12 and 13 hold the
+  practice that REM-OBJECT 1.0.0-draft.4 moved out of that specification:
+  handling hostile media, restoring onto a host, staging and durability,
+  catalogs and indexes, keeping attribute values out of logs, verification,
+  scrub and repair, ingest, and which directory entries a writer emits.

@@ -4,7 +4,7 @@
 //!
 //! The target intentionally validates only the deterministic-CBOR profile,
 //! as the REM Implementation and Operations Guide, §2.5, recommends: fuzz the
-//! manifest CBOR decoder as a separate target (docs/rem-implementation-guide.md).
+//! manifest CBOR decoder as a separate target (specs/publication/rem-implementation-guide.md).
 
 use libfuzzer_sys::fuzz_target;
 use remanence_format::validate_manifest_cbor_for_fuzz;

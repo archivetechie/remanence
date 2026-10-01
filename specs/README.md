@@ -16,6 +16,11 @@ normative revisions today:
   layout, sidecar parity, bootstrap blocks, and catalog-less recovery.
 - [formats-explained.md](publication/formats-explained.md) — the
   plain-language companion: motivation and design, informative only.
+- [rem-implementation-guide.md](publication/rem-implementation-guide.md) — the
+  REM Implementation and Operations Guide: informative, tool-neutral practice for
+  tools that read or write the formats. It is not a specification. Its concept DOI
+  is reserved and it has not yet been deposited; once a revision is deposited, the
+  copy deposited under that concept DOI, named in its identifiers table, governs.
 - [remanence-test-vectors.tar](publication/remanence-test-vectors.tar) —
   the pinned test-vector archive; its SHA-256 is printed in the
   specifications.
