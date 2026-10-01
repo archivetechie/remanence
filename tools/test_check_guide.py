@@ -36,6 +36,7 @@ class GuideCheckerTests(unittest.TestCase):
         self.root = Path(temporary.name)
         shutil.copytree(ROOT / "docs", self.root / "docs")
         shutil.copytree(ROOT / "specs/in-progress", self.root / "specs/in-progress")
+        shutil.copytree(ROOT / "specs/publication", self.root / "specs/publication")
 
     def run_checker(self, success):
         result = subprocess.run(
@@ -67,7 +68,7 @@ class GuideCheckerTests(unittest.TestCase):
             self.assertRegex(output, summary + r": [1-9][0-9]*; problems: 0")
 
     def test_corrupted_quotation_fails(self):
-        self.replace("docs/rem-implementation-guide.md",
+        self.replace("specs/publication/rem-implementation-guide.md",
                      "Decoders MUST enforce both limits.",
                      "Decoders MUST enforce neither limit.")
         self.assertIn("NOT FOUND", self.run_checker(False))
@@ -83,13 +84,13 @@ class GuideCheckerTests(unittest.TestCase):
                       self.run_checker(False))
 
     def test_keyword_outside_quotation_fails(self):
-        target = self.root / "docs/rem-implementation-guide.md"
+        target = self.root / "specs/publication/rem-implementation-guide.md"
         with target.open("a", encoding="utf-8") as stream:
             stream.write("\nReaders MUST do this.\n")
         self.assertIn("keywords outside quoted spans: ['MUST']", self.run_checker(False))
 
     def test_quotation_in_wrong_section_fails(self):
-        self.replace("docs/rem-implementation-guide.md",
+        self.replace("specs/publication/rem-implementation-guide.md",
                      '"Decoders MUST enforce both limits." (REM-OBJECT §4.7.1)',
                      '"Decoders MUST enforce both limits." (REM-OBJECT §1)')
         self.assertIn("WRONG SECTION", self.run_checker(False))
@@ -106,7 +107,7 @@ class GuideCheckerTests(unittest.TestCase):
         self.assertEqual(self.run_checker(True), baseline)
 
     def test_missing_guide_fails(self):
-        (self.root / "docs/rem-implementation-guide.md").unlink()
+        (self.root / "specs/publication/rem-implementation-guide.md").unlink()
         self.assertIn("FileNotFoundError", self.run_checker(False))
 
 

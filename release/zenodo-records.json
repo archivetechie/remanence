@@ -3,6 +3,7 @@
   "publish_order": [
     "vectors",
     "companion",
+    "guide",
     "object",
     "encrypt",
     "parity"
@@ -127,6 +128,66 @@
         {
           "name": "formats-explained.md",
           "version": "1.2"
+        }
+      ]
+    },
+    "guide": {
+      "draft_id": 23078224,
+      "version_doi": "10.5281/zenodo.23078224",
+      "concept_doi": "10.5281/zenodo.23078223",
+      "kind": "document",
+      "metadata": {
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "title": "REM Implementation and Operations Guide",
+        "version": "2026-10-01",
+        "description": "<p>This is the REM Implementation and Operations Guide: tool-neutral practice for building and operating tools that read and write the REM formats. It covers safe implementation and archival operations. It is informative, not a specification; the REM-OBJECT, REM-ENCRYPT and REM-PARITY specifications alone define conformance.</p><p>The Guide is revised independently of the specifications and deposited by dated revision.</p>",
+        "keywords": [
+          "digital preservation",
+          "archival storage",
+          "LTO tape",
+          "file format"
+        ],
+        "language": "eng",
+        "license": "cc-by-4.0",
+        "creators": [
+          {
+            "name": "The ArchiveTech Project"
+          }
+        ],
+        "related_identifiers": [
+          {
+            "relation": "isSupplementTo",
+            "identifier": "10.5281/zenodo.21719158",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementTo",
+            "identifier": "10.5281/zenodo.21719161",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "isSupplementTo",
+            "identifier": "10.5281/zenodo.21719156",
+            "resource_type": "publication-technicalnote"
+          },
+          {
+            "relation": "references",
+            "identifier": "10.5281/zenodo.21551570",
+            "resource_type": "software"
+          }
+        ]
+      },
+      "files": [
+        {
+          "path": "specs/publication/rem-implementation-guide.md",
+          "name": "rem-implementation-guide.md"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "rem-implementation-guide.md",
+          "version": "2026-10-01"
         }
       ]
     },

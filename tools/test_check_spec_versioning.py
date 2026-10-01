@@ -3,9 +3,12 @@
 
 import unittest
 import hashlib
+from contextlib import redirect_stderr, redirect_stdout
+import io
 from pathlib import Path
 import sys
 import tempfile
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -557,6 +560,49 @@ class PreparingCopyRuleTests(unittest.TestCase):
     def test_an_unrelated_document_digest_is_not_an_archive_pin(self):
         text = self.copy() + "\nThe published revision (SHA-256 `" + "c" * 64 + "`) governs.\n"
         self.assertEqual(self.findings(text), [])
+
+
+class GuideVersionTests(unittest.TestCase):
+    """Dated Guide revisions use the same immutable-deposit guard as the companion."""
+
+    def test_version_is_exactly_one_valid_calendar_date(self):
+        for version in ("2026-10-01", "2028-02-29"):
+            self.assertEqual(lint.guide_version_findings(f"| Version | {version} |\n"), [])
+        for text in ("", "| Version | 1.0.0 |\n", "| Version | 2026-1-01 |\n",
+                     "| Version | 2026-02-29 |\n", "| Version | 2026-13-01 |\n",
+                     "| Version | 2026-10-01 |\n" * 2):
+            with self.subTest(text=text):
+                self.assertTrue(lint.guide_version_findings(text))
+
+    def test_guide_is_not_treated_as_an_archive(self):
+        record = {(lint.GUIDE, "2026-10-01"): "a" * 64}
+        self.assertEqual(lint.deposited_archive_findings(Path("."), record,
+                                                        require_archives=True), ([], []))
+
+    def test_main_enforces_guide_version_and_recorded_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pub = Path(tmp)
+            for name in [*lint.SPECS, lint.COMPANION]:
+                (pub / name).write_bytes((lint.PUB / name).read_bytes())
+            guide = pub / lint.GUIDE
+            original = (lint.PUB / lint.GUIDE).read_bytes()
+            digest = hashlib.sha256(original).hexdigest()
+            (pub / "DEPOSITED.sha256").write_text(f"{lint.GUIDE} 2026-10-01 {digest}\n")
+            cases = ((original, 0, ""),
+                     (original + b"\nChanged practice.\n", 1, "was deposited as"),
+                     (original.replace(b"| Version | 2026-10-01 |", b"| Version | 2026-10-02 |"), 0, ""),
+                     (original.replace(b"| Version | 2026-10-01 |", b"| Version | 1.0.0 |"), 1, "YYYY-MM-DD"))
+            # Structural checks are separately covered against the real corpus;
+            # these cases exercise main's version and digest dispatch unchanged.
+            with patch.object(lint, "PUB", pub), patch.object(lint, "structural_findings", return_value=[]):
+                for contents, expected, message in cases:
+                    with self.subTest(expected=expected, message=message):
+                        guide.write_bytes(contents)
+                        output = io.StringIO()
+                        with redirect_stdout(output), redirect_stderr(output):
+                            self.assertEqual(lint.main([]), expected)
+                        if message:
+                            self.assertIn(message, output.getvalue())
 
 
 class DepositedArchiveTests(unittest.TestCase):

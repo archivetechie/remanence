@@ -28,11 +28,11 @@ mistake in a deposited text stays public. The tool `tools/zenodo_deposit.py` exi
 irreversible step is the last one and every earlier step can be repeated. This section is the order of
 work. The design that explains the choices is kept with the project's working documents.
 
-Format records are deposited as one set: the three specifications, the companion and the vector
-dataset. The documents cite each other and the dataset by DOI, and a reserved DOI does not resolve until
+Format records are deposited as one set: the three specifications, the companion, the Guide and the
+vector dataset. The documents cite each other and the dataset by DOI, and a reserved DOI does not resolve until
 its record is first published. A specification published alone would cite DOIs that do not yet exist.
-The tool therefore refuses a plan that does not cover all five, and it publishes them in a fixed order:
-the dataset, the companion, REM-OBJECT, REM-ENCRYPT, and REM-PARITY last.
+The tool therefore refuses a plan that does not cover all six, and it publishes them in a fixed order:
+the dataset, the companion, the Guide, REM-OBJECT, REM-ENCRYPT, and REM-PARITY last.
 
 ### Before the day
 
@@ -42,7 +42,7 @@ the dataset, the companion, REM-OBJECT, REM-ENCRYPT, and REM-PARITY last.
   `stage-metadata` mode writes the metadata to the drafts and reads it back. A draft without files cannot
   be published, so this is safe to do in advance.
 - `python3 tools/zenodo_deposit.py probe` checks the tool's assumptions about Zenodo's responses against
-  a published reference record and the five drafts. It changes nothing. Run it before the day and on it.
+  a published reference record and the six drafts. It changes nothing. Run it before the day and on it.
 - The draft vector archive is built from a clean tree (`tools/build_draft_vector_archive.py`), verified
   (`tools/verify_draft_vector_archive.py`), and its digest is quoted in the texts that cite it.
 - The GitHub-to-Zenodo integration is switched off for this repository (see "The webhook"). The tool
@@ -60,10 +60,10 @@ the dataset, the companion, REM-OBJECT, REM-ENCRYPT, and REM-PARITY last.
    and confirm that each still resolves.
 5. `stage-metadata`, then `stage-files`. Both read everything back and compare it with the plan. The
    drafts are still private.
-6. Read the five drafts in the Zenodo web interface. A staged draft is one click from public there, so
+6. Read the six drafts in the Zenodo web interface. A staged draft is one click from public there, so
    leave the drafts alone except to read them.
 7. `publish --plan-digest <digest> --publish-permanently --webhook-off-confirmed`. The tool checks all
-   five records before the first irreversible call, reads each one fresh before it publishes it, and
+   six records before the first irreversible call, reads each one fresh before it publishes it, and
    compares the account's record list after each. If it stops, run it again with the same plan: it
    verifies the records already public and completes the rest. It cannot change a published record.
 8. `record`. It downloads every published file through the records API, compares SHA-256 and MD5,

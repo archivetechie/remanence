@@ -3,6 +3,7 @@
   "publish_order": [
     "vectors",
     "companion",
+    "guide",
     "object",
     "encrypt",
     "parity"
@@ -90,6 +91,49 @@
         {
           "name": "companion.txt",
           "version": "0.1-test"
+        }
+      ]
+    },
+    "guide": {
+      "draft_id": 900012,
+      "version_doi": "10.5281/zenodo.900012",
+      "concept_doi": "10.5281/zenodo.900011",
+      "kind": "document",
+      "metadata": {
+        "title": "Example Guide",
+        "version": "2026-10-01",
+        "creators": [
+          {
+            "name": "Example Project"
+          }
+        ],
+        "license": "cc-by-4.0",
+        "upload_type": "publication",
+        "publication_type": "technicalnote",
+        "keywords": [
+          "example",
+          "offline"
+        ],
+        "language": "eng",
+        "related_identifiers": [
+          {
+            "identifier": "https://example.org/reference",
+            "relation": "references",
+            "scheme": "url"
+          }
+        ],
+        "description": "<P>Small &amp; entirely <B>invented</B> example.</P>"
+      },
+      "files": [
+        {
+          "path": "input/guide.txt",
+          "name": "guide.txt"
+        }
+      ],
+      "deposit_lines": [
+        {
+          "name": "guide.txt",
+          "version": "2026-10-01"
         }
       ]
     },

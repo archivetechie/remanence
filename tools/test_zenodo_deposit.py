@@ -1,4 +1,4 @@
-"""Offline safety tests for the irreversible, five-record Zenodo deposit.
+"""Offline safety tests for the irreversible, six-record Zenodo deposit.
 
 The example JSON names invented ids and tiny inputs created in a temporary
 repository. Only git's read-only answers are stubbed: no branch, index, or commit
@@ -299,7 +299,7 @@ class DepositTests(unittest.TestCase):
             self.assertEqual(public["files"][0]["checksum"], "md5:" + f["checksum"])
         self.fake.calls.clear()
         self.cli("record")
-        self.assertEqual(sum(c[1].endswith("/content") for c in self.fake.calls), 5)
+        self.assertEqual(sum(c[1].endswith("/content") for c in self.fake.calls), 6)
         self.assertFalse(any("/draft/" in c[1] for c in self.fake.calls))
 
     def test_content_endpoint_is_unavailable_before_publication(self):
@@ -472,7 +472,7 @@ class DepositTests(unittest.TestCase):
                     self.assertEqual(listings, 2)
                     self.assertFalse(self.fake.posts)
                 else:
-                    self.assertEqual(listings, 7)  # Two initial attempts, five post-publish lists.
+                    self.assertEqual(listings, 8)  # Two initial attempts, six post-publish lists.
 
     def test_inventory_retries_overlapping_pages(self):
         listings = 0
@@ -497,7 +497,7 @@ class DepositTests(unittest.TestCase):
         (self.repo / "input/vectors.txt").unlink()
         self.checker.unlink()
         output = self.cli("probe", "--reference-record", "800002")
-        self.assertEqual(sum(line.startswith("PASS ") for line in output.splitlines()), 9)
+        self.assertEqual(sum(line.startswith("PASS ") for line in output.splitlines()), 10)
         self.assertFalse(self.fake.writes)
         self.assertFalse(self.subprocesses)
         self.assertFalse(self.state.exists())
@@ -531,7 +531,7 @@ class DepositTests(unittest.TestCase):
         self.remote("parity")["links"]["bucket"] = "https://evil.example/bucket"
         output = self.cli("probe", "--reference-record", "800002", expected=1)
         lines = [line for line in output.splitlines() if line.startswith(("PASS ", "FAIL "))]
-        self.assertEqual(len(lines), 9)
+        self.assertEqual(len(lines), 10)
         self.assertEqual(sum(line.startswith("FAIL ") for line in lines), 6)
         self.assertFalse(self.fake.writes)
         self.assertFalse(self.subprocesses)
@@ -581,7 +581,7 @@ class DepositTests(unittest.TestCase):
         self.fake.hook = unavailable
         output = self.cli("probe", "--reference-record", "800002", expected=1)
         self.assertIn("FAIL account inventory: HTTP 503: upstream service unavailable\n", output)
-        self.assertEqual(sum(line.startswith("PASS ") for line in output.splitlines()), 8)
+        self.assertEqual(sum(line.startswith("PASS ") for line in output.splitlines()), 9)
         self.assertFalse(self.fake.writes)
 
     def test_probe_reference_need_not_appear_in_account_inventory(self):
@@ -647,6 +647,51 @@ class DepositTests(unittest.TestCase):
         path.write_text(original)
         self.checker.write_text("raise SystemExit('checker deliberately failed')\n")
         self.assertIn("checker deliberately failed", self.cli("plan", expected=1))
+        self.assertFalse(self.fake.calls)
+
+    def test_guide_plan_has_dated_version_and_fixed_six_record_order(self):
+        plan = self.plan()
+        self.assertEqual(plan["publish_order"],
+                         ["vectors", "companion", "guide", "object", "encrypt", "parity"])
+        guide = plan["records"]["guide"]
+        self.assertEqual(guide["kind"], "document")
+        self.assertEqual(guide["metadata"]["version"], "2026-10-01")
+        self.assertEqual(guide["deposit_lines"][0]["version"], "2026-10-01")
+        for field in ("concept_doi", "version_doi"):
+            self.assertIn("https://doi.org/" + guide[field], plan["external_urls"]["guide"])
+        self.assertFalse(self.fake.calls)
+
+    def test_guide_plan_requires_matching_version_and_both_dois(self):
+        guide = self.config["records"]["guide"]
+        path = self.repo / guide["files"][0]["path"]
+        original = path.read_text()
+        for old, new, message in (
+                ("2026-10-01", "2026-10-02", "Version row differs"),
+                (guide["concept_doi"], "missing", "must cite concept_doi"),
+                (guide["version_doi"], "missing", "must cite version_doi")):
+            with self.subTest(old=old):
+                self.assertIn(old, original)
+                path.write_text(original.replace(old, new))
+                self.assertIn(message, self.cli("plan", expected=1))
+        self.assertFalse(self.fake.calls)
+
+    def test_guide_requires_valid_date_and_matching_deposit_version(self):
+        guide = self.config["records"]["guide"]
+        for version in ("1.0.0", "2026-1-01", "2026-02-30"):
+            with self.subTest(version=version):
+                guide["metadata"]["version"] = version
+                self.write_config()
+                self.assertIn("valid date YYYY-MM-DD", self.cli("plan", expected=1))
+        guide["metadata"]["version"] = "2026-10-01"
+        guide["deposit_lines"][0]["version"] = "2026-10-02"
+        self.write_config()
+        self.assertIn("deposit version differs", self.cli("plan", expected=1))
+        self.assertFalse(self.fake.calls)
+
+    def test_missing_guide_record_is_refused(self):
+        del self.config["records"]["guide"]
+        self.write_config()
+        self.assertIn("All six records are required", self.cli("plan", expected=1))
         self.assertFalse(self.fake.calls)
 
     def test_plan_rejects_absent_file(self):
@@ -830,7 +875,7 @@ class DepositTests(unittest.TestCase):
         self.assertEqual(ids, [str(self.config["records"][key]["draft_id"]) for key in z.ORDER])
         state = json.loads(self.state.read_text())
         self.assertEqual(set(state["public"]), set(z.ORDER))
-        self.assertEqual(len(state["inventory"]), 5)
+        self.assertEqual(len(state["inventory"]), 6)
         self.assertEqual(state["uncertain"], [])
         self.assertTrue(any("page=4&" in c[1] for c in self.fake.calls))
         self.assertFalse(list(self.root.glob(".state.json.*")))
@@ -860,7 +905,7 @@ class DepositTests(unittest.TestCase):
         self.fake.hook = fail
         flags = self.flags()
         self.cli("publish", *flags, expected=1)
-        self.assertEqual(set(json.loads(self.state.read_text())["public"]), {"vectors", "companion"})
+        self.assertEqual(set(json.loads(self.state.read_text())["public"]), {"vectors", "companion", "guide"})
         self.fake.hook = None
         # A public record must still be verified before skipping it.
         old = self.remote("vectors")["files"][0]["checksum"]
@@ -885,7 +930,7 @@ class DepositTests(unittest.TestCase):
         self.cli("publish", *flags, expected=1)
         self.assertEqual(set(json.loads(self.state.read_text())["public"]), {"vectors"})
         self.cli("publish", *flags)
-        self.assertEqual(len(self.fake.posts), 5)
+        self.assertEqual(len(self.fake.posts), 6)
 
     def test_post_publication_identity_failure_is_recorded_and_stops(self):
         self.stage()
@@ -925,14 +970,14 @@ class DepositTests(unittest.TestCase):
         content = self.deposited.read_text()
         self.assertTrue(content.startswith(self.before.decode()))
         rows = [line.split() for line in content.splitlines() if not line.startswith("#")]
-        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(rows), 6)
         for name, version, sha in rows:
-            self.assertEqual(version, "0.1-test")
+            self.assertEqual(version, "2026-10-01" if name == "guide.txt" else "0.1-test")
             self.assertEqual(sha, hashlib.sha256((self.repo / "input" / name).read_bytes()).hexdigest())
         self.cli("record")
         self.assertEqual(self.deposited.read_text(), content)
         downloads = [c for c in self.fake.calls if c[1].endswith("/content")]
-        self.assertEqual(len(downloads), 10)
+        self.assertEqual(len(downloads), 12)
 
     def test_record_file_doi_version_and_state_mismatches_write_nothing(self):
         self.publish_all()
@@ -982,7 +1027,7 @@ class DepositTests(unittest.TestCase):
         output = self.cli("status")
         self.assertIn('"state":"unsubmitted"', output)
         self.assertIn('"conceptrecid":"900001"', output)
-        self.assertEqual(len(self.fake.calls), 5)
+        self.assertEqual(len(self.fake.calls), 6)
         self.assertFalse(self.fake.writes)
         self.assertFalse(self.subprocesses)
 
@@ -1024,7 +1069,7 @@ class DepositTests(unittest.TestCase):
         output = self.cli("publish", *flags, expected=1)
         self.assertIn("Unable to confirm current state", output)
         self.assertEqual(json.loads(self.state.read_text())["public"], known)
-        self.assertEqual(len(self.fake.posts), 5)
+        self.assertEqual(len(self.fake.posts), 6)
 
     def test_record_preserves_existing_bytes_including_crlf_comments(self):
         self.publish_all()
@@ -1033,7 +1078,7 @@ class DepositTests(unittest.TestCase):
         self.cli("record")
         self.assertTrue(self.deposited.read_bytes().startswith(before))
 
-    def test_all_five_preflight_before_first_publication(self):
+    def test_all_six_preflight_before_first_publication(self):
         self.stage()
         self.remote("parity")["metadata"]["title"] = "wrong last record"
         self.assertIn("parity: metadata differs", self.cli("publish", *self.flags(), expected=1))
