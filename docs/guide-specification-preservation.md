@@ -1,5 +1,10 @@
 # Checking specification preservation
 
+When a specification is reorganized or reworded, text can be lost without
+anyone noticing. `tools/spec_preservation.py` is a mechanical check that every
+piece of a baseline version either survives in the candidate or is accounted
+for by a reviewed decision.
+
 `tools/spec_preservation.py` compares a frozen baseline with a candidate. It
 inventories affected prose blocks, headings, schemas, table rows, identifiers,
 formulas, and normative statements. The complete baseline inventory is retained
@@ -55,7 +60,7 @@ python3 -m unittest discover -s tools -p 'test_spec*.py'
 python3 -m unittest discover -s tools/oracle -p 'test_*.py'
 ```
 
-The historical fixtures replay the draft.5 deletion and reject unmapped loss and
-false mappings to surviving sections. They also check complete section moves and
-unchanged documents. Frozen fixtures and independent oracle tests should change
+The fixtures cover a specification edit that deletes a section, rejecting
+unmapped loss and false mappings to surviving sections. They also cover
+complete section moves and unchanged documents. Frozen fixtures and independent oracle tests should change
 only when their intended contract changes through separate review.

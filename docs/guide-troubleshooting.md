@@ -1,9 +1,10 @@
 # Troubleshooting
 
-A field guide to the failure modes Remanence surfaces on purpose. The
-recurring theme: when the stack cannot prove what state the hardware is in,
-it stops and says so rather than guessing. Most of what looks like an outage
-is a fence doing its job.
+This page lists the failure modes Remanence reports deliberately, what each
+message means, and what to do about it. When the software cannot prove what
+state the hardware is in, it stops and says so rather than guessing, so many
+things that look like an outage are a fence (a recorded block on a tape or
+drive) doing its job.
 
 <!-- code-anchor: crates/remanence-library/src/error.rs crates/remanence-cli/src/lib.rs crates/remanence-scsi/src/error.rs @ 6ed03ef0 -->
 ## Discovery finds no libraries
@@ -64,8 +65,8 @@ load triggers a one-time media optimization pass that can run well over an
 hour; this is documented drive behavior, not a hang, and it is why
 `wait-ready` defaults to a 2.5h timeout with 30s polls. Second, a readiness
 wait that gets interrupted (signal, crash) does not evaporate: it leaves a
-durable operation record, and `rem tape wait-ready --resume <UUID>`
-continues it without moving media.
+durable operation record, and `rem tape wait-ready --resume <OPERATION_UUID>`
+continues it (`rem op list` prints the operation UUID) without moving media.
 
 When an operation ends in a completion-unknown or interrupted state,
 Remanence writes a **quarantine fence** against that tape or drive. Fenced
@@ -87,8 +88,7 @@ rem tape quarantine release <id> --after-settled-inventory \
     --ack "verified slot inventory after power event; RCA in ticket 123"
 ```
 
-The `--ack` text is recorded. The fence is deliberately annoying: its
-whole purpose is that nobody writes to a tape whose state was last seen
+The `--ack` text is recorded. The fence exists so that nobody writes to a tape whose state was last seen
 mid-uncertainty.
 
 <!-- code-anchor: crates/remanence-library/src/handle/mod.rs crates/remanence-library/src/handle/tape_io/mod.rs @ 1dd451b2 -->
@@ -120,7 +120,7 @@ layers — seeing one does not imply the others tripped too.
 
 | Message | Cause and fix |
 |---|---|
-| `error: load config ...` | TOML parse or validation failure. Unknown keys are hard errors; all paths must be absolute; `listen` requires `[daemon.tls]`; `tape_io.legacy_single_block`/`tape_io.pipelined_submission` are removed keys that fail to load with a migration-specific message — the pipelined path is now the only one, delete the key. |
+| `error: load config ...` | TOML parse or validation failure. Unknown keys are hard errors; all paths must be absolute; `listen` requires `[daemon.tls]`; `tape_io.legacy_single_block`/`tape_io.pipelined_submission` are not accepted keys and fail to load with a specific message; the pipelined path is the only path for streaming reads and writes, so delete the key. (Full verification reads one block per command and does not use it.) |
 | `daemon.io_memory_ceiling must be non-zero` / `... exceeds daemon.io_memory_ceiling` (on `spool_tmpfs_ram_budget` or `tape_io.read_reservoir_bytes`) | The shared I/O memory budget is zero, or a per-purpose reservation exceeds it. `io_memory_ceiling` (default 24 GiB) is the hard cap shared by the append spool and every drive's read reservoir. |
 | `tape_io reservoir watermarks require 0 < read_reservoir_low_pct < read_reservoir_high_pct <= 100` | Watermark percentages misordered or out of range. |
 | `tape_io.staging_ring_buffers` validation failure | Must be in `2..=16`. |
@@ -207,7 +207,7 @@ positioning would be unsafe`.
 The daemon logs JSON to stderr, one flattened object per event, filtered
 by the standard `RUST_LOG` variable (default `info`). Write-path events
 carry `tape_uuid`, `pool_id`, and `session_id` fields, so `jq
-'select(.tape_uuid=="...")'` reconstructs one tape's story. The CLIs do
+'select(.tape_uuid=="...")'` (put the tape's UUID from `rem catalog tapes` in place of the dots) reconstructs one tape's story. The CLIs do
 not use the tracing stack at all: `rem` and `rem-debug` print
 human-readable text, or stable JSON with `--json`.
 
@@ -251,6 +251,5 @@ unreadable bootstrap, and the refusals the tools print for each.
 
 Tape recycling outside Remanence (for example re-creating a virtual
 cartridge with the same barcode) can leave the catalog's tape identity
-out of step with the UUID written at the beginning of tape. The retire
-and rebind machinery exists (`rem tape retire`); the automated
-reconciliation is still open work.
+out of step with the UUID written at the beginning of tape. The retire and rebind machinery exists (`rem tape retire`); Remanence does
+not yet reconcile this automatically.

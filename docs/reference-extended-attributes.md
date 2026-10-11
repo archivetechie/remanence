@@ -1,10 +1,13 @@
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-format/src/tar.rs crates/remanence-format/src/writer.rs crates/remanence-cli/src/archive_ingest.rs crates/remanence-stream/src/lib.rs crates/rem-recover/src/main.rs @ 6ed03ef0 -->
 # Extended attributes and file metadata
 
-This reference explains what file metadata Remanence preserves in a REM-OBJECT
-object, how that metadata is stored, and — importantly — how it behaves on
-restore, including the case where an archive is recovered decades later with
-nothing but a standard `tar`. The format rules live in the REM-OBJECT
+This reference describes which file metadata Remanence preserves in a REM-OBJECT
+object, how that metadata is stored, and how it behaves on restore, including
+a restore made years later with nothing but a standard `tar`. An extended
+attribute (xattr) is a named piece of metadata that a filesystem attaches to a
+file in addition to its content, for example `user.comment`. REM-OBJECT is the
+native stored-object format; the [glossary](reference-glossary.md) defines the
+other terms used here. The format rules live in the REM-OBJECT
 specification (§4.3, §4.7.3, §4.10), and §12.10 describes the restore hazards
 and what a restore must reproduce; recommended restore practice is in the
 [REM Implementation and Operations Guide](../specs/publication/rem-implementation-guide.md), under
@@ -22,19 +25,19 @@ It deliberately does **not** preserve **ownership** (uid/gid), and it does
 not preserve **mode bits beyond the executable bit** (no setuid, setgid, or
 sticky bit). The tar header carries fixed placeholder values for these
 (uid/gid `0`, a normalized mode), and a reader is required to ignore them.
-The reasoning is a preservation one: an archive is meant to outlive the
-system that produced it, and a numeric owner or a security mode from a host
-that no longer exists is not meaningful content — it is environment. The
-same principle governs extended attributes, below.
+The reason is that an archive is meant to outlive the system that produced
+it. A numeric owner or a security mode from a host that no longer exists
+describes that host's environment and is not part of the file's content. The
+same reasoning governs extended attributes, below.
 
 ## Where attributes are stored: the manifest, not the tar headers
 
 Extended attributes are stored inside the object's **CBOR manifest**, in a
-per-entry `metadata_preservation_data` map — **not** as pax
-`SCHILY.xattr.*` extended-header records. This is a deliberate and
-consequential choice, and it is what makes the standard-tool recovery path
-(below) safe by construction. A generic tar reader has no knowledge of the
-REM-OBJECT manifest; to it, the manifest is simply one extra file in the archive.
+per-entry `metadata_preservation_data` map. They are not stored as pax
+`SCHILY.xattr.*` extended-header records. This choice makes the standard-tool
+recovery path (below) safe. The manifest is a file in CBOR, a compact binary
+data format. A generic tar reader does not know the manifest's meaning and
+treats it as one extra file in the archive.
 
 This is the path for every natively representable entry. An entry with a
 non-native file type, or with a single kept attribute value over 4 KiB, or
@@ -46,7 +49,7 @@ the attributes it keeps by policy do appear there as real, filtered
 recovery guarantee below — a plain `tar x` on the outer archive does not
 recurse into a nested `.remwrap.tar`, so those attributes still are not
 reapplied by the standard-tool path — but a reader inspecting a wrapped
-entry's bytes directly, rather than restoring through `rem`, will find pax
+entry's bytes directly, rather than restoring through `rem`, finds pax
 xattr records there.
 
 ## Capture
@@ -58,7 +61,7 @@ in the ingest report, and one stderr warning gives the total count. Attribute
 values are never included in command output. Six built-in macOS housekeeping
 attributes are always discarded silently, so they do not add report noise.
 
-Attribute selection remains a matter of local policy, not of the byte format.
+Attribute selection is a matter of local policy and is not part of the byte format.
 An ingest ruleset can widen the portable core with a validated namespace
 prefix:
 
@@ -115,13 +118,13 @@ Remanence therefore restores conservatively by default:
   attributes" is treated as a benign skip.
 
 The same allow-list, opt-in, and reporting behavior applies to every restore
-surface, including the disaster-recovery reader.
+surface, including the standalone disaster-recovery tool `rem-recover`.
 
-## The standard-tool recovery path is safe by construction
+## The standard-tool recovery path
 
 Because attributes live in the manifest and not in tar-visible headers, a
-recovery performed with a plain `tar` — the long-term fallback that needs no
-Remanence binary at all — **does not reapply any extended attribute.** Such
+recovery performed with a plain `tar` does not reapply any extended attribute.
+This is the long-term fallback that needs no Remanence binary. Such
 a recovery restores the file bytes, the directory structure, symlinks and
 hardlinks, and writes the manifest as one ordinary file
 (`_remanence/manifest.cbor`) containing the attribute data as inert bytes,
@@ -134,12 +137,12 @@ a nested `.remwrap.tar` blob that a single non-recursive `tar x` never opens
 with the exclusion of ownership and setuid/setgid mode bits, the
 standard-tool path cannot escalate privilege through file metadata.
 
-This yields a clean division of responsibility: the recovery path that
-anyone can run with a forty-year-old tool is inherently safe, and the only
-path that can reapply privileged metadata is the Remanence-aware reader,
-which is exactly where the allow-list policy is enforced.
+Responsibility is therefore divided as follows. The recovery path that anyone
+can run with an old, unchanged `tar` cannot reapply privileged metadata. Only
+the Remanence-aware reader can, and that is where the allow-list policy is
+enforced.
 
-## A note on published archives
+## Published archives
 
 Preserved metadata is stored in the clear inside a plaintext object's
 manifest, readable with any CBOR tool. Attribute values, symlink targets,

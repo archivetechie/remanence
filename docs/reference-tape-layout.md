@@ -1,26 +1,33 @@
 # On-tape layout reference
 
-What a Remanence-written cartridge physically contains. Byte-level detail for
-the stable formats lives in the published specifications —
+This page describes what a Remanence-written cartridge physically contains:
+the tape files and their order, the parity scheme, the stored object and its
+encrypted envelope, how a tape is finalized and recovered without a catalog,
+how a tape is identified, and the host-side records that accompany it. Byte-level
+detail is in the specifications:
 [REM-OBJECT Core](../specs/publication/rem-object-core-1-specification.md),
 [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md), and
-[REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md). The
-terminal index described below is the experimental generation-2
-replacement in the current preparing copy,
+[REM-PARITY](../specs/publication/rem-parity-1-specification.md). The terminal
+index described below is specified in the preparing copy
 [REM-PARITY 1.0.0-draft.5](../specs/in-progress/rem-parity-1-specification.md),
-whose Sections 8.3 and 10 give its byte tables. It is not part of the
-unchanged publication baseline.
+whose Sections 8.3 and 10 give its byte tables.
 
-The design goal behind all of it: a tape must be readable with no access
-to Remanence's host state. Everything the catalog knows is either written
-to the tape itself or rebuildable from journals; the SQLite index is a
-cache, never the truth.
+A tape must be readable without access to Remanence's host state. Everything
+the catalog knows is either written to the tape or rebuildable from journals.
+The SQLite index is a cache and is never the authority.
+
+Terms used on this page: a **block** is one fixed-size tape record; a
+**filemark** is the separator the drive records between tape files; **BOT** and
+**EOD** are the beginning of tape and the end of recorded data; a **sidecar** is
+a tape file of parity data covering the blocks written before it; an **epoch**
+is the run of data covered by one sidecar; **LBA** is a logical block address.
+The [glossary](reference-glossary.md) defines the rest.
 
 <!-- code-anchor: crates/remanence-parity/src/terminal_tail.rs crates/remanence-parity/src/tape_index_replica.rs crates/remanence-parity/src/index_separation.rs @ a7fee789 -->
 ## Tape files and filemarks
 
 A cartridge is a sequence of tape files separated by filemarks, written in
-fixed-size records. Six structural kinds are emitted by the replacement draft:
+fixed-size records. Six structural kinds are emitted:
 `Object` (0), `ParitySidecar` (1), `Bootstrap` (2), `ParityMap` (3),
 `TapeIndexReplica` (4), and `IndexSeparationExtent` (5).
 Scale-derived file numbers, block counts, data ordinals, edition sequences,
@@ -32,9 +39,8 @@ profile remains 256 KiB, 512 KiB, and 1 MiB.
 - **Bootstrap** at tape file 0 is the volume label and geometry root: tape UUID,
   fixed block size, and parity profile. It is Object-count independent and
   contains no Object recovery rows, including on a no-parity tape. Host
-  checkpoint operations do not emit a bootstrap. The terminal design does not write
-  intermediate bootstrap indexes and does not append a singular final
-  bootstrap.
+  checkpoint operations do not emit a bootstrap. No intermediate bootstrap
+  index and no final bootstrap are written.
 - **Object** tape files contain only body-format blocks (a stored REM-OBJECT
   object). The parity layer owns every filemark; body formats cannot emit
   them.
@@ -119,10 +125,9 @@ so that every member's data starts on a chunk boundary (default chunk
 size 262144 bytes). The last member is a deterministic CBOR manifest at
 `_remanence/manifest.cbor`, followed by tar end-of-archive records.
 
-The consequence worth stating plainly: a plaintext rem-object-v1 object is
-extractable with stock `tar` on any Unix system, with the Remanence
-metadata visible as pax headers. The 30-year-readability property is not
-a promise, it is the format.
+A plaintext rem-object-v1 object can be extracted with stock `tar` on any Unix
+system, and the Remanence metadata is visible as pax headers. Reading a
+plaintext object therefore does not depend on Remanence software.
 
 ![rem-object-v1 stored object layout: pax global header, chunk-aligned members, trailing CBOR manifest, tar end-of-archive records and zero fill](assets/rem-object-v1-object.svg)
 
@@ -134,17 +139,16 @@ a promise, it is the format.
 An encrypted object wraps the same tar byte stream in an AEAD envelope.
 The live REM-ENCRYPT 1.0 wire profile accepts only on-tape
 `format_version = 2` (cipher-suite id `0x01`, HKDF-SHA-256 +
-ChaCha20-Poly1305). Format version 1 is permanently reserved and rejected
-with `UnsupportedFormatVersion`; there is no compatibility reader or writer.
+ChaCha20-Poly1305). Format version 1 is permanently forbidden and is rejected with
+`UnsupportedFormatVersion`; there is no reader or writer for it.
 
 - The fixed plaintext scalar header is 128 bytes. Bytes `0x10..0x20` are
   reserved and must be zero. Byte `0x38` is the wrap-suite id, fixed at
   `0x02` (HPKE, RFC 9180 Base mode, running the X-Wing post-quantum/
   classical hybrid KEM — ML-KEM-768 combined with X25519 per
   `draft-connolly-cfrg-xwing-kem`, IANA HPKE KEM id `0x647a` — with
-  HKDF-SHA256 and ChaCha20-Poly1305). Wrap-suite id `0x01`, the
-  pre-production X25519-only KEM, is permanently reserved; both readers
-  and sealers reject it. Bytes `0x39..0x3c` are reserved-zero, and
+  HKDF-SHA256 and ChaCha20-Poly1305). Wrap-suite id `0x01` (an X25519-only
+  KEM) is permanently forbidden; both readers and sealers reject it. Bytes `0x39..0x3c` are reserved-zero, and
   `0x3c..0x40` holds the key-frame length.
 - A plaintext **key frame** follows immediately (wire tag `REMK`). Readers
   accept 1-8 slots; production sealers require 2-8 distinct, nonzero
@@ -250,9 +254,9 @@ Once replica C is proved, the reserved tail is already on the medium. Completing
 the host steps therefore does not reapply a changed capacity cap or watermark.
 
 The catalog can represent a `finalized_degraded` outcome, which must name one
-or two complete replicas. Nothing in Remanence produces it yet. There is no
-operation that accepts a degraded replica set. A tape whose finalization
-cannot complete therefore stays in `RecoveryRequired`.
+or two complete replicas. No operation produces it, and none accepts a
+degraded replica set. A tape whose finalization cannot complete stays in
+`RecoveryRequired`.
 
 Healthy inventory reads the bootstrap at BOT, positions to EOD, and finds the
 planned terminal layout from the footer of a terminal replica read back from
@@ -261,20 +265,24 @@ that layout plans, without walking an Object. It reads a replica's payload
 only for the replica it accepts, or when two replica envelopes differ in a
 field that every replica of an edition shares (REM-PARITY Section 8.4, steps 1
 and 2). Among agreeing replicas it reads C first, then B, then A, and reports
-degraded redundancy when a replica fails. A footer supplies a layout only when
-the layout's planned EOD is at or after the tape's EOD; a tape file written
-after the terminal suffix therefore makes that layout unusable, and unless
-another footer supplies a layout the reader walks from BOT (see
-[Damaged tapes](guide-damaged-tapes.md)). Surviving replicas must agree on
-tape, edition, scope, counts, canonical payload/map digests, block/compression facts, writer
-facts, and the planned layout. If none survives, the truthful fallback is a
-structural scan from BOT; missing terminal authority is never an empty
-inventory. When a matching fsynced checkpoint journal survives, the BOT walk
-can recover exact Object identifiers only for its measured committed prefix;
-complete Objects beyond that boundary remain unknown and a torn tail remains
-incomplete. A foreign tape without local authority stays unknown rather than
-causing Remanence to invent a journal. Full verification is a separate
-operation. It reads every data block that a sidecar protects and every parity
+degraded redundancy when a replica fails.
+
+A footer supplies a layout only when the layout's planned EOD is at or after
+the tape's EOD. A tape file written after the terminal suffix therefore makes
+that layout unusable, and unless another footer supplies a layout the reader
+walks from BOT (see [Damaged tapes](guide-damaged-tapes.md)). Surviving
+replicas must agree on tape, edition, scope, counts, canonical payload and map
+digests, block and compression facts, writer facts, and the planned layout.
+
+If no replica survives, the fallback is a structural scan from BOT. Missing
+terminal authority is never reported as an empty inventory. When a matching
+fsynced checkpoint journal survives, the BOT walk recovers exact Object
+identifiers only for its measured committed prefix. Complete Objects beyond that
+boundary remain unknown, and a torn tail remains incomplete. A tape from
+another installation, without local authority, stays unknown; Remanence does
+not create a journal for it.
+
+Full verification is a separate operation. It reads every data block that a sidecar protects and every parity
 shard, checks each against its sidecar's index, and reports each failure by its
 address. It also walks the measured prefix and checks every surviving replica
 and both separation extents. A check of structure and metadata alone, which
@@ -298,24 +306,23 @@ A tape's durable identity is the 16-byte UUID in its bootstrap at BOT,
 written once at initialization. The barcode (voltag) is deliberately not
 written to tape — barcodes are library-inventory labels, and the binding
 voltag ↔ tape UUID lives in the catalog's `tapes` table. This is what
-makes identity library-independent: move a cartridge to another library
-and it is still the same tape. It is also the root of the known
-recycle-skew issue when something outside Remanence rewrites a cartridge
-under an existing barcode (see
+makes identity library-independent: a cartridge moved to another library is
+still the same tape. The same design means that if software outside Remanence
+rewrites a cartridge under an existing barcode, the catalog still binds that
+barcode to the old UUID (recycle skew; see
 [troubleshooting](guide-troubleshooting.md#known-open-issue)).
 
 <!-- code-anchor: crates/remanence-state/src/index.rs crates/remanence-state/src/paths.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs crates/remanence-state/src/calibration.rs @ a7fee789 -->
 ## On disk: durable records and rebuildable state
 
-The host-side state, for completeness (paths are operator-configured; see
-the [configuration reference](reference-configuration.md)):
+The host-side records that accompany the tapes. Paths are set by the operator;
+see the [configuration reference](reference-configuration.md).
 
 - **Parity tape-file journals** (`<tape-uuid>.remjournal`) — the Layer 3c
   record of tape-file entries, parity state, and checkpoint watermarks for
-  parity-enabled tapes. The format is version 4 (magic `REMJRNL\x01`).
-  Version 3 added the `CheckpointedThrough` watermark record; version 4
-  replaced the earlier terminal control records with typed terminal-prefix and
-  terminal-component transitions, each followed by its own watermark.
+  parity-enabled tapes. The format is version 4 (magic `REMJRNL\x01`). It
+  includes the `CheckpointedThrough` watermark record and typed terminal-prefix
+  and terminal-component transitions, each followed by its own watermark.
 - **Per-tape checkpoint journals**
   (`checkpoints/<tape-uuid>.remcheckpoint`) — fsynced checkpoint histories with
   the barrier-proved physical EOD and replayable catalog projection. Records use
@@ -326,10 +333,10 @@ the [configuration reference](reference-configuration.md)):
   manual close, the barrier-proved progress, whether the current boundary needs
   media reconciliation, and the edition being written. It has its own format
   version (magic `REMFINT\x01`, version 3), independent of the journal and
-  checkpoint record versions. Version 3 adds the finalization planning software
-  and time to the immutable terminal-prefix plan. The completed checkpoint
-  record embeds this plan and also uses version 3. Readers reject earlier
-  versions of both formats without migration.
+  checkpoint record versions. Version 3 includes the finalization planning
+  software and time in the immutable terminal-prefix plan. The completed
+  checkpoint record embeds this plan and also uses version 3. Readers reject
+  earlier versions of both formats.
 - **Audit segments** (daily `.remaudit` files) — append-only record of
   every state-changing operation, fsynced by default.
 - **SQLite index** — schema version 18, tracked via `PRAGMA

@@ -28,9 +28,9 @@ copy here.
 - [REM-OBJECT](../specs/publication/rem-object-core-1-specification.md) and
   [REM-ENCRYPT](../specs/publication/rem-encrypt-1-specification.md) define the
   object and envelope bytes carried through the API.
-- The current generation-2 tape implementation follows the
-  [REM-PARITY revision in preparation](../specs/in-progress/rem-parity-1-specification.md),
-  while the publication candidate still describes generation 1.
+- The tape implementation follows the
+  [REM-PARITY revision in preparation](../specs/in-progress/rem-parity-1-specification.md).
+  The copy in `specs/publication/` describes the `schema_major` 1 layout, which current software rejects.
 - [Architecture](../docs/architecture-overview.md) and
   [configuration](../docs/reference-configuration.md) describe deployment and
   transport trust boundaries.

@@ -1,9 +1,14 @@
 # Remanence documentation
 
-This directory holds the user-facing guides and references. The published
-format specifications, their plain-language companion, and the REM Implementation
-and Operations Guide live in
-[../specs/publication](../specs/publication). The root
+Remanence writes archives to LTO tape and reads them back years later. This
+directory holds the guides and references for people who install it, run it,
+or want to understand how it works: how to build and try it, how a tape is laid
+out, what each command does, and what to do when something goes wrong.
+
+If you are new, read the [quickstart](guide-quickstart.md) and then the
+[architecture overview](architecture-overview.md). The format specifications,
+their plain-language companion, and the REM Implementation and Operations Guide
+are in [../specs/publication](../specs/publication). The root
 [README.md](../README.md) is the project entry point.
 
 ## Start here
@@ -38,8 +43,8 @@ and Operations Guide live in
   what file metadata is preserved, how it is stored, and how it behaves on
   restore (including the standard-`tar` fallback).
 - [reference-foreign-format-adapters.md](reference-foreign-format-adapters.md)
-  — the read-only compatibility boundary for older archive formats, and
-  where adapter crates live relative to core.
+  — the read-only interface for reading archive formats written by other
+  software, and where adapter crates live relative to core.
 
 ## Deeper background
 
@@ -57,14 +62,15 @@ and Operations Guide live in
   classic failures of the conventional stack.
 - [tape-identity-lifecycle-explainer.md](tape-identity-lifecycle-explainer.md)
   — how a cartridge acquires and keeps its identity.
-- [pfr-reference.md](pfr-reference.md) — partial-file restore mechanics.
+- [pfr-reference.md](pfr-reference.md) — how partial-file restore reads a byte range from tape
+  (drive mechanics and arithmetic).
 - [reference-extract-stream-protocol.md](reference-extract-stream-protocol.md)
   — the ranged-ciphertext extract-stream contract.
 - [encryption-explained.md](encryption-explained.md) — why REM-ENCRYPT
   seals objects in software instead of relying on LTO drive-level
   encryption, and what an operator still has to manage themselves.
 - [versioning-explained.md](versioning-explained.md) — the three-question
-  change policy that governs every format revision, in plain language.
+  change policy for format revisions, in plain language.
 - [versioning-register.md](versioning-register.md) — every versioned
   component (bootstrap, sidecar, object, encryption registries, the
   documents themselves), one entry each: current value, what an unknown
@@ -73,8 +79,11 @@ and Operations Guide live in
   is Lean-proved, and what is deliberately not.
 - [decision-log.md](decision-log.md) — public format and compatibility
   decisions that affect independent implementations.
+- [guide-specification-preservation.md](guide-specification-preservation.md) —
+  the mechanical check that no text is lost when a specification is reorganized.
+- [guide-release-verification.md](guide-release-verification.md) — what a binary
+  release contains and how to check it was built from the signed source.
+- [api-module-organization.md](api-module-organization.md) — where each
+  behavior of the `remanence-api` crate lives in the source.
 
-This page lists every current document in this directory. Internal
-engineering records (design iterations, review transcripts, dispatch
-records) are kept outside the repository; git history preserves
-everything that ever lived here.
+This page lists every document in this directory.

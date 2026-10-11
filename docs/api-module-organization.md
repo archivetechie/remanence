@@ -1,21 +1,14 @@
 # Remanence API module organization
 
 `remanence-api` is the Layer 5 composition crate. It owns the gRPC services,
-daemon state, tape-pool write orchestration, and the drive/changer actors that
-serialize hardware access.
+daemon state, tape-pool write orchestration, and the drive and changer actors
+that serialize hardware access. This page maps its source files to those
+responsibilities, for someone who needs to find where a behavior lives.
 
-The crate once concentrated most of that work in three files. Before the
-organization pass, `lib.rs`, `write_owner.rs`, and `pool_write.rs` contained
-15,423, 18,479, and 14,196 lines respectively. Their public paths were useful,
-but their implementation boundaries were not: unrelated changes repeatedly
-met in the same files and a write-admission dependency ran in both directions
-between the pool writer and drive owner.
-
-Those three files are now façades. Existing callers still use root paths such
-as `remanence_api::ApiState`, `remanence_api::LtoGen`, and
-`remanence_api::WriteObjectSource`; the façades re-export the implementations
-from focused private modules. The refactor changes neither protobuf messages
-nor media/state-machine behavior.
+Three files, `lib.rs`, `write_owner.rs` and `pool_write.rs`, are façades: short
+files that re-export the implementation from focused private modules.
+Callers use root paths such as `remanence_api::ApiState`,
+`remanence_api::LtoGen` and `remanence_api::WriteObjectSource`.
 
 ## Top-level responsibilities
 
@@ -33,8 +26,8 @@ the other merely to coordinate an exclusive tape write.
 
 ## Drive-owner modules
 
-`write_owner.rs` retains the actor-facing façade. Its child modules each own
-one operational concern:
+`write_owner.rs` is the actor-facing façade. Its child modules each own one
+operational concern:
 
 - `actor_protocol.rs` and `actor_runtime.rs`: command types and actor loops.
 - `readiness.rs`: load-time media-readiness probing and durable fences.
@@ -42,19 +35,19 @@ one operational concern:
 - `write_session.rs`: the mounted write-session state machine.
 - `terminal_types.rs` and `terminal_finalize.rs`: irreversible finalization,
   recovery, and terminal-tail completion.
-- `terminal_inventory.rs`: terminal-index inventory and verification.
+- `terminal_inventory.rs` and `bot_recovery.rs`: terminal-index inventory and
+  verification, and recovery by walking the tape from its beginning when the
+  terminal index cannot be used.
 - `read_session.rs` and `restore.rs`: read-session opening and streamed reads.
 - `robotics.rs`, `cleaning.rs`, and `reconcile.rs`: changer motion, cleaning,
   and catalog reconciliation.
 
-The append-finish state transition remains a single coherent method inside
-`write_session.rs`. Moving it preserved the existing state machine; breaking
-that transition into smaller behavioral steps would be a separate semantic
-change and was intentionally not hidden inside this organization pass.
+The append-finish state transition is a single method inside
+`write_session.rs`, so the state machine stays in one place.
 
 ## Pool-writer modules
 
-`pool_write.rs` retains the stable write API and re-exports:
+`pool_write.rs` is the stable write API and re-exports:
 
 - `model.rs`: public requests, results, errors, and copy records.
 - `selection.rs`: pool selection and pinned-tape admission.
@@ -65,47 +58,13 @@ change and was intentionally not hidden inside this organization pass.
 - `direct.rs`: direct checkpointed writes and terminal close.
 - `no_parity.rs`: no-parity object write, projection, and replay.
 
-## Size and review guardrails
+## Size guideline
 
-After the pass, `lib.rs`, `write_owner.rs`, and `pool_write.rs` are 161, 139,
-and 54 lines. The largest new implementation module is roughly 2,250 lines;
-the largest pre-existing API implementation file is `mount.rs`, at roughly
-4,200 lines. New concepts should receive focused modules rather than growing
-one of the façades.
+`lib.rs`, `write_owner.rs` and `pool_write.rs` are each under 200 lines. The
+largest implementation file is `mount.rs`, at roughly 4,200 lines. New concepts
+get focused modules instead of growing one of the façades.
 
-The former inline unit suites are now out-of-line test modules. They retain
-their original test names and private-item access, keeping the organization
-change reviewable without rewriting fixtures at the same time. The crate's
-unit, documentation, formatting, lint, workspace, release-build, and
-clean-slate scenario gates remain the behavioral proof for this refactor.
-
-## Verification evidence
-
-The decomposition is committed at Remanence
-`f559f17d5581c29e0b8552172cc424837c22966b`. At that head:
-
-- `cargo test -p remanence-api --all-targets` passed 515 unit tests and one
-  documentation test.
-- `cargo test --workspace --all-targets`, `cargo fmt --all -- --check`,
-  warning-denied workspace Clippy, and `cargo build --release` all completed
-  successfully.
-- Clean-slate strict-freshness System scenarios passed for same-tape append,
-  operator `put`, parity-checkpoint replay, whole-object crash recovery,
-  terminal-index finalization/recovery, and live status. The terminal-index
-  run completed all 12 steps, including manual early finalization and its
-  fault/recovery matrix.
-
-These are behavior checks, not merely source-layout checks: they exercise the
-extracted ingress, pool selection, mounted write-session, checkpoint,
-terminal-finalization, inventory, readback, and recovery paths through the
-release daemon and CLI.
-
-## Independent incremental review
-
-The exact range from the last recorded clean baseline
-`7f6861c2f5b7dcd8237e22696c15d229ee0ccb3e` through evidence head
-`bbd28c4d3b4b55401cdee9a90fe187a3943d897c` passed two consecutive
-independent incremental reviews on 2026-08-12 with zero actionable findings.
-The reviewers checked the moved function set, public re-exports, module
-dependency direction, focused façades, relevant live receipts, and the clean
-worktree. Untouched regions retain their previously reviewed-clean status.
+Unit tests live in three shared out-of-line suites, `src/tests.rs`,
+`src/write_owner/tests.rs` and `src/pool_write/tests.rs`, which keep access to
+the modules' private items. Some other modules, such as `read_core.rs`, keep
+their tests inline.
