@@ -1,8 +1,8 @@
 # Reference: Partial File Restore (PFR) on LTO
 
-This page explains the drive mechanics and the arithmetic behind partial file restore: how Remanence reads a byte range out of one file on tape without reading the rest of the object. The format rules themselves are in the REM-OBJECT specification (`specs/publication/`); where this page and the specification differ, the specification governs.
+This page explains the drive mechanics and the arithmetic behind partial file restore: how Remanence reads a byte range out of one file on tape without reading the rest of the object. The format rules themselves are in the REM-OBJECT specification (`specs/publication/`); If this page and the specification differ, follow the specification.
 
-Sources are listed at the bottom. Anything on this page that is not cited should be checked against the IBM LTO SCSI Reference and the T10 SSC-5 standard before code depends on it.
+Sources are listed at the bottom. Anything on this page that is not cited should be checked against the IBM LTO SCSI Reference and T10's SCSI Stream Commands standard (SSC-5) before code depends on it.
 
 ---
 
@@ -19,9 +19,9 @@ This page is about the second. Single-file restore is the special case where the
 
 ---
 
-## 2. The hardware substrate
+## 2. What the hardware provides
 
-PFR is enabled by three things LTO actually exposes via SCSI:
+PFR rests on three things LTO exposes via SCSI:
 
 1. **Logical Block Addresses (LBAs).** Every application-level block
    written to tape gets an LBA, monotonically increasing within a
@@ -32,25 +32,25 @@ PFR is enabled by three things LTO actually exposes via SCSI:
 3. **READ POSITION.** The drive reports its current LBA on demand —
    useful for sanity checks and progress.
 
-A fourth optional accelerator exists on LTO-9 only:
+A fourth optional accelerator exists on LTO-9 and later full-height drives only:
 
 4. **RAO (Recommended Access Order).** The application submits a batch
    of segments — each a partition, a start and an *end* block — and the
    drive returns them reordered for the serpentine track layout. Used
-   for bulk multi-target restore, not by single-range PFR. Available on
-   LTO-9 and later full-height drives only, so rem does not use it and
+   for bulk multi-target restore, not by single-range PFR. Because it is not
+   available on every drive Remanence supports, rem does not use it and
    computes the order itself instead; see §8.
 
 ### 2.1 The LOCATE BLOCK command
 
-LOCATE comes in two flavours per SSC-3:
+LOCATE comes in two flavours per SSC-3 (SCSI Stream Commands, the T10 standard for tape drives):
 
 | Form | Opcode | Block-address width | Notes |
 |--|--|--|--|
 | `LOCATE(10)` | `2Bh` | 32-bit | Legacy. 32 bits is enough to address LTO-9 at the block sizes rem supports (256 KiB to 1 MiB) but not small-block formats. |
 | `LOCATE(16)` | `92h` | 64-bit | The form rem uses. |
 
-The byte layout of the `LOCATE(16)` command is defined in SSC-5 and in the IBM LTO SCSI
+The byte layout of the `LOCATE(16)` command (its CDB, the command descriptor block, which is the SCSI command packet) is defined in SSC-5 and in the IBM LTO SCSI
 Reference (the LOCATE(16) table); take it from there rather than from this page. What matters
 here is which options rem uses: it sends a logical block address in the command's 8-byte
 address field, with every selector bit (destination type, change partition, immediate and
@@ -86,19 +86,20 @@ with a 16-byte tag, so its chunks do not line up with tape blocks (§4.6).
 
 ### 2.3 LOCATE latency, real numbers
 
-LTO seek times are unforgiving compared to disk. The numbers an
+LTO seek times are much slower than disk seeks. The numbers an
 orchestrator should plan against:
 
 | Scenario | LTO-8 | LTO-9 | Notes |
 |--|--|--|--|
-| BOT → middle (average locate) | ~60 s | similar | IBM-documented. |
-| End-to-end (BOT → EOT) | ~100–102 s | similar | Tape is ~1 km of physical media. |
+| BOT (beginning of tape) → middle (average locate) | ~60 s | similar | IBM-documented. |
+| End-to-end (BOT → EOT, end of tape) | ~100–102 s | similar | Tape is ~1 km of physical media. |
 | Typical inter-file seek | 10–100 s | 10–100 s | Depends on distance + drive thermal calibration state. |
-| With ordered access (batch) | applies | ~50% reduction | Per CERN testing, for recalls under 500 targets. |
+| With ordered access (batch) | n/a (software ordering only) | ~50% reduction | Per CERN testing, for recalls under 500 targets. |
 | Reposition after a stop | 2.50 s mean | similar | HP LTO-6 technical reference. ~750 MB of foregone streaming at 300 MB/s. |
 
 **Practical rule of thumb:** when the drive has to LOCATE, a cold byte-range PFR on an
-already-loaded tape costs **one LOCATE (~30–60 s typical, up to ~100 s worst case)
+already-loaded tape costs **one LOCATE (about 60 s on average from BOT to the middle of the tape,
+10–100 s between files, and about 100 s end to end, per the table above)
 plus the chunk read (sub-second for ≤1 MiB)**. Loading a fresh tape
 adds the library MOVE + drive LOAD time on top (LTO-9 first-load
 calibration alone can take up to two hours; subsequent loads are
@@ -106,13 +107,13 @@ calibration alone can take up to two hours; subsequent loads are
 
 Two corollaries:
 
-- **PFR is fast-ish only if the tape is already loaded.** For an
+- **PFR is fast only when the tape is already loaded.** For an
   orchestrator restoring from cold storage, queue depth matters more
   than individual-range latency.
-- **Batching wins.** Restoring 100 byte-ranges from one tape in a
-  planned order is dramatically faster than 100 separate PFR calls —
+- **Batching matters.** Restoring 100 byte-ranges from one tape in a
+  planned order is much faster than 100 separate PFR calls —
   partly from shorter travel, and partly from avoiding the 2.5 s
-  reposition that each stop between calls invites.
+  reposition after each stop.
 
 ### 2.4 File marks
 
@@ -145,7 +146,7 @@ Given:
 
 the result is a byte stream of exactly `n` bytes, in a time that depends on tape position and on the number of blocks covered, not on the size of the file.
 
-What a range read verifies depends on the copy. A plaintext copy on a parity-protected tape is covered by the parity layer's per-block CRCs, which detect damage but do not authenticate. An encrypted copy authenticates each chunk it releases (§4.6). A plaintext copy without the parity layer has no per-range integrity. A range read that does not cover the whole file cannot check the file's whole-file hash. REM-OBJECT section 6.5 states these cases, and a restorer reports which one applies.
+What a range read verifies depends on the copy. A plaintext copy on a parity-protected tape is covered by the parity layer's per-block CRCs (checksums), which detect damage but do not authenticate. An encrypted copy authenticates each chunk it releases (§4.6). A plaintext copy without the parity layer has no per-range integrity. A range read that does not cover the whole file cannot check the file's whole-file hash. REM-OBJECT section 6.5 states these cases, and a restorer reports which one applies.
 
 These are the checks the formats make possible. The daemon's ranged read RPC streams the
 covering blocks as opaque bytes, trimmed to the range, and does not check sidecar CRCs on
@@ -260,7 +261,7 @@ Because of the 16-byte tags, stored chunks drift against tape-block boundaries, 
 
 Remanence writes tapes only at these three block sizes (REM-PARITY section 8.4). The drive can accept larger blocks (see §11), and REM-OBJECT itself allows any positive multiple of 512 bytes, but a Remanence tape uses one of the three. A range that straddles a block boundary reads two blocks and discards less than `2 * chunk_size` in total.
 
-The default is 256 KiB. Smaller blocks cost per-block overhead on the drive (sync and ECC framing); larger blocks cost over-read on every small range. For most PFR work, such as video frame ranges or slices of a scientific dataset, an over-read of a few hundred KiB is small next to the 30 to 60 seconds a LOCATE costs. The object's `chunk_size` is recorded with the object, so readers do not assume it. On tape it equals the tape block size of the object's tape file.
+The default is 256 KiB. Smaller blocks cost per-block overhead on the drive (sync and ECC framing); larger blocks cost over-read on every small range. For most PFR work, such as video frame ranges or slices of a scientific dataset, an over-read of a few hundred KiB is small next to the 10 to 100 seconds a LOCATE costs. The object's `chunk_size` is recorded with the object, so readers do not assume it. On tape it equals the tape block size of the object's tape file.
 
 ---
 
