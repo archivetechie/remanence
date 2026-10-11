@@ -4,7 +4,7 @@
 
 This document compares Remanence with the other ways of putting data on LTO tape
 and explains the trade-offs in operator terms. It is for someone choosing between
-Remanence and an alternative. The formal format commitments live in the published
+Remanence and an alternative. The format commitments themselves are in the published
 [REM-OBJECT Core Format 1.0](../specs/publication/rem-object-core-1-specification.md),
 [REM-ENCRYPT 1.0](../specs/publication/rem-encrypt-1-specification.md), and
 [REM-PARITY 1.0](../specs/publication/rem-parity-1-specification.md)
@@ -28,8 +28,7 @@ workflows (retention policy, cross-tier orchestration, deduplication, job
 scheduling, user-facing UI) are out of scope and belong to the orchestrator that
 calls Remanence's API.
 
-The small scope is the main difference between Remanence and the alternatives in
-the space. The alternatives fall into four categories, and each has a weakness for
+The small scope is the main difference between Remanence and the alternatives. The alternatives fall into four categories, and each has a weakness for
 the archival use case.
 
 ---
@@ -57,16 +56,16 @@ Remanence is smaller than every category above, on purpose.
 | Phase-aware error reporting on composed ops | yes | no | n/a | partial | varies |
 | Completion-unknown handling (transport-error semantics) | yes (`dirty` state machine) | no | no | partial | opaque |
 | Per-operation-class SCSI timeouts | yes | no (single global) | partial | partial | varies |
-| Hot-plug aware (re-derive on udev events) | yes | no | n/a | depends | yes |
+| Hot-plug aware (re-derive on udev events, the Linux device events) | yes | no | n/a | depends | yes |
 | Unit-testable without hardware | yes (captured fixtures and virtual media) | no | no | partial | no |
-| Data readable in 10 to 20 years with standard tools | yes (plaintext REM-OBJECT is constrained pax tar) | n/a (raw bytes) | only if LTFS persists | suite-specific | proprietary |
+| Data readable in 10 to 20 years with standard tools | yes (plaintext REM-OBJECT is constrained pax tar, the POSIX tar format) | n/a (raw bytes) | only if LTFS persists | suite-specific | proprietary |
 | Operator-grade audit log | yes (hash-chained on-disk log) | no | no | yes | yes |
 | Minimal scope (no scheduler or retention engine) | yes | yes | yes | no | no |
-| OS-portable architecture (seams for Windows port) | yes | partial | partial | partial | no |
+| OS-portable architecture | yes (seams kept; no Windows port yet) | partial | partial | partial | no |
 | Open-source licence | Apache-2.0 (code) | various | various | AGPL/GPL | no |
 
 Remanence leads on most rows because the alternatives took on more responsibility
-than the mechanism layer needs. Less software has fewer ways to be wrong.
+than the mechanism layer needs. A smaller scope means fewer failure modes.
 
 ---
 
@@ -83,11 +82,11 @@ Eight things Remanence does that an `mt`/`mtx` script cannot:
 
 `mtx` references libraries via `/dev/sg7` (or similar); `mt` references drives via
 `/dev/nst2`. Both are kernel-enumeration paths that renumber silently after a
-reboot, an HBA rescan, a driver reload, or a drive replacement. A script that
+reboot, a rescan of the host bus adapter (HBA), a driver reload, or a drive replacement. A script that
 worked yesterday can fail today by talking to the wrong drive.
 
-Remanence derives every operation by drive serial number, read from VPD page 0x80
-of the device itself. `/dev/sg7` and `/dev/nst2` are treated as temporary labels:
+Remanence derives every operation by drive serial number, read from VPD (Vital Product Data) page 0x80,
+which holds the unit serial number, of the device itself. `/dev/sg7` and `/dev/nst2` are treated as temporary labels:
 they are resolved afresh on every discovery, and the persistent state never refers
 to them.
 
@@ -118,8 +117,8 @@ Remanence uses a per-library allowlist: state-changing operations refuse to run
 against any library not on the list. For the direct library commands the list is given
 with `--allow` (the library's serial number, repeatable); `rem tape init` takes its
 list from the configured libraries; `rem tape retire` changes only the catalog and
-needs none. Read-only inspection works on every reachable library, so visibility is
-open and action requires an explicit opt-in.
+needs none. Read-only inspection works on every reachable library; state-changing operations
+require an explicit opt-in.
 This lets Remanence share a host with another tape system safely, without the
 operator having to be careful with each command.
 
@@ -425,7 +424,8 @@ accompanied by pinned test vectors. The software version and the format versions
 independent: the format versions stay at 1.0 when the software is at 0.1.0. The
 specifications are review drafts, not frozen. They freeze on 31 July 2027, and the
 durability guarantees described in this document take effect then. For the current
-capability and limitations, see the [README](../README.md) and [status.md](status.md).
+capability and limitations, see the [README](../README.md) and [status.md](status.md). If this
+document and a specification differ, follow the specification.
 
 ---
 

@@ -1,14 +1,15 @@
 <!-- code-anchor: crates/remanence-aead specs/publication/rem-encrypt-1-specification.md @ bc2f9f90 -->
 # Encryption explained
 
-REM-ENCRYPT seals a REM-OBJECT before it reaches any storage medium. LTO drives
-have been able to encrypt in hardware since generation 4, which raises a fair
-question: why encrypt in the object format at all?
+REM-ENCRYPT seals a REM-OBJECT before it reaches any storage medium. Sealing
+means encrypting the object and wrapping it in an envelope that carries the
+wrapped key. LTO drives have encrypted in hardware since generation 4; this page
+explains why REM-ENCRYPT encrypts in the object format instead of using the
+drive.
 
-This document gives the full answer. The short version is on the
-[website](https://archivetech.org/drive-encryption); what follows is the detail
-behind it, together with guidance on key custody, the one part an operator has to
-supply.
+The short version is on the [website](https://archivetech.org/drive-encryption).
+This page gives the detail behind it, plus guidance on key custody, which is the
+part an operator has to supply.
 
 ---
 
@@ -16,7 +17,8 @@ supply.
 
 Both approaches use a published authenticated cipher and neither has a known
 weakness. The difference is where the boundary between plaintext and ciphertext
-is drawn, and what that boundary costs the work an archive repeats for as long as it is held.
+is drawn, and what that boundary costs the work an archive repeats for as long as
+it holds the collection.
 
 Under drive encryption the ciphertext begins at the tape head. Everything before
 it — the ingest process, the staging disk, the host, the cable — holds plaintext,
@@ -25,7 +27,8 @@ ciphertext begins at ingest, so every copy on every medium is the same protected
 byte string.
 
 The operational consequence is that storing, replicating, repairing from parity
-(extra recovery data written alongside the objects) and scrubbing stored bytes all
+(extra recovery data written alongside the objects) and scrubbing stored bytes
+(reading stored copies on a schedule to check them against their checksums) all
 proceed with no key present. Authenticated verification of an object's contents, and
 any restore, require a key.
 
@@ -84,7 +87,7 @@ and firmware that still supports the feature.
 ### 2.3 One consequence of policy-driven encryption
 
 Where encryption is applied by library policy, the drives serving that partition
-encrypt everything they write. An estate holding both encrypted and unencrypted
+encrypt everything they write. A site holding both encrypted and unencrypted
 collections therefore divides into encrypting and non-encrypting drives, and a
 drive failure removes the ability to write one of the two kinds of copy until it
 is replaced. Nothing in the hardware requires this — encryption parameters are
@@ -100,7 +103,7 @@ usually deployed.
 | Cipher | AES-256-GCM in drive silicon | ChaCha20-Poly1305; key wrapped with HPKE (a public-key scheme for sealing a key to a recipient) and X-Wing (a hybrid of classical and post-quantum key exchange) |
 | Ciphertext begins | At the tape head | At ingest, before any storage is touched |
 | What is protected | The cartridge | The object, on every medium it is copied to |
-| Key granularity | One key per encrypted data set; reuse decided by the manager | A fresh key per seal, wrapped to one to eight recipient keys |
+| Key granularity | One key per encrypted data set (the unit of data the drive encrypts under one key); reuse decided by the manager | A fresh key per seal, wrapped to one to eight recipient keys |
 | Verify a copy without the key | Possible in principle — a drive can return raw encrypted blocks — but we know of no archiving product that uses it | Yes; the specification defines the role |
 | Repair from parity without the key | No | Yes |
 | Authority held by upkeep jobs | Must be able to decrypt everything in their scope | None for storage, replication, parity repair and stored-byte scrubbing; authenticated verification and any restore need a key |
@@ -120,13 +123,13 @@ to be arranged at another layer. That layer can share centralised key management
 and policy with the tape system, but it is a second mechanism either way, and the
 archive's effective protection is whatever the weaker of the two provides.
 
-There is a second consequence during repair. If a disk copy is lost and has to be
+Repair has a second consequence. If a disk copy is lost and has to be
 rebuilt from tape, the data is decrypted by the drive and re-encrypted by whatever
 protects the disk. Repairs of this kind are routine, and each one produces
 plaintext on the host.
 
 With encryption in the object the material is sealed once, and that stored byte
-string is fanned out unchanged to every medium. A later reseal uses a fresh key
+string is copied unchanged to every medium. A later reseal uses a fresh key
 and produces different bytes, but the copies made from one seal are identical.
 
 ### 3.2 The work an archive repeats
@@ -134,14 +137,14 @@ and produces different bytes, but the copies made from one seal are identical.
 An object is written once. The operations that follow recur for as long as the
 collection is held: reading copies back, scrubbing cartridges on a schedule,
 rebuilding damaged regions from parity, making additional copies, and eventually
-moving everything to newer media. This work is automated because it is dull and
-very large, and automated work of this kind is watched less closely than the paths
-an operator sits in front of.
+moving everything to newer media. This work is automated because it is repetitive and
+very large, and automated work of this kind gets less oversight than interactive
+operations.
 
 Under drive encryption all of it runs through the decryption path, so the key
 store has to be reachable and the key released for operations whose only purpose
-is to confirm that stored data has not changed. The standing authority to decrypt
-the collection sits with automated jobs that run unattended for years.
+is to confirm that stored data has not changed. Automated jobs that run unattended
+for years hold the authority to decrypt the collection.
 
 With encryption in the object, the ciphertext is what gets stored, checksummed,
 replicated and repaired. A copy can be checked without being opened, and custody

@@ -8,13 +8,23 @@ below). For an epoch whose sidecar index cannot be read, it reads the blocks
 but has no checksum to compare them against. It has two practical
 uses. One is a periodic, systematic check of the whole archive, for example
 verifying every tape in turn on a rotation so that unreadable blocks are found
-while there is time to act on them. The other is to judge one suspect tape.
+early enough to repair or re-copy them. The other is to judge one suspect tape.
+
+Four terms from the tape layout recur on this page (each is also in the
+[glossary](reference-glossary.md)). A parity sidecar, or sidecar, is a tape file
+of parity shards (blocks of parity data) and per-block checksums that covers the
+data blocks of one epoch. An epoch is one group of data blocks that are protected
+together and described by one sidecar; at the default settings a full epoch
+covers 16 GiB of Object data. The ParityMap is the tape file written after the
+last sidecar, and it lists every sidecar and the range of data each protects. A
+separation extent is one of the two spacer tape files, AB and BC, that sit
+between the three terminal index copies and keep them physically apart.
 
 This page explains what `rem tape verify-index` checks, what it means when the
 command reports a tape as complete, what it prints when it finds a problem,
 and how long it takes. The command's row in the [CLI reference](reference-cli.md)
 states what it does in a line; this page gives the reasons. The rule it
-follows is REM-PARITY Section 2.2, in the preparing copy of the specification,
+follows is REM-PARITY Section 2.2, in the draft specification under review,
 [REM-PARITY 1.0.0-draft.5](../specs/in-progress/rem-parity-1-specification.md).
 For what to do when a tape does not verify, or will not identify itself, see
 [Damaged tapes](guide-damaged-tapes.md).
@@ -30,9 +40,9 @@ and metadata alone, which reads no data block or parity shard, is not a full
 verification." `rem tape verify-index` performs the full verification.
 
 No command checks the structure of a whole tape and stops there. The quick
-check that exists is `rem tape inventory`. It reads the bootstrap record at
+check is `rem tape inventory`. It reads the bootstrap record at
 the beginning of the tape and the terminal index copies at the end, and
-normally does not walk over every tape file in between. It normally reads no
+normally does not walk over every tape file in between. It reads no
 Object data and normally takes minutes. If the terminal index cannot be used,
 inventory falls back to a structural walk from the beginning of the tape, which
 reads the first and last block of each Object and can take hours. A successful
@@ -45,7 +55,7 @@ A sensible pattern is to run `rem tape inventory` as a quick, frequent check
 and a full verification on a rotation, at an interval that suits the number of
 tapes and drives you have.
 
-The reason for the definition is what a parity tape promises. Each Object's
+The reason for the definition is the guarantee a parity tape makes. Each Object's
 blocks are protected by parity shards written into sidecar tape files. The tape
 can only be called good if those blocks and shards can still be read and still
 match the checksums the sidecar recorded for them. Only a read of every block
@@ -71,7 +81,7 @@ gives the arithmetic.
 
 ## When a tape is verified complete
 
-A tape is verified complete when four things hold together.
+A tape is verified complete when four conditions hold.
 
 1. The terminal suffix is complete. All three replicas of the terminal index
    validate in full, both separation extents validate, and the end of data
@@ -88,14 +98,14 @@ A failure of any one of these leaves the tape not complete. The specification
 states the same condition in one sentence: the Verifier "reports the tape as
 complete when the terminal suffix is complete, the full verification was
 performed, and it finds no failed data block, no failed parity shard and no
-finding about a sidecar or about the prefix", and a finding about a copy of
-the ParityMap or its footer likewise leaves the tape not complete.
+finding about a sidecar or about the prefix". A finding about a copy of
+the ParityMap or its footer also leaves the tape not complete.
 
 The fourth condition includes the fill at the end of the bootstrap block. The
 bootstrap is one block, and the bytes after its payload are written as zeros.
-REM-PARITY Section 8.1 tells a Reader never to let that fill decide whether it
-accepts the bootstrap, so that a damaged byte cannot cost the tape its entry
-point. It tells a Verifier to check it and to report a nonzero fill as a
+REM-PARITY Section 8.1 requires a Reader to accept the bootstrap whatever the
+fill contains, so a damaged byte in the fill cannot make the tape unreadable. It
+tells a Verifier to check it and to report a nonzero fill as a
 nonconformity, so a tape whose bootstrap fill is not zero is readable and is
 not complete. The Verifier reports the fill only when it can read the
 bootstrap.
@@ -151,9 +161,9 @@ planned, because something was written after C; or the prefix is truncated
 before the planned prefix. The first two are described in
 [Damaged tapes](guide-damaged-tapes.md). This state prints no `complete` line
 and no `verification_basis` line in the human form. `verification_basis:
-bot_structural_recovery` appears only in the JSON, and so do any findings from
-the pass over the protected content, which still runs over the walked map; the
-human form does not print them. Such a tape is not verified against a terminal
+bot_structural_recovery` appears only in the JSON. Findings from the pass over
+the protected content, which still runs over the walked map, also appear only in
+the JSON; the human form does not print them. Such a tape is not verified against a terminal
 index.
 
 `verified_degraded` also has a second cause that involves no finding line. A

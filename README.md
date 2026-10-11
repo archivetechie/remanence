@@ -6,7 +6,8 @@ still be read 10 to 20 years from now, after the hardware, the software and the
 people who wrote the tapes have changed. Each tape describes itself and the
 object format is publicly specified, so a copy never depends on a particular
 database, vendor or program staying available. It also supports optional
-encryption, erasure-coded recovery from damaged media, and partial-file
+encryption, erasure-coded recovery from damaged media (extra parity data that
+can rebuild unreadable regions), and partial-file
 restore, which reads one byte range of a file without reading the whole
 object.
 
@@ -24,9 +25,9 @@ cartridges, write self-describing objects with erasure-coded parity, and
 account for every byte in a rebuildable catalog. What to archive, when, and
 for how long are decisions for whatever orchestrator calls its API.
 
-The long-term archive niche is served mostly by proprietary systems whose
-on-tape formats end with their vendors, and by tooling that treats tape like a
-disk. Remanence makes different choices. The object format is publicly
+Long-term tape archiving is dominated by proprietary systems whose on-tape
+formats become unreadable when the vendor disappears, and by tools that treat
+tape like a disk. Remanence makes different choices. The object format is publicly
 specified and a plaintext object can be read with stock `tar`. Every tape
 describes itself, so no database is the only copy of the truth. When the
 hardware leaves the software uncertain about physical state, the software
@@ -42,7 +43,8 @@ HPE MSL3040 with LTO-9 drives.
 **Version 0.1.0 — alpha.** The implementation has not had enough operational
 testing to be trusted with material you cannot afford to lose. Expect defects
 and breaking changes. [CHANGELOG.md](CHANGELOG.md) lists the releases,
-including the v1.0.0 tag, which is marked superseded.
+including the v1.0.0 tag, which is marked superseded because that number
+overstated the implementation's maturity.
 
 REM-OBJECT and REM-ENCRYPT are specified, implemented, and pinned by the test
 vectors that ship with the source. For REM-PARITY, current `main` writes and
@@ -53,7 +55,7 @@ vector archive describe `schema_major = 1`, which current `main` rejects. Tapes 
 by the released v0.1.0 binaries use `schema_major = 1` and cannot be read by
 current `main`.
 
-The specification review copies are public, but their concept DOIs are reserved
+The specification review copies are public, but their concept DOIs (registry entries covering all revisions) are reserved
 and the first deposits are still pending. The review checks whether the
 documents describe the formats correctly and completely, not whether the design
 works. The documents freeze on 31 July 2027, and the guarantee that no tape a
@@ -78,8 +80,7 @@ cargo build --release
 ```
 
 yields `target/release/{rem,rem-debug,rem-daemon,rem-recover}`. `rem` is the
-operator CLI and `rem-debug` the break-glass one that talks to hardware
-directly; `rem-recover` is a separate crate that depends on neither the daemon
+operator CLI and `rem-debug` the break-glass one (direct hardware access for emergencies); `rem-recover` is a separate crate that depends on neither the daemon
 nor the catalog. One optional feature, `remanence-cli/linux-udev`, adds
 hot-plug watching and needs `pkg-config` and `libudev-dev`.
 
@@ -113,7 +114,7 @@ rem archive inspect --object demo.rem-object
 rem archive extract --object demo.rem-object --dest restored
 ```
 
-`demo.rem-object` is a chunk-aligned POSIX pax tar stream — `bsdtar -tf
+`demo.rem-object` is a POSIX pax tar stream — `bsdtar -tf
 demo.rem-object` lists your files — and it is byte-for-byte what a tape write
 stores as the object body. The full walkthrough, from local round trip
 to library discovery, daemon setup, tape initialization, and a first
@@ -138,7 +139,7 @@ tape write, is [docs/guide-quickstart.md](docs/guide-quickstart.md).
   fences, and permissions.
 - [Glossary](docs/reference-glossary.md) — project terms and tape
   vocabulary.
-- [How the formats change — and what never does](docs/versioning-explained.md)
+- [How the formats change](docs/versioning-explained.md)
   — the versioning and revision policy, in plain language.
 - [The versioning register](docs/versioning-register.md) — every versioned
   component of the system, one entry each: current values, unknown-value
