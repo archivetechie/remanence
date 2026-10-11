@@ -28,9 +28,14 @@ Choose by what you already know.
    than you expected. Run `rem tape inventory --tape-uuid TAPE_UUID`, and go to
    "The terminal index is damaged, or is not where it was expected".
 3. The first record of the tape, the bootstrap, is unreadable, or you suspect
-   its values are wrong. Run `rem-debug tape recovery-report SOURCE` with the
-   three values you know (the tape UUID, the block size, and the parity scheme),
-   and go to "The bootstrap is unreadable" and the situations after it.
+   its values are wrong. Run `rem-debug tape recovery-report SOURCE`, where
+   SOURCE is the drive's SCSI generic device path (for example `/dev/sg3`,
+   which `lsscsi -g` lists), or a directory that holds a tape image in the
+   published layout (files named `tape-file-NNN-*.bin`). If the bootstrap
+   cannot be read, add the three values you know: the tape UUID, the block
+   size and the parity scheme, as `--tape-uuid`, `--block-size` and `--scheme`.
+   The next sections say where each value comes from. Then go to "The
+   bootstrap is unreadable" and the situations after it.
 
 A tape can also have more than one of these problems. Start with the one whose
 command you can run.
@@ -191,11 +196,33 @@ block size and the parity scheme are the identity and geometry the tools need
 from it, and you can supply them.
 
 What to do next. Supply all three to `rem-debug tape recovery-report`, which
-takes them together or not at all:
+takes them together or not at all. SOURCE is the drive's SCSI generic device
+path (for example `/dev/sg3`, which `lsscsi -g` lists) or a directory holding a
+tape image in the published layout (`tape-file-NNN-*.bin`):
 
 ```text
-rem-debug tape recovery-report SOURCE --tape-uuid UUID --block-size BYTES --scheme k,m,S
+rem-debug tape recovery-report SOURCE --tape-uuid TAPE_UUID --block-size BLOCK_SIZE_BYTES --scheme K,M,S
 ```
+
+For example, for a drive at `/dev/sg3` and a tape written with the default
+scheme at a 256 KiB block size (128 data blocks and 4 parity blocks per stripe,
+512 stripes per neighborhood; see the [tape layout reference](reference-tape-layout.md#parity-scheme)):
+
+```text
+rem-debug tape recovery-report /dev/sg3 --tape-uuid TAPE_UUID --block-size 256KiB --scheme 128,4,512
+```
+
+The tape cannot supply these values, since the bootstrap that holds them is the
+part that cannot be read. They come from records you keep elsewhere:
+
+- `--tape-uuid` is the tape's UUID. Look it up in the catalog by the cartridge's
+  barcode, or in whatever record you made when the tape was initialized.
+- `--block-size` is the fixed block size the tape was written with: 256 KiB,
+  512 KiB or 1 MiB, given in bytes or with a KiB or MiB suffix. It is a
+  property of the pool or tape and appears in the catalog.
+- `--scheme` is the parity scheme as `k,m,S`: data blocks per stripe, parity
+  blocks per stripe, and stripes per neighborhood. It comes from the pool's
+  policy or the catalog's record of the tape.
 
 For a tape written without parity, give `--scheme none`. Without the values,
 nothing can be read from this tape by this route.

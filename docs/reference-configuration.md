@@ -56,9 +56,9 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `default_idle_timeout_seconds` | integer > 0 | required | Default idle timeout for write/read sessions. |
 | `drive_idle_unload_seconds` | integer ≥ 0 | `300` | Rewind, unload, and return a seated cartridge to its home slot after this many idle seconds. `0` keeps it seated until eviction or daemon shutdown. |
 | `spool_dir` | absolute path | `<state_dir>/spool` | Pre-commit append spool. Created with mode `0700` at startup. |
-| `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Post-R2, spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
+| `spool_tmpfs_ram_budget` | byte size > 0 | unset | Required acknowledgement when the spool resolves to tmpfs/ramfs. Spool growth reserves this fixed budget from the shared `io_memory_ceiling`; runtime `MemAvailable` never clamps or authorizes growth. Must be ≤ `io_memory_ceiling`. |
 | `io_memory_ceiling` | byte size > 0 | `"24GiB"` | Fixed total for ALL pipeline I/O memory: append-spool reservations plus every drive's read reservoir, granted through one atomic permit manager. See the deployment note below. |
-| `append_staging_mode` | `"serial"` \| `"overlap"` | `"serial"` | `"serial"` spools an entire object to disk before any of it reaches tape (the write path described below). `"overlap"` is an opt-in v0.1 rollout that admits an append into a shared ring buffer before the whole object has landed; a per-append is only eligible when the caller attests `source_replay_capability = REPLAY_FROM_START` (it can replay its source from byte zero after an interrupted overlap append) alongside a declared size and a binding content digest. |
+| `append_staging_mode` | `"serial"` \| `"overlap"` | `"serial"` | `"serial"` spools an entire object to disk before any of it reaches tape (the write path described below). `"overlap"` admits an append into a shared ring buffer before the whole object has landed. An individual append is eligible only when the caller attests `source_replay_capability = REPLAY_FROM_START` (it can replay its source from byte zero after an interrupted overlap append) and supplies a declared size and a binding content digest. |
 | `append_ring_bytes` | byte size > 0 | `"8GiB"` | Shared ring-buffer size for `"overlap"` mode. |
 | `append_ring_high_pct` | integer 1..=100 | `90` | Overlap-ring occupancy percentage that pauses further admission. |
 | `append_ring_low_pct` | integer 1..=99 | `25` | Overlap-ring occupancy percentage that resumes admission after draining. |
@@ -69,9 +69,8 @@ string with a suffix: `B`, `KiB`/`K`/`KB`, `MiB`/`M`/`MB`, `GiB`/`G`/`GB`,
 | `socket_path` | absolute path | `<state_dir>/rem.sock` | Unix-domain gRPC socket. Parent directory created `0700`; socket chmod `0660`; connecting peers must be root or the daemon's own user. |
 | `listen` | `host:port` string | unset | TCP listen address for mTLS gRPC. Requires `[daemon.tls]`. |
 
-`checkpoint_mode` was removed on 2026-07-21; checkpoint-batched durability
-is the only write mode. Configurations that still contain the key are
-rejected so an obsolete `per_object` value cannot silently change meaning.
+Checkpoint-batched durability is the only write mode, so there is no
+`checkpoint_mode` key. A configuration that contains the key is rejected.
 
 ### Transport trust boundaries
 
@@ -86,26 +85,31 @@ authorization boundaries:
 - The TCP listener requires a client certificate signed by the configured CA.
   Its explicit `remanence-role` subject attribute selects the role; otherwise
   access defaults to read-only. Certificate revocation is not implemented, so
-  removing a client currently requires rotating the trusted CA or issuing a
+  removing a client requires rotating the trusted CA or issuing a
   replacement trust bundle and restarting the daemon.
 
-Authenticated API clients can currently receive internal-error text that may
+Authenticated API clients can receive internal-error text that may
 include host paths or SQLite diagnostics. Treat both transports as
 administrative interfaces rather than exposing them to untrusted tenants.
 
-### I/O memory ceiling deployment note (TIO-6 R2)
+### I/O memory ceiling deployment note
 
-The daemon unit must run under a cgroup memory limit
-(systemd `MemoryMax`) with `io_memory_ceiling` + daemon baseline headroom
-≤ `MemoryMax` (guidance: leave ≥ 2 GiB), and `LimitMEMLOCK` sized ≥ the
-ceiling (a safe upper bound: only read-reservoir slabs are actually
-mlocked). Residency scoping: **read-reservoir slabs are mlocked —
-never-swap holds for them**; the tmpfs spool is **ceiling-reserved but
-NOT guaranteed-resident** (tmpfs pages are file-backed and swappable
-under memory pressure — the reservation bounds its size, not its
-residency). `MemAvailable` and `RLIMIT_MEMLOCK` are consulted once at
-startup as loud sanity warnings only; the ceiling is the authority and
-the cgroup limit is the enforcement backstop.
+Run the daemon under a cgroup memory limit (systemd `MemoryMax`). Set
+`MemoryMax` to at least `io_memory_ceiling` plus the daemon's own baseline
+memory; leaving 2 GiB or more above the ceiling is a reasonable margin. Set
+systemd `LimitMEMLOCK` to at least the ceiling. This is a safe upper bound,
+because only read-reservoir slabs are locked into memory.
+
+Read-reservoir slabs are locked into memory (`mlock`), so the kernel never
+swaps them out. A tmpfs spool is counted against the ceiling but is not
+guaranteed to stay in RAM: tmpfs pages are file-backed and can be swapped
+under memory pressure. The reservation bounds the spool's size, not its
+residency.
+
+At startup the daemon reads `MemAvailable` and `RLIMIT_MEMLOCK` once and logs
+a warning if either looks too small. The ceiling is the limit the daemon
+enforces, and the cgroup limit is the backstop if the daemon's accounting is
+wrong.
 
 ### `[daemon.tls]`
 
@@ -131,10 +135,10 @@ TCP clients must configure matching HTTP/2 initial stream and connection
 windows of at least 4 MiB; changing only the server cannot remove a smaller
 client receive window. With tonic, apply `initial_stream_window_size(4 * 1024 *
 1024)` and `initial_connection_window_size(4 * 1024 * 1024)` to the client
-`Endpoint`. Client-side flag ownership is intentionally deferred; until that
-surface exists, client implementations must set these values directly.
+`Endpoint`. The `rem` CLI has no flag for these values, so a client implementation sets
+them directly.
 
-### HTTP/2 keepalive (dead-peer detection) — TIO-6 R2 transport defaults
+### HTTP/2 keepalive (dead-peer detection)
 
 Like the windows, these are compiled transport defaults, not configuration
 keys:
@@ -144,14 +148,15 @@ keys:
 - **Client (tonic `Endpoint`):** `http2_keep_alive_interval = 30 s`,
   `keep_alive_timeout = 20 s`, `keep_alive_while_idle(true)`.
 
-The PING must run while streams are idle or send-stalled — a parked read
-reservoir behind a stalled sender is exactly the guarded state — so a
-half-open peer (power loss, no FIN) tears down the connection, stream,
-receiver, and session within roughly interval + timeout (≤ ~50 s), and a
-drive parked for that session never moves. This bound is what makes the
-park-indefinitely-for-slow-but-alive-clients policy coherent; it is
-verified by the half-open-while-parked integration test required by the
-TIO-6 design (§10).
+The keepalive PING runs while streams are idle or stalled on the sender. A
+read session whose reservoir is parked behind a stalled sender is in exactly
+that state. A half-open peer (one that lost power and never sent a FIN) is
+detected within the interval plus the timeout, about 50 s at most, and the
+daemon then closes the connection, stream, receiver, and session. The drive
+parked for that session does not move.
+This bound allows the daemon to keep a drive parked indefinitely for a client
+that is slow but alive. An integration test covers the half-open case while
+the drive is parked.
 
 <!-- code-anchor: crates/remanence-state/src/config.rs @ 244bc6de -->
 ## `[[libraries]]`
@@ -205,8 +210,13 @@ pool, and Remanence picks the tape. Pool ids may use letters, digits, and
 | `min_object_size` | byte size | `0` | Minimum object/bundle size the orchestrator promises; checked against the watermark band. |
 
 Capacity admission subtracts the exact terminal reserve before admitting an
-Object. For block size `B`, fixed pre-A structural-row count `S`, Object-row
-count `R`, and configured separation extent record count `G`, the reserve is
+Object. The terminal reserve is the space the tape must keep free for the
+terminal suffix (three index copies, A, B and C, with two separation extents
+between them; see the [glossary](reference-glossary.md#formats-and-objects)).
+For block size `B`, the number of structural rows `S` that precede replica A
+(one per tape file before the terminal suffix), the number of Object rows `R`
+(one per Object), and the number of records `G` in each separation extent, the
+reserve is
 three replicas of `2 + ceil((64S + 256R)/B)` records plus two `G`-record separation
 extents, five filemarks, pending parity closeout (including a final ParityMap when the
 sidecar directory is nonempty), and the implementation's safety
@@ -214,28 +224,10 @@ allowance. The watermarks do not authorize consuming this reserve; increasing
 `block_size` changes replica rounding and the default 1 GiB separation-extent
 record count.
 
-The system TIX acceptance scenario has a private, process-local fault surface;
-it is not a daemon API or an operator feature. It is disabled unless both
-`REM_TIX_TERMINAL_FAULT_ENABLE=terminal-index-stage7-v1-abort` and
-`REM_TIX_TERMINAL_FAULT_PLAN` are present. The plan must be exact-tape scoped
-and confined beneath `/tmp/system-harness/scenario-tix/terminal-faults`.
-Malformed, unconfined, or cross-component plans fail closed before terminal
-media motion. A matching cut durably fsyncs one evidence record before abort;
-the assignment-race variant uses the catalog's conditional generation update
-and then lets the normal FinalizeTape reread reject before Finalizing.
-
-The system WOR acceptance scenario has a separate private cut at a completed
-Object-body write-command boundary. It is inert unless
-`REM_WOR_OBJECT_FAULT_ENABLE=whole-object-recovery-v1-abort` and
-`REM_WOR_OBJECT_FAULT_PLAN` are both present. The exact-tape, exact-caller plan
-and its durable one-shot evidence must be confined beneath
-`/tmp/system-harness/scenario-wor/object-faults`. Malformed, unconfined,
-mismatched, or invalid-evidence plans fail closed. Matching durable evidence
-means the one-shot cut was already consumed and makes that exact plan inert.
-This is a scenario seam, not an operator recovery control; ordinary production
-recovery on positively identified rewritable media uses checkpoint EOD and a
-whole-Object source replay. Ordinary Object sessions reject WORM media and an
-unknown WORM state rather than promise an impossible in-place tail rewrite.
+Ordinary production recovery on positively identified rewritable media uses
+checkpoint EOD and a whole-Object source replay. Ordinary Object sessions
+reject WORM media and an unknown WORM state, because an in-place rewrite of the
+tail is impossible on WORM media.
 
 `[[tape_pool_rules]]` maps barcodes to pools by prefix. Prefixes are ASCII
 alphanumeric, matched case-insensitively, longest match wins, and each
@@ -292,7 +284,9 @@ Serves `rem top` and the live-status RPC. Optional.
 ## `[tape_io]`
 
 Tape I/O batching and staging-ring settings. Optional. Fixed-block pipelined
-submission is the only tape transfer path; removed mode keys are rejected.
+submission is the only path for streaming object reads and writes, and a key for
+any other mode is rejected. Full verification reads single blocks and does not use
+these settings.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

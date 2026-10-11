@@ -1,97 +1,61 @@
 # Glossary
 
-Project-internal terms and the tape-industry vocabulary Remanence leans
-on. Definitions reflect what the code does today, not aspirations.
+This page defines the Remanence terms and the tape and SCSI vocabulary used in
+the other documentation. A reader new to Remanence can start with the
+[formats and objects](#formats-and-objects) section. Names in `code font` are
+literal identifiers, flags, or file names.
 
 <!-- code-anchor: crates/remanence-format/src/model.rs crates/remanence-aead/src/header.rs crates/remanence-aead/src/wrap.rs crates/remanence-aead/src/key_frame.rs crates/remanence-aead/src/xwing.rs crates/remanence-parity/src/lib.rs @ bc2f9f90 -->
 ## Formats and objects
 
-**REM-OBJECT** — REM-OBJECT, the native stored-object format. One REM-OBJECT
-object holds many files. Specified by REM-OBJECT Core Format 1.0; the
-`1.0`/`1.1` pair that appears on the wire is the stream-schema feature gate
+Remanence uses three formats. REM-OBJECT packages files into one stored unit,
+REM-ENCRYPT encrypts such a unit, and REM-PARITY lays units out on tape with
+recovery data. Terms are grouped in that order: the unit and its encryption
+first, then the tape layout.
+
+**REM-OBJECT** — the native stored-object format. One REM-OBJECT object packages
+many files, with their paths and checksums, into a single unit that is written
+to tape in one pass. Specified by REM-OBJECT Core Format 1.0. The `1.0`/`1.1`
+pair that appears on the wire is the stream-schema feature gate
 (`REMANENCE.schema_version`), not a pair of documents.
+
+**object / Object** — a lowercase "object" is one REM-OBJECT unit. REM-PARITY
+defines an **Object** (capital O) more generally: one opaque string of blocks
+that occupies exactly one tape file, whose contents the tape layout does not
+interpret. Remanence stores a REM-OBJECT as each Object. Remanence's builders
+require a non-empty caller object id, and Remanence gives each object a UUID;
+the format itself treats the object identifier as opaque UTF-8 text.
+
+**representation** — the form in which an object's bytes are stored.
+`plaintext` is the readable form (`rem-object-v1`, below). `encrypted` is the
+same object sealed by REM-ENCRYPT (`REMO`, below). Each copy of an object has
+one representation, recorded in the catalog.
+
+**plaintext_digest** — the SHA-256 checksum of the object in its plain form
+(files and manifest together). It is the same for the plaintext and the
+encrypted representation of one object, so it identifies the content, and a
+reader that has decrypted an object checks the result against it.
+
+**stored_digest** — the SHA-256 checksum of the bytes actually stored on tape,
+whichever representation they are. A storage system can check a copy against
+it without understanding the format or holding a key.
 
 **rem-object-v1** — the plaintext REM-OBJECT body: a POSIX pax tar archive with
 `REMANENCE.*` pax headers, chunk-aligned members, and a trailing CBOR
-manifest. Readable with stock `tar`.
+manifest. Readable with stock `tar`. (tar is the standard Unix archive format;
+pax is its extended-header form, used here to carry extra named fields; CBOR is
+a compact binary data format, readable with common libraries.)
 
-**REMO** — the encrypted representation of an REM-OBJECT object: a 128-byte
-header (magic `REMO`), HKDF-SHA-256 key derivation, and a
-ChaCha20-Poly1305 STREAM over the tar bytes. The accepted representation
-is REM-ENCRYPT 1.0 with on-tape `format_version = 2` and an HPKE recipient
-key frame.
-
-**format version 1 (reserved)** — a permanently unsupported REMO wire
-version retained only as a reserved version number. Current parsers reject
-it with `UnsupportedFormatVersion`; there is no compatibility reader,
-writer, recovery mode, or CLI flag for it.
-
-**REM-ENCRYPT 1.0 HPKE envelope (`format_version = 2`)** — a REMO shape with no shared
-secret: a fresh per-object **data-encryption key (DEK)** is generated
-and wrapped once per recipient with HPKE (RFC 9180 Base mode, HKDF-
-SHA256, ChaCha20-Poly1305) running the **X-Wing hybrid KEM** (see below)
-into a **key frame** (wire tag `REMK`, 1-8 recipient slots accepted by
-readers) sitting between the header and metadata frame. Production
-sealers require 2-8 distinct, nonzero recipient epochs. `archive build`,
-pool-selected `archive write`, and a full `archive reseal` produce it;
-`archive extract`/`restore`/`read`/`verify`, the streaming range commands,
-and `rem-recover` open it with a matching REMP private key.
-
-**X-Wing hybrid KEM** — the key-encapsulation mechanism (KEM) that wraps
-each recipient's copy of the DEK: ML-KEM-768 (a post-quantum lattice
-scheme, FIPS 203) combined with X25519 (classical elliptic-curve
-Diffie-Hellman) by the combiner in `draft-connolly-cfrg-xwing-kem`,
-plugged into HPKE as KEM id `0x647a`. A recipient's public key (`REMR`
-file) is a 1216-byte serialized X-Wing encapsulation key; the matching
-private key (`REMP` file) is a 32-byte seed. Wrap-suite id `0x01`, an
-earlier pre-production X25519-only KEM, is permanently reserved and
-rejected by current readers and sealers alike — every REMO object this
-codebase produces or accepts uses the X-Wing hybrid.
-
-**covering range** — the mapping, computed once by `remanence-aead`,
-from a requested plaintext byte range to the smallest span of AEAD
-chunks (and their stored ciphertext byte offsets) that must be fetched
-and authenticated to serve it. What `rem archive covering-range` prints
-and `extract-stream`'s ranged mode consumes.
-
-**REM-PARITY** — the tape-layout-plus-parity format: the BOT bootstrap,
-Object tape files, Reed-Solomon parity sidecars, final parity map, and the
-terminal inventory in replicas A, B and C, with separation extents AB and BC.
-Published as the REM-PARITY 1.0 specification.
-
-**bootstrap** — the Object-count-independent self-description block at LBA 0:
-tape UUID, block size, and parity scheme. It contains no Object recovery rows
-and is not repeated at checkpoints or finalization. On a tape written without
-parity the bootstrap carries the no-parity flag and no parity scheme record; a
-no-parity bootstrap whose payload carries one is refused
-(REM-PARITY Section 8.2, where the error is `BootstrapParse`). The CLI reference
-gives the line the tool prints.
-
-**parity sidecar** — a tape file of Reed-Solomon parity shards covering
-the data blocks written since the previous sidecar.
-
-**parity map** — the final pre-A sidecar-directory file emitted during parity
-closeout when sidecar metadata exists. It is indexed by the terminal replicas
-but is not itself terminal inventory authority.
-
-**terminal replica** — one of three complete streamed final inventories, A,
-B, and C. A reader prefers C, then B, then A, while requiring valid survivors
-to agree.
-
-**filemark map** — the structural catalog of a tape: which tape file at
-which position is an Object, sidecar, BOT bootstrap, or final parity map. The terminal replica
-payload fixes the complete pre-tail map.
-
-**stripe / neighborhood** — parity geometry. A stripe is k data blocks
-plus m parity blocks; a neighborhood is S consecutive stripes whose
-parity lands in one sidecar.
+**manifest** — the deterministic CBOR member index written as the last
+entry of every REM-OBJECT object (`_remanence/manifest.cbor`). It holds each
+member's metadata and, for regular files, a checksum. A hardlink refers to
+its primary entry, and directories and symlinks have no checksum.
 
 **chunk size / block size** — the fixed transfer unit, 256 KiB by
 default. The REM-OBJECT chunk size aligns member data inside an object; the
-tape block size is the fixed SCSI block recorded in the bootstrap.
-
-**manifest** — the deterministic CBOR member index written as the last
-entry of every REM-OBJECT object (`_remanence/manifest.cbor`).
+tape block size is the fixed SCSI block recorded in the bootstrap. In an
+encrypted object a **chunk** is also the unit that is encrypted and
+authenticated on its own.
 
 **blob wrapper** — an ingest artifact: a dense subtree of non-compliant
 files packed into a `.remwrap.tar` member (with a generated
@@ -99,9 +63,136 @@ files packed into a `.remwrap.tar` member (with a generated
 entries. The convention, the index fields, and the single-file recovery
 procedure are described in REM-OBJECT Core Format Appendix E (informative).
 
+**REMO** — the encrypted representation of a REM-OBJECT object: a 128-byte
+header (magic `REMO`), HKDF-SHA-256 key derivation, and a
+ChaCha20-Poly1305 STREAM over the tar bytes. The accepted representation
+is REM-ENCRYPT 1.0 with on-tape `format_version = 2` and an HPKE recipient
+key frame. Readers reject every other `format_version`
+(`UnsupportedFormatVersion`).
+
+**recipient** — a public key that an object is encrypted for. The matching
+private key opens the object. An encrypted object names two to eight
+recipients when written, so that more than one key can open it. A recipient's
+public key is stored in a `REMR` file and its private key in a `REMP` file; the
+byte layouts are in the [CLI reference](reference-cli.md#recipient-key-file-formats).
+
+**recipient epoch** — the identity of one recipient key: a 16-byte epoch id and
+an optional text label. Replacing a recipient's key creates a new epoch. A
+`REMP` file carries its epoch id, and opening an object selects the key-frame
+slot that has the same epoch id.
+
+**DEK (data-encryption key)** — the random key generated for one object, used
+to encrypt that object's content. It is never stored in the clear.
+
+**wrap / wrapped key** — to wrap a key is to encrypt it under a recipient's
+public key. Each object's DEK is wrapped once per recipient. The wrapped copies
+are stored in the key frame, so any one recipient's private key can recover the
+DEK.
+
+**REM-ENCRYPT 1.0 HPKE envelope (`format_version = 2`)** — the REMO layout in
+which no secret is shared between writer and reader. A fresh DEK is generated
+for each object and wrapped for each recipient with HPKE (RFC 9180 Base mode,
+HKDF-SHA256, ChaCha20-Poly1305) running the **X-Wing hybrid KEM** (below). The
+wrapped keys sit in a **key frame** (wire tag `REMK`, 1-8 recipient slots
+accepted by readers) between the header and the metadata frame. Production
+sealers require 2-8 distinct, nonzero recipient epochs. `archive build`,
+pool-selected `archive write`, and a full `archive reseal` produce it;
+`archive extract`/`restore`/`read`/`verify`, the streaming range commands,
+and `rem-recover` open it with a matching REMP private key.
+
+**HPKE** — Hybrid Public Key Encryption (RFC 9180), a standard way to encrypt a
+small secret, here the DEK, to a public key.
+
+**KEM** — key-encapsulation mechanism: the public-key operation that HPKE uses
+to derive a shared secret for one recipient.
+
+**X-Wing hybrid KEM** — the KEM that wraps
+each recipient's copy of the DEK: ML-KEM-768 (a post-quantum lattice
+scheme, FIPS 203) combined with X25519 (classical elliptic-curve
+Diffie-Hellman) by the combiner in `draft-connolly-cfrg-xwing-kem`,
+plugged into HPKE as KEM id `0x647a`. Combining the two means an attacker
+must break both. A recipient's public key (`REMR`
+file) is a 1216-byte serialized X-Wing encapsulation key; the matching
+private key (`REMP` file) is a 32-byte seed. Wrap-suite id `0x01` (an
+X25519-only KEM) is permanently forbidden and rejected by readers and sealers, so every
+REMO object this codebase produces or accepts uses the X-Wing hybrid.
+
+**covering range** — the mapping, computed once by `remanence-aead`,
+from a requested plaintext byte range to the smallest span of encrypted
+chunks (and their stored ciphertext byte offsets) that must be fetched
+and authenticated to serve it. It is what `rem archive covering-range` prints
+and what the ranged mode of `extract-stream` consumes. See the
+[extract-stream protocol](reference-extract-stream-protocol.md).
+
+**REM-PARITY** — the tape-layout-plus-parity format. A tape holds the
+bootstrap, Object tape files, Reed-Solomon parity sidecars, a final ParityMap,
+and the terminal suffix (replicas A, B and C separated by extents AB and BC).
+Published as the REM-PARITY 1.0 specification.
+
+**tape file** — a run of one or more tape blocks ended by exactly one
+filemark. A tape holds a sequence of tape files; the kinds are the bootstrap,
+Object, parity sidecar, ParityMap, terminal replica, and separation extent.
+
+**filemark** — a marker the drive writes on tape to end a tape file. The drive
+can skip forward or backward over filemarks without reading the data between
+them, which is how a reader counts and measures tape files.
+
+**parity** — extra recovery data written alongside the data blocks. With
+Reed-Solomon parity, a reader can rebuild damaged blocks within stated limits.
+A tape can also be written without parity.
+
+**bootstrap** — the first tape file, a single block at LBA 0 (the first block
+on the tape). It states the tape UUID, the block size, and the parity scheme,
+and it does not change when Objects are added. It holds no per-Object
+information and is written once, not repeated at checkpoints or finalization. On a tape written
+without parity the bootstrap carries the no-parity flag and no parity scheme
+record; a no-parity bootstrap whose payload carries one is refused (REM-PARITY
+Section 8.2, where the error is `BootstrapParse`). The CLI reference gives the
+line the tool prints.
+
+**parity sidecar (sidecar)** — a tape file of Reed-Solomon parity shards and
+per-block checksums that covers the data blocks of one epoch (below). A reader
+uses it to find damaged data blocks and rebuild them.
+
+**stripe / neighborhood** — parity geometry. A stripe is one Reed-Solomon
+codeword: k data blocks plus m parity blocks. A neighborhood is S consecutive
+stripes whose parity lands in one sidecar.
+
+**epoch (parity epoch)** — one group of data blocks that are protected
+together and described by one sidecar. At the default settings a full epoch
+covers 16 GiB of Object data. A bare "epoch" in the tape layout means this;
+the other uses are **recipient epoch** (above), **write epoch** and **daemon
+epoch** (below).
+
+**ParityMap** — the tape file written after the last sidecar, when the tape
+has any sidecars. It lists every sidecar and the range of data each protects.
+It is indexed by the terminal replicas but is not itself terminal inventory
+authority.
+
+**terminal suffix** — the last five tape files of a finished tape, in this
+order: terminal replica A, separation extent AB, terminal replica B, separation
+extent BC, terminal replica C. Writing the suffix finalizes the tape, and no
+Object is written after it.
+
+**terminal replica** — one of the three tape files A, B and C of the terminal
+suffix. Each is a complete copy of the tape's index (the terminal inventory),
+which lists every tape file before the suffix and the recovery data for every
+Object. A reader prefers C, then B, then A, and requires valid copies to agree.
+
+**separation extent** — one of the two spacer tape files, AB and BC, that sit
+between the terminal replicas. Each is a header record, zero-filled interior
+records, and a footer record, 1 GiB by default. They keep the replicas
+physically apart so that one damaged region is unlikely to destroy all three.
+
+**filemark map** — the structural catalog of a tape: which tape file at
+which position is an Object, sidecar, BOT bootstrap, or final ParityMap. The
+terminal replica payload fixes the complete map of the tape files before the
+suffix.
+
 **foreign-format adapter** — an auxiliary, read-only parser linked into a
 separate Remanence distribution. Core Remanence owns the normalized reader and
 registry contract but ships with an empty registry and no concrete adapters.
+See [foreign-format adapters](reference-foreign-format-adapters.md).
 
 <!-- code-anchor: crates/remanence-state/src/config.rs crates/remanence-api/src/pool_write.rs crates/remanence-state/src/index.rs crates/remanence-state/src/checkpoint.rs crates/remanence-parity/src/journal.rs @ 6ed03ef0 -->
 ## Catalog and daemon
@@ -170,14 +261,13 @@ relocates to the exact catalogued file boundary (never mid-file).
 
 **position proof** — a real SCSI READ POSITION result (not an arithmetic
 estimate) returned to a caller as evidence of where the drive actually
-is. Long-standing on the write side; RM3.1b added it to read-session
-opens (including cold resumes) too.
+is. Write sessions and read-session opens (including cold resumes) return it.
 
 **daemon epoch** — a random value minted once when `rem-daemon` starts
 and returned on every `ReadSession`, letting a client detect that it's
 now talking to a restarted daemon instance by diffing epochs. (The
-request side of this field, `prior_daemon_epoch`, is currently decoded
-but never checked against anything — a client can't yet ask the daemon
+request side of this field, `prior_daemon_epoch`, is decoded
+but not checked, so a client cannot ask the daemon
 to reject a stale-epoch resume.)
 
 **advisory arbitration surface / drive assignment** — a read-only
@@ -186,7 +276,7 @@ per-`(library_serial, bay)` atomic reservation, exposed for an external
 arbitration client to make scheduling decisions against. It cannot gate,
 queue, or block a mount — the atomic reservation itself remains the sole
 enforcement path, unchanged by this projection existing. `rem top` does
-not currently render it.
+not render it.
 
 **spool** — the daemon's pre-commit staging directory for appends
 (default `<state_dir>/spool`), sized from the shared `io_memory_ceiling`
@@ -267,7 +357,8 @@ durable, catalog-persisted refusal); see
 **staging ring** — the fixed pool of page-aligned buffers
 (`tape_io.staging_ring_buffers`, default 4) a write session's producer
 thread fills while a submitter issues one blocking tape-write command at
-a time. The only tape I/O path — there is no non-pipelined fallback.
+a time. It is the only path for streaming object reads and writes; there is no
+non-pipelined fallback. Full verification reads single blocks outside it.
 
 **read reservoir / watermark stop-start** — the host-RAM buffer a read
 session's submitter fills up to a high watermark
@@ -295,8 +386,8 @@ staging pool) is a hard error, not a soft degrade.
 <!-- code-anchor: none -->
 ## Tape and SCSI background
 
-**LTO** — Linear Tape-Open, the cartridge/drive standard (LTO-9 ≈ 18 TB
-native per cartridge).
+**LTO** — Linear Tape-Open, the cartridge and drive standard (LTO-9 holds about
+18 TB per cartridge, uncompressed).
 
 **library / changer** — the robot chassis holding cartridges, drives,
 slots, and mail slots. SCSI calls it a medium changer.
@@ -324,9 +415,13 @@ that role. The recovery index is a separate structure: three terminal replicas
 and two separation extents written at the tape's tail during finalization.
 These are not repeated bootstrap copies. See **bootstrap** and **terminal replica**.
 
-**BOT / EOM** — beginning of tape / end of media.
+**BOT / EOM / EOD** — beginning of tape, end of media (the physical end), and
+end of data (the position just after the last data written).
 
-**filemark** — the on-tape separator between tape files.
+**LBA** — logical block address: the SCSI logical position on the tape,
+counted from 0 at the beginning of tape. It counts both blocks and filemarks.
+It is distinct from the dense ordinal that REM-PARITY assigns to Object data
+blocks only.
 
 **st driver / mt** — the Linux kernel tape driver (`/dev/st*`,
 `/dev/nst*`) and its command-line tool; the conventional way to operate
@@ -337,9 +432,10 @@ a drive. Remanence bypasses it — see
 by element address, with no join to the st driver's device files; the
 gap is described in [why-sg-passthrough.md](why-sg-passthrough.md).
 
-**SG_IO** — the Linux ioctl that passes a raw SCSI CDB to a device
-through its `/dev/sg*` node and returns status and sense data.
-Remanence's only transport, for drives and changers alike.
+**SG_IO / sg device** — the Linux ioctl that passes a raw SCSI command (CDB)
+to a device through its `/dev/sgN` node and returns status and sense data.
+It is Remanence's only transport, for drives and changers alike. A `/dev/sgN`
+path is what commands such as `rem-debug tape recovery-report` take for a drive.
 
 **VPD page 0x80** — the SCSI vital-product-data page carrying a device's
 serial number; the basis of all identity joins.
@@ -356,11 +452,8 @@ identical UAs become terminal.
 
 **RES** — READ ELEMENT STATUS, the changer inventory command.
 
-**SG_IO / sg device** — the Linux generic SCSI ioctl and the `/dev/sgN`
-nodes Remanence issues commands through.
+**CRC** — cyclic redundancy check, a short checksum used to detect damage in a block.
 
-**VTL** — virtual tape library, software emulating a chassis (Quadstor
-in this project's development setup).
+**VTL** — virtual tape library, software that emulates a tape library
+chassis, its drives, and its cartridges.
 
-**Miria** — the commercial archive product whose tape role Remanence is
-built to replace.

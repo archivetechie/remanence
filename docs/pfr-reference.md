@@ -1,31 +1,21 @@
 # Reference: Partial File Restore (PFR) on LTO
 
-**Status:** Working reference, not a specification. Written during the
-format's design phase, and some of it predates the shipped names — the
-design-phase "rem-chunked-v1" became the `rem-object-v1` object format defined by
-the published REM-OBJECT Format Specification (`specs/publication/`). Where this
-document and the published specification disagree, the specification wins;
-this document exists to explain the drive mechanics and arithmetic behind
-the format's range-addressing design.
+This page explains the drive mechanics and the arithmetic behind partial file restore: how Remanence reads a byte range out of one file on tape without reading the rest of the object. The format rules themselves are in the REM-OBJECT specification (`specs/publication/`); where this page and the specification differ, the specification governs.
 
-Sources are listed at the bottom. Anything that looks definitive but is
-not cited should be verified against the IBM LTO SCSI Reference and the
-T10 SSC-5 standard before code depends on it.
+Sources are listed at the bottom. Anything on this page that is not cited should be checked against the IBM LTO SCSI Reference and the T10 SSC-5 standard before code depends on it.
 
 ---
 
-## 1. What "PFR" actually means
+## 1. What "PFR" means
 
-Two distinct operations get bundled under the same acronym. Keep them
-separate:
+Two operations are often grouped under the same acronym. They are kept separate here:
 
-| Operation | What the caller asks for | Capability tier (per spec v0.3 §5.3) |
-|--|--|--|
-| **Single-file restore** | Give me file `foo.dat` from object `obj-0042`. | `FileAddressable` (Tier 1) |
-| **Partial file restore (PFR)** | Give me bytes `[800 MB, 802 MB)` of file `foo.dat` from object `obj-0042`. | `ByteRangeAddressable` (Tier 2) |
+| Operation | What the caller asks for |
+|--|--|
+| **Single-file restore** | File `foo.dat` from object `obj-0042`. |
+| **Partial file restore (PFR)** | Bytes `[800 MB, 802 MB)` of file `foo.dat` from object `obj-0042`. |
 
-This document is about Tier 2. Tier 1 falls out as a degenerate case
-(byte range = `[0, file_size)`).
+This page is about the second. Single-file restore is the special case where the byte range is `[0, file_size)`.
 
 ---
 
@@ -57,50 +47,42 @@ LOCATE comes in two flavours per SSC-3:
 
 | Form | Opcode | Block-address width | Notes |
 |--|--|--|--|
-| `LOCATE(10)` | `2Bh` | 32-bit | Legacy; insufficient for modern tape capacities. |
-| `LOCATE(16)` | `92h` | 64-bit | The form rem will use. |
+| `LOCATE(10)` | `2Bh` | 32-bit | Legacy. 32 bits is enough to address LTO-9 at the block sizes rem supports (256 KiB to 1 MiB) but not small-block formats. |
+| `LOCATE(16)` | `92h` | 64-bit | The form rem uses. |
 
-`LOCATE(16)` CDB shape (from SSC-3 §6.6; verify against the latest
-SSC-5 and the IBM LTO SCSI Reference before coding):
+The byte layout of the `LOCATE(16)` command is defined in SSC-5 and in the IBM LTO SCSI
+Reference (the LOCATE(16) table); take it from there rather than from this page. What matters
+here is which options rem uses: it sends a logical block address in the command's 8-byte
+address field, with every selector bit (destination type, change partition, immediate and
+block address mode) set to zero.
 
-| Byte | Field | Notes |
-|--|--|--|
-| 0 | opcode = `92h` | LOCATE(16) |
-| 1 | `[reserved:5 | BT:1 | CP:1 | IMMED:1]` | BT=0 → logical block; BT=1 → physical position. CP=1 → change partition (uses byte 3). IMMED=1 → return immediately, completion async. |
-| 2 | reserved | |
-| 3 | partition number | Used only if CP=1. |
-| 4..11 | 8-byte block address | Big-endian. The LBA to seek to. |
-| 12..14 | reserved | |
-| 15 | CONTROL | Standard SCSI control byte. |
-
-**rem will always set BT=0 (logical addressing).** Physical positions
+That means logical block addressing in partition 0, waiting for completion. Physical positions
 are not portable across drives, generations, or even read passes within
 the same cartridge. Logical block addresses are the durable identifier.
 
 ### 2.2 Block sizes and what an LBA actually addresses
 
-This is the part the spec v0.3 §5.5 example got wrong. The correction:
-
-- **An LBA addresses one *application-level block*** — the unit the host
-  wrote in a single WRITE command. If the host writes 1 MiB chunks, each
-  LBA = 1 MiB of user data. If the host writes 64 KiB records, each LBA
-  = 64 KiB.
+- **An LBA addresses one *application-level block*,** also called a logical
+  record: the unit the host writes, whatever its size. If the host writes
+  1 MiB records, each LBA = 1 MiB of user data. The size of a block is
+  separate from the size of a WRITE command, because in fixed-block mode one
+  WRITE command can transfer several consecutive blocks (rem batches writes
+  this way).
 - **The drive's internal codeword unit is different and not application-
   visible.** The drive internally groups host blocks into "data sets"
   for ECC and compression. An app doing READ on LBA N gets the bytes the
   app wrote at LBA N regardless of what the drive did internally.
 - **Block size is variable per write call** by default. The app can also
-  set a fixed block size via MODE SELECT, but variable is the norm for
-  archive workloads.
+  set a fixed block size via MODE SELECT.
 - Practical block sizes for archive apps: **256 KiB to 1 MiB**. Smaller
   blocks cost per-block overhead (sync, ECC framing); larger blocks cost
-  intra-block scan time during PFR. The LTO-9 maximum logical block size
-  is in the multi-MiB range but the precise cap is drive-dependent.
+  over-read during PFR. The drive's own maximum block length is larger (see
+  §11), but Remanence writes tapes only at 256 KiB, 512 KiB and 1 MiB.
 
-**Implication for rem-chunked-v1:** if we set chunk_size == block_size,
-then one chunk == one LBA. LOCATE(16) to an LBA delivers exactly one
-chunk in one block read. This is the design rem-chunked-v1 adopts;
-the spec example in v0.3 §5.5 is aligned with this.
+**Consequence for REM-OBJECT:** in a plaintext copy `chunk_size` equals the
+tape block size, so one chunk is one LBA, and positioning to an LBA delivers
+exactly one chunk in one block read. An encrypted copy stores each chunk
+with a 16-byte tag, so its chunks do not line up with tape blocks (§4.6).
 
 ### 2.3 LOCATE latency, real numbers
 
@@ -115,8 +97,8 @@ orchestrator should plan against:
 | With ordered access (batch) | applies | ~50% reduction | Per CERN testing, for recalls under 500 targets. |
 | Reposition after a stop | 2.50 s mean | similar | HP LTO-6 technical reference. ~750 MB of foregone streaming at 300 MB/s. |
 
-**Practical rule of thumb:** a cold byte-range PFR on an already-loaded
-tape costs **one LOCATE (~30–60 s typical, up to ~100 s worst case)
+**Practical rule of thumb:** when the drive has to LOCATE, a cold byte-range PFR on an
+already-loaded tape costs **one LOCATE (~30–60 s typical, up to ~100 s worst case)
 plus the chunk read (sub-second for ≤1 MiB)**. Loading a fresh tape
 adds the library MOVE + drive LOAD time on top (LTO-9 first-load
 calibration alone can take up to two hours; subsequent loads are
@@ -145,347 +127,170 @@ but they are **not the right primitive for PFR**:
   unlabelled.
 - LOCATE(16) by LBA bypasses file marks entirely.
 
-rem will write file marks at coarse boundaries (one per object, plus
-the catalog-block separators per spec v0.3 §5.1) for recoverability,
-but **PFR seeks happen via LOCATE-by-LBA**, not by SPACE-by-file-mark.
+rem writes file marks at coarse boundaries (one per object, plus
+the structural files described in the tape layout reference) for
+recoverability. A range read positions to its first block by the means §4.1 describes:
+forward block SPACE when the drive is already close, LOCATE by LBA otherwise, and REWIND
+plus filemark SPACE only when the absolute start is unknown.
 
 ---
 
 ## 3. The PFR problem stated precisely
 
 Given:
-- tape `T` is loaded in some drive (we have a tape position state machine
-  that says so);
-- object `O` lives on `T` at LBA range `[O.start_lba, O.end_lba)`;
-- file `F` lives within object `O` at file-relative byte range
-  `[F.start, F.end)`;
-- caller asks for bytes `[U_start, U_end)` of `F` (where `0 ≤ U_start <
-  U_end ≤ F.size`);
+- tape `T` is loaded in a drive;
+- object `O` is stored on `T` as a run of fixed-size blocks;
+- file `F` lies within object `O` and has size `Z`;
+- the caller asks for `n` bytes starting at byte offset `s` of `F`, where `0 ≤ s` and `s + n ≤ Z` (the sum computed with checked arithmetic);
 
-return a byte stream of exactly `U_end − U_start` bytes corresponding
-to the requested range, with end-to-end integrity (no corruption) and
-in a time that depends on tape position and chunk count, not file size.
+the result is a byte stream of exactly `n` bytes, in a time that depends on tape position and on the number of blocks covered, not on the size of the file.
+
+What a range read verifies depends on the copy. A plaintext copy on a parity-protected tape is covered by the parity layer's per-block CRCs, which detect damage but do not authenticate. An encrypted copy authenticates each chunk it releases (§4.6). A plaintext copy without the parity layer has no per-range integrity. A range read that does not cover the whole file cannot check the file's whole-file hash. REM-OBJECT section 6.5 states these cases, and a restorer reports which one applies.
+
+These are the checks the formats make possible. The daemon's ranged read RPC streams the
+covering blocks as opaque bytes, trimmed to the range, and does not check sidecar CRCs on
+that path. An encrypted range is decrypted and authenticated by the client, as described in
+the [extract-stream protocol reference](reference-extract-stream-protocol.md).
 
 ---
 
-## 4. How rem solves it (the mapping math)
+## 4. The mapping arithmetic
 
-The format must expose two indexes (both stored in the on-tape catalog
-per spec v0.3 §5.2):
+REM-OBJECT stores an object as a sequence of body blocks of `chunk_size` bytes each. In a plaintext copy on tape, one body block is one tape block, and sections 4.1 to 4.5 describe that case. Section 4.6 gives the mapping for encrypted copies. Each regular file's payload starts on a block boundary, and the object's manifest records, for every file, `first_chunk_lba` (the index of the file's first body block within the object) and `size_bytes`. The catalog holds the same two values per file, so a range read does not need to fetch the manifest first. Nothing in the stream is compressed, so a byte offset in a file maps to a block by division alone.
 
-**Per-file index** (one entry per file inside an object):
+Hardlinked names store no content of their own. A PFR request on a hardlinked name uses the `first_chunk_lba` and `size_bytes` of the file it links to.
 
-```
-FileIndexEntry {
-  file_id:        FileId,    // opaque, format-defined
-  file_offset:    u64,       // byte offset within the object
-  file_size:      u64,
-  first_chunk:    u32,       // index into the per-chunk table below
-  chunk_count:    u64,
-}
-```
+### 4.1 From byte range to block range
 
-**Per-chunk index** (one entry per chunk for every file that supports
-Tier 2):
+With `C = chunk_size`, `L = first_chunk_lba`, `Z = size_bytes`, `chunk_count = ceil(Z / C)` (the number of body blocks the file's payload covers), and a request for `n` bytes at offset `s`:
 
-```
-ChunkIndexEntry {
-  lba:                u64,   // LBA of this chunk on tape
-  uncompressed_size:  u32,   // bytes of user data this chunk decodes to
-  compressed_size:    u32,   // for stats only; not needed for read
-}
-```
-
-`uncompressed_size` is fixed (= `chunk_size`) for every chunk except
-possibly the last, which may be short. The format pins `chunk_size`
-in the object header; the chunk table only needs to record the LBA per
-chunk if the size is constant.
-
-### 4.1 The byte-range → chunk-range calculation
-
-Given the indexes and a caller request `[U_start, U_end)`:
-
-1. **Bound check.** `0 ≤ U_start < U_end ≤ F.file_size`. Reject early
-   otherwise.
-2. **First and last chunk indexes within the file:**
+1. **Bound check.** `s + n ≤ Z`, computed with checked arithmetic. Reject the request otherwise. If `n = 0` (and `s ≤ Z`) the result is the empty range and nothing is read. The formulas below apply to `n > 0`.
+2. **First and last body block:**
 
    ```
-   first_chunk_within_file = U_start / chunk_size           // integer division
-   last_chunk_within_file  = (U_end - 1) / chunk_size
-   chunk_count_to_read     = last_chunk_within_file - first_chunk_within_file + 1
+   b_first = L + floor(s / C)
+   b_last  = L + floor((s + n - 1) / C)
+   blocks_to_read = b_last - b_first + 1
    ```
 
-3. **Translate to absolute chunk indexes within the object:**
+3. **Find the tape position** of body block `b_first`. The catalog gives where the object's first block is; body block `b` is `b` blocks after it.
+4. **Position the drive** at that block. When the file's start position on the tape is known, the daemon's reader spaces forward by blocks if the drive is already inside the same tape file at or before the target, uses an absolute LOCATE(16) otherwise, and falls back to REWIND followed by filemark and block SPACE when no absolute start is known. In the LOCATE case this is one LOCATE; the remaining blocks are at consecutive positions, so no further positioning is needed. The worked examples below count one LOCATE for that reason.
+5. **Read `blocks_to_read` blocks.**
+6. **Trim.** Drop `head_drop = s - floor(s / C) * C` bytes from the start of the first block, then emit exactly `n` bytes. Bytes after the requested range, including whatever follows the file's last byte in its final block, are discarded. The final block of a file holds `Z - (chunk_count - 1) * C` bytes of the file, followed by unrelated stream bytes, so trimming always counts from `n` and `Z`, never from block boundaries.
 
-   ```
-   first_abs_chunk = F.first_chunk + first_chunk_within_file
-   ```
+### 4.2 A two-block example
 
-4. **Look up the LBA of the first chunk:**
-
-   ```
-   start_lba = chunk_table[first_abs_chunk].lba
-   ```
-
-5. **Issue ONE LOCATE(16) to `start_lba`.** The remaining chunks are at
-   consecutive LBAs (assuming the format writes chunks contiguously,
-   which rem-chunked-v1 must guarantee), so no further LOCATEs are
-   needed.
-
-6. **Read `chunk_count_to_read` blocks.** Each block is one chunk.
-
-7. **Decompress and concatenate.** For zstd-seekable framing, each
-   chunk is one independent zstd frame; decompress in sequence.
-
-8. **Compute the actual decompressed byte count.** The last chunk of
-   a file may be short — its effective size is `file_size mod
-   chunk_size` if that is non-zero, otherwise `chunk_size`. So:
-
-   ```
-   F.last_chunk_within_file = (F.file_size - 1) / chunk_size
-   short_last_size = F.file_size - F.last_chunk_within_file * chunk_size  // ∈ (0, chunk_size]
-
-   // Iterate every chunk in the inclusive range [first, last], not
-   // just the endpoints. `..=` is Rust's inclusive-range syntax;
-   // implementations in other languages should produce the same set
-   // of integers c such that first_chunk_within_file ≤ c ≤ last_chunk_within_file.
-   total_decompressed = 0
-   for c in first_chunk_within_file..=last_chunk_within_file:
-       if c == F.last_chunk_within_file:
-           total_decompressed += short_last_size
-       else:
-           total_decompressed += chunk_size
-   ```
-
-   Equivalently: if the read range does *not* include the file's
-   last chunk, `total_decompressed = chunk_count_to_read * chunk_size`.
-   If it *does*, swap in `short_last_size` for the last chunk.
-
-   The decoder will also tell you the actual bytes per chunk (zstd
-   reports `decompressed_size` per frame); using that as a runtime
-   cross-check catches index/data divergence early.
-
-9. **Trim the head and tail:**
-
-   ```
-   head_drop = U_start - first_chunk_within_file * chunk_size      // ∈ [0, chunk_size)
-   tail_drop = total_decompressed - (head_drop + (U_end - U_start))
-   ```
-
-   Drop `head_drop` bytes from the start, drop `tail_drop` bytes from
-   the end.
-
-10. **Stream the result** — exactly `U_end - U_start` bytes.
-
-### 4.2 Worked example (the one the spec got wrong)
-
-Caller asks for `[800 MiB, 802 MiB)` of file `foo.dat`, chunk_size = 1 MiB:
+A caller asks for `[800 MiB, 802 MiB)` of `foo.dat`, with `chunk_size` = 1 MiB:
 
 ```
-first_chunk_within_file = 800 MiB / 1 MiB = 800
-last_chunk_within_file  = (802 MiB - 1) / 1 MiB = 801
-chunk_count_to_read     = 801 - 800 + 1 = 2
+b_first        = L + 800 MiB / 1 MiB = L + 800
+b_last         = L + (802 MiB - 1) / 1 MiB = L + 801
+blocks_to_read = 2
 
-LOCATE(16) → chunk_table[F.first_chunk + 800].lba
-READ block (chunk 800: bytes [800 MiB, 801 MiB) of file)
-READ block (chunk 801: bytes [801 MiB, 802 MiB) of file)
+LOCATE(16) to body block L + 800
+READ block (bytes [800 MiB, 801 MiB) of the file)
+READ block (bytes [801 MiB, 802 MiB) of the file)
 
-intra_chunk_head_offset = 800 MiB - 800 * 1 MiB = 0
-trim_tail               = 2 * 1 MiB - (0 + 2 MiB) = 0
-
-Stream 2 MiB to caller.
+head_drop = 800 MiB - 800 * 1 MiB = 0
+Emit 2 MiB.
 ```
 
-**Two chunks, two block reads, one LOCATE.** This is the case the spec
-§5.5 example walks through — it was wrong in earlier drafts (said "one
-block"); v0.3 is now aligned with the math here.
+Two blocks, one LOCATE.
 
-### 4.3 A sub-chunk example
+### 4.3 A sub-block example
 
-Caller asks for `[800.25 MiB, 800.75 MiB)`, chunk_size = 1 MiB.
-File is large; chunk 800 is *not* the last chunk of the file:
+A caller asks for `[800.25 MiB, 800.75 MiB)`, with `chunk_size` = 1 MiB:
 
 ```
-first_chunk_within_file = 800.25 MiB / 1 MiB = 800
-last_chunk_within_file  = (800.75 MiB - 1 B) / 1 MiB = 800
-chunk_count_to_read     = 800 - 800 + 1 = 1
+b_first        = L + 800
+b_last         = L + (800.75 MiB - 1 B) / 1 MiB = L + 800
+blocks_to_read = 1
 
-LOCATE(16) → chunk_table[F.first_chunk + 800].lba
-READ block (chunk 800: bytes [800 MiB, 801 MiB) of file)
+LOCATE(16) to body block L + 800
+READ block (bytes [800 MiB, 801 MiB) of the file)
 
-(chunk 800 is not the file's last chunk → use full chunk_size)
-total_decompressed = 1 MiB
-head_drop          = 800.25 MiB - 800 MiB = 0.25 MiB
-tail_drop          = 1 MiB - (0.25 MiB + 0.5 MiB) = 0.25 MiB
-
-Drop first 0.25 MiB, drop last 0.25 MiB, stream the middle 0.5 MiB.
+head_drop = 800.25 MiB - 800 MiB = 0.25 MiB
+Drop the first 0.25 MiB and emit 0.5 MiB; the last 0.25 MiB of the block is discarded.
 ```
 
-One LOCATE, one block read, ~50% waste. This is the worst case for a
-half-chunk range and motivates picking chunk_size carefully.
+One LOCATE, one block read, and half of the block read is discarded. A range that straddles a block boundary reads more: `[0.75 MiB, 1.25 MiB)` with the same `chunk_size` covers two blocks, reads 2 MiB and discards 1.5 MiB. This is why `chunk_size` is a choice worth making deliberately (section 5).
 
-### 4.4 A short-last-chunk example
+### 4.4 A short final block
 
-This is the case the trim formula has to special-case. File `foo.dat`
-has `file_size = 1.5 MiB`, `chunk_size = 1 MiB`, so:
+`foo.dat` has `Z` = 1.5 MiB and `chunk_size` = 1 MiB, so it occupies two blocks and the second holds 0.5 MiB of the file. A caller asks for `[1.25 MiB, 1.5 MiB)`, which lies entirely in that second block:
 
 ```
-F.last_chunk_within_file = (1.5 MiB - 1 B) / 1 MiB = 1
-short_last_size          = 1.5 MiB - 1 * 1 MiB = 0.5 MiB
+b_first        = L + 1.25 MiB / 1 MiB = L + 1
+b_last         = L + (1.5 MiB - 1 B) / 1 MiB = L + 1
+blocks_to_read = 1
+
+LOCATE(16) to body block L + 1
+READ block (bytes [1 MiB, 1.5 MiB) of the file, then unrelated stream bytes)
+
+head_drop = 1.25 MiB - 1 MiB = 0.25 MiB
+Drop the first 0.25 MiB and emit n = 0.25 MiB; everything after byte 1.5 MiB of the file is discarded.
 ```
 
-Caller asks for `[1.25 MiB, 1.5 MiB)` — entirely inside the short
-last chunk:
+Counting from `n` rather than from the end of the block keeps the result correct when the final block holds other bytes after the file's last byte.
+
+### 4.5 Seek granularity
+
+The smallest amount that can be read from tape for one range is one block, so `chunk_size` is the seek granularity. A read covers `blocks_to_read` blocks and discards `blocks_to_read * C - n` bytes, which is less than `2 * C` for any range. Many small ranges that fall in the same block are cheaper as one read.
+
+### 4.6 Encrypted copies
+
+The mapping in 4.1 gives the inner chunk `b` of the plaintext stream. In an encrypted copy (REM-ENCRYPT), inner chunk `b` is stored as encrypted chunk `b`, which is `C + 16` bytes (the chunk plus a 16-byte authentication tag), after a header of `F` bytes (`F = 128 + key_frame_len + metadata_frame_len`):
 
 ```
-first_chunk_within_file = 1.25 MiB / 1 MiB = 1
-last_chunk_within_file  = (1.5 MiB - 1 B) / 1 MiB = 1
-chunk_count_to_read     = 1 - 1 + 1 = 1
-
-LOCATE(16) → chunk_table[F.first_chunk + 1].lba
-READ block (chunk 1: bytes [1 MiB, 1.5 MiB) of file — 0.5 MiB of data)
-
-(chunk 1 IS the file's last chunk → use short_last_size, not chunk_size)
-total_decompressed = 0.5 MiB
-head_drop          = 1.25 MiB - 1 * 1 MiB = 0.25 MiB
-tail_drop          = 0.5 MiB - (0.25 MiB + 0.25 MiB) = 0
+cipher_offset(b) = F + b * (C + 16)
+cipher_len       = C + 16
 ```
 
-Drop first 0.25 MiB, drop 0 from the end, stream 0.25 MiB. **Correct.**
-
-If we had naively used `total_decompressed = chunks_to_read * chunk_size
-= 1 MiB`, `tail_drop` would have been 0.5 MiB — and dropping 0.5 MiB
-from a 0.5 MiB stream after a 0.25 MiB head drop would have streamed
-*negative* bytes (i.e. crashed or returned empty). This was a real
-bug in earlier drafts of this doc and the spec; codex caught it.
-
-### 4.5 seek_granularity()
-
-The `ByteRangeAddressable` trait exposes `seek_granularity() -> u64`.
-For rem-chunked-v1 this returns `chunk_size`. The caller uses it as:
-
-- "If my range is smaller than seek_granularity, I'm going to over-read
-  by roughly that much. Plan accordingly."
-- "If I'm doing many small ranges within the same chunk, batch them
-  into one read."
+Because of the 16-byte tags, stored chunks drift against tape-block boundaries, and a run of `k` chunks occupies at most `k + ceil(16 * k / C) + 1` stored blocks (REM-ENCRYPT section 6.4). Encrypted PFR needs the object's key and one read of the metadata frame to learn `F`. The restorer authenticates each chunk and releases only chunks whose tag verifies, then trims as in 4.1. A failure after some chunks were released aborts the range, and the restorer reports it.
 
 ---
 
 ## 5. Chunk size: how to pick it
 
-Tradeoffs:
-
-| Chunk size | Index cost (per GiB) | Worst-case over-read | Block read overhead |
+| Chunk size | Chunks per GiB | Over-read for a range inside one block | Remarks |
 |--|--|--|--|
-| 64 KiB | ~16 KiB | 64 KiB | Per-block sync/ECC dominates throughput |
-| 256 KiB | ~4 KiB | 256 KiB | Sub-second per chunk; ~40 chunks/s |
-| 1 MiB | ~1 KiB | 1 MiB | ~360 chunks/s at LTO-9 line rate |
-| 4 MiB | ~256 bytes | 4 MiB | ~90 chunks/s |
-| 16 MiB | ~64 bytes | 16 MiB | ~22 chunks/s; near upper bound for many drives |
+| 256 KiB | 4,096 | under 256 KiB | The REM-OBJECT default. |
+| 512 KiB | 2,048 | under 512 KiB | |
+| 1 MiB | 1,024 | under 1 MiB | Fewer blocks per GiB; larger over-read. |
 
-Index cost = LBA per chunk (8 bytes) plus a few bytes of metadata; rounded.
+Remanence writes tapes only at these three block sizes (REM-PARITY section 8.4). The drive can accept larger blocks (see §11), and REM-OBJECT itself allows any positive multiple of 512 bytes, but a Remanence tape uses one of the three. A range that straddles a block boundary reads two blocks and discards less than `2 * chunk_size` in total.
 
-**Default: 1 MiB.** Reasoning:
-
-- Matches typical archive-app block size — drive throughput is comfortable
-  at this size.
-- Index cost (~1 KiB per GiB) is trivial; a 1 TiB object has a 1 MiB
-  chunk index.
-- Worst-case over-read on a single PFR call is 1 MiB. For most PFR
-  workloads (video frame ranges, scientific dataset slices) this is
-  insignificant.
-- A 1 MiB block survives LTO compression well — large enough that the
-  per-block overhead is small, small enough that the drive's internal
-  data-set boundaries don't dominate.
-
-**Override per write session.** The format header records the chunk
-size in use. PFR readers consult it; no global setting needed.
+The default is 256 KiB. Smaller blocks cost per-block overhead on the drive (sync and ECC framing); larger blocks cost over-read on every small range. For most PFR work, such as video frame ranges or slices of a scientific dataset, an over-read of a few hundred KiB is small next to the 30 to 60 seconds a LOCATE costs. The object's `chunk_size` is recorded with the object, so readers do not assume it. On tape it equals the tape block size of the object's tape file.
 
 ---
 
 ## 6. Compression interaction
 
-Two compression layers can exist independently:
+Compression can happen in the drive. REM-OBJECT itself does not compress.
 
 ### 6.1 LTO hardware compression (SLDC / NLZ-1)
 
-- Built into the drive. Toggleable via MODE SELECT page 0Fh (the Data
-  Compression page) or via the COMPRESSION bit in MODE SELECT.
-- Operates on the application's block stream; produces fewer physical
-  bytes on tape but **LBAs remain the same**. App writes LBA 42; app
-  reads LBA 42 back; same bytes.
-- For already-compressed data (zstd, gzip, encrypted), hardware
-  compression is a no-op (zero or negative compression ratio in the
-  worst case).
+- Built into the drive. Toggleable via MODE SELECT page 0Fh (the Data Compression page) or via the COMPRESSION bit in MODE SELECT.
+- Operates on the application's block stream and produces fewer physical bytes on tape, but **LBAs remain the same**. If the application writes LBA 42 and reads LBA 42 back, it gets the same bytes.
+- For already-compressed data (video, archives, encrypted data), hardware compression is a no-op and in the worst case expands the data slightly.
 
-### 6.2 Format-level compression (zstd seekable)
+### 6.2 Format-level compression
 
-- Applied by rem-chunked-v1 before the bytes hit the drive.
-- Each chunk is one independent zstd frame, optionally with the
-  seekable-format seek table appended for in-chunk skipping (irrelevant
-  for our case since one chunk == one tape block already).
-- The decoder can decompress chunk N without state from chunks 0..N-1.
-- This is what makes "decodable from chunk boundary" (the Tier 2
-  contract) cheap.
+None. REM-OBJECT performs no compression, because the payload is mostly already-compressed media and compressing the stream would make a file's offset depend on decompressing everything before it. That would remove the closed-form mapping of section 4.
 
-### 6.3 Recommended posture for rem-chunked-v1
+### 6.3 Posture
 
-- **Format-level compression: ON, zstd-seekable per chunk.** This is
-  the mechanism that makes PFR cheap.
-- **Hardware compression: OFF.** Compressing already-compressed data
-  wastes drive CPU and yields no capacity benefit. Disabling it also
-  removes a vendor-specific variable from the encoding.
-- Caller can override per write session (e.g. raw uncompressed
-  archival data may benefit from HW compression; the orchestrator
-  knows its content best).
-
-### 6.4 zstd seekable in 200 words
-
-The zstd seekable format is a concatenation of independently-compressed
-zstd frames plus a trailing skippable frame containing the seek table.
-
-- Skippable frame magic: any value `0x184D2A5?` (low nibble unconstrained).
-- Seek-table-trailer magic: `0x8F92EAB1`, mandated to be the last bytes
-  of the file so decoders find the table by reading from EOF backwards.
-- Seek table entry: 4 bytes Compressed_Size + 4 bytes Decompressed_Size,
-  optionally + 4 bytes XXH64 checksum. So **8 or 12 bytes per frame**.
-  (The frame *envelope* — magic + skippable header — adds a fixed
-  overhead outside the entry array; the seek-table trailer adds 9
-  bytes after the entries.)
-- Standard `zstd -d` decoder handles seekable files transparently because
-  the seek table sits in a skippable frame the decoder ignores.
-
-For rem-chunked-v1, the seekable-format wire layout is **not** what's
-on tape (we write one chunk per tape block; there's no in-frame
-seeking needed). But the *independent-frame* property is what we use:
-each chunk is one zstd frame with no shared dictionary or state with
-its neighbours, so the decoder can start fresh at any chunk.
+Hardware compression is off by default. Compressing already-compressed data costs drive CPU and gains no capacity, and disabling it removes a vendor-specific variable from what is stored on tape.
 
 ---
 
 ## 7. Encryption interaction
 
-LTO supports hardware AES-256-GCM via SECURITY PROTOCOL IN/OUT. Like
-hardware compression, encryption is **LBA-transparent**: LBA N reads
-back the same plaintext bytes you wrote, the drive does the GCM
-encrypt/decrypt internally.
+LTO supports hardware AES-256-GCM via SECURITY PROTOCOL IN/OUT. Like hardware compression, hardware encryption is **LBA-transparent**: LBA N reads back the same plaintext bytes that were written, and the drive does the GCM encrypt and decrypt internally.
 
-But there is a subtlety for PFR:
+With hardware encryption, reading one LBA returns that block's plaintext, so block N can be read without reading block N-1.
 
-- LTO drives encrypt with **per-block GCM**, where the IV / nonce is
-  derived from the LBA. This means: each tape block has its own
-  authentication tag. Reading one block decrypts and authenticates
-  exactly that block.
-- This is good for PFR — we can read chunk N without reading chunk
-  N-1 — but it puts a constraint on the chunk == block invariant.
-  If we ever broke that (multiple chunks per block, or chunks
-  spanning blocks), we'd need to read the whole containing block
-  and discard.
-
-**Conclusion:** the "one chunk per tape block" rule for rem-chunked-v1
-isn't just a convenience — it's a *correctness* requirement for
-encrypted tapes. The format header should refuse encryption + chunks-
-per-block > 1.
+Encrypted REM-OBJECT copies made with REM-ENCRYPT are a separate mechanism, applied by the software before the bytes reach the drive. Their stored chunks are mapped from the plaintext byte range as section 4.6 and REM-ENCRYPT section 6 define.
 
 ---
 
@@ -525,12 +330,10 @@ harvests a drive's wrap map once per load and answers it through the gRPC
 `ReadPlanService.PlanBatchRead` RPC (see [architecture
 overview](architecture-overview.md#read-order-planning)) — a plan that
 never touches media and commits nothing, so the read contract in §8.3
-below is unchanged. No in-tree CLI issues this RPC yet; it exists today for
-an external orchestrator client. The batched-execution RPC in §8.4 remains
-unbuilt — planning an order and executing a batch of reads are different
-things, and only the former exists. The rest of this section describes the
-design and the reasoning that shaped it, which now matches shipped
-behavior.
+below is not affected. No in-tree CLI issues this RPC yet; it exists today for
+an external orchestrator client. Remanence does not yet have a batched-execution RPC (§8.4);
+planning an order and executing a batch of reads are different things,
+and only the former exists.
 
 RAO is available on **LTO-9 and later full-height drives only**. It is
 not available on LTO-9 half-height, nor on LTO-8 or earlier. The
@@ -557,35 +360,19 @@ in the same load it was written in therefore gets no ordering benefit.
 Losing the cache costs one command at the next load, since the map is
 re-derivable from the medium.
 
-An earlier revision of this section described deriving wrap boundaries
-arithmetically from each generation's published capacity, needing no SCSI
-command at all. That approach was abandoned, and the reason is worth
-recording because the arithmetic version was appealing. Published
-capacity is not exact — IBM gives two figures per generation, 12,000 and
-11,600 GB for LTO-8, and directs system designs to read application
-design capacity at runtime rather than rely on the nominal number. The
+rem reads the boundaries from the drive instead of deriving them from
+each generation's published capacity, because published capacity is not
+exact. IBM gives two figures for LTO-8, 12,000 and 11,600 GB, and directs
+system designs to read the application design capacity at runtime. The
 resulting error is not proportional: wrap parity decides whether a block
 sits near or far along its wrap, so an error large enough to shift the
 wrap index by one places that block at the opposite end of the cartridge.
-Simulation against ascending block order showed ordering to be 67–82%
-better with exact boundaries. With approximate boundaries the result
-depends on how the targets are spread, and the difference is large enough
-that an unqualified statement would be wrong: for targets spread across
-the cartridge, and for many targets spread across several distant
-clusters, a 1% capacity error leaves ordering no better than ascending
-and a 3.3% error leaves it *worse than not ordering at all*. For a small
-number of targets concentrated in one region the approximation still
-helps — around 35% better at 1% error — because a small region spans few
-wraps and the parity is rarely wrong within it.
+An ordering built on approximate boundaries can therefore be no better than
+ascending block order, or worse than not ordering at all.
 
-The numbers above come from a model, not from a drive. They compare
-orderings under a cost model built from published figures, so they
-establish sensitivity to geometry error rather than the throughput a
-real restore would see.
-
-Ordering is therefore available on LTO-7 and later. LTO-6 and earlier
-predate the command; for those, rem reports the volume unsupported rather
-than ordering on an approximation known to be worse than doing nothing.
+Ordering is available on LTO-7 and later. LTO-6 and earlier predate the
+command; for those, rem reports the volume unsupported rather than
+ordering on an approximation that can be worse than not ordering.
 
 Volumes written with drive compression enabled are also excluded, because
 the number of blocks in a wrap then depends on how well each wrap's
@@ -593,39 +380,16 @@ contents compressed, which cannot be computed from anything recorded.
 
 ### 8.3 The read contract
 
-The read contract is strict and unchanged. The read path does not queue
-or reorder, and individual `ReadObjectRange` and `ReadFile` calls execute
-in the order the caller issues them, one target per call.
+The read contract is strict. Read requests are serialized through the drive's actor, and the read path does not reorder them. Each `ReadObjectRange` and `ReadFile` call reads one target. Concurrent calls from different clients are served one at a time, and the order between them is not specified.
 
 Ordering is offered as advice: rem is asked for a good order, and the
 caller then issues its own reads in whatever order it chooses. A plan
 that has gone stale is suboptimal, never incorrect, so no session or
 validity window attaches to it.
 
-### 8.4 Batched execution — planned, not yet built
+### 8.4 Batched execution is not implemented
 
-A future `ReadService.BatchReadRange` RPC will accept a batch of read
-targets against one session and stream the results back — distinct from
-§8.2's `PlanBatchRead`, which only plans an order and never reads. It is
-worth recording why, because the reason is not the drive feature above.
-
-When a drive stops streaming it must halt, back up and resume. The HP
-LTO-6 technical reference gives the mean cost of that reposition as
-**2.50 seconds**, against an average random access time of 50 seconds.
-At 300 MB/s a reposition is roughly 750 MB of foregone streaming, which
-means two targets closer together than that are cheaper to read straight
-through — gap included and discarded — than to stop between. A caller
-issuing one call per target invites a reposition between every one.
-
-Batching wins nothing by overlapping work; a drive has one head and
-cannot seek while reading. What it wins is the elimination of stops, and
-the ability to coalesce near-adjacent ranges into one contiguous read.
-Whether to read through a gap or stop and relocate depends on the block
-distance and the drive's reposition cost, so it is a decision only rem
-can make.
-
-Callers of plain `ReadObjectRange` retain the strict no-reorder contract
-regardless.
+Remanence does not yet have an RPC that accepts a batch of read targets in one session and executes them together. `PlanBatchRead` (§8.2) only plans an order and never reads.
 
 ---
 
@@ -633,7 +397,7 @@ regardless.
 
 ### 9.1 LTFS extent lists
 
-LTFS (which rem **does not implement** — see spec v0.3 §5 / Appendix A)
+LTFS (which rem does not implement)
 solves a similar mapping problem with a per-file extent list, each
 entry being:
 
@@ -648,41 +412,17 @@ entry being:
 A file can have multiple extents (interleaved writes, holes, etc.) and
 maps any file byte to a unique (LBA, intra-block offset) pair.
 
-**Why rem uses a chunk table instead:**
+**Why REM-OBJECT uses a per-file block index instead:**
 
-1. LTFS's `byteoffset` mechanism exists because LTFS allows file ranges
-   to share tape blocks with other files' ranges (the cost of doing
-   small writes without rewriting whole blocks). rem-chunked-v1 enforces
-   chunk == block alignment by construction, eliminating the
-   intra-block-offset case at the cost of slight space waste on the
-   last block of each file.
-2. LTFS files can be discontiguous (multi-extent). For an archive
-   format we control the writer for, we can guarantee contiguous chunk
-   sequences per file, making the index a flat array of LBAs rather
-   than a list of (start, count) extents.
-3. Trading flexibility for simpler PFR math is the right deal in an
-   immutable-archive context.
+1. LTFS's `byteoffset` mechanism exists because LTFS allows file ranges to share tape blocks with other files' ranges (the cost of doing small writes without rewriting whole blocks). REM-OBJECT starts every file payload on a block boundary, which removes the intra-block-offset case at the cost of some wasted space in the last block of each file.
+2. LTFS files can be discontiguous (multi-extent). A REM-OBJECT file is one contiguous run of blocks, so the index is a first block and a size, not a list of extents.
+3. Giving up flexibility for simpler PFR arithmetic suits an immutable archive.
 
 ### 9.2 tar with sidecar index (ratarmount, tar-split)
 
-Ratarmount builds a SQLite index `.<archive>.index.sqlite` mapping
-file paths to their byte offsets inside the tar stream. Once built,
-the index enables file-level seeking in under a second.
+Ratarmount builds a SQLite index `.<archive>.index.sqlite` mapping file paths to their byte offsets inside the tar stream. With the index, tar members can be opened and read at random offsets without scanning the archive. That works on a file or disk. A tape needs more: the reader must know which tape block holds a given byte and what to discard after reading it.
 
-This is **Tier 1 only** — it gets you to the start of a file inside
-a tar, but tar has no notion of intra-file chunk boundaries. To get
-Tier 2 (PFR) on top of tar, you'd need to either:
-
-- Wrap tar in zstd-seekable (chunked compressed envelope) and index
-  the zstd frames, not the tar entries; or
-- Write a sidecar PFR index alongside the tar index, with byte
-  offsets per fixed-size chunk inside each file.
-
-`pax-tar-v1` in rem is the first option-shaped solution: pax tar
-inside the chunked container. The format implementation declares
-Tier 1 only (the chunk table is rem's, not tar's; using it for PFR
-loses the round-trip guarantee that standard `tar` tooling can read
-the bytes).
+REM-OBJECT is a plain pax tar stream, so standard `tar` reads it. It also carries its own index and alignment: the manifest records each file's first block and size, and every file payload starts on a block boundary, so a byte range maps to whole tape blocks by the arithmetic in section 4 without an external index file.
 
 ### 9.3 Spectra Logic / Drastic / Imagen vendor implementations
 
@@ -701,70 +441,20 @@ covering chunks, trim — is invariant.
 
 ---
 
-## 10. Implications for rem-chunked-v1
+## 10. Summary: how REM-OBJECT supports PFR
 
-Concretely, what the format spec needs to say:
-
-1. **One chunk per tape block.** Hard invariant. Enables one-LOCATE
-   PFR and per-block GCM correctness.
-2. **Chunk size in the object header.** Default 1 MiB, configurable
-   per write session. Recorded in the chunk table header so readers
-   don't have to assume.
-3. **Chunks contiguous within a file, files contiguous within an
-   object.** Allows LBA arithmetic without per-chunk index lookups
-   for sequential reads. The catalog still records each chunk LBA
-   for resilience.
-4. **Per-file index** in the object header: `(file_id, file_offset,
-   file_size, first_chunk, chunk_count)`.
-5. **Per-chunk index** in the object header: just `lba` per chunk
-   (compressed/uncompressed sizes are stats, not needed for read
-   correctness given chunk_size is uniform). For a 1 TiB object at
-   1 MiB chunks: 1,048,576 chunks × 8 bytes = 8 MiB index.
-6. **zstd-seekable per-chunk framing.** Each chunk = one zstd frame.
-   No shared dictionary. Per-chunk XXH64 checksum (the seekable
-   format's optional 4-byte checksum field is sufficient).
-7. **Hardware compression OFF by default.** Format-level zstd does
-   the compression.
-8. **Hardware encryption transparent.** Per-block GCM matches our
-   one-chunk-per-block invariant; no extra format work needed.
-9. **CBOR-serialised metadata blocks** for header and chunk table.
-   Stable schema, versioned.
+1. **One chunk per tape block in a plaintext copy.** Every body block is `chunk_size` bytes and is one tape block, so a range read positions once and then reads consecutive blocks. An encrypted copy stores `C + 16`-byte chunks and uses the mapping in section 4.6.
+2. **`chunk_size` recorded with the object.** The default is 256 KiB. Readers take the value from the catalog, the bootstrap or the object's own header rather than assuming it.
+3. **Payloads start on block boundaries.** A file's first body block is `payload offset / chunk_size`, so the position of any byte in the file follows from arithmetic.
+4. **Per-file index.** The manifest and the catalog record `first_chunk_lba` and `size_bytes` for every file, and the same values serve plaintext and encrypted copies of an object.
+5. **No format-level compression.** Hardware compression is off by default.
+6. **Hardware encryption is transparent** to block addressing, and REM-ENCRYPT maps plaintext ranges to stored ranges for software-encrypted copies (section 4.6).
 
 ---
 
-## 11. Open questions
+## 11. Maximum block size
 
-1. **Index placement.** Do we put the chunk table inside the object
-   (at the start, before the data chunks), or only in rem's catalog
-   (file mark 0 of the tape)? Tradeoff: in-object placement means the
-   object is self-recoverable without the tape catalog, at the cost
-   of reading the index from a different LBA than the data. Catalog-
-   only means one trip to the catalog block to get all PFR addresses
-   for the tape. Lean: both. Catalog has all per-tape indexes; each
-   object also embeds its own at object start for resilience.
-2. **Batched execution timeline.** Resolved: the drive-native RAO path
-   is not pursued, since it requires full-height LTO-9. rem computes
-   the order itself. A batching `BatchReadRange` RPC is planned but
-   deferred behind the ordering work; see §8.4.
-3. **Maximum chunk_size.** Hardware reports a max via the **READ
-   BLOCK LIMITS** response (IBM LTO SCSI Reference §5.2.17.1 /
-   Table 78), **not** MODE SENSE. There are two distinct values:
-   the *reported* `MAXIMUM BLOCK LENGTH LIMIT` field — Table 78
-   documents this as `0x80_0000` (8 MiB) on LTO-9 — and the
-   *supported* max from §4.11, where unencrypted cartridges accept
-   up to `0xFF_FFFF` (≈16 MiB - 1) per Note 15 even though the
-   field doesn't report it. Layer 3a's `read_config()` issues
-   READ BLOCK LIMITS at session open and stashes the reported
-   value on `DriveHandle`; callers should query that rather than
-   hard-code a portable cap, but understand that the drive may
-   accept a larger block in practice.
-4. **Variable chunk_size within an object.** Last chunk is naturally
-   short; is there ever a reason to allow chunks of differing sizes
-   mid-object? Lean: no. Uniform chunk_size keeps the math trivial.
-5. **Format-level integrity vs hardware ECC.** LTO has strong ECC; do
-   we still need per-chunk XXH64? Lean: yes — protects against
-   silent corruption between drive and host, e.g. cable / HBA bit
-   flips.
+The hardware reports a maximum block size through the **READ BLOCK LIMITS** response (IBM LTO SCSI Reference §5.2.17.1 / Table 78), not through MODE SENSE. There are two distinct values: the *reported* `MAXIMUM BLOCK LENGTH LIMIT` field, which Table 78 documents as `0x80_0000` (8 MiB) on LTO-9, and the *supported* maximum from §4.11, where unencrypted cartridges accept up to `0xFF_FFFF` (about 16 MiB - 1) per Note 15 even though the field does not report it. Layer 3a's `read_config()` issues READ BLOCK LIMITS at session open and stores the reported value on `DriveHandle`. Callers query that value rather than hard-coding a portable cap, and should expect that the drive may accept a larger block in practice.
 
 ---
 
@@ -778,8 +468,6 @@ Concretely, what the format spec needs to say:
 - IBM. *Performance specifications for LTO tape drives.* <https://www.ibm.com/docs/en/ts4500-tape-library?topic=performance-lto-specifications>
 - Versity. *Designing a High Performance Tape Archive.* <https://www.versity.com/designing-a-high-performance-tape-archive/>
 - Archiware. *Why LTO Tape Drives Never Reach Their Rated Speed.* <https://blog.archiware.com/blog/why-lto-tape-drives-never-reach-their-rated-speed/>
-- Facebook. *zstd seekable format specification.* <https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/zstd_seekable_compression_format.md>
-- IETF RFC 8478. *Zstandard Compression and the application/zstd Media Type.* <https://www.ietf.org/rfc/rfc8478>
 - mxmlnkn. *ratarmount.* <https://github.com/mxmlnkn/ratarmount>
 - Drastic Technologies. *Net-X-Copy Partial File Restore.* <https://www.drastic.tv/support-59/supporttipstechnical/44-net-x-copy-partial-file-restore>
 - Imagen. *PFR (Partial File Restore) and Segments.* <https://knowledge.imagen.io/pfr-partial-file-restore-and-segments>
@@ -788,8 +476,6 @@ Concretely, what the format spec needs to say:
 - Petertc. *Estimating Magnetic Tape Locate Time.* <https://petertc.medium.com/estimating-magnetic-tape-locate-time-32a74738cdf2>
 - Wikipedia. *Linear Tape-Open.* <https://en.wikipedia.org/wiki/Linear_Tape-Open>
 
-Numbers in this document that should be verified against the IBM LTO
-SCSI Reference and the live MSL3040 before code depends on them: the
-LOCATE(16) byte layout in §2.1; the LTO-9 maximum block size in §2.2;
-the per-block GCM IV-derivation claim in §7. Everything else is from
-public documentation or self-evident arithmetic.
+Numbers on this page to verify against the IBM LTO SCSI Reference and the
+MSL3040 before code depends on them: the LOCATE(16) byte layout in §2.1
+and the LTO-9 maximum block size in §2.2. Everything else is from public documentation or arithmetic.

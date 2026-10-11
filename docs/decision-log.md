@@ -6,21 +6,23 @@ record; this page is the stable public summary.
 
 ## 2026-07-31 — Public format review milestone
 
-The project marked REM-OBJECT Core, REM-ENCRYPT, and REM-PARITY as their first
-public review drafts with deterministic test-vector archives. The format DOIs
-were reserved but the records were not yet deposited or published.
+The project published REM-OBJECT Core, REM-ENCRYPT, and REM-PARITY, the three
+format specifications, as review drafts with deterministic test-vector
+archives. Their DOIs (persistent citation identifiers) were reserved, and the
+records were not yet deposited.
 
-## 2026-08-09 — REM-PARITY generation 2 development format
+## 2026-08-09 — REM-PARITY terminal-index layout
 
-The implementation moved its parity bootstrap and sidecar schema to generation
-2 while the public review archive remained generation 1. The generation-2 reader
-rejects generation-1 bootstrap records; compatibility requires an explicit
-migration reader and is not implied by the shared REM-PARITY 1 name.
+The implementation changed its parity bootstrap and sidecar schema to
+`schema_major` 2 while the public review archive stayed at `schema_major` 1.
+The reader rejects `schema_major` 1 bootstrap records. Reading them would need
+an explicit migration reader, because the shared REM-PARITY 1 name does not
+imply compatibility.
 
-## 2026-09-06 — Compatibility boundary made explicit
+## 2026-09-06 — Compatibility boundary stated
 
-The documentation and publication test now state and assert the generation
-boundary. Publication deposits remain pending until a self-consistent review
-candidate, vectors, and implementation can be deposited together. Repository
-crates are marked non-publishable until crate names and release policy are
-deliberately established.
+The documentation and the publication test state and assert the
+`schema_major` boundary. Publication deposits wait until a self-consistent
+review candidate, vectors, and implementation can be deposited together. The
+repository crates are marked non-publishable until crate names and a release
+policy are set.

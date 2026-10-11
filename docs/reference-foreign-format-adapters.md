@@ -1,10 +1,16 @@
 <!-- code-anchor: crates/remanence-format-driver/src/lib.rs crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 # Foreign-format adapters
 
-Remanence can expose files from an older archive format through the same
-normalized scan, restore, and recovery paths used by its own tools. This is a
-read-only compatibility boundary: an adapter may identify and read an existing
-archive, but it cannot write new archives in that foreign format.
+A foreign format is an archive format other than REM-OBJECT, for example the
+format of an earlier archive system. Remanence can expose the files in such an
+archive through the same scan, restore, and recovery commands it uses for its
+own objects. An adapter is the parser that makes this possible. It identifies
+and reads an existing archive, and it cannot write a new archive in the
+foreign format.
+
+A dump is a file that holds the bytes of one foreign-format archive, for
+example an image copied off a tape. Adapters can also read the records of a
+mounted tape directly.
 
 ## Core and distribution boundary
 
@@ -18,8 +24,9 @@ JSON; stock Remanence reports an empty `foreign_formats` array.
 
 Concrete parsers are not core crates or optional core features. A separate
 distribution selects adapter crates at compile time, registers them, and calls
-the registry-aware CLI and daemon entrypoints. This keeps parser maintenance,
-release cadence, and support status separate from the native Remanence format.
+the registry-aware CLI and daemon entrypoints. Parser maintenance, release
+schedule, and support status are therefore separate from the native Remanence
+format.
 
 The auxiliary
 [`remanence-adaptors`](https://github.com/archivetechie/remanence-adaptors)
@@ -50,8 +57,9 @@ from arbitrary paths at runtime.
 
 ## Catalog use
 
-An application may import metadata for an older archive into the catalog and
-record the adapter's stable format ID and source. When the same adapter is
+An application may import the metadata of a foreign-format archive into the
+catalog as a catalog unit (see the [glossary](reference-glossary.md#catalog-and-daemon)) and
+record the adapter's stable format ID and the source. When the same adapter is
 registered in the daemon distribution, catalog entry listing opens that source
 through the generic reader. Search and other cross-format views belong to the
 application above this mechanism layer; the adapter supplies the readable

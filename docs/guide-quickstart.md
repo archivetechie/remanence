@@ -77,8 +77,8 @@ rem archive build --inputs src --out demo.rem-object
 
 The command prints a JSON build report: the object id, the chunk size
 (262144 bytes by default), and one entry per file with its SHA-256, size,
-and position inside the object. This report is what an orchestrator would
-store; every field in it is also recoverable from the object itself.
+and position inside the object. This report is what a system that manages the
+archive (an orchestrator) would store; every field in it is also recoverable from the object itself.
 
 Inspect the object without extracting it:
 
@@ -93,12 +93,12 @@ rem archive extract --object demo.rem-object --dest restored
 diff -r src restored && echo identical
 ```
 
-Two properties worth noticing. First, `demo.rem-object` is a valid POSIX pax tar
+Two properties of the object are worth knowing. First, `demo.rem-object` is a valid POSIX pax tar
 stream padded to fixed-size chunks — `bsdtar -tf demo.rem-object` lists your
 files plus a `_remanence/manifest.cbor` index entry. A tape written by
-Remanence holds exactly these bytes as its object body, which is the
-30-year-readability story: no Remanence software is needed to get the
-data back. Second, every file's SHA-256 travels with it, so verification
+Remanence holds exactly these bytes as its object body, so no Remanence
+software is needed to get the data back, which matters for an archive that
+must stay readable for decades. Second, every file's SHA-256 travels with it, so verification
 never depends on host state.
 
 ![Local round trip: rem archive build turns src/ into demo.rem-object, rem archive extract restores it, diff -r confirms the copies are byte-identical, and rem archive inspect reads the object in place](assets/local-roundtrip.svg)
@@ -323,6 +323,10 @@ rem-debug --allow <SERIAL> archive read \
     --library <SERIAL> --locator "$(cat locator.json)" --out restored.bin \
     --private-key primary.remp
 ```
+
+Replace `/path/to/payload.bin` with the path of the file you want to store; the
+same path appears in the write and verify commands, and `restored.bin` is where
+the read writes its copy.
 
 The locator JSON emitted by `write` pins the object copy to physical
 media and records `format_version: 2` plus the recipient epochs; `verify`

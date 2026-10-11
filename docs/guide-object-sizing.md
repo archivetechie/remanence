@@ -1,19 +1,25 @@
 # Object sizing for terminal-index tapes
 
-REM-PARITY generation 2 no longer stores a cumulative Object directory in a
-one-block checkpoint or final bootstrap. The final inventory is streamed into
-three complete terminal replicas, so there is no fixed per-tape Object-count
-ceiling and no bootstrap row-budget table.
+This page explains how the size of the Objects you write affects a tape, and how
+the writer decides that an Object still leaves room to close the tape. An
+Object is one stored item on tape, written as one tape file followed by a
+filemark. The tape's final inventory is written at the end of the tape as three
+complete copies, called terminal replicas, so the number of Objects on a tape
+has no fixed ceiling. Block size and Object count still determine how much
+space the index occupies, and the writer's capacity check counts that space
+(see below).
 
-Object size still matters. It controls tape-file and filemark overhead, the
-number of recovery rows in each terminal replica, parity closeout frequency,
-catalog scale, and the amount of work needed to retry a whole Object on another
-tape.
+Object size still affects the tape in other ways. It controls tape-file and filemark
+overhead, the number of recovery rows in each terminal replica, how often
+parity is closed out, catalog scale, and the amount of work needed to retry a
+whole Object on another tape.
 
 ## What admission reserves
 
 Before an Object moves, the writer proves that its complete commit and the
-terminal close fit the conservative tape capacity. For structural-row count
+terminal close fit the conservative tape capacity. The terminal close writes
+the three replicas, with a 1 GiB gap between each pair called a
+separation extent. For structural-row count
 `S`, Object-row count `R`, and fixed block size `B`:
 
 ```text
@@ -64,7 +70,7 @@ remains individually named and checksummed in
 `_remanence/manifest.cbor`, while the tape index spends one Object row on the
 bundle rather than one row per member.
 
-Bundling is explicit today. Ordinary `rem put A B C` writes three one-member
+Bundling is explicit. Ordinary `rem put A B C` (three input paths) writes three one-member
 Objects and therefore three tape filemarks. Build one multi-member object first
 and ingest it with `rem put --stored-object` when the files should share one
 tape file and one trailing filemark. Per-member catalog rows, hashes, and
@@ -91,14 +97,15 @@ A larger tape block reduces the number of records occupied by the fixed one-GiB
 separation extents and by a given replica payload, but also enlarges the unit of
 read damage and the minimum I/O buffer. Block size is fixed when the tape or
 pool is created and cannot change on an already formatted tape. Select it from
-drive guidance, throughput, memory, and damage-unit requirements; do not select
-it to chase the removed bootstrap row budget.
+drive guidance, throughput, memory, and damage-unit requirements; there is no
+fixed Object-count ceiling, but block size still affects index storage and
+capacity admission.
 
 ## Capacity planning
 
 For planning, include the exact terminal report produced by the writer rather
-than a fixed percentage or an assumed final-bootstrap size. That report breaks
+than a fixed percentage. That report breaks
 out parity closeout, one replica, all three replicas, one separation extent,
 both separation extents, safety allowance, required tape records, and spool bytes. The shipped
-watermarks remain the policy defaults; the reserve is the safety proof beneath
+watermarks are the policy defaults; the reserve is the safety proof beneath
 them.

@@ -1,74 +1,68 @@
 <!-- code-anchor: none -->
 # Remanence: Open-Source LTO Tape Archival Software
 
-> **Alpha software (v0.1.0).** The implementation has not had enough
-> operational testing to be trusted with material you cannot afford to lose.
-> Expect defects and breaking changes. Do not use it as the only copy of
-> anything. See [Status](#status).
->
-> The three **format specifications** are a separate matter: they are at
-> version 1.0, pinned by test vectors, and independently reimplemented. The
-> alpha label applies to this software, not to the formats it writes.
-
-Self-describing, catalog-rebuildable tape archives with optional 
-encryption, erasure-coded media recovery, and partial-file restore. 
-Designed for standards-based linear tape and currently validated on LTO.
+Remanence writes archives to LTO tape and reads them back, so that the data can
+still be read 10 to 20 years from now, after the hardware, the software and the
+people who wrote the tapes have changed. Each tape describes itself and the
+object format is publicly specified, so a copy never depends on a particular
+database, vendor or program staying available. It also supports optional
+encryption, erasure-coded recovery from damaged media, and partial-file
+restore, which reads one byte range of a file without reading the whole
+object.
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21551570.svg)](https://doi.org/10.5281/zenodo.21551570)
 
 **Website:** [archivetech.org](https://archivetech.org) — overview, the formats explained, and how to verify them.
 
-Remanence is open Rust infrastructure for writing archives to LTO tape
-and getting them back decades later. It is the mechanism layer of an
-archive system: a daemon and CLIs that discover tape libraries, move
+> **Alpha software (v0.1.0).** Do not use it as the only copy of anything. The
+> three format specifications are at version 1.0 and are separate from this
+> software's version. See [Status](#status).
+
+Remanence is open Rust infrastructure. It is the mechanism layer of an archive
+system: a daemon and command-line tools that discover tape libraries, move
 cartridges, write self-describing objects with erasure-coded parity, and
-account for every byte in a rebuildable catalog. What to archive, when,
-and for how long are deliberately not its decisions — those belong to
-whatever orchestrator calls its API.
+account for every byte in a rebuildable catalog. What to archive, when, and
+for how long are decisions for whatever orchestrator calls its API.
 
-The project exists because the long-horizon archive niche is served
-mostly by proprietary systems whose on-tape formats die with their
-vendors, and by tooling that treats tape like a disk. Remanence takes
-the opposite bets: the object format is publicly specified and readable with
-stock `tar`, every tape self-describes so no database is ever the single
-copy of the truth, and when the hardware leaves the software uncertain
-about physical state, the software stops rather than guesses. The
-reasoning is laid out in [docs/why-remanence.md](docs/why-remanence.md).
+The long-term archive niche is served mostly by proprietary systems whose
+on-tape formats end with their vendors, and by tooling that treats tape like a
+disk. Remanence makes different choices. The object format is publicly
+specified and a plaintext object can be read with stock `tar`. Every tape
+describes itself, so no database is the only copy of the truth. When the
+hardware leaves the software uncertain about physical state, the software
+stops instead of guessing. The reasoning is laid out in
+[docs/why-remanence.md](docs/why-remanence.md).
 
-It is developed against a Quadstor virtual tape library and field-tested
-on an HPE MSL3040 with LTO-9 drives.
+It is developed against a Quadstor virtual tape library and field-tested on an
+HPE MSL3040 with LTO-9 drives.
 
 <!-- code-anchor: none -->
 ## Status
 
-**Version 0.1.0 — alpha.** This software was first published as v1.0.0 on
-25 July 2026. That number claimed more maturity than the implementation has
-earned, so it was withdrawn and renumbered on 7 August 2026. Nothing about the
-code got worse; the label was wrong and has been corrected. The v1.0.0 tag and
-its Zenodo deposit remain in place, marked as superseded, because the format
-specifications cite them and an archiving project should correct its claims in
-public rather than erase them.
+**Version 0.1.0 — alpha.** The implementation has not had enough operational
+testing to be trusted with material you cannot afford to lose. Expect defects
+and breaking changes. [CHANGELOG.md](CHANGELOG.md) lists the releases,
+including the v1.0.0 tag, which is marked superseded.
 
 REM-OBJECT and REM-ENCRYPT are specified, implemented, and pinned by the test
-vectors that ship with the source. **REM-PARITY is currently split across two
-generations:** the repository review specification and published vector archive
-describe `schema_major = 1`, while current `main` writes and accepts only the
-terminal-triple-index replacement at `schema_major = 2`. The replacement text
-is under `specs/in-progress/` and is not yet a published specification. Tapes
-written by the v0.1.0/v1.0.0 binaries use generation 1 and are not readable by
+vectors that ship with the source. For REM-PARITY, current `main` writes and
+accepts only the terminal-index layout (`schema_major = 2`), which is described
+in the revision under `specs/in-progress/` and is not yet a published
+specification. The REM-PARITY copy under `specs/publication/` and the published
+vector archive describe `schema_major = 1`, which current `main` rejects. Tapes written
+by the released v0.1.0 binaries use `schema_major = 1` and cannot be read by
 current `main`.
 
 The specification review copies are public, but their concept DOIs are reserved
-and the first deposits are still pending. What is under review is
-whether the documents describe the formats correctly and completely, not
-whether the design works — but the documents are not final until they freeze on
-31 July 2027, and the guarantee that no tape a format validates will ever be
-invalidated begins then rather than now. Until then a review finding could
-still change what goes on tape, so treat material written during the window as
-re-writable rather than final. The daemon and its gRPC control surface are
-released but may also still change.
+and the first deposits are still pending. The review checks whether the
+documents describe the formats correctly and completely, not whether the design
+works. The documents freeze on 31 July 2027, and the guarantee that no tape a
+format validates will ever be invalidated begins then. Until then a review
+finding could still change what goes on tape, so treat material written during
+the window as re-writable. The daemon and its gRPC control surface are released
+but may also still change.
 
-The project is young, and has run on a narrow range of hardware. Restore and
+The project is young and has run on a narrow range of hardware. Restore and
 verify real material on your own equipment before you rely on it.
 
 [docs/status.md](docs/status.md) sets out what works today and what does not.
@@ -111,7 +105,7 @@ environment variables documented in their test modules.
 <!-- code-anchor: crates/remanence-cli/src/lib.rs @ 6ed03ef0 -->
 ## Quickstart
 
-The native object format works against local files, no tape required:
+The native object format works against local files, no tape required. In the first command, replace `some-directory` with an existing directory that holds the files you want to archive:
 
 ```sh
 rem archive build --inputs some-directory --out demo.rem-object

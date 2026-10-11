@@ -1,5 +1,9 @@
 # Release verification
 
+This page describes what a Remanence binary release contains and how to check
+that the files you downloaded are the ones the project built from a specific,
+signed source revision.
+
 Binary releases require an annotated, GitHub-verified signed tag on an ancestor
 of `main`, successful main-push CI for the exact tagged commit, and a matching
 workspace version. The release build repeats Rust tests and clippy with locked

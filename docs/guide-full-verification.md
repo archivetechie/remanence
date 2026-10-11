@@ -1,11 +1,20 @@
 # Full verification
 
+A full verification reads every data block and every parity shard that the
+tape's parity sidecars protect, and checks each against the checksum recorded
+for it. A tape written without parity has no sidecars, so for it the
+verification checks structure only (see "A tape written without parity"
+below). For an epoch whose sidecar index cannot be read, it reads the blocks
+but has no checksum to compare them against. It has two practical
+uses. One is a periodic, systematic check of the whole archive, for example
+verifying every tape in turn on a rotation so that unreadable blocks are found
+while there is time to act on them. The other is to judge one suspect tape.
+
 This page explains what `rem tape verify-index` checks, what it means when the
 command reports a tape as complete, what it prints when it finds a problem,
-and how long it takes. It is written for the person who has to decide whether a
-tape is good. The command's row in the [CLI reference](reference-cli.md) states
-what it does in a line; this page gives the reasons. The rule it follows is
-REM-PARITY Section 2.2, in the preparing copy of the specification,
+and how long it takes. The command's row in the [CLI reference](reference-cli.md)
+states what it does in a line; this page gives the reasons. The rule it
+follows is REM-PARITY Section 2.2, in the preparing copy of the specification,
 [REM-PARITY 1.0.0-draft.5](../specs/in-progress/rem-parity-1-specification.md).
 For what to do when a tape does not verify, or will not identify itself, see
 [Damaged tapes](guide-damaged-tapes.md).
@@ -13,22 +22,28 @@ For what to do when a tape does not verify, or will not identify itself, see
 <!-- code-anchor: crates/remanence-parity/src/verify_protected.rs crates/remanence-api/src/write_owner/terminal_inventory.rs @ c80a553a -->
 ## What a full verification is
 
-A tape can be checked at two depths. The shallow check reads the bootstrap,
-the terminal index, and the structure of the files in between: where each tape
-file starts and ends, whether the three terminal replicas agree, and whether
-the tape ends where the index says it should. It reads none of the data that
-Objects are made of. A tape can pass it and still hold a block that no drive
-can read.
+REM-PARITY Section 2.2 defines it in these words: "A Verifier's validation is
+a full verification: it reads every data block that a sidecar protects and
+every parity shard, and checks each against its sidecar's index (Section
+13.4)." The same paragraph says where the line falls: "A check of structure
+and metadata alone, which reads no data block or parity shard, is not a full
+verification." `rem tape verify-index` performs the full verification.
 
-The deep check is a full verification. REM-PARITY Section 2.2 defines it in
-these words: "A Verifier's validation is a full verification: it reads every
-data block that a sidecar protects and every parity shard, and checks each
-against its sidecar's index (Section 13.4)." The same paragraph says the other
-side of the line just as plainly: "A check of structure and metadata alone,
-which reads no data block or parity shard, is not a full verification." An
-older note, or an older version of this documentation, may have called the
-shallow check a full verification. It is not one, and `rem tape verify-index`
-performs the deep check.
+No command checks the structure of a whole tape and stops there. The quick
+check that exists is `rem tape inventory`. It reads the bootstrap record at
+the beginning of the tape and the terminal index copies at the end, and
+normally does not walk over every tape file in between. It normally reads no
+Object data and normally takes minutes. If the terminal index cannot be used,
+inventory falls back to a structural walk from the beginning of the tape, which
+reads the first and last block of each Object and can take hours. A successful
+terminal-index inventory tells you that the selected index is readable and
+consistent; a BOT-recovery outcome reports the structure recovered by the walk instead. It does not tell you that the data blocks can be
+read. A tape can pass an inventory and still hold a block that no drive can
+read. There is no shallow-walk mode of `rem tape verify-index`.
+
+A sensible pattern is to run `rem tape inventory` as a quick, frequent check
+and a full verification on a rotation, at an interval that suits the number of
+tapes and drives you have.
 
 The reason for the definition is what a parity tape promises. Each Object's
 blocks are protected by parity shards written into sidecar tape files. The tape
@@ -42,8 +57,8 @@ also does not repair anything: it reads and reports.
 
 ## Running it
 
-The command takes the tape's UUID and runs through the daemon, like
-`rem tape inventory`:
+The command takes the tape's UUID, which `rem catalog tapes` prints, and runs
+through the daemon, like `rem tape inventory`:
 
 ```text
 rem tape verify-index --tape-uuid TAPE_UUID
@@ -204,62 +219,91 @@ that were never written.
 <!-- code-anchor: crates/remanence-parity/src/verify_protected.rs @ c80a553a -->
 ## How long a full verification takes
 
-A full verification reads every data block and parity shard on the tape. Its
-duration is therefore at least the number of bytes on the tape divided by the
-sustained read rate of the drive. This is arithmetic. It is not a measurement
-of a full verification, because none has been run on a full cartridge.
+The time has two parts: the time to read the bytes, and the time the drive
+spends moving to places on the tape.
 
-A full LTO-9 cartridge holds 18 TB natively, which is 18 x 10^12 bytes, about
-16.4 TiB. Two read rates give two figures.
+The bytes set a floor. A full LTO-9 cartridge holds 18 TB natively, which is
+18 x 10^12 bytes. A half-height LTO-9 drive reads at 300 MB/s native, so:
 
-- At 200 MiB/s, which is 209,715,200 bytes per second: 18 x 10^12 divided by
-  209,715,200 is about 85,800 seconds, or 23.8 hours. The figure of 200 MiB/s
-  is a streaming read rate measured on physical LTO-9 hardware during testing.
-  It is not the measured rate of a full verification. A slower rate takes
-  longer.
-- At the LTO-9 native rate of 400 MB/s, which is 400 x 10^6 bytes per second:
-  18 x 10^12 divided by 400 x 10^6 is 45,000 seconds, or 12.5 hours. A
-  half-height drive may be rated below this rate, and then it takes longer.
-  Use the rating of your own drive.
+```text
+18 x 10^12 bytes / (300 x 10^6 bytes/s) = 60,000 s = 16 h 40 min
+```
 
-The figures rest on assumptions, and they are a starting point for a plan and
-not a promise. Twelve and a half hours is a lower bound; 23.8 hours is what
-the measured streaming rate gives, and it is not an upper bound. The
-assumptions are these.
+That is the least time a full cartridge written with parity can take. Use the rating of your own
+drive if it differs. A parity tape holds `k + m` shards for every `k` data
+blocks, so the bytes read exceed the user's bytes, and a tape that is one third
+full takes about one third as long.
 
-- The drive streams without stopping. The verification pass reads in order and
-  repositions the drive only when the next block is not where the previous read
-  left it, but it must reposition between tape files and to each sidecar, and
-  those repositions are not counted.
-- The host, the SCSI adapter and the verification pipeline keep up with the
-  drive at the stated rate.
-- No read errors force retries.
-- The bytes read are the bytes written, parity included. A parity tape holds
-  `k + m` shards for every `k` data blocks, so the bytes read exceed the user's
-  bytes. A tape that is one third full takes about one third as long.
-- Loading the cartridge, positioning to the beginning of tape, and reading the
-  terminal suffix add time and are not counted. So does the walk of the prefix
-  that comes first, which spaces over one filemark for each tape file. Each
-  sidecar's header and index copies are also read twice, once when the copy is
-  checked and once when the index is acquired.
+Verification is not one forward pass over the tape, so it does not reach that
+floor. In order, it does the following.
 
-The [implementation guide](../specs/publication/rem-implementation-guide.md) says of the walk from
-the beginning of the tape that it "can take hours". A full verification is of
-the same order or longer: on the scale of a working day for a full LTO-9
-cartridge, with the drive occupied throughout. Run it in a maintenance window.
-Do not run it to check a tape just before a read that will read the same
-blocks anyway.
+1. It reads the bootstrap, then the end of the terminal index, then walks
+   every tape file from the beginning of the tape. For each tape file it
+   spaces over one filemark and performs at least one locate; for an Object it
+   performs two.
+2. It reads the terminal index copies and the separation extents between them.
+3. For each epoch (the span of Object data covered by one sidecar, a tape file
+   that holds the parity for that data), it reads the sidecar's metadata, which
+   sits after the data it protects. It then seeks back to the start of that
+   epoch's data and reads the data forward. It then seeks forward to the
+   sidecar's parity and reads the parity forward.
 
-This page gives no duration for a check of structure alone. The time of a walk
-grows with the number of tape files, and on a tape of many small Objects the
-repositioning alone can take hours. No figure has been measured.
+The drive reads one block per command. Verification does not use the pipelined
+reader that writes and restores use, so its sustained read rate is expected to
+be below the drive's streaming rate. No full-cartridge verification has been
+measured.
+
+The time can be approximated as follows. The formula is an approximation, and
+it is useful for comparing tapes with similar layouts once its two unknowns
+have been measured on your own drive:
+
+```text
+T = D / R  +  N_files x t_file  +  N_epochs x t_epoch
+```
+
+| Symbol | Meaning | Remarks |
+| --- | --- | --- |
+| `D` | Bytes on the tape, parity included. | A full 18 TB LTO-9 cartridge is about 18 x 10^12 bytes. |
+| `R` | Sustained read rate of verification, in bytes per second. | At most the drive's native rate (300 MB/s for a half-height LTO-9 drive); expected to be lower, because reads are one block per command. |
+| `N_files` | Number of tape files. | Objects, plus sidecars, plus the five terminal files, plus the bootstrap and the ParityMap. |
+| `t_file` | Time to space over a filemark and position, for one tape file. | Not measured. |
+| `N_epochs` | Number of epochs, which equals the number of sidecars. | A full epoch covers 16 GiB of Object data at the default settings, but checkpoints can close shorter epochs. For planning, use the actual sidecar count; `rem tape inventory --tape-uuid TAPE_UUID --json` lists the tape's structural files by kind, including parity sidecars. |
+| `t_epoch` | Time for one epoch's backward seek to its data, and its metadata reads. | Not measured. |
+
+`t_file` and `t_epoch` have not been measured. They depend on the drive and the
+cartridge, so measure them on your own drive. One timed tape cannot determine
+two unknowns: verify at least two tapes whose file-to-epoch ratios differ, and
+solve for the two values from the time that exceeds `D / R`. Seek time grows
+with the distance travelled, so values measured on a short tape are uncertain
+when applied to a full cartridge. The formula leaves out several costs that
+also depend on the layout: the overlaps between Objects and epochs (each starts
+a new read position), the final ParityMap being read again for every epoch, and
+the per-block positioning used to read sidecar metadata. Treat the result as an
+empirical estimate for comparable tape layouts. The number of tape files matters as much
+as the byte count. A tape of many small Objects has many tape files, and the
+per-file term can then take hours.
+
+The formula leaves out some costs. Loading the cartridge and positioning to the
+beginning of tape add time. Read errors that force retries add more. Each
+sidecar's header and index copies are read twice, once when the copy is checked
+and once when the index is acquired, and the host and SCSI adapter must keep up
+with the drive.
+
+The [implementation guide](../specs/publication/rem-implementation-guide.md)
+says of the walk from the beginning of the tape that it "can take hours". Plan
+for a full verification of a full LTO-9 cartridge as a task of a working day or
+more, with the drive occupied throughout, and run it in a maintenance window. A
+verification of a tape just before a read that will read the same blocks
+anyway repeats work.
 
 ## In plain terms
 
-Verifying a tape completely means reading every page of a very long book, at
-the speed the drive turns the pages. A full LTO-9 cartridge is roughly half a
-day to a day of reading. A look at the cover and the table of contents is much
-quicker, but it cannot tell you that the pages are readable, which is why the
-tool no longer calls that a full verification. "Verified" says the reading
-finished, "complete" says every page was good, and when a page was not, the
-tool tells you which one.
+Verifying a tape completely means reading every page of a very long book. The
+pages alone take about seventeen hours for a full LTO-9 cartridge, and the
+drive also spends time turning back to the index and to the parity pages as it
+goes. A tape written without parity has no checksums for its pages, and a page
+whose checksum list is missing can be read but not checked. A look at the cover
+and the table of contents, which is what `rem tape inventory` does, normally
+takes minutes, and it cannot tell you that the pages are readable. "Verified" says the reading finished, "complete" says every
+check that applies to the tape passed (pages without a checksum list are not
+covered), and when a page failed, the tool tells you which one.
