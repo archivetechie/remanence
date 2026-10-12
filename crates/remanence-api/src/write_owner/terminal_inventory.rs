@@ -532,6 +532,8 @@ pub(crate) fn handle_drive_verify_tape_index(
     source_slot: Option<u16>,
     drive_serial: Option<&str>,
 ) -> Result<pb::TapeIndexVerification, Status> {
+    let io = drive.begin_verification_io();
+    let _verification = drive.verification_context().verification();
     session_open_short_probe_or_load(
         index,
         drive,
@@ -567,6 +569,7 @@ pub(crate) fn handle_drive_verify_tape_index(
         .map_err(status_from_terminal_index_verification_error)?
     };
     let mut report = terminal_verification_to_proto(tape_uuid, outcome);
+    report.io = Some(verification_io_to_proto(io.finish()));
     prepared.append_provenance(&mut report.detail);
     Ok(report)
 }
@@ -590,6 +593,7 @@ pub fn terminal_verification_to_proto(
             terminal_verified_to_proto(tape_uuid, *verified, false)
         }
         Outcome::RecoveryRequired(recovery) => pb::TapeIndexVerification {
+            io: None,
             tape_uuid: tape_uuid.to_vec(),
             state: pb::TapeIndexVerificationState::RecoveryRequired as i32,
             fast_inventory: None,
@@ -695,6 +699,7 @@ pub(crate) fn terminal_verified_to_proto(
     complete: bool,
 ) -> pb::TapeIndexVerification {
     pb::TapeIndexVerification {
+        io: None,
         tape_uuid: tape_uuid.to_vec(),
         state: if complete {
             pb::TapeIndexVerificationState::VerifiedComplete as i32
@@ -949,5 +954,51 @@ pub(crate) const fn terminal_replica_failure_name(
         TerminalReplicaFailureKind::TrailingFilemark => "trailing_filemark",
         TerminalReplicaFailureKind::PayloadInvalid => "payload_invalid",
         TerminalReplicaFailureKind::CrossSurvivorConflict => "cross_survivor_conflict",
+    }
+}
+
+/// Project only collected diagnostics; verdict conversion alone leaves io absent.
+fn verification_io_to_proto(
+    io: remanence_library::verification_io::VerificationIo,
+) -> pb::VerificationIo {
+    fn counts(c: remanence_library::verification_io::IoCounts) -> pb::VerificationIoCounts {
+        pb::VerificationIoCounts {
+            locate: c.locate,
+            space: c.space,
+            read_position: c.read_position,
+            single_read: c.single_read,
+            batch_read: c.batch_read,
+            other: c.other,
+            records_requested: c.records_requested,
+            records_confirmed: c.records_confirmed,
+            bytes: c.bytes,
+            hardware_batch_fallbacks: c.hardware_batch_fallbacks,
+            recovered_reads: c.recovered_reads,
+            algorithmic_fallback_epochs: c.algorithmic_fallback_epochs,
+        }
+    }
+    pb::VerificationIo {
+        total: Some(counts(io.total)),
+        phases: remanence_library::verification_io::VerificationPhase::ALL
+            .into_iter()
+            .zip(io.phases)
+            .map(|(phase, c)| pb::VerificationIoPhase {
+                phase: phase.name().into(),
+                counts: Some(counts(c)),
+            })
+            .collect(),
+        elapsed_ms: io.elapsed_ms,
+        backward_data_seeks: io.backward_data_seeks,
+        protected_bytes: io.protected_bytes,
+        protected_ranges: io
+            .protected_ranges
+            .into_iter()
+            .map(|r| pb::VerificationIoRange {
+                start_lba: r.start_lba,
+                end_lba: r.end_lba,
+            })
+            .collect(),
+        recovered_lbas: io.recovered_lbas,
+        recovered_unknown_addresses: io.recovered_unknown_addresses,
     }
 }

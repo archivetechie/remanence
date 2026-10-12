@@ -616,10 +616,10 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
         (
             "remanence-cli/src/damage_vectors.rs",
             DispatchPolicy::Exact {
-                execute_out: 1,
-                execute_none: 1,
-                why: "the damage-vector executor's over-length read \
-                      wrapper, which forwards every other command unchanged \
+                execute_out: 2,
+                execute_none: 2,
+                why: "the damage-vector executor's over-length and recovered-read \
+                      wrappers, which forward every other command unchanged \
                       to the in-memory chaos model; it initiates nothing and \
                       has no real device behind it",
             },

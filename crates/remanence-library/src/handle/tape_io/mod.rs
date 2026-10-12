@@ -1982,6 +1982,19 @@ impl super::DriveHandle {
         self.transport.set_timeout_for(TimeoutClass::TapeIo);
         let started = Instant::now();
         let result = self.transport.execute_in(&cdb, buf);
+        if result.is_err()
+            && self.verification_context().is_verifying()
+            && crate::verification_io::exact_recovered(&result, buf.len())
+        {
+            if let Err(error) = self.advance_known_single_read_position(buf.len()) {
+                self.finish_tape_error(op, &error);
+                return Err(error);
+            }
+            if let Err(ScsiError::CheckCondition { sense, .. }) = result {
+                self.finish_tape_recovered(op, started.elapsed(), sense);
+            }
+            return Ok(buf.len());
+        }
         match result {
             Ok(outcome) => {
                 let bytes = (outcome.bytes_transferred as usize).min(buf.len());

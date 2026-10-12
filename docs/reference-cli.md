@@ -261,6 +261,47 @@ with `address` `null` where there is none, in both the verified and the
 recovery-required envelope. The array is `[]` when the protected content
 verified clean.
 
+The verification JSON also carries `io`, a diagnostic object under the same
+`rem.tape.verify-index.v1` schema. It is present for complete, degraded and
+recovery-required results when the daemon collects it, and `null` when the
+daemon supplies none. Human output has one `io:` summary line. Counts and
+physical addresses in JSON are decimal strings. These measurements do not
+change the outcome or findings.
+
+`io.total` and each entry of `io.phases[].counts` contain attempted `locate`,
+`space`, `read_position`, `single_read`, `batch_read` and `other` commands;
+`records_requested` and `records_confirmed`; transport-reported `bytes`;
+`hardware_batch_fallbacks`; `algorithmic_fallback_epochs`; and `recovered_reads`.
+Inline positioning commands and retries count. Fixed-mode reads of one record
+count as batches. Unclean batches contribute requested records and reported
+bytes, but only their successful single-record retries confirm records.
+`other` includes setup and readiness commands. Bytes include configuration
+responses and unconfirmed transfers; errors without a byte count contribute no
+known bytes. Hardware fallback counts an unclean batch selected for single
+retry, even if repositioning fails. Algorithmic fallback counts an epoch needing
+unbuffered data reads, independently of hardware retries.
+
+The phases are `setup`, `walk_terminal`, `parity_map`, `sidecar`,
+`protected_data`, `fallback_data` and `bot_recovery`. They attribute each command
+once, to the innermost active boundary. `elapsed_ms` measures daemon elapsed
+time from readiness through completion with a monotonic clock. It includes
+computation and excludes earlier drive queueing and client overhead.
+`backward_data_seeks` counts protected-sweep LOCATE targets before the previous
+confirmed protected read's end position. `protected_bytes` and
+`protected_ranges` describe confirmed forward-sweep coverage, excluding
+fallback reads. Ranges use inclusive `start_lba` and exclusive `end_lba`;
+overlaps and duplicates are retained. `recovered_lbas` lists accepted
+self-corrected read addresses; `recovered_unknown_addresses` counts events
+without a known address. Together they account for `total.recovered_reads`.
+See [The I/O report](guide-full-verification.md#the-io-report) for the phase
+boundaries and interpretation of coverage.
+
+An exact self-corrected single read is accepted during verification when it has
+no incorrect-length, filemark, end-of-medium or residual anomaly. It is counted
+and does not itself fail the tape. Its bytes still undergo the normal checksum
+checks, so a mismatch remains a finding. No extra drive commands are issued for
+measurement. An RPC error produces no verification report.
+
 Nonzero trailing fill after the bootstrap payload is reported as a
 `PREFIX_DAMAGE` finding. A bootstrap that was treated as unreadable is not
 reported for fill, because its bytes were not read as a bootstrap; a bootstrap

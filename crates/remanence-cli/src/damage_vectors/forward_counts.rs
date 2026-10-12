@@ -73,6 +73,10 @@ impl<S: RawTapeSource> Counter<S> {
     }
 }
 impl<S: RawTapeSource> RawTapeSource for Counter<S> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.inner.verification_context()
+    }
+
     fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
         self.phase = if self.setup && !self.configured {
             Phase::Setup
@@ -287,6 +291,7 @@ fn four_epoch_transport_counts_by_phase_and_pending_high_water() {
     ] {
         let (mut drive, _, log) =
             source_with_command_log(&vector, &json!({"unreadable_records": []}));
+        let io = drive.begin_verification_io();
         let mut raw = counter(
             DriveHandleRawSource::new(&mut drive),
             log,
@@ -341,6 +346,72 @@ fn four_epoch_transport_counts_by_phase_and_pending_high_water() {
             assert!(!raw.late_data.is_empty());
             assert!(payload > 0);
             assert!(total <= budget.unwrap());
+        }
+        let report = io.finish();
+        assert_eq!(report.total.single_read, 24);
+        assert_eq!(report.total.batch_read, 18);
+        assert_eq!(report.total.records_requested, 286);
+        assert_eq!(report.total.records_confirmed, 286);
+        assert_eq!(report.total.other, if name == "Step1" { 8 } else { 10 });
+        assert_eq!(
+            report.total.bytes,
+            286 * u64::from(BLOCK) + report.total.read_position * 32 + report.total.other / 2 * 34
+        );
+        assert_eq!(report.total.hardware_batch_fallbacks, 0);
+
+        use remanence_library::verification_io::VerificationPhase as Vp;
+        let positioning = |p: Vp| {
+            let c = &report.phases[p as usize];
+            [c.locate, c.space, c.read_position]
+        };
+        println!(
+            "io {name}: total={:?}; phases={:?}; protected_bytes={} ranges={:?}; backward={}",
+            report.total,
+            report.phases,
+            report.protected_bytes,
+            report.protected_ranges,
+            report.backward_data_seeks
+        );
+        assert_eq!(
+            report.total.locate as usize,
+            raw.log.borrow().iter().filter(|c| c[0] == 0x92).count()
+        );
+        assert_eq!(
+            report.total.space as usize,
+            raw.log
+                .borrow()
+                .iter()
+                .filter(|c| c[0] == 0x11 || c[0] == 0x91)
+                .count()
+        );
+        assert_eq!(
+            report.total.read_position as usize,
+            raw.log.borrow().iter().filter(|c| c[0] == 0x34).count()
+        );
+        if name == "forward" {
+            assert_eq!(report.backward_data_seeks, 0);
+            assert_eq!(
+                report.protected_bytes,
+                raw.data.len() as u64 * u64::from(BLOCK)
+            );
+            for &address in raw.data.keys() {
+                assert_eq!(
+                    report
+                        .protected_ranges
+                        .iter()
+                        .filter(|r| r.start_lba <= address && address < r.end_lba)
+                        .count(),
+                    1,
+                    "protected address {address}"
+                );
+            }
+            assert_eq!(positioning(Vp::ProtectedData), [3, 0, 3]);
+            assert_eq!(positioning(Vp::ParityMap), [3, 0, 4]);
+            assert_eq!(positioning(Vp::FallbackData), [0, 0, 0]);
+            assert_eq!(report.total.algorithmic_fallback_epochs, 0);
+        } else {
+            assert!(report.total.algorithmic_fallback_epochs > 0);
+            assert!(report.phases[Vp::FallbackData as usize].records_confirmed > 0);
         }
         let counts = raw.counts();
         println!("{name}: [LOCATE, SPACE, READ_POSITION] setup={:?} sweep={:?} sidecar-internal={:?} fallback={:?}; payload_high_water={payload} total_high_water={total}", counts[0], counts[1], counts[2], counts[3]);

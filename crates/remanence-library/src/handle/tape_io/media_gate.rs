@@ -321,6 +321,7 @@ pub(in crate::handle) struct MediaFencedTransport {
     /// The raw drive transport. Private to this module — that
     /// privacy IS the structural enforcement.
     inner: Box<dyn SgTransport>,
+    pub(crate) verification: crate::verification_io::VerificationContext,
     /// The installed durable-fence hook. [`NoCalibrationControl`]
     /// until the load path (P4) installs the real store's fence.
     fence: Box<dyn MediaWriteFence>,
@@ -340,6 +341,7 @@ impl MediaFencedTransport {
     pub(in crate::handle) fn new(inner: Box<dyn SgTransport>) -> Self {
         Self {
             inner,
+            verification: Default::default(),
             fence: Box::new(NoCalibrationControl),
             fenced_this_load: false,
         }
@@ -374,6 +376,7 @@ impl MediaFencedTransport {
         buf: &mut [u8],
     ) -> Result<TransferOutcome, ScsiError> {
         let result = self.inner.execute_in(cdb, buf);
+        self.verification.dispatch(cdb, buf, &result);
         if let Err(error) = &result {
             self.note_unit_attention(error);
         }
@@ -393,6 +396,8 @@ impl MediaFencedTransport {
             ));
         }
         let result = self.inner.execute_none(cdb);
+        self.verification
+            .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)));
         if let Err(error) = &result {
             self.note_unit_attention(error);
         }
@@ -480,8 +485,17 @@ impl MediaFencedTransport {
         }
 
         let result = match data_out {
-            Some(buf) => self.inner.execute_out(cdb, buf).map(Some),
-            None => self.inner.execute_none(cdb).map(|()| None),
+            Some(buf) => {
+                let result = self.inner.execute_out(cdb, buf);
+                self.verification.dispatch(cdb, buf, &result);
+                result.map(Some)
+            }
+            None => {
+                let result = self.inner.execute_none(cdb);
+                self.verification
+                    .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)));
+                result.map(|()| None)
+            }
         };
         result.map_err(|error| {
             self.note_unit_attention(&error);

@@ -1442,6 +1442,14 @@ fn print_verification(
     json_output: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
+    let io_json = verification.io.as_ref().map(verification_io_json);
+    if !json_output {
+        if let Some(io) = &verification.io {
+            if let Some(c) = &io.total {
+                writeln!(out, "io: {} ms; LOCATE {} SPACE {} READ POSITION {}; READ single {} batch {}; records {}/{} confirmed/requested; {} bytes; protected {} bytes; backward seeks {}; recovered {}", io.elapsed_ms, c.locate, c.space, c.read_position, c.single_read, c.batch_read, c.records_confirmed, c.records_requested, c.bytes, io.protected_bytes, io.backward_data_seeks, c.recovered_reads).map_err(|e| e.to_string())?;
+            }
+        }
+    }
     let state = pb::TapeIndexVerificationState::try_from(verification.state)
         .map_err(|_| "verification state is unknown".to_string())?;
     if state == pb::TapeIndexVerificationState::DeferredFullPhysicalVerify {
@@ -1524,6 +1532,7 @@ fn print_verification(
                 json!({
                     "tape_uuid": bytes_to_uuid_text(&verification.tape_uuid),
                     "verification_state": "recovery_required",
+                    "io": io_json,
                     "verified": false,
                     "verification_basis": verification.verification_basis,
                     "measured_eod_lba": verification.measured_eod_lba.to_string(),
@@ -1565,6 +1574,7 @@ fn print_verification(
             json!({
                 "tape_uuid": bytes_to_uuid_text(&verification.tape_uuid),
                 "verification_state": state_name,
+                "io": io_json,
                 "verified": true,
                 "complete": complete,
                 "verification_basis": verification.verification_basis,
@@ -1663,6 +1673,36 @@ fn print_verification(
         .map_err(|error| error.to_string())?;
     }
     writeln!(out, "verification_detail: {}", verification.detail).map_err(|error| error.to_string())
+}
+
+/// Preserve wire presence and the CLI's decimal-string convention for u64s.
+fn verification_io_json(io: &pb::VerificationIo) -> serde_json::Value {
+    fn counts(c: &pb::VerificationIoCounts) -> serde_json::Value {
+        json!({
+            "locate": c.locate.to_string(),
+            "space": c.space.to_string(),
+            "read_position": c.read_position.to_string(),
+            "single_read": c.single_read.to_string(),
+            "batch_read": c.batch_read.to_string(),
+            "other": c.other.to_string(),
+            "records_requested": c.records_requested.to_string(),
+            "records_confirmed": c.records_confirmed.to_string(),
+            "bytes": c.bytes.to_string(),
+            "hardware_batch_fallbacks": c.hardware_batch_fallbacks.to_string(),
+            "recovered_reads": c.recovered_reads.to_string(),
+            "algorithmic_fallback_epochs": c.algorithmic_fallback_epochs.to_string(),
+        })
+    }
+    json!({
+        "total": io.total.as_ref().map(counts),
+        "phases": io.phases.iter().map(|p| json!({"phase": p.phase, "counts": p.counts.as_ref().map(counts)})).collect::<Vec<_>>(),
+        "elapsed_ms": io.elapsed_ms.to_string(),
+        "backward_data_seeks": io.backward_data_seeks.to_string(),
+        "protected_bytes": io.protected_bytes.to_string(),
+        "protected_ranges": io.protected_ranges.iter().map(|r| json!({"start_lba": r.start_lba.to_string(), "end_lba": r.end_lba.to_string()})).collect::<Vec<_>>(),
+        "recovered_lbas": io.recovered_lbas.iter().map(u64::to_string).collect::<Vec<_>>(),
+        "recovered_unknown_addresses": io.recovered_unknown_addresses.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1962,6 +2002,63 @@ mod tests {
     }
 
     #[test]
+    fn verification_io_json_preserves_presence_and_large_counts() {
+        let mut report = verified_degraded_with_invalid_bc();
+        for state in [
+            pb::TapeIndexVerificationState::VerifiedComplete,
+            pb::TapeIndexVerificationState::VerifiedDegraded,
+            pb::TapeIndexVerificationState::RecoveryRequired,
+        ] {
+            report.state = state as i32;
+            if state == pb::TapeIndexVerificationState::RecoveryRequired {
+                report.recovery_inventory = Some(recovery_inventory());
+            }
+            for present in [false, true] {
+                report.io = present.then(|| pb::VerificationIo {
+                    total: Some(pb::VerificationIoCounts {
+                        records_requested: u64::MAX,
+                        recovered_reads: 1,
+                        ..Default::default()
+                    }),
+                    recovered_lbas: vec![u64::MAX],
+                    protected_ranges: vec![pb::VerificationIoRange {
+                        start_lba: 0,
+                        end_lba: u64::MAX,
+                    }],
+                    ..Default::default()
+                });
+                let mut out = Vec::new();
+                print_verification(&report, None, true, &mut out).unwrap();
+                let value: Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(value["schema"], VERIFY_INDEX_JSON_SCHEMA);
+                if present {
+                    assert_eq!(
+                        value["data"]["io"]["total"]["records_requested"],
+                        u64::MAX.to_string()
+                    );
+                    assert_eq!(
+                        value["data"]["io"]["recovered_lbas"][0],
+                        u64::MAX.to_string()
+                    );
+                    assert_eq!(value["data"]["io"]["protected_ranges"][0]["start_lba"], "0");
+                } else {
+                    assert!(value["data"]["io"].is_null());
+                }
+                out.clear();
+                print_verification(&report, None, false, &mut out).unwrap();
+                assert_eq!(
+                    String::from_utf8(out)
+                        .unwrap()
+                        .lines()
+                        .filter(|l| l.starts_with("io:"))
+                        .count(),
+                    usize::from(present)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn verify_index_json_truthfully_reports_deferred_not_verified() {
         let inventory = complete_inventory(pb::TapeInventoryOutcome::Complete);
         let verification = pb::TapeIndexVerification {
@@ -2044,6 +2141,7 @@ mod tests {
     fn verify_index_json_reports_full_measured_evidence() {
         let complete = pb::tape_index_replica_health::State::TapeIndexReplicaStateComplete as i32;
         let verification = pb::TapeIndexVerification {
+            io: None,
             tape_uuid: Uuid::from_u128(1).as_bytes().to_vec(),
             state: pb::TapeIndexVerificationState::VerifiedComplete as i32,
             fast_inventory: None,

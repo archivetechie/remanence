@@ -377,6 +377,11 @@ pub struct RawReadBatch {
 
 /// Raw physical-tape READ access used by Layer 3c.
 pub trait RawTapeSource {
+    /// Passive drive context; non-drive sources have no transport to observe.
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        Default::default()
+    }
+
     /// Configure the drive for fixed-block reads at `block_size` bytes.
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError>;
 
@@ -544,6 +549,10 @@ impl<'a> ReadRun<'a> {
 }
 
 impl RawTapeSource for ReadRun<'_> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.source.verification_context()
+    }
+
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
         self.source.configure_fixed_block_size(block_size)
     }
@@ -1418,6 +1427,10 @@ impl RawTapeSink for DriveHandleRawSink<'_> {
 }
 
 impl RawTapeSource for DriveHandleRawSource<'_> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.drive.verification_context()
+    }
+
     fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
         if block_size == 0 {
             return Err(ParityError::Invariant("fixed block size is zero"));
@@ -1568,6 +1581,7 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
                         batch.end = RawReadEnd::Error(error.into());
                         break;
                     }
+                    self.verification_context().hardware_fallback();
                     if let Err(error) = self.locate_physical(before) {
                         batch.end = RawReadEnd::Error(error);
                         break;
@@ -3108,6 +3122,54 @@ mod compat_tests {
         );
         assert_eq!(raw.cursor_hint.unwrap().lba, 1);
         assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(), 1);
+    }
+
+    /// Verification accepts exact recovered singles; unrelated callers retain
+    /// their existing CHECK CONDITION result. Inconsistent recovery is unchanged.
+    #[test]
+    fn verification_recovered_single_policy_is_scoped_and_exact() {
+        for bytes in [3, 4, 5] {
+            for residual in [0u32, 1] {
+                let observe = |verify: bool| {
+                    let mut sense = vec![0; 18];
+                    sense[0] = 0xf0;
+                    sense[2] = 1;
+                    sense[7] = 10;
+                    sense[3..7].copy_from_slice(&residual.to_be_bytes());
+                    let (mut drive, _) = scripted_read_drive(
+                        vec![
+                            (0x34, Ok(read_position_long_response(0, 0, 12))),
+                            (
+                                0x08,
+                                Err(remanence_library::ScsiError::CheckCondition {
+                                    sense,
+                                    bytes_transferred: bytes,
+                                }),
+                            ),
+                        ],
+                        0,
+                    );
+                    let io = drive.begin_verification_io();
+                    let _scope = verify.then(|| drive.verification_context().verification());
+                    let result = DriveHandleRawSource::new(&mut drive).read_record(&mut [0; 4]);
+                    (result, io.finish())
+                };
+                let (plain, _) = observe(false);
+                let (verified, io) = observe(true);
+                assert!(plain.is_err());
+                if bytes == 4 && residual == 0 {
+                    assert!(matches!(
+                        verified,
+                        Ok(RawReadOutcome::Block { bytes: 4, .. })
+                    ));
+                    assert_eq!(io.total.records_confirmed, 1);
+                    assert_eq!(io.recovered_lbas, vec![12]);
+                } else {
+                    assert_eq!(format!("{plain:?}"), format!("{verified:?}"));
+                    assert_eq!(io.total.recovered_reads, 0);
+                }
+            }
+        }
     }
 
     /// Restore's buffer handoff still accepts the fixed reader's recovered completion.

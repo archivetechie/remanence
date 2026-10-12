@@ -244,6 +244,11 @@ impl ForwardPass {
         map: &ScopedFilemarkMap,
         object: &TapeFileMapEntry,
     ) -> Result<(), ParityError> {
+        let _phase = reader
+            .source
+            .verification_context()
+            .phase(remanence_library::verification_io::VerificationPhase::ProtectedData);
+
         for epoch in self.epochs.iter_mut().filter(|epoch| !epoch.stopped) {
             let Some((first, lo, hi)) = overlap(object, epoch.start, epoch.end)? else {
                 continue;

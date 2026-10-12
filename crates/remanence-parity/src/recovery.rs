@@ -964,6 +964,10 @@ impl DirectoryCache {
         tape_uuid: &[u8; 16],
         block_size: u32,
     ) -> Result<(), ParityError> {
+        let _phase = source
+            .verification_context()
+            .phase(remanence_library::verification_io::VerificationPhase::ParityMap);
+
         if scoped_map.sidecar_directory.is_some() {
             return Ok(());
         }
