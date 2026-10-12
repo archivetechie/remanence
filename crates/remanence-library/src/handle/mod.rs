@@ -2178,3 +2178,14 @@ fn revalidate_serial(transport: &mut dyn SgTransport) -> Result<Option<String>, 
 
 #[cfg(test)]
 mod tests;
+
+impl DriveHandle {
+    /// Passive verification context shared by every raw adapter on this drive.
+    pub fn verification_context(&self) -> crate::verification_io::VerificationContext {
+        self.transport.verification.clone()
+    }
+    /// Collect all verification dispatches until the returned session ends.
+    pub fn begin_verification_io(&self) -> crate::verification_io::VerificationIoSession {
+        self.verification_context().begin()
+    }
+}

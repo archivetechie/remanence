@@ -163,3 +163,24 @@ TapeInventoryBotRecoveryProgress.partition           as tape_file_number; partit
 TapeInventoryBotRecoveryProgress.position_lba        as tape_file_number
 TapeInventoryBotRecoveryProgress.structural_candidate_count as tape_file_number; always tape_file_number + 1
 TapeInventoryBotRecoveryProgress.elapsed_millis      as tape_file_number; 0 ms is a real duration
+
+# Verification diagnostics: enclosing io message supplies presence.
+VerificationIoCounts.locate  measured counter; zero means no such work in this collection
+VerificationIoCounts.space  measured counter; zero means no such work in this collection
+VerificationIoCounts.read_position  measured counter; zero means no such work in this collection
+VerificationIoCounts.single_read  measured counter; zero means no such work in this collection
+VerificationIoCounts.batch_read  measured counter; zero means no such work in this collection
+VerificationIoCounts.other  measured counter; zero means no such work in this collection
+VerificationIoCounts.records_requested  measured counter; zero means no such work in this collection
+VerificationIoCounts.records_confirmed  measured counter; zero means no such work in this collection
+VerificationIoCounts.bytes  measured counter; zero means no such work in this collection
+VerificationIoCounts.hardware_batch_fallbacks  measured counter; zero means no such work in this collection
+VerificationIoCounts.recovered_reads  measured counter; zero means no such work in this collection
+VerificationIoCounts.algorithmic_fallback_epochs  measured counter; zero means no such work in this collection
+VerificationIoPhase.phase  always a named measured phase
+VerificationIoRange.start_lba  measured physical boundary; LBA zero is BOT
+VerificationIoRange.end_lba  measured physical boundary; LBA zero is BOT
+VerificationIo.elapsed_ms  measured diagnostic; zero is an observed value within present io
+VerificationIo.backward_data_seeks  measured diagnostic; zero is an observed value within present io
+VerificationIo.protected_bytes  measured diagnostic; zero is an observed value within present io
+VerificationIo.recovered_unknown_addresses  measured diagnostic; zero is an observed value within present io

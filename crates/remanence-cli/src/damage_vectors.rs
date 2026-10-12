@@ -99,10 +99,73 @@ pub(crate) fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, Faul
     (drive, engine)
 }
 
+/// Inject recovered completions after delivering actual model bytes. A fixed
+/// batch containing the address is retried singly by the production adapter.
+struct RecoveredRead<T> {
+    inner: T,
+    fault: Option<(u64, bool)>,
+    position: Option<u64>,
+}
+impl<T: SgTransport> SgTransport for RecoveredRead<T> {
+    fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
+        let result = self.inner.execute_in(cdb, buf);
+        if cdb[0] == 0x34 && result.is_ok() {
+            self.position = Some(u64::from_be_bytes(buf[8..16].try_into().unwrap()));
+        }
+        if cdb[0] == 8 {
+            let count = if cdb[1] & 1 != 0 {
+                u64::from(u32::from_be_bytes([0, cdb[2], cdb[3], cdb[4]]))
+            } else {
+                1
+            };
+            let start = self.position;
+            self.position = if result.is_ok() {
+                start.map(|p| p + count)
+            } else {
+                None
+            };
+            if let (Some(start), Some((lba, corrupt)), Ok(outcome)) = (start, self.fault, &result) {
+                if start <= lba && lba < start + count {
+                    if corrupt {
+                        buf[(lba - start) as usize * BLOCK as usize] ^= 1;
+                    }
+                    let mut sense = vec![0; 18];
+                    sense[0] = 0xf0;
+                    sense[2] = 1;
+                    sense[7] = 10;
+                    return Err(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: outcome.bytes_transferred,
+                    });
+                }
+            }
+        }
+        result
+    }
+    fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+        self.position = None;
+        self.inner.execute_none(cdb)
+    }
+    fn execute_out(&mut self, cdb: &[u8], buf: &[u8]) -> Result<TransferOutcome, ScsiError> {
+        self.inner.execute_out(cdb, buf)
+    }
+    fn set_timeout_for(&mut self, class: TimeoutClass) {
+        self.inner.set_timeout_for(class);
+    }
+}
+
 /// Record actual drive commands below the raw adapter and its metric decorator.
 fn source_with_command_log(
     vector: &VectorImage,
     faults: &Value,
+) -> (DriveHandle, FaultEngine, remanence_library::RecordingLog) {
+    source_with_read_completion(vector, faults, None)
+}
+
+fn source_with_read_completion(
+    vector: &VectorImage,
+    faults: &Value,
+    recovered: Option<(u64, bool)>,
 ) -> (DriveHandle, FaultEngine, remanence_library::RecordingLog) {
     // No key of the fault map may be ignored silently.
     for key in faults.as_object().expect("fault map object").keys() {
@@ -241,6 +304,11 @@ fn source_with_command_log(
         engine.clone(),
         DeviceCtx::new().with_backend("model"),
     );
+    let transport = RecoveredRead {
+        inner: transport,
+        fault: recovered,
+        position: None,
+    };
     let (transport, log) = remanence_library::RecordingTransport::new(transport);
     (
         DriveHandle::open_standalone_with_transport(
@@ -3085,6 +3153,55 @@ fn batch_verification_matches_single_records_for_entire_damage_matrix() {
     }
 }
 
+/// Collection is passive over every frozen damage case, including fatal errors.
+#[test]
+fn collector_preserves_outcomes_findings_and_commands_for_entire_damage_matrix() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let cases = frozen["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let vector = generate(case["image"].as_str().unwrap()).unwrap();
+        let faults = fault_map_of(case, &vector);
+        let observe = |collect: bool| {
+            let (mut drive, _, log) = source_with_command_log(&vector, &faults);
+            let io = collect.then(|| drive.begin_verification_io());
+            let mut raw = crate::terminal_index_drill::InstrumentedSource::new(
+                DriveHandleRawSource::new(&mut drive),
+            );
+
+            let uuid = vector.written.inputs.tape_uuid;
+            let block_size = vector.written.inputs.block_size;
+            let hints = faults["hints"].as_object().map(|h| ScanRecoveryHints {
+                tape_uuid: uuid,
+                block_size: h["block_size"].as_u64().unwrap() as u32,
+                scheme: ParityConfig::Scheme(scheme(
+                    h["scheme"]["k"].as_u64().unwrap(),
+                    h["scheme"]["m"].as_u64().unwrap(),
+                    h["scheme"]["S"].as_u64().unwrap(),
+                )),
+            });
+            let mode = match &hints {
+                Some(hints) => ScanMode::Recovery(hints),
+                None => ScanMode::Standard,
+            };
+            let result =
+                verify_terminal_index_full_with_scan_mode(&mut raw, &uuid, block_size, None, mode);
+            if let Some(io) = io {
+                let io = io.finish();
+                assert!(io.total.single_read + io.total.batch_read > 0);
+            }
+            let commands = log.borrow().clone();
+            (
+                commands,
+                format!("{result:?}"),
+                result.as_ref().ok().map(verification_projection),
+            )
+        };
+        assert_eq!(observe(true), observe(false), "damage case {id}");
+    }
+}
+
 /// Stable per-address damage must have identical outcomes and ordered findings
 /// with the forward observation schedule and the original Step 1 schedule.
 #[test]
@@ -3405,3 +3522,57 @@ fn metadata_run_positioning_is_independent_of_block_count() {
 }
 
 mod forward_counts;
+
+/// Recovery never bypasses the sidecar CRC, including the batch retry path.
+#[test]
+fn recovered_verification_reads_are_counted_and_crc_checked() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let vector = generate(frozen["cases"][0]["image"].as_str().unwrap()).unwrap();
+    let object = vector
+        .written
+        .map
+        .entries()
+        .iter()
+        .find(|e| e.kind == TapeFileKind::Object && e.block_count > 2)
+        .expect("protected object");
+    let lba = vector
+        .written
+        .map
+        .physical_position(TapeFilePosition {
+            tape_file_number: object.tape_file_number,
+            block_within_file: 1,
+        })
+        .unwrap()
+        .lba;
+    let run = |fault| {
+        let (mut drive, _, _) =
+            source_with_read_completion(&vector, &json!({"unreadable_records": []}), fault);
+        let io = drive.begin_verification_io();
+        let outcome = verify_terminal_index_full_with_scan_mode(
+            &mut DriveHandleRawSource::new(&mut drive),
+            &vector.written.inputs.tape_uuid,
+            BLOCK,
+            None,
+            ScanMode::Standard,
+        )
+        .unwrap();
+        (outcome, io.finish())
+    };
+    let (clean, _) = run(None);
+    let (recovered, io) = run(Some((lba, false)));
+    assert_eq!(format!("{clean:?}"), format!("{recovered:?}"));
+    assert_eq!(io.total.recovered_reads, 1);
+    assert_eq!(io.recovered_lbas, vec![lba]);
+    assert_eq!(io.total.hardware_batch_fallbacks, 1);
+    let (bad, io) = run(Some((lba, true)));
+    assert_eq!(io.total.recovered_reads, 1);
+    assert_eq!(io.recovered_lbas, vec![lba]);
+    let debug = format!("{bad:?}");
+    let projected =
+        remanence_api::terminal_verification_to_proto(vector.written.inputs.tape_uuid, bad);
+    assert_eq!(
+        projected.state,
+        remanence_api::pb::TapeIndexVerificationState::VerifiedDegraded as i32
+    );
+    assert!(debug.contains("CrcMismatch"), "{debug}");
+}

@@ -7464,6 +7464,32 @@ fn verify_index_unreadable_bootstrap_uses_catalog_hints() {
                 Some("DRV-RECOVERY"),
             )
             .expect("verify-index proceeds with unreadable BOT");
+            let io = report.io.as_ref().expect("recovery-required I/O");
+            assert!(io.total.as_ref().unwrap().single_read > 0);
+            assert!(
+                io.phases
+                    .iter()
+                    .find(|p| p.phase == "setup")
+                    .unwrap()
+                    .counts
+                    .as_ref()
+                    .unwrap()
+                    .other
+                    > 0
+            );
+            assert!(
+                io.phases
+                    .iter()
+                    .find(|p| p.phase == "bot_recovery")
+                    .unwrap()
+                    .counts
+                    .as_ref()
+                    .unwrap()
+                    .single_read
+                    > 0
+            );
+            drop(drive.begin_verification_io()); // prior session detached
+
             assert_eq!(report.tape_uuid, RANGE_TAPE_UUID);
             assert_eq!(
                 report.state,
@@ -7867,6 +7893,10 @@ fn catalog_recovery_terminal_tail_retains_bootstrap_provenance() {
                     Some("DRV-RECOVERY"),
                 )
                 .expect("verification reports damaged BOT with surviving replicas");
+                let io = verification.io.as_ref().expect("degraded I/O");
+                assert!(io.total.as_ref().unwrap().read_position > 0);
+                drop(drive.begin_verification_io());
+
                 assert!(
                     verification
                         .detail

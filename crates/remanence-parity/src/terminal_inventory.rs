@@ -866,6 +866,11 @@ fn verify_terminal_index_full_inner<V: ProtectedPass>(
     authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
     mode: ScanMode<'_>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    let _verification = source.verification_context().verification();
+    let _phase = source
+        .verification_context()
+        .phase(remanence_library::verification_io::VerificationPhase::Walk);
+
     match verify_terminal_index_strict::<V>(source, tape_uuid, block_size, mode) {
         Ok(complete) => {
             let replicas = complete
@@ -1558,6 +1563,9 @@ fn terminal_recovery_required<V: ProtectedPass>(
     let measured_eod = source
         .locate_end_of_data()
         .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
+    let _bot_phase = source
+        .verification_context()
+        .phase(remanence_library::verification_io::VerificationPhase::BotRecovery);
     let bot_recovery = match authority.as_deref_mut() {
         Some(authority) => {
             crate::bot_recovery::recover_terminal_inventory_from_bot_with_authority_controlled_mode(
@@ -1580,6 +1588,7 @@ fn terminal_recovery_required<V: ProtectedPass>(
         ),
     }
     .map_err(bot_recovery_verification_error)?;
+    drop(_bot_phase);
     // No terminal replica supplies a canonical prefix, but the walked map still
     // has a validated scope, and the protected content within it is verified.
     let protected = verify_protected_walk::<V>(source, tape_uuid, block_size, mode)?;

@@ -534,6 +534,10 @@ fn verify_sidecar_cached(
     directory_cache: &mut crate::recovery::DirectoryCache,
     pending: Option<&PendingEpoch>,
 ) -> Result<SidecarVerification, ParityError> {
+    let _phase = source
+        .verification_context()
+        .phase(remanence_library::verification_io::VerificationPhase::Sidecar);
+
     let (start, end, epoch_id) = match (
         sidecar.protected_ordinal_start,
         sidecar.protected_ordinal_end_exclusive,
@@ -720,6 +724,7 @@ fn verify_sidecar_cached(
 
     // Every data block the sidecar protects, in physical order.
     let mut failed_data_blocks = Vec::new();
+    let mut fallback_counted = false;
     let mut observations = pending.into_iter().flat_map(PendingEpoch::runs).peekable();
     for entry in scoped_map.map.entries() {
         let Some((first, overlap_start, overlap_end)) = forward::overlap(entry, start, end)? else {
@@ -745,7 +750,16 @@ fn verify_sidecar_cached(
             // (if any) locates from the live source's actual metadata position.
             let observation = match buffered.filter(|run| offset < run.len()) {
                 Some(run) => run.get(offset),
-                None => DataObservation::from_probe(reader.read(physical)?),
+                None => {
+                    let context = reader.source.verification_context();
+                    if !fallback_counted {
+                        context.algorithmic_fallback();
+                        fallback_counted = true;
+                    }
+                    let _phase = context
+                        .phase(remanence_library::verification_io::VerificationPhase::FallbackData);
+                    DataObservation::from_probe(reader.read(physical)?)
+                }
             };
             let reason = match observation.crc() {
                 Some(crc) => match index.filter(|_| usable) {
@@ -904,6 +918,10 @@ fn verify_pass(
         }
         if entry.kind == TapeFileKind::ParityMap && scoped_map.is_validated(entry.tape_file_number)
         {
+            let _phase = reader
+                .source
+                .verification_context()
+                .phase(remanence_library::verification_io::VerificationPhase::ParityMap);
             // Both copies of every ParityMap are read, and one that cannot be
             // used is reported even when the other is (REM-PARITY 2.2).
             reader.next = None;

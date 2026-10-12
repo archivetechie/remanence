@@ -1089,6 +1089,43 @@ message TapeIndexVerification {
   // protected content verified clean. A non-empty list is never
   // VERIFIED_COMPLETE.
   repeated ProtectedContentFinding protected_content_findings = 17;
+  // Diagnostic only; absent when the daemon does not collect verification I/O.
+  VerificationIo io = 18;
+}
+
+// Counts are measured even when zero. Retries count as separate dispatches.
+message VerificationIoCounts {
+  uint64 locate = 1;
+  uint64 space = 2;
+  uint64 read_position = 3;
+  uint64 single_read = 4;
+  uint64 batch_read = 5;
+  uint64 other = 6;
+  uint64 records_requested = 7;
+  uint64 records_confirmed = 8;
+  uint64 bytes = 9;
+  uint64 hardware_batch_fallbacks = 10;
+  uint64 recovered_reads = 11;
+  uint64 algorithmic_fallback_epochs = 12;
+}
+message VerificationIoPhase {
+  string phase = 1;
+  VerificationIoCounts counts = 2;
+}
+// Physical LBA interval [start_lba, end_lba). Overlaps remain visible.
+message VerificationIoRange {
+  uint64 start_lba = 1;
+  uint64 end_lba = 2;
+}
+message VerificationIo {
+  VerificationIoCounts total = 1;
+  repeated VerificationIoPhase phases = 2;
+  uint64 elapsed_ms = 3;
+  uint64 backward_data_seeks = 4;
+  uint64 protected_bytes = 5;
+  repeated VerificationIoRange protected_ranges = 6;
+  repeated uint64 recovered_lbas = 7;
+  uint64 recovered_unknown_addresses = 8;
 }
 
 enum ProtectedContentFindingKind {

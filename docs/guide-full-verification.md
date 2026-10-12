@@ -173,6 +173,71 @@ protected content are intact. In that case there are no
 names the damaged component, and the tape is not complete because its terminal
 suffix is not.
 
+## The I/O report
+
+The `io` report shows the work the drive did during verification. It helps
+explain the elapsed time and makes repeated reads visible. It is diagnostic:
+none of its numbers decides the tape's outcome or adds a finding. The human
+output has one `io:` summary line. With `--json`, `io` is an object in the
+`rem.tape.verify-index.v1` response for complete, degraded and recovery-required
+results. Every count and address is a decimal string. When the daemon supplies
+no report, `io` is `null`; that does not mean no commands were issued. A failed
+RPC carries no verification report.
+
+`total` covers all commands dispatched from readiness and setup to the end of
+verification. `phases` divides the same work at the existing read boundaries:
+
+| Phase | Work counted |
+| --- | --- |
+| `setup` | Readiness, drive configuration and the initial bootstrap check. |
+| `walk_terminal` | Terminal discovery, the prefix walk, replica checks and separation checks. |
+| `parity_map` | Directory preload and explicit ParityMap verification. ParityMap reads made as part of the prefix walk remain in `walk_terminal`. |
+| `sidecar` | Metadata acquisition, copy and footer checks, and parity-shard reads. |
+| `protected_data` | The forward sweep of protected Object blocks. |
+| `fallback_data` | Data reads that the sidecar check needs because an epoch was ineligible for buffering or only partly buffered. |
+| `bot_recovery` | The structural recovery walk from the beginning of tape. |
+
+Each phase has a `counts` object with the same fields as `total`:
+
+| Field | Meaning |
+| --- | --- |
+| `locate`, `space`, `read_position` | Attempted positioning commands. Inline READ POSITION commands issued by LOCATE and SPACE count too. |
+| `single_read` | Variable-mode, single-record READ commands. |
+| `batch_read` | Fixed-mode READ commands, including a batch that requests one record. |
+| `other` | Every other dispatched command, including configuration and readiness commands. |
+| `records_requested` | Records requested by READ commands, including retries. |
+| `records_confirmed` | Records returned by exact, clean transfers or accepted self-corrected single reads. An unclean batch is not confirmed; its successful single-record retries are. |
+| `bytes` | Bytes the transport reports transferring, including configuration responses, failed or unconfirmed transfers, and retries. A transport error without a byte count contributes no known bytes. This is not the tape's stored data size. |
+| `hardware_batch_fallbacks` | Unclean hardware batches for which the reader starts a single-record retry. A failed repositioning attempt still counts. |
+| `algorithmic_fallback_epochs` | Epochs needing at least one unbuffered data read. These are counted in `fallback_data`, separately from hardware retries. |
+| `recovered_reads` | Accepted reads for which the drive reports that it corrected an error. |
+
+`elapsed_ms` is monotonic elapsed time in the daemon, including readiness and
+setup. It excludes time spent waiting for a drive before verification starts,
+and client and RPC overhead. It measures the whole verification, not just I/O.
+
+`backward_data_seeks` counts LOCATE commands in the protected sweep whose target
+precedes the end position of the previous confirmed protected read. Sidecar and
+metadata positioning is outside this count. `protected_bytes` counts confirmed
+bytes in that sweep, excluding fallback data. `protected_ranges` lists the
+physical intervals read, with an inclusive `start_lba` and exclusive `end_lba`.
+An LBA is a physical tape record address. Adjacent intervals may be joined;
+overlapping or repeated intervals remain visible. Zero backward seeks alone
+proves little: check the coverage and fallback counts too. A tape without parity
+has no protected sweep.
+
+`recovered_lbas` lists the physical addresses of accepted self-corrected reads,
+including repeated events at the same address. `recovered_unknown_addresses`
+counts such events when the passive position evidence gives no address. Their
+sum equals `total.recovered_reads`. No commands are issued just to measure the
+report.
+
+A self-corrected read does not itself fail the tape. Verification accepts it
+only when exactly one block was transferred, with no incorrect-length, filemark,
+end-of-medium or residual-count anomaly. Its bytes undergo the same checksum
+checks as any other read; a checksum mismatch remains a finding. The recovered
+count records the drive's correction even when those bytes fail a later check.
+
 ## The six kinds of finding
 
 The text after `protected_content_finding:` is the kind of the finding, printed
@@ -252,16 +317,17 @@ floor. In order, it does the following.
    spaces over one filemark and performs at least one locate; for an Object it
    performs two.
 2. It reads the terminal index copies and the separation extents between them.
-3. For each epoch (the span of Object data covered by one sidecar, a tape file
-   that holds the parity for that data), it reads the sidecar's metadata, which
-   sits after the data it protects. It then seeks back to the start of that
-   epoch's data and reads the data forward. It then seeks forward to the
-   sidecar's parity and reads the parity forward.
+3. It preloads the ParityMap directory, then visits Objects and sidecars in
+   tape-file order. For an eligible epoch it reads the protected data forward
+   and retains checksum observations until the sidecar supplies the expected
+   checksums. It reads the sidecar's metadata and parity at that point. An
+   ineligible or partly buffered epoch needs fallback data reads, which can
+   require a backward seek. The `io` report distinguishes these paths.
 
-The drive reads one block per command. Verification does not use the pipelined
-reader that writes and restores use, so its sustained read rate is expected to
-be below the drive's streaming rate. No full-cartridge verification has been
-measured.
+Contiguous runs use fixed-mode batches. An unclean batch is repositioned and
+read singly. Metadata probes also use single reads. Verification does not use
+the pipelined restore reader, so command counts alone do not establish its
+sustained rate. No full-cartridge verification has been measured.
 
 The time can be approximated as follows. The formula is an approximation, and
 it is useful for comparing tapes with similar layouts once its two unknowns
@@ -274,11 +340,11 @@ T = D / R  +  N_files x t_file  +  N_epochs x t_epoch
 | Symbol | Meaning | Remarks |
 | --- | --- | --- |
 | `D` | Bytes on the tape, parity included. | A full 18 TB LTO-9 cartridge is about 18 x 10^12 bytes. |
-| `R` | Sustained read rate of verification, in bytes per second. | At most the drive's native rate (300 MB/s for a half-height LTO-9 drive); expected to be lower, because reads are one block per command. |
+| `R` | Sustained read rate of verification, in bytes per second. | At most the drive's native rate (300 MB/s for a half-height LTO-9 drive); measure it for the drive and layout being checked. |
 | `N_files` | Number of tape files. | Objects, plus sidecars, plus the five terminal files, plus the bootstrap and the ParityMap. |
 | `t_file` | Time to space over a filemark and position, for one tape file. | Not measured. |
 | `N_epochs` | Number of epochs, which equals the number of sidecars. | A full epoch covers 16 GiB of Object data at the default settings, but checkpoints can close shorter epochs. For planning, use the actual sidecar count; `rem tape inventory --tape-uuid TAPE_UUID --json` lists the tape's structural files by kind, including parity sidecars. |
-| `t_epoch` | Time for one epoch's backward seek to its data, and its metadata reads. | Not measured. |
+| `t_epoch` | Time for one epoch's metadata and parity positioning, including any fallback data seeks. | Not measured. |
 
 `t_file` and `t_epoch` have not been measured. They depend on the drive and the
 cartridge, so measure them on your own drive. One timed tape cannot determine
@@ -286,9 +352,9 @@ two unknowns: verify at least two tapes whose file-to-epoch ratios differ, and
 solve for the two values from the time that exceeds `D / R`. Seek time grows
 with the distance travelled, so values measured on a short tape are uncertain
 when applied to a full cartridge. The formula leaves out several costs that
-also depend on the layout: the overlaps between Objects and epochs (each starts
-a new read position), the final ParityMap being read again for every epoch, and
-the per-block positioning used to read sidecar metadata. Treat the result as an
+also depend on the layout: the overlaps between Objects and epochs, ParityMap reads, and
+the positioning used to read sidecar metadata. Use the measured phase counts
+and fallback counts in `io` to distinguish these costs. Treat the result as an
 empirical estimate for comparable tape layouts. The number of tape files matters as much
 as the byte count. A tape of many small Objects has many tape files, and the
 per-file term can then take hours.

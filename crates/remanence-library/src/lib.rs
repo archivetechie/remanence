@@ -24,6 +24,7 @@ pub mod ops;
 pub mod physical_io;
 pub mod sysfs;
 pub mod transport;
+pub mod verification_io;
 pub mod watch;
 
 pub use block_io::{

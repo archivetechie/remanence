@@ -446,6 +446,10 @@ impl<S> InstrumentedSource<S> {
 }
 
 impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
+    fn verification_context(&self) -> remanence_library::verification_io::VerificationContext {
+        self.inner.verification_context()
+    }
+
     fn configure_fixed_block_size(
         &mut self,
         block_size: u32,
