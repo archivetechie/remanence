@@ -256,6 +256,22 @@ on. A refused unsafe operation is a PASS.
   bytes moved, operations, and error count.
 - Re-run `11-happy-path.sh` — after every fault above, the plain happy
   path must still pass. This is the stability headline.
+- **5.V — full-verification timing** (after the last write of the day, with the soak stopped, before
+  evidence collection; it occupies one drive for the whole run). Use a tape initialized with
+  `--parity default` (the normal pool tapes from `10-init-pools.sh` are parity-off, and a parity-off tape
+  verifies only its structure). Prefer the fullest such tape; finalize it, then run
+
+  ```text
+  rem tape verify-index --tape-uuid TAPE_UUID --json > evidence/verify-index-TAPE_UUID.json
+  ```
+
+  `TAPE_UUID` is the tape's UUID as printed by `rem catalog tapes`. Then restore every Object on that
+  tape (`rem get OBJECT_UUID --tape TAPE_UUID --dest SCRATCH_DIR --json`, one at a time, deleting each
+  restored file after its digest check) and time the whole restore as the streaming baseline. Record:
+  tape UUID; stored and protected bytes; Object and epoch counts; drive model and firmware; block size and
+  read batch setting; the verification's own elapsed time (in the `io` report) and the restore's elapsed
+  time; and the complete `io` report. A tape that is not full gives a measured rate, not a full-cartridge
+  duration; label any extrapolation to 18 TB as such.
 
 ---
 
