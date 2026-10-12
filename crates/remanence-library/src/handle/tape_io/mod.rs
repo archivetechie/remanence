@@ -88,7 +88,7 @@ fn validate_residual_claim(
 }
 
 /// Errors a Layer 3a tape I/O operation can return. Preserves Layer
-/// 2b's dirty-state vocabulary: `Transport` always marks the parent
+/// 2b's dirty-state vocabulary: completion-unknown errors mark the parent
 /// `LibraryHandle` dirty with cause `CompletionUnknown` (via
 /// `DriveHandle`'s shared dirty state); `CheckCondition` leaves it
 /// clean (physical state is known).
@@ -118,6 +118,19 @@ pub enum TapeIoError {
     /// Caller should refresh / rescan before re-issuing.
     #[error("transport error (completion unknown): {0}")]
     Transport(ScsiError),
+
+    /// GOOD on a fixed READ cannot prove record completion when the transport
+    /// byte count disagrees with the requested batch. No records are credited,
+    /// and position knowledge is invalidated just as for ambiguous residuals.
+    #[error(
+        "GOOD fixed READ length mismatch (completion unknown): requested_bytes={requested_bytes} bytes_transferred={bytes_transferred}"
+    )]
+    GoodReadLengthMismatch {
+        /// Bytes required by the selected fixed records.
+        requested_bytes: u32,
+        /// Actual byte count reported by the transport.
+        bytes_transferred: u32,
+    },
 
     /// MODE SENSE / MODE SELECT returned bytes we couldn't parse —
     /// the drive is reporting a mode page we don't recognise, or a
@@ -283,12 +296,12 @@ impl TapeIoError {
     /// True iff this error is "completion unknown" in the sense of
     /// `DirtyCause::CompletionUnknown`. Layer 3a method bodies use
     /// this to decide whether to flip the parent `LibraryHandle`'s
-    /// shared dirty state. Only [`Self::Transport`] qualifies —
-    /// `CheckCondition` and friends leave the snapshot clean because
-    /// physical state is known.
+    /// shared dirty state. Transport failures and inconsistent GOOD fixed READ
+    /// lengths qualify, including when wrapped by a write arbitration error.
+    /// Ordinary `CheckCondition` leaves the snapshot clean.
     pub fn is_completion_unknown(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::GoodReadLengthMismatch { .. } => true,
             Self::GoodWriteTripwire { cause, .. } => cause.is_completion_unknown(),
             Self::WriteFailureWithPositionError {
                 write_error,
@@ -1778,7 +1791,17 @@ impl super::DriveHandle {
         self.record_pipeline_ioctl(started, completed_at);
 
         match result {
-            Ok(_) => {
+            Ok(transfer) => {
+                // Validate at the outcome funnel, before crediting any records
+                // or allowing an owned buffer to reach the restore decoder.
+                if transfer.bytes_transferred != transfer_len {
+                    let error = TapeIoError::GoodReadLengthMismatch {
+                        requested_bytes: transfer_len,
+                        bytes_transferred: transfer.bytes_transferred,
+                    };
+                    self.finish_tape_error(op, &error);
+                    return Err(error);
+                }
                 self.record_pipeline_good(records, transfer_len, completed_at);
                 let position_evidence =
                     match self.advance_expected_position(records, 0, transfer_len as u64) {

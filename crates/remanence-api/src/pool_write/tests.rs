@@ -1192,6 +1192,42 @@ impl BlockSink for SingleBlockOutcomeSink {
 }
 
 #[test]
+/// Bootstrap completion must reject incomplete data before attempting its filemark.
+fn bootstrap_rejects_incomplete_block_before_filemark() {
+    let payload = build_tape_bootstrap(
+        [0x42; 16],
+        4096,
+        ParityConfig::None,
+        "1970-01-01T00:00:00Z",
+        "remanence-test",
+    );
+    for (bytes_written, end_of_medium) in [(0, false), (4095, false), (4097, false), (4096, true)] {
+        let mut sink = SingleBlockOutcomeSink {
+            bytes_written,
+            early_warning: end_of_medium,
+            end_of_medium,
+            writes: 0,
+        };
+        let error = write_tape_bootstrap(&mut sink, &payload)
+            .expect_err("incomplete bootstrap must fail before the filemark");
+        assert!(
+            matches!(
+                error,
+                PoolWriteError::TapeIo(TapeIoError::PartialBatchUncommittable {
+                    requested_records: 1,
+                    requested_bytes: 4096,
+                    written_bytes,
+                    end_of_medium: reported_eom,
+                    ..
+                }) if written_bytes == u64::from(bytes_written) && reported_eom == end_of_medium
+            ),
+            "{error:?}"
+        );
+        assert_eq!(sink.writes, 1);
+    }
+}
+
+#[test]
 fn fixed_block_helper_rejects_short_bytes_and_hard_eom() {
     for (bytes_written, end_of_medium) in [(3, false), (4, true)] {
         let mut sink = SingleBlockOutcomeSink {

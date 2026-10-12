@@ -2084,6 +2084,104 @@ mod tests {
         );
     }
 
+    /// Exercise the production drive/handoff/restore funnel with a short GOOD
+    /// completion after a full batch, for both ordinary and ranged delivery.
+    #[test]
+    fn restore_pipeline_short_good_emits_only_real_data_prefix_and_aborts() {
+        use remanence_library::{
+            DriveHandle, DriveHandleSource, FixtureTransport, RecordingTransport,
+        };
+
+        let real_data = (1..=192u8).collect::<Vec<_>>();
+        for ranged_frontier in [false, true] {
+            let position_response = |lba: u64| {
+                let mut response = vec![0; 32];
+                response[8..16].copy_from_slice(&lba.to_be_bytes());
+                response
+            };
+            let mut responses = vec![
+                include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin").to_vec(),
+                vec![0x01, 0x80, 0, 4, b'T', b'E', b'S', b'T'],
+                position_response(0),     // initial cursor
+                position_response(0),     // pipeline opening proof
+                real_data[..64].to_vec(), // first full batch: 16 x 4 bytes
+            ];
+            if ranged_frontier {
+                responses.push(position_response(16)); // release first batch
+            }
+            // FixtureTransport copies only these 63 bytes and returns GOOD.
+            // The last byte in the 64-byte slab remains untransferred.
+            responses.push(real_data[64..127].to_vec());
+            let (transport, commands) =
+                RecordingTransport::new(FixtureTransport::new().with_responses(responses));
+            let mut drive = DriveHandle::open_standalone_with_transport(
+                std::path::Path::new("/dev/sg-short-good-fixture"),
+                Box::new(transport),
+            )
+            .expect("fixture drive opens");
+            let mut source = DriveHandleSource(&mut drive);
+            assert_eq!(source.read_batch_blocks(4), 16);
+            let expected = source.position().expect("initial cursor");
+            let mut emitted = Vec::new();
+            let error = run_read_pipeline(
+                &mut source,
+                4,
+                48,
+                expected,
+                ReadPipelineConfig {
+                    reservoir_bytes: 256,
+                    high_pct: 100,
+                    low_pct: 25,
+                    ranged_frontier,
+                    proof_cadence_bytes: 64,
+                    terminal: None,
+                },
+                IoMemoryReservation::new(512).expect("memory manager"),
+                |handoffs| {
+                    for _ in 0..48 {
+                        let mut block = [0xa5; 4];
+                        let read = handoffs.read_block(&mut block)?;
+                        emitted.extend_from_slice(&block[..read]);
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("short GOOD aborts the restore");
+            assert!(matches!(
+                error,
+                FormatError::TapeIo(TapeIoError::GoodReadLengthMismatch {
+                    requested_bytes: 64,
+                    bytes_transferred: 63,
+                })
+            ));
+            assert!(!emitted.is_empty(), "failure occurs after real delivery");
+            assert!(real_data.starts_with(&emitted));
+            assert_eq!(
+                emitted,
+                real_data[..64],
+                "failed batch is withheld entirely"
+            );
+            let diagnostics = drive.pipelined_read_diagnostics();
+            assert_eq!(diagnostics.good_commands, 1);
+            assert_eq!(diagnostics.good_records, 16);
+            assert_eq!(diagnostics.good_bytes, 64);
+            assert_eq!(diagnostics.accounting_samples, 1);
+            let commands = commands.borrow();
+            let reads = commands
+                .iter()
+                .filter(|cdb| cdb[0] == 0x08)
+                .collect::<Vec<_>>();
+            assert_eq!(reads.len(), 2, "abort without retry or a third READ");
+            for cdb in reads {
+                assert_eq!(
+                    cdb.as_slice(),
+                    remanence_scsi::read_write::build_read_fixed_cdb(16)
+                );
+            }
+            assert_eq!(commands.last().expect("last command")[0], 0x08);
+        }
+    }
+
     #[test]
     fn chaos_process_loss_discards_unconsumed_read_ring_without_extra_data_command() {
         let blocks = (0u8..8).map(|value| vec![value; 4]).collect::<Vec<_>>();

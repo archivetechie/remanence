@@ -569,8 +569,8 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
             "remanence-cli/src/lib.rs",
             DispatchPolicy::Exact {
                 execute_out: 1,
-                execute_none: 1,
-                why: "cfg(test) TurSequenceTransport forwarder only; production \
+                execute_none: 2,
+                why: "cfg(test) TurSequenceTransport and BootstrapTransport forwarders only; production \
                       CLI code dispatches through DriveHandle",
             },
         ),
