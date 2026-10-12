@@ -35,7 +35,7 @@ x25519-dalek     = { version = "=3.0.0", features = ["static_secrets"] }
 zeroize          = { workspace = true }
 
 [dev-dependencies]
-libcrux-kem = { version = "=0.0.9", default-features = false }
+libcrux-kem = { version = "=0.0.10", default-features = false }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
