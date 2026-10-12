@@ -48,7 +48,7 @@ use super::overlap::write_parity_object_to_selected_tape;
 use super::prepare::{
     open_prepared_readers, parity_label, prepare_pool_object, prepare_stored_object,
     prepared_payload_bytes, stored_footprint_bytes, write_canonical_plaintext_object_to_parity,
-    write_encrypted_object_to_parity, PreparedPoolWrite, PreparedStoredObject,
+    write_encrypted_object_to_parity, write_fixed_blocks, PreparedPoolWrite, PreparedStoredObject,
 };
 #[cfg(test)]
 use super::selection::select_tape_in_pool;
@@ -1627,14 +1627,14 @@ pub fn build_tape_bootstrap(
     }
 }
 
-/// Write one bootstrap tape file through a generic block sink.
+/// Write one bootstrap tape file, requiring a complete block before its filemark.
 pub fn write_tape_bootstrap(
     sink: &mut dyn BlockSink,
     payload: &BootstrapPayload,
 ) -> Result<(), PoolWriteError> {
     let mut block = vec![0u8; payload.block_size_bytes as usize];
     write_bootstrap_block(payload, &mut block)?;
-    sink.write_block(&block)?;
+    write_fixed_blocks(sink, block.len(), &block)?;
     sink.write_filemarks(1)?;
     Ok(())
 }

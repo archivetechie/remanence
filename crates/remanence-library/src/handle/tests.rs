@@ -3744,6 +3744,81 @@ fn write_eom_position_arbitration_ignores_helper_mismatch_and_records_diagnostic
 }
 
 #[test]
+/// GOOD fixed reads must match the selected batch before any success accounting.
+fn fixed_read_good_requires_exact_transfer_before_cursor_advance() {
+    let config = TapeIoRuntimeConfig {
+        read_batch_blocks: 8,
+        position_check_bytes: 0,
+        ..TapeIoRuntimeConfig::default()
+    };
+    for bytes_transferred in [0, 8, 15, 17, 16] {
+        let (mut drive, commands, audit) = open_hot_script_drive(
+            "LIB_READ_GOOD_LENGTH",
+            [10],
+            [HotWriteScript::CleanWithBytes(bytes_transferred)],
+            config,
+        );
+        drive.position().expect("seed known cursor");
+        audit.lock().expect("audit events").clear();
+        let result = drive.read_block_batch(&mut [0xa5; 32], 4, 8, 4);
+        let diagnostics = drive.pipelined_read_diagnostics();
+        assert_eq!(diagnostics.ioctl_samples, 1);
+        if bytes_transferred == 16 {
+            let outcome = result.expect("exact selected transfer succeeds");
+            assert_eq!(outcome.records_read, 4);
+            assert_eq!(outcome.bytes_read, 16);
+            assert_eq!(outcome.position_after.lba, 14);
+            assert_eq!(drive.expected_position.expect("known cursor").lba, 14);
+            assert!(drive.position_known);
+            assert!(!lock_drive_shared(&drive.shared).dirty.is_dirty());
+            assert_eq!(diagnostics.good_commands, 1);
+            assert_eq!(diagnostics.good_records, 4);
+            assert_eq!(diagnostics.good_bytes, 16);
+            assert_eq!(diagnostics.accounting_samples, 1);
+        } else {
+            let error = result.expect_err("nonexact GOOD must fail closed");
+            assert!(error.is_completion_unknown());
+            assert!(matches!(
+                error,
+                TapeIoError::GoodReadLengthMismatch {
+                    requested_bytes: 16,
+                    bytes_transferred: actual,
+                } if actual == bytes_transferred
+            ));
+            assert!(drive.expected_position.is_none());
+            assert!(!drive.position_known);
+            assert!(lock_drive_shared(&drive.shared).dirty.is_dirty());
+            assert_eq!(drive.bytes_since_position_check, 0);
+            assert_eq!(diagnostics.good_commands, 0);
+            assert_eq!(diagnostics.good_records, 0);
+            assert_eq!(diagnostics.good_bytes, 0);
+            assert_eq!(diagnostics.accounting_samples, 0);
+            assert!(matches!(
+                audit.lock().expect("audit events").as_slice(),
+                [
+                    CapturedEvent::Started { op: AuditOp::TapeRead { len: 16, .. }, .. },
+                    CapturedEvent::FinishedScsiError { op: AuditOp::TapeRead { len: 16, .. }, summary },
+                ] if summary.contains("completion unknown")
+            ));
+            assert!(matches!(
+                drive.read_block_batch(&mut [0; 16], 4, 4, 4),
+                Err(TapeIoError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(
+            commands
+                .lock()
+                .expect("command log")
+                .iter()
+                .filter(|(cdb, _)| cdb[0] == 0x08)
+                .count(),
+            1,
+            "no retry or extra reader"
+        );
+    }
+}
+
+#[test]
 fn fixed_read_cadence_histograms_and_batch_effectiveness_are_populated() {
     let config = TapeIoRuntimeConfig {
         read_batch_blocks: 4,

@@ -3994,6 +3994,10 @@ pub(crate) fn open_library_handle(
 
 #[cfg(target_os = "linux")]
 fn cli_transport_factory(access: CliTransportAccess) -> Result<CliTransportFactory, IoErrorKind> {
+    #[cfg(test)]
+    if let Some(factory) = TEST_CLI_TRANSPORT_FACTORY.with(|slot| slot.borrow_mut().take()) {
+        return Ok(factory);
+    }
     let engine = if remanence_chaos::chaos_real_enabled_from_env() {
         Some(remanence_chaos::FaultEngine::from_env().map_err(chaos_io_error)?)
     } else {
@@ -4017,6 +4021,13 @@ fn cli_transport_factory(access: CliTransportAccess) -> Result<CliTransportFacto
             Ok(Box::new(inner) as Box<dyn remanence_library::SgTransport>)
         }
     }))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    // Inject only the device boundary so CLI regressions run the real init and catalog path.
+    static TEST_CLI_TRANSPORT_FACTORY: std::cell::RefCell<Option<CliTransportFactory>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(target_os = "linux")]
@@ -18970,6 +18981,194 @@ mod tests {
             &MediaReadiness::NoMedium { ascq: 0x00 },
             false,
         ));
+    }
+
+    /// Exercise CLI parsing, hardware init, and real catalog provisioning with a
+    /// blank fixture tape whose WRITE returns GOOD with a controlled byte count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tape_init_cli_rejects_short_good_bootstrap_without_provisioning() {
+        struct BootstrapTransport {
+            inner: FixtureTransport,
+            written_bytes: u32,
+        }
+
+        impl SgTransport for BootstrapTransport {
+            fn execute_in(
+                &mut self,
+                cdb: &[u8],
+                buf: &mut [u8],
+            ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
+                if cdb[0] == 0x08 {
+                    return Err(readiness_check_condition(0x08, 0x00, 0x05));
+                }
+                self.inner.execute_in(cdb, buf)
+            }
+
+            fn execute_out(
+                &mut self,
+                cdb: &[u8],
+                buf: &[u8],
+            ) -> Result<remanence_library::transport::TransferOutcome, ScsiError> {
+                assert_eq!(cdb[0], 0x0a, "only bootstrap WRITE is expected");
+                assert_eq!(buf.len(), 262144);
+                remanence_parity::bootstrap::parse_bootstrap_block(buf)
+                    .expect("CLI sends a valid bootstrap block");
+                Ok(remanence_library::transport::TransferOutcome::clean(
+                    self.written_bytes,
+                ))
+            }
+
+            fn execute_none(&mut self, cdb: &[u8]) -> Result<(), ScsiError> {
+                self.inner.execute_none(cdb)
+            }
+        }
+
+        for written_bytes in [262143, 262144] {
+            let temp = tempfile::tempdir().expect("temp state directory");
+            let config_path = write_retire_test_config(temp.path());
+            let mut config_text = fs::read_to_string(&config_path).expect("read test config");
+            config_text.push_str(
+                r#"
+[[libraries]]
+serial = "LIB-INIT-GOOD"
+[[tape_pools]]
+id = "init-test"
+block_size = "256KiB"
+[[tape_pool_rules]]
+prefix = "RMT"
+pool_id = "init-test"
+"#,
+            );
+            fs::write(&config_path, config_text).expect("write init config");
+
+            let mut library = fake_library("LIB-INIT-GOOD");
+            library.drive_bays = vec![DriveBay {
+                element_address: 1,
+                accessible: true,
+                exception: None,
+                installed: Some(InstalledDrive {
+                    serial: "DRV-INIT-GOOD".into(),
+                    identity_source: IdentitySource::DvcidInline,
+                    vendor: Some("HPE".into()),
+                    product: Some("Ultrium 9-SCSI".into()),
+                    revision: Some("R3G3".into()),
+                    sg_path: Some(PathBuf::from("/dev/sg-init-fixture")),
+                    sysfs_path: None,
+                }),
+                loaded: true,
+                loaded_tape: Some("RMT001L9".into()),
+                source_slot: None,
+            }];
+            let mut mode = vec![0u8; 28];
+            mode[0] = 27;
+            mode[1] = 0x98;
+            mode[2] = 0x10;
+            mode[3] = 8;
+            mode[12] = 0x0f;
+            mode[13] = 14;
+            let mut position = vec![0u8; 32];
+            position[8..16].copy_from_slice(&1u64.to_be_bytes());
+            let mut filemark_position = position.clone();
+            filemark_position[8..16].copy_from_slice(&2u64.to_be_bytes());
+            let mut changer = Some(
+                FixtureTransport::new()
+                    .with_responses([changer_inquiry_response(), vpd80_response("LIB-INIT-GOOD")]),
+            );
+            let mut drive = Some(BootstrapTransport {
+                inner: FixtureTransport::new().with_responses([
+                    lto9_inquiry_response(),
+                    vpd80_response("DRV-INIT-GOOD"),
+                    vec![0, 0x10, 0, 0, 0, 1],
+                    mode,
+                    vec![0u8; 32], // LOCATE(0) for BOT classification.
+                    position,
+                    filemark_position,
+                ]),
+                written_bytes,
+            });
+            let log = RecordingLog::new();
+            let transport_log = log.clone();
+            TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Box::new(move |path| {
+                    let transport: Box<dyn SgTransport> = match path.to_str().unwrap() {
+                        "/dev/sg-mock" => Box::new(changer.take().expect("open changer once")),
+                        "/dev/sg-init-fixture" => Box::new(drive.take().expect("open drive once")),
+                        _ => panic!("unexpected device path: {path:?}"),
+                    };
+                    Ok(Box::new(RecordingTransport::with_log(
+                        transport,
+                        transport_log.clone(),
+                    )))
+                }));
+            });
+            let (code, stdout, stderr) = invoke(
+                &[
+                    "rem",
+                    "tape",
+                    "init",
+                    "RMT001L9",
+                    "--library",
+                    "LIB-INIT-GOOD",
+                    "--parity",
+                    "none",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                ],
+                Ok(DiscoveryReport {
+                    libraries: vec![library],
+                    warnings: vec![],
+                }),
+            );
+            TEST_CLI_TRANSPORT_FACTORY.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "CLI must open the fixture transport: {stderr}"
+                );
+            });
+            let log = log.borrow();
+            assert_eq!(
+                log.iter().filter(|cdb| cdb[0] == 0x0a).count(),
+                1,
+                "{stderr}"
+            );
+            let complete = written_bytes == 262144;
+            assert_eq!(
+                log.iter().filter(|cdb| cdb[0] == 0x10).count(),
+                usize::from(complete)
+            );
+            let catalog = remanence_state::CatalogIndex::open_read_only(
+                temp.path().join("index/rem-state.sqlite"),
+            )
+            .expect("open real CLI catalog");
+            let tapes = catalog
+                .list_tapes(None, remanence_state::TapeKindFilter::All)
+                .expect("list initialized tapes");
+            assert_eq!(tapes.len(), usize::from(complete), "{stderr}");
+            let audit = remanence_state::FileAuditLog::replay(temp.path().join("audit"))
+                .expect("read real CLI audit");
+            assert_eq!(
+                audit
+                    .iter()
+                    .filter(|record| record.event == remanence_state::AuditEvent::TapeProvisioned)
+                    .count(),
+                usize::from(complete)
+            );
+            if complete {
+                assert_eq!(code, ExitCode::SUCCESS, "{stderr}");
+                assert!(stdout.contains("wrote-bootstrap"), "{stdout}");
+            } else {
+                assert_eq!(code, ExitCode::from(1), "{stderr}");
+                assert!(stdout.is_empty(), "{stdout}");
+                assert!(stderr.contains("apply init write gate"), "{stderr}");
+                assert!(
+                    stderr.contains("partial fixed batch uncommittable"),
+                    "{stderr}"
+                );
+                assert!(stderr.contains("written_bytes=262143"), "{stderr}");
+            }
+        }
     }
 
     #[test]
