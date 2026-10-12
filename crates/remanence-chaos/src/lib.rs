@@ -160,7 +160,7 @@ impl FaultEngine {
     }
 
     /// Build an in-process scenario that persistently returns MEDIUM ERROR for
-    /// reads beginning at any of the supplied physical LBAs.
+    /// reads containing any of the supplied physical LBAs.
     ///
     /// This is the programmatic counterpart of a Phase A SQLite scenario for
     /// callers, such as the freeze drill, that derive fault locations from the
@@ -250,7 +250,7 @@ impl FaultEngine {
             inner.fired_once.insert(fault.id);
         }
         if fault.catalogue_id == "MED-01" {
-            if let Some(lba) = command.lba {
+            if let Some(lba) = json_u64(fault.trigger.get("lba")).or(command.lba) {
                 inner.observed_medium_error_lbas.insert(lba);
             }
         }
@@ -1604,6 +1604,28 @@ fn parse_json_column(column: &'static str, raw: &str) -> Result<Value, ChaosErro
 }
 
 fn fault_matches(fault: &Fault, ctx: &DeviceCtx, command: &CommandInfo) -> bool {
+    // MED-01 describes damaged media, so a fixed READ that covers the bad
+    // record must fail even when it begins earlier. Confirm no prefix here;
+    // the reader will locate and retry singly to identify the damaged record.
+    if fault.catalogue_id == "MED-01" && command.operation == "read" {
+        if let (Some(start), Some(bad), Some(count)) = (
+            command.lba,
+            json_u64(fault.trigger.get("lba")),
+            command.transfer_blocks,
+        ) {
+            if bad
+                .checked_sub(start)
+                .is_some_and(|offset| offset < u64::from(count))
+            {
+                let at_fault = CommandInfo {
+                    lba: Some(bad),
+                    ..command.clone()
+                };
+                return target_matches(&fault.target, ctx)
+                    && trigger_matches(&fault.trigger, &at_fault);
+            }
+        }
+    }
     target_matches(&fault.target, ctx) && trigger_matches(&fault.trigger, command)
 }
 
@@ -2851,6 +2873,23 @@ mod tests {
             assert_eq!(sense[13], 0x00);
         }
         assert_eq!(engine.observed_medium_error_lbas(), BTreeSet::from([42]));
+    }
+
+    /// A bad interior record cannot disappear behind a fixed-mode batch.
+    #[test]
+    fn medium_error_plan_covers_the_whole_fixed_read() {
+        let engine = FaultEngine::for_read_medium_errors([42]).unwrap();
+        let mut command = CommandInfo::decode(&[0x08, 1, 0, 0, 4, 0], DataDirection::In, 2048);
+        command.lba = Some(40);
+        assert!(engine
+            .pre_call_decision(&DeviceCtx::new(), &command, 2048)
+            .is_some());
+        assert_eq!(engine.observed_medium_error_lbas(), BTreeSet::from([42]));
+        let mut before_fault = CommandInfo::decode(&[0x08, 1, 0, 0, 2, 0], DataDirection::In, 1024);
+        before_fault.lba = Some(40);
+        assert!(engine
+            .pre_call_decision(&DeviceCtx::new(), &before_fault, 1024)
+            .is_none());
     }
 
     fn chaos_fixture(state_path: &Path, ctx: DeviceCtx) -> ChaosTransport<FixtureTransport> {

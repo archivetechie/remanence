@@ -335,6 +335,46 @@ pub struct TapeGeometryHint {
     pub probe_positions: Vec<PhysicalPositionHint>,
 }
 
+/// How a consecutive fixed-record read ended. Only `records_read` full records
+/// are confirmed. A terminal observation is final for the next record; callers
+/// must deliver it after the prefix without retrying that record.
+#[derive(Debug)]
+pub enum RawReadEnd {
+    /// Every selected record was read.
+    Complete,
+    /// A filemark was consumed.
+    Filemark {
+        /// Position observed by the single reader after consuming the boundary.
+        position_after: PhysicalPositionHint,
+    },
+    /// The drive reached end of recorded data.
+    EndOfData {
+        /// Position observed by the single reader at end of data.
+        position_after: PhysicalPositionHint,
+    },
+    /// A record did not have the requested fixed length. Its bytes follow the
+    /// confirmed prefix in the batch buffer.
+    WrongLength {
+        /// Length reported by the single reader.
+        bytes: usize,
+        /// Position observed after the short/long record.
+        position_after: PhysicalPositionHint,
+    },
+    /// A read failed after the confirmed prefix.
+    Error(ParityError),
+}
+
+/// Confirmed prefix of a bounded fixed-record read, in the caller's buffer.
+#[derive(Debug)]
+pub struct RawReadBatch {
+    /// Number of complete, consecutive records in the buffer.
+    pub records_read: u32,
+    /// Position after the confirmed data, excluding any consumed boundary.
+    pub position_after: Option<PhysicalPositionHint>,
+    /// Completion or the reason the read stopped.
+    pub end: RawReadEnd,
+}
+
 /// Raw physical-tape READ access used by Layer 3c.
 pub trait RawTapeSource {
     /// Configure the drive for fixed-block reads at `block_size` bytes.
@@ -355,8 +395,308 @@ pub trait RawTapeSource {
     /// Read one physical record at the current position.
     fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError>;
 
+    /// Read at most `max_records` fixed records without intentionally crossing
+    /// the current tape file. A short/error result confirms only its prefix.
+    /// Terminal outcomes, including fallback errors and failed fallback LOCATEs,
+    /// are final for the next record and must be delivered after that prefix.
+    /// Adapters must propagate state-invalidating errors without fallback.
+    /// The default preserves compatibility with single-record sources.
+    fn read_records(
+        &mut self,
+        buf: &mut [u8],
+        block_size: u32,
+        max_records: u32,
+        records_remaining_in_file: u32,
+    ) -> RawReadBatch {
+        read_records_default(
+            self,
+            buf,
+            block_size,
+            max_records,
+            records_remaining_in_file,
+        )
+    }
+
     /// Return the current physical tape position.
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError>;
+}
+
+/// Single-record implementation of the batch contract, also useful to adapters
+/// that deliberately exercise the compatibility path.
+pub fn read_records_default<S: RawTapeSource + ?Sized>(
+    source: &mut S,
+    buf: &mut [u8],
+    block_size: u32,
+    max_records: u32,
+    records_remaining_in_file: u32,
+) -> RawReadBatch {
+    let mut batch = RawReadBatch {
+        records_read: 0,
+        position_after: None,
+        end: RawReadEnd::Complete,
+    };
+    let count = max_records.min(records_remaining_in_file);
+    if block_size == 0 || count == 0 || u64::from(count) * u64::from(block_size) > buf.len() as u64
+    {
+        batch.end = RawReadEnd::Error(ParityError::Invariant(
+            "invalid raw read batch buffer/count",
+        ));
+        return batch;
+    }
+    for block in buf
+        .chunks_exact_mut(block_size as usize)
+        .take(count as usize)
+    {
+        match source.read_record(block) {
+            Ok(RawReadOutcome::Block {
+                bytes,
+                position_after,
+            }) if bytes == block_size as usize
+                && batch
+                    .position_after
+                    .is_none_or(|previous: PhysicalPositionHint| {
+                        previous.partition == position_after.partition
+                            && previous.lba.checked_add(1) == Some(position_after.lba)
+                    }) =>
+            {
+                batch.records_read += 1;
+                batch.position_after = Some(position_after);
+            }
+            Ok(RawReadOutcome::Filemark { position_after }) => {
+                batch.end = RawReadEnd::Filemark { position_after };
+                break;
+            }
+            Ok(RawReadOutcome::EndOfData { position_after }) => {
+                batch.end = RawReadEnd::EndOfData { position_after };
+                break;
+            }
+            Ok(RawReadOutcome::Block {
+                bytes,
+                position_after,
+            }) if bytes != block_size as usize => {
+                batch.end = RawReadEnd::WrongLength {
+                    bytes,
+                    position_after,
+                };
+                break;
+            }
+            Ok(_) => {
+                batch.end =
+                    RawReadEnd::Error(ParityError::Invariant("unconfirmed fixed record in batch"));
+                break;
+            }
+            Err(error) => {
+                batch.end = RawReadEnd::Error(error);
+                break;
+            }
+        }
+    }
+    batch
+}
+
+/// Bounded read-ahead for one consecutive run. Existing block readers retain
+/// their parsing, error classification and address checks through this adapter.
+/// Deliver the adapter's terminal observation after its confirmed prefix, then
+/// finish any later records singly after explicit positioning.
+pub(crate) struct ReadRun<'a> {
+    source: &'a mut dyn RawTapeSource,
+    block_size: u32,
+    remaining: u64,
+    next: Option<PhysicalPositionHint>,
+    located: bool,
+    single: bool,
+    buffer: Vec<u8>,
+    consumed: usize,
+    pending_end: Option<RawReadEnd>,
+    pending_data: Vec<u8>,
+}
+
+impl<'a> ReadRun<'a> {
+    pub(crate) fn new(source: &'a mut dyn RawTapeSource, block_size: u32, records: u64) -> Self {
+        Self {
+            source,
+            block_size,
+            remaining: records,
+            next: None,
+            located: false,
+            single: false,
+            buffer: Vec::new(),
+            consumed: 0,
+            pending_end: None,
+            pending_data: Vec::new(),
+        }
+    }
+    /// Set the suffix length after reading and validating a single header.
+    pub(crate) fn after_header(&mut self, remaining: u64) {
+        assert_eq!(
+            self.consumed,
+            self.buffer.len(),
+            "header must not have unread prefetch"
+        );
+        self.remaining = remaining;
+    }
+
+    /// Continue from the preceding single read's observed position.
+    pub(crate) fn continue_at(&mut self, next: Option<PhysicalPositionHint>) {
+        self.next = next;
+        self.located = next.is_some();
+    }
+}
+
+impl RawTapeSource for ReadRun<'_> {
+    fn configure_fixed_block_size(&mut self, block_size: u32) -> Result<(), ParityError> {
+        self.source.configure_fixed_block_size(block_size)
+    }
+    fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+        if self.next != Some(hint) {
+            self.buffer.clear();
+            self.consumed = 0;
+            self.pending_end = None;
+            self.pending_data.clear();
+            self.next = None;
+            self.located = false;
+            self.source.locate_physical(hint)?;
+            self.next = Some(hint);
+            self.located = true;
+        }
+        Ok(())
+    }
+    fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        self.next = None;
+        self.buffer.clear();
+        self.pending_end = None;
+        self.pending_data.clear();
+        self.source.locate_end_of_data()
+    }
+    fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+        self.next = None;
+        self.buffer.clear();
+        self.pending_end = None;
+        self.pending_data.clear();
+        self.source.space_filemarks(count)
+    }
+    fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+        match self.next {
+            Some(next) => Ok(next),
+            None => self.source.position(),
+        }
+    }
+    fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+        let position = self
+            .next
+            .ok_or(ParityError::Invariant("read run requires a locate"))?;
+        if self.consumed == self.buffer.len() && self.pending_end.is_none() {
+            self.buffer.clear();
+            self.consumed = 0;
+            if !self.located {
+                self.source.locate_physical(position)?;
+                self.located = true;
+            }
+            if !self.single && self.remaining > 1 && buf.len() == self.block_size as usize {
+                let count = self
+                    .remaining
+                    .min(u64::from(remanence_library::DEFAULT_TAPE_IO_BATCH_BLOCKS))
+                    as u32;
+                self.buffer
+                    .resize(count as usize * self.block_size as usize, 0);
+                let batch =
+                    self.source
+                        .read_records(&mut self.buffer, self.block_size, count, count);
+                let confirmed = if batch.records_read <= count
+                    && batch.position_after
+                        == Some(device_position_after(
+                            position,
+                            u64::from(batch.records_read),
+                            "read run batch",
+                        )?) {
+                    batch.records_read
+                } else {
+                    0
+                };
+                let confirmed_bytes = confirmed as usize * self.block_size as usize;
+                if confirmed != count || !matches!(batch.end, RawReadEnd::Complete) {
+                    self.single = true;
+                    self.located = false;
+                }
+                if !matches!(batch.end, RawReadEnd::Complete) {
+                    if confirmed != batch.records_read || confirmed == count {
+                        self.buffer.clear();
+                        self.next = None;
+                        return Err(ParityError::Invariant("invalid terminal batch prefix"));
+                    }
+                    if matches!(batch.end, RawReadEnd::WrongLength { .. }) {
+                        self.pending_data.extend_from_slice(
+                            &self.buffer
+                                [confirmed_bytes..confirmed_bytes + self.block_size as usize],
+                        );
+                    }
+                    self.pending_end = Some(batch.end);
+                }
+                self.buffer.truncate(confirmed_bytes);
+            }
+        }
+        if self.consumed < self.buffer.len() {
+            let end = self.consumed + buf.len();
+            buf.copy_from_slice(&self.buffer[self.consumed..end]);
+            self.consumed = end;
+            self.remaining -= 1;
+            let position_after = device_position_after(position, 1, "read run delivery")?;
+            self.next = Some(position_after);
+            return Ok(RawReadOutcome::Block {
+                bytes: buf.len(),
+                position_after,
+            });
+        }
+        if let Some(end) = self.pending_end.take() {
+            // The adapter already made the decisive single read (or failed to
+            // arrange it). Do not let a later successful retry erase its result.
+            self.remaining = self.remaining.saturating_sub(1);
+            self.next = None;
+            self.located = false;
+            return match end {
+                RawReadEnd::Error(error) => Err(error),
+                RawReadEnd::Filemark { position_after } => {
+                    Ok(RawReadOutcome::Filemark { position_after })
+                }
+                RawReadEnd::EndOfData { position_after } => {
+                    Ok(RawReadOutcome::EndOfData { position_after })
+                }
+                RawReadEnd::WrongLength {
+                    bytes,
+                    position_after,
+                } => {
+                    let copied = bytes.min(buf.len()).min(self.pending_data.len());
+                    buf[..copied].copy_from_slice(&self.pending_data[..copied]);
+                    self.pending_data.clear();
+                    Ok(RawReadOutcome::Block {
+                        bytes,
+                        position_after,
+                    })
+                }
+                RawReadEnd::Complete => {
+                    unreachable!("complete batches have no terminal observation")
+                }
+            };
+        }
+        if !self.located {
+            self.source.locate_physical(position)?;
+        }
+        self.remaining = self.remaining.saturating_sub(1);
+        self.next = None;
+        self.located = false;
+        let result = self.source.read_record(buf);
+        if let Ok(RawReadOutcome::Block {
+            bytes,
+            position_after,
+        }) = &result
+        {
+            if *bytes == self.block_size as usize {
+                self.next = Some(*position_after);
+                self.located = true;
+            }
+        }
+        result
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1152,6 +1492,103 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
                 }
             },
         }
+    }
+
+    /// Use batches only as a clean fast path; redo an entire unclean command
+    /// from its first record through the existing single-record reader. Earlier
+    /// clean commands remain confirmed. Filemark/EOD completions are also redone.
+    ///
+    /// For responses stable per record, verification is equivalent to single
+    /// reads. A time-dependent batch fault absent on the single re-read is not
+    /// reported: that one re-read is final, including its error, and is delivered
+    /// after the confirmed prefix without another retry by ReadRun. A failed
+    /// fallback LOCATE is equally final. State-invalidating errors bypass the
+    /// fallback and propagate unchanged; reset/mode recovery belongs to the
+    /// caller, as on the single path. The drive handle still audits batch faults.
+    fn read_records(
+        &mut self,
+        buf: &mut [u8],
+        block_size: u32,
+        max_records: u32,
+        records_remaining_in_file: u32,
+    ) -> RawReadBatch {
+        let count = max_records.min(records_remaining_in_file);
+        let mut batch = RawReadBatch {
+            records_read: 0,
+            position_after: None,
+            end: RawReadEnd::Complete,
+        };
+        if block_size == 0
+            || count == 0
+            || u64::from(count) * u64::from(block_size) > buf.len() as u64
+        {
+            batch.end = RawReadEnd::Error(ParityError::Invariant(
+                "invalid raw read batch buffer/count",
+            ));
+            return batch;
+        }
+        while batch.records_read < count {
+            let before = match self.current_or_seed_position() {
+                Ok(before) => before,
+                Err(error) => {
+                    batch.end = RawReadEnd::Error(error);
+                    break;
+                }
+            };
+            let offset = batch.records_read as usize * block_size as usize;
+            let remaining = count - batch.records_read;
+            // The strict entry point checks the actual transport byte count,
+            // GOOD status and absence of sense against the selected CDB count.
+            match self.drive.read_block_batch_for_verification(
+                &mut buf[offset..],
+                block_size,
+                remaining,
+                remaining,
+            ) {
+                Ok(read) => {
+                    let after = match device_position_after(
+                        before,
+                        u64::from(read.records_read),
+                        "drive raw batch",
+                    ) {
+                        Ok(after) => after,
+                        Err(error) => {
+                            self.cursor_hint = None;
+                            batch.end = RawReadEnd::Error(error);
+                            break;
+                        }
+                    };
+                    self.cursor_hint = Some(after);
+                    batch.records_read += read.records_read;
+                    batch.position_after = Some(after);
+                }
+                Err(error) => {
+                    self.cursor_hint = None;
+                    if !self.drive.verification_single_fallback_allowed(&error) {
+                        batch.end = RawReadEnd::Error(error.into());
+                        break;
+                    }
+                    if let Err(error) = self.locate_physical(before) {
+                        batch.end = RawReadEnd::Error(error);
+                        break;
+                    }
+                    let single = read_records_default(
+                        self,
+                        &mut buf[offset..],
+                        block_size,
+                        remaining,
+                        remaining,
+                    );
+                    batch.records_read += single.records_read;
+                    if single.position_after.is_some() {
+                        batch.position_after = single.position_after;
+                    }
+                    batch.end = single.end;
+                    break;
+                }
+            }
+        }
+        batch
     }
 
     fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
@@ -2038,6 +2475,763 @@ mod compat_tests {
         assert!(!handle.is_dirty());
     }
 
+    /// Strict transport script: unexpected or omitted commands fail the test.
+    struct ReadScript {
+        steps: std::collections::VecDeque<(u8, Result<Vec<u8>, remanence_library::ScsiError>)>,
+        fixed_good_sense: Option<remanence_library::transport::SenseInfo>,
+    }
+
+    impl SgTransport for ReadScript {
+        fn execute_in(
+            &mut self,
+            cdb: &[u8],
+            buf: &mut [u8],
+        ) -> Result<TransferOutcome, remanence_library::ScsiError> {
+            let (opcode, response) = self.steps.pop_front().expect("unexpected input command");
+            assert_eq!(cdb[0], opcode);
+            let bytes = response?;
+            assert!(bytes.len() <= buf.len());
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(TransferOutcome {
+                bytes_transferred: bytes.len() as u32,
+                sense: if cdb[0] == 0x08 && cdb[1] & 1 != 0 {
+                    self.fixed_good_sense.take()
+                } else {
+                    None
+                },
+            })
+        }
+        fn execute_none(&mut self, cdb: &[u8]) -> Result<(), remanence_library::ScsiError> {
+            assert_eq!(cdb[0], 0x92, "only LOCATE is expected");
+            if self
+                .steps
+                .front()
+                .is_some_and(|(opcode, _)| *opcode == 0x92)
+            {
+                return self.steps.pop_front().unwrap().1.map(|_| ());
+            }
+            Ok(())
+        }
+        fn execute_out(
+            &mut self,
+            _: &[u8],
+            _: &[u8],
+        ) -> Result<TransferOutcome, remanence_library::ScsiError> {
+            panic!("no writes in a read test")
+        }
+    }
+
+    impl Drop for ReadScript {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert!(self.steps.is_empty(), "unconsumed transport script");
+                assert!(self.fixed_good_sense.is_none(), "unconsumed GOOD sense");
+            }
+        }
+    }
+
+    fn scripted_read_drive(
+        steps: Vec<(u8, Result<Vec<u8>, remanence_library::ScsiError>)>,
+        position_check_bytes: u64,
+    ) -> (DriveHandle, RecordingLog) {
+        scripted_read_drive_with_sense(steps, position_check_bytes, None)
+    }
+
+    fn scripted_read_drive_with_sense(
+        steps: Vec<(u8, Result<Vec<u8>, remanence_library::ScsiError>)>,
+        position_check_bytes: u64,
+        fixed_good_sense: Option<remanence_library::transport::SenseInfo>,
+    ) -> (DriveHandle, RecordingLog) {
+        let serial = "LIB_READ_SCRIPT";
+        let policy = StaticAllowlist::new([serial]);
+        let mut script = vec![
+            (0x12, Ok(lto9_inquiry_response())),
+            (0x12, Ok(vpd80_response("DRV_A"))),
+        ];
+        script.extend(steps);
+        let log = RecordingLog::new();
+        let mut drive_transport = Some(RecordingTransport::with_log(
+            ReadScript {
+                steps: script.into(),
+                fixed_good_sense,
+            },
+            log.clone(),
+        ));
+        let mut changer = Some(
+            FixtureTransport::new()
+                .with_responses([changer_inquiry_response(), vpd80_response(serial)]),
+        );
+        let factory: TestTransportFactory = Box::new(move |path| {
+            if path == Path::new("/dev/sg-mock") {
+                Ok(Box::new(changer.take().unwrap()) as Box<dyn SgTransport>)
+            } else {
+                Ok(Box::new(drive_transport.take().unwrap()) as Box<dyn SgTransport>)
+            }
+        });
+        let mut handle = open_drive_test_lib(serial)
+            .open_with(&policy, factory)
+            .unwrap();
+        let drive = handle
+            .open_drive_with_tape_io(
+                0x0100,
+                &policy,
+                remanence_library::TapeIoRuntimeConfig {
+                    read_batch_blocks: 2,
+                    position_check_bytes,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (drive, log)
+    }
+
+    fn read_filemark_error(residual: u32, bytes_transferred: u32) -> remanence_library::ScsiError {
+        let mut sense = vec![0; 18];
+        sense[0] = 0xf0;
+        sense[2] = 0x80;
+        sense[3..7].copy_from_slice(&residual.to_be_bytes());
+        sense[7] = 10;
+        sense[13] = 1;
+        remanence_library::ScsiError::CheckCondition {
+            sense,
+            bytes_transferred,
+        }
+    }
+
+    /// Counts below the bare adapter include tripwires, never decorator queries.
+    #[test]
+    fn bare_drive_single_batch_transitions_keep_position_through_boundaries() {
+        let eod = || remanence_library::ScsiError::CheckCondition {
+            sense: vec![0x72, 0x08, 0x00, 0x05],
+            bytes_transferred: 0,
+        };
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 20))),
+                (0x08, Ok(vec![1; 4])), // single -> 21
+                (0x08, Ok(vec![2; 8])), // clamped batch -> 23
+                (0x34, Ok(read_position_long_response(0, 0, 23))),
+                (0x08, Ok(vec![3; 4])), // remaining batch -> 24
+                (0x08, Ok(vec![4; 4])), // single -> 25
+                (0x08, Err(read_filemark_error(1, 4))), // partial batch: data -> 26, FM -> 27
+                (0x34, Ok(read_position_long_response(0, 0, 25))), // redo LOCATE
+                (0x08, Ok(vec![4; 4])), // redo data -> 26
+                (0x08, Err(read_filemark_error(0, 0))), // single FM -> 27
+                (0x34, Ok(read_position_long_response(0, 0, 27))), // boundary resync
+                (0x08, Ok(vec![5; 4])), // single -> 28
+                (0x08, Ok(vec![6; 8])), // prefix -> 30
+                (0x34, Ok(read_position_long_response(0, 0, 30))),
+                (0x08, Err(eod())), // EOD during the next partial command
+                (0x34, Ok(read_position_long_response(0, 0, 30))), // redo LOCATE
+                (0x08, Err(eod())),
+                (0x34, Ok(read_position_long_response(0, 0, 30))), // redo boundary resync
+                (0x08, Err(eod())),
+                (0x34, Ok(read_position_long_response(0, 0, 30))), // single boundary resync
+            ],
+            8,
+        );
+        {
+            let mut raw = DriveHandleRawSource::new(&mut drive);
+            assert_eq!(
+                raw.read_record(&mut [0; 4]).unwrap().position_after().lba,
+                21
+            );
+            let batch = raw.read_records(&mut [0; 12], 4, 3, 3);
+            assert!(matches!(batch.end, RawReadEnd::Complete), "{batch:?}");
+            assert_eq!(
+                (batch.records_read, batch.position_after.unwrap().lba),
+                (3, 24)
+            );
+            assert_eq!(
+                raw.read_record(&mut [0; 4]).unwrap().position_after().lba,
+                25
+            );
+            let batch = raw.read_records(&mut [0; 12], 4, 3, 3);
+            assert!(
+                matches!(batch.end, RawReadEnd::Filemark { .. }),
+                "{batch:?}"
+            );
+            assert_eq!(
+                (batch.records_read, batch.position_after.unwrap().lba),
+                (1, 26)
+            );
+            assert_eq!(
+                raw.read_record(&mut [0; 4]).unwrap().position_after().lba,
+                28
+            );
+            let batch = raw.read_records(&mut [0; 12], 4, 3, 3);
+            assert!(
+                matches!(batch.end, RawReadEnd::EndOfData { .. }),
+                "{batch:?}"
+            );
+            assert_eq!(
+                (batch.records_read, batch.position_after.unwrap().lba),
+                (2, 30)
+            );
+            assert!(
+                matches!(raw.read_record(&mut [0; 4]).unwrap(), RawReadOutcome::EndOfData { position_after } if position_after.lba == 30)
+            );
+        }
+        let log = log.borrow();
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x92).count(), 2);
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x34).count(), 8);
+        assert_eq!(
+            log.iter()
+                .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 == 0)
+                .count(),
+            7
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 != 0)
+                .count(),
+            5
+        );
+        println!("bare transitions: LOCATE=2 READ_POSITION=8 single_READ=7 batch_READ=5");
+    }
+
+    /// A failed batch tripwire is discarded too; successful positioning and
+    /// single re-reads supply the verification result.
+    #[test]
+    fn batch_read_position_failure_redoes_singly() {
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![1; 8])),
+                (
+                    0x34,
+                    Err(remanence_library::ScsiError::InvalidInput(
+                        "tripwire failure",
+                    )),
+                ),
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![2; 4])),
+                (0x08, Ok(vec![3; 4])),
+            ],
+            4,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let mut buf = [0; 8];
+        let batch = raw.read_records(&mut buf, 4, 2, 2);
+        assert!(matches!(batch.end, RawReadEnd::Complete), "{batch:?}");
+        assert_eq!(batch.records_read, 2);
+        assert_eq!(buf, [2, 2, 2, 2, 3, 3, 3, 3]);
+        assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(), 1);
+    }
+
+    /// The batch fault is time-dependent: the successful single re-read stands.
+    #[test]
+    fn one_shot_non_medium_batch_fault_uses_single_reread() {
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 8])), // earlier clean command stays confirmed
+                (
+                    0x08,
+                    Err(remanence_library::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x04, 0x44, 0],
+                        bytes_transferred: 0,
+                    }),
+                ),
+                (0x34, Ok(read_position_long_response(0, 0, 2))),
+                (0x08, Ok(vec![8; 4])),
+            ],
+            0,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let mut run = ReadRun::new(&mut raw, 4, 3);
+        run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+        for lba in 1..=3 {
+            let mut buf = [0; 4];
+            assert_eq!(run.read_record(&mut buf).unwrap().position_after().lba, lba);
+            assert_eq!(buf, [if lba == 3 { 8 } else { 7 }; 4]);
+        }
+        let log = log.borrow();
+        let locates: Vec<_> = log
+            .iter()
+            .filter(|cdb| cdb[0] == 0x92)
+            .map(|cdb| u64::from_be_bytes(cdb[4..12].try_into().unwrap()))
+            .collect();
+        assert_eq!(locates, [0, 2]);
+        assert_eq!(
+            log.iter()
+                .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 == 0)
+                .count(),
+            1
+        );
+    }
+
+    /// A read-ahead fault must not prevent delivery of an earlier clean prefix;
+    /// the designated single fault is final even if a further attempt succeeds.
+    #[test]
+    fn read_run_delivers_single_fault_before_a_later_success() {
+        let fault = || remanence_library::ScsiError::CheckCondition {
+            sense: vec![0x72, 0x04, 0x44, 0],
+            bytes_transferred: 0,
+        };
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 8])),
+                (0x08, Err(fault())), // speculative fixed command
+                (0x34, Ok(read_position_long_response(0, 0, 2))),
+                (0x08, Err(fault())), // adapter's single redo
+                (0x34, Ok(read_position_long_response(0, 0, 2))),
+                (0x08, Ok(vec![9; 4])), // a further attempt would succeed
+            ],
+            0,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let mut run = ReadRun::new(&mut raw, 4, 3);
+        run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+        for lba in 1..=2 {
+            let mut buf = [0; 4];
+            assert_eq!(run.read_record(&mut buf).unwrap().position_after().lba, lba);
+            assert_eq!(buf, [7; 4]);
+        }
+        let error = run.read_record(&mut [0; 4]).unwrap_err();
+        assert!(
+            matches!(error, ParityError::TapeIo(TapeIoError::CheckCondition(
+            remanence_library::ScsiError::CheckCondition { sense, .. }
+        )) if sense == [0x72, 0x04, 0x44, 0])
+        );
+        let log = log.borrow();
+        let locates: Vec<_> = log
+            .iter()
+            .filter(|cdb| cdb[0] == 0x92)
+            .map(|cdb| u64::from_be_bytes(cdb[4..12].try_into().unwrap()))
+            .collect();
+        assert_eq!(locates, [0, 2]);
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x08).count(), 3);
+        drop(log);
+        drop(run);
+        // Explicitly demonstrate the next attempt would succeed. It must not
+        // be consumed by the verification run above.
+        raw.locate_physical(PhysicalPositionHint::new(2)).unwrap();
+        let mut buf = [0; 4];
+        assert!(matches!(
+            raw.read_record(&mut buf).unwrap(),
+            RawReadOutcome::Block { bytes: 4, .. }
+        ));
+        assert_eq!(buf, [9; 4]);
+
+        let (mut single_drive, _) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 2))),
+                (0x08, Err(fault())),
+            ],
+            0,
+        );
+        let single_error = DriveHandleRawSource::new(&mut single_drive)
+            .read_record(&mut [0; 4])
+            .unwrap_err();
+        assert!(
+            matches!(single_error, ParityError::TapeIo(TapeIoError::CheckCondition(
+            remanence_library::ScsiError::CheckCondition { sense, .. }
+        )) if sense == [0x72, 0x04, 0x44, 0])
+        );
+    }
+
+    /// A failed fallback LOCATE is delivered after the clean prefix, with no
+    /// second positioning attempt that could erase the error.
+    #[test]
+    fn read_run_preserves_failed_fallback_locate() {
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 8])),
+                (0x08, Ok(vec![8; 3])), // unclean short batch
+                (
+                    0x92,
+                    Err(remanence_library::ScsiError::InvalidInput(
+                        "fallback LOCATE failed",
+                    )),
+                ),
+            ],
+            0,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let mut run = ReadRun::new(&mut raw, 4, 3);
+        run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+        for lba in 1..=2 {
+            let mut buf = [0; 4];
+            assert_eq!(run.read_record(&mut buf).unwrap().position_after().lba, lba);
+            assert_eq!(buf, [7; 4]);
+        }
+        assert!(matches!(
+            run.read_record(&mut [0; 4]).unwrap_err(),
+            ParityError::TapeIo(TapeIoError::InvalidRequest(
+                remanence_library::ScsiError::InvalidInput("fallback LOCATE failed")
+            ))
+        ));
+        let log = log.borrow();
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x92).count(), 2);
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x08).count(), 2);
+    }
+
+    /// Reset is returned unchanged, whether fixed mode was validated or not,
+    /// and whether the failed batch has an earlier clean prefix or not.
+    #[test]
+    fn batch_reset_matches_single_without_fallback() {
+        for validated in [false, true] {
+            for prefix in [false, true] {
+                for ascq in 0..=4 {
+                    let sense = vec![0x72, 0x06, 0x29, ascq];
+                    let observe = |batch| {
+                        let mut steps = Vec::new();
+                        if validated {
+                            steps.extend([
+                                (0x05, Ok(rbl_response(1024, 1))),
+                                (0x1a, Ok(mode_sense_response(4, false))),
+                            ]);
+                        }
+                        steps.push((0x34, Ok(read_position_long_response(0, 0, 0))));
+                        if prefix {
+                            if batch {
+                                steps.push((0x08, Ok(vec![7; 8])));
+                            } else {
+                                steps.extend([(0x08, Ok(vec![7; 4])), (0x08, Ok(vec![7; 4]))]);
+                            }
+                        }
+                        steps.push((
+                            0x08,
+                            Err(remanence_library::ScsiError::CheckCondition {
+                                sense: sense.clone(),
+                                bytes_transferred: 0,
+                            }),
+                        ));
+                        let (mut drive, log) = scripted_read_drive(steps, 0);
+                        if validated {
+                            drive.read_config().unwrap();
+                        }
+                        let mut raw = DriveHandleRawSource::new(&mut drive);
+                        let error = if batch {
+                            let mut run = ReadRun::new(&mut raw, 4, if prefix { 3 } else { 2 });
+                            run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+                            if prefix {
+                                for lba in 1..=2 {
+                                    assert_eq!(
+                                        run.read_record(&mut [0; 4]).unwrap().position_after().lba,
+                                        lba
+                                    );
+                                }
+                            }
+                            run.read_record(&mut [0; 4]).unwrap_err()
+                        } else {
+                            if prefix {
+                                for _ in 0..2 {
+                                    raw.read_record(&mut [0; 4]).unwrap();
+                                }
+                            }
+                            raw.read_record(&mut [0; 4]).unwrap_err()
+                        };
+                        assert!(
+                            matches!(&error, ParityError::TapeIo(TapeIoError::StateInvalidatingReset(
+                            remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: 0 }
+                        )) if actual == &sense),
+                            "{error:?}"
+                        );
+                        assert_eq!(
+                            log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(),
+                            usize::from(batch)
+                        );
+                        format!("{error:?}")
+                    };
+                    assert_eq!(observe(true), observe(false));
+                }
+            }
+        }
+    }
+
+    /// A pre-existing mode-reverification flag must preserve the guard's
+    /// InvalidRequest too; selecting a batch cannot introduce another LOCATE.
+    #[test]
+    fn batch_preserves_mode_reverification_guard_error() {
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x05, Ok(rbl_response(1024, 1))),
+                (0x1a, Ok(mode_sense_response(4, false))),
+                (
+                    0x08,
+                    Err(remanence_library::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x06, 0x29, 2],
+                        bytes_transferred: 0,
+                    }),
+                ),
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+            ],
+            0,
+        );
+        drive.read_config().unwrap();
+        assert!(matches!(
+            drive.read_block(&mut [0; 4]),
+            Err(TapeIoError::StateInvalidatingReset(_))
+        ));
+        let expected = drive.read_block(&mut [0; 4]).unwrap_err();
+        assert!(matches!(expected, TapeIoError::InvalidRequest(_)));
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let mut run = ReadRun::new(&mut raw, 4, 2);
+        run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+        let error = run.read_record(&mut [0; 4]).unwrap_err();
+        assert_eq!(
+            format!("{error:?}"),
+            format!("{:?}", ParityError::TapeIo(expected))
+        );
+        let log = log.borrow();
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x92).count(), 1);
+        assert_eq!(log.iter().filter(|cdb| cdb[0] == 0x08).count(), 1);
+    }
+
+    /// ILI without complete INFORMATION remains the single reader's error.
+    #[test]
+    fn truncated_ili_batch_fault_matches_single_read_error() {
+        for len in 3..7 {
+            let mut sense = vec![0; len];
+            sense[0] = 0xf0;
+            sense[2] = 0x20;
+            assert_stable_batch_fault_matches_single(sense, 0);
+        }
+    }
+
+    /// Even recovered completions accepted by restore are re-read singly.
+    #[test]
+    fn recovered_batch_completion_matches_single_read_error() {
+        for sense in [
+            vec![0x70, 0, 0x01],
+            vec![0xf0, 0, 0x01, 0, 0, 0, 0],
+            vec![0x72, 0x01, 0, 0],
+        ] {
+            assert_stable_batch_fault_matches_single(sense, 4);
+        }
+    }
+
+    /// Recovered completions rejected by restore also use the single error policy.
+    #[test]
+    fn rejected_recovered_batch_completion_matches_single_check_condition() {
+        assert_stable_batch_fault_matches_single(vec![0x72, 1, 0, 0], 0);
+        assert_stable_batch_fault_matches_single(vec![0xf0, 0, 1, 0, 0, 0, 1], 4);
+    }
+
+    #[test]
+    fn short_good_batch_redoes_singly_and_reports_wrong_length() {
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 3])), // GOOD, but one requested byte never arrived
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 3])),
+            ],
+            0,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let batch = raw.read_records(&mut [0xff; 4], 4, 1, 1);
+        assert_eq!(batch.records_read, 0);
+        assert!(
+            matches!(batch.end, RawReadEnd::WrongLength { .. }),
+            "{batch:?}"
+        );
+        assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(), 1);
+
+        let (mut drive, _) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 3])),
+            ],
+            0,
+        );
+        assert!(matches!(
+            read_fixed_record(&mut DriveHandleRawSource::new(&mut drive), &mut [0; 4]).unwrap(),
+            FixedRecordRead::WrongLength {
+                measured_bytes: 3,
+                ..
+            }
+        ));
+    }
+
+    /// GOOD status alone is insufficient: informational recovered sense or a
+    /// residual still forces a single re-read, whose bytes replace the batch.
+    #[test]
+    fn good_batch_with_sense_redoes_singly() {
+        for (key, information) in [(1, None), (0, Some(1))] {
+            let (mut drive, log) = scripted_read_drive_with_sense(
+                vec![
+                    (0x34, Ok(read_position_long_response(0, 0, 0))),
+                    (0x08, Ok(vec![9; 4])),
+                    (0x34, Ok(read_position_long_response(0, 0, 0))),
+                    (0x08, Ok(vec![7; 4])),
+                ],
+                0,
+                Some(remanence_library::transport::SenseInfo {
+                    key,
+                    asc: 0,
+                    ascq: 0,
+                    information,
+                    ili: false,
+                    eom: false,
+                    filemark: false,
+                }),
+            );
+            let mut raw = DriveHandleRawSource::new(&mut drive);
+            let mut buf = [0; 4];
+            let batch = raw.read_records(&mut buf, 4, 1, 1);
+            assert!(matches!(batch.end, RawReadEnd::Complete), "{batch:?}");
+            assert_eq!(batch.records_read, 1);
+            assert_eq!(buf, [7; 4]);
+            assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(), 1);
+        }
+    }
+
+    #[test]
+    fn descriptor_filemark_batch_redoes_singly_and_reports_boundary() {
+        let fault = || remanence_library::ScsiError::CheckCondition {
+            sense: vec![
+                0x72, 0, 0, 1, 0, 0, 0, 16, 0, 10, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 2, 0, 0x80,
+            ],
+            bytes_transferred: 0,
+        };
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Err(fault())),
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Err(fault())),
+                (0x34, Ok(read_position_long_response(0, 0, 1))),
+            ],
+            0,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let batch = raw.read_records(&mut [0xff; 4], 4, 1, 1);
+        assert_eq!(batch.records_read, 0);
+        assert!(
+            matches!(batch.end, RawReadEnd::Filemark { .. }),
+            "{batch:?}"
+        );
+        assert_eq!(raw.cursor_hint.unwrap().lba, 1);
+        assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(), 1);
+    }
+
+    /// Restore's buffer handoff still accepts the fixed reader's recovered completion.
+    #[test]
+    fn recovered_batch_completion_remains_successful_for_restore_handoff() {
+        let (mut drive, _) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (
+                    0x08,
+                    Err(remanence_library::ScsiError::CheckCondition {
+                        sense: vec![0x72, 0x01, 0, 0],
+                        bytes_transferred: 8,
+                    }),
+                ),
+            ],
+            0,
+        );
+        let mut source = remanence_library::DriveHandleSource(&mut drive);
+        let outcome = source
+            .read_buffer_handoff(
+                remanence_library::ReadBuffer::try_new_page_aligned(8).unwrap(),
+                4,
+                2,
+                2,
+            )
+            .unwrap();
+        assert_eq!(outcome.position_after.lba, 2);
+        assert_eq!(outcome.handoff.records_read, 2);
+        assert_eq!(outcome.handoff.valid_bytes, 8);
+        assert!(!outcome.handoff.terminal_flags.error);
+    }
+
+    /// Stable responses yield the exact single-path error, retaining earlier
+    /// clean batches and locating only the first record of the failed command.
+    fn assert_stable_batch_fault_matches_single(sense: Vec<u8>, bytes_transferred: u32) {
+        let fault = || remanence_library::ScsiError::CheckCondition {
+            sense: sense.clone(),
+            bytes_transferred,
+        };
+        let observe = |batch| {
+            let mut steps = vec![(0x34, Ok(read_position_long_response(0, 0, 0)))];
+            if batch {
+                steps.extend([
+                    (0x08, Ok(vec![7; 8])),
+                    (0x08, Err(fault())),
+                    (0x34, Ok(read_position_long_response(0, 0, 2))),
+                ]);
+            } else {
+                steps.extend([(0x08, Ok(vec![7; 4])), (0x08, Ok(vec![7; 4]))]);
+            }
+            steps.push((0x08, Err(fault())));
+            let (mut drive, log) = scripted_read_drive(steps, 0);
+            let mut raw = DriveHandleRawSource::new(&mut drive);
+            let error = if batch {
+                let mut buf = [0xff; 12];
+                let result = raw.read_records(&mut buf, 4, 3, 3);
+                assert_eq!(result.records_read, 2);
+                assert_eq!(result.position_after, Some(PhysicalPositionHint::new(2)));
+                assert_eq!(&buf[..8], &[7; 8]);
+                let RawReadEnd::Error(error) = result.end else {
+                    panic!("{result:?}")
+                };
+                error
+            } else {
+                for lba in 1..=2 {
+                    assert_eq!(
+                        raw.read_record(&mut [0; 4]).unwrap().position_after().lba,
+                        lba
+                    );
+                }
+                raw.read_record(&mut [0; 4]).unwrap_err()
+            };
+            assert!(
+                matches!(&error, ParityError::TapeIo(TapeIoError::CheckCondition(
+                remanence_library::ScsiError::CheckCondition { sense: actual, bytes_transferred: bytes }
+            )) if actual == &sense && *bytes == bytes_transferred),
+                "{error:?}"
+            );
+            assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x08).count(), 3);
+            assert_eq!(
+                log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(),
+                usize::from(batch)
+            );
+            format!("{error:?}")
+        };
+        assert_eq!(observe(true), observe(false));
+    }
+
+    #[test]
+    fn fixed_batch_wrong_length_finishes_through_single_record_classification() {
+        let mut sense = vec![0; 18];
+        sense[0] = 0xf0;
+        sense[2] = 0x20;
+        sense[6] = 1;
+        sense[7] = 10;
+        let (mut drive, log) = scripted_read_drive(
+            vec![
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (
+                    0x08,
+                    Err(remanence_library::ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    }),
+                ),
+                (0x34, Ok(read_position_long_response(0, 0, 0))),
+                (0x08, Ok(vec![7; 3])),
+            ],
+            0,
+        );
+        let mut raw = DriveHandleRawSource::new(&mut drive);
+        let mut run = ReadRun::new(&mut raw, 4, 2);
+        run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+        assert!(matches!(
+            read_fixed_record(&mut run, &mut [0; 4]).unwrap(),
+            FixedRecordRead::WrongLength {
+                measured_bytes: 3,
+                ..
+            }
+        ));
+        assert_eq!(log.borrow().iter().filter(|cdb| cdb[0] == 0x92).count(), 2);
+    }
+
     #[test]
     fn drive_handle_raw_source_rejects_wrong_locate_lba_and_partition() {
         for (serial, observed) in [
@@ -2196,6 +3390,194 @@ mod compat_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    /// A batch adapter that consumes a good prefix and loses its cursor at a
+    /// boundary/fault, as a drive may. Singles still read the original image.
+    struct StoppedBatchSource {
+        inner: ImageDirectoryRawSource,
+        end: Option<RawReadEnd>,
+        locates: Vec<u64>,
+        singles: Vec<u64>,
+        batches: usize,
+    }
+
+    impl RawTapeSource for StoppedBatchSource {
+        fn configure_fixed_block_size(&mut self, size: u32) -> Result<(), ParityError> {
+            self.inner.configure_fixed_block_size(size)
+        }
+        fn locate_physical(&mut self, hint: PhysicalPositionHint) -> Result<(), ParityError> {
+            self.locates.push(hint.lba);
+            self.inner.locate_physical(hint)
+        }
+        fn locate_end_of_data(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.inner.locate_end_of_data()
+        }
+        fn space_filemarks(&mut self, count: i64) -> Result<SpaceFilemarksOutcome, ParityError> {
+            self.inner.space_filemarks(count)
+        }
+        fn position(&mut self) -> Result<PhysicalPositionHint, ParityError> {
+            self.inner.position()
+        }
+        fn read_record(&mut self, buf: &mut [u8]) -> Result<RawReadOutcome, ParityError> {
+            self.singles.push(self.inner.position()?.lba);
+            self.inner.read_record(buf)
+        }
+        fn read_records(
+            &mut self,
+            buf: &mut [u8],
+            size: u32,
+            max: u32,
+            remaining: u32,
+        ) -> RawReadBatch {
+            self.batches += 1;
+            assert_eq!((max, remaining), (4, 4));
+            let mut prefix = self.inner.read_records(buf, size, 1, remaining);
+            assert_eq!(prefix.records_read, 1);
+            buf[size as usize..].fill(0xff);
+            self.inner.locate_end_of_data().unwrap();
+            prefix.end = self.end.take().expect("only one batch before fallback");
+            prefix
+        }
+    }
+
+    /// A short clean batch leaves a suffix to read; a terminal observation is
+    /// final and must be returned without consulting the underlying source.
+    #[test]
+    fn incomplete_batches_preserve_terminal_observations() {
+        let position_after = PhysicalPositionHint::new(2);
+        for end in [
+            RawReadEnd::Complete,
+            RawReadEnd::Filemark { position_after },
+            RawReadEnd::EndOfData { position_after },
+            RawReadEnd::WrongLength {
+                bytes: 3,
+                position_after,
+            },
+            RawReadEnd::Error(ParityError::Invariant("decisive single failure")),
+        ] {
+            let expected = match &end {
+                RawReadEnd::Complete => Ok(RawReadOutcome::Block {
+                    bytes: 4,
+                    position_after,
+                }),
+                RawReadEnd::Filemark { position_after } => Ok(RawReadOutcome::Filemark {
+                    position_after: *position_after,
+                }),
+                RawReadEnd::EndOfData { position_after } => Ok(RawReadOutcome::EndOfData {
+                    position_after: *position_after,
+                }),
+                RawReadEnd::WrongLength {
+                    bytes,
+                    position_after,
+                } => Ok(RawReadOutcome::Block {
+                    bytes: *bytes,
+                    position_after: *position_after,
+                }),
+                RawReadEnd::Error(_) => Err(()),
+            };
+            let complete = matches!(end, RawReadEnd::Complete);
+            let mut source = StoppedBatchSource {
+                inner: ImageDirectoryRawSource::from_tape_files(
+                    vec![(0..4).flat_map(|n| [n; 4]).collect()],
+                    4,
+                )
+                .unwrap(),
+                end: Some(end),
+                locates: Vec::new(),
+                singles: Vec::new(),
+                batches: 0,
+            };
+            source.configure_fixed_block_size(4).unwrap();
+            let mut run = ReadRun::new(&mut source, 4, 4);
+            run.locate_physical(PhysicalPositionHint::new(0)).unwrap();
+            let mut block = [0; 4];
+            assert_eq!(run.read_record(&mut block).unwrap().position_after().lba, 1);
+            assert_eq!(block, [0; 4]);
+            run.locate_physical(PhysicalPositionHint::new(1)).unwrap();
+            let result = run.read_record(&mut block);
+            match expected {
+                Ok(outcome) => {
+                    assert_eq!(result.unwrap(), outcome);
+                    if matches!(outcome, RawReadOutcome::Block { bytes: 3, .. }) {
+                        assert_eq!(&block[..3], &[0xff; 3]);
+                    }
+                }
+                Err(()) => assert!(matches!(
+                    result.unwrap_err(),
+                    ParityError::Invariant("decisive single failure")
+                )),
+            }
+            // The next explicit address can still be read after a final error.
+            for lba in 2..4 {
+                run.locate_physical(PhysicalPositionHint::new(lba)).unwrap();
+                assert_eq!(
+                    run.read_record(&mut block).unwrap().position_after().lba,
+                    lba + 1
+                );
+                assert_eq!(block, [lba as u8; 4]);
+            }
+            assert_eq!(
+                source.locates,
+                if complete { vec![0, 1] } else { vec![0, 2] }
+            );
+            assert_eq!(
+                source.singles,
+                if complete { vec![1, 2, 3] } else { vec![2, 3] }
+            );
+            assert_eq!(source.batches, 1);
+        }
+    }
+
+    #[test]
+    fn a_failed_single_retry_forces_positioning_before_the_next_record() {
+        let mut source = StoppedBatchSource {
+            inner: ImageDirectoryRawSource::from_tape_files(vec![vec![0x35; 16]], 4).unwrap(),
+            end: Some(RawReadEnd::Complete),
+            locates: Vec::new(),
+            singles: Vec::new(),
+            batches: 0,
+        };
+        source.configure_fixed_block_size(4).unwrap();
+        source.inner.mark_unreadable(0, 2).unwrap();
+        let mut run = ReadRun::new(&mut source, 4, 4);
+        for lba in 0..4 {
+            run.locate_physical(PhysicalPositionHint::new(lba)).unwrap();
+            let result = run.read_record(&mut [0; 4]);
+            if lba == 2 {
+                assert!(matches!(result, Err(ParityError::TapeIo(_))));
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    RawReadOutcome::Block { bytes: 4, .. }
+                ));
+            }
+        }
+        assert_eq!(source.locates, [0, 1, 3]);
+        assert_eq!(source.singles, [1, 2, 3]);
+        assert_eq!(source.batches, 1);
+    }
+
+    #[test]
+    fn default_batches_report_good_prefix_and_respect_file_bound() {
+        let mut source = ImageDirectoryRawSource::from_tape_files(vec![vec![0x35; 8]], 4).unwrap();
+        source.configure_fixed_block_size(4).unwrap();
+        let mut buf = [0xff; 16];
+        let batch = source.read_records(&mut buf, 4, 4, 2);
+        assert_eq!(batch.records_read, 2);
+        assert!(matches!(batch.end, RawReadEnd::Complete));
+        assert_eq!(source.position().unwrap().lba, 2);
+        assert_eq!(buf[8..], [0xff; 8]);
+        source
+            .locate_physical(PhysicalPositionHint::new(0))
+            .unwrap();
+        let batch = source.read_records(&mut buf, 4, 4, 4);
+        assert_eq!(batch.records_read, 2);
+        assert!(matches!(batch.end, RawReadEnd::Filemark { .. }));
+        assert_eq!(batch.position_after, Some(PhysicalPositionHint::new(2)));
+        let batch = source.read_records(&mut buf, 4, 1, 1);
+        assert_eq!(batch.records_read, 0);
+        assert!(matches!(batch.end, RawReadEnd::EndOfData { .. }));
+    }
 
     fn fixed_sense(byte2: u8, asc: u8, ascq: u8) -> Vec<u8> {
         let mut sense = vec![0u8; 18];

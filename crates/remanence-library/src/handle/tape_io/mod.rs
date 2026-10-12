@@ -1631,6 +1631,93 @@ impl super::DriveHandle {
         }
     }
 
+    /// Strict fixed READ fast path for verification. Only a full GOOD transfer
+    /// without informational sense is accepted; all other completions are audited
+    /// and returned as errors. Before arranging a single-record redo, callers
+    /// must check [`Self::verification_single_fallback_allowed`]; errors needing
+    /// reset/mode recovery must propagate unchanged without a fallback LOCATE.
+    /// The restore batch reader retains its independent completion policy.
+    pub fn read_block_batch_for_verification(
+        &mut self,
+        buf: &mut [u8],
+        block_size_bytes: u32,
+        requested_records: u32,
+        remaining_records_in_file: u32,
+    ) -> Result<ReadBatchOutcome, TapeIoError> {
+        self.ensure_data_command_state_valid(true)?;
+        if block_size_bytes == 0 || requested_records == 0 || remaining_records_in_file == 0 {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "verification batch requires nonzero block size and record counts",
+            )));
+        }
+        let records = requested_records
+            .min(remaining_records_in_file)
+            .min(self.effective_read_batch_blocks_for(block_size_bytes));
+        let transfer_len = fixed_batch_len_bytes("verification batch", records, block_size_bytes)?;
+        if buf.len() < transfer_len as usize {
+            return Err(TapeIoError::InvalidRequest(ScsiError::InvalidInput(
+                "verification batch buffer is smaller than the selected transfer",
+            )));
+        }
+        self.seed_expected_position()?;
+        let op = AuditOp::TapeRead {
+            bay: self.bay_address,
+            len: transfer_len,
+        };
+        let cdb = remanence_scsi::read_write::build_read_fixed_cdb(records);
+        self.fire_tape_started(op, &cdb);
+        self.transport.set_timeout_for(TimeoutClass::TapeIo);
+        let started = Instant::now();
+        let result = self
+            .transport
+            .execute_in(&cdb, &mut buf[..transfer_len as usize]);
+        let result = match result {
+            Ok(transfer)
+                if transfer.bytes_transferred == transfer_len && transfer.sense.is_none() =>
+            {
+                self.advance_expected_position(records, 0, u64::from(transfer_len))
+                    .map(|position| {
+                        ReadBatchOutcome::from_position_evidence(
+                            records,
+                            transfer.bytes_transferred,
+                            false,
+                            position,
+                        )
+                    })
+            }
+            Ok(transfer) => Err(TapeIoError::OperationFailed(format!(
+                "unclean verification batch: transferred {} of {transfer_len} bytes, sense {:?}",
+                transfer.bytes_transferred, transfer.sense,
+            ))),
+            Err(error) => Err(map_scsi(error)),
+        };
+        match &result {
+            Ok(_) => self.finish_tape_success(op, started.elapsed()),
+            Err(error) => {
+                self.mark_position_unknown();
+                self.finish_tape_error(op, error);
+            }
+        }
+        result
+    }
+
+    /// Whether verification may arrange a LOCATE and one single-record fallback
+    /// after a rejected batch, without concealing a required reset/mode recovery.
+    pub fn verification_single_fallback_allowed(&self, error: &TapeIoError) -> bool {
+        // StateInvalidatingReset (current UNIT ATTENTION 06/29/00..04 and 06/29/07) is final
+        // even when no fixed mode was previously validated. For every other
+        // TapeIoError variant, mode_reverification_required also forbids a redo,
+        // including InvalidRequest from an already-blocked handle: the guard
+        // ensure_data_command_state_valid(false), used by read_block, refuses it.
+        // position_known=false / expected_position=None alone are recoverable
+        // by the fallback LOCATE; read_block's guard does not require position.
+        // This includes Transport and ordinary CheckCondition errors, which may
+        // invalidate the cursor without invalidating mode. The shared dirty bit
+        // is audit evidence, not an additional data-command guard.
+        !matches!(error, TapeIoError::StateInvalidatingReset(_))
+            && self.ensure_data_command_state_valid(false).is_ok()
+    }
+
     /// Issue fixed-mode READ(6) for a batch that is clamped to the
     /// caller's remaining records in the current tape file.
     ///
@@ -1875,6 +1962,10 @@ impl super::DriveHandle {
         match result {
             Ok(outcome) => {
                 let bytes = (outcome.bytes_transferred as usize).min(buf.len());
+                if let Err(error) = self.advance_known_single_read_position(bytes) {
+                    self.finish_tape_error(op, &error);
+                    return Err(error);
+                }
                 self.finish_tape_success(op, started.elapsed());
                 Ok(bytes)
             }
@@ -1888,6 +1979,7 @@ impl super::DriveHandle {
                         self.invalidate_for_reset_unit_attention();
                     }
                     if read_filemark_signal(sense) {
+                        self.mark_position_unknown();
                         let mapped = TapeIoError::FilemarkEncountered;
                         self.finish_tape_error(op, &mapped);
                         return Err(mapped);
@@ -1900,6 +1992,12 @@ impl super::DriveHandle {
                             // malformed sense cannot report stale bytes.
                             let actual_usize = ((len_u32 as i64) - signed_info).max(0) as usize;
                             let actual_usize = actual_usize.min(buf.len());
+                            if let Err(error) =
+                                self.advance_known_single_read_position(actual_usize)
+                            {
+                                self.finish_tape_error(op, &error);
+                                return Err(error);
+                            }
                             self.finish_tape_success(op, started.elapsed());
                             return Ok(actual_usize);
                         } else {
@@ -1908,6 +2006,7 @@ impl super::DriveHandle {
                             // before retrying.
                             let actual_i64 = (len_u32 as i64) - signed_info;
                             let actual_u32 = actual_i64.clamp(0, u32::MAX as i64) as u32;
+                            self.mark_position_unknown();
                             let mapped = TapeIoError::ReadBufferTooSmall {
                                 actual: actual_u32,
                                 provided: len_u32,
@@ -1917,6 +2016,7 @@ impl super::DriveHandle {
                         }
                     }
                 }
+                self.mark_position_unknown();
                 let mapped = map_scsi(e);
                 self.finish_tape_error(op, &mapped);
                 Err(mapped)
@@ -2761,6 +2861,19 @@ impl super::DriveHandle {
         self.expected_position = Some(position_after);
         self.bytes_since_position_check = self.bytes_since_position_check.saturating_add(bytes);
         Ok(position_after)
+    }
+
+    /// Keep a seeded batch cursor current across variable single-record reads.
+    /// Do not seed or run a tripwire here: the next batch retains the accumulated
+    /// byte count and performs its usual check, without extra healthy-path I/O.
+    fn advance_known_single_read_position(&mut self, bytes: usize) -> Result<(), TapeIoError> {
+        if self.expected_position.is_some() {
+            if let Err(error) = self.advance_expected_position_arithmetic(1, 0, bytes as u64) {
+                self.mark_position_unknown();
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn pipeline_tripwire_due(&self) -> bool {

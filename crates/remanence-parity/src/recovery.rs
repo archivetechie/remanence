@@ -24,7 +24,9 @@ use crate::filemark_map::{
 use crate::mapping::{data_shards_per_epoch, ordinal_to_stripe};
 use crate::mapping::{ordinal_to_stripe_in_epoch, stripe_data_shard_in_epoch, EpochDataShard};
 use crate::model::{ParityScheme, SidecarMetadataHealth, StripeAddress, StripePosition};
-use crate::parity_map::{read_final_sidecar_directory, SidecarEpochDirectoryEntry};
+use crate::parity_map::{
+    read_final_sidecar_directory, SidecarEpochDirectory, SidecarEpochDirectoryEntry,
+};
 use crate::raw::{
     read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead, PhysicalPositionHint,
     RawTapeSource,
@@ -941,11 +943,23 @@ pub(crate) fn sidecar_geometry_from_total(total: u64, parity: u64) -> Option<(u6
     Some((h, h + parity))
 }
 
+/// Per-run acquisition state. Only failed attempts may be retried; a validated
+/// absence (including a map digest mismatch) is stable for this verification.
+#[derive(Default)]
+pub(crate) enum DirectoryCache {
+    #[default]
+    Unattempted,
+    Loaded(SidecarEpochDirectory),
+    Absent,
+    Failed,
+}
+
 /// Classify the directory's entry for one sidecar. The one place that decides
 /// whether an entry is available, shared with the directory-assisted rescue.
 /// A ParityMap that does not validate against this map (its scope exceeds the
 /// map) supplies no directory. When `tolerate_faults` is set, a fault while
 /// reading the ParityMap does not abort the acquisition: the footer decides.
+#[allow(clippy::too_many_arguments)]
 fn directory_evidence(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
@@ -954,29 +968,31 @@ fn directory_evidence(
     block_size: u32,
     parity: u64,
     tolerate_faults: bool,
+    directory_cache: &mut DirectoryCache,
 ) -> Result<DirectoryEvidence, ParityError> {
-    let loaded_directory;
-    let directory = match scoped_map.sidecar_directory.as_ref() {
-        Some(directory) => directory,
-        None => {
-            loaded_directory = match read_final_sidecar_directory(
-                source,
-                &scoped_map.map,
-                tape_uuid,
-                block_size,
-            ) {
-                Ok(loaded) => loaded,
-                Err(ParityError::FilemarkMapDigestMismatch { .. }) => None,
-                // A device fault is tolerated when the footer decides; an
-                // internal failure (`Invariant`) is a defect and propagates.
-                Err(ParityError::TapeIo(_)) if tolerate_faults => None,
+    if scoped_map.sidecar_directory.is_none()
+        && matches!(
+            directory_cache,
+            DirectoryCache::Unattempted | DirectoryCache::Failed
+        )
+    {
+        *directory_cache = DirectoryCache::Failed;
+        *directory_cache =
+            match read_final_sidecar_directory(source, &scoped_map.map, tape_uuid, block_size) {
+                Ok(Some(loaded)) => DirectoryCache::Loaded(loaded),
+                Ok(None) | Err(ParityError::FilemarkMapDigestMismatch { .. }) => {
+                    DirectoryCache::Absent
+                }
+                Err(ParityError::TapeIo(_)) if tolerate_faults => DirectoryCache::Failed,
                 Err(error) => return Err(error),
             };
-            match loaded_directory.as_ref() {
-                Some(directory) => directory,
-                None => return Ok(DirectoryEvidence::Absent),
-            }
-        }
+    }
+    let cached = match directory_cache {
+        DirectoryCache::Loaded(directory) => Some(&*directory),
+        _ => None,
+    };
+    let Some(directory) = scoped_map.sidecar_directory.as_ref().or(cached) else {
+        return Ok(DirectoryEvidence::Absent);
     };
     if sidecar_entry.tape_file_number >= directory.directory_scope_tape_file_count {
         return Ok(DirectoryEvidence::Unavailable);
@@ -1004,6 +1020,28 @@ pub(crate) fn read_and_parse_sidecar_index(
     scheme: &ParityScheme,
     tape_uuid: &[u8; 16],
     block_size: u32,
+) -> Result<SidecarIndexRead, ParityError> {
+    read_and_parse_sidecar_index_cached(
+        source,
+        scoped_map,
+        sidecar_entry,
+        scheme,
+        tape_uuid,
+        block_size,
+        &mut DirectoryCache::default(),
+    )
+}
+
+/// Acquire through the same reader, caching loaded and established-absent evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_and_parse_sidecar_index_cached(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar_entry: &TapeFileMapEntry,
+    scheme: &ParityScheme,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    directory_cache: &mut DirectoryCache,
 ) -> Result<SidecarIndexRead, ParityError> {
     if sidecar_entry.block_count == 0 {
         return Err(ParityError::SidecarParse(format!(
@@ -1036,6 +1074,7 @@ pub(crate) fn read_and_parse_sidecar_index(
                 block_size,
                 parity,
                 true,
+                directory_cache,
             )?;
             read_sidecar_index_by_footer(
                 source,
@@ -1057,6 +1096,7 @@ pub(crate) fn read_and_parse_sidecar_index(
                 block_size,
                 parity,
                 false,
+                directory_cache,
             )?;
             read_sidecar_index_without_footer(
                 source,
@@ -1275,6 +1315,12 @@ fn read_tail_copy_at(
 ) -> Result<DecodedSidecarIndex, ParityError> {
     // No capacity is reserved from a count that a hostile map or header may
     // state: the reads stop at the first block the file does not hold.
+    let mut run = crate::raw::ReadRun::new(
+        source,
+        block_size,
+        header_block_count.min(sidecar_entry.block_count.saturating_sub(start_block)),
+    );
+    let source: &mut dyn RawTapeSource = &mut run;
     let mut blocks = Vec::new();
     for offset in 0..header_block_count {
         let block_within_file = start_block
@@ -1414,6 +1460,8 @@ pub(crate) fn read_directory_tail_index(
     // fits.
     let tail_start = h + parity;
 
+    let mut run = crate::raw::ReadRun::new(source, block_size, h);
+    let source: &mut dyn RawTapeSource = &mut run;
     let mut blocks = Vec::new();
     for offset in 0..h {
         let physical = map.physical_position(TapeFilePosition {
@@ -1467,7 +1515,8 @@ fn read_primary_sidecar_index_without_footer(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<SidecarIndexRead, ParityError> {
-    let block0 = read_sidecar_block(source, scoped_map, sidecar_entry, 0, block_size)
+    let mut run = crate::raw::ReadRun::new(source, block_size, 1);
+    let block0 = read_sidecar_block(&mut run, scoped_map, sidecar_entry, 0, block_size)
         .map_err(|_| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
     let header = parse_sidecar_header_block(&block0, tape_uuid)
         .map_err(|_| sidecar_metadata_unavailable_from_map_entry(sidecar_entry))?;
@@ -1482,6 +1531,13 @@ fn read_primary_sidecar_index_without_footer(
     }
 
     let h = ParityError::host_usize(header.shard_index_block_count, "sidecar index block count")?;
+    run.after_header(
+        header
+            .shard_index_block_count
+            .saturating_sub(1)
+            .min(sidecar_entry.block_count.saturating_sub(1)),
+    );
+    let source: &mut dyn RawTapeSource = &mut run;
     let mut blocks = Vec::with_capacity(h);
     blocks.push(block0);
     for block_within_file in 1..header.shard_index_block_count {
@@ -1539,6 +1595,14 @@ fn read_sidecar_index_copy(
         footer.sidecar_header_block_count,
         "sidecar index block count",
     )?;
+    let mut run = crate::raw::ReadRun::new(
+        source,
+        block_size,
+        footer
+            .sidecar_header_block_count
+            .min(sidecar_entry.block_count.saturating_sub(start_block)),
+    );
+    let source: &mut dyn RawTapeSource = &mut run;
     let mut blocks = Vec::with_capacity(h);
     for offset in 0..footer.sidecar_header_block_count {
         let block_within_file = start_block
@@ -6787,6 +6851,173 @@ mod tests {
             matches!(result, Err(ParityError::SchemeMismatch { .. })),
             "{result:?}"
         );
+    }
+
+    /// A real encoded final map lets cache tests distinguish parser-established
+    /// absence from I/O failure without substituting the acquisition routine.
+    fn directory_cache_tape(t: &AcquisitionTape, scope: u64) -> (ScopedFilemarkMap, RawVec, usize) {
+        let mut directory = t
+            .with_directory(
+                t.scoped(&t.sidecar.blocks),
+                t.entry(t.sidecar.header.canonical_metadata_hash),
+            )
+            .sidecar_directory
+            .unwrap();
+        directory.directory_scope_tape_file_count = scope;
+        let encoded = crate::parity_map::encode_parity_map_tape_file(
+            &crate::parity_map::ParityMapPayload {
+                tape_uuid: TAPE_UUID,
+                sequence: 0,
+                directory,
+                canonical_map_digest: [0; 32],
+                writer_version: None,
+                write_timestamp: None,
+            },
+            BLOCK_SIZE,
+        )
+        .unwrap();
+        let mut entries = t.scoped(&t.sidecar.blocks).map.entries().to_vec();
+        entries.push(TapeFileMapEntry::parity_map(3, encoded.blocks.len() as u64));
+        let scoped = ScopedFilemarkMap::from_catalog(
+            FilemarkMap::new(entries).unwrap(),
+            t.object_blocks.len() as u64,
+        );
+        let mut raw = raw_tape(&t.object_blocks, &t.sidecar.blocks);
+        let start = raw.records.len();
+        raw.records
+            .extend(encoded.blocks.into_iter().map(Record::Block));
+        raw.records.push(Record::Filemark);
+        (scoped, raw, start)
+    }
+
+    #[test]
+    fn directory_cache_retains_loaded_and_established_absent_states() {
+        let t = AcquisitionTape::new();
+        for state in ["loaded", "invalid", "digest-mismatch", "no-map"] {
+            let (mut scoped, mut raw, start) =
+                directory_cache_tape(&t, if state == "digest-mismatch" { 10 } else { 3 });
+            if state == "invalid" {
+                for record in &mut raw.records[start..] {
+                    if let Record::Block(block) = record {
+                        block.fill(0);
+                    }
+                }
+            }
+            if state == "no-map" {
+                scoped = t.scoped(&t.sidecar.blocks);
+            }
+            let mut cache = DirectoryCache::default();
+            assert!(matches!(cache, DirectoryCache::Unattempted));
+            for attempt in 0..3 {
+                let reads_before = raw.read_lbas.len();
+                let evidence = directory_evidence(
+                    &mut raw,
+                    &scoped,
+                    &scoped.map.entries()[2],
+                    &TAPE_UUID,
+                    BLOCK_SIZE,
+                    scheme_parity_blocks(&t.scheme),
+                    false,
+                    &mut cache,
+                )
+                .unwrap();
+                if state == "loaded" {
+                    assert!(matches!(evidence, DirectoryEvidence::Available(_)));
+                    assert!(matches!(cache, DirectoryCache::Loaded(_)));
+                } else {
+                    assert!(matches!(evidence, DirectoryEvidence::Absent));
+                    assert!(matches!(cache, DirectoryCache::Absent));
+                }
+                if attempt > 0 || state == "no-map" {
+                    assert_eq!(raw.read_lbas.len(), reads_before, "{state} reloaded");
+                } else {
+                    assert!(
+                        raw.read_lbas.len() > reads_before,
+                        "{state} never attempted"
+                    );
+                }
+                // Would fail if a cached result were reloaded.
+                raw.transport_fault_lbas.push(start);
+            }
+        }
+    }
+
+    #[test]
+    fn directory_cache_retries_failures_with_each_epochs_footer_policy() {
+        let t = AcquisitionTape::new();
+        let (scoped, mut raw, start) = directory_cache_tape(&t, 3);
+        raw.transport_fault_lbas.push(start);
+        let mut cache = DirectoryCache::default();
+        let entry = &scoped.map.entries()[2];
+        read_and_parse_sidecar_index_cached(
+            &mut raw, &scoped, entry, &t.scheme, &TAPE_UUID, BLOCK_SIZE, &mut cache,
+        )
+        .expect("usable footer tolerates directory fault");
+        assert!(matches!(cache, DirectoryCache::Failed));
+        let footer = t.sidecar_lba(t.footer_index());
+        let Record::Block(footer_block) = &mut raw.records[footer] else {
+            panic!("footer must be a block")
+        };
+        footer_block[0] ^= 0xff;
+        let result = read_and_parse_sidecar_index_cached(
+            &mut raw, &scoped, entry, &t.scheme, &TAPE_UUID, BLOCK_SIZE, &mut cache,
+        );
+        assert!(matches!(result, Err(ParityError::TapeIo(_))));
+        assert!(matches!(cache, DirectoryCache::Failed));
+        // The default batch adapter's single read is final within each failed
+        // acquisition; the next epoch still retries the failed directory load.
+        assert_eq!(raw.read_lbas.iter().filter(|&&lba| lba == start).count(), 2);
+        raw.transport_fault_lbas.clear();
+        read_and_parse_sidecar_index_cached(
+            &mut raw, &scoped, entry, &t.scheme, &TAPE_UUID, BLOCK_SIZE, &mut cache,
+        )
+        .expect("failed load is retried and directory becomes available");
+        assert!(matches!(cache, DirectoryCache::Loaded(_)));
+        assert_eq!(raw.read_lbas.iter().filter(|&&lba| lba == start).count(), 3);
+    }
+
+    #[test]
+    fn cached_unavailable_directory_entry_does_not_rescue_from_terminal_index() {
+        let t = AcquisitionTape::new();
+        let (scoped, mut raw, _) = directory_cache_tape(&t, 3);
+        let scoped = scoped.with_map_source(MapSource::TerminalReplica);
+        let mut cache = DirectoryCache::default();
+        directory_evidence(
+            &mut raw,
+            &scoped,
+            &scoped.map.entries()[2],
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            scheme_parity_blocks(&t.scheme),
+            false,
+            &mut cache,
+        )
+        .unwrap();
+        let DirectoryCache::Loaded(directory) = &mut cache else {
+            panic!("directory must load")
+        };
+        directory.entries[0].sidecar_header_block_count += 1;
+        for index in [0, t.footer_index()] {
+            let Record::Block(block) = &mut raw.records[t.sidecar_lba(index)] else {
+                panic!("metadata must be a block")
+            };
+            block[0] ^= 0xff;
+        }
+        raw.read_lbas.clear();
+        let result = read_and_parse_sidecar_index_cached(
+            &mut raw,
+            &scoped,
+            &scoped.map.entries()[2],
+            &t.scheme,
+            &TAPE_UUID,
+            BLOCK_SIZE,
+            &mut cache,
+        );
+        assert!(matches!(
+            result,
+            Err(ParityError::SidecarMetadataUnavailable { .. })
+        ));
+        assert!(!t.read_block(&raw, t.tail_start()));
     }
 
     /// The directory is consulted with a valid footer only to see whether an
