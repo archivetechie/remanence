@@ -1083,7 +1083,7 @@ fn verify_terminal_index_after_damage(
             };
         let mut entry_index = 0usize;
         let mut rows = Vec::new();
-        let result = validate_member_payload(
+        let result = validate_member_payload_batched(
             source,
             block_size,
             &envelope,
@@ -1700,7 +1700,7 @@ fn verify_terminal_index_strict(
         let mut entry_index = 0usize;
         let mut replica_rows_seen = Vec::new();
         let mut canonical_mismatch = None;
-        let summary = validate_member_payload(
+        let summary = validate_member_payload_batched(
             source,
             block_size,
             &envelope,
@@ -2021,6 +2021,7 @@ impl IndexSeparationInteriorBlockSource for RawSeparationInteriorSource<'_> {
         &mut self,
         visitor: &mut dyn FnMut(&[u8]) -> Result<(), IndexSeparationError>,
     ) -> Result<(), IndexSeparationError> {
+        let mut run = crate::raw::ReadRun::new(self.source, self.block_size, self.record_count);
         for offset in 0..self.record_count {
             let lba = self.start.lba.checked_add(offset).ok_or(
                 IndexSeparationError::ArithmeticOverflow {
@@ -2028,7 +2029,7 @@ impl IndexSeparationInteriorBlockSource for RawSeparationInteriorSource<'_> {
                 },
             )?;
             let block = match read_fixed_block(
-                self.source,
+                &mut run,
                 PhysicalPositionHint {
                     lba,
                     partition: self.start.partition,
@@ -2216,6 +2217,32 @@ fn validate_member_envelope(
     )?;
 
     Ok(ValidatedReplicaEnvelope { header, footer })
+}
+
+/// Full verification batches the existing payload reader; inventory retains its
+/// original command path and all payload validation stays in one function.
+fn validate_member_payload_batched<FE, FR>(
+    source: &mut dyn RawTapeSource,
+    block_size: u32,
+    envelope: &ValidatedReplicaEnvelope,
+    visit_entry: &mut FE,
+    visit_row: &mut FR,
+) -> Result<TapeIndexReplicaPayloadSummary, TerminalMemberReadError>
+where
+    FE: FnMut(&TapeIndexReplicaMapEntry) -> Result<(), TapeIndexReplicaError>,
+    FR: FnMut(&TapeIndexReplicaObjectRow) -> Result<(), TapeIndexReplicaError>,
+{
+    let mut run = crate::raw::ReadRun::new(
+        source,
+        block_size,
+        envelope
+            .header
+            .plan
+            .edition
+            .replica_layout
+            .payload_record_count,
+    );
+    validate_member_payload(&mut run, block_size, envelope, visit_entry, visit_row)
 }
 
 fn validate_member_payload<FE, FR>(

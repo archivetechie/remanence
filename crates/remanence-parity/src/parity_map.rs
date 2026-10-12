@@ -902,6 +902,8 @@ pub(crate) fn read_parity_map_blocks(
     use crate::filemark_map::TapeFilePosition;
     use crate::raw::{read_fixed_record, tape_error_is_current_medium_damage, FixedRecordRead};
 
+    let mut run = crate::raw::ReadRun::new(source, block_size, entry.block_count);
+    let source: &mut dyn crate::raw::RawTapeSource = &mut run;
     let mut blocks = Vec::new();
     for block_within_file in 0..entry.block_count {
         source.locate_physical(map.physical_position(TapeFilePosition {

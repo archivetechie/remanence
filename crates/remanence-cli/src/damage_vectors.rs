@@ -28,7 +28,9 @@ use std::{
 /// variable-block READ(6) with SILI clear: CHECK CONDITION, ILI, VALID and
 /// INFORMATION = requested − actual, with the record consumed. The chaos model
 /// silently truncates such a read, so the record-length fault needs this to be
-/// observed faithfully. Every other command passes through unchanged.
+/// observed faithfully. For fixed READs the model reports a wrong-sized record
+/// as InvalidInput; translate that specific model signal to current ILI, as a
+/// drive would. Other adapter/transport errors must retain their fatal meaning.
 struct OverlengthReads<T> {
     inner: T,
     scratch: Vec<u8>,
@@ -38,7 +40,25 @@ impl<T: SgTransport> SgTransport for OverlengthReads<T> {
     fn execute_in(&mut self, cdb: &[u8], buf: &mut [u8]) -> Result<TransferOutcome, ScsiError> {
         let variable_read = cdb.first() == Some(&0x08) && cdb.get(1).is_some_and(|b| b & 1 == 0);
         if !variable_read {
-            return self.inner.execute_in(cdb, buf);
+            return match self.inner.execute_in(cdb, buf) {
+                Err(ScsiError::InvalidInput(
+                    "fixed READ encountered non-fixed-size block"
+                    | "fixed READ encountered non-fixed-size sparse zero block",
+                )) if cdb.first() == Some(&0x08) => {
+                    let mut sense = vec![0u8; 18];
+                    sense[0] = 0xf0; // VALID, current fixed-format sense
+                    sense[2] = 0x20; // NO SENSE with ILI
+                                     // No prefix is confirmed by the model's error. The raw
+                                     // reader must reposition and measure the record singly.
+                    sense[4..7].copy_from_slice(&cdb[2..5]);
+                    sense[7] = 10;
+                    Err(ScsiError::CheckCondition {
+                        sense,
+                        bytes_transferred: 0,
+                    })
+                }
+                result => result,
+            };
         }
         // Read with the largest transfer READ(6) allows, then report the fit.
         const MAX_TRANSFER: usize = 0x00ff_ffff;
@@ -75,6 +95,15 @@ impl<T: SgTransport> SgTransport for OverlengthReads<T> {
 }
 
 pub(crate) fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, FaultEngine) {
+    let (drive, engine, _) = source_with_command_log(vector, faults);
+    (drive, engine)
+}
+
+/// Record actual drive commands below the raw adapter and its metric decorator.
+fn source_with_command_log(
+    vector: &VectorImage,
+    faults: &Value,
+) -> (DriveHandle, FaultEngine, remanence_library::RecordingLog) {
     // No key of the fault map may be ignored silently.
     for key in faults.as_object().expect("fault map object").keys() {
         assert!(
@@ -212,6 +241,7 @@ pub(crate) fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, Faul
         engine.clone(),
         DeviceCtx::new().with_backend("model"),
     );
+    let (transport, log) = remanence_library::RecordingTransport::new(transport);
     (
         DriveHandle::open_standalone_with_transport(
             Path::new("/dev/sg-image-model"),
@@ -219,6 +249,7 @@ pub(crate) fn source(vector: &VectorImage, faults: &Value) -> (DriveHandle, Faul
         )
         .unwrap(),
         engine,
+        log,
     )
 }
 
@@ -3009,5 +3040,268 @@ fn s6b_comparison_checks_only_pinned_claims() {
         }
         actual["walk"]["walk_damaged"] = json!([{"tape_file":4,"kind":"InvalidTerminalControl"}]);
         assert!(!compare_s6(id, &case["expected"], checks, &actual).is_empty());
+    }
+}
+
+/// Every frozen damage case exercises both the compatibility loop and actual
+/// fixed-mode drive batches. Compare the whole outcome (including ordered
+/// findings and diagnostics), not just the golden projection's selected fields.
+#[test]
+fn batch_verification_matches_single_records_for_entire_damage_matrix() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    for case in frozen["cases"].as_array().unwrap() {
+        let id = case["id"].as_str().unwrap();
+        let vector = generate(case["image"].as_str().unwrap()).unwrap();
+        let faults = fault_map_of(case, &vector);
+        let observe = |single| {
+            let (mut drive, _) = source(&vector, &faults);
+            let mut raw = crate::terminal_index_drill::InstrumentedSource::new(
+                DriveHandleRawSource::new(&mut drive),
+            );
+            raw.single_record_batches = single;
+            let uuid = vector.written.inputs.tape_uuid;
+            let block_size = vector.written.inputs.block_size;
+            let hints = faults["hints"].as_object().map(|h| ScanRecoveryHints {
+                tape_uuid: uuid,
+                block_size: h["block_size"].as_u64().unwrap() as u32,
+                scheme: ParityConfig::Scheme(scheme(
+                    h["scheme"]["k"].as_u64().unwrap(),
+                    h["scheme"]["m"].as_u64().unwrap(),
+                    h["scheme"]["S"].as_u64().unwrap(),
+                )),
+            });
+            let mode = match &hints {
+                Some(hints) => ScanMode::Recovery(hints),
+                None => ScanMode::Standard,
+            };
+            let result =
+                verify_terminal_index_full_with_scan_mode(&mut raw, &uuid, block_size, None, mode);
+            (
+                format!("{result:?}"),
+                result.as_ref().ok().map(verification_projection),
+            )
+        };
+        assert_eq!(observe(true), observe(false), "damage case {id}");
+    }
+}
+
+/// Three epochs with an Object crossing epoch boundaries. Increasing index
+/// sizes must not multiply positioning commands; data/parity use drive batches.
+#[test]
+fn full_verification_command_counts() {
+    use crate::tape_image_vectors::{inputs, object, recipe, write_model};
+    const TEST_BLOCK: u32 = BLOCK;
+    for stripes in [16] {
+        let mut inputs = inputs("two-epoch");
+        inputs.block_size = TEST_BLOCK;
+        inputs.scheme.stripes_per_neighborhood = stripes;
+        inputs.objects = [4 * stripes as usize, 2 * stripes as usize]
+            .into_iter()
+            .enumerate()
+            .map(|(index, blocks)| {
+                let mut object = object(4, index);
+                object.options.chunk_size = TEST_BLOCK as usize;
+                let bytes = vec![0x35; (blocks - 3) * TEST_BLOCK as usize];
+                let mut spec = object.files[0].spec.clone();
+                spec.size_bytes = bytes.len() as u64;
+                spec.file_sha256 = Some(Sha256::digest(&bytes).into());
+                object.files = vec![crate::tape_image::TapeImageFile::from_bytes(spec, bytes)];
+                object
+            })
+            .collect();
+        inputs.checkpoint_after_objects.clear();
+        inputs.nominal_extent_bytes = 20 * u64::from(TEST_BLOCK);
+        let recipe = recipe(&inputs);
+        let (written, image) = write_model(inputs).expect("three-epoch image");
+        let vector = VectorImage {
+            written,
+            image,
+            recipe,
+        };
+        let (mut drive, _, command_log) =
+            source_with_command_log(&vector, &json!({"unreadable_records": []}));
+        let mut raw = crate::terminal_index_drill::InstrumentedSource::new(
+            DriveHandleRawSource::new(&mut drive),
+        );
+        let result =
+            verify_terminal_index_full(&mut raw, &vector.written.inputs.tape_uuid, TEST_BLOCK)
+                .expect("full verification");
+        assert!(result.is_complete_tape(), "{result:?}");
+        assert_eq!(result.protected().sidecars.len(), 3);
+        let sidecar_files: Vec<_> = result
+            .protected()
+            .sidecars
+            .iter()
+            .map(|s| &vector.image.files[s.tape_file_number as usize])
+            .collect();
+        let mut epoch_locates = Vec::new();
+        for file in &sidecar_files {
+            let start = file.start_record as u64;
+            let end = start + file.bytes.len() as u64 / u64::from(TEST_BLOCK);
+            let locates = raw
+                .locate_lbas
+                .iter()
+                .filter(|&&lba| (start..end).contains(&lba))
+                .count();
+            epoch_locates.push(locates);
+            assert!(
+                locates <= 12,
+                "sidecar LOCATE count grows with metadata: {locates}"
+            );
+            let header = remanence_parity::sidecar::parse_sidecar_header_block(
+                &file.bytes[..TEST_BLOCK as usize],
+                &vector.written.inputs.tape_uuid,
+            )
+            .unwrap();
+            let parity_start = start + header.shard_index_block_count;
+            let parity_end = parity_start + header.parity_block_count;
+            assert!(raw
+                .batch_reads
+                .iter()
+                .any(|&(lba, count)| (parity_start..parity_end).contains(&lba) && count > 1));
+        }
+        let map_entry = vector
+            .written
+            .map
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == TapeFileKind::ParityMap)
+            .expect("final ParityMap");
+        let map_file = &vector.image.files[map_entry.tape_file_number as usize];
+        let map_body_lba = map_file.start_record as u64 + 1;
+        let map_body_reads = raw
+            .read_lbas
+            .iter()
+            .filter(|&&lba| lba == map_body_lba)
+            .count();
+        // One directory acquisition, the scanner's validation, and the
+        // independent copy-health audit. Only acquisition varies by epoch.
+        assert_eq!(map_body_reads, 3, "directory reloaded between epochs");
+        let objects: Vec<_> = vector
+            .written
+            .map
+            .entries()
+            .iter()
+            .filter(|e| e.kind == TapeFileKind::Object)
+            .collect();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].block_count, 4 * u64::from(stripes));
+        assert_eq!(objects[1].block_count, 2 * u64::from(stripes));
+        assert_eq!(vector.image.files.len(), 12);
+        for object in objects {
+            let start = vector.image.files[object.tape_file_number as usize].start_record as u64;
+            assert!(raw
+                .batch_reads
+                .iter()
+                .any(
+                    |&(lba, count)| (start..start + object.block_count).contains(&lba) && count > 1
+                ));
+        }
+        let metadata_blocks = remanence_parity::sidecar::parse_sidecar_header_block(
+            &sidecar_files[0].bytes[..TEST_BLOCK as usize],
+            &vector.written.inputs.tape_uuid,
+        )
+        .unwrap()
+        .shard_index_block_count;
+        let commands = command_log.borrow();
+        let locates = commands.iter().filter(|cdb| cdb[0] == 0x92).count();
+        let positions = commands.iter().filter(|cdb| cdb[0] == 0x34).count();
+        let singles = commands
+            .iter()
+            .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 == 0)
+            .count();
+        let batches = commands
+            .iter()
+            .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 != 0)
+            .count();
+        assert_eq!((locates, positions, singles, batches), (73, 110, 56, 19));
+        assert_eq!(locates, raw.locate_lbas.len());
+        assert_eq!(batches, raw.batch_reads.len());
+        println!("transport counts: LOCATE={locates} READ_POSITION={positions} single_READ={singles} batch_READ={batches}");
+        println!("stripes={stripes} files={} epochs=3 objects=2 metadata_blocks={metadata_blocks} locates={} singles={} batches={} epoch_locates={epoch_locates:?} directory_loads={}",
+            vector.image.files.len(), raw.locate_lbas.len(),
+            raw.read_lbas.len() - raw.batch_reads.iter().map(|(_, n)| *n as usize).sum::<usize>(),
+            raw.batch_reads.len(), map_body_reads - 2);
+    }
+}
+
+/// Exercise metadata growth cheaply at the protected-content layer, whose
+/// codec supports smaller blocks than the terminal-index format.
+#[test]
+fn metadata_run_positioning_is_independent_of_block_count() {
+    use remanence_parity::sidecar::{
+        data_shard_crc64, encode_sidecar_tape_file, SidecarDescriptor,
+    };
+    for stripes in [16, 256] {
+        const SIZE: u32 = 4096;
+        let scheme = scheme(2, 2, stripes);
+        let data = vec![vec![0x35; SIZE as usize]; 2 * stripes as usize];
+        let codec = remanence_parity::codec::ReedSolomonCodec::new(&scheme).unwrap();
+        let mut parity = Vec::new();
+        for stripe in 0..stripes as usize {
+            parity.extend(
+                codec
+                    .encode(&[
+                        data[stripe].clone(),
+                        data[stripes as usize + stripe].clone(),
+                    ])
+                    .unwrap(),
+            );
+        }
+        let sidecar = encode_sidecar_tape_file(
+            &SidecarDescriptor {
+                tape_uuid: [0x12; 16],
+                epoch_id: 0,
+                k: 2,
+                m: 2,
+                stripes_per_epoch: stripes as u32,
+                block_size: SIZE,
+                protected_ordinal_start: 0,
+                protected_ordinal_end_exclusive: data.len() as u64,
+            },
+            &parity,
+            data.iter().map(|b| data_shard_crc64(b)).collect(),
+        )
+        .unwrap();
+        let map = FilemarkMap::new(vec![
+            TapeFileMapEntry::bootstrap(0, 1),
+            TapeFileMapEntry::object(1, data.len() as u64, 0),
+            TapeFileMapEntry::parity_sidecar(
+                2,
+                sidecar.blocks.len() as u64,
+                0,
+                0,
+                data.len() as u64,
+            ),
+        ])
+        .unwrap();
+        let scoped = ScopedFilemarkMap::from_catalog(map, data.len() as u64);
+        let image = ImageDirectoryRawSource::from_tape_files(
+            vec![
+                vec![0; SIZE as usize],
+                data.concat(),
+                sidecar.blocks.concat(),
+            ],
+            SIZE,
+        )
+        .unwrap();
+        let mut raw = crate::terminal_index_drill::InstrumentedSource::new(image);
+        raw.configure_fixed_block_size(SIZE).unwrap();
+        let result =
+            verify_protected_content(&mut raw, &scoped, &scheme, &[0x12; 16], SIZE).unwrap();
+        assert!(result.is_clean(), "{result:?}");
+        assert_eq!(sidecar.header.shard_index_block_count > 1, stripes > 16);
+        assert!(
+            raw.locate_lbas.len() <= 10,
+            "metadata causes per-block LOCATEs: {:?}",
+            raw.locate_lbas
+        );
+        println!(
+            "metadata stripes={stripes} H={} locates={} batches={}",
+            sidecar.header.shard_index_block_count,
+            raw.locate_lbas.len(),
+            raw.batch_reads.len()
+        );
     }
 }

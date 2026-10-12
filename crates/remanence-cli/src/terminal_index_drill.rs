@@ -401,20 +401,34 @@ struct TerminalIndexDrillReport {
     success: bool,
 }
 
-struct InstrumentedSource<S> {
+pub(crate) struct InstrumentedSource<S> {
+    #[cfg(test)]
+    pub(crate) locate_lbas: Vec<u64>,
+    #[cfg(test)]
+    pub(crate) batch_reads: Vec<(u64, u32)>,
+    #[cfg(test)]
+    pub(crate) single_record_batches: bool,
     inner: S,
+    cursor: Option<PhysicalPositionHint>,
     unreadable_lbas: BTreeSet<u64>,
     replacement_records: BTreeMap<u64, Vec<u8>>,
     unproved_lbas: BTreeSet<u64>,
-    read_lbas: Vec<u64>,
+    pub(crate) read_lbas: Vec<u64>,
     eod_calls: u64,
     backward_filemark_calls: u64,
 }
 
 impl<S> InstrumentedSource<S> {
-    fn new(inner: S) -> Self {
+    pub(crate) fn new(inner: S) -> Self {
         Self {
             inner,
+            cursor: None,
+            #[cfg(test)]
+            locate_lbas: Vec::new(),
+            #[cfg(test)]
+            batch_reads: Vec::new(),
+            #[cfg(test)]
+            single_record_batches: false,
             unreadable_lbas: BTreeSet::new(),
             replacement_records: BTreeMap::new(),
             unproved_lbas: BTreeSet::new(),
@@ -449,7 +463,12 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
                 hint.lba
             )));
         }
-        self.inner.locate_physical(hint)
+        #[cfg(test)]
+        self.locate_lbas.push(hint.lba);
+        self.cursor = None;
+        self.inner.locate_physical(hint)?;
+        self.cursor = Some(hint);
+        Ok(())
     }
 
     fn locate_end_of_data(
@@ -461,7 +480,10 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
                 .ok_or(remanence_parity::ParityError::Invariant(
                     "terminal-index EOD metric overflow",
                 ))?;
-        self.inner.locate_end_of_data()
+        self.cursor = None;
+        let position = self.inner.locate_end_of_data()?;
+        self.cursor = Some(position);
+        Ok(position)
     }
 
     fn space_filemarks(
@@ -473,14 +495,20 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
                 remanence_parity::ParityError::Invariant("terminal-index filemark metric overflow"),
             )?;
         }
-        self.inner.space_filemarks(count)
+        self.cursor = None;
+        let outcome = self.inner.space_filemarks(count)?;
+        self.cursor = Some(outcome.position_after);
+        Ok(outcome)
     }
 
     fn read_record(
         &mut self,
         buf: &mut [u8],
     ) -> Result<RawReadOutcome, remanence_parity::ParityError> {
-        let position = self.inner.position()?;
+        let position = match self.cursor.take() {
+            Some(position) => position,
+            None => self.inner.position()?,
+        };
         self.read_lbas.push(position.lba);
         if self.unreadable_lbas.contains(&position.lba) {
             return Err(TapeIoError::CheckCondition(ScsiError::CheckCondition {
@@ -493,6 +521,7 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
             .into());
         }
         let outcome = self.inner.read_record(buf)?;
+        self.cursor = Some(outcome.position_after());
         if let Some(replacement) = self.replacement_records.get(&position.lba) {
             if replacement.len() != buf.len() {
                 return Err(remanence_parity::ParityError::Invariant(
@@ -504,8 +533,55 @@ impl<S: RawTapeSource> RawTapeSource for InstrumentedSource<S> {
         Ok(outcome)
     }
 
+    fn read_records(
+        &mut self,
+        buf: &mut [u8],
+        block_size: u32,
+        max_records: u32,
+        records_remaining_in_file: u32,
+    ) -> remanence_parity::raw::RawReadBatch {
+        // Injected drill damage must still pass through read_record. Healthy
+        // hardware drills forward batches rather than defeating the verifier.
+        let use_single = !self.unreadable_lbas.is_empty() || !self.replacement_records.is_empty();
+        #[cfg(test)]
+        let use_single = use_single || self.single_record_batches;
+        if use_single {
+            return remanence_parity::raw::read_records_default(
+                self,
+                buf,
+                block_size,
+                max_records,
+                records_remaining_in_file,
+            );
+        }
+        let position = match self.cursor.map(Ok).unwrap_or_else(|| self.inner.position()) {
+            Ok(position) => position,
+            Err(error) => {
+                return remanence_parity::raw::RawReadBatch {
+                    records_read: 0,
+                    position_after: None,
+                    end: remanence_parity::raw::RawReadEnd::Error(error),
+                }
+            }
+        };
+        #[cfg(test)]
+        self.batch_reads.push((position.lba, max_records));
+        let result =
+            self.inner
+                .read_records(buf, block_size, max_records, records_remaining_in_file);
+        self.cursor = match result.end {
+            remanence_parity::raw::RawReadEnd::Complete => result.position_after,
+            _ => None,
+        };
+        self.read_lbas
+            .extend((0..result.records_read).map(|n| position.lba + u64::from(n)));
+        result
+    }
+
     fn position(&mut self) -> Result<PhysicalPositionHint, remanence_parity::ParityError> {
-        self.inner.position()
+        let position = self.inner.position()?;
+        self.cursor = Some(position);
+        Ok(position)
     }
 }
 

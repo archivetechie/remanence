@@ -28,8 +28,8 @@ use crate::raw::{
     RawTapeSource,
 };
 use crate::recovery::{
-    data_crc_for_ordinal, parity_crc_for, read_and_parse_sidecar_index, scheme_parity_blocks,
-    sidecar_geometry_from_total, validate_sidecar_for_recovery,
+    data_crc_for_ordinal, parity_crc_for, read_and_parse_sidecar_index_cached,
+    scheme_parity_blocks, sidecar_geometry_from_total, validate_sidecar_for_recovery,
 };
 use crate::sidecar::{
     data_shard_crc64, parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
@@ -414,6 +414,18 @@ fn read_copy(
         Ok(header) => header,
         Err(error) => return Ok(CopyProbe::Invalid(error.to_string())),
     };
+    let block_size = reader.block_size;
+    let next = reader.next.take();
+    let mut run = crate::raw::ReadRun::new(
+        reader.source,
+        block_size,
+        header
+            .shard_index_block_count
+            .saturating_sub(1)
+            .min(sidecar.block_count.saturating_sub(start).saturating_sub(1)),
+    );
+    run.continue_at(next);
+    let mut reader = SequentialReader::new(&mut run, block_size);
     let mut blocks = vec![block0];
     // No capacity is reserved from a count the copy itself states.
     for offset in 1..header.shard_index_block_count {
@@ -494,6 +506,28 @@ pub fn verify_sidecar(
     scheme: &ParityScheme,
     tape_uuid: &[u8; 16],
     block_size: u32,
+) -> Result<SidecarVerification, ParityError> {
+    verify_sidecar_cached(
+        source,
+        scoped_map,
+        sidecar,
+        scheme,
+        tape_uuid,
+        block_size,
+        &mut crate::recovery::DirectoryCache::default(),
+    )
+}
+
+/// Share loaded and established-absent directory evidence across the epoch pass.
+#[allow(clippy::too_many_arguments)]
+fn verify_sidecar_cached(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    sidecar: &TapeFileMapEntry,
+    scheme: &ParityScheme,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    directory_cache: &mut crate::recovery::DirectoryCache,
 ) -> Result<SidecarVerification, ParityError> {
     let (start, end, epoch_id) = match (
         sidecar.protected_ordinal_start,
@@ -635,13 +669,14 @@ pub fn verify_sidecar(
     }
 
     // The index, acquired as the Recoverer acquires it.
-    let acquired = match read_and_parse_sidecar_index(
+    let acquired = match read_and_parse_sidecar_index_cached(
         reader.source,
         scoped_map,
         sidecar,
         scheme,
         tape_uuid,
         block_size,
+        directory_cache,
     ) {
         Ok(read) => Some(read),
         Err(error @ ParityError::SidecarMetadataUnavailable { .. }) => {
@@ -698,6 +733,9 @@ pub fn verify_sidecar(
         if overlap_start >= overlap_end {
             continue;
         }
+        let mut run =
+            crate::raw::ReadRun::new(reader.source, block_size, overlap_end - overlap_start);
+        let mut reader = SequentialReader::new(&mut run, block_size);
         let mut ordinal = overlap_start;
         while ordinal < overlap_end {
             let position = TapeFilePosition {
@@ -750,6 +788,13 @@ pub fn verify_sidecar(
         }
     };
     if let Some((header_blocks, stripes, parity_per_stripe)) = geometry {
+        let mut run = crate::raw::ReadRun::new(
+            reader.source,
+            block_size,
+            (u64::from(stripes) * u64::from(parity_per_stripe))
+                .min(sidecar.block_count.saturating_sub(header_blocks)),
+        );
+        let mut reader = SequentialReader::new(&mut run, block_size);
         for parity_index in 0..parity_per_stripe {
             for stripe_index in 0..stripes {
                 let sidecar_block = parity_block_position(
@@ -819,6 +864,7 @@ pub fn verify_protected_content(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<ProtectedContentVerification, ParityError> {
+    let mut directory_cache = crate::recovery::DirectoryCache::default();
     let mut sidecars = Vec::new();
     let mut parity_map_findings = Vec::new();
     for entry in scoped_map.map.entries() {
@@ -845,8 +891,14 @@ pub fn verify_protected_content(
         {
             continue;
         }
-        sidecars.push(verify_sidecar(
-            source, scoped_map, entry, scheme, tape_uuid, block_size,
+        sidecars.push(verify_sidecar_cached(
+            source,
+            scoped_map,
+            entry,
+            scheme,
+            tape_uuid,
+            block_size,
+            &mut directory_cache,
         )?);
     }
     Ok(ProtectedContentVerification {
