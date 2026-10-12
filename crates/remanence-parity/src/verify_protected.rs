@@ -20,6 +20,9 @@
 //! parity shard, is not a full verification, and this module's result is the
 //! only one that may report a tape's protected content as verified.
 
+mod forward;
+use forward::{DataObservation, ForwardPass, PendingEpoch, PENDING_BUDGET};
+
 use crate::error::ParityError;
 use crate::filemark_map::{ScopedFilemarkMap, TapeFileKind, TapeFileMapEntry, TapeFilePosition};
 use crate::model::{ParityScheme, SidecarMetadataHealth};
@@ -32,7 +35,7 @@ use crate::recovery::{
     scheme_parity_blocks, sidecar_geometry_from_total, validate_sidecar_for_recovery,
 };
 use crate::sidecar::{
-    data_shard_crc64, parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
+    parity_block_position, parity_shard_crc64, parse_sidecar_footer_block,
     parse_sidecar_header_block, parse_sidecar_index_blocks, DecodedSidecarIndex, SidecarCopyKind,
     SidecarFooter,
 };
@@ -515,6 +518,7 @@ pub fn verify_sidecar(
         tape_uuid,
         block_size,
         &mut crate::recovery::DirectoryCache::default(),
+        None,
     )
 }
 
@@ -528,6 +532,7 @@ fn verify_sidecar_cached(
     tape_uuid: &[u8; 16],
     block_size: u32,
     directory_cache: &mut crate::recovery::DirectoryCache,
+    pending: Option<&PendingEpoch>,
 ) -> Result<SidecarVerification, ParityError> {
     let (start, end, epoch_id) = match (
         sidecar.protected_ordinal_start,
@@ -715,26 +720,18 @@ fn verify_sidecar_cached(
 
     // Every data block the sidecar protects, in physical order.
     let mut failed_data_blocks = Vec::new();
+    let mut observations = pending.into_iter().flat_map(PendingEpoch::runs).peekable();
     for entry in scoped_map.map.entries() {
-        if entry.kind != TapeFileKind::Object {
-            continue;
-        }
-        let Some(first) = entry.first_parity_data_ordinal else {
+        let Some((first, overlap_start, overlap_end)) = forward::overlap(entry, start, end)? else {
             continue;
         };
-        let Some(object_end) = first.checked_add(entry.block_count) else {
-            return Err(ParityError::FilemarkMapReconstruct(format!(
-                "object tape file {} ordinal range overflows",
-                entry.tape_file_number
-            )));
-        };
-        let overlap_start = first.max(start);
-        let overlap_end = object_end.min(end);
-        if overlap_start >= overlap_end {
-            continue;
-        }
-        let mut run =
-            crate::raw::ReadRun::new(reader.source, block_size, overlap_end - overlap_start);
+        let buffered = observations.next_if(|run| run.file == entry.tape_file_number);
+        let buffered_len = buffered.map_or(0, |run| run.len() as u64);
+        let mut run = crate::raw::ReadRun::new(
+            reader.source,
+            block_size,
+            overlap_end - overlap_start - buffered_len,
+        );
         let mut reader = SequentialReader::new(&mut run, block_size);
         let mut ordinal = overlap_start;
         while ordinal < overlap_end {
@@ -743,16 +740,21 @@ fn verify_sidecar_cached(
                 block_within_file: ordinal - first,
             };
             let physical = scoped_map.map.physical_position(position)?;
-            let probe = reader.read(physical)?;
-            let reason = match &probe {
-                Probe::Block(block) => match index.filter(|_| usable) {
+            let offset = (ordinal - overlap_start) as usize;
+            // Observations carry no physical cursor. The first unbuffered read
+            // (if any) locates from the live source's actual metadata position.
+            let observation = match buffered.filter(|run| offset < run.len()) {
+                Some(run) => run.get(offset),
+                None => DataObservation::from_probe(reader.read(physical)?),
+            };
+            let reason = match observation.crc() {
+                Some(crc) => match index.filter(|_| usable) {
                     // The Recoverer's own data CRC lookup and comparison.
-                    Some(index) => (data_crc_for_ordinal(index, ordinal, start).ok()
-                        != Some(data_shard_crc64(block)))
-                    .then_some(BlockFailureReason::CrcMismatch),
+                    Some(index) => (data_crc_for_ordinal(index, ordinal, start).ok() != Some(crc))
+                        .then_some(BlockFailureReason::CrcMismatch),
                     None => None,
                 },
-                failed => failed.failure(),
+                None => observation.failure(),
             };
             if let Some(reason) = reason {
                 failed_data_blocks.push(FailedDataBlock {
@@ -855,8 +857,11 @@ fn verify_sidecar_cached(
 /// Verify every sidecar of a validated map in full (REM-PARITY 2.2).
 ///
 /// Only sidecars inside the map's validated prefix are verified: the durable
-/// boundary bounds what the Recoverer may trust, and the Verifier does not
-/// read past it.
+/// boundary bounds which sidecars the Recoverer may trust. Their Object overlaps
+/// include navigational suffix entries, as in direct sidecar verification.
+/// Configures fixed records and preloads the directory before reading eligible
+/// data forward. Stable per-address observations and successful positioning give
+/// the same findings as direct verification; fatal fault order can differ.
 pub fn verify_protected_content(
     source: &mut dyn RawTapeSource,
     scoped_map: &ScopedFilemarkMap,
@@ -864,16 +869,46 @@ pub fn verify_protected_content(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<ProtectedContentVerification, ParityError> {
+    source.configure_fixed_block_size(block_size)?;
     let mut directory_cache = crate::recovery::DirectoryCache::default();
+    directory_cache.preload(source, scoped_map, tape_uuid, block_size)?;
+    let mut pending = ForwardPass::plan(scoped_map, PENDING_BUDGET)?;
+    verify_pass(
+        source,
+        scoped_map,
+        scheme,
+        tape_uuid,
+        block_size,
+        &mut directory_cache,
+        &mut pending,
+    )
+}
+
+/// Single verification funnel; an empty observation table retains Step 1 order.
+#[allow(clippy::too_many_arguments)]
+fn verify_pass(
+    source: &mut dyn RawTapeSource,
+    scoped_map: &ScopedFilemarkMap,
+    scheme: &ParityScheme,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    directory_cache: &mut crate::recovery::DirectoryCache,
+    pending: &mut ForwardPass,
+) -> Result<ProtectedContentVerification, ParityError> {
     let mut sidecars = Vec::new();
     let mut parity_map_findings = Vec::new();
+    let mut reader = SequentialReader::new(source, block_size);
     for entry in scoped_map.map.entries() {
+        if entry.kind == TapeFileKind::Object {
+            pending.read_object(&mut reader, scoped_map, entry)?;
+        }
         if entry.kind == TapeFileKind::ParityMap && scoped_map.is_validated(entry.tape_file_number)
         {
             // Both copies of every ParityMap are read, and one that cannot be
             // used is reported even when the other is (REM-PARITY 2.2).
+            reader.next = None;
             let blocks = crate::parity_map::read_parity_map_blocks(
-                source,
+                reader.source,
                 &scoped_map.map,
                 entry,
                 block_size,
@@ -891,15 +926,19 @@ pub fn verify_protected_content(
         {
             continue;
         }
+        reader.next = None;
+        pending.prepare(entry.tape_file_number);
         sidecars.push(verify_sidecar_cached(
-            source,
+            reader.source,
             scoped_map,
             entry,
             scheme,
             tape_uuid,
             block_size,
-            &mut directory_cache,
+            directory_cache,
+            pending.epoch(entry.tape_file_number),
         )?);
+        pending.release(entry.tape_file_number);
     }
     Ok(ProtectedContentVerification {
         sidecars,
@@ -908,3 +947,94 @@ pub fn verify_protected_content(
         prefix_damage: Vec::new(),
     })
 }
+
+/// Compile-time observation schedule shared by terminal verification's paths.
+/// The production implementation always buffers; tests can retain Step 1 order.
+pub(crate) trait ProtectedPass {
+    fn verify(
+        source: &mut dyn RawTapeSource,
+        map: &ScopedFilemarkMap,
+        scheme: &ParityScheme,
+        uuid: &[u8; 16],
+        block_size: u32,
+    ) -> Result<ProtectedContentVerification, ParityError>;
+}
+
+pub(crate) struct Forward;
+impl ProtectedPass for Forward {
+    fn verify(
+        source: &mut dyn RawTapeSource,
+        map: &ScopedFilemarkMap,
+        scheme: &ParityScheme,
+        uuid: &[u8; 16],
+        block_size: u32,
+    ) -> Result<ProtectedContentVerification, ParityError> {
+        verify_protected_content(source, map, scheme, uuid, block_size)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct Step1;
+#[cfg(any(test, feature = "test-support"))]
+impl ProtectedPass for Step1 {
+    fn verify(
+        source: &mut dyn RawTapeSource,
+        map: &ScopedFilemarkMap,
+        scheme: &ParityScheme,
+        uuid: &[u8; 16],
+        block_size: u32,
+    ) -> Result<ProtectedContentVerification, ParityError> {
+        verify_pass(
+            source,
+            map,
+            scheme,
+            uuid,
+            block_size,
+            &mut crate::recovery::DirectoryCache::default(),
+            &mut ForwardPass::default(),
+        )
+    }
+}
+
+/// Test-only access to the live observation seam, without a production switch.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn verify_protected_step1_for_test(
+    source: &mut dyn RawTapeSource,
+    map: &ScopedFilemarkMap,
+    scheme: &ParityScheme,
+    uuid: &[u8; 16],
+    block_size: u32,
+) -> Result<ProtectedContentVerification, ParityError> {
+    Step1::verify(source, map, scheme, uuid, block_size)
+}
+
+/// Test-only budget injection and allocated-storage high-water measurements.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn verify_protected_budget_for_test(
+    source: &mut dyn RawTapeSource,
+    map: &ScopedFilemarkMap,
+    scheme: &ParityScheme,
+    uuid: &[u8; 16],
+    block_size: u32,
+    budget: usize,
+) -> Result<(ProtectedContentVerification, usize, usize), ParityError> {
+    source.configure_fixed_block_size(block_size)?;
+    let mut cache = crate::recovery::DirectoryCache::default();
+    cache.preload(source, map, uuid, block_size)?;
+    let mut pending = ForwardPass::plan(map, budget)?;
+    let result = verify_pass(
+        source,
+        map,
+        scheme,
+        uuid,
+        block_size,
+        &mut cache,
+        &mut pending,
+    )?;
+    Ok((result, pending.payload_high_water, pending.high_water))
+}
+
+#[cfg(test)]
+mod tests;

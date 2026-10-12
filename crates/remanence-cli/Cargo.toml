@@ -47,6 +47,7 @@ zeroize           = { workspace = true }
 ratatui           = { version = "0.30", optional = true }
 
 [dev-dependencies]
+remanence-parity = { path = "../remanence-parity", features = ["test-support"] }
 tempfile = { workspace = true }
 
 [features]
