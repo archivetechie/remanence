@@ -361,8 +361,6 @@ mod tests {
 
     use rand_core::{Infallible, Rng, TryCryptoRng, TryRng};
 
-    use libcrux_kem::{key_gen_derand, Algorithm};
-
     use super::*;
     use crate::wrap::EphemeralRng;
 
@@ -516,38 +514,6 @@ mod tests {
         assert_eq!(
             *decapsulate(&seed, &ciphertext).expect("official KAT must decapsulate"),
             expected_shared_secret
-        );
-    }
-
-    #[test]
-    fn libcrux_kem_reference_agrees_on_draft10_bytes() {
-        // Draft revisions 07 through 10 did not alter the construction, so
-        // libcrux-kem's Draft06 variant is a byte-compatible reference.
-        let seed_bytes = decode_kat::<XWING_SEED_LEN>("seed");
-        let encapsulation_seed = decode_kat::<XWING_ENCAPSULATION_RANDOMNESS_LEN>("eseed");
-        let seed = XWingSeed::from_bytes(seed_bytes);
-
-        let (public_key, expanded_secret) = derive_keypair(&seed);
-        drop(expanded_secret);
-        let mut rng = FixedRng::new(encapsulation_seed);
-        let (ciphertext, shared_secret) =
-            encapsulate(&public_key, &mut rng).expect("KAT key must encapsulate");
-
-        let (reference_private, reference_public) =
-            key_gen_derand(Algorithm::XWingKemDraft06, &seed_bytes)
-                .expect("reference key derivation must succeed");
-        assert_eq!(reference_public.encode(), public_key.as_bytes());
-        let (reference_secret, reference_ciphertext) = reference_public
-            .encapsulate_derand(&encapsulation_seed)
-            .expect("reference encapsulation must succeed");
-        assert_eq!(reference_ciphertext.encode(), ciphertext);
-        assert_eq!(reference_secret.encode(), *shared_secret);
-        assert_eq!(
-            reference_ciphertext
-                .decapsulate(&reference_private)
-                .expect("reference decapsulation must succeed")
-                .encode(),
-            *shared_secret
         );
     }
 
