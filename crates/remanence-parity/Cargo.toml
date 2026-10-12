@@ -9,6 +9,10 @@ license = "Apache-2.0"
 publish.workspace = true
 repository  .workspace = true
 
+[features]
+# Compile-time seam for cross-crate verification equivalence tests.
+test-support = []
+
 [dependencies]
 # Sibling layer (not stacked): parity and body-format compose above this crate.
 # remanence-format is NOT a dep; the BlockSink / BlockSource

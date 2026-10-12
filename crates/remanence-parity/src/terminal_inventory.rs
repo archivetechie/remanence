@@ -38,7 +38,7 @@ use crate::terminal_tail::{
     TERMINAL_TAIL_COMPONENT_COUNT,
 };
 use crate::verify_protected::{
-    bootstrap_fill_finding, verify_protected_content, ProtectedContentVerification,
+    bootstrap_fill_finding, Forward, ProtectedContentVerification, ProtectedPass,
 };
 #[cfg(test)]
 use remanence_library::TapeIoError;
@@ -822,7 +822,13 @@ pub fn verify_terminal_index_full(
     tape_uuid: &[u8; 16],
     block_size: u32,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut None, ScanMode::Standard)
+    verify_terminal_index_full_inner::<Forward>(
+        source,
+        tape_uuid,
+        block_size,
+        &mut None,
+        ScanMode::Standard,
+    )
 }
 
 /// Perform complete physical verification with optional checkpoint identity
@@ -833,7 +839,7 @@ pub fn verify_terminal_index_full_with_authority(
     block_size: u32,
     authority: &mut dyn BotObjectRecoveryAuthority,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    verify_terminal_index_full_inner(
+    verify_terminal_index_full_inner::<Forward>(
         source,
         tape_uuid,
         block_size,
@@ -850,17 +856,17 @@ pub fn verify_terminal_index_full_with_scan_mode(
     mut authority: Option<&mut dyn BotObjectRecoveryAuthority>,
     mode: ScanMode<'_>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    verify_terminal_index_full_inner(source, tape_uuid, block_size, &mut authority, mode)
+    verify_terminal_index_full_inner::<Forward>(source, tape_uuid, block_size, &mut authority, mode)
 }
 
-fn verify_terminal_index_full_inner(
+fn verify_terminal_index_full_inner<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
     authority: &mut Option<&mut dyn BotObjectRecoveryAuthority>,
     mode: ScanMode<'_>,
 ) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
-    match verify_terminal_index_strict(source, tape_uuid, block_size, mode) {
+    match verify_terminal_index_strict::<V>(source, tape_uuid, block_size, mode) {
         Ok(complete) => {
             let replicas = complete
                 .replicas
@@ -885,7 +891,7 @@ fn verify_terminal_index_full_inner(
             ))
         }
         Err(error) if verification_error_is_physical_damage(&error) => {
-            verify_terminal_index_after_damage(
+            verify_terminal_index_after_damage::<V>(
                 source,
                 tape_uuid,
                 block_size,
@@ -915,7 +921,7 @@ fn verification_error_is_physical_damage(error: &TerminalIndexVerificationError)
     )
 }
 
-fn verify_terminal_index_after_damage(
+fn verify_terminal_index_after_damage<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -937,7 +943,7 @@ fn verify_terminal_index_after_damage(
                     kind: TerminalReplicaFailureKind::PayloadInvalid,
                     detail: error.to_string(),
                 });
-            return terminal_recovery_required(
+            return terminal_recovery_required::<V>(
                 source,
                 tape_uuid,
                 block_size,
@@ -954,7 +960,7 @@ fn verify_terminal_index_after_damage(
     let selection = match inventory {
         TerminalInventoryOutcome::Inventory(selection) => selection,
         TerminalInventoryOutcome::BotStructuralRecoveryRequired(recovery) => {
-            return terminal_recovery_required(
+            return terminal_recovery_required::<V>(
                 source,
                 tape_uuid,
                 block_size,
@@ -973,7 +979,7 @@ fn verify_terminal_index_after_damage(
         .locate_end_of_data()
         .map_err(|error| verification_source_error("SPACE(EOD)", error))?;
     if measured_eod.partition != layout.partition || measured_eod.lba > layout.expected_eod_lba {
-        return terminal_recovery_required(
+        return terminal_recovery_required::<V>(
             source,
             tape_uuid,
             block_size,
@@ -995,7 +1001,7 @@ fn verify_terminal_index_after_damage(
         .truncation
         .is_some_and(|truncation| truncation.tape_file_number < prefix_count)
     {
-        return terminal_recovery_required(
+        return terminal_recovery_required::<V>(
             source,
             tape_uuid,
             block_size,
@@ -1011,7 +1017,7 @@ fn verify_terminal_index_after_damage(
         }
     })?;
     let Some(physical_prefix) = walked.map.entries().get(..prefix_len) else {
-        return terminal_recovery_required(
+        return terminal_recovery_required::<V>(
             source,
             tape_uuid,
             block_size,
@@ -1142,7 +1148,7 @@ fn verify_terminal_index_after_damage(
         .iter()
         .rposition(|evidence| matches!(evidence, TerminalReplicaEvidence::Valid { .. }));
     let Some(selected_index) = selected_index else {
-        return terminal_recovery_required(
+        return terminal_recovery_required::<V>(
             source,
             tape_uuid,
             block_size,
@@ -1227,7 +1233,7 @@ fn verify_terminal_index_after_damage(
                 .ok_or(TerminalIndexVerificationError::ArithmeticOverflow {
                     context: "degraded verification complete file count",
                 })?;
-    let protected = verify_protected_prefix(
+    let protected = verify_protected_prefix::<V>(
         source,
         tape_uuid,
         block_size,
@@ -1291,7 +1297,7 @@ fn walked_verification_scheme(
 /// The full verification of the protected content of a canonical prefix that
 /// a validated terminal replica describes (REM-PARITY 2.2). The map is the
 /// physical prefix the replicas' rows were compared with row by row.
-fn verify_protected_prefix(
+fn verify_protected_prefix<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1309,12 +1315,19 @@ fn verify_protected_prefix(
     );
     // The damage is a finding whatever the pass could read.
     retain_prefix_findings(
-        verify_protected_prefix_rows(source, tape_uuid, block_size, walked, edition, replica_rows),
+        verify_protected_prefix_rows::<V>(
+            source,
+            tape_uuid,
+            block_size,
+            walked,
+            edition,
+            replica_rows,
+        ),
         findings,
     )
 }
 
-fn verify_protected_prefix_rows(
+fn verify_protected_prefix_rows<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1338,7 +1351,7 @@ fn verify_protected_prefix_rows(
             message: error.to_string(),
         }
     })?;
-    verify_protected_content(source, &scoped, &scheme, tape_uuid, block_size)
+    V::verify(source, &scoped, &scheme, tape_uuid, block_size)
         .map_err(|error| verification_source_error("protected-content read", error))
 }
 
@@ -1392,7 +1405,7 @@ fn replica_row_as_map_entry(row: &TapeIndexReplicaMapEntry) -> TapeFileMapEntry 
 /// The full verification of the protected content of a map that the BOT walk
 /// produced, when no terminal replica supplies a canonical prefix: validated
 /// against the final ParityMap or, without one, the bootstrap's scope.
-fn verify_protected_walk(
+fn verify_protected_walk<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1405,7 +1418,7 @@ fn verify_protected_walk(
         .filter_map(bootstrap_fill_finding)
         .collect();
     retain_prefix_findings(
-        verify_protected_walk_rows(source, tape_uuid, block_size, walked),
+        verify_protected_walk_rows::<V>(source, tape_uuid, block_size, walked),
         findings,
     )
 }
@@ -1475,7 +1488,7 @@ fn attach_prefix_findings(
 
 /// Validate the walked scope and read protected blocks; the caller retains fill findings
 /// even when no parity is present or this pass cannot be performed.
-fn verify_protected_walk_rows(
+fn verify_protected_walk_rows<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1526,11 +1539,11 @@ fn verify_protected_walk_rows(
                 "the walked map has neither a readable bootstrap nor a final ParityMap to scope it",
             )),
         };
-    verify_protected_content(source, &scoped, &scheme, tape_uuid, block_size)
+    V::verify(source, &scoped, &scheme, tape_uuid, block_size)
         .map_err(|error| verification_source_error("protected-content read", error))
 }
 
-fn terminal_recovery_required(
+fn terminal_recovery_required<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1569,7 +1582,7 @@ fn terminal_recovery_required(
     .map_err(bot_recovery_verification_error)?;
     // No terminal replica supplies a canonical prefix, but the walked map still
     // has a validated scope, and the protected content within it is verified.
-    let protected = verify_protected_walk(source, tape_uuid, block_size, mode)?;
+    let protected = verify_protected_walk::<V>(source, tape_uuid, block_size, mode)?;
     Ok(TerminalIndexVerificationOutcome::RecoveryRequired(
         Box::new(TerminalIndexRecoveryRequired {
             measured_eod,
@@ -1601,7 +1614,7 @@ fn bot_recovery_verification_error(
 /// in each replica, streams all three replica payloads, and reads every record
 /// in both typed separation extents. Success therefore means all five terminal
 /// components and the complete canonical prefix agreed physically.
-fn verify_terminal_index_strict(
+fn verify_terminal_index_strict<V: ProtectedPass>(
     source: &mut dyn RawTapeSource,
     tape_uuid: &[u8; 16],
     block_size: u32,
@@ -1791,7 +1804,7 @@ fn verify_terminal_index_strict(
     let replicas: [TapeIndexReplicaPayloadSummary; 3] = replica_summaries
         .try_into()
         .expect("terminal replica count is exactly three");
-    let protected = verify_protected_prefix(
+    let protected = verify_protected_prefix::<V>(
         source,
         tape_uuid,
         block_size,
@@ -2577,6 +2590,21 @@ fn inventory_error_to_verification(
     }
 }
 
+/// Step 1 observation order for cross-crate damage-matrix equivalence tests.
+/// Uses exactly the same walk, path selection and verification implementation.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn verify_terminal_index_step1_for_test(
+    source: &mut dyn RawTapeSource,
+    tape_uuid: &[u8; 16],
+    block_size: u32,
+    mode: ScanMode<'_>,
+) -> Result<TerminalIndexVerificationOutcome, TerminalIndexVerificationError> {
+    verify_terminal_index_full_inner::<crate::verify_protected::Step1>(
+        source, tape_uuid, block_size, &mut None, mode,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3235,7 +3263,7 @@ mod tests {
         let walked =
             scan_verification_prefix(&mut source, &TAPE_UUID, BLOCK_SIZE, ScanMode::Standard)
                 .unwrap();
-        let error = verify_protected_prefix(
+        let error = verify_protected_prefix::<Forward>(
             &mut source,
             &TAPE_UUID,
             BLOCK_SIZE,
@@ -3271,8 +3299,13 @@ mod tests {
             let error = if terminal {
                 verify_terminal_index_full(&mut source, &TAPE_UUID, BLOCK_SIZE).unwrap_err()
             } else {
-                verify_protected_walk(&mut source, &TAPE_UUID, BLOCK_SIZE, ScanMode::Standard)
-                    .unwrap_err()
+                verify_protected_walk::<Forward>(
+                    &mut source,
+                    &TAPE_UUID,
+                    BLOCK_SIZE,
+                    ScanMode::Standard,
+                )
+                .unwrap_err()
             };
             assert!(matches!(
                 error,

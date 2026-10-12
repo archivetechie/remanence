@@ -3085,6 +3085,103 @@ fn batch_verification_matches_single_records_for_entire_damage_matrix() {
     }
 }
 
+/// Stable per-address damage must have identical outcomes and ordered findings
+/// with the forward observation schedule and the original Step 1 schedule.
+#[test]
+fn forward_verification_matches_step1_for_entire_damage_matrix() {
+    let frozen: Value = serde_json::from_str(EXPECTATIONS).unwrap();
+    let cases = frozen["cases"].as_array().unwrap();
+    assert!(!cases.is_empty());
+    let mut distinct_schedules = 0;
+    for case in cases {
+        let id = case["id"].as_str().unwrap();
+        let vector = generate(case["image"].as_str().unwrap()).unwrap();
+        let faults = fault_map_of(case, &vector);
+        let uuid = vector.written.inputs.tape_uuid;
+        let block_size = vector.written.inputs.block_size;
+        let hints = faults["hints"].as_object().map(|h| ScanRecoveryHints {
+            tape_uuid: uuid,
+            block_size: h["block_size"].as_u64().unwrap() as u32,
+            scheme: ParityConfig::Scheme(scheme(
+                h["scheme"]["k"].as_u64().unwrap(),
+                h["scheme"]["m"].as_u64().unwrap(),
+                h["scheme"]["S"].as_u64().unwrap(),
+            )),
+        });
+        let mode = hints
+            .as_ref()
+            .map_or(ScanMode::Standard, ScanMode::Recovery);
+        let (mut before, _, before_log) = source_with_command_log(&vector, &faults);
+        let (mut after, _, after_log) = source_with_command_log(&vector, &faults);
+        let before = remanence_parity::terminal_inventory::verify_terminal_index_step1_for_test(
+            &mut DriveHandleRawSource::new(&mut before),
+            &uuid,
+            block_size,
+            mode,
+        );
+        let after = verify_terminal_index_full_with_scan_mode(
+            &mut DriveHandleRawSource::new(&mut after),
+            &uuid,
+            block_size,
+            None,
+            mode,
+        );
+        distinct_schedules += usize::from(*before_log.borrow() != *after_log.borrow());
+        assert_eq!(
+            format!("{before:?}"),
+            format!("{after:?}"),
+            "damage case {id}"
+        );
+    }
+    assert!(
+        distinct_schedules > 0,
+        "the observation schedules must actually differ"
+    );
+    println!("distinct transport schedules: {distinct_schedules}");
+    println!("forward / Step 1 equivalence: {} damage cases", cases.len());
+}
+
+/// Damage-touched Object files still have to agree with replica row counts;
+/// the relaxed kind/ordinal comparison must never authorize a forward sweep.
+#[test]
+fn damaged_object_count_mismatch_never_authorizes_protected_reads() {
+    let mut vector = generate("a4-minimal").unwrap();
+    // Move one Object record into the following sidecar. All later LBAs,
+    // including the surviving terminal replica envelopes, remain unchanged.
+    let moved = vector.image.files[1].bytes.split_off(3 * BLOCK as usize);
+    vector.image.files[2].bytes.splice(0..0, moved);
+    let faults = json!({"unreadable_records": [{"lba": 2}]});
+    let (mut before, _) = source(&vector, &faults);
+    let (mut after, _) = source(&vector, &faults);
+    let uuid = vector.written.inputs.tape_uuid;
+    let before = remanence_parity::terminal_inventory::verify_terminal_index_step1_for_test(
+        &mut DriveHandleRawSource::new(&mut before),
+        &uuid,
+        BLOCK,
+        ScanMode::Standard,
+    );
+    let after =
+        verify_terminal_index_full(&mut DriveHandleRawSource::new(&mut after), &uuid, BLOCK);
+    assert_eq!(format!("{before:?}"), format!("{after:?}"));
+    match after {
+        Ok(TerminalIndexVerificationOutcome::RecoveryRequired(recovery)) => {
+            assert!(recovery.bot_recovery.damaged_region_count > 0);
+            assert!(
+                recovery.replicas.iter().all(|replica| matches!(
+                    replica,
+                    TerminalReplicaEvidence::Invalid(failure)
+                        if failure.detail.contains("canonical row")
+                            && failure.detail.contains("block_count: 3")
+                )),
+                "{recovery:?}"
+            );
+            assert!(recovery.protected.sidecars.is_empty());
+            assert!(recovery.protected.not_performed.is_some());
+        }
+        other => panic!("count-mismatched damaged Object must require recovery: {other:?}"),
+    }
+}
+
 /// Three epochs with an Object crossing epoch boundaries. Increasing index
 /// sizes must not multiply positioning commands; data/parity use drive batches.
 #[test]
@@ -3215,7 +3312,8 @@ fn full_verification_command_counts() {
             .iter()
             .filter(|cdb| cdb[0] == 0x08 && cdb[1] & 1 != 0)
             .count();
-        assert_eq!((locates, positions, singles, batches), (73, 110, 56, 19));
+        // Step 2 setup observes the directory excursion's return position.
+        assert_eq!((locates, positions, singles, batches), (73, 111, 56, 19));
         assert_eq!(locates, raw.locate_lbas.len());
         assert_eq!(batches, raw.batch_reads.len());
         println!("transport counts: LOCATE={locates} READ_POSITION={positions} single_READ={singles} batch_READ={batches}");
@@ -3305,3 +3403,5 @@ fn metadata_run_positioning_is_independent_of_block_count() {
         );
     }
 }
+
+mod forward_counts;

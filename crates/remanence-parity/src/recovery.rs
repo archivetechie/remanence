@@ -954,6 +954,39 @@ pub(crate) enum DirectoryCache {
     Failed,
 }
 
+impl DirectoryCache {
+    /// Preload before the data sweep. Failed loads remain retryable: acquisition
+    /// must still apply its footer-dependent fault policy at the original site.
+    pub(crate) fn preload(
+        &mut self,
+        source: &mut dyn RawTapeSource,
+        scoped_map: &ScopedFilemarkMap,
+        tape_uuid: &[u8; 16],
+        block_size: u32,
+    ) -> Result<(), ParityError> {
+        if scoped_map.sidecar_directory.is_some() {
+            return Ok(());
+        }
+        if !scoped_map
+            .map
+            .entries()
+            .iter()
+            .any(|entry| entry.kind == TapeFileKind::ParityMap)
+        {
+            *self = Self::Absent;
+            return Ok(());
+        }
+        let resume = source.position()?;
+        *self = match read_final_sidecar_directory(source, &scoped_map.map, tape_uuid, block_size) {
+            Ok(Some(directory)) => Self::Loaded(directory),
+            Ok(None) | Err(ParityError::FilemarkMapDigestMismatch { .. }) => Self::Absent,
+            Err(_) => Self::Failed,
+        };
+        source.locate_physical(resume)?;
+        Ok(())
+    }
+}
+
 /// Classify the directory's entry for one sidecar. The one place that decides
 /// whether an entry is available, shared with the directory-assisted rescue.
 /// A ParityMap that does not validate against this map (its scope exceeds the
