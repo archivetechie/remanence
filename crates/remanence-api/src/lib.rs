@@ -127,14 +127,14 @@ pub(crate) use live_status::{DriveByteCounters, LibrarySnapshot};
 pub use mount::{load_tape_by_uuid, LoadByUuidError};
 pub use pool_write::{
     build_tape_bootstrap, can_read, can_write, check_writability_preconditions,
-    lto_generation_from_drive_product, lto_generation_from_voltag, raw_capacity_bytes,
-    replay_committed_pool_write_from_state, seal_decision_after_write, select_tape_in_pool,
-    select_tape_in_pool_for_write_session, verify_tape_identity, write_tape_bootstrap,
-    write_to_selected_drive_checkpointed, LtoGen, ObjectWriteMediaError, PoolWriteError,
-    PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResources,
-    PoolWriteResult, SelectTapeError, SelectedTape, StreamedWriteSource, TapeIdentityError,
-    TapePositionAfterWrite, TapeSealReason, TapeUuid, WritabilityError, WriteObjectInputKind,
-    WriteObjectSource, WriteObjectToPoolRequest,
+    lto_generation_from_drive_product, raw_capacity_bytes, replay_committed_pool_write_from_state,
+    seal_decision_after_write, select_tape_in_pool, select_tape_in_pool_for_write_session,
+    tape_generation, verify_tape_identity, write_tape_bootstrap,
+    write_to_selected_drive_checkpointed, LtoGen, MediaObservation, ObjectWriteMediaError,
+    PoolWriteError, PoolWriteObjectCopyRecord, PoolWriteObjectRecord, PoolWriteRepresentation,
+    PoolWriteResources, PoolWriteResult, SelectTapeError, SelectedTape, StreamedWriteSource,
+    TapeIdentityError, TapePositionAfterWrite, TapeSealReason, TapeUuid, WritabilityError,
+    WriteObjectInputKind, WriteObjectSource, WriteObjectToPoolRequest,
 };
 #[cfg(test)]
 pub use pool_write::{write_object_to_pool, write_to_selected_tape};
@@ -149,11 +149,11 @@ pub use tape_init::{
     classify_bootstrap_adoption_from_source, classify_bot_bytes, classify_bot_from_source,
     classify_bot_identity_bytes, decide_tape_init, has_canonical_adoption_geometry,
     maybe_write_tape_init_bootstrap, probe_bot_identity_from_source,
-    project_tape_init_catalog_inputs, sniff, BarcodeLifecycleState, BootstrapAdoptionProjection,
+    project_tape_init_catalog_inputs, sniff, BootstrapAdoptionProjection,
     BootstrapTailClassification, BotClassification, BotIdentityClassification, BotInitProjection,
     CatalogBarcodeRelation, CatalogRowDisposition, CatalogTapeInitRow, CommittedCopyState,
-    FormatId, InitDecision, TapeInitCatalogProjection, TapeInitError, TapeInitGeometry,
-    TapeInitWriteAction, TapeInitWriteError, TapeInitWriteOptions,
+    FormatId, InitDecision, LabelLifecycleState, TapeInitCatalogProjection, TapeInitError,
+    TapeInitGeometry, TapeInitWriteAction, TapeInitWriteError, TapeInitWriteOptions,
     CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
 };
 pub use write_session_ingress::WriteSessionApi;

@@ -13,6 +13,9 @@ pub mod config;
 pub mod error;
 pub mod index;
 pub mod lock;
+pub mod media;
+pub use media::{tape_generation, GenerationSource, LabelProvenance, LtoGen, MediaObservation};
+pub use remanence_library::DriveKey;
 pub mod paths;
 pub mod state;
 

@@ -11,6 +11,8 @@ repository  .workspace = true
 
 [dependencies]
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 remanence-scsi = { path = "../remanence-scsi" }
 thiserror      = { workspace = true }
 tokio          = { workspace = true }

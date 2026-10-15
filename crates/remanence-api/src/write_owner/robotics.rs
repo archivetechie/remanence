@@ -231,7 +231,10 @@ pub(crate) fn run_load_sequence(
         .and_then(|candidate| candidate.installed.as_ref())
         .and_then(|drive| drive.sg_path.as_ref())
         .map(|path| path.display().to_string());
-    let family = session_open_media_family(barcode.as_deref());
+    let observation = index
+        .readiness_media_observation(barcode.as_deref())
+        .map_err(|e| e.to_string())?;
+    let family = session_open_media_family(observation);
     let retryable_load_completion = match library.load(slot, bay, &cfg.policy) {
         Ok(()) => None,
         Err(error) => match retryable_readiness_from_load_error(&error, family) {
@@ -245,21 +248,13 @@ pub(crate) fn run_load_sequence(
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
             operation_id,
             run_id: None,
-            library_serial: library.library().serial.clone(),
+            endpoint: remanence_state::DriveKey::new(library.library().serial.clone(), bay),
             changer_sg: Some(library.library().changer_sg.display().to_string()),
-            drive_element: bay,
             drive_sg,
             drive_serial,
             barcode,
             source_slot: Some(slot),
-            media_generation: library
-                .library()
-                .drive_bays
-                .iter()
-                .find(|candidate| candidate.element_address == bay)
-                .and_then(|candidate| candidate.loaded_tape.as_deref())
-                .and_then(crate::lto_generation_from_voltag)
-                .map(|generation| generation.generation_number()),
+            media_generation: observation.map(|o| o.generation.generation_number()),
             phase: "load_drive_readiness".to_string(),
             state: "planned".to_string(),
             dirty_scope: Some("drive+tape".to_string()),

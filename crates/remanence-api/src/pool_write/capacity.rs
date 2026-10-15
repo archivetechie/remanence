@@ -23,7 +23,7 @@ use crate::pool_selection::{
     capacity_admission_disposition, AdmissionDisposition, CapacityAdmissionInput, TapeFitState,
 };
 
-use super::media::{lto_generation_from_voltag, raw_capacity_bytes};
+use super::media::{raw_capacity_bytes, tape_generation};
 use super::model::seal_decision_after_write;
 use super::model::{
     BatchedAppendPosition, BatchedNoParityAppendContext, NoParityAppendContext,
@@ -75,10 +75,7 @@ pub(crate) fn validate_pool_capacity_invariant_for_tapes(
     if let Some(capacity_bytes) = tapes
         .iter()
         .filter_map(|tape| {
-            tape.voltag
-                .as_deref()
-                .and_then(lto_generation_from_voltag)
-                .map(raw_capacity_bytes)
+            tape_generation(tape).map(|(generation, _)| raw_capacity_bytes(generation))
         })
         .min()
     {
@@ -117,12 +114,9 @@ pub(crate) fn tape_fit_state_from_record(
 }
 
 pub(crate) fn tape_capacity_bytes(tape: &TapeRecord) -> Result<u64, WritabilityError> {
-    let voltag = tape
-        .voltag
-        .as_deref()
-        .ok_or_else(|| missing_geometry("voltag is null"))?;
-    let generation = lto_generation_from_voltag(voltag)
-        .ok_or_else(|| missing_geometry("voltag does not end in a known LTO suffix"))?;
+    let (generation, _) = tape_generation(tape).ok_or_else(|| {
+        missing_geometry("cartridge generation is unknown; set generation before writing")
+    })?;
     Ok(raw_capacity_bytes(generation))
 }
 

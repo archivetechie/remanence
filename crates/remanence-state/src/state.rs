@@ -65,14 +65,12 @@ pub enum TapeJournalIngestionOutcome {
 /// Exact physical provenance recorded for one BOT identity adoption.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapAdoptionEvidence {
-    /// Inquiry serial of the selected library.
-    pub library_serial: String,
-    /// Inquiry revision of the selected library.
-    pub library_revision: String,
-    /// Exact storage element to which the medium was returned.
-    pub home_slot: u16,
-    /// Exact drive element used throughout the physical recheck.
-    pub drive_element: u16,
+    /// Durable identity of the exact endpoint used for the physical recheck.
+    pub endpoint: crate::DriveKey,
+    /// Changer inquiry revision, required for a Bay and absent for Standalone.
+    pub library_revision: Option<String>,
+    /// Return storage element, required for a Bay and absent for Standalone.
+    pub home_slot: Option<u16>,
     /// Inquiry serial of the selected drive.
     pub drive_serial: String,
     /// Exact Bootstrap hardware-compression flag (must be false).
@@ -81,6 +79,33 @@ pub struct BootstrapAdoptionEvidence {
     pub configured_drive_compression: bool,
     /// Typed observed post-Bootstrap layout.
     pub physical_tail: BootstrapAdoptionTailEvidence,
+}
+
+/// One validation funnel for live adoption and authoritative audit replay.
+pub(crate) fn validate_bootstrap_endpoint_evidence(
+    endpoint: &crate::DriveKey,
+    library_revision: Option<&str>,
+    home_slot: Option<u16>,
+    drive_serial: &str,
+) -> Result<(), StateError> {
+    let valid_text = |value: &str| !value.is_empty() && value.trim() == value;
+    let valid = valid_text(drive_serial)
+        && match endpoint {
+            crate::DriveKey::Bay { library_serial, .. } => {
+                valid_text(library_serial)
+                    && library_revision.is_some_and(valid_text)
+                    && home_slot.is_some()
+            }
+            crate::DriveKey::Standalone {
+                drive_serial: serial,
+            } => serial == drive_serial && library_revision.is_none() && home_slot.is_none(),
+        };
+    if !valid {
+        return Err(StateError::ConfigInvalid(
+            "bootstrap adoption has invalid endpoint evidence".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Valid-BOT tail evidence accepted by the durable adoption boundary.
@@ -217,6 +242,12 @@ pub struct CatalogResetPreflightTape {
     pub tape_uuid: [u8; 16],
     /// Bound volume tag, absent for unbound retired history.
     pub voltag: Option<String>,
+    /// Label provenance preserved across reset.
+    pub voltag_source: Option<String>,
+    /// Recorded media generation preserved across reset.
+    pub cartridge_generation: Option<String>,
+    /// Generation provenance preserved across reset.
+    pub generation_source: Option<String>,
     /// Catalog kind (`data` or `cleaning`).
     pub kind: String,
     /// Current source-catalog pool assignment.
@@ -665,6 +696,17 @@ impl StateHandle {
     /// Provision or reprovision one tape while coordinating any old physical
     /// identity's durable wrap-map calibration eviction.
     pub fn provision_tape(&mut self, input: ProvisionTapeInput) -> Result<(), StateError> {
+        let observation = crate::MediaObservation::label_hint(&input.voltag);
+        self.provision_tape_with_media(input, crate::LabelProvenance::Changer, observation)
+    }
+
+    /// Provision observed media through the calibration-owning state boundary.
+    pub fn provision_tape_with_media(
+        &mut self,
+        input: ProvisionTapeInput,
+        provenance: crate::LabelProvenance,
+        observation: Option<crate::MediaObservation>,
+    ) -> Result<(), StateError> {
         let prior = match self.index.get_tape(&input.tape_uuid)? {
             Some(tape) => Some(tape),
             None => self.index.get_tape_by_voltag(input.voltag.as_str())?,
@@ -684,10 +726,47 @@ impl StateHandle {
                 })
             })
             .transpose()?;
-        self.index.provision_tape(input)?;
+        self.index
+            .provision_tape_with_media(input, provenance, observation)?;
         if let Some(prior_uuid) = prior_uuid_to_evict {
             self.calibration.record_map_evicted(prior_uuid)?;
         }
+        Ok(())
+    }
+
+    /// Rebind a shell label after the caller proves the target BOT identity.
+    /// Audit is fsynced before projection, so replay completes an interrupted rebind.
+    pub fn rebind_tape_label(
+        &mut self,
+        tape_uuid: [u8; 16],
+        label: &str,
+        previous_uuid: [u8; 16],
+    ) -> Result<(), StateError> {
+        let records = FileAuditLog::replay(&self.paths.audit_dir)?;
+        self.index.replay_audit_records(&records)?;
+        self.index
+            .preview_label_rebind(tape_uuid, label, previous_uuid)?;
+        self.audit.append(AuditEventRecord {
+            actor: AuditActor::local_user(),
+            source_layer: SourceLayer::Layer4,
+            operation_id: None,
+            session_id: None,
+            idempotency_key: None,
+            event: AuditEvent::TapeLabelRebound,
+            subject: AuditSubject {
+                kind: "tape".into(),
+                id: Some(hex_tape_uuid(tape_uuid)),
+            },
+            detail: BTreeMap::from([
+                ("voltag".into(), CborValue::Text(label.into())),
+                (
+                    "previous_uuid".into(),
+                    CborValue::Bytes(previous_uuid.to_vec()),
+                ),
+                ("voltag_source".into(), CborValue::Text("operator".into())),
+            ]),
+        })?;
+        self.replay_audit_projection()?;
         Ok(())
     }
 
@@ -728,27 +807,33 @@ impl StateHandle {
                     .to_string(),
             ));
         }
-        for (name, value) in [
-            ("library_serial", evidence.library_serial.as_str()),
-            ("library_revision", evidence.library_revision.as_str()),
-            ("drive_serial", evidence.drive_serial.as_str()),
-        ] {
-            if value.trim().is_empty() || value.trim() != value {
-                return Err(StateError::ConfigInvalid(format!(
-                    "bootstrap adoption {name} must be non-empty and trimmed"
-                )));
-            }
-        }
+        validate_bootstrap_endpoint_evidence(
+            &evidence.endpoint,
+            evidence.library_revision.as_deref(),
+            evidence.home_slot,
+            &evidence.drive_serial,
+        )?;
         let state = evidence.physical_tail.adopted_state();
-        let pool_id =
-            derive_tape_pool_from_voltag(input.voltag.as_str(), &self.config.tape_pool_rules)
+        let pool_id = if let Some(pool) = &input.pool_id {
+            if pool.trim().is_empty() || pool.trim() != pool {
+                return Err(StateError::ConfigInvalid(
+                    "adoption pool must be non-empty and trimmed".into(),
+                ));
+            }
+            pool.clone()
+        } else {
+            input
+                .voltag
+                .as_deref()
+                .and_then(|label| derive_tape_pool_from_voltag(label, &self.config.tape_pool_rules))
                 .ok_or_else(|| {
                     StateError::TapeProvisionConflict(format!(
                         "bootstrap barcode {:?} does not match any locked tape_pool_rule",
                         input.voltag
                     ))
                 })?
-                .to_string();
+                .to_string()
+        };
         if !self.config.tape_pools.iter().any(|pool| pool.id == pool_id) {
             return Err(StateError::TapeProvisionConflict(format!(
                 "bootstrap barcode {:?} derives unconfigured pool {pool_id:?}",
@@ -861,7 +946,14 @@ impl StateHandle {
             .map(|outcome| outcome.assignment_generation)
             .unwrap_or(1);
         let mut detail = BTreeMap::from([
-            ("voltag".to_string(), CborValue::Text(input.voltag.clone())),
+            (
+                "voltag".to_string(),
+                input
+                    .voltag
+                    .clone()
+                    .map(CborValue::Text)
+                    .unwrap_or(CborValue::Null),
+            ),
             ("pool_id".to_string(), CborValue::Text(pool_id.clone())),
             (
                 "block_size".to_string(),
@@ -881,20 +973,8 @@ impl StateHandle {
                 CborValue::Integer(projected_assignment_generation.into()),
             ),
             (
-                "library_serial".to_string(),
-                CborValue::Text(evidence.library_serial),
-            ),
-            (
-                "library_revision".to_string(),
-                CborValue::Text(evidence.library_revision),
-            ),
-            (
-                "home_slot".to_string(),
-                CborValue::Integer(evidence.home_slot.into()),
-            ),
-            (
-                "drive_element".to_string(),
-                CborValue::Integer(evidence.drive_element.into()),
+                "endpoint_key".into(),
+                CborValue::Text(evidence.endpoint.encode()),
             ),
             (
                 "drive_serial".to_string(),
@@ -913,6 +993,56 @@ impl StateHandle {
                 CborValue::Text(evidence.physical_tail.as_str().to_string()),
             ),
         ]);
+        if let crate::DriveKey::Bay {
+            library_serial,
+            bay,
+        } = &evidence.endpoint
+        {
+            detail.insert(
+                "library_serial".into(),
+                CborValue::Text(library_serial.clone()),
+            );
+            detail.insert("drive_element".into(), CborValue::Integer((*bay).into()));
+            detail.insert(
+                "library_revision".into(),
+                CborValue::Text(
+                    evidence
+                        .library_revision
+                        .clone()
+                        .expect("validated Bay revision"),
+                ),
+            );
+            detail.insert(
+                "home_slot".into(),
+                CborValue::Integer(evidence.home_slot.expect("validated Bay slot").into()),
+            );
+        }
+        detail.insert("media_observation_recorded".into(), CborValue::Bool(true));
+        detail.insert(
+            "voltag_source".into(),
+            CborValue::Text(input.label_provenance.as_str().into()),
+        );
+        detail.insert(
+            "assignment_source".into(),
+            CborValue::Text(
+                if input.pool_id.is_some() {
+                    "operator"
+                } else {
+                    "rule"
+                }
+                .into(),
+            ),
+        );
+        if let Some(observation) = input.observation {
+            detail.insert(
+                "cartridge_generation".into(),
+                CborValue::Text(observation.generation.media_code().into()),
+            );
+            detail.insert(
+                "generation_source".into(),
+                CborValue::Text(observation.source.as_str().into()),
+            );
+        }
         detail.insert("identity_only".to_string(), CborValue::Bool(true));
         self.audit.append(AuditEventRecord {
             actor: AuditActor::local_user(),
@@ -1336,27 +1466,80 @@ fn bootstrap_adoption_request_fingerprint(
     let mut hash = Sha256::new();
     hash.update(b"remanence.bootstrap-adoption-request.v1\0");
     field(&mut hash, "tape_uuid", input.tape_uuid.as_slice());
-    field(&mut hash, "voltag", input.voltag.as_bytes());
+    field(
+        &mut hash,
+        "voltag",
+        input.voltag.as_deref().unwrap_or_default().as_bytes(),
+    );
+    if input.label_provenance != crate::LabelProvenance::Changer
+        || input.observation
+            != input
+                .voltag
+                .as_deref()
+                .and_then(crate::MediaObservation::label_hint)
+        || input.pool_id.is_some()
+    {
+        field(
+            &mut hash,
+            "voltag_source",
+            input.label_provenance.as_str().as_bytes(),
+        );
+        field(
+            &mut hash,
+            "assignment_source",
+            if input.pool_id.is_some() {
+                b"operator"
+            } else {
+                b"rule"
+            },
+        );
+        if let Some(observation) = input.observation {
+            field(
+                &mut hash,
+                "cartridge_generation",
+                observation.generation.media_code().as_bytes(),
+            );
+            field(
+                &mut hash,
+                "generation_source",
+                observation.source.as_str().as_bytes(),
+            );
+        }
+    }
+
     field(&mut hash, "block_size", &input.block_size.to_be_bytes());
     field(&mut hash, "geometry", geometry.as_bytes());
     field(&mut hash, "pool_id", pool_id.as_bytes());
     field(&mut hash, "state", state.as_str().as_bytes());
-    field(
-        &mut hash,
-        "library_serial",
-        evidence.library_serial.as_bytes(),
-    );
-    field(
-        &mut hash,
-        "library_revision",
-        evidence.library_revision.as_bytes(),
-    );
-    field(&mut hash, "home_slot", &evidence.home_slot.to_be_bytes());
-    field(
-        &mut hash,
-        "drive_element",
-        &evidence.drive_element.to_be_bytes(),
-    );
+    match &evidence.endpoint {
+        crate::DriveKey::Bay {
+            library_serial,
+            bay,
+        } => {
+            // Preserve historical Bay fingerprints exactly.
+            field(&mut hash, "library_serial", library_serial.as_bytes());
+            field(
+                &mut hash,
+                "library_revision",
+                evidence
+                    .library_revision
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            field(
+                &mut hash,
+                "home_slot",
+                &evidence.home_slot.unwrap_or_default().to_be_bytes(),
+            );
+            field(&mut hash, "drive_element", &bay.to_be_bytes());
+        }
+        crate::DriveKey::Standalone { .. } => field(
+            &mut hash,
+            "endpoint_key",
+            evidence.endpoint.encode().as_bytes(),
+        ),
+    }
     field(&mut hash, "drive_serial", evidence.drive_serial.as_bytes());
     field(
         &mut hash,
@@ -1766,6 +1949,9 @@ fn catalog_reset_preflight_tape(tape: TapeRecord) -> Result<CatalogResetPrefligh
     Ok(CatalogResetPreflightTape {
         tape_uuid,
         voltag: tape.voltag,
+        voltag_source: tape.voltag_source.map(|source| source.as_str().to_string()),
+        cartridge_generation: tape.cartridge_generation,
+        generation_source: tape.generation_source,
         kind: tape.kind,
         pool_id: tape.pool_id,
         assignment_generation: tape.assignment_generation,
@@ -1912,6 +2098,9 @@ fn catalog_reset_preflight_token(
         hash_catalog_reset_field(&mut hasher, &tape.tape_uuid);
         for value in [
             tape.voltag.as_deref(),
+            tape.voltag_source.as_deref(),
+            tape.cartridge_generation.as_deref(),
+            tape.generation_source.as_deref(),
             Some(tape.kind.as_str()),
             tape.pool_id.as_deref(),
             Some(tape.state.as_str()),
@@ -1963,6 +2152,9 @@ fn hash_catalog_reset_output_tape(
     hash_catalog_reset_field(hasher, &tape.tape_uuid);
     for value in [
         tape.voltag.as_deref(),
+        tape.voltag_source.as_deref(),
+        tape.cartridge_generation.as_deref(),
+        tape.generation_source.as_deref(),
         Some(tape.kind.as_str()),
         pool_id,
         Some(state),
@@ -2667,7 +2859,10 @@ pool_id = "camera.copy-a"
                 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x46, 0x17, 0x88, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
                 0x1e, 0x1f,
             ],
-            voltag: "ACM901L9".to_string(),
+            voltag: Some("ACM901L9".to_string()),
+            label_provenance: crate::LabelProvenance::Changer,
+            observation: crate::MediaObservation::label_hint("ACM901L9"),
+            pool_id: None,
             block_size: 1024 * 1024,
             parity: ParityConfig::Scheme(remanence_parity::default_scheme_for_block_size(
                 1024 * 1024,
@@ -2677,10 +2872,9 @@ pool_id = "camera.copy-a"
 
     fn adoption_evidence(tail: BootstrapAdoptionTailEvidence) -> BootstrapAdoptionEvidence {
         BootstrapAdoptionEvidence {
-            library_serial: "LIB001".to_string(),
-            library_revision: "D.00".to_string(),
-            home_slot: 0x0401,
-            drive_element: 0x0101,
+            endpoint: crate::DriveKey::new("LIB001", 0x0101),
+            library_revision: Some("D.00".to_string()),
+            home_slot: Some(0x0401),
             drive_serial: "DRV001".to_string(),
             bootstrap_drive_compression: false,
             configured_drive_compression: false,
@@ -2728,6 +2922,295 @@ pool_id = "camera.copy-a"
     }
 
     #[test]
+    fn operator_adoption_records_media_and_explicit_pool_intent_for_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let mut input = adoption_input(Uuid::new_v4());
+        input.voltag = Some("handwritten".into());
+        input.label_provenance = crate::LabelProvenance::Operator;
+        input.observation = Some(crate::MediaObservation {
+            generation: crate::LtoGen::Lto7,
+            source: crate::GenerationSource::Measured,
+        });
+        input.pool_id = Some("camera.copy-a".into());
+        handle
+            .adopt_bootstrap_identity(
+                input.clone(),
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod),
+            )
+            .unwrap();
+        let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
+        let mut restored = CatalogIndex::open(":memory:").unwrap();
+        restored.replay_audit_records(&records).unwrap();
+        for index in [&mut handle.index, &mut restored] {
+            index
+                .reconcile_tape_pool_projection_from_rules(&[], &[])
+                .unwrap();
+            let tape = index.get_tape(&input.tape_uuid).unwrap().unwrap();
+            assert_eq!(tape.voltag_source, Some(crate::LabelProvenance::Operator));
+            assert_eq!(
+                crate::tape_generation(&tape),
+                Some((crate::LtoGen::Lto7, crate::GenerationSource::Measured))
+            );
+            assert_eq!(tape.pool_id.as_deref(), Some("camera.copy-a"));
+        }
+        let mut changed = input.clone();
+        changed.observation = crate::MediaObservation::label_hint("L9");
+        assert!(handle
+            .adopt_bootstrap_identity(
+                changed,
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn standalone_adoption_without_label_preserves_typed_evidence_through_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let mut input = adoption_input(Uuid::new_v4());
+        input.voltag = None;
+        input.label_provenance = crate::LabelProvenance::Operator;
+        input.pool_id = Some("camera.copy-a".into());
+        input.observation = Some(crate::MediaObservation {
+            generation: crate::LtoGen::Lto7,
+            source: crate::GenerationSource::Measured,
+        });
+        let evidence = BootstrapAdoptionEvidence {
+            endpoint: crate::DriveKey::Standalone {
+                drive_serial: "DRV001".into(),
+            },
+            library_revision: None,
+            home_slot: None,
+            ..adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
+        };
+        handle
+            .adopt_bootstrap_identity(input.clone(), evidence.clone())
+            .unwrap();
+        assert!(
+            !handle
+                .adopt_bootstrap_identity(input.clone(), evidence.clone())
+                .unwrap()
+                .newly_adopted
+        );
+        let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
+        let record = records
+            .iter()
+            .find(|r| r.event == AuditEvent::TapeIdentityAdopted)
+            .unwrap();
+        assert_eq!(record.detail.get("voltag"), Some(&CborValue::Null));
+        assert_eq!(
+            record.detail.get("endpoint_key"),
+            Some(&CborValue::Text(evidence.endpoint.encode()))
+        );
+        for field in [
+            "library_serial",
+            "library_revision",
+            "home_slot",
+            "drive_element",
+        ] {
+            assert!(!record.detail.contains_key(field));
+        }
+        let mut restored = CatalogIndex::open(":memory:").unwrap();
+        restored.replay_audit_records(&records).unwrap();
+        restored
+            .rebuild_from_authoritative_sources(&records, &[])
+            .unwrap();
+        let expected = handle.index.get_tape(&input.tape_uuid).unwrap().unwrap();
+        let actual = restored.get_tape(&input.tape_uuid).unwrap().unwrap();
+        assert_eq!(
+            (actual.voltag.as_deref(), actual.voltag_source),
+            (None, None)
+        );
+        assert_eq!(
+            crate::tape_generation(&actual),
+            crate::tape_generation(&expected)
+        );
+        assert_eq!(actual.pool_id, expected.pool_id);
+        assert_eq!(actual.assignment_generation, expected.assignment_generation);
+        // Typed endpoint and inquiry evidence must identify the same drive.
+        let mut invalid = evidence.clone();
+        invalid.drive_serial = "different".into();
+        assert!(handle
+            .adopt_bootstrap_identity(input.clone(), invalid)
+            .is_err());
+        let mut bad_records = records.clone();
+        bad_records
+            .iter_mut()
+            .find(|r| r.event == AuditEvent::TapeIdentityAdopted)
+            .unwrap()
+            .detail
+            .insert("drive_serial".into(), CborValue::Text("different".into()));
+        let mut rejected = CatalogIndex::open(":memory:").unwrap();
+        rejected.replay_audit_records(&bad_records).unwrap();
+        assert!(rejected.get_tape(&input.tape_uuid).unwrap().is_none());
+        // Bay admission still requires revision and return slot, live and replay.
+        for missing_revision in [false, true] {
+            let mut bay =
+                adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
+            if missing_revision {
+                bay.library_revision = None;
+            } else {
+                bay.home_slot = None;
+            }
+            assert!(handle.adopt_bootstrap_identity(input.clone(), bay).is_err());
+            let mut bad = record.clone();
+            bad.detail.insert(
+                "endpoint_key".into(),
+                CborValue::Text(crate::DriveKey::new("LIB001", 0).encode()),
+            );
+            if missing_revision {
+                bad.detail
+                    .insert("home_slot".into(), CborValue::Integer(1.into()));
+            } else {
+                bad.detail
+                    .insert("library_revision".into(), CborValue::Text("D.00".into()));
+            }
+            let mut rejected = CatalogIndex::open(":memory:").unwrap();
+            rejected.replay_audit_records(&[bad]).unwrap();
+            assert!(rejected.get_tape(&input.tape_uuid).unwrap().is_none());
+        }
+        drop(handle);
+        let mut reopened = StateHandle::open_from_config_file(&config_path).unwrap();
+        assert!(
+            !reopened
+                .adopt_bootstrap_identity(input, evidence)
+                .unwrap()
+                .newly_adopted
+        );
+    }
+
+    #[test]
+    fn media_aware_state_provisioning_retains_calibration_eviction() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        let uuid = [0x45; 16];
+        let mut input = ProvisionTapeInput {
+            tape_uuid: uuid,
+            voltag: "pen label".into(),
+            block_size: 1024 * 1024,
+            parity: ParityConfig::None,
+            force: false,
+        };
+        let observation = crate::MediaObservation {
+            generation: crate::LtoGen::Lto7,
+            source: crate::GenerationSource::Measured,
+        };
+        handle
+            .provision_tape_with_media(
+                input.clone(),
+                crate::LabelProvenance::Operator,
+                Some(observation),
+            )
+            .unwrap();
+        let crate::calibration::HarvestTransition::Calibrated {
+            write_epoch,
+            calibration_generation,
+        } = handle
+            .calibration_control()
+            .record_harvest_success(uuid, 0)
+            .unwrap()
+        else {
+            panic!("expected calibration");
+        };
+        handle
+            .index
+            .upsert_wrap_map(&wrap_map_record(uuid, write_epoch, calibration_generation))
+            .unwrap();
+        // An idempotent call retains calibration; geometry replacement evicts it.
+        handle
+            .provision_tape_with_media(
+                input.clone(),
+                crate::LabelProvenance::Operator,
+                Some(observation),
+            )
+            .unwrap();
+        assert!(handle
+            .calibration_control()
+            .is_map_servable(uuid, write_epoch));
+        input.block_size = 512 * 1024;
+        input.force = true;
+        handle
+            .provision_tape_with_media(input, crate::LabelProvenance::Operator, Some(observation))
+            .unwrap();
+        let tape = handle.index.get_tape(&uuid).unwrap().unwrap();
+        assert_eq!(tape.voltag_source, Some(crate::LabelProvenance::Operator));
+        assert_eq!(
+            crate::tape_generation(&tape),
+            Some((observation.generation, observation.source))
+        );
+        assert!(handle.index.get_wrap_map(&uuid).unwrap().is_none());
+        assert!(!handle
+            .calibration_control()
+            .is_map_servable(uuid, write_epoch));
+        let control = handle.calibration_control().row(uuid);
+        assert_eq!(
+            control.state,
+            crate::calibration::VolumeCalibrationState::Uncalibrated
+        );
+        assert!(control.calibration_generation > calibration_generation);
+    }
+
+    #[test]
+    fn rebind_is_audited_and_survives_state_reopen_and_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, config_text(temp.path())).unwrap();
+        let mut handle = StateHandle::open_from_config_file(&config_path).unwrap();
+        for (id, label) in [(1u8, "ACM001L9"), (2, "ACM002L9")] {
+            handle
+                .audit
+                .append(AuditEventRecord {
+                    actor: AuditActor::System,
+                    source_layer: SourceLayer::Layer4,
+                    operation_id: None,
+                    session_id: None,
+                    idempotency_key: None,
+                    event: AuditEvent::TapeProvisioned,
+                    subject: AuditSubject {
+                        kind: "tape".into(),
+                        id: Some(hex_tape_uuid([id; 16])),
+                    },
+                    detail: BTreeMap::from([("voltag".into(), CborValue::Text(label.into()))]),
+                })
+                .unwrap();
+        }
+        handle.replay_audit_projection().unwrap();
+        handle
+            .rebind_tape_label([2; 16], "ACM001L9", [1; 16])
+            .unwrap();
+        let records = FileAuditLog::replay(&handle.paths.audit_dir).unwrap();
+        assert!(records
+            .iter()
+            .any(|r| r.event == AuditEvent::TapeLabelRebound));
+        drop(handle);
+        let mut reopened = StateHandle::open_from_config_file(&config_path).unwrap();
+        reopened
+            .index
+            .rebuild_from_authoritative_sources(&records, &[])
+            .unwrap();
+        assert_eq!(
+            reopened.index.get_tape(&[1; 16]).unwrap().unwrap().voltag,
+            None
+        );
+        assert_eq!(
+            reopened
+                .index
+                .get_tape_by_voltag("ACM001L9")
+                .unwrap()
+                .unwrap()
+                .tape_uuid,
+            vec![2; 16]
+        );
+    }
+
+    #[test]
     fn bootstrap_adoption_is_audited_identity_only_and_idempotent() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-state-adopt-bootstrap")
@@ -2753,7 +3236,7 @@ pool_id = "camera.copy-a"
         let fresh_operation_id = Uuid::new_v4();
         let mut fresh_evidence =
             adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
-        fresh_evidence.home_slot = 0x0402;
+        fresh_evidence.home_slot = Some(0x0402);
         let fresh_operation = handle
             .adopt_bootstrap_identity(adoption_input(fresh_operation_id), fresh_evidence)
             .expect("fresh operation may confirm exact identity-only adoption");
@@ -2770,6 +3253,18 @@ pool_id = "camera.copy-a"
         );
         assert_eq!(first.assignment_generation, 1);
         assert_eq!(first.state, AdoptedTapeState::Ready);
+        let mut explicit_pool = adoption_input(Uuid::new_v4());
+        explicit_pool.pool_id = Some("camera.copy-a".into());
+        assert!(
+            handle
+                .adopt_bootstrap_identity(
+                    explicit_pool,
+                    adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod)
+                )
+                .is_err(),
+            "a repeated rule adoption must not silently discard explicit operator intent"
+        );
+
         let tape = handle
             .catalog_index()
             .get_tape(&adoption_input(operation_id).tape_uuid)
@@ -2797,9 +3292,8 @@ pool_id = "camera.copy-a"
             .record_media_readiness_operation(crate::index::MediaReadinessOperationInput {
                 operation_id: Uuid::new_v4(),
                 run_id: None,
-                library_serial: "LIB001".to_string(),
+                endpoint: crate::DriveKey::new("LIB001".to_string(), 0x0101),
                 changer_sg: None,
-                drive_element: 0x0101,
                 drive_sg: None,
                 drive_serial: Some("DRV001".to_string()),
                 barcode: Some("ACM901L9".to_string()),
@@ -2908,7 +3402,10 @@ pool_id = "camera.copy-a"
                X'0000000000000000', X'0000000000000000',
                X'0000000000000001', 'ready', '2026-08-09T00:00:00Z'
              )",
-            rusqlite::params![conflicting_uuid.to_vec(), original.voltag.as_str()],
+            rusqlite::params![
+                conflicting_uuid.to_vec(),
+                original.voltag.as_deref().unwrap()
+            ],
         )
         .expect("insert newer conflicting barcode authority");
         drop(conn);
@@ -2929,7 +3426,7 @@ pool_id = "camera.copy-a"
             .expect("conflicting row remains");
         assert_eq!(
             conflicting.voltag.as_deref(),
-            Some(original.voltag.as_str())
+            Some(original.voltag.as_deref().unwrap())
         );
         assert_eq!(conflicting.written_extent_lba, Some(1));
         assert!(handle
@@ -2966,7 +3463,7 @@ pool_id = "camera.copy-a"
 
         let mut changed_drive =
             adoption_evidence(BootstrapAdoptionTailEvidence::ExactBootstrapFilemarkEod);
-        changed_drive.drive_element = 0x0102;
+        changed_drive.endpoint = crate::DriveKey::new("LIB001", 0x0102);
         changed_drive.drive_serial = "DRV002".to_string();
         let changed_drive = handle
             .adopt_bootstrap_identity(adoption_input(operation_id), changed_drive)
@@ -2987,7 +3484,7 @@ pool_id = "camera.copy-a"
 
         let mut different_tape_same_operation = adoption_input(operation_id);
         different_tape_same_operation.tape_uuid[15] ^= 0x01;
-        different_tape_same_operation.voltag = "ACM902L9".to_string();
+        different_tape_same_operation.voltag = Some("ACM902L9".to_string());
         let different_tape_same_operation = handle
             .adopt_bootstrap_identity(
                 different_tape_same_operation,
@@ -3109,7 +3606,7 @@ pool_id = "camera.copy-a"
         conn.execute(
             "insert into tapes(tape_uuid, voltag, kind, cleaning_uses, cleaning_state, state, updated_at_utc)
              values(?1, ?2, 'cleaning', 0, 'unverified', 'ready', '2026-08-09T00:00:00Z')",
-            rusqlite::params![input.tape_uuid.to_vec(), input.voltag.as_str()],
+            rusqlite::params![input.tape_uuid.to_vec(), input.voltag.as_deref()],
         )
         .expect("insert conflicting cleaning identity");
         drop(conn);
