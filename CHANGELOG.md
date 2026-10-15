@@ -4,7 +4,9 @@ Notable changes to Remanence and its published formats. The format
 specifications carry their own revision histories; entries here are
 per-release summaries.
 
-## Unreleased
+## 0.2.0 — 2026-10-15
+
+- First release with prebuilt Linux binaries (`remanence-x86_64-linux.tar.gz`, `rem-recover-x86_64-linux-musl.tar.gz`, `SHA256SUMS`) and build provenance attestation.
 
 - Wording pass over the REM-PARITY text that the recent clarifications touched.
   No requirement changes. Section 17 opens with the damage matrix as it now

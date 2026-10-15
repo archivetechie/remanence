@@ -8,7 +8,7 @@ root [README](../README.md) has a shorter version.
 
 ## The short version
 
-**This is alpha software, v0.1.0.** The implementation has had limited
+**This is alpha software, v0.2.0.** The implementation has had limited
 operational testing, so do not make it the only copy of anything. The format
 specifications are versioned separately and are at 1.0.
 

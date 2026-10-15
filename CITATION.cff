@@ -8,9 +8,9 @@ authors:
   - name: "The ArchiveTech Project"
     website: "https://archivetech.org"
     email: "specs@archivetech.org"
-version: 0.1.0
+version: 0.2.0
 doi: 10.5281/zenodo.21551570
-date-released: 2026-08-07
+date-released: 2026-10-15
 license: Apache-2.0
 repository-code: "https://github.com/archivetechie/remanence"
 url: "https://archivetech.org"
@@ -22,9 +22,9 @@ abstract: >-
   tar container with
   per-file SHA-256 identities, closed-form byte-range addressing, a
   deterministic CBOR manifest — its separately versioned REM-ENCRYPT profile,
-  and the generation-1 REM-PARITY tape layout for catalog-less,
-  parity-protected recovery from bare tape. Later repository revisions use an
-  incompatible experimental generation-2 REM-PARITY layout.
+  and an experimental generation-2 REM-PARITY tape layout for catalog-less,
+  parity-protected recovery from bare tape. The generation-1 layout used by
+  v0.1.0 is incompatible with this release.
 keywords:
   - digital preservation
   - archival storage
