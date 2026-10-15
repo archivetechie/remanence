@@ -28,6 +28,7 @@ use super::checkpoint::{
 use super::read_session::session_open_reject_tape_io_fences;
 use super::readiness::session_open_short_probe_or_load;
 use super::restore::{status_from_parity_error, status_from_pool_write_error};
+use super::terminal_types::TerminalConfig;
 use super::terminal_types::{
     parity_progress_from_state, persist_terminal_recovery_required,
     reconcile_and_authorize_parity_resume, reconcile_terminal_component_host_authority,
@@ -63,13 +64,72 @@ pub(super) fn handle_drive_finalize_tape(
         drive_uuid,
         drive_serial,
     } = mounted;
-    validate_manual_finalize_owned_request(index, &request)?;
-    session_open_reject_tape_io_fences(
+    finalize_mounted_tape(
         index,
-        &request.tape_uuid,
+        &cfg.terminal_config(),
+        drive,
+        &request,
         barcode.as_deref(),
-        "finalize tape",
-    )?;
+        |index, drive| {
+            session_open_short_probe_or_load(
+                index,
+                drive,
+                SessionOpenReadinessContext {
+                    action: "finalize tape",
+                    bay,
+                    library_serial: library_serial.as_str(),
+                    barcode: barcode.as_deref(),
+                    source_slot,
+                    drive_serial: drive_serial.as_deref(),
+                    needs_drive_load,
+                },
+            )?;
+            prepare_drive_for_write(
+                drive,
+                &request.tape_uuid,
+                request.block_size,
+                request.candidate_operation_id,
+                WriteMediaPolicy::TerminalAppend,
+            )?;
+            if needs_drive_load {
+                run_load_calibration_harvest(
+                    index,
+                    drive,
+                    cfg,
+                    &request.tape_uuid,
+                    barcode.as_deref(),
+                );
+            }
+            Ok(())
+        },
+        |index, drive| {
+            record_session_close_snapshot(
+                index,
+                cfg,
+                drive,
+                drive_uuid,
+                request.candidate_operation_id,
+                request.tape_uuid,
+                snapshot_misses,
+            );
+        },
+    )
+}
+
+/// The shared finalization funnel after ownership has been established. The
+/// actor supplies load readiness; OperatorMount supplies its already-held lock.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_mounted_tape(
+    index: &mut CatalogIndex,
+    cfg: &super::terminal_types::TerminalWriteConfig,
+    drive: &mut DriveHandle,
+    request: &ManualFinalizeTapeActorRequest,
+    barcode: Option<&str>,
+    prepare: impl FnOnce(&mut CatalogIndex, &mut DriveHandle) -> Result<(), Status>,
+    finish: impl FnOnce(&mut CatalogIndex, &mut DriveHandle),
+) -> Result<ManualFinalizeTapeActorReply, Status> {
+    validate_manual_finalize_owned_request(index, request)?;
+    session_open_reject_tape_io_fences(index, &request.tape_uuid, barcode, "finalize tape")?;
 
     let checkpoint_journal = remanence_state::FileCheckpointJournal::open(
         cfg.checkpoint_journal_dir.as_path(),
@@ -148,31 +208,9 @@ pub(super) fn handle_drive_finalize_tape(
             "FinalizeTape drive dispatch is missing its durable BeforeReplicaA intent",
         )
     })?;
-    validate_manual_finalize_intent(&request, accepted_intent)?;
-    require_manual_finalize_preflight_binding(index, &request)?;
-    session_open_short_probe_or_load(
-        index,
-        drive,
-        SessionOpenReadinessContext {
-            action: "finalize tape",
-            bay,
-            library_serial: library_serial.as_str(),
-            barcode: barcode.as_deref(),
-            source_slot,
-            drive_serial: drive_serial.as_deref(),
-            needs_drive_load,
-        },
-    )?;
-    prepare_drive_for_write(
-        drive,
-        &request.tape_uuid,
-        request.block_size,
-        request.candidate_operation_id,
-        WriteMediaPolicy::TerminalAppend,
-    )?;
-    if needs_drive_load {
-        run_load_calibration_harvest(index, drive, cfg, &request.tape_uuid, barcode.as_deref());
-    }
+    validate_manual_finalize_intent(request, accepted_intent)?;
+    require_manual_finalize_preflight_binding(index, request)?;
+    prepare(index, drive)?;
     let drive_config = drive
         .read_config()
         .map_err(|error| Status::unavailable(format!("read finalization drive config: {error}")))?;
@@ -194,7 +232,7 @@ pub(super) fn handle_drive_finalize_tape(
         block_size: request.block_size,
         parity_config: request.parity_config.clone(),
     };
-    let spec = TerminalFinalizeSpec::operator(&request);
+    let spec = TerminalFinalizeSpec::operator(request);
 
     let result = match request.parity_config {
         remanence_parity::ParityConfig::None => finalize_terminal_no_parity(
@@ -208,7 +246,7 @@ pub(super) fn handle_drive_finalize_tape(
             existing_intent,
             &spec,
             &selected,
-            Some(&request),
+            Some(request),
             rewritable,
         ),
         remanence_parity::ParityConfig::Scheme(_) => finalize_terminal_with_parity(
@@ -222,20 +260,12 @@ pub(super) fn handle_drive_finalize_tape(
             existing_intent,
             &spec,
             &selected,
-            Some(&request),
+            Some(request),
             rewritable,
         ),
     };
 
-    record_session_close_snapshot(
-        index,
-        cfg,
-        drive,
-        drive_uuid,
-        request.candidate_operation_id,
-        request.tape_uuid,
-        snapshot_misses,
-    );
+    finish(index, drive);
     result.map(|result| ManualFinalizeTapeActorReply {
         operation_id: request.candidate_operation_id,
         projection: result.projection,
@@ -1190,7 +1220,7 @@ pub(super) fn project_sealed_checkpoint_then_retire_terminal_intent(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_terminal_no_parity(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
     previous: &remanence_state::CheckpointJournalRecord,
@@ -1200,6 +1230,7 @@ pub(super) fn finalize_terminal_no_parity(
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
     rewritable: bool,
 ) -> Result<TerminalFinalizeResult, Status> {
+    let cfg = &cfg.terminal_config();
     let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
         .map_err(|error| {
             Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
@@ -1286,7 +1317,7 @@ pub(super) fn finalize_terminal_no_parity(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_terminal_with_parity(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
     previous: &remanence_state::CheckpointJournalRecord,
@@ -1296,6 +1327,7 @@ pub(super) fn finalize_terminal_with_parity(
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
     rewritable: bool,
 ) -> Result<TerminalFinalizeResult, Status> {
+    let cfg = &cfg.terminal_config();
     let scheme = match &selected.parity_config {
         remanence_parity::ParityConfig::Scheme(scheme) => scheme.clone(),
         remanence_parity::ParityConfig::None => {
@@ -1335,7 +1367,7 @@ pub(super) fn finalize_terminal_with_parity(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_terminal_with_parity_journal(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
     previous: &remanence_state::CheckpointJournalRecord,
@@ -1346,6 +1378,7 @@ pub(super) fn finalize_terminal_with_parity_journal(
     journal: FileTapeFileJournal,
     rewritable: bool,
 ) -> Result<TerminalFinalizeResult, Status> {
+    let cfg = &cfg.terminal_config();
     let tix_fault = crate::terminal_fault::TerminalFaultPlan::from_env_for_tape(spec.tape_uuid)
         .map_err(|error| {
             Status::failed_precondition(format!("TIX terminal fault plan: {error}"))
@@ -1769,7 +1802,7 @@ pub(super) fn complete_terminal_finalization_host_only(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finish_terminal_tail(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     drive: &mut DriveHandle,
     checkpoint: &mut remanence_state::FileCheckpointJournalLease,
     previous: &remanence_state::CheckpointJournalRecord,
@@ -1783,6 +1816,7 @@ pub(super) fn finish_terminal_tail(
     rewritable: bool,
     tix_fault: Option<&crate::terminal_fault::TerminalFaultPlan>,
 ) -> Result<TerminalFinalizeResult, Status> {
+    let cfg = &cfg.terminal_config();
     let mut authority = TerminalTailCatalogAuthority {
         checkpoint,
         parity_journal,
@@ -2025,9 +2059,10 @@ pub(super) fn require_manual_finalize_preflight_binding(
 
 pub(super) fn record_manual_finalize_request(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     request: &ManualFinalizeTapeActorRequest,
 ) -> Result<(), Status> {
+    let cfg = &cfg.terminal_config();
     record_manual_finalize_request_with(
         index,
         cfg.audit_dir.as_path(),
@@ -2148,12 +2183,13 @@ pub(super) fn record_manual_finalize_request_with(
 
 pub(super) fn record_terminal_finalize_event(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     manual_request: Option<&ManualFinalizeTapeActorRequest>,
     event: AuditEvent,
     progress: remanence_state::TerminalFinalizationProgress,
     detail_text: Option<(&str, String)>,
 ) -> Result<(), Status> {
+    let cfg = &cfg.terminal_config();
     record_terminal_finalize_event_with(
         index,
         TerminalFinalizeAuditConfig::from(cfg),

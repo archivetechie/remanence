@@ -1,15 +1,9 @@
 //! Load-time wrap-map harvest and the serve path.
 //!
-//! **Harvest-and-install is one act.** [`harvest_and_install_calibration`]
-//! is the only place in the codebase that installs a real
-//! [`remanence_state::VolumeMediaWriteFence`] into a `DriveHandle`, and
-//! it does so *before* any map can be stored: the fence install is the
-//! first thing the function does after reading the harvest epoch, and
-//! the map row is written only after the durable calibrated transition.
-//! A harvested map without an installed fence, or a fence installed
-//! without a fresh harvest, would break `NoCalibrationControl`'s
-//! soundness argument (see its doc comment in the media gate), so
-//! neither half is callable on its own from anywhere else.
+//! All durable fence installations live here. A load-time harvest installs
+//! its fence before publishing a map. A standalone invocation cannot prove a
+//! fresh physical load, so it installs the fence and invalidates calibration
+//! without issuing REOWP or publishing a potentially stale map.
 //!
 //! **Harvest timing is dictated by the standard, not chosen.** REOWP
 //! data "is valid at load" and "becomes stale on any write operation";
@@ -37,6 +31,25 @@ use remanence_state::{
 };
 
 use crate::pool_write::TapeUuid;
+
+/// Bind a standalone invocation without claiming a fresh physical load.
+/// The fence precedes all media writes; existing wrap maps remain unserved.
+pub(crate) fn install_standalone_calibration_fence(
+    drive: &mut DriveHandle,
+    store: &CalibrationControlStore,
+    tape_uuid: TapeUuid,
+) -> Result<(), StateError> {
+    install_volume_fence(drive, store, tape_uuid);
+    store.record_map_evicted(tape_uuid)?;
+    Ok(())
+}
+fn install_volume_fence(
+    drive: &mut DriveHandle,
+    store: &CalibrationControlStore,
+    tape_uuid: TapeUuid,
+) {
+    drive.install_media_write_fence(Box::new(store.volume_fence(tape_uuid)));
+}
 
 /// Convert one on-the-wire REOWP descriptor into the planner's shape.
 /// This u16-to-u32 widening is owned by the harvest layer precisely so
@@ -148,7 +161,7 @@ pub(crate) fn harvest_and_install_calibration(
     // the drive handle and cannot fail; from here on, the first
     // media-modifying CDB of this load durably advances the epoch or
     // is not dispatched.
-    drive.install_media_write_fence(Box::new(store.volume_fence(tape_uuid)));
+    install_volume_fence(drive, store, tape_uuid);
 
     // (3) Recognised-but-unsupported format: no REOWP is issued.
     if let Some(media_code) = barcode.and_then(media_code_of) {

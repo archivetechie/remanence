@@ -680,6 +680,10 @@ pub enum AuditOp {
     LockRemoval,
     /// ALLOW MEDIUM REMOVAL on the audited changer or drive.
     AllowRemoval,
+    /// Explicit SCSI RESERVE(6), never implicit at mount.
+    ReserveDrive,
+    /// Release an explicit SCSI reservation.
+    ReleaseDrive,
     /// Single SSC UNLOAD CDB issued directly through `DriveHandle`,
     /// not as the first phase of a composed `Unload`.
     DriveUnload {

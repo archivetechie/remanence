@@ -1769,12 +1769,13 @@ pub(super) fn append_tape_sealed_evidence(
     )
 }
 
-pub(super) fn append_tape_io_fence_evidence(
+pub(crate) fn append_tape_io_fence_evidence(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     fence: &TapeIoFenceRecord,
     event: AuditEvent,
 ) -> Result<(), Status> {
+    let cfg = &cfg.terminal_config();
     let mut detail = BTreeMap::from([
         (
             "tape_uuid".to_string(),
@@ -1789,6 +1790,9 @@ pub(super) fn append_tape_io_fence_evidence(
     insert_optional_audit_text(&mut detail, "barcode", fence.barcode.as_ref());
     insert_optional_audit_text(&mut detail, "evidence_json", fence.evidence_json.as_ref());
     insert_optional_audit_text(&mut detail, "release_ack", fence.release_ack.as_ref());
+    if let Some(endpoint) = &fence.endpoint {
+        detail.insert("endpoint_key".into(), CborValue::Text(endpoint.encode()));
+    }
     append_and_project_audit(
         index,
         cfg.audit_dir.as_path(),
@@ -1877,7 +1881,7 @@ pub(super) fn run_load_calibration_harvest(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WriteMediaPolicy {
+pub(crate) enum WriteMediaPolicy {
     RewritableObject,
     TerminalAppend,
 }
@@ -1897,7 +1901,7 @@ pub(super) fn validate_write_media_policy(
         .map_err(|error| Status::failed_precondition(error.to_string()))
 }
 
-pub(super) fn prepare_drive_for_write(
+pub(crate) fn prepare_drive_for_write(
     drive: &mut DriveHandle,
     tape_uuid: &TapeUuid,
     block_size: u32,

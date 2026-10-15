@@ -129,8 +129,12 @@ pub(crate) struct SessionOpenReadinessContext<'a> {
 }
 
 mod write_session;
+pub(crate) use write_session::{
+    append_tape_io_fence_evidence, prepare_drive_for_write, WriteMediaPolicy,
+};
 
 mod terminal_finalize;
+pub(crate) use terminal_finalize::finalize_mounted_tape;
 pub(crate) use terminal_finalize::*;
 
 mod read_session;

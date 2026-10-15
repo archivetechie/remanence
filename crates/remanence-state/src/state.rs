@@ -108,6 +108,39 @@ pub(crate) fn validate_bootstrap_endpoint_evidence(
     Ok(())
 }
 
+/// Library adoption retains its established canonical geometry; standalone
+/// adoption records any validated on-tape geometry, including parity-off.
+pub(crate) fn validate_bootstrap_adoption_geometry(
+    endpoint: &crate::DriveKey,
+    block_size: u32,
+    parity: &remanence_parity::ParityConfig,
+) -> Result<(), StateError> {
+    if matches!(endpoint, crate::DriveKey::Bay { .. }) {
+        if block_size != 1024 * 1024
+            || parity
+                != &remanence_parity::ParityConfig::Scheme(
+                    remanence_parity::default_scheme_for_block_size(1024 * 1024),
+                )
+        {
+            return Err(StateError::TapeProvisionConflict(
+                "bootstrap adoption requires canonical 1 MiB default parity geometry".into(),
+            ));
+        }
+    } else {
+        if block_size == 0 || !block_size.is_multiple_of(512) {
+            return Err(StateError::TapeProvisionConflict(
+                "invalid standalone bootstrap block size".into(),
+            ));
+        }
+        if let remanence_parity::ParityConfig::Scheme(scheme) = parity {
+            scheme
+                .validate()
+                .map_err(|e| StateError::TapeProvisionConflict(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Valid-BOT tail evidence accepted by the durable adoption boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapAdoptionTailEvidence {
@@ -794,17 +827,10 @@ impl StateHandle {
                 "Bootstrap tape UUID must be an RFC 4122 UUIDv4".to_string(),
             ));
         }
-        let canonical_parity = remanence_parity::ParityConfig::Scheme(
-            remanence_parity::default_scheme_for_block_size(1024 * 1024),
-        );
-        if input.block_size != 1024 * 1024
-            || input.parity != canonical_parity
-            || evidence.bootstrap_drive_compression
-            || evidence.configured_drive_compression
-        {
+        validate_bootstrap_adoption_geometry(&evidence.endpoint, input.block_size, &input.parity)?;
+        if evidence.bootstrap_drive_compression || evidence.configured_drive_compression {
             return Err(StateError::TapeProvisionConflict(
-                "bootstrap adoption requires canonical 1 MiB default parity geometry with drive compression disabled"
-                    .to_string(),
+                "bootstrap adoption requires drive compression disabled".into(),
             ));
         }
         validate_bootstrap_endpoint_evidence(
@@ -1097,7 +1123,7 @@ impl StateHandle {
     pub fn startup_replay(&mut self) -> Result<StartupReplayReport, StateError> {
         let rebuild = self.rebuild_index_from_journals()?;
         let lost_operations_marked = self.mark_lost_operations_by_restart()?;
-        let lost_sessions_marked = self.mark_lost_sessions_by_restart()?;
+        let lost_sessions_marked = self.recover_sessions_after_restart(None, |_, _| Ok(()))?;
         Ok(StartupReplayReport {
             rebuild,
             lost_operations_marked,
@@ -1360,8 +1386,20 @@ impl StateHandle {
         Ok(count)
     }
 
-    fn mark_lost_sessions_by_restart(&mut self) -> Result<u64, StateError> {
-        let sessions = self.index.non_terminal_sessions()?;
+    /// Recover prior sessions under an owned state/endpoint boundary. A scoped
+    /// caller must hold the durable endpoint lock. The callback persists any
+    /// additional quarantine before a session can be marked terminal.
+    pub fn recover_sessions_after_restart(
+        &mut self,
+        endpoint: Option<&crate::DriveKey>,
+        mut quarantine: impl FnMut(&mut Self, &crate::RestartSession) -> Result<(), StateError>,
+    ) -> Result<u64, StateError> {
+        let sessions = self
+            .index
+            .non_terminal_sessions()?
+            .into_iter()
+            .filter(|s| endpoint.is_none_or(|key| s.drive_key.as_ref() == Some(key)))
+            .collect::<Vec<_>>();
         let count = sessions.len() as u64;
         for session in sessions {
             // A write session that was non-terminal when the process
@@ -1380,7 +1418,12 @@ impl StateHandle {
                     self.calibration.record_possible_write_recovery(tape_uuid)?;
                 }
             }
+            quarantine(self, &session)?;
+            self.refresh_audit_append_cursor()?;
             let mut detail = BTreeMap::new();
+            if let Some(key) = &session.drive_key {
+                detail.insert("endpoint_key".into(), CborValue::Text(key.encode()));
+            }
             detail.insert(
                 "session_kind".to_string(),
                 CborValue::Text(session.session_kind.clone()),

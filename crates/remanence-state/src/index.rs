@@ -4300,6 +4300,79 @@ impl CatalogIndex {
         Ok(())
     }
 
+    /// Clear only append recovery after replaying the imported authority pair.
+    /// An active quarantine or any terminal-finalization state remains a refusal.
+    pub fn recover_imported_append_authority(
+        &mut self,
+        checkpoint: &crate::FileCheckpointJournalLease,
+        parity: Option<&remanence_parity::FileTapeFileJournal>,
+        endpoint: &DriveKey,
+    ) -> Result<(), StateError> {
+        let source = match parity {
+            Some(parity) => {
+                crate::CheckpointTerminalIndexRecordSource::new_replay_backed(checkpoint, parity)?
+            }
+            None => {
+                crate::CheckpointTerminalIndexRecordSource::new_replay_backed_no_parity(checkpoint)?
+            }
+        };
+        drop(source);
+        let last = checkpoint.last_record_bounded()?.ok_or_else(|| {
+            StateError::TapeProvisionConflict("import requires checkpoint authority".into())
+        })?;
+        if last.sealed_after_write
+            || last.terminal_finalization.is_some()
+            || checkpoint.terminal_finalization_intent()?.is_some()
+        {
+            return Err(StateError::TapeProvisionConflict(
+                "import cannot authorize a terminal tape".into(),
+            ));
+        }
+        let tape = self
+            .get_tape(&last.tape_uuid)?
+            .ok_or_else(|| StateError::TapeProvisionConflict("adopt tape before import".into()))?;
+        let imported_parity = last
+            .scheme
+            .clone()
+            .map(ParityConfig::Scheme)
+            .unwrap_or(ParityConfig::None);
+        if catalog_reset_geometry(&tape)? != Some((last.block_size, imported_parity)) {
+            return Err(StateError::TapeProvisionConflict(
+                "imported authority differs from adopted geometry".into(),
+            ));
+        }
+        if tape.kind != "data"
+            || !matches!(tape.state.as_str(), "ready" | "recovery_required")
+            || tape.terminal_finalization.is_some()
+            || !self
+                .tape_io_admission_conflicts(&last.tape_uuid, tape.voltag.as_deref())?
+                .is_empty()
+            || !self
+                .media_readiness_admission_conflicts(endpoint, None, tape.voltag.as_deref(), false)?
+                .is_empty()
+        {
+            return Err(StateError::TapeProvisionConflict(
+                "import preserves quarantine and finalization restrictions".into(),
+            ));
+        }
+        let changed = self
+            .conn
+            .execute(
+                "update tapes set state = 'ready', updated_at_utc = ?2
+            where tape_uuid = ?1 and kind = 'data' and state = 'recovery_required'
+            and finalization_progress is null and finalization_trigger is null
+            and finalization_operation_id is null and finalization_outcome is null",
+                params![last.tape_uuid.as_slice(), now_utc()?],
+            )
+            .map_err(|e| sqlite_error("recover imported append authority", e))?;
+        if tape.state == "recovery_required" && changed != 1 {
+            return Err(StateError::TapeProvisionConflict(
+                "import preserves incomplete finalization restrictions".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Mark a tape journal as pending because a live append session owns it.
     pub fn mark_tape_journal_ingestion_pending(
         &mut self,
@@ -10144,12 +10217,25 @@ fn project_tape_identity_adopted_record(
         return Ok(());
     }
     let geometry = audit_tape_geometry(record);
-    let canonical = remanence_parity::default_scheme_for_block_size(1024 * 1024);
-    if block_size != 1024 * 1024
-        || geometry.scheme_id.as_deref() != Some(canonical.id.as_str())
-        || geometry.data_blocks_per_stripe != Some(i64::from(canonical.data_blocks_per_stripe))
-        || geometry.parity_blocks_per_stripe != Some(i64::from(canonical.parity_blocks_per_stripe))
-        || geometry.stripes_per_neighborhood != Some(i64::from(canonical.stripes_per_neighborhood))
+    let parity = (|| {
+        if detail_text(record, "geometry").as_deref() == Some("no-parity") {
+            return Some(ParityConfig::None);
+        }
+        Some(ParityConfig::Scheme(ParityScheme {
+            id: remanence_parity::SchemeId::new_owned(geometry.scheme_id.clone()?),
+            data_blocks_per_stripe: u16::try_from(geometry.data_blocks_per_stripe?).ok()?,
+            parity_blocks_per_stripe: u16::try_from(geometry.parity_blocks_per_stripe?).ok()?,
+            stripes_per_neighborhood: u32::try_from(geometry.stripes_per_neighborhood?).ok()?,
+        }))
+    })();
+    if !endpoint
+        .as_ref()
+        .zip(parity.as_ref())
+        .is_some_and(|(endpoint, parity)| {
+            u32::try_from(block_size).ok().is_some_and(|size| {
+                crate::state::validate_bootstrap_adoption_geometry(endpoint, size, parity).is_ok()
+            })
+        })
         || !matches!(
             record.detail.get("bootstrap_drive_compression"),
             Some(ciborium::value::Value::Bool(false))

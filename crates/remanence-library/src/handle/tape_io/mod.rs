@@ -2816,6 +2816,13 @@ impl super::DriveHandle {
         self.transport.install_media_write_fence(fence);
     }
 
+    /// Number of media-modifying commands handed to this handle's transport.
+    /// Unlike the per-load fence flag, this survives proof invalidation and
+    /// distinguishes an input refusal from an uncertain write after a checkpoint.
+    pub fn media_write_dispatch_count(&self) -> u64 {
+        self.transport.media_write_dispatch_count()
+    }
+
     /// Whether the media-write fence has run — and therefore a
     /// media-modifying CDB has been handed to the transport — in the
     /// current load. Startup/orphan recovery uses this to decide
@@ -2889,7 +2896,16 @@ impl super::DriveHandle {
         self.read_position_inline()
     }
 
+    /// Last established cursor, only while its cartridge identity remains valid.
+    /// This accessor never issues a command or supplies new positioning proof.
+    pub fn known_position(&self) -> Option<TapePosition> {
+        (self.position_known && self.position_generation == self.identity_generation())
+            .then_some(self.expected_position)
+            .flatten()
+    }
+
     fn record_device_position(&mut self, position: TapePosition) {
+        self.position_generation = self.identity_generation();
         self.position_known = true;
         self.expected_position = Some(position);
         self.bytes_since_position_check = 0;

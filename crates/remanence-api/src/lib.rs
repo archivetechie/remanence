@@ -83,6 +83,8 @@ mod audit_query_service;
 mod auth;
 mod calibration;
 mod catalog_conversion;
+mod catalogless_restore;
+pub use catalogless_restore::{restore_catalogless, scan_and_restore};
 mod catalog_request;
 mod daemon_catalog_services;
 mod diagnostics;
@@ -91,11 +93,20 @@ mod drive_collection;
 mod drive_mode;
 mod drive_pool;
 mod hex_encoding;
+mod reader_hash;
+pub use reader_hash::sha256_reader;
 mod io_memory;
 mod library;
 mod live_status;
 mod mount;
+mod mount_backend;
+pub use mount_backend::{
+    ChangerMount, MountBackend, MountEndpoint, MountError, MountTarget, MountedTape, OperatorMount,
+    StandaloneFinalizeRequest,
+};
 mod object_fault;
+mod object_position;
+pub use object_position::{position_to_object, BotRelativeTapeFile, ObjectPositionOrigin};
 mod operations;
 mod pool_selection;
 mod pool_write;

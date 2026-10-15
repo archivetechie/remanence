@@ -87,6 +87,43 @@ impl<'a> From<&'a WriteOwnerConfig> for TerminalFinalizeAuditConfig<'a> {
     }
 }
 
+/// Persistence-only context shared by actor and standalone terminal writers.
+/// It carries no changer, bay, reservation pool, or discovery authority.
+#[derive(Clone)]
+pub(crate) struct TerminalWriteConfig {
+    pub checkpoint_journal_dir: std::path::PathBuf,
+    pub audit_dir: std::path::PathBuf,
+    pub audit_fsync: bool,
+    pub audit_append_lock: Arc<std::sync::Mutex<()>>,
+}
+pub(crate) trait TerminalConfig {
+    fn terminal_config(&self) -> TerminalWriteConfig;
+}
+impl TerminalConfig for TerminalWriteConfig {
+    fn terminal_config(&self) -> TerminalWriteConfig {
+        self.clone()
+    }
+}
+impl TerminalConfig for WriteOwnerConfig {
+    fn terminal_config(&self) -> TerminalWriteConfig {
+        TerminalWriteConfig {
+            checkpoint_journal_dir: self.checkpoint_journal_dir.clone(),
+            audit_dir: self.audit_dir.clone(),
+            audit_fsync: self.audit_fsync,
+            audit_append_lock: Arc::clone(&self.audit_append_lock),
+        }
+    }
+}
+impl<'a> From<&'a TerminalWriteConfig> for TerminalFinalizeAuditConfig<'a> {
+    fn from(cfg: &'a TerminalWriteConfig) -> Self {
+        Self {
+            audit_dir: &cfg.audit_dir,
+            audit_fsync: cfg.audit_fsync,
+            audit_append_lock: &cfg.audit_append_lock,
+        }
+    }
+}
+
 pub(super) struct ManualFinalizeTapeMountRequest {
     pub(super) request: ManualFinalizeTapeActorRequest,
     pub(super) needs_drive_load: bool,

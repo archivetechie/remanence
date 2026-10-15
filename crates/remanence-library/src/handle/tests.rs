@@ -3384,11 +3384,15 @@ fn check_removal_reset_recovery(prevent: bool) {
                 .into_iter()
                 .map(HotPositionScript::Clean)
                 .collect(),
-            writes: VecDeque::from([
+            writes: [
                 HotWriteScript::CheckCondition(current_sense(0x06, 0, 0x29, 0x02)),
                 HotWriteScript::Clean,
                 HotWriteScript::Clean,
-            ]),
+            ]
+            .into_iter()
+            // PREVENT owns an ALLOW even when its completion is uncertain.
+            .chain(prevent.then_some(HotWriteScript::Clean))
+            .collect(),
             timeout: TimeoutClass::Inquiry,
             command_timeouts: Arc::clone(&log),
         };
@@ -3467,6 +3471,16 @@ fn check_removal_reset_recovery(prevent: bool) {
             .unwrap();
         drive.read_block_batch(&mut [0; 4], 4, 1, 1).unwrap();
         drive.write_block_batch_pipelined(&[0; 4], 4, &cdb).unwrap();
+        let before_drop = log.lock().unwrap().len();
+        drop(drive);
+        let commands = log.lock().unwrap();
+        assert_eq!(commands.len(), before_drop + usize::from(prevent));
+        if prevent {
+            assert_eq!(
+                commands.last().unwrap().0,
+                remanence_scsi::prevent_allow::build_cdb(false)
+            );
+        }
     }
 }
 

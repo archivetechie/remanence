@@ -1063,6 +1063,8 @@ impl LibraryHandle {
             max_write_block_size_bytes: None,
             position_known: true,
             expected_position: None,
+            position_generation: 0,
+            removal_guard: None,
             bytes_since_position_check: 0,
             position_check_bytes: tape_io.position_check_bytes,
             staging_ring_buffers: tape_io.staging_ring_buffers,
@@ -1587,6 +1589,10 @@ pub struct DriveHandle {
     /// Arithmetic cursor seeded from READ POSITION and advanced by
     /// clean fixed-mode batched operations.
     expected_position: Option<tape_io::TapePosition>,
+    /// Identity generation under which the cached cursor was established.
+    position_generation: u64,
+    /// Owned release obligation, discharged before this handle closes.
+    removal_guard: Option<MediumRemovalGuard>,
     /// Bytes advanced since the last tripwire READ POSITION.
     bytes_since_position_check: u64,
     /// Tripwire cadence for arithmetic cursor checks. Zero disables
@@ -1615,6 +1621,17 @@ pub struct DriveHandle {
     /// Shared audit hook + dirty-state cell cloned from the parent
     /// library handle.
     shared: Arc<Mutex<DriveShared>>,
+}
+
+/// Owned PREVENT obligation. DriveHandle releases it in Drop while its
+/// transport and audit hook are alive; mounted release uses the same path.
+struct MediumRemovalGuard;
+
+impl Drop for DriveHandle {
+    fn drop(&mut self) {
+        // The command reports its outcome through the normal drive audit hook.
+        let _ = self.release_medium_removal_guard();
+    }
 }
 
 impl std::fmt::Debug for DriveHandle {
@@ -1750,6 +1767,8 @@ impl DriveHandle {
             max_write_block_size_bytes: None,
             position_known: true,
             expected_position: None,
+            position_generation: 0,
+            removal_guard: None,
             bytes_since_position_check: 0,
             position_check_bytes: tape_io.position_check_bytes,
             staging_ring_buffers: tape_io.staging_ring_buffers,
@@ -1800,12 +1819,42 @@ impl DriveHandle {
 
     /// Prevent operator removal of the current cartridge for this invocation.
     pub fn prevent_medium_removal(&mut self) -> Result<(), DriveOpError> {
+        // Arm before dispatch: an uncertain PREVENT also needs an ALLOW.
+        self.removal_guard = Some(MediumRemovalGuard);
         self.issue_removal(true)
     }
 
     /// Allow operator removal, including recovery after a crashed invocation.
     pub fn allow_medium_removal(&mut self) -> Result<(), DriveOpError> {
-        self.issue_removal(false)
+        self.issue_removal(false)?;
+        self.removal_guard = None;
+        Ok(())
+    }
+
+    /// Release this handle's owned removal lock, if any. Repeated release is
+    /// silent after success; failure retains the obligation for Drop to retry.
+    pub fn release_medium_removal_guard(&mut self) -> Result<(), DriveOpError> {
+        if self.removal_guard.is_some() {
+            self.allow_medium_removal()?;
+        }
+        Ok(())
+    }
+
+    /// Opt-in SCSI RESERVE(6); the invocation owns the matching RELEASE(6).
+    pub fn reserve(&mut self) -> Result<(), DriveOpError> {
+        self.issue_drive_control(
+            &[0x16, 0, 0, 0, 0, 0],
+            AuditOp::ReserveDrive,
+            TimeoutClass::TapeStatus,
+        )
+    }
+    /// Release an explicitly acquired SCSI reservation.
+    pub fn release_reservation(&mut self) -> Result<(), DriveOpError> {
+        self.issue_drive_control(
+            &[0x17, 0, 0, 0, 0, 0],
+            AuditOp::ReleaseDrive,
+            TimeoutClass::TapeStatus,
+        )
     }
 
     fn issue_removal(&mut self, prevent: bool) -> Result<(), DriveOpError> {

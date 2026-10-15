@@ -71,6 +71,10 @@ pub enum Layer2AuditOpTag {
     LockRemoval,
     /// ALLOW MEDIUM REMOVAL.
     AllowRemoval,
+    /// Explicit drive reservation.
+    ReserveDrive,
+    /// Explicit reservation release.
+    ReleaseDrive,
     /// Drive-side UNLOAD.
     DriveUnload,
     /// Drive-side LOAD.
@@ -113,6 +117,8 @@ impl Layer2AuditOpTag {
             Self::Rescan => "rescan",
             Self::LockRemoval => "lock_removal",
             Self::AllowRemoval => "allow_removal",
+            Self::ReserveDrive => "reserve_drive",
+            Self::ReleaseDrive => "release_drive",
             Self::DriveUnload => "drive_unload",
             Self::DriveLoad => "drive_load",
             Self::TapeRewind => "tape_rewind",
@@ -141,6 +147,8 @@ impl Layer2AuditOpTag {
             LibraryAuditOp::Rescan => Self::Rescan,
             LibraryAuditOp::LockRemoval => Self::LockRemoval,
             LibraryAuditOp::AllowRemoval => Self::AllowRemoval,
+            LibraryAuditOp::ReserveDrive => Self::ReserveDrive,
+            LibraryAuditOp::ReleaseDrive => Self::ReleaseDrive,
             LibraryAuditOp::DriveUnload { .. } => Self::DriveUnload,
             LibraryAuditOp::DriveLoad { .. } => Self::DriveLoad,
             LibraryAuditOp::TapeRewind { .. } => Self::TapeRewind,
@@ -702,7 +710,11 @@ fn add_library_operation_detail(
             optional_u16(detail, "ie_element", ie);
             uint(detail, "slot_element", u64::from(slot));
         }
-        LibraryAuditOp::Rescan | LibraryAuditOp::LockRemoval | LibraryAuditOp::AllowRemoval => {}
+        LibraryAuditOp::Rescan
+        | LibraryAuditOp::LockRemoval
+        | LibraryAuditOp::AllowRemoval
+        | LibraryAuditOp::ReserveDrive
+        | LibraryAuditOp::ReleaseDrive => {}
         LibraryAuditOp::DriveUnload { bay }
         | LibraryAuditOp::DriveLoad { bay }
         | LibraryAuditOp::TapeRewind { bay }

@@ -1157,7 +1157,8 @@ fn native_collision_component(component: &str) -> String {
         .collect()
 }
 
-fn ensure_restore_root(root: &Path) -> Result<(), StreamingError> {
+/// Create and validate a restore root using the shared containment boundary.
+pub fn ensure_restore_root(root: &Path) -> Result<(), StreamingError> {
     fs::create_dir_all(root).map_err(|err| io_error("create restore root", root, err))?;
     let metadata =
         fs::symlink_metadata(root).map_err(|err| io_error("inspect restore root", root, err))?;

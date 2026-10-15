@@ -130,9 +130,10 @@ impl RawTapeSink for ActivityTrackingRawTapeSink<'_> {
 }
 
 pub(super) fn parity_journal_path(
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     tape_uuid: TapeUuid,
 ) -> Result<PathBuf, Status> {
+    let cfg = &cfg.terminal_config();
     let journal_dir = cfg.checkpoint_journal_dir.parent().ok_or_else(|| {
         Status::internal("checkpoint journal directory has no parent for the parity journal")
     })?;
@@ -909,7 +910,7 @@ pub(super) fn parity_raw_write_fence_reason(error: &str) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fence_failed_parity_raw_write(
     index: &mut CatalogIndex,
-    cfg: &WriteOwnerConfig,
+    cfg: &impl super::terminal_types::TerminalConfig,
     selected: &SelectedTape,
     phase: &'static str,
     current_caller_object_id: Option<&str>,
@@ -917,6 +918,7 @@ pub(super) fn fence_failed_parity_raw_write(
     error: &str,
     status: Status,
 ) -> (Status, bool) {
+    let cfg = &cfg.terminal_config();
     let barcode = index
         .get_tape(&selected.tape_uuid)
         .ok()
