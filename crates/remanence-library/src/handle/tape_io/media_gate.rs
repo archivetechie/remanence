@@ -333,6 +333,9 @@ pub(in crate::handle) struct MediaFencedTransport {
     /// clearing too rarely is the silent stale-map failure, so every
     /// ambiguous boundary clears.
     fenced_this_load: bool,
+    identity_generation: u64,
+    write_identity_generation: u64,
+    writable: bool,
 }
 
 impl MediaFencedTransport {
@@ -344,6 +347,9 @@ impl MediaFencedTransport {
             verification: Default::default(),
             fence: Box::new(NoCalibrationControl),
             fenced_this_load: false,
+            identity_generation: 0,
+            write_identity_generation: 0,
+            writable: true,
         }
     }
 
@@ -359,7 +365,47 @@ impl MediaFencedTransport {
     /// Clear the once-per-load flag at a load boundary (SSC
     /// LOAD/UNLOAD attempt, reset UNIT ATTENTION).
     pub(in crate::handle) fn reset_media_write_fence_for_load_boundary(&mut self) {
+        self.invalidate_identity();
+    }
+
+    /// Invalidate proof without wrapping into a previously issued generation.
+    pub(in crate::handle) fn invalidate_identity(&mut self) {
+        self.identity_generation = self
+            .identity_generation
+            .checked_add(1)
+            .expect("identity generation exhausted; refusing to reuse proof");
         self.fenced_this_load = false;
+    }
+
+    pub(in crate::handle) fn identity_generation(&self) -> u64 {
+        self.identity_generation
+    }
+
+    /// Bind writes only after the caller has re-established all media evidence.
+    pub(in crate::handle) fn bind_identity_generation(
+        &mut self,
+        proved: u64,
+    ) -> Result<(), TapeIoError> {
+        self.check_identity_generation(proved)?;
+        self.write_identity_generation = proved;
+        Ok(())
+    }
+
+    pub(in crate::handle) fn check_identity_generation(
+        &self,
+        proved: u64,
+    ) -> Result<(), TapeIoError> {
+        if proved != self.identity_generation {
+            return Err(TapeIoError::IdentityInvalidated {
+                proved,
+                current: self.identity_generation,
+            });
+        }
+        Ok(())
+    }
+
+    pub(in crate::handle) fn set_writable(&mut self, writable: bool) {
+        self.writable = writable;
     }
 
     /// Whether the epoch has been advanced (and a media-modifying CDB
@@ -377,8 +423,11 @@ impl MediaFencedTransport {
     ) -> Result<TransferOutcome, ScsiError> {
         let result = self.inner.execute_in(cdb, buf);
         self.verification.dispatch(cdb, buf, &result);
+        if let Ok(outcome) = &result {
+            self.note_outcome(outcome);
+        }
         if let Err(error) = &result {
-            self.note_unit_attention(error);
+            self.note_error(error, cdb.first() == Some(&0x00));
         }
         result
     }
@@ -399,7 +448,7 @@ impl MediaFencedTransport {
         self.verification
             .dispatch(cdb, &[], &Ok(TransferOutcome::clean(0)));
         if let Err(error) = &result {
-            self.note_unit_attention(error);
+            self.note_error(error, cdb.first() == Some(&0x00));
         }
         result
     }
@@ -475,6 +524,15 @@ impl MediaFencedTransport {
             ));
         }
 
+        if class == WriteDirectionClass::MediaModifying {
+            if !self.writable {
+                return Err(MediaDispatchError::NotDispatched(
+                    TapeIoError::EphemeralReadOnly,
+                ));
+            }
+            self.check_identity_generation(self.write_identity_generation)
+                .map_err(MediaDispatchError::NotDispatched)?;
+        }
         if class == WriteDirectionClass::MediaModifying && !self.fenced_this_load {
             if let Err(fence_error) = self.fence.fence_media_write() {
                 return Err(MediaDispatchError::NotDispatched(
@@ -488,6 +546,9 @@ impl MediaFencedTransport {
             Some(buf) => {
                 let result = self.inner.execute_out(cdb, buf);
                 self.verification.dispatch(cdb, buf, &result);
+                if let Ok(outcome) = &result {
+                    self.note_outcome(outcome);
+                }
                 result.map(Some)
             }
             None => {
@@ -498,7 +559,7 @@ impl MediaFencedTransport {
             }
         };
         result.map_err(|error| {
-            self.note_unit_attention(&error);
+            self.note_error(&error, false);
             MediaDispatchError::Scsi(error)
         })
     }
@@ -508,11 +569,24 @@ impl MediaFencedTransport {
     /// change, mode change). Clearing the once-per-load flag makes
     /// the next media write re-fence — false invalidation, the safe
     /// direction.
-    fn note_unit_attention(&mut self, error: &ScsiError) {
-        if let ScsiError::CheckCondition { sense, .. } = error {
-            if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x06) {
-                self.fenced_this_load = false;
-            }
+    fn note_outcome(&mut self, outcome: &TransferOutcome) {
+        if outcome
+            .sense
+            .as_ref()
+            .is_some_and(|sense| sense.key == 0x06)
+        {
+            self.invalidate_identity();
+        }
+    }
+
+    fn note_error(&mut self, error: &ScsiError, readiness_check: bool) {
+        let unit_attention = matches!(error, ScsiError::CheckCondition { sense, .. }
+            if decode_sense(sense).is_some_and(|decoded| decoded.key == 0x06));
+        let deferred = matches!(error, ScsiError::CheckCondition { sense, .. }
+            if super::sense_is_deferred(sense));
+        if readiness_check || unit_attention || deferred || crate::handle::completion_unknown(error)
+        {
+            self.invalidate_identity();
         }
     }
 }
@@ -740,11 +814,52 @@ mod tests {
             "UA cleared the flag"
         );
 
+        // A caller must explicitly re-prove identity before the next write.
+        transport
+            .bind_identity_generation(transport.identity_generation())
+            .unwrap();
         // Next write re-fences.
         transport
             .dispatch_media_out(&[0x0A, 0, 0, 0, 1, 0], &[0u8; 1])
             .expect("clean write after UA");
         assert_eq!(control.fence_transactions(), 2);
+    }
+
+    /// The common gate must also protect fixed batches, pipelined writes,
+    /// and all filemark forms; re-installing a fence cannot resurrect proof.
+    #[test]
+    fn stale_generation_blocks_every_media_opcode_before_fence_or_dispatch() {
+        let (mut gate, control) = fenced_fixture();
+        let proved = gate.identity_generation();
+        gate.invalidate_identity();
+        gate.install_media_write_fence(Box::new(control.clone()));
+        assert!(matches!(
+            gate.bind_identity_generation(proved),
+            Err(TapeIoError::IdentityInvalidated { .. })
+        ));
+        for fixed in [0, 1] {
+            assert!(matches!(
+                gate.dispatch_media_out(&[0x0a, fixed, 0, 0, 1, 0], &[0; 64]),
+                Err(MediaDispatchError::NotDispatched(
+                    TapeIoError::IdentityInvalidated { .. }
+                ))
+            ));
+        }
+        for immed in [0, 1] {
+            for count in [0, 1] {
+                assert!(matches!(
+                    gate.dispatch_media_none(&[0x10, immed, 0, 0, count, 0]),
+                    Err(MediaDispatchError::NotDispatched(
+                        TapeIoError::IdentityInvalidated { .. }
+                    ))
+                ));
+            }
+        }
+        assert_eq!(control.fence_transactions(), 0);
+        gate.bind_identity_generation(gate.identity_generation())
+            .unwrap();
+        gate.dispatch_media_none(&[0x10, 0, 0, 0, 1, 0]).unwrap();
+        assert_eq!(control.fence_transactions(), 1);
     }
 
     #[test]

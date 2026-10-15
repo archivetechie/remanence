@@ -800,6 +800,8 @@ pub enum WormMediaState {
 /// MODE SELECT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapeConfig {
+    /// Recorded density from the MODE SENSE block descriptor; ignored on write_config.
+    pub density_code: Option<u8>,
     /// Block-size mode: [`BlockSize::Variable`] or [`BlockSize::Fixed`].
     pub block_size: BlockSize,
     /// Whether the drive's hardware compression is enabled. `false`
@@ -922,6 +924,7 @@ mod tests {
         // LTO SCSI Reference §4.11 (codex 03706ad5 caught the
         // earlier off-by-one 16 MiB literal).
         let c = TapeConfig {
+            density_code: None,
             block_size: BlockSize::Variable,
             compression: false,
             max_block_size_bytes: 0xFF_FFFF,

@@ -15,15 +15,14 @@ pub enum DiscoveryError {
         cause: IoErrorKind,
     },
 
-    /// The host has no `/dev/sg*` devices, or none classifiable as a tape
-    /// library after INQUIRY, or every changer probe failed. The
+    /// The host has no usable changer or sequential-access device. The
     /// `warnings` vec carries the per-device diagnostics we collected
     /// during the doomed pass — typically `ScsiError` and
     /// `DeviceUnreachable` entries. The CLI prints these to stderr so
     /// the operator can see *why* discovery returned nothing (most
     /// commonly: missing `CAP_SYS_RAWIO`, surfacing as a per-device
     /// SCSI error on every RES call).
-    #[error("no tape libraries reachable on this host ({} warning(s))", warnings.len())]
+    #[error("no tape libraries or drives reachable on this host ({} warning(s))", warnings.len())]
     NoLibraries {
         /// Per-device / per-library diagnostics gathered during the
         /// pass. Empty if the host genuinely has no `/dev/sg*` at all.
@@ -118,7 +117,7 @@ pub enum DiscoveryWarning {
     /// disambiguate (multiple logical libraries share the channel —
     /// e.g., the MSL3040 partitioning case). Affected bays have
     /// `installed = None`.
-    DriveMappingUnavailable { library: String },
+    DriveMappingUnavailable { library: String, bays: Vec<u16> },
     /// A tape device's VPD 0x80 serial didn't match any library's
     /// drive bay.
     UnclaimedTape { sg_path: PathBuf, serial: String },
@@ -151,6 +150,20 @@ pub enum DiscoveryWarning {
 /// Errors from `Library::open()` (and the equivalent drive-handle path).
 #[derive(Debug, Error)]
 pub enum OpenError {
+    /// Standalone persistence requires a VPD unit serial.
+    #[error("device {path:?} has no VPD 0x80 serial; only an explicit unserialized read-only allowance can open it")]
+    MissingDriveSerial {
+        /// Requested device.
+        path: PathBuf,
+    },
+    /// Neither the serial nor exact path was allowed.
+    #[error("device {path:?} (serial {serial:?}) is not on the access policy allowlist")]
+    DeviceNotAllowed {
+        /// Requested device.
+        path: PathBuf,
+        /// Observed serial.
+        serial: Option<String>,
+    },
     /// `AccessPolicy::allows` returned false for this library's serial.
     #[error("library {serial:?} is not on the access policy allowlist")]
     NotAllowed {
@@ -541,8 +554,8 @@ pub enum RescanWarning {
 pub enum AuditEvent<'a> {
     /// Preflight succeeded; the CDB is about to be issued.
     Started {
-        /// Library serial the operation targets.
-        library_serial: &'a str,
+        /// Durable library or standalone drive subject.
+        subject: AuditSubject<'a>,
         /// What operation is starting.
         operation: AuditOp,
         /// Raw CDB bytes about to go over SG_IO.
@@ -552,8 +565,8 @@ pub enum AuditEvent<'a> {
     },
     /// Preflight refused. No CDB ever issued.
     Refused {
-        /// Library serial that was targeted.
-        library_serial: &'a str,
+        /// Durable library or standalone drive subject.
+        subject: AuditSubject<'a>,
         /// What operation was attempted.
         operation: AuditOp,
         /// Variant name of the refusing [`MoveError`] (e.g.
@@ -565,8 +578,8 @@ pub enum AuditEvent<'a> {
     },
     /// CDB returned. `outcome` carries success or failure detail.
     Finished {
-        /// Library serial the operation targeted.
-        library_serial: &'a str,
+        /// Durable library or standalone drive subject.
+        subject: AuditSubject<'a>,
         /// What operation finished.
         operation: AuditOp,
         /// What happened.
@@ -580,8 +593,8 @@ pub enum AuditEvent<'a> {
     /// standalone for `refresh()`. One event per warning — operators
     /// can filter the log for `Warning { warning: DriveReplaced .. }`.
     Warning {
-        /// Library serial the operation targeted.
-        library_serial: &'a str,
+        /// Durable library or standalone drive subject.
+        subject: AuditSubject<'a>,
         /// What operation produced this warning. For `rescan()` this
         /// is `AuditOp::Rescan`; for `refresh()` we surface it as
         /// `Rescan` too, since the operator-visible effect (a drive
@@ -663,43 +676,43 @@ pub enum AuditOp {
     /// The audited CDB is the INIT; the post-init RES is read-only
     /// and not separately audited.
     Rescan,
-    /// PREVENT MEDIUM REMOVAL on the changer.
+    /// PREVENT MEDIUM REMOVAL on the audited changer or drive.
     LockRemoval,
-    /// ALLOW MEDIUM REMOVAL on the changer.
+    /// ALLOW MEDIUM REMOVAL on the audited changer or drive.
     AllowRemoval,
     /// Single SSC UNLOAD CDB issued directly through `DriveHandle`,
     /// not as the first phase of a composed `Unload`.
     DriveUnload {
         /// Drive bay address whose drive received UNLOAD.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Single SSC LOAD CDB issued directly through `DriveHandle`,
     /// not as the second phase of a composed `Load`.
     DriveLoad {
         /// Drive bay address whose drive received LOAD.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Layer 3a: SSC REWIND on a tape drive.
     TapeRewind {
         /// Drive bay address whose drive received REWIND.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Layer 3a: SSC READ POSITION (long form, service action 6) on a
     /// tape drive. Read-only; never marks the snapshot dirty on
     /// successful completion.
     TapeReadPosition {
         /// Drive bay address whose drive received READ POSITION.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Layer 3a: SSC LOG SENSE TapeAlert page on a tape drive.
     TapeReadAlerts {
         /// Drive bay address whose drive received LOG SENSE.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Layer 3a: SSC LOCATE(16) on a tape drive — seek to LBA.
     TapeLocate {
         /// Drive bay address whose drive received LOCATE(16).
-        bay: u16,
+        bay: Option<u16>,
         /// Target logical block address.
         lba: u64,
     },
@@ -708,7 +721,7 @@ pub enum AuditOp {
     /// End-of-Data.
     TapeSpace {
         /// Drive bay address whose drive received SPACE.
-        bay: u16,
+        bay: Option<u16>,
         /// Signed count of units. Negative is backward; ignored for
         /// `SpaceKind::EndOfData`.
         count: i64,
@@ -718,7 +731,7 @@ pub enum AuditOp {
     /// Layer 3a: SSC READ(6) on a tape drive (variable-block).
     TapeRead {
         /// Drive bay address whose drive received READ.
-        bay: u16,
+        bay: Option<u16>,
         /// Host buffer length the caller passed (the per-CDB
         /// transfer limit). The drive returns ≤ this many bytes
         /// in variable-block mode.
@@ -727,7 +740,7 @@ pub enum AuditOp {
     /// Layer 3a: SSC WRITE(6) on a tape drive (variable-block).
     TapeWrite {
         /// Drive bay address whose drive received WRITE.
-        bay: u16,
+        bay: Option<u16>,
         /// Buffer length the caller passed (the block size the
         /// drive will write).
         len: u32,
@@ -736,7 +749,7 @@ pub enum AuditOp {
     /// event is the durable pre-ioctl intent marker for the planned range.
     TapeWriteWindow {
         /// Drive bay receiving the window.
-        bay: u16,
+        bay: Option<u16>,
         /// Planned WRITE(6) command count.
         command_count: u32,
         /// Planned bytes across all commands.
@@ -749,7 +762,7 @@ pub enum AuditOp {
     /// Layer 3a: SSC WRITE FILEMARKS(6) on a tape drive.
     TapeWriteFilemarks {
         /// Drive bay address whose drive received WRITE FILEMARKS.
-        bay: u16,
+        bay: Option<u16>,
         /// Number of file marks to write. IMMED is always 0.
         count: u32,
     },
@@ -757,20 +770,20 @@ pub enum AuditOp {
     /// block size via MODE SENSE(6) page 0x0F + READ BLOCK LIMITS.
     TapeReadConfig {
         /// Drive bay address whose drive was queried.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Layer 3a: write block-size + compression configuration via
     /// MODE SELECT(6) with page 0x0F + block descriptor.
     TapeWriteConfig {
         /// Drive bay address whose drive received MODE SELECT.
-        bay: u16,
+        bay: Option<u16>,
     },
     /// Layer 3a: READ END OF WRAP POSITION (long form) on a tape
     /// drive — the wrap-map harvest read. Read-only; never marks the
     /// snapshot dirty on successful completion.
     TapeReadWrapPositions {
         /// Drive bay address whose drive received the command.
-        bay: u16,
+        bay: Option<u16>,
     },
 }
 
@@ -824,4 +837,32 @@ pub enum AuditOutcome {
         /// Human-readable summary.
         summary: String,
     },
+}
+
+/// Durable subject of a Layer 2 event. Ephemeral devices cannot authorize audit records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditSubject<'a> {
+    /// Changer serial.
+    Library(&'a str),
+    /// Standalone drive VPD 0x80 serial.
+    Drive(&'a str),
+    /// No durable identity; hooks are suppressed for this subject.
+    Ephemeral,
+}
+impl<'a> AuditSubject<'a> {
+    /// Stable audit subject kind.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Library(_) => "library",
+            Self::Drive(_) => "drive",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+    /// Persistent serial, if any.
+    pub fn id(self) -> Option<&'a str> {
+        match self {
+            Self::Library(id) | Self::Drive(id) => Some(id),
+            Self::Ephemeral => None,
+        }
+    }
 }

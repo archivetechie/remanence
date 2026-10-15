@@ -869,6 +869,7 @@ fn mount_tape_object(
     })?;
     drive
         .write_config(TapeConfig {
+            density_code: None,
             block_size: BlockSize::Fixed {
                 size_bytes: plan.block_size_bytes,
             },

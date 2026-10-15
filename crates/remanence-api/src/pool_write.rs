@@ -20,8 +20,9 @@ pub(crate) use capacity::{
 };
 
 pub use media::{
-    can_read, can_write, check_writability_preconditions, lto_generation_from_drive_product,
-    raw_capacity_bytes, tape_generation, LtoGen, MediaObservation,
+    can_read, can_write, check_writability_preconditions, lto_generation_from_density,
+    lto_generation_from_drive_product, raw_capacity_bytes, tape_generation, LtoGen,
+    MediaObservation,
 };
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;

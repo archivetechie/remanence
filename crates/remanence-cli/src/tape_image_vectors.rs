@@ -170,6 +170,7 @@ pub(crate) fn write_model(
     let mut drive = DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-image-model"),
         Box::new(transport),
+        &remanence_library::StaticAllowlist::new(["/dev/sg-image-model"]),
     )
     .map_err(|e| e.to_string())?;
     let written = write_tape_image(&mut drive, inputs)?;

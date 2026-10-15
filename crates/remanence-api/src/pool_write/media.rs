@@ -153,3 +153,22 @@ pub(super) fn check_pool_block_size_precondition(
     }
     Ok(())
 }
+
+/// Decode the MODE SENSE block descriptor's recorded density, not medium type.
+/// IBM LTO SCSI Reference GA32-0928-05 (2022-02-28), p. 362 (PDF p. 392),
+/// block descriptor density table. Zero/default and unknown codes are not evidence.
+pub fn lto_generation_from_density(density: u8) -> Option<LtoGen> {
+    match density {
+        0x40 => Some(LtoGen::Lto1),
+        0x42 => Some(LtoGen::Lto2),
+        0x44 => Some(LtoGen::Lto3),
+        0x46 => Some(LtoGen::Lto4),
+        0x58 => Some(LtoGen::Lto5),
+        0x5a => Some(LtoGen::Lto6),
+        0x5c => Some(LtoGen::Lto7),
+        0x5d => Some(LtoGen::M8),
+        0x5e => Some(LtoGen::Lto8),
+        0x60 => Some(LtoGen::Lto9),
+        _ => None,
+    }
+}

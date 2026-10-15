@@ -2117,6 +2117,11 @@ mod tests {
             let mut drive = DriveHandle::open_standalone_with_transport(
                 std::path::Path::new("/dev/sg-short-good-fixture"),
                 Box::new(transport),
+                &remanence_library::StaticAllowlist::new([(std::path::Path::new(
+                    "/dev/sg-short-good-fixture",
+                ))
+                .to_string_lossy()
+                .into_owned()]),
             )
             .expect("fixture drive opens");
             let mut source = DriveHandleSource(&mut drive);

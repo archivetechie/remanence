@@ -3364,6 +3364,9 @@ fn state_with_library_snapshot(serial: &str) -> ApiState {
     state.default_library_serial = Some(Arc::new(serial.to_string()));
     state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
         report: DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![test_library(serial)],
             warnings: Vec::new(),
         },
@@ -3483,6 +3486,9 @@ fn foreign_poll_skips_same_serial_collision_rows_without_attribution() {
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
     let report = DiscoveryReport {
+        unattached_drives: Vec::new(),
+        complete: true,
+        incomplete_evidence: Vec::new(),
         libraries: vec![foreign_drive_library(
             "d2lib",
             &[
@@ -3557,6 +3563,9 @@ fn foreign_poll_attributes_unambiguous_row_by_library_and_element_address() {
         .expect("tempdir");
     let index_path = temp.path().join("rem-state.sqlite");
     let report = DiscoveryReport {
+        unattached_drives: Vec::new(),
+        complete: true,
+        incomplete_evidence: Vec::new(),
         libraries: vec![foreign_drive_library(
             "d2lib",
             &[
@@ -6679,6 +6688,9 @@ fn drive_target_test_state(
     state.default_library_serial = Some(Arc::new(serial.to_string()));
     state.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
         report: DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![library],
             warnings: Vec::new(),
         },
@@ -6784,6 +6796,9 @@ async fn drive_target_read_open_uses_virtual_world_actor_and_proves_bot_identity
 
     let discovered_library = world.lock().expect("virtual world lock").library_snapshot();
     let report = DiscoveryReport {
+        unattached_drives: Vec::new(),
+        complete: true,
+        incomplete_evidence: Vec::new(),
         libraries: vec![discovered_library.clone()],
         warnings: Vec::new(),
     };
@@ -6936,6 +6951,9 @@ fn drive_target_read_errors_are_precise_and_pool_guard_is_enforced() {
         .expect("library snapshot");
     foreign.library_snapshot = Some(Arc::new(RwLock::new(Arc::new(LibrarySnapshot {
         report: DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![current.report.libraries[0].clone(), second_library],
             warnings: Vec::new(),
         },

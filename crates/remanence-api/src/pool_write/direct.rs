@@ -703,6 +703,7 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     };
 
     drive.rewind()?;
+    let identity_generation = drive.identity_generation();
     {
         let mut source = DriveHandleSource(drive);
         verify_tape_identity(&mut source, &selected.tape_uuid)?;
@@ -711,6 +712,7 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     let current_cfg = drive.read_config()?;
     require_rewritable_object_media(current_cfg)?;
     crate::drive_mode::configure_fixed_uncompressed_write(drive, current_cfg, selected.block_size)?;
+    drive.bind_identity_generation(identity_generation)?;
     let mut sink = DriveHandleSink(drive);
     write_to_selected_tape_checkpointed_after_preflight(
         state,

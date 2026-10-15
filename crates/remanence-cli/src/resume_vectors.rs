@@ -325,6 +325,7 @@ pub fn model(
     let drive = DriveHandle::open_standalone_with_transport(
         Path::new("/dev/sg-resume-model"),
         Box::new(transport),
+        &remanence_library::StaticAllowlist::new(["/dev/sg-resume-model"]),
     )
     .unwrap();
     world.lock().unwrap().command_log.clear();

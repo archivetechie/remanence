@@ -1793,6 +1793,7 @@ where
         ));
     }
     let configured_for_bot = TapeConfig {
+        density_code: None,
         block_size: BlockSize::Fixed {
             size_bytes: remanence_api::CANONICAL_ADOPTION_BLOCK_SIZE_BYTES,
         },
@@ -3961,7 +3962,7 @@ fn cli_discover() -> Result<DiscoveryReport, DiscoveryError> {
         .map_err(|cause| DiscoveryError::EnumerationDenied { cause })?;
     let devices = remanence_library::sysfs::enumerate_sg_devices()
         .map_err(|cause| DiscoveryError::EnumerationDenied { cause })?;
-    remanence_library::discover_with(devices, factory)
+    remanence_library::discover_enumerated_with(devices, factory)
 }
 
 #[cfg(target_os = "linux")]
@@ -8501,7 +8502,10 @@ fn run_direct_device_recovery_report(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    let mut drive = match remanence_library::DriveHandle::open_standalone(&args.source) {
+    let mut drive = match remanence_library::DriveHandle::open_standalone(
+        &args.source,
+        &remanence_library::StaticAllowlist::new([args.source.to_string_lossy().into_owned()]),
+    ) {
         Ok(drive) => drive,
         Err(error) => {
             let _ = writeln!(
@@ -11207,6 +11211,7 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         "after_rewind_before_bot_read",
         || signal_guard.requested_signal_name(),
     )?;
+    let identity_generation = drive.identity_generation();
     let bot_projection = {
         let mut source = DriveHandleSource(&mut drive);
         remanence_api::classify_bot_from_source(&mut source)
@@ -11303,6 +11308,9 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
         "before_apply_init_write_gate",
         || signal_guard.requested_signal_name(),
     )?;
+    drive
+        .bind_identity_generation(identity_generation)
+        .map_err(|error| error.to_string())?;
     let action_result = {
         let mut sink = DriveHandleSink(&mut drive);
         remanence_api::maybe_write_tape_init_bootstrap(
@@ -11730,6 +11738,7 @@ fn write_dump_to_loaded_tape(
     if dump_len == 0 {
         return Err("dump file is empty".to_string());
     }
+    let identity_generation = drive.identity_generation();
     let current_config = drive.read_config().map_err(|error| error.to_string())?;
     if record_size > current_config.max_block_size_bytes as usize {
         return Err(format!(
@@ -11750,6 +11759,7 @@ fn write_dump_to_loaded_tape(
     drive.rewind().map_err(|error| error.to_string())?;
     drive
         .write_config(TapeConfig {
+            density_code: None,
             block_size: BlockSize::Variable,
             compression: false,
             max_block_size_bytes: current_config.max_block_size_bytes,
@@ -11758,6 +11768,9 @@ fn write_dump_to_loaded_tape(
         })
         .map_err(|error| error.to_string())?;
 
+    drive
+        .bind_identity_generation(identity_generation)
+        .map_err(|error| error.to_string())?;
     loop {
         let mut filled = 0usize;
         while filled < buffer.len() {
@@ -15963,8 +15976,8 @@ fn format_warning(w: &DiscoveryWarning) -> String {
         DiscoveryWarning::DriveMappingDerived { library, method } => {
             format!("library {library}: drive identity derived via {method} — operations require explicit policy opt-in")
         }
-        DiscoveryWarning::DriveMappingUnavailable { library } => {
-            format!("library {library}: drive identity unavailable — affected bays have no /dev/sgN binding")
+        DiscoveryWarning::DriveMappingUnavailable { library, bays } => {
+            format!("changer {library}: this changer did not report drive identities for bays {bays:?}; see the hardware-support page")
         }
         DiscoveryWarning::UnclaimedTape { sg_path, serial } => {
             format!(
@@ -17236,6 +17249,7 @@ mod tests {
 
     fn bot_test_config(block_size: BlockSize, compression: bool) -> TapeConfig {
         TapeConfig {
+            density_code: None,
             block_size,
             compression,
             max_block_size_bytes: 8 * 1024 * 1024,
@@ -19180,6 +19194,9 @@ pool_id = "init-test"
                     config_path.to_str().unwrap(),
                 ],
                 Ok(DiscoveryReport {
+                    unattached_drives: Vec::new(),
+                    complete: true,
+                    incomplete_evidence: Vec::new(),
                     libraries: vec![library],
                     warnings: vec![],
                 }),
@@ -19294,6 +19311,9 @@ pool_id = "init-test"
             cartridge: Some("AOX030L9".to_string()),
         }];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![rem_lib, d2_lib],
             warnings: Vec::new(),
         };
@@ -23574,7 +23594,7 @@ blob Project/Render Files/
         // Can't compare ExitCode directly; round-trip via Debug repr.
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
         assert_eq!(out, "");
-        assert!(err.contains("no tape libraries reachable"));
+        assert!(err.contains("no tape libraries or drives reachable"));
         // No warnings → no warning block, no setcap hint.
         assert!(!err.contains("warnings ("));
         assert!(!err.contains("CAP_SYS_RAWIO"));
@@ -23607,7 +23627,7 @@ blob Project/Render Files/
         );
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
         assert_eq!(out, "");
-        assert!(err.contains("no tape libraries reachable"));
+        assert!(err.contains("no tape libraries or drives reachable"));
         assert!(err.contains("warnings (2):"));
         assert!(err.contains("transport error"));
         assert!(err.contains("/dev/sg5"));
@@ -23674,6 +23694,9 @@ blob Project/Render Files/
             },
         ];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![],
         };
@@ -23705,6 +23728,9 @@ blob Project/Render Files/
             cartridge: Some("L00001".into()),
         }];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![],
         };
@@ -23725,6 +23751,9 @@ blob Project/Render Files/
     #[test]
     fn libs_alias_dispatches_to_libraries() {
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![fake_library("LIB_A")],
             warnings: vec![],
         };
@@ -23767,6 +23796,9 @@ blob Project/Render Files/
             },
         ];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![],
         };
@@ -23786,6 +23818,9 @@ blob Project/Render Files/
     #[test]
     fn library_subcommand_returns_exit_2_when_serial_not_found() {
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![fake_library("LIB_X")],
             warnings: vec![],
         };
@@ -23823,6 +23858,9 @@ blob Project/Render Files/
             },
         ];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![],
         };
@@ -23901,6 +23939,9 @@ blob Project/Render Files/
             export_enabled: true,
         }];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![],
         };
@@ -24001,6 +24042,9 @@ blob Project/Render Files/
             export_enabled: true,
         }];
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![],
         };
@@ -24028,6 +24072,9 @@ blob Project/Render Files/
     #[test]
     fn lib_alias_dispatches_to_library() {
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![fake_library("LIB_ALIAS")],
             warnings: vec![],
         };
@@ -24042,9 +24089,13 @@ blob Project/Render Files/
     fn warnings_print_to_stderr_after_success() {
         let lib = fake_library("LIB_W");
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![lib],
             warnings: vec![
                 DiscoveryWarning::DriveMappingUnavailable {
+                    bays: vec![0x100],
                     library: "LIB_W".into(),
                 },
                 DiscoveryWarning::UnclaimedTape {
@@ -24059,7 +24110,9 @@ blob Project/Render Files/
         assert!(!out.contains("warning"));
         // Warnings show on stderr with the count and each variant.
         assert!(err.contains("warnings (2):"));
-        assert!(err.contains("library LIB_W: drive identity unavailable"));
+        assert!(
+            err.contains("changer LIB_W: this changer did not report drive identities for bays")
+        );
         assert!(err.contains("/dev/sg9"));
         assert!(err.contains("ORPHAN1"));
     }
@@ -24153,6 +24206,9 @@ blob Project/Render Files/
         // exit 2 path still emits the warnings — operator sees them
         // regardless of whether the focused command found its target.
         let report = DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![fake_library("LIB_KNOWN")],
             warnings: vec![DiscoveryWarning::UnclaimedTape {
                 sg_path: PathBuf::from("/dev/sg9"),

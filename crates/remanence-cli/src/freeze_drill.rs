@@ -1111,8 +1111,12 @@ impl LiveTransportFactory {
     }
 
     fn open_handle(&self, transport: Box<dyn SgTransport>) -> Result<DriveHandle, String> {
-        DriveHandle::open_standalone_with_transport(&self.device, transport)
-            .map_err(|error| format!("open standalone drive {}: {error}", self.device.display()))
+        DriveHandle::open_standalone_with_transport(
+            &self.device,
+            transport,
+            &remanence_library::StaticAllowlist::new([self.device.to_string_lossy().into_owned()]),
+        )
+        .map_err(|error| format!("open standalone drive {}: {error}", self.device.display()))
     }
 }
 
@@ -1250,6 +1254,7 @@ mod tests {
             DriveHandle::open_standalone_with_transport(
                 Path::new("/dev/sg-freeze-model"),
                 transport,
+                &remanence_library::StaticAllowlist::new(["/dev/sg-freeze-model"]),
             )
             .map_err(|error| format!("open model drive: {error}"))
         }

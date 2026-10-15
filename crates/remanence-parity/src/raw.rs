@@ -1321,6 +1321,7 @@ impl<'a> DriveHandleRawSink<'a> {
             size_bytes: block_size,
         };
         self.drive.write_config(TapeConfig {
+            density_code: None,
             block_size: desired_block_size,
             compression: false,
             max_block_size_bytes: current.max_block_size_bytes,
@@ -1445,6 +1446,7 @@ impl RawTapeSource for DriveHandleRawSource<'_> {
         }
 
         self.drive.write_config(TapeConfig {
+            density_code: None,
             block_size: desired,
             compression: current.compression,
             max_block_size_bytes: current.max_block_size_bytes,

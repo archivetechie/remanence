@@ -3284,6 +3284,9 @@ fn test_write_owner_config(
     WriteOwnerConfig {
         index_path,
         report: DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![library.library().clone()],
             warnings: Vec::new(),
         },
@@ -3324,6 +3327,9 @@ fn test_io_memory() -> Arc<crate::io_memory::IoMemoryReservation> {
 fn library_snapshot_cell(library: Library) -> Arc<RwLock<Arc<crate::LibrarySnapshot>>> {
     Arc::new(RwLock::new(Arc::new(crate::LibrarySnapshot {
         report: DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![library],
             warnings: Vec::new(),
         },
@@ -5404,6 +5410,9 @@ async fn changer_move_succeeds_and_publishes_snapshot_when_catalog_observation_f
     let cfg = WriteOwnerConfig {
         index_path: index_path.clone(),
         report: DiscoveryReport {
+            unattached_drives: Vec::new(),
+            complete: true,
+            incomplete_evidence: Vec::new(),
             libraries: vec![library.clone()],
             warnings: Vec::new(),
         },
@@ -6349,6 +6358,7 @@ async fn induced_append_and_read_failures_persist_session_snapshots() {
 #[test]
 fn object_write_media_policy_requires_positive_rewritable_evidence() {
     let config = |write_protected, worm| TapeConfig {
+        density_code: None,
         block_size: remanence_library::BlockSize::Variable,
         compression: false,
         max_block_size_bytes: 8 * 1024 * 1024,

@@ -10,8 +10,10 @@ use remanence_scsi::{
 };
 
 use crate::error::{DiscoveryError, DiscoveryWarning, IoErrorKind};
-use crate::model::{DeviceCaptures, DiscoveryReport, IdentitySource, Library};
-use crate::sysfs::DeviceAttachment;
+use crate::model::{
+    DeviceCaptures, DiscoveryReport, DriveOwnership, IdentitySource, Library, UnattachedDrive,
+};
+use crate::sysfs::{DeviceAttachment, DeviceEnumeration};
 use crate::transport::{SgTransport, TimeoutClass};
 
 // CDB / buffer sizes for the read-only commands discovery issues.
@@ -22,28 +24,45 @@ const VPD_BUF_LEN: usize = vpd::ALLOC_LEN as usize;
 /// Build a [`DiscoveryReport`] for the host, given an enumeration of
 /// SG attachments and a way to open an [`SgTransport`] for each.
 ///
-/// This is the testable form: `transport_for` is a closure that the
-/// caller controls. Production code calls [`discover`] (Linux-only),
-/// which passes the sysfs walker output and
+/// This form assumes a complete enumeration: `transport_for` is a closure that
+/// the caller controls. Callers with enumeration failures must instead use
+/// [`discover_enumerated_with`], as [`discover`] (Linux-only) does with the
+/// sysfs walker output and
 /// [`LinuxSgTransport::open`](crate::transport::LinuxSgTransport::open).
 /// Tests use [`FixtureTransport`](crate::transport::FixtureTransport)
 /// to replay canned CDB responses without touching `/dev/sg*`.
 pub fn discover_with<F, T>(
     devices: impl IntoIterator<Item = DeviceAttachment>,
+    transport_for: F,
+) -> Result<DiscoveryReport, DiscoveryError>
+where
+    F: FnMut(&Path) -> Result<T, IoErrorKind>,
+    T: SgTransport,
+{
+    discover_enumerated_with(
+        DeviceEnumeration {
+            devices: devices.into_iter().collect(),
+            warnings: Vec::new(),
+        },
+        transport_for,
+    )
+}
+
+/// Discover from a host enumeration, preserving failures as incomplete evidence.
+/// Live callers must use this entry point so an unresolved SG attachment cannot
+/// turn an unclaimed drive into a proven standalone drive.
+pub fn discover_enumerated_with<F, T>(
+    enumeration: DeviceEnumeration,
     mut transport_for: F,
 ) -> Result<DiscoveryReport, DiscoveryError>
 where
     F: FnMut(&Path) -> Result<T, IoErrorKind>,
     T: SgTransport,
 {
-    let devices: Vec<_> = devices.into_iter().collect();
-    if devices.is_empty() {
-        return Err(DiscoveryError::NoLibraries {
-            warnings: Vec::new(),
-        });
-    }
-
-    let mut warnings: Vec<DiscoveryWarning> = Vec::new();
+    let DeviceEnumeration {
+        devices,
+        mut warnings,
+    } = enumeration;
     let mut libraries: Vec<Library> = Vec::new();
     // Tape devices we've successfully probed but not yet matched into
     // any library's drive bay.
@@ -88,18 +107,10 @@ where
         }
     }
 
-    // NoLibraries means "no medium-changer was successfully classified."
-    // A host with only tape drives still counts as having no libraries —
-    // Remanence requires a changer to be useful. Per the error model,
-    // tapes alone are not enough. We hand the collected warnings to the
-    // caller so the CLI can surface *why* every probe failed (e.g., a
-    // string of `ScsiError ... EPERM` from a missing CAP_SYS_RAWIO).
-    if libraries.is_empty() {
+    if libraries.is_empty() && tapes.is_empty() {
         return Err(DiscoveryError::NoLibraries { warnings });
     }
-
-    // -- match tape devices into drive bays ---------------------------
-    attach_tape_devices(&mut libraries, tapes, &mut warnings)?;
+    let mut unattached_drives = attach_tape_devices(&mut libraries, tapes, &mut warnings)?;
 
     // -- emit UnresolvedDrive warnings for bays without a /dev/sgN ----
     for lib in &libraries {
@@ -119,7 +130,36 @@ where
     // Deterministic ordering for human-readable output & snapshot tests.
     libraries.sort_by(|a, b| a.serial.cmp(&b.serial));
 
+    // Unclaimed devices alone do not make a pass incomplete. Probe failures,
+    // unresolved bays and ambiguous claims do: none may prove non-ownership.
+    let incomplete_evidence: Vec<_> = warnings
+        .iter()
+        .filter(|warning| {
+            matches!(
+                warning,
+                DiscoveryWarning::DeviceUnreachable { .. }
+                    | DiscoveryWarning::ScsiError { .. }
+                    | DiscoveryWarning::DriveMappingUnavailable { .. }
+                    | DiscoveryWarning::UnresolvedDrive { .. }
+                    | DiscoveryWarning::DriveSerialAmbiguous { .. }
+                    | DiscoveryWarning::DriveMappingDerived { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    let complete = incomplete_evidence.is_empty();
+    for drive in &mut unattached_drives {
+        drive.ownership = if complete {
+            DriveOwnership::Standalone
+        } else {
+            DriveOwnership::Unknown
+        };
+    }
+    unattached_drives.sort_by(|a, b| a.sg_path.cmp(&b.sg_path));
     Ok(DiscoveryReport {
+        unattached_drives,
+        complete,
+        incomplete_evidence,
         libraries,
         warnings,
     })
@@ -140,7 +180,7 @@ pub fn discover() -> Result<DiscoveryReport, DiscoveryError> {
 
     let devices = sysfs::enumerate_sg_devices()
         .map_err(|cause| DiscoveryError::EnumerationDenied { cause })?;
-    discover_with(devices, |path| {
+    discover_enumerated_with(devices, |path| {
         LinuxSgTransport::open(path).map_err(|e| IoErrorKind::from(&e))
     })
 }
@@ -153,7 +193,7 @@ struct TapeDevice {
     sg_path: PathBuf,
     sysfs_path: PathBuf,
     inquiry: Inquiry,
-    serial: String,
+    serial: Option<String>,
 }
 
 fn read_standard_inquiry<T: SgTransport>(t: &mut T) -> Result<Inquiry, ScsiError> {
@@ -285,6 +325,15 @@ fn probe_element_status<T: SgTransport>(
     // bays remain uncommandable and surface as a warning.
     warnings.push(DiscoveryWarning::DriveMappingUnavailable {
         library: library_serial.to_string(),
+        bays: primary
+            .elements
+            .iter()
+            .filter(|el| {
+                matches!(el.element_type, res::ElementType::DataTransfer)
+                    && el.drive_serial.is_none()
+            })
+            .map(|el| el.address)
+            .collect(),
     });
     Some(primary)
 }
@@ -412,10 +461,11 @@ fn probe_tape<T: SgTransport>(
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Option<TapeDevice> {
     let serial = match read_vpd_80(t) {
-        Ok(s) => s,
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) => None,
         Err(e) => {
             warnings.push(scsi_warning(&attach.sg_path, "INQUIRY VPD 0x80", e));
-            return None;
+            None
         }
     };
     Some(TapeDevice {
@@ -435,13 +485,14 @@ fn attach_tape_devices(
     libraries: &mut [Library],
     tapes: Vec<TapeDevice>,
     warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
+) -> Result<Vec<UnattachedDrive>, DiscoveryError> {
+    let mut unattached = Vec::new();
     for tape in tapes {
         let mut matches: Vec<(usize, usize)> = Vec::new();
         for (li, lib) in libraries.iter().enumerate() {
             for (bi, bay) in lib.drive_bays.iter().enumerate() {
                 if let Some(inst) = &bay.installed {
-                    if inst.serial == tape.serial {
+                    if tape.serial.as_deref() == Some(inst.serial.as_str()) {
                         matches.push((li, bi));
                     }
                 }
@@ -450,9 +501,18 @@ fn attach_tape_devices(
 
         match matches.len() {
             0 => {
-                warnings.push(DiscoveryWarning::UnclaimedTape {
-                    sg_path: tape.sg_path,
+                if let Some(serial) = &tape.serial {
+                    warnings.push(DiscoveryWarning::UnclaimedTape {
+                        sg_path: tape.sg_path.clone(),
+                        serial: serial.clone(),
+                    });
+                }
+                unattached.push(UnattachedDrive {
                     serial: tape.serial,
+                    sg_path: tape.sg_path,
+                    sysfs_path: tape.sysfs_path,
+                    inquiry: tape.inquiry,
+                    ownership: DriveOwnership::Unknown,
                 });
             }
             1 => {
@@ -480,13 +540,13 @@ fn attach_tape_devices(
                     .collect();
                 warnings.push(DiscoveryWarning::DriveSerialAmbiguous {
                     sg_path: tape.sg_path,
-                    serial: tape.serial,
+                    serial: tape.serial.expect("matching serial"),
                     claimants,
                 });
             }
         }
     }
-    Ok(())
+    Ok(unattached)
 }
 
 fn scsi_warning(path: &Path, command: &'static str, e: ScsiError) -> DiscoveryWarning {
@@ -714,7 +774,7 @@ mod tests {
             .collect();
         assert_eq!(mapping_unavailable.len(), 1);
         match mapping_unavailable[0] {
-            DiscoveryWarning::DriveMappingUnavailable { library } => {
+            DiscoveryWarning::DriveMappingUnavailable { library, .. } => {
                 assert_eq!(library, "7CBAD9CF74");
             }
             _ => unreachable!(),
@@ -824,11 +884,8 @@ mod tests {
     }
 
     #[test]
-    fn no_libraries_when_host_has_only_tapes() {
-        // A host with one tape device and no changer should be a
-        // NoLibraries error, not Ok(libraries: []). Per the error
-        // model, "no libraries" means none classifiable as a tape
-        // library — a tape drive alone is not a library.
+    fn discovers_standalone_when_host_has_only_tapes() {
+        // A complete drives-only pass proves standalone ownership.
         let drive_vpd80 = &[
             0x01u8, 0x80, 0x00, 0x0a, b'8', b'0', b'3', b'1', b'B', b'D', b'C', b'7', b'D', b'1',
         ];
@@ -836,7 +893,50 @@ mod tests {
         scripts.insert(PathBuf::from("/dev/sg0"), lto9_drive_responses(drive_vpd80));
         let attachments = vec![attachment("/dev/sg0")];
         let r = discover_with(attachments, make_factory(scripts));
-        assert!(matches!(r, Err(DiscoveryError::NoLibraries { .. })));
+        let report = r.unwrap();
+        assert!(report.complete);
+        assert_eq!(
+            report.unattached_drives[0].ownership,
+            DriveOwnership::Standalone
+        );
+    }
+
+    /// An unresolved changer attachment must not prove a visible drive unowned.
+    #[test]
+    fn unresolved_changer_attachment_keeps_discoverable_drive_ownership_unknown() {
+        let host = tempfile::tempdir().unwrap();
+        let dev = host.path().join("dev");
+        let sys = host.path().join("sys/class/scsi_generic");
+        let drive_attachment = host.path().join("sys/devices/drive");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::create_dir_all(&drive_attachment).unwrap();
+        for node in ["sg0", "sg1"] {
+            std::fs::write(dev.join(node), []).unwrap();
+            std::fs::create_dir_all(sys.join(node)).unwrap();
+        }
+        std::os::unix::fs::symlink(&drive_attachment, sys.join("sg0/device")).unwrap();
+        // The changer's attachment disappears during enumeration. Its INQUIRY
+        // cannot be collected, so discovery cannot rule out its drive claims.
+        std::os::unix::fs::symlink(
+            host.path().join("sys/devices/missing-changer"),
+            sys.join("sg1/device"),
+        )
+        .unwrap();
+        let enumeration = crate::sysfs::enumerate_sg_devices_under(&dev, &sys).unwrap();
+        let drive_vpd80 = include_bytes!("../../../fixtures/vpd-80/drive1-lto9.bin");
+        let scripts = HashMap::from([(dev.join("sg0"), lto9_drive_responses(drive_vpd80))]);
+        let report = discover_enumerated_with(enumeration, make_factory(scripts)).unwrap();
+
+        assert!(report.libraries.is_empty());
+        assert!(!report.complete);
+        assert_eq!(report.unattached_drives.len(), 1);
+        assert_eq!(
+            report.unattached_drives[0].ownership,
+            DriveOwnership::Unknown
+        );
+        assert!(matches!(&report.incomplete_evidence[..],
+            [DiscoveryWarning::DeviceUnreachable { path, .. }] if path == &dev.join("sg1")
+        ));
     }
 
     #[test]
@@ -850,13 +950,13 @@ mod tests {
                 sg_path: PathBuf::from("/dev/sg-dup"),
                 sysfs_path: PathBuf::from("/sys/tape/dup"),
                 inquiry: test_drive_inquiry(),
-                serial: "DUP".to_string(),
+                serial: Some("DUP".to_string()),
             },
             TapeDevice {
                 sg_path: PathBuf::from("/dev/sg-ok"),
                 sysfs_path: PathBuf::from("/sys/tape/ok"),
                 inquiry: test_drive_inquiry(),
-                serial: "OK".to_string(),
+                serial: Some("OK".to_string()),
             },
         ];
         let mut warnings = Vec::new();

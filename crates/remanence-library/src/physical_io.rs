@@ -144,6 +144,7 @@ impl PhysicalTapeSource for DriveHandlePhysicalSource<'_> {
             return Ok(());
         }
         self.drive.write_config(TapeConfig {
+            density_code: current.density_code,
             block_size,
             compression: current.compression,
             max_block_size_bytes: current.max_block_size_bytes,

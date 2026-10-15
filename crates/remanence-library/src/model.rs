@@ -15,11 +15,40 @@ use crate::error::{DiscoveryWarning, LoadError};
 /// enumerated, plus any non-fatal issues we noticed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryReport {
+    /// Sequential devices unclaimed by a changer.
+    pub unattached_drives: Vec<UnattachedDrive>,
+    /// Every attachment was probed and every bay resolved.
+    pub complete: bool,
+    /// Evidence preventing a complete ownership classification.
+    pub incomplete_evidence: Vec<DiscoveryWarning>,
     /// Libraries enumerated, ordered by `serial` (lexicographic) for
     /// determinism.
     pub libraries: Vec<Library>,
     /// Non-fatal per-device or per-library issues observed.
     pub warnings: Vec<DiscoveryWarning>,
+}
+
+/// Ownership established by this discovery pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveOwnership {
+    /// Complete discovery proved no changer claims this device.
+    Standalone,
+    /// Incomplete discovery cannot exclude changer ownership; not writable.
+    Unknown,
+}
+/// A sequential-access device not joined to a changer bay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnattachedDrive {
+    /// VPD 0x80 serial, when supplied by the device.
+    pub serial: Option<String>,
+    /// Host SG path.
+    pub sg_path: PathBuf,
+    /// Host topology path (not identity evidence).
+    pub sysfs_path: PathBuf,
+    /// Standard INQUIRY metadata.
+    pub inquiry: Inquiry,
+    /// Ownership evidence, separate from device identity.
+    pub ownership: DriveOwnership,
 }
 
 impl DiscoveryReport {
@@ -173,6 +202,8 @@ pub struct InstalledDrive {
 /// Provenance of an [`InstalledDrive::serial`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentitySource {
+    /// Direct device INQUIRY under explicit standalone policy.
+    Standalone,
     /// Returned inline by the changer in the RES DVCID block. Trustable.
     DvcidInline,
     /// DVCID inline AND independently matched against the drive's own
@@ -317,6 +348,7 @@ pub trait AccessPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct StaticAllowlist {
     allowed: HashSet<String>,
+    unserialized_devices: HashSet<PathBuf>,
     allowed_with_derived: HashSet<String>,
 }
 
@@ -333,7 +365,27 @@ impl StaticAllowlist {
         Self {
             allowed: library_serials.into_iter().map(Into::into).collect(),
             allowed_with_derived: HashSet::new(),
+            unserialized_devices: HashSet::new(),
         }
+    }
+
+    /// Permit this exact device path to open without VPD 0x80, read-only.
+    /// The device must also be on the ordinary access allowlist.
+    pub fn with_unserialized_device_allowed(mut self, path: &std::path::Path) -> Self {
+        self.unserialized_devices.insert(path.to_path_buf());
+        self
+    }
+    /// Whether the caller explicitly allowed an unserialized read-only device.
+    pub fn allows_unserialized_device(&self, path: &std::path::Path) -> bool {
+        self.unserialized_devices.contains(path)
+    }
+    /// Allow a standalone device by its VPD serial or exact path.
+    pub fn allows_device(&self, path: &std::path::Path, serial: Option<&str>) -> bool {
+        serial.is_some_and(|serial| self.allowed.contains(serial))
+            || self
+                .allowed
+                .iter()
+                .any(|entry| std::path::Path::new(entry) == path)
     }
 
     /// Mark a library serial as permitting derived-identity drives.

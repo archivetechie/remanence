@@ -69,9 +69,12 @@ fn seeded_fixture(rp_count: usize) -> FixtureTransport {
 /// in-memory calibration control as the fence, and hand back the
 /// observation clone.
 fn fenced_drive_over(transport: Box<dyn SgTransport>) -> (DriveHandle, InMemoryCalibrationControl) {
-    let mut drive =
-        DriveHandle::open_standalone_with_transport(Path::new("/dev/sg-fence-test"), transport)
-            .expect("standalone drive opens over fixture transport");
+    let mut drive = DriveHandle::open_standalone_with_transport(
+        Path::new("/dev/sg-fence-test"),
+        transport,
+        &crate::StaticAllowlist::new(["/dev/sg-fence-test"]),
+    )
+    .expect("standalone drive opens over fixture transport");
     let control = InMemoryCalibrationControl::new();
     drive.install_media_write_fence(Box::new(control.clone()));
     (drive, control)
@@ -267,6 +270,7 @@ fn write_config_routes_through_the_gate_but_never_trips_the_fence() {
     let (mut drive, control, log) = fenced_drive(2);
     drive
         .write_config(TapeConfig {
+            density_code: None,
             block_size: BlockSize::Variable,
             compression: false,
             max_block_size_bytes: 0,
@@ -305,6 +309,14 @@ fn load_unload_boundary_rearms_the_fence() {
     );
     drive.load().expect("load");
 
+    assert!(matches!(
+        drive.write_block(&[0u8; 64]),
+        Err(TapeIoError::IdentityInvalidated { .. })
+    ));
+    // Fixture models the caller completing media re-proof for the new load.
+    drive
+        .bind_identity_generation(drive.identity_generation())
+        .unwrap();
     drive.write_block(&[0u8; 64]).expect("write in load 2");
     assert_eq!(
         control.fence_transactions(),
@@ -437,6 +449,14 @@ fn reset_unit_attention_rearms_the_fence() {
     // Recover position (reset invalidated it), then write again:
     // the fence must run a second time.
     drive.position().expect("re-establish position after reset");
+    assert!(matches!(
+        drive.write_block(&[0u8; 64]),
+        Err(TapeIoError::IdentityInvalidated { .. })
+    ));
+    // Position recovery alone cannot authorize writes after an identity change.
+    drive
+        .bind_identity_generation(drive.identity_generation())
+        .unwrap();
     drive.write_block(&[0u8; 64]).expect("write after reset");
     assert_eq!(
         control.fence_transactions(),
@@ -624,6 +644,9 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                       has no real device behind it",
             },
         ),
+        // Frozen P1 model-only fault-injection forwarders.
+        ("remanence-api/tests/oracle_standalone_mount.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
+        ("remanence-cli/tests/oracle_standalone_cli.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
     ];
 
     let mut rust_files = Vec::new();

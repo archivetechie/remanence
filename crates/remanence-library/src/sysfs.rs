@@ -1,15 +1,16 @@
 //! Linux sysfs walker — enumerate `/dev/sg*` and resolve each to its
 //! current SCSI sysfs attachment path.
 //!
-//! The walker is intentionally minimal: it returns a flat
-//! `Vec<DeviceAttachment>` and does not classify devices (that's
+//! The walker returns attachments and any enumeration failures, so discovery
+//! cannot mistake a partial host inventory for proof of standalone ownership.
+//! It does not classify devices (that's
 //! discovery's job, since classification requires INQUIRY). Linux-only;
 //! the rest of `remanence-library` compiles fine without this module.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::error::IoErrorKind;
+use crate::error::{DiscoveryWarning, IoErrorKind};
 
 /// One `/dev/sgN` discovered on the host, paired with the current
 /// sysfs attachment path it resolves to. Both are observed at the
@@ -25,10 +26,19 @@ pub struct DeviceAttachment {
     pub sysfs_path: PathBuf,
 }
 
-/// Default sysfs walk against the live system. Returns one entry per
-/// existing `/dev/sg*` whose sysfs symlink could be resolved.
+/// Host attachments together with evidence that enumeration was incomplete.
+#[derive(Debug, Default)]
+pub struct DeviceEnumeration {
+    /// SG nodes whose current sysfs attachments were resolved.
+    pub devices: Vec<DeviceAttachment>,
+    /// Failures that must be retained when deciding standalone ownership.
+    pub warnings: Vec<DiscoveryWarning>,
+}
+
+/// Default sysfs walk against the live system. Returns resolved SG attachments
+/// and warnings for directory entries or attachments that could not be read.
 #[cfg(target_os = "linux")]
-pub fn enumerate_sg_devices() -> Result<Vec<DeviceAttachment>, IoErrorKind> {
+pub fn enumerate_sg_devices() -> Result<DeviceEnumeration, IoErrorKind> {
     enumerate_sg_devices_under(Path::new("/dev"), Path::new("/sys/class/scsi_generic"))
 }
 
@@ -42,16 +52,33 @@ pub fn enumerate_sg_devices() -> Result<Vec<DeviceAttachment>, IoErrorKind> {
 pub fn enumerate_sg_devices_under(
     dev_root: &Path,
     sys_root: &Path,
-) -> Result<Vec<DeviceAttachment>, IoErrorKind> {
+) -> Result<DeviceEnumeration, IoErrorKind> {
     let entries = fs::read_dir(dev_root).map_err(|e| IoErrorKind::from(&e))?;
+    Ok(resolve_sg_devices(
+        dev_root,
+        sys_root,
+        entries.map(|entry| entry.map(|entry| entry.path())),
+    ))
+}
 
-    let mut out = Vec::new();
+/// Keep iteration and attachment failures alongside the nodes we can resolve.
+fn resolve_sg_devices(
+    dev_root: &Path,
+    sys_root: &Path,
+    entries: impl IntoIterator<Item = Result<PathBuf, std::io::Error>>,
+) -> DeviceEnumeration {
+    let mut out = DeviceEnumeration::default();
     for entry in entries {
-        let entry = match entry {
+        let path = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                out.warnings.push(DiscoveryWarning::DeviceUnreachable {
+                    path: dev_root.to_path_buf(),
+                    source: IoErrorKind::from(&e),
+                });
+                continue;
+            }
         };
-        let path = entry.path();
         let name = match path.file_name().and_then(|n| n.to_str()) {
             Some(n) => n,
             None => continue,
@@ -69,18 +96,24 @@ pub fn enumerate_sg_devices_under(
         let link = sys_root.join(name).join("device");
         let resolved = match fs::canonicalize(&link) {
             Ok(p) => p,
-            Err(_) => continue, // unreadable / not present; the device is unusable
+            Err(e) => {
+                out.warnings.push(DiscoveryWarning::DeviceUnreachable {
+                    path,
+                    source: IoErrorKind::from(&e),
+                });
+                continue;
+            }
         };
 
-        out.push(DeviceAttachment {
+        out.devices.push(DeviceAttachment {
             sg_path: path,
             sysfs_path: resolved,
         });
     }
 
     // Lexicographic sort by sg_path for deterministic output.
-    out.sort_by(|a, b| a.sg_path.cmp(&b.sg_path));
-    Ok(out)
+    out.devices.sort_by(|a, b| a.sg_path.cmp(&b.sg_path));
+    out
 }
 
 /// Match exactly `sg` followed by one or more ASCII digits.
@@ -142,6 +175,7 @@ mod tests {
         // Lexicographic sort puts sg11 between sg1- and sg2-; that's fine
         // for determinism. (We don't promise numeric sort.)
         let names: Vec<_> = out
+            .devices
             .iter()
             .map(|d| {
                 d.sg_path
@@ -154,7 +188,8 @@ mod tests {
         assert_eq!(names, vec!["sg11", "sg3", "sg7"]);
 
         // Each entry resolved its sysfs path.
-        for d in &out {
+        assert!(out.warnings.is_empty());
+        for d in &out.devices {
             assert!(d.sysfs_path.to_string_lossy().contains("devices/"));
         }
     }
@@ -172,15 +207,16 @@ mod tests {
         fs::write(dev_root.join("sg_some_link"), b"").unwrap(); // sg_* is not sg<digits>
 
         let out = enumerate_sg_devices_under(&dev_root, &sys_root).unwrap();
-        assert_eq!(out.len(), 1);
-        assert!(out[0].sg_path.ends_with("sg0"));
+        assert_eq!(out.devices.len(), 1);
+        assert!(out.devices[0].sg_path.ends_with("sg0"));
+        assert!(out.warnings.is_empty());
     }
 
     #[test]
-    fn skips_devices_without_sysfs_link() {
+    fn reports_devices_without_sysfs_link() {
         // /dev/sg0 exists but its /sys/class/scsi_generic/sg0/device
-        // symlink doesn't. The walker drops it (the device is unusable
-        // — we couldn't even resolve where on the SCSI bus it sits).
+        // symlink doesn't. The failure must survive into discovery because
+        // this unprobed node could be a changer that owns a visible drive.
         let tmp = tempfile::Builder::new()
             .prefix("sysfs-test")
             .tempdir()
@@ -193,12 +229,51 @@ mod tests {
         // intentionally no symlink at sys/.../sg0/device
 
         let out = enumerate_sg_devices_under(&dev, &sys).unwrap();
-        assert!(out.is_empty());
+        assert!(out.devices.is_empty());
+        assert!(matches!(&out.warnings[..],
+            [DiscoveryWarning::DeviceUnreachable { path, .. }] if path == &dev.join("sg0")
+        ));
     }
 
     #[test]
     fn enumerate_returns_error_for_missing_dev_root() {
         let r = enumerate_sg_devices_under(Path::new("/no/such/dir-zzzzz"), Path::new("/sys"));
         assert!(r.is_err());
+    }
+
+    /// A failed directory entry may hide a changer, even with a usable drive.
+    #[test]
+    fn directory_entry_error_keeps_discovery_incomplete() {
+        let tmp = build_mock_host(&[("sg0", "host0/0:0:0:0")]);
+        let dev = tmp.path().join("dev");
+        let sys = tmp.path().join("sys/class/scsi_generic");
+        let enumeration = resolve_sg_devices(
+            &dev,
+            &sys,
+            [
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "directory entry unreadable",
+                )),
+                Ok(dev.join("sg0")),
+            ],
+        );
+        let report = crate::discover_enumerated_with(enumeration, |_| {
+            Ok(crate::FixtureTransport::new().with_responses([
+                include_bytes!("../../../fixtures/inquiry/drive1-lto9.bin").to_vec(),
+                include_bytes!("../../../fixtures/vpd-80/drive1-lto9.bin").to_vec(),
+            ]))
+        })
+        .unwrap();
+        assert!(!report.complete);
+        assert_eq!(report.unattached_drives.len(), 1);
+        assert_eq!(
+            report.unattached_drives[0].ownership,
+            crate::DriveOwnership::Unknown
+        );
+        assert!(matches!(&report.incomplete_evidence[..],
+            [DiscoveryWarning::DeviceUnreachable { path, source }]
+                if path == &dev && source.kind == "PermissionDenied"
+        ));
     }
 }
