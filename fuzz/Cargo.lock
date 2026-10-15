@@ -1005,7 +1005,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "remanence-aead"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20",
  "chacha20poly1305",
@@ -1028,11 +1028,11 @@ dependencies = [
 
 [[package]]
 name = "remanence-crc"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "remanence-format"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "remanence-aead",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-format-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "remanence-aead",
  "remanence-library",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-library"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "remanence-scsi",
@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-parity"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ciborium",
  "hmac",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "remanence-scsi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "nix",

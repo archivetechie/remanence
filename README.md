@@ -15,7 +15,7 @@ object.
 
 **Website:** [archivetech.org](https://archivetech.org) — overview, the formats explained, and how to verify them.
 
-> **Alpha software (v0.1.0).** Do not use it as the only copy of anything. The
+> **Alpha software (v0.2.0).** Do not use it as the only copy of anything. The
 > three format specifications are at version 1.0 and are separate from this
 > software's version. See [Status](#status).
 
@@ -40,7 +40,7 @@ HPE MSL3040 with LTO-9 drives.
 <!-- code-anchor: none -->
 ## Status
 
-**Version 0.1.0 — alpha.** The implementation has not had enough operational
+**Version 0.2.0 — alpha.** The implementation has not had enough operational
 testing to be trusted with material you cannot afford to lose. Expect defects
 and breaking changes. [CHANGELOG.md](CHANGELOG.md) lists the releases,
 including the v1.0.0 tag, which is marked superseded because that number
