@@ -5012,11 +5012,12 @@ fn no_parity_stored_images_cross_read_between_serial_and_batched_paths() {
             .with_read_batch_blocks_for_test(4);
     let mut restored = Vec::new();
     let mut capture = crate::read_core::CapturePayloadSink::new(&mut restored);
+    let position = remanence_library::BlockSource::position(&mut batched_reader).unwrap();
     crate::read_core::read_object_payload(
         &mut batched_reader,
         API_SESSION_BLOCK_SIZE as usize,
         serial.expect_write_report().layout.projected_size_blocks,
-        0,
+        position,
         None,
         &mut capture,
     )

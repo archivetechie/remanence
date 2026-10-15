@@ -9,6 +9,7 @@
 mod media;
 mod overlap;
 mod prepare;
+pub(crate) use prepare::ValidateCanonicalEntrySink;
 mod staging;
 #[cfg(test)]
 pub(crate) use prepare::canonical_admission_format_error;

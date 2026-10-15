@@ -16,18 +16,17 @@ use std::process::ExitCode;
 use crate::bytes_to_hex;
 use remanence_aead::{RecipientPrivateKey, RecipientPublicKey};
 use remanence_api::{
-    load_tape_by_uuid,
+    load_tape_by_uuid, position_to_object,
     read_core::{read_object_payload, CapturePayloadSink},
     replay_committed_pool_write_from_state, select_tape_in_pool_for_write_session,
-    verify_tape_identity, write_to_selected_drive_checkpointed, PoolWriteObjectRecord,
-    PoolWriteRepresentation, PoolWriteResult, TapeUuid, WriteObjectToPoolRequest,
+    write_to_selected_drive_checkpointed, BotRelativeTapeFile, ChangerMount, MountBackend,
+    MountTarget, MountedTape, PoolWriteObjectRecord, PoolWriteRepresentation, PoolWriteResult,
+    TapeUuid, WriteObjectToPoolRequest,
 };
 use remanence_format::{
     read_encrypted_rem_object_with_manifest_anchor, RemTarReadObject, MANIFEST_PATH,
 };
-use remanence_library::{
-    BlockSize, BlockSource, DriveHandleSource, SpaceKind, StaticAllowlist, TapeConfig,
-};
+use remanence_library::{BlockSize, BlockSource, DriveHandleSource, StaticAllowlist, TapeConfig};
 use remanence_state::{
     CatalogIndex, NativeObjectCopyRecord, StateHandle, TapeFileRecord,
     OBJECT_COPY_REPRESENTATION_ENCRYPTED, OBJECT_COPY_REPRESENTATION_PLAINTEXT,
@@ -783,8 +782,7 @@ struct TapeObjectRef<'a> {
 struct MountedTapeObject {
     loc: DecodedLocator,
     plan: ObjectReadPlan,
-    _library_handle: remanence_library::LibraryHandle,
-    drive: remanence_library::DriveHandle,
+    mount: MountedTape,
 }
 
 /// Result of streaming one object's payload through a sink.
@@ -805,7 +803,7 @@ struct StoredObjectExportOutcome {
     object_sha256: [u8; 32],
 }
 
-fn mount_tape_object(
+fn mount_library_tape_object(
     report: &remanence_library::DiscoveryReport,
     target: &TapeObjectRef<'_>,
     allow: &[String],
@@ -843,26 +841,33 @@ fn mount_tape_object(
         ExitCode::from(1)
     })?;
 
-    let mut drive = {
-        let index = state_handle.catalog_index();
-        load_tape_by_uuid(index, &mut library_handle, &policy, &loc.tape_uuid).map_err(|e| {
-            let _ = writeln!(err, "error: load tape: {e}");
-            ExitCode::from(1)
-        })?
-    };
-
-    drive.rewind().map_err(|e| {
-        let _ = writeln!(err, "error: rewind before verify: {e}");
+    let mount = ChangerMount {
+        library: &mut library_handle,
+        policy: &policy,
+        index: state_handle.catalog_index(),
+    }
+    .mount(MountTarget::Tape {
+        tape_uuid: loc.tape_uuid,
+    })
+    .map_err(|e| {
+        let _ = writeln!(err, "error: mount tape: {e}");
         ExitCode::from(1)
     })?;
-    {
-        let mut source = DriveHandleSource(&mut drive);
-        verify_tape_identity(&mut source, &loc.tape_uuid).map_err(|e| {
-            let _ = writeln!(err, "error: tape identity: {e}");
-            ExitCode::from(1)
-        })?;
-    }
+    mount_tape_object(mount, loc, plan, err)
+}
 
+/// Configure a proven cartridge; key validation precedes object positioning.
+fn mount_tape_object(
+    mut mount: MountedTape,
+    loc: DecodedLocator,
+    plan: ObjectReadPlan,
+    err: &mut dyn Write,
+) -> Result<MountedTapeObject, ExitCode> {
+    if mount.tape_uuid != loc.tape_uuid {
+        let _ = writeln!(err, "error: mounted tape differs from object locator");
+        return Err(ExitCode::from(1));
+    }
+    let drive = &mut mount.drive;
     let current_cfg = drive.read_config().map_err(|e| {
         let _ = writeln!(err, "error: read drive config: {e}");
         ExitCode::from(1)
@@ -883,11 +888,21 @@ fn mount_tape_object(
             ExitCode::from(1)
         })?;
 
-    Ok(MountedTapeObject {
-        loc,
-        plan,
-        _library_handle: library_handle,
-        drive,
+    Ok(MountedTapeObject { loc, plan, mount })
+}
+
+/// Consume the mount's established origin and retain SPACE's position proof.
+fn position_mounted_object(
+    mounted: &mut MountedTapeObject,
+    err: &mut dyn Write,
+) -> Result<remanence_library::TapePosition, ExitCode> {
+    position_to_object(
+        &mut mounted.mount,
+        BotRelativeTapeFile(mounted.loc.tape_file_number),
+    )
+    .map_err(|e| {
+        let _ = writeln!(err, "error: position to object: {e}");
+        ExitCode::from(1)
     })
 }
 
@@ -901,25 +916,34 @@ fn stream_tape_object<W: Write + Send>(
     sink_writer: W,
     err: &mut dyn Write,
 ) -> Result<TapeStreamOutcome, ExitCode> {
-    let mut mounted = mount_tape_object(report, target, allow, allow_derived, err)?;
+    let mounted = mount_library_tape_object(report, target, allow, allow_derived, err)?;
+    stream_mounted_payload(mounted, target.private_key, sink_writer, err)
+}
 
+fn stream_mounted_payload<W: Write + Send>(
+    mut mounted: MountedTapeObject,
+    private_key: Option<&Path>,
+    sink_writer: W,
+    err: &mut dyn Write,
+) -> Result<TapeStreamOutcome, ExitCode> {
     let (payload_bytes, actual_sha256) = match mounted.plan.representation.as_str() {
         OBJECT_COPY_REPRESENTATION_PLAINTEXT => {
-            if target.private_key.is_some() {
+            if private_key.is_some() {
                 let _ = writeln!(
                     err,
                     "error: key options are only valid for encrypted copies"
                 );
                 return Err(ExitCode::from(1));
             }
+            let position = position_mounted_object(&mut mounted, err)?;
             let mut sink = CapturePayloadSink::new(sink_writer);
             let stream_result = {
-                let mut source = DriveHandleSource(&mut mounted.drive);
+                let mut source = DriveHandleSource(&mut mounted.mount.drive);
                 read_object_payload(
                     &mut source,
                     mounted.plan.block_size_bytes as usize,
                     mounted.plan.block_count,
-                    mounted.loc.tape_file_number,
+                    position,
                     mounted.plan.manifest_sha256,
                     &mut sink,
                 )
@@ -934,7 +958,7 @@ fn stream_tape_object<W: Write + Send>(
             })?
         }
         OBJECT_COPY_REPRESENTATION_ENCRYPTED => {
-            let private_key = target.private_key.ok_or_else(|| {
+            let private_key = private_key.ok_or_else(|| {
                 let _ = writeln!(err, "error: encrypted copy requires --private-key");
                 ExitCode::from(1)
             })?;
@@ -942,23 +966,9 @@ fn stream_tape_object<W: Write + Send>(
                 let _ = writeln!(err, "error: {error}");
                 ExitCode::from(1)
             })?;
+            position_mounted_object(&mut mounted, err)?;
             let opened = {
-                let mut source = DriveHandleSource(&mut mounted.drive);
-                let tape_file_count =
-                    i64::try_from(mounted.loc.tape_file_number).map_err(|_| {
-                        let _ = writeln!(
-                            err,
-                            "error: tape file number {} exceeds the drive SPACE command range",
-                            mounted.loc.tape_file_number
-                        );
-                        ExitCode::from(1)
-                    })?;
-                if let Err(error) =
-                    source.space(tape_file_count, remanence_library::SpaceKind::Filemarks)
-                {
-                    let _ = writeln!(err, "error: space to object tape file: {error}");
-                    return Err(ExitCode::from(1));
-                }
+                let mut source = DriveHandleSource(&mut mounted.mount.drive);
                 read_encrypted_rem_object_with_manifest_anchor(
                     &mut source,
                     mounted.plan.block_size_bytes as usize,
@@ -1022,21 +1032,18 @@ fn stream_stored_tape_object<W: Write>(
     sink_writer: W,
     err: &mut dyn Write,
 ) -> Result<StoredObjectExportOutcome, ExitCode> {
-    let mut mounted = mount_tape_object(report, target, allow, allow_derived, err)?;
+    let mounted = mount_library_tape_object(report, target, allow, allow_derived, err)?;
+    stream_mounted_stored(mounted, sink_writer, err)
+}
+
+fn stream_mounted_stored<W: Write>(
+    mut mounted: MountedTapeObject,
+    sink_writer: W,
+    err: &mut dyn Write,
+) -> Result<StoredObjectExportOutcome, ExitCode> {
+    position_mounted_object(&mut mounted, err)?;
     let (bytes_written, object_sha256) = {
-        let mut source = DriveHandleSource(&mut mounted.drive);
-        let tape_file_count = i64::try_from(mounted.loc.tape_file_number).map_err(|_| {
-            let _ = writeln!(
-                err,
-                "error: tape file number {} exceeds the drive SPACE command range",
-                mounted.loc.tape_file_number
-            );
-            ExitCode::from(1)
-        })?;
-        if let Err(error) = source.space(tape_file_count, SpaceKind::Filemarks) {
-            let _ = writeln!(err, "error: space to object tape file: {error}");
-            return Err(ExitCode::from(1));
-        }
+        let mut source = DriveHandleSource(&mut mounted.mount.drive);
         copy_stored_object_blocks(
             &mut source,
             mounted.plan.block_size_bytes as usize,
@@ -1057,6 +1064,68 @@ fn stream_stored_tape_object<W: Write>(
         bytes_written,
         object_sha256,
     })
+}
+
+/// Read a catalogued object on either endpoint using the shared payload reader.
+pub fn read_mounted_tape_object<W: Write + Send>(
+    mount: MountedTape,
+    index: &CatalogIndex,
+    locator: &str,
+    private_key: Option<&Path>,
+    writer: W,
+) -> Result<serde_json::Value, String> {
+    let loc = decode_locator(locator)?;
+    let plan = resolve_object_read_plan(index, &loc)?;
+    let mut errors = Vec::new();
+    let mounted = mount_tape_object(mount, loc, plan, &mut errors)
+        .map_err(|_| String::from_utf8_lossy(&errors).into_owned())?;
+    let result = stream_mounted_payload(mounted, private_key, writer, &mut errors)
+        .map_err(|_| String::from_utf8_lossy(&errors).into_owned())?;
+    if result.actual_sha256 != result.locator_content_sha256 {
+        return Err("content SHA-256 differs from locator".into());
+    }
+    serde_json::to_value(ArchiveReadReceipt {
+        object_id: result.object_id,
+        bytes_written: result.payload_bytes,
+        content_sha256: bytes_to_hex(&result.actual_sha256),
+        verified: true,
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Verify a mounted copy without materializing its payload on disk.
+pub fn verify_mounted_tape_object(
+    mount: MountedTape,
+    index: &CatalogIndex,
+    locator: &str,
+    private_key: Option<&Path>,
+) -> Result<serde_json::Value, String> {
+    read_mounted_tape_object(mount, index, locator, private_key, std::io::sink())
+}
+
+/// Export stored blocks from either endpoint with the same positioning owner.
+pub fn export_mounted_tape_object<W: Write>(
+    mount: MountedTape,
+    index: &CatalogIndex,
+    locator: &str,
+    writer: W,
+) -> Result<serde_json::Value, String> {
+    let loc = decode_locator(locator)?;
+    let plan = resolve_object_read_plan(index, &loc)?;
+    let mut errors = Vec::new();
+    let mounted = mount_tape_object(mount, loc, plan, &mut errors)
+        .map_err(|_| String::from_utf8_lossy(&errors).into_owned())?;
+    let result = stream_mounted_stored(mounted, writer, &mut errors)
+        .map_err(|_| String::from_utf8_lossy(&errors).into_owned())?;
+    serde_json::to_value(ArchiveExportObjectReceipt {
+        object_id: result.object_id,
+        bytes_written: result.bytes_written,
+        block_count: result.block_count,
+        block_size_bytes: result.block_size_bytes,
+        representation: result.representation,
+        object_sha256: bytes_to_hex(&result.object_sha256),
+    })
+    .map_err(|e| e.to_string())
 }
 
 fn copy_stored_object_blocks<W: Write>(
@@ -1430,6 +1499,9 @@ pub fn run_archive_list(
 // =====================================================================
 //  Tests
 // =====================================================================
+
+#[cfg(test)]
+mod mounted_tests;
 
 #[cfg(test)]
 mod tests {

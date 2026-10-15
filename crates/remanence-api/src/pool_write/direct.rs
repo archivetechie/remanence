@@ -609,8 +609,11 @@ pub fn write_to_selected_drive_checkpointed(
     let pool_cfg = configured_direct_pool(state, &request.pool_id)?;
     let checkpoint_journal_dir = state.paths().journal_dir.join("checkpoints");
     let parity_journal_path = state.journal_path(selected.tape_uuid);
-    let resources = PoolWriteResources::new(state.config().daemon.io_memory_ceiling)
-        .map_err(PoolWriteError::InvalidInput)?;
+    let resources = PoolWriteResources::for_state(
+        state.config().daemon.io_memory_ceiling,
+        &state.paths().state_dir,
+    )
+    .map_err(PoolWriteError::InvalidInput)?;
     let result = write_to_selected_drive_checkpointed_with_catalog(
         state.catalog_index(),
         drive,
@@ -713,19 +716,57 @@ pub(super) fn write_to_selected_drive_checkpointed_with_catalog(
     require_rewritable_object_media(current_cfg)?;
     crate::drive_mode::configure_fixed_uncompressed_write(drive, current_cfg, selected.block_size)?;
     drive.bind_identity_generation(identity_generation)?;
-    let mut sink = DriveHandleSink(drive);
-    write_to_selected_tape_checkpointed_after_preflight(
+    let appended = write_to_selected_tape_checkpointed_after_preflight(
         state,
-        &mut sink,
+        &mut DriveHandleSink(drive),
         pool_cfg,
         request,
-        selected,
+        selected.clone(),
         parity_journal_path,
         resources,
         checkpoint_lease,
         prior_records,
         Some(&mut write_admission),
+    )?;
+    if appended.seal_reason.is_some() {
+        reprove_checkpoint_boundary(drive, &appended.record)?;
+    }
+    finish_checkpointed_append(
+        state,
+        &mut DriveHandleSink(drive),
+        pool_cfg,
+        &selected,
+        parity_journal_path,
+        appended,
     )
+}
+
+/// Re-establish readiness, removal lock, BOT identity, mode, and the exact
+/// durable append cursor before any post-checkpoint terminal modification.
+fn reprove_checkpoint_boundary(
+    drive: &mut DriveHandle,
+    record: &remanence_state::CheckpointJournalRecord,
+) -> Result<(), PoolWriteError> {
+    drive
+        .test_unit_ready()
+        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
+    drive
+        .prevent_medium_removal()
+        .map_err(|e| PoolWriteError::InvalidInput(e.to_string()))?;
+    drive.rewind()?;
+    let generation = drive.identity_generation();
+    verify_tape_identity(&mut DriveHandleSource(drive), &record.tape_uuid)?;
+    let config = drive.read_config()?;
+    require_rewritable_object_media(config)?;
+    crate::drive_mode::configure_fixed_uncompressed_write(drive, config, record.block_size)?;
+    drive.bind_identity_generation(generation)?;
+    let position = drive.locate(record.eod_lba)?;
+    if position.partition != record.eod_partition || position.lba != record.eod_lba {
+        return Err(PoolWriteError::InvalidInput(
+            "checkpoint append position mismatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(super) enum CheckpointedWritePreflight {
@@ -790,17 +831,25 @@ pub(super) fn write_to_selected_tape_checkpointed(
             prior_records,
         } => (checkpoint_lease, prior_records),
     };
-    write_to_selected_tape_checkpointed_after_preflight(
+    let appended = write_to_selected_tape_checkpointed_after_preflight(
         state,
         sink,
         pool_cfg,
         request,
-        selected,
+        selected.clone(),
         parity_journal_path,
         resources,
         checkpoint_lease,
         prior_records,
         None,
+    )?;
+    finish_checkpointed_append(
+        state,
+        sink,
+        pool_cfg,
+        &selected,
+        parity_journal_path,
+        appended,
     )
 }
 
@@ -816,7 +865,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
     mut checkpoint_lease: remanence_state::FileCheckpointJournalLease,
     prior_records: Vec<remanence_state::CheckpointJournalRecord>,
     write_admission: Option<&mut crate::write_admission::WriteAdmissionReservation>,
-) -> Result<PoolWriteResult, PoolWriteError> {
+) -> Result<CheckpointedAppend, PoolWriteError> {
     let direct_replay_fault =
         crate::direct_replay_fault::DirectReplayFaultPlan::from_env_for_object(
             selected.tape_uuid,
@@ -838,13 +887,13 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
     let batch_id = *Uuid::new_v4().as_bytes();
 
     let (
-        mut result,
+        result,
         next_tape_file_number,
         sync,
         scheme,
         object_bundles,
         barrier_bundle,
-        mut terminal_parity_state,
+        terminal_parity_state,
     ) = match &selected.parity_config {
         ParityConfig::None => {
             let append = first_batched_append_context(state, &selected, &prior_records)?;
@@ -1097,6 +1146,41 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
         }
         return Err(error.into());
     }
+    Ok(CheckpointedAppend {
+        result,
+        record,
+        checkpoint_lease,
+        prior_records,
+        terminal_parity_state,
+        seal_reason,
+    })
+}
+
+/// A published checkpoint retains its lease until terminal close is finished.
+pub(super) struct CheckpointedAppend {
+    result: PoolWriteResult,
+    record: remanence_state::CheckpointJournalRecord,
+    checkpoint_lease: remanence_state::FileCheckpointJournalLease,
+    prior_records: Vec<remanence_state::CheckpointJournalRecord>,
+    terminal_parity_state: Option<ParitySinkSessionState>,
+    seal_reason: Option<TapeSealReason>,
+}
+fn finish_checkpointed_append(
+    state: &mut CatalogIndex,
+    sink: &mut dyn BlockSink,
+    pool_cfg: &TapePoolConfig,
+    selected: &SelectedTape,
+    parity_journal_path: &Path,
+    appended: CheckpointedAppend,
+) -> Result<PoolWriteResult, PoolWriteError> {
+    let CheckpointedAppend {
+        mut result,
+        record,
+        mut checkpoint_lease,
+        prior_records,
+        mut terminal_parity_state,
+        seal_reason,
+    } = appended;
     if let Some(seal_reason) = seal_reason {
         let mut authority_records = prior_records;
         authority_records.push(record);
@@ -1109,7 +1193,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                     sink,
                     &mut checkpoint_lease,
                     &authority_records,
-                    &selected,
+                    selected,
                     trigger,
                     None,
                     None,
@@ -1134,7 +1218,7 @@ pub(super) fn write_to_selected_tape_checkpointed_after_preflight(
                     sink,
                     &mut checkpoint_lease,
                     &authority_records,
-                    &selected,
+                    selected,
                     trigger,
                     Some(&mut parity_journal),
                     Some(parity_state),

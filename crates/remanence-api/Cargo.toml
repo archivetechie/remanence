@@ -11,6 +11,7 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
+tempfile.workspace = true
 prost.workspace = true
 prost-derive.workspace = true
 prost-types.workspace = true
@@ -53,7 +54,6 @@ default = []
 remanence-chaos = { path = "../remanence-chaos" }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints.rust]

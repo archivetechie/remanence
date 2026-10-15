@@ -303,9 +303,11 @@ pub(crate) fn stream_one_object(
 
     let block_size_u32 = u32::try_from(block_size)
         .map_err(|_| Status::internal("tape block size does not fit u32"))?;
-    drive
-        .rewind()
-        .map_err(|err| Status::internal(format!("rewind before object read: {err}")))?;
+    let position = crate::position_to_object(
+        &mut *drive,
+        crate::BotRelativeTapeFile(copy.tape_file_number),
+    )
+    .map_err(|err| Status::internal(format!("position before object read: {err}")))?;
 
     drive.reset_pipelined_diagnostics();
     let wall_started = Instant::now();
@@ -321,7 +323,7 @@ pub(crate) fn stream_one_object(
                     &mut diagnostic_source,
                     block_size_usize,
                     tape_file.block_count,
-                    copy.tape_file_number,
+                    position,
                     manifest_sha256,
                     &mut sink,
                     crate::read_core::ReadPipelineConfig {

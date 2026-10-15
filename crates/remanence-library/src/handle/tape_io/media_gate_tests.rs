@@ -644,6 +644,23 @@ fn media_dispatch_gate_is_the_sole_write_direction_dispatcher() {
                       has no real device behind it",
             },
         ),
+        // P4 model-only failure and mounted-reader forwarders.
+        (
+            "remanence-api/src/mount_backend/tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "mount crash-cut tests forward through an in-memory ModelTransport; no real device",
+            },
+        ),
+        (
+            "remanence-cli/src/pool_ops/mounted_tests.rs",
+            DispatchPolicy::Exact {
+                execute_out: 1,
+                execute_none: 1,
+                why: "mounted-reader tests forward through an in-memory ModelTransport; no real device",
+            },
+        ),
         // Frozen P1 model-only fault-injection forwarders.
         ("remanence-api/tests/oracle_standalone_mount.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),
         ("remanence-cli/tests/oracle_standalone_cli.rs", DispatchPolicy::Exact { execute_out: 1, execute_none: 2, why: "P1 model fault-injection forwarder" }),

@@ -91,6 +91,9 @@ mod damage_vectors;
 mod freeze_drill;
 mod get;
 mod pool_ops;
+pub use pool_ops::{
+    export_mounted_tape_object, read_mounted_tape_object, verify_mounted_tape_object,
+};
 mod put;
 mod recovery_report;
 mod tape_finalize;
@@ -14584,18 +14587,8 @@ fn recipient_epochs_json(key_frame: &remanence_aead::KeyFrame) -> Vec<Value> {
 
 fn sha256_file(path: &Path) -> Result<[u8; 32], String> {
     let mut file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| format!("read {}: {error}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(finalize_sha256(hasher))
+    remanence_api::sha256_reader(&mut file)
+        .map_err(|error| format!("read {}: {error}", path.display()))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {

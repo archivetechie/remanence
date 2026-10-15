@@ -336,6 +336,7 @@ pub(in crate::handle) struct MediaFencedTransport {
     identity_generation: u64,
     write_identity_generation: u64,
     writable: bool,
+    media_write_dispatch_count: u64,
 }
 
 impl MediaFencedTransport {
@@ -350,6 +351,7 @@ impl MediaFencedTransport {
             identity_generation: 0,
             write_identity_generation: 0,
             writable: true,
+            media_write_dispatch_count: 0,
         }
     }
 
@@ -406,6 +408,10 @@ impl MediaFencedTransport {
 
     pub(in crate::handle) fn set_writable(&mut self, writable: bool) {
         self.writable = writable;
+    }
+
+    pub(in crate::handle) fn media_write_dispatch_count(&self) -> u64 {
+        self.media_write_dispatch_count
     }
 
     /// Whether the epoch has been advanced (and a media-modifying CDB
@@ -540,6 +546,15 @@ impl MediaFencedTransport {
                 ));
             }
             self.fenced_this_load = true;
+        }
+
+        if class == WriteDirectionClass::MediaModifying {
+            self.media_write_dispatch_count =
+                self.media_write_dispatch_count.checked_add(1).ok_or(
+                    MediaDispatchError::NotDispatched(TapeIoError::InvalidRequest(
+                        ScsiError::InvalidInput("media dispatch counter exhausted"),
+                    )),
+                )?;
         }
 
         let result = match data_out {

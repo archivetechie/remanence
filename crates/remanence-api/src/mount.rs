@@ -623,32 +623,18 @@ async fn verify_tape_index_critical(
     result
 }
 
-/// Acquire the same exact-tape owner used by append and dispatch terminal
-/// close-out only after the pool assignment and generation have been captured.
-/// A conflicting Object/read session therefore returns busy before audit,
-/// intent publication, changer motion, or tape motion.
-pub(crate) async fn manual_finalize_tape(
-    state: &ApiState,
+/// Shared no-motion admission for daemon and standalone finalization.
+pub(crate) fn prepare_manual_finalize_request(
+    index: &CatalogIndex,
     mut admission: ManualFinalizeTapeAdmission,
-) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
-    let pool = state.drive_pool()?.clone();
-    let tape_reservation = match pool.reserve_tape(admission.tape_uuid) {
-        Ok(reservation) => reservation,
-        Err(error)
-            if error.code() == tonic::Code::FailedPrecondition
-                && error.message() == "tape is already mounted" =>
-        {
-            if let Some(reply) = rejoin_accepted_manual_finalization(state, &admission)? {
-                return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
-                    reply,
-                ));
-            }
-            return Ok(crate::write_owner::ManualFinalizeTapeResult::Busy);
-        }
-        Err(error) => return Err(error),
-    };
-    let mut index = CatalogIndex::open(state.index_path.as_ref())
-        .map_err(|error| Status::internal(error.to_string()))?;
+    pool_config: impl Fn(&str) -> Result<remanence_state::TapePoolConfig, Status>,
+) -> Result<
+    (
+        remanence_state::TapeRecord,
+        crate::write_owner::ManualFinalizeTapeActorRequest,
+    ),
+    Status,
+> {
     let tape = index
         .get_tape(&admission.tape_uuid)
         .map_err(crate::startup_media_readiness::status_from_state_error)?
@@ -712,10 +698,10 @@ pub(crate) async fn manual_finalize_tape(
         crate::pool_write::selected_tape_geometry(&tape, geometry_label)
             .map_err(crate::write_owner::status_from_select_tape_error)?;
     let pool_config = match assignment.pool_id.as_deref() {
-        Some(pool_id) => Some(state.pool_config(pool_id)?),
+        Some(pool_id) => Some(pool_config(pool_id)?),
         None => None,
     };
-    let mut actor_request = crate::write_owner::ManualFinalizeTapeActorRequest {
+    let actor_request = crate::write_owner::ManualFinalizeTapeActorRequest {
         candidate_operation_id: admission.candidate_operation_id,
         actor: admission.actor,
         actor_fingerprint: admission.actor_fingerprint,
@@ -729,6 +715,37 @@ pub(crate) async fn manual_finalize_tape(
         parity_config,
         pool_config,
     };
+    Ok((tape, actor_request))
+}
+
+/// Acquire the same exact-tape owner used by append and dispatch terminal
+/// close-out only after the pool assignment and generation have been captured.
+/// A conflicting Object/read session therefore returns busy before audit,
+/// intent publication, changer motion, or tape motion.
+pub(crate) async fn manual_finalize_tape(
+    state: &ApiState,
+    admission: ManualFinalizeTapeAdmission,
+) -> Result<crate::write_owner::ManualFinalizeTapeResult, Status> {
+    let pool = state.drive_pool()?.clone();
+    let tape_reservation = match pool.reserve_tape(admission.tape_uuid) {
+        Ok(reservation) => reservation,
+        Err(error)
+            if error.code() == tonic::Code::FailedPrecondition
+                && error.message() == "tape is already mounted" =>
+        {
+            if let Some(reply) = rejoin_accepted_manual_finalization(state, &admission)? {
+                return Ok(crate::write_owner::ManualFinalizeTapeResult::Accepted(
+                    reply,
+                ));
+            }
+            return Ok(crate::write_owner::ManualFinalizeTapeResult::Busy);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut index = CatalogIndex::open(state.index_path.as_ref())
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let (tape, mut actor_request) =
+        prepare_manual_finalize_request(&index, admission, |pool_id| state.pool_config(pool_id))?;
     if let Some(reply) = crate::write_owner::preflight_manual_finalize_tape(
         &mut index,
         crate::write_owner::ManualFinalizePreflightConfig {
@@ -745,7 +762,7 @@ pub(crate) async fn manual_finalize_tape(
         ));
     }
     let projection = index
-        .terminal_finalization(&admission.tape_uuid)
+        .terminal_finalization(&actor_request.tape_uuid)
         .map_err(crate::startup_media_readiness::status_from_state_error)?
         .ok_or_else(|| {
             Status::internal("durably accepted FinalizeTape has no finalization projection")

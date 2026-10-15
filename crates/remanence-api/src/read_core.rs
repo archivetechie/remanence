@@ -1174,17 +1174,13 @@ enum BlockingReadStreamSendError {
     Closed,
 }
 
-/// Position to `tape_file_number` and stream the object's payload blocks into `sink`.
-///
-/// The caller is responsible for mounting the tape, setting the drive block
-/// size, and positioning the source at the point from which tape-file spacing
-/// is defined. Current hardware callers verify the BOT bootstrap immediately
-/// before this helper, matching the established CLI archive-read path.
+/// Stream already-positioned object blocks into `sink`. Positioning belongs to
+/// `position_to_object`; representation readers never move to another tape file.
 pub fn read_object_payload<S: RemTarEntrySink + Send + ?Sized>(
     source: &mut dyn BlockSource,
     block_size: usize,
     block_count: u64,
-    tape_file_number: u64,
+    position: TapePosition,
     manifest_sha256: Option<[u8; 32]>,
     sink: &mut S,
 ) -> Result<(), FormatError> {
@@ -1194,7 +1190,7 @@ pub fn read_object_payload<S: RemTarEntrySink + Send + ?Sized>(
         source,
         block_size,
         block_count,
-        tape_file_number,
+        position,
         manifest_sha256,
         sink,
         config,
@@ -1207,20 +1203,17 @@ pub(crate) fn read_object_payload_with_pipeline<S: RemTarEntrySink + Send + ?Siz
     source: &mut dyn BlockSource,
     block_size: usize,
     block_count: u64,
-    tape_file_number: u64,
+    position: TapePosition,
     manifest_sha256: Option<[u8; 32]>,
     sink: &mut S,
     config: ReadPipelineConfig,
     manager: Arc<IoMemoryReservation>,
 ) -> Result<(), FormatError> {
-    let filemark_count = i64::try_from(tape_file_number)
-        .map_err(|_| FormatError::invalid("tape-file number exceeds SPACE range"))?;
-    let positioned = source.space(filemark_count, SpaceKind::Filemarks)?;
     run_read_pipeline(
         source,
         block_size,
         block_count,
-        positioned.position_after,
+        position,
         config,
         manager,
         move |handoffs| {
@@ -1999,42 +1992,31 @@ mod tests {
         let mut payload = Vec::new();
         let mut sink = CapturePayloadSink::new(&mut payload);
 
+        let position = source.position().unwrap();
         read_object_payload(
             &mut source,
             opts.chunk_size,
             layout.projected_size_blocks,
-            0,
+            position,
             None,
             &mut sink,
         )
         .unwrap();
 
+        assert!(
+            source.calls.iter().all(|call| !matches!(
+                call,
+                remanence_library::VecBlockSourceCall::Rewind
+                    | remanence_library::VecBlockSourceCall::Locate { .. }
+                    | remanence_library::VecBlockSourceCall::Space { .. }
+            )),
+            "representation consumer must not position the tape"
+        );
         let (bytes_written, digest) = sink.finish().unwrap();
         assert_eq!(bytes_written, b"hello from tape".len() as u64);
         assert_eq!(payload, b"hello from tape");
         let expected: [u8; 32] = Sha256::digest(b"hello from tape").into();
         assert_eq!(digest, expected);
-    }
-
-    #[test]
-    fn read_object_payload_rejects_tape_file_beyond_scsi_space_range() {
-        let mut source = VecBlockSource::new(Vec::new());
-        let mut payload = Vec::new();
-        let mut sink = CapturePayloadSink::new(&mut payload);
-
-        let error = read_object_payload(
-            &mut source,
-            4096,
-            0,
-            u64::try_from(i64::MAX).unwrap() + 1,
-            None,
-            &mut sink,
-        )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("tape-file number exceeds SPACE range"));
     }
 
     #[test]
@@ -2056,11 +2038,12 @@ mod tests {
         let mut restored = Vec::new();
         let mut sink = CapturePayloadSink::new(&mut restored);
 
+        let position = source.position().unwrap();
         read_object_payload(
             &mut source,
             opts.chunk_size,
             layout.projected_size_blocks,
-            0,
+            position,
             None,
             &mut sink,
         )
@@ -2232,11 +2215,12 @@ mod tests {
         let mut full_source = VecBlockSource::new(block_sink.blocks.clone());
         let mut full = Vec::new();
         let mut full_sink = CapturePayloadSink::new(&mut full);
+        let position = full_source.position().unwrap();
         read_object_payload(
             &mut full_source,
             opts.chunk_size,
             layout.projected_size_blocks,
-            0,
+            position,
             None,
             &mut full_sink,
         )

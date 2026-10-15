@@ -72,6 +72,36 @@ impl PoolWriteResources {
         })
     }
 
+    /// Admission identities are scoped to one state store, just like SQLite
+    /// replay keys. Independent installations in one process must not collide.
+    pub(super) fn for_state(
+        io_memory_ceiling_bytes: u64,
+        state_dir: &std::path::Path,
+    ) -> Result<Self, String> {
+        static STORES: OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    std::path::PathBuf,
+                    crate::write_admission::WriteAdmissionCoordinator,
+                >,
+            >,
+        > = OnceLock::new();
+        let path = state_dir
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let coordinator = STORES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(path)
+            .or_default()
+            .clone();
+        Ok(Self {
+            io_memory: crate::io_memory::IoMemoryReservation::new(io_memory_ceiling_bytes)?,
+            write_admissions: coordinator,
+        })
+    }
+
     pub(super) fn io_memory(&self) -> &Arc<crate::io_memory::IoMemoryReservation> {
         &self.io_memory
     }
