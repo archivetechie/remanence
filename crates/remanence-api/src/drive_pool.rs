@@ -13,25 +13,7 @@ use remanence_state::DriveHealthSnapshotRecord;
 
 use crate::pool_write::TapeUuid;
 
-/// A drive bay is only unique within one logical library.
-#[derive(Clone, Debug, Hash, Ord, PartialOrd, PartialEq, Eq)]
-pub(crate) struct DriveKey {
-    pub(crate) library_serial: String,
-    pub(crate) bay: u16,
-}
-
-impl DriveKey {
-    pub(crate) fn new(library_serial: impl Into<String>, bay: u16) -> Self {
-        Self {
-            library_serial: library_serial.into(),
-            bay,
-        }
-    }
-
-    fn label(&self) -> String {
-        format!("{} drive bay 0x{:04x}", self.library_serial, self.bay)
-    }
-}
+pub(crate) use remanence_state::DriveKey;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MountedSession {
@@ -191,7 +173,7 @@ impl DrivePool {
         let mut drives = self
             .reservations
             .keys()
-            .filter(|drive| drive.library_serial == library_serial)
+            .filter(|drive| drive.library_serial() == Some(library_serial))
             .cloned()
             .collect::<Vec<_>>();
         drives.sort();
@@ -248,7 +230,7 @@ impl DrivePool {
     }
 
     pub(crate) fn reserve_library_exclusive(&self, library_serial: &str) -> Result<(), Status> {
-        self.reserve_matching_exclusive(|drive| drive.library_serial == library_serial)
+        self.reserve_matching_exclusive(|drive| drive.library_serial() == Some(library_serial))
     }
 
     fn reserve_matching_exclusive(
@@ -300,8 +282,8 @@ impl DrivePool {
     pub(crate) fn busy_bays(&self, library_serial: &str) -> HashSet<u16> {
         self.busy_drives()
             .into_iter()
-            .filter(|drive| drive.library_serial == library_serial)
-            .map(|drive| drive.bay)
+            .filter(|drive| drive.library_serial() == Some(library_serial))
+            .filter_map(|drive| drive.bay())
             .collect()
     }
 
@@ -582,7 +564,7 @@ pub(crate) fn release_library_reservations(
     library_serial: &str,
 ) {
     for (drive, reservation) in reservations {
-        if drive.library_serial == library_serial {
+        if drive.library_serial() == Some(library_serial) {
             reservation.store(false, Ordering::SeqCst);
         }
     }

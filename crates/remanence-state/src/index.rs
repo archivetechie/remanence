@@ -1,4 +1,26 @@
 //! Rebuildable SQLite projection index.
+//!
+//! Provenance columns and their authority (standalone endpoint contract C1/C2):
+//!
+//! | Column | Writers | Readers | Meaning |
+//! |---|---|---|---|
+//! | `tapes.voltag_source` | init, adopt, rebind, migration, audit replay, reset/rebuild preservation | init decisions, display, pool rules | The label names the shell as a scanner or a person read it; it never proves which logical tape is loaded. |
+//! | `tapes.cartridge_generation` | init/adopt observations, set-generation, migration, replay, reset/rebuild preservation | capacity and compatibility checks | The recorded cartridge media generation determines capacity independently of the shell label. |
+//! | `tapes.generation_source` | same generation writers | capacity, display, diagnostics | Measured density, a label hint, or an operator assertion supplied the recorded generation. |
+//! | `tape_pool_assignments.tape_uuid` | guarded membership setter (including migration seed) | reconciliation, history | The BOT UUID identifies the logical tape whose assignment changed. |
+//! | `tape_pool_assignments.seq` | guarded membership setter (including migration seed) | reconciliation, history | Per-tape sequence orders events independently of wall-clock time. |
+//! | `tape_pool_assignments.pool_id` | guarded membership setter (including migration seed) | reconciliation, pool selection | The assigned pool is nullable; null records unassignment. |
+//! | `tape_pool_assignments.source` | guarded membership setter (including migration seed) | reconciliation | Rule derivation or operator intent supplied this assignment; latest operator intent takes precedence. |
+//! | `tape_pool_assignments.actor` | guarded membership setter (including migration seed) | history | The actor records who requested the assignment. |
+//! | `tape_pool_assignments.at_utc` | guarded membership setter (including migration seed) | history | The timestamp records when the event was written, not its ordering. |
+//! | `tape_pool_assignments.assignment_generation` | guarded membership setter (including migration seed) | conditional assignment, history | The generation binds the event to its atomic projection update. |
+//! | `tape_assignment_replay_baselines.tape_uuid` | schema migration | assignment replay | The migrated tape projection already includes historical audit without generation identities. |
+//! | `tape_assignment_replay_baselines.assignment_generation` | schema migration | assignment replay, migration diagnostics | The projection generation records the durable migration boundary, independently of its pool value. |
+//! | `endpoint_key` on readiness operations, sessions, fences, drives, drive events | readiness/session/fence projection, migration | endpoint lookup and recovery | A durable endpoint names a library bay or standalone drive serial, never a device path. |
+//! | `tape_audit_cursors.tape_uuid` | assignment/label replay | replay and rebuild | The BOT UUID scopes the durable record of applied intent. |
+//! | `tape_audit_cursors.field` | assignment/label replay | replay and rebuild | Label binding and pool assignment are independent kinds of intent. |
+//! | `tape_audit_cursors.audit_sequence` | assignment/label replay | replay and rebuild | Audit order prevents an older request from becoming new intent. |
+//! | `tape_audit_cursors.record_uuid` | assignment/label replay | replay integrity checks | The durable event identity distinguishes a repeated event from conflicting authority. |
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,13 +43,14 @@ use crate::audit::{AuditActor, AuditEvent, AuditRecord};
 use crate::checkpoint::{TerminalFinalizationProgress, TerminalFinalizationTrigger};
 use crate::config::{derive_tape_pool_from_voltag, TapePoolRuleConfig};
 use crate::error::StateError;
+use crate::{DriveKey, LabelProvenance, MediaObservation};
 
 /// Current Layer 4 SQLite schema version.
-pub const SCHEMA_VERSION: u32 = 18;
+pub const SCHEMA_VERSION: u32 = 19;
 
 /// Oldest clean-break catalog whose tape table can be inspected safely by the
-/// exact full-catalog erase admission path. Ordinary opens still reject every
-/// pre-current schema.
+/// exact full-catalog erase admission path. Ordinary opens migrate the supported
+/// released predecessor schemas transactionally.
 const MIN_EXACT_ERASE_SCHEMA_VERSION: u32 = 16;
 
 const STRUCTURAL_U64_COLUMNS: &[(&str, &str)] = &[
@@ -371,12 +394,18 @@ pub struct AdoptBootstrapIdentityInput {
     pub operation_id: Uuid,
     /// UUID parsed from the checksum-valid Bootstrap.
     pub tape_uuid: [u8; 16],
-    /// Exact physical barcode observed by the changer.
-    pub voltag: String,
+    /// Optional shell label supplied by the scanner or operator named by its provenance.
+    pub voltag: Option<String>,
     /// Fixed block size from the Bootstrap.
     pub block_size: u32,
     /// Exact parity geometry from the Bootstrap.
     pub parity: ParityConfig,
+    /// Who observed the shell label.
+    pub label_provenance: LabelProvenance,
+    /// Media evidence obtained by the existing adoption ceremony.
+    pub observation: Option<MediaObservation>,
+    /// Explicit operator pool intent; absent means derive from label rules.
+    pub pool_id: Option<String>,
 }
 
 /// Result of one idempotent identity-only catalog adoption.
@@ -402,6 +431,10 @@ pub struct AdoptBootstrapIdentityOutcome {
 pub(crate) struct CatalogResetPreservedTape {
     pub(crate) tape_uuid: [u8; 16],
     pub(crate) voltag: String,
+    voltag_source: Option<LabelProvenance>,
+    cartridge_generation: Option<String>,
+    generation_source: Option<String>,
+    assignment_source: String,
     pub(crate) kind: String,
     pub(crate) pool_id: Option<String>,
     assignment_generation: i64,
@@ -506,12 +539,10 @@ pub struct MediaReadinessOperationInput {
     pub operation_id: Uuid,
     /// Optional caller/run id that groups fieldtest attempts.
     pub run_id: Option<String>,
-    /// Selected library serial. This is the durable ownership boundary.
-    pub library_serial: String,
+    /// Durable endpoint identity; a standalone serial is never a library bay.
+    pub endpoint: DriveKey,
     /// Changer sg path observed when the operation was recorded.
     pub changer_sg: Option<String>,
-    /// Changer drive element address.
-    pub drive_element: u16,
     /// Drive sg path observed when the operation was recorded.
     pub drive_sg: Option<String>,
     /// Drive serial observed through selected-library discovery.
@@ -583,11 +614,11 @@ pub struct MediaReadinessOperationRecord {
     /// Optional caller/run id that groups fieldtest attempts.
     pub run_id: Option<String>,
     /// Selected library serial.
-    pub library_serial: String,
+    pub library_serial: Option<String>,
     /// Changer sg path observed when recorded.
     pub changer_sg: Option<String>,
     /// Changer drive element address.
-    pub drive_element: i64,
+    pub drive_element: Option<i64>,
     /// Drive sg path observed when recorded.
     pub drive_sg: Option<String>,
     /// Drive serial observed through selected-library discovery.
@@ -638,6 +669,32 @@ pub struct MediaReadinessOperationRecord {
     pub last_error_json: Option<String>,
     /// Quarantine id associated with this row.
     pub quarantine_id: Option<String>,
+    /// Durable mount endpoint.
+    pub endpoint: DriveKey,
+}
+
+/// Scope admitted through the shared readiness fence checks.
+#[derive(Clone, Copy, Debug)]
+pub enum MediaReadinessAdmissionTarget<'a> {
+    /// Changer operation, optionally narrowed by the legacy bay argument.
+    Library(&'a str),
+    /// A resolved library or standalone endpoint.
+    Endpoint(&'a DriveKey),
+}
+impl<'a> From<&'a str> for MediaReadinessAdmissionTarget<'a> {
+    fn from(value: &'a str) -> Self {
+        Self::Library(value)
+    }
+}
+impl<'a> From<&'a String> for MediaReadinessAdmissionTarget<'a> {
+    fn from(value: &'a String) -> Self {
+        Self::Library(value)
+    }
+}
+impl<'a> From<&'a DriveKey> for MediaReadinessAdmissionTarget<'a> {
+    fn from(value: &'a DriveKey) -> Self {
+        Self::Endpoint(value)
+    }
 }
 
 /// Input for recording a durable tape-I/O fence.
@@ -676,6 +733,8 @@ pub struct TapeIoFenceRecord {
     pub updated_at_utc: String,
     /// Operator release acknowledgment.
     pub release_ack: Option<String>,
+    /// Durable endpoint when recorded; absent on historical UUID-only evidence.
+    pub endpoint: Option<DriveKey>,
 }
 
 /// One raw REOWP wrap descriptor exactly as harvested. The cache stores these unchanged;
@@ -731,6 +790,8 @@ pub struct RestartSession {
     pub drive_bay: Option<i64>,
     /// Drive UUID attached to the session, if any.
     pub drive_uuid: Option<Vec<u8>>,
+    /// Durable endpoint when recorded; absent on historical UUID-only evidence.
+    pub drive_key: Option<DriveKey>,
 }
 
 /// One row from the authoritative drive catalog.
@@ -1175,6 +1236,12 @@ pub struct TapeRecord {
     pub tape_uuid: Vec<u8>,
     /// Operator-facing voltag when known.
     pub voltag: Option<String>,
+    /// Who read the shell label; not identity authority.
+    pub voltag_source: Option<LabelProvenance>,
+    /// Recorded cartridge media code, independent of the label.
+    pub cartridge_generation: Option<String>,
+    /// Evidence supplying the recorded generation.
+    pub generation_source: Option<String>,
     /// Tape classification.
     pub kind: String,
     /// Current tape-pool assignment, if any.
@@ -1397,11 +1464,12 @@ impl CatalogIndex {
                      drive_element, drive_sg, drive_serial, barcode,
                      source_slot, media_generation, phase, state, dirty_scope,
                      started_at_utc, updated_at_utc, deadline_at_utc,
-                     evidence_path
+                     evidence_path, endpoint_key
                  )
                  values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                        ?14, ?14, ?15, ?16)
+                        ?14, ?14, ?15, ?16, ?17)
                  on conflict(operation_id) do update set
+                     endpoint_key = excluded.endpoint_key,
                      run_id = excluded.run_id,
                      library_serial = excluded.library_serial,
                      changer_sg = excluded.changer_sg,
@@ -1420,9 +1488,9 @@ impl CatalogIndex {
                 params![
                     input.operation_id.to_string(),
                     input.run_id,
-                    input.library_serial,
+                    input.endpoint.library_serial(),
                     input.changer_sg,
-                    i64::from(input.drive_element),
+                    input.endpoint.bay().map(i64::from),
                     input.drive_sg,
                     input.drive_serial,
                     input.barcode,
@@ -1434,6 +1502,7 @@ impl CatalogIndex {
                     now,
                     input.deadline_at_utc,
                     input.evidence_path,
+                    input.endpoint.encode(),
                 ],
             )
             .map_err(|err| sqlite_error("record media readiness operation", err))?;
@@ -1603,22 +1672,37 @@ impl CatalogIndex {
     /// changer moves or otherwise depend on the selected logical-library
     /// snapshot remaining settled. Specific drive/tape operations should also
     /// pass the resolved drive element and/or barcode.
-    pub fn media_readiness_admission_conflicts(
+    pub fn media_readiness_admission_conflicts<'a>(
         &self,
-        library_serial: &str,
+        target: impl Into<MediaReadinessAdmissionTarget<'a>>,
         drive_element: Option<u16>,
         barcode: Option<&str>,
         library_robotics: bool,
     ) -> Result<Vec<MediaReadinessOperationRecord>, StateError> {
+        let target = target.into();
         let barcode = barcode.map(str::trim).filter(|value| !value.is_empty());
-        let drive_element = drive_element.map(i64::from);
+        let legacy_endpoint = match target {
+            MediaReadinessAdmissionTarget::Library(serial) => {
+                drive_element.map(|bay| DriveKey::new(serial, bay))
+            }
+            MediaReadinessAdmissionTarget::Endpoint(_) => None,
+        };
+        let (library, endpoint) = match target {
+            MediaReadinessAdmissionTarget::Library(serial) => {
+                (Some(serial), legacy_endpoint.as_ref())
+            }
+            MediaReadinessAdmissionTarget::Endpoint(endpoint) => {
+                (endpoint.library_serial(), Some(endpoint))
+            }
+        };
         Ok(self
-            .list_active_media_readiness_operations(Some(library_serial))?
+            .list_active_media_readiness_operations(None)?
             .into_iter()
             .filter(|record| {
                 media_readiness_record_conflicts_with_admission(
                     record,
-                    drive_element,
+                    library,
+                    endpoint,
                     barcode,
                     library_robotics,
                 )
@@ -1633,6 +1717,15 @@ impl CatalogIndex {
         &mut self,
         input: TapeIoFenceInput,
     ) -> Result<TapeIoFenceRecord, StateError> {
+        self.record_tape_io_fence_at_endpoint(input, None)
+    }
+
+    /// Record tape and endpoint fencing in the same durable insert.
+    pub fn record_tape_io_fence_at_endpoint(
+        &mut self,
+        input: TapeIoFenceInput,
+        endpoint: Option<&DriveKey>,
+    ) -> Result<TapeIoFenceRecord, StateError> {
         let now = now_utc()?;
         let id_time = now.replace([':', '.', '+'], "");
         let quarantine_id = format!("tioq-{}-{}", Uuid::from_bytes(input.tape_uuid), id_time);
@@ -1640,9 +1733,9 @@ impl CatalogIndex {
             .execute(
                 "insert into tape_io_fences(
                    tape_uuid, barcode, state, reason, evidence_json,
-                   quarantine_id, created_at_utc, updated_at_utc, release_ack
+                   quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key
                  )
-                 values(?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, null)",
+                 values(?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, null, ?7)",
                 params![
                     input.tape_uuid.as_slice(),
                     input.barcode.as_deref(),
@@ -1650,6 +1743,7 @@ impl CatalogIndex {
                     input.evidence_json.as_deref(),
                     quarantine_id.as_str(),
                     now.as_str(),
+                    endpoint.map(DriveKey::encode),
                 ],
             )
             .map_err(|err| sqlite_error("record tape io fence", err))?;
@@ -1758,7 +1852,7 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select fence_id, tape_uuid, barcode, state, reason, evidence_json,
-                        quarantine_id, created_at_utc, updated_at_utc, release_ack
+                        quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key
                  from tape_io_fences
                  where state = 'active'
                  order by updated_at_utc desc, fence_id",
@@ -1829,7 +1923,7 @@ impl CatalogIndex {
         self.conn
             .query_row(
                 "select fence_id, tape_uuid, barcode, state, reason, evidence_json,
-                        quarantine_id, created_at_utc, updated_at_utc, release_ack
+                        quarantine_id, created_at_utc, updated_at_utc, release_ack, endpoint_key
                  from tape_io_fences
                  where quarantine_id = ?1",
                 params![quarantine_id],
@@ -1975,12 +2069,41 @@ impl CatalogIndex {
         })
     }
 
+    /// Readiness uses recorded media evidence whenever a catalog row exists.
+    /// A label hint is permitted only before that row exists; an unknown recorded
+    /// generation stays unknown rather than silently deriving a capacity class.
+    pub fn readiness_media_observation(
+        &self,
+        label: Option<&str>,
+    ) -> Result<Option<MediaObservation>, StateError> {
+        let Some(label) = label else {
+            return Ok(None);
+        };
+        match self.get_tape_by_voltag(label)? {
+            Some(tape) => Ok(crate::tape_generation(&tape)
+                .map(|(generation, source)| MediaObservation { generation, source })),
+            None => Ok(MediaObservation::label_hint(label)),
+        }
+    }
+
     /// Register or refresh a blank/ready tape row without projecting objects.
     ///
     /// Provisioning owns only the `tapes` row. Pool membership is derived from
     /// the barcode via `[[tape_pool_rules]]` and projected onto `tapes.pool_id`
     /// by `reconcile_tape_pool_projection_from_rules`.
     pub fn provision_tape(&mut self, input: ProvisionTapeInput) -> Result<(), StateError> {
+        let observation = MediaObservation::label_hint(&input.voltag);
+        self.provision_tape_with_media(input, LabelProvenance::Changer, observation)
+    }
+
+    /// Provision identity and its observed shell/media evidence atomically.
+    /// A label hint cannot replace an existing measured/operator generation.
+    pub fn provision_tape_with_media(
+        &mut self,
+        input: ProvisionTapeInput,
+        provenance: LabelProvenance,
+        observation: Option<MediaObservation>,
+    ) -> Result<(), StateError> {
         let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
         let voltag = input.voltag.trim().to_string();
         if voltag.is_empty() {
@@ -1993,16 +2116,65 @@ impl CatalogIndex {
             .conn
             .transaction()
             .map_err(|err| sqlite_error("begin tape provisioning transaction", err))?;
+        let previous: Option<(Vec<u8>, Option<String>)> = tx
+            .query_row(
+                "select tape_uuid, voltag_source from tapes where voltag = ?1",
+                [&voltag],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| sqlite_error("check operator label reuse", e))?;
+        if let Some((previous_uuid, previous_source)) = previous {
+            if previous_uuid != input.tape_uuid
+                && (provenance == LabelProvenance::Operator
+                    || previous_source.as_deref() == Some("operator"))
+            {
+                return Err(StateError::TapeProvisionConflict(format!(
+                    "label reused on a different uuid; rebind requires --previous-uuid {}",
+                    hex_uuid_from_slice(&previous_uuid)
+                )));
+            }
+        }
         provision_tape_tx(
             &tx,
             input.tape_uuid,
-            voltag.as_str(),
+            (voltag.as_str(), provenance),
             &geometry,
             input.force,
             updated_at.as_str(),
         )?;
+        record_media_observation_tx(&tx, &input.tape_uuid, provenance, observation)?;
         tx.commit()
             .map_err(|err| sqlite_error("commit tape provisioning transaction", err))?;
+        Ok(())
+    }
+
+    /// Validate the compare-and-swap before the state owner appends rebind authority.
+    pub(crate) fn preview_label_rebind(
+        &self,
+        tape_uuid: [u8; 16],
+        label: &str,
+        previous_uuid: [u8; 16],
+    ) -> Result<(), StateError> {
+        validate_label_rebind(&self.conn, tape_uuid, label, previous_uuid)
+    }
+
+    /// Persist an explicit generation assertion for an already proven tape UUID.
+    /// The caller owns the device/BOT proof; this updates no identity or capacity counters.
+    pub fn set_tape_generation(
+        &mut self,
+        tape_uuid: [u8; 16],
+        observation: MediaObservation,
+    ) -> Result<(), StateError> {
+        let changed = self.conn.execute(
+            "update tapes set cartridge_generation = ?2, generation_source = ?3, updated_at_utc = ?4 where tape_uuid = ?1",
+            params![tape_uuid.as_slice(), observation.generation.media_code(), observation.source.as_str(), now_utc()?],
+        ).map_err(|e| sqlite_error("record cartridge generation", e))?;
+        if changed != 1 {
+            return Err(StateError::TapeProvisionConflict(
+                "cannot set generation for an unknown tape".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2011,7 +2183,7 @@ impl CatalogIndex {
     /// This never manufactures tape-file, Object, extent, wrap-map, or
     /// finalization authority. UUID and barcode conflicts are checked across
     /// all tape kinds in the same transaction that inserts the row and its
-    /// derived pool assignment.
+    /// pool assignment with its provenance.
     pub(crate) fn adopt_bootstrap_identity(
         &mut self,
         input: AdoptBootstrapIdentityInput,
@@ -2020,12 +2192,7 @@ impl CatalogIndex {
         request_fingerprint: [u8; 32],
     ) -> Result<AdoptBootstrapIdentityOutcome, StateError> {
         let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
-        let voltag = input.voltag.trim().to_string();
-        if voltag.is_empty() || voltag != input.voltag {
-            return Err(StateError::ConfigInvalid(
-                "bootstrap adoption requires a non-empty trimmed voltag".to_string(),
-            ));
-        }
+        let voltag = validate_adoption_label(input.voltag.as_deref())?;
         let pool_id = normalize_pool_id(pool_id)?;
         let updated_at = now_utc()?;
         let tx = self
@@ -2036,12 +2203,19 @@ impl CatalogIndex {
             &tx,
             BootstrapAdoptionCatalogFacts {
                 tape_uuid: input.tape_uuid,
-                voltag: voltag.as_str(),
+                voltag,
                 geometry: &geometry,
                 pool_id: pool_id.as_str(),
                 state,
                 operation_id: input.operation_id,
                 request_fingerprint,
+                provenance: input.label_provenance,
+                observation: input.observation,
+                assignment_source: if input.pool_id.is_some() {
+                    "operator"
+                } else {
+                    "rule"
+                },
             },
             updated_at.as_str(),
         )?;
@@ -2062,12 +2236,7 @@ impl CatalogIndex {
         request_fingerprint: [u8; 32],
     ) -> Result<Option<AdoptBootstrapIdentityOutcome>, StateError> {
         let geometry = ProvisionTapeGeometry::from_parity(input.block_size, &input.parity)?;
-        let voltag = input.voltag.trim();
-        if voltag.is_empty() || voltag != input.voltag {
-            return Err(StateError::ConfigInvalid(
-                "bootstrap adoption requires a non-empty trimmed voltag".to_string(),
-            ));
-        }
+        let voltag = validate_adoption_label(input.voltag.as_deref())?;
         let pool_id = normalize_pool_id(pool_id)?;
         validate_bootstrap_identity_adoption_conn(
             &self.conn,
@@ -2079,6 +2248,13 @@ impl CatalogIndex {
                 state,
                 operation_id: input.operation_id,
                 request_fingerprint,
+                provenance: input.label_provenance,
+                observation: input.observation,
+                assignment_source: if input.pool_id.is_some() {
+                    "operator"
+                } else {
+                    "rule"
+                },
             },
         )
     }
@@ -2132,6 +2308,17 @@ impl CatalogIndex {
         if invalid_tape {
             return Ok(false);
         }
+        let invalid_assignments: bool = self.conn.query_row(
+            "select exists(select 1 from tape_pool_assignments a left join tapes t on t.tape_uuid = a.tape_uuid
+                where t.tape_uuid is null or a.seq <> 1 or a.actor <> 'catalog-reset'
+                  or a.assignment_generation <> t.assignment_generation or a.pool_id is not t.pool_id)
+             or exists(select 1 from tapes t where t.pool_id is not null and not exists(
+                select 1 from tape_pool_assignments a where a.tape_uuid = t.tape_uuid))",
+            [], |r|r.get(0),
+        ).map_err(|e|sqlite_error("validate reset assignment evidence",e))?;
+        if invalid_assignments {
+            return Ok(false);
+        }
         let mut stmt = self
             .conn
             .prepare(
@@ -2146,7 +2333,10 @@ impl CatalogIndex {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| sqlite_error("read reset output table", err))?;
         for name in names {
-            if matches!(name.as_str(), "schema_meta" | "tapes" | "tape_pools") {
+            if matches!(
+                name.as_str(),
+                "schema_meta" | "tapes" | "tape_pools" | "tape_pool_assignments"
+            ) {
                 continue;
             }
             let quoted = name.replace('"', "\"\"");
@@ -2194,7 +2384,8 @@ impl CatalogIndex {
                           or exists(select 1 from media_readiness_ops
                                     where media_readiness_ops.barcode = tapes.voltag
                                       and media_readiness_ops.state not in ('ready', 'released')
-                                      and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none')
+                                      and coalesce(media_readiness_ops.dirty_scope, 'drive+tape') <> 'none'),
+                        tapes.voltag_source, tapes.cartridge_generation, tapes.generation_source
                  from tapes
                  where tapes.voltag = ?1
                  order by hex(tapes.tape_uuid)",
@@ -2288,11 +2479,21 @@ impl CatalogIndex {
                 ))
             })?;
 
+        let assignment_source: String = self.conn.query_row("select source from tape_pool_assignments where tape_uuid = ?1 order by seq desc limit 1", params![tape_uuid.as_slice()], |r|r.get(0)).optional().map_err(|e|sqlite_error("capture reset assignment source",e))?.unwrap_or_else(|| "rule".into());
+        let pool_id = if assignment_source == "operator" {
+            tape.pool_id.clone()
+        } else {
+            derive_tape_pool_from_voltag(source_voltag, pool_rules).map(str::to_string)
+        };
         Ok(CatalogResetPreservedTape {
             tape_uuid,
             voltag: source_voltag.to_string(),
             kind: tape.kind,
-            pool_id: derive_tape_pool_from_voltag(source_voltag, pool_rules).map(str::to_string),
+            pool_id,
+            assignment_source,
+            voltag_source: tape.voltag_source,
+            cartridge_generation: tape.cartridge_generation,
+            generation_source: tape.generation_source,
             assignment_generation,
             geometry,
             restore_ready,
@@ -2312,6 +2513,8 @@ impl CatalogIndex {
             .map_err(|err| sqlite_error("begin catalog reset tape restore", err))?;
         for tape in tapes {
             let geometry = tape.geometry.as_ref();
+            let assignment_event = tape.pool_id.is_some() || tape.assignment_source == "operator";
+            let initial_generation = tape.assignment_generation - i64::from(assignment_event);
             tx.execute(
                 "insert into tapes(
                    tape_uuid, voltag, pool_id, assignment_generation, kind,
@@ -2322,20 +2525,20 @@ impl CatalogIndex {
                    written_extent_lba, finalization_progress, finalization_trigger,
                    finalization_operation_id, finalization_edition_digest,
                    finalization_layout_digest, completed_replicas,
-                   finalization_outcome, state, updated_at_utc
+                   finalization_outcome, state, updated_at_utc, voltag_source, cartridge_generation, generation_source
                  ) values(
-                   ?1, ?2, ?3, ?4, ?5,
+                   ?1, ?2, null, ?4, ?5,
                    case when ?5 = 'cleaning' then 0 else null end,
                    case when ?5 = 'cleaning' then 'unverified' else null end,
                    ?6, ?7, ?8, ?9, ?10,
                    X'0000000000000000', X'0000000000000000', null,
-                   null, null, null, null, null, null, null, null, ?11, ?12
+                   null, null, null, null, null, null, null, null, 'ready', ?12, ?13, ?14, ?15
                  )",
                 params![
                     tape.tape_uuid.as_slice(),
                     tape.voltag.as_str(),
                     tape.pool_id.as_deref(),
-                    tape.assignment_generation,
+                    initial_generation,
                     tape.kind.as_str(),
                     geometry.map(|value| value.block_size),
                     geometry.and_then(|value| value.scheme_id.as_deref()),
@@ -2348,9 +2551,29 @@ impl CatalogIndex {
                         "recovery_required"
                     },
                     updated_at.as_str(),
+                    tape.voltag_source.map(LabelProvenance::as_str),
+                    tape.cartridge_generation.as_deref(), tape.generation_source.as_deref(),
                 ],
             )
             .map_err(|err| sqlite_error("restore catalog reset tape", err))?;
+            if assignment_event {
+                set_tape_pool_membership_tx(
+                    &tx,
+                    tape.tape_uuid,
+                    i64_to_u64(initial_generation, "assignment_generation")?,
+                    tape.pool_id.as_deref(),
+                    (&tape.assignment_source, "catalog-reset"),
+                    &updated_at,
+                    AssignmentWrite::Change,
+                )?;
+            }
+            if !tape.restore_ready {
+                tx.execute(
+                    "update tapes set state = 'recovery_required' where tape_uuid = ?1",
+                    params![tape.tape_uuid.as_slice()],
+                )
+                .map_err(|e| sqlite_error("restore reset recovery requirement", e))?;
+            }
         }
         tx.commit()
             .map_err(|err| sqlite_error("commit catalog reset tape restore", err))?;
@@ -4360,7 +4583,9 @@ impl CatalogIndex {
                     tape_uuid,
                     snapshot.assignment_generation,
                     None,
+                    ("rule", "rule-reconciliation"),
                     now_utc()?.as_str(),
+                    AssignmentWrite::Change,
                 )?;
             }
         }
@@ -4476,6 +4701,28 @@ impl CatalogIndex {
         expected_generation: u64,
         pool_id: Option<&str>,
     ) -> Result<TapeAssignmentSnapshot, StateError> {
+        self.compare_and_set_tape_pool_assignment_as(
+            tape_uuid,
+            expected_generation,
+            pool_id,
+            "operator",
+        )
+    }
+
+    /// Assign or unassign a pool with the authenticated/local actor recorded in
+    /// the same transaction as the guarded projection update.
+    pub fn compare_and_set_tape_pool_assignment_as(
+        &mut self,
+        tape_uuid: [u8; 16],
+        expected_generation: u64,
+        pool_id: Option<&str>,
+        actor: &str,
+    ) -> Result<TapeAssignmentSnapshot, StateError> {
+        if actor.trim().is_empty() {
+            return Err(StateError::ConfigInvalid(
+                "pool assignment requires an actor".into(),
+            ));
+        }
         let pool_id = pool_id.map(normalize_pool_id).transpose()?;
         let updated_at_utc = now_utc()?;
         let tx = self
@@ -4487,7 +4734,9 @@ impl CatalogIndex {
             tape_uuid,
             expected_generation,
             pool_id.as_deref(),
+            ("operator", actor),
             updated_at_utc.as_str(),
+            AssignmentWrite::Change,
         )?;
         let snapshot = query_tape_assignment_snapshot_tx(&tx, tape_uuid)?.ok_or_else(|| {
             StateError::TapePoolAssignmentConflict(format!(
@@ -4881,7 +5130,8 @@ impl CatalogIndex {
                     assignment_generation, finalization_progress,
                     finalization_trigger, finalization_operation_id,
                     finalization_edition_digest, finalization_layout_digest,
-                    completed_replicas, finalization_outcome
+                    completed_replicas, finalization_outcome,
+                    voltag_source, cartridge_generation, generation_source
              from tapes{where_clause}
              order by hex(tapes.tape_uuid)"
         );
@@ -5030,7 +5280,8 @@ impl CatalogIndex {
                         assignment_generation, finalization_progress,
                         finalization_trigger, finalization_operation_id,
                         finalization_edition_digest, finalization_layout_digest,
-                        completed_replicas, finalization_outcome
+                        completed_replicas, finalization_outcome,
+                    voltag_source, cartridge_generation, generation_source
                  from tapes
                  where tapes.tape_uuid = ?1",
             )
@@ -5075,7 +5326,8 @@ impl CatalogIndex {
                         assignment_generation, finalization_progress,
                         finalization_trigger, finalization_operation_id,
                         finalization_edition_digest, finalization_layout_digest,
-                        completed_replicas, finalization_outcome
+                        completed_replicas, finalization_outcome,
+                    voltag_source, cartridge_generation, generation_source
                  from tapes
                  where tapes.voltag = ?1",
             )
@@ -5696,7 +5948,7 @@ impl CatalogIndex {
             .conn
             .prepare(
                 "select session_id, session_kind, tape_uuid, library_serial, drive_bay,
-                        drive_uuid
+                        drive_uuid, endpoint_key
                  from sessions
                  where state = 'open'
                  order by opened_at_utc, session_id",
@@ -5712,13 +5964,23 @@ impl CatalogIndex {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<i64>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<String>>(6)?
+                        .map(decode_endpoint_sql)
+                        .transpose()?,
                 ))
             })
             .map_err(|err| sqlite_error("query non-terminal sessions", err))?;
         let mut out = Vec::new();
         for row in rows {
-            let (session_id, session_kind, tape_uuid, library_serial, drive_bay, drive_uuid) =
-                row.map_err(|err| sqlite_error("read non-terminal session row", err))?;
+            let (
+                session_id,
+                session_kind,
+                tape_uuid,
+                library_serial,
+                drive_bay,
+                drive_uuid,
+                endpoint,
+            ) = row.map_err(|err| sqlite_error("read non-terminal session row", err))?;
             out.push(RestartSession {
                 session_id: parse_uuid_for_index(&session_id, "session_id")?,
                 session_kind,
@@ -5726,6 +5988,7 @@ impl CatalogIndex {
                 library_serial,
                 drive_bay,
                 drive_uuid,
+                drive_key: endpoint,
             });
         }
         Ok(out)
@@ -6110,18 +6373,24 @@ struct ExistingAdoptedTape {
 #[derive(Clone, Copy)]
 struct BootstrapAdoptionCatalogFacts<'a> {
     tape_uuid: [u8; 16],
-    voltag: &'a str,
+    voltag: Option<&'a str>,
     geometry: &'a ProvisionTapeGeometry,
     pool_id: &'a str,
     state: AdoptedTapeState,
     operation_id: Uuid,
     request_fingerprint: [u8; 32],
+    provenance: LabelProvenance,
+    observation: Option<MediaObservation>,
+    assignment_source: &'a str,
 }
 
 #[derive(Clone, Debug)]
 struct PreservedTapeRow {
     tape_uuid: Vec<u8>,
     voltag: Option<String>,
+    voltag_source: Option<String>,
+    cartridge_generation: Option<String>,
+    generation_source: Option<String>,
     pool_id: Option<String>,
     assignment_generation: i64,
     kind: String,
@@ -6334,11 +6603,12 @@ impl ExistingProvisionedTape {
 fn provision_tape_tx(
     tx: &rusqlite::Transaction<'_>,
     tape_uuid: [u8; 16],
-    voltag: &str,
+    label: (&str, LabelProvenance),
     geometry: &ProvisionTapeGeometry,
     force: bool,
     updated_at: &str,
 ) -> Result<(), StateError> {
+    let (voltag, _) = label;
     let existing = find_provisioned_tape_tx(tx, tape_uuid, voltag)?;
     if let Some(existing) = existing {
         // Retirement is terminal, including against `force`: `force` reuses
@@ -6370,7 +6640,7 @@ fn provision_tape_tx(
             return update_provisioned_tape_voltag_tx(
                 tx,
                 existing.tape_uuid.as_slice(),
-                voltag,
+                label,
                 updated_at,
             );
         }
@@ -6394,14 +6664,24 @@ fn provision_tape_tx(
             tx,
             existing.tape_uuid.as_slice(),
             tape_uuid,
-            voltag,
+            label,
             geometry,
             next_assignment_generation,
             updated_at,
         )
     } else {
-        insert_provisioned_tape_tx(tx, tape_uuid, voltag, geometry, updated_at)
+        insert_provisioned_tape_tx(tx, tape_uuid, label, geometry, updated_at)
     }
+}
+
+/// Absence is valid; a supplied shell label must be nonempty and canonical.
+fn validate_adoption_label(label: Option<&str>) -> Result<Option<&str>, StateError> {
+    if label.is_some_and(|label| label.is_empty() || label.trim() != label) {
+        return Err(StateError::ConfigInvalid(
+            "bootstrap adoption label must be non-empty and trimmed when supplied".into(),
+        ));
+    }
+    Ok(label)
 }
 
 fn adopt_bootstrap_identity_tx(
@@ -6435,8 +6715,8 @@ fn adopt_bootstrap_identity_tx(
            highest_protected_ordinal, total_committed_ordinals,
            last_committed_tape_file, state, updated_at_utc
          ) values(
-           ?1, ?2, ?3, 1, 'data', ?4, ?5, ?6, ?7, ?8,
-           X'0000000000000000', X'0000000000000000', null, ?9, ?10
+           ?1, ?2, null, 0, 'data', ?4, ?5, ?6, ?7, ?8,
+           X'0000000000000000', X'0000000000000000', null, 'ready', ?10
          )",
         params![
             facts.tape_uuid.to_vec(),
@@ -6453,6 +6733,21 @@ fn adopt_bootstrap_identity_tx(
     )
     .map_err(|err| sqlite_error("insert adopted Bootstrap identity", err))?;
 
+    record_media_observation_tx(tx, &facts.tape_uuid, facts.provenance, facts.observation)?;
+    set_tape_pool_membership_tx(
+        tx,
+        facts.tape_uuid,
+        0,
+        Some(facts.pool_id),
+        (facts.assignment_source, "bootstrap-adoption"),
+        updated_at,
+        AssignmentWrite::Change,
+    )?;
+    tx.execute(
+        "update tapes set state = ?2 where tape_uuid = ?1",
+        params![facts.tape_uuid.as_slice(), facts.state.as_str()],
+    )
+    .map_err(|e| sqlite_error("record adopted state", e))?;
     Ok(AdoptBootstrapIdentityOutcome {
         newly_adopted: true,
         assignment_generation: 1,
@@ -6503,8 +6798,31 @@ fn validate_bootstrap_identity_adoption_conn(
             hex_uuid_from_slice(existing.tape_uuid.as_slice())
         )));
     }
-    let exact_identity = existing.tape_uuid == facts.tape_uuid.to_vec()
-        && existing.voltag.as_deref() == Some(facts.voltag)
+    let evidence: (Option<String>, Option<String>, Option<String>) = conn.query_row(
+        "select voltag_source, cartridge_generation, generation_source from tapes where tape_uuid=?1",
+        params![existing.tape_uuid.as_slice()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))
+    ).map_err(|e|sqlite_error("validate adoption media evidence",e))?;
+    let same_media = evidence.0.as_deref() == facts.voltag.map(|_| facts.provenance.as_str())
+        && facts.observation.is_none_or(|o| {
+            evidence.1.as_deref() == Some(o.generation.media_code())
+                && evidence.2.as_deref() == Some(o.source.as_str())
+        });
+    let assignment_source: Option<String> = conn
+        .query_row(
+            "select source from tape_pool_assignments where tape_uuid=?1 order by seq desc limit 1",
+            params![existing.tape_uuid.as_slice()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| sqlite_error("validate adoption assignment authority", e))?;
+    // A repeated adoption must not silently discard new explicit pool intent.
+    // Evolved assignment authority is changed by assign-pool, not adoption.
+    let same_assignment =
+        facts.assignment_source != "operator" || assignment_source.as_deref() == Some("operator");
+    let exact_identity = same_media
+        && same_assignment
+        && existing.tape_uuid == facts.tape_uuid.to_vec()
+        && existing.voltag.as_deref() == facts.voltag
         && existing.kind == "data"
         && existing.geometry.as_ref() == Some(facts.geometry)
         && existing.pool_id.as_deref() == Some(facts.pool_id)
@@ -6701,33 +7019,87 @@ where
     .map_err(|err| sqlite_error("query existing provisioned tape", err))
 }
 
+/// Decode media evidence carried by newer audit events. Older changer events
+/// retain their label hint and never overwrite measured generation authority.
+fn audit_media_observation(
+    record: &AuditRecord,
+    label: Option<&str>,
+) -> Result<Option<MediaObservation>, StateError> {
+    match (
+        detail_text(record, "cartridge_generation"),
+        detail_text(record, "generation_source"),
+    ) {
+        (None, None) => {
+            if record.detail.contains_key("media_observation_recorded") {
+                Ok(None)
+            } else {
+                Ok(label.and_then(MediaObservation::label_hint))
+            }
+        }
+        (Some(code), Some(source)) => {
+            let generation = crate::LtoGen::from_media_code(&code).ok_or_else(|| {
+                StateError::IndexCorrupt("invalid audit cartridge generation".into())
+            })?;
+            let source = match source.as_str() {
+                "measured" => crate::GenerationSource::Measured,
+                "label" => crate::GenerationSource::Label,
+                "operator" => crate::GenerationSource::Operator,
+                _ => {
+                    return Err(StateError::IndexCorrupt(
+                        "invalid audit generation source".into(),
+                    ))
+                }
+            };
+            Ok(Some(MediaObservation { generation, source }))
+        }
+        _ => Err(StateError::IndexCorrupt(
+            "partial audit generation evidence".into(),
+        )),
+    }
+}
+
+/// Store shell provenance and generation together with identity creation.
+fn record_media_observation_tx(
+    tx: &rusqlite::Transaction<'_>,
+    uuid: &[u8],
+    provenance: LabelProvenance,
+    observation: Option<MediaObservation>,
+) -> Result<(), StateError> {
+    tx.execute("update tapes set voltag_source = case when voltag is null then null else ?2 end where tape_uuid = ?1", params![uuid, provenance.as_str()]).map_err(|e| sqlite_error("record label provenance", e))?;
+    if let Some(observation) = observation {
+        tx.execute("update tapes set cartridge_generation = ?2, generation_source = ?3 where tape_uuid = ?1 and (cartridge_generation is null or ?3 <> 'label')", params![uuid, observation.generation.media_code(), observation.source.as_str()]).map_err(|e| sqlite_error("record media observation", e))?;
+    }
+    Ok(())
+}
+
 fn insert_provisioned_tape_tx(
     tx: &rusqlite::Transaction<'_>,
     tape_uuid: [u8; 16],
-    voltag: &str,
+    label: (&str, LabelProvenance),
     geometry: &ProvisionTapeGeometry,
     updated_at: &str,
 ) -> Result<(), StateError> {
     tx.execute(
         "insert into tapes(
-           tape_uuid, voltag, block_size, scheme_id, data_blocks_per_stripe,
+           tape_uuid, voltag, voltag_source, block_size, scheme_id, data_blocks_per_stripe,
            parity_blocks_per_stripe, stripes_per_neighborhood,
            highest_protected_ordinal, total_committed_ordinals,
            last_committed_tape_file, state, updated_at_utc
          )
          values(
-           ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+           ?1, ?2, ?9, ?3, ?4, ?5, ?6, ?7,
            X'0000000000000000', X'0000000000000000', null, 'ready', ?8
          )",
         params![
             tape_uuid.to_vec(),
-            voltag,
+            label.0,
             geometry.block_size,
             geometry.scheme_id.as_deref(),
             geometry.data_blocks_per_stripe,
             geometry.parity_blocks_per_stripe,
             geometry.stripes_per_neighborhood,
             updated_at,
+            label.1.as_str(),
         ],
     )
     .map_err(|err| sqlite_error("insert provisioned tape", err))?;
@@ -6737,15 +7109,15 @@ fn insert_provisioned_tape_tx(
 fn update_provisioned_tape_voltag_tx(
     tx: &rusqlite::Transaction<'_>,
     tape_uuid: &[u8],
-    voltag: &str,
+    label: (&str, LabelProvenance),
     updated_at: &str,
 ) -> Result<(), StateError> {
     tx.execute(
         "update tapes
-         set voltag = ?2,
+         set voltag = ?2, voltag_source = ?4,
              updated_at_utc = ?3
          where tape_uuid = ?1",
-        params![tape_uuid, voltag, updated_at],
+        params![tape_uuid, label.0, updated_at, label.1.as_str()],
     )
     .map_err(|err| sqlite_error("update provisioned tape voltag", err))?;
     Ok(())
@@ -6755,22 +7127,21 @@ fn reprovision_tape_tx(
     tx: &rusqlite::Transaction<'_>,
     old_tape_uuid: &[u8],
     new_tape_uuid: [u8; 16],
-    voltag: &str,
+    label: (&str, LabelProvenance),
     geometry: &ProvisionTapeGeometry,
     assignment_generation: i64,
     updated_at: &str,
 ) -> Result<(), StateError> {
+    let previous_generation = i64_to_u64(assignment_generation - 1, "assignment_generation")?;
     tx.execute(
         "update tapes
          set tape_uuid = ?2,
-             voltag = ?3,
+             voltag = ?3, voltag_source = ?11,
              block_size = ?4,
              scheme_id = ?5,
              data_blocks_per_stripe = ?6,
              parity_blocks_per_stripe = ?7,
              stripes_per_neighborhood = ?8,
-             pool_id = null,
-             assignment_generation = ?9,
              state = 'ready',
              highest_protected_ordinal = X'0000000000000000',
              total_committed_ordinals = X'0000000000000000',
@@ -6788,7 +7159,7 @@ fn reprovision_tape_tx(
         params![
             old_tape_uuid,
             new_tape_uuid.to_vec(),
-            voltag,
+            label.0,
             geometry.block_size,
             geometry.scheme_id.as_deref(),
             geometry.data_blocks_per_stripe,
@@ -6796,9 +7167,20 @@ fn reprovision_tape_tx(
             geometry.stripes_per_neighborhood,
             assignment_generation,
             updated_at,
+            label.1.as_str(),
         ],
     )
     .map_err(|err| sqlite_error("re-provision tape", err))?;
+    set_tape_pool_membership_tx(
+        tx,
+        new_tape_uuid,
+        previous_generation,
+        None,
+        ("rule", "reprovision"),
+        updated_at,
+        AssignmentWrite::LifecycleChange,
+    )?;
+
     tx.execute(
         "delete from tape_files where tape_uuid = ?1",
         params![old_tape_uuid],
@@ -6860,9 +7242,12 @@ fn query_preserved_tape_rows_tx(
                     state, updated_at_utc, finalization_progress,
                     finalization_trigger, finalization_operation_id,
                     finalization_edition_digest, finalization_layout_digest,
-                    completed_replicas, finalization_outcome
+                    completed_replicas, finalization_outcome,
+                    voltag_source, cartridge_generation, generation_source
              from tapes
              where voltag is not null
+                or cartridge_generation is not null
+                or generation_source is not null
                 or pool_id is not null
                 or assignment_generation != 0
                 or kind != 'data'
@@ -6886,6 +7271,9 @@ fn query_preserved_tape_rows_tx(
         preserved.push(PreservedTapeRow {
             tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
             voltag: row_get(row, 1, "tapes.voltag")?,
+            voltag_source: row_get(row, 24, "tapes.voltag_source")?,
+            cartridge_generation: row_get(row, 25, "tapes.cartridge_generation")?,
+            generation_source: row_get(row, 26, "tapes.generation_source")?,
             pool_id: row_get(row, 2, "tapes.pool_id")?,
             assignment_generation: row_get(row, 3, "tapes.assignment_generation")?,
             kind: row_get(row, 4, "tapes.kind")?,
@@ -6928,11 +7316,11 @@ fn restore_preserved_tape_rows_tx(
                finalization_progress, finalization_trigger,
                finalization_operation_id, finalization_edition_digest,
                finalization_layout_digest, completed_replicas,
-               finalization_outcome
+               finalization_outcome, voltag_source, cartridge_generation, generation_source
             )
              values(
                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-               ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+               ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
              )",
             params![
                 row.tape_uuid.as_slice(),
@@ -6959,6 +7347,9 @@ fn restore_preserved_tape_rows_tx(
                 row.finalization_layout_digest.as_deref(),
                 row.completed_replicas,
                 row.finalization_outcome.as_deref(),
+                row.voltag_source.as_deref(),
+                row.cartridge_generation.as_deref(),
+                row.generation_source.as_deref(),
             ],
         )
         .map_err(|err| sqlite_error("restore preserved tape row", err))?;
@@ -6977,6 +7368,8 @@ fn merge_preserved_tape_operator_columns_tx(
         // without this merge a rebuild would re-ingest it and resurrect the
         // retired identity as `ingested`.
         if row.voltag.is_none()
+            && row.cartridge_generation.is_none()
+            && row.generation_source.is_none()
             && row.pool_id.is_none()
             && row.assignment_generation == 0
             && row.kind == "data"
@@ -7011,6 +7404,7 @@ fn merge_preserved_tape_operator_columns_tx(
                  finalization_layout_digest = ?12,
                  completed_replicas = ?13,
                  finalization_outcome = ?14,
+                 voltag_source = ?16, cartridge_generation = ?17, generation_source = ?18,
                  state =
                    case
                      when ?15 in (
@@ -7036,6 +7430,9 @@ fn merge_preserved_tape_operator_columns_tx(
                 row.completed_replicas,
                 row.finalization_outcome.as_deref(),
                 row.state.as_str(),
+                row.voltag_source.as_deref(),
+                row.cartridge_generation.as_deref(),
+                row.generation_source.as_deref(),
             ],
         )
         .map_err(|err| sqlite_error("merge preserved tape operator columns", err))?;
@@ -8984,6 +9381,26 @@ fn project_operation_record(
     Ok(())
 }
 
+/// Explicit endpoint evidence is decoded before replay; legacy bay coordinates
+/// remain supported without inventing a standalone identity from a path.
+fn audit_endpoint(record: &AuditRecord) -> Result<Option<DriveKey>, StateError> {
+    if let Some(encoded) = detail_text(record, "endpoint_key") {
+        return DriveKey::decode(&encoded)
+            .map(Some)
+            .map_err(|e| StateError::IndexCorrupt(format!("invalid audit endpoint: {e}")));
+    }
+    let serial = detail_text(record, "library_serial");
+    let bay = detail_i64(record, "drive_bay").or_else(|| detail_i64(record, "drive_element"));
+    match (serial, bay) {
+        (Some(serial), Some(bay)) => Ok(Some(DriveKey::new(
+            serial,
+            u16::try_from(bay)
+                .map_err(|_| StateError::IndexCorrupt("audit bay outside u16".into()))?,
+        ))),
+        _ => Ok(None),
+    }
+}
+
 fn project_session_record(
     tx: &rusqlite::Transaction<'_>,
     record: &AuditRecord,
@@ -9013,9 +9430,9 @@ fn project_session_record(
         "insert into sessions(
            session_id, session_kind, tape_uuid, library_serial, drive_bay,
            drive_uuid,
-           state, opened_at_utc, updated_at_utc
+           state, opened_at_utc, updated_at_utc, endpoint_key
          )
-         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+         values(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
          on conflict(session_id) do update set
            session_kind = case
              when excluded.session_kind != 'unknown' then excluded.session_kind
@@ -9025,6 +9442,7 @@ fn project_session_record(
            library_serial = coalesce(excluded.library_serial, sessions.library_serial),
            drive_bay = coalesce(excluded.drive_bay, sessions.drive_bay),
            drive_uuid = coalesce(excluded.drive_uuid, sessions.drive_uuid),
+           endpoint_key = coalesce(excluded.endpoint_key, sessions.endpoint_key),
            state = excluded.state,
            updated_at_utc = excluded.updated_at_utc",
         params![
@@ -9036,6 +9454,7 @@ fn project_session_record(
             detail_bytes(record, "drive_uuid"),
             state,
             record.timestamp_utc.as_str(),
+            audit_endpoint(record)?.map(|endpoint| endpoint.encode()),
         ],
     )
     .map_err(|err| sqlite_error("project audit session", err))?;
@@ -9136,6 +9555,195 @@ fn project_idempotency_record(
     Ok(())
 }
 
+fn validate_label_rebind(
+    conn: &Connection,
+    tape_uuid: [u8; 16],
+    label: &str,
+    previous_uuid: [u8; 16],
+) -> Result<(), StateError> {
+    if label.is_empty() || label.trim() != label {
+        return Err(StateError::ConfigInvalid(
+            "rebind requires a non-empty trimmed label".into(),
+        ));
+    }
+    let previous: Option<Vec<u8>> = conn
+        .query_row(
+            "select tape_uuid from tapes where voltag=?1",
+            [label],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| sqlite_error("read prior label", e))?;
+    if previous.as_deref() != Some(previous_uuid.as_slice()) {
+        return Err(StateError::TapeProvisionConflict(
+            "previous UUID does not match the current label binding".into(),
+        ));
+    }
+    let live: bool = conn
+        .query_row(
+            "select exists(select 1 from tapes where tape_uuid=?1 and state <> 'retired')",
+            params![tape_uuid.as_slice()],
+            |r| r.get(0),
+        )
+        .map_err(|e| sqlite_error("check rebind target", e))?;
+    if !live {
+        return Err(StateError::TapeProvisionConflict(
+            "rebind target must be an existing live identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn replay_label_rebind(tx: &Connection, record: &AuditRecord) -> Result<(), StateError> {
+    let uuid: [u8; 16] = audit_tape_uuid(record)
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| StateError::IndexCorrupt("rebind has invalid tape UUID".into()))?;
+    let previous: [u8; 16] = detail_bytes(record, "previous_uuid")
+        .and_then(|v| v.try_into().ok())
+        .ok_or_else(|| StateError::IndexCorrupt("rebind has invalid previous UUID".into()))?;
+    if !audit_intent_is_new(tx, &uuid, "label", record)?
+        || !audit_intent_is_new(tx, &previous, "label", record)?
+    {
+        return Ok(());
+    }
+    let label = detail_text(record, "voltag")
+        .ok_or_else(|| StateError::IndexCorrupt("rebind has no label".into()))?;
+    validate_label_rebind(tx, uuid, &label, previous)?;
+    tx.execute(
+        "update tapes set voltag=null,voltag_source=null,updated_at_utc=?2 where tape_uuid=?1",
+        params![previous.as_slice(), record.timestamp_utc],
+    )
+    .map_err(|e| sqlite_error("release rebound label", e))?;
+    tx.execute(
+        "update tapes set voltag=?2,voltag_source='operator',updated_at_utc=?3 where tape_uuid=?1",
+        params![uuid.as_slice(), label, record.timestamp_utc],
+    )
+    .map_err(|e| sqlite_error("project rebound label", e))?;
+    remember_audit_intent(tx, &previous, "label", record)?;
+    remember_audit_intent(tx, &uuid, "label", record)
+}
+
+/// Durable cursors order audit intent independently of projection generations.
+const TAPE_AUDIT_CURSOR_SCHEMA: &str = "create table if not exists tape_audit_cursors(
+ tape_uuid blob not null, field text not null, audit_sequence blob not null,
+ record_uuid text not null, primary key(tape_uuid, field));
+ create table if not exists tape_assignment_replay_baselines(
+ tape_uuid blob primary key not null, assignment_generation integer not null);";
+
+fn audit_intent_is_new(
+    tx: &Connection,
+    uuid: &[u8],
+    field: &str,
+    record: &AuditRecord,
+) -> Result<bool, StateError> {
+    let cursor: Option<(SqliteU64,String)> = tx.query_row("select audit_sequence, record_uuid from tape_audit_cursors where tape_uuid = ?1 and field = ?2", params![uuid,field], |r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|sqlite_error("read audit cursor",e))?;
+    if let Some((sequence, id)) = cursor {
+        if sequence.get() == record.sequence && id != record.record_uuid.to_string() {
+            return Err(StateError::IndexCorrupt(
+                "conflicting audit records at the same sequence".into(),
+            ));
+        }
+        return Ok(record.sequence > sequence.get());
+    }
+    Ok(true)
+}
+fn remember_audit_intent(
+    tx: &Connection,
+    uuid: &[u8],
+    field: &str,
+    record: &AuditRecord,
+) -> Result<(), StateError> {
+    tx.execute("insert into tape_audit_cursors(tape_uuid,field,audit_sequence,record_uuid) values(?1,?2,?3,?4)
+        on conflict(tape_uuid,field) do update set audit_sequence=excluded.audit_sequence,record_uuid=excluded.record_uuid
+        where excluded.audit_sequence > tape_audit_cursors.audit_sequence",params![uuid,field,SqliteU64::new(record.sequence),record.record_uuid.to_string()]).map_err(|e|sqlite_error("record audit cursor",e))?;
+    Ok(())
+}
+fn audit_assignment_source(record: &AuditRecord) -> Result<String, StateError> {
+    // The sole historical TapePoolAssigned producer was library init.
+    let source = detail_text(record, "assignment_source").unwrap_or_else(|| "rule".into());
+    if !matches!(source.as_str(), "rule" | "operator") {
+        return Err(StateError::IndexCorrupt("invalid assignment source".into()));
+    }
+    Ok(source)
+}
+fn audit_assignment_pool(record: &AuditRecord) -> Result<Option<String>, StateError> {
+    match record.detail.get("pool_id") {
+        Some(ciborium::value::Value::Null) => Ok(None),
+        Some(ciborium::value::Value::Text(pool)) => normalize_pool_id(pool).map(Some),
+        _ => Err(StateError::IndexCorrupt(
+            "assignment audit requires a pool or explicit null".into(),
+        )),
+    }
+}
+fn replay_assignment(
+    tx: &Connection,
+    uuid: [u8; 16],
+    record: &AuditRecord,
+) -> Result<(), StateError> {
+    if !audit_intent_is_new(tx, &uuid, "assignment", record)? {
+        return Ok(());
+    }
+    let generation: i64 = tx
+        .query_row(
+            "select assignment_generation from tapes where tape_uuid=?1",
+            params![uuid.as_slice()],
+            |r| r.get(0),
+        )
+        .map_err(|e| sqlite_error("read replay assignment generation", e))?;
+    // New assignment evidence carries its projection generation. This binds
+    // audit intent to the same durable transition even when reconciliation has
+    // already advanced beyond it. Never infer event identity from pool values.
+    let recorded_generation = if record.detail.contains_key("assignment_generation") {
+        Some(
+            detail_i64(record, "assignment_generation")
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| {
+                    StateError::IndexCorrupt("invalid assignment audit generation".into())
+                })?,
+        )
+    } else {
+        None
+    };
+    let migrated_generation: Option<i64> = tx
+        .query_row(
+            "select assignment_generation from tape_assignment_replay_baselines where tape_uuid=?1",
+            params![uuid.as_slice()],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| sqlite_error("read legacy assignment replay boundary", e))?;
+    if migrated_generation.is_some_and(|baseline| generation < baseline) {
+        return Err(StateError::IndexCorrupt(
+            "assignment projection predates its durable migration boundary".into(),
+        ));
+    }
+    let source = audit_assignment_source(record)?;
+    let pool = audit_assignment_pool(record)?;
+    // Historical library-init rule audit was appended after its projection and
+    // is already represented by migration, including a null projection. Explicit
+    // operator intent did not exist in that format and must still be replayed.
+    if recorded_generation.is_some_and(|recorded| recorded <= generation)
+        || (recorded_generation.is_none() && source == "rule" && migrated_generation.is_some())
+    {
+        return remember_audit_intent(tx, &uuid, "assignment", record);
+    }
+    set_tape_pool_membership_tx(
+        tx,
+        uuid,
+        i64_to_u64(generation, "assignment_generation")?,
+        pool.as_deref(),
+        (&source, &actor_fingerprint(&record.actor)),
+        &record.timestamp_utc,
+        match recorded_generation {
+            Some(generation) => AssignmentWrite::Replay {
+                generation: i64_to_u64(generation, "assignment_generation")?,
+            },
+            None => AssignmentWrite::Change,
+        },
+    )?;
+    remember_audit_intent(tx, &uuid, "assignment", record)
+}
+
 /// Replay catalog/lifecycle evidence whose durable source is the audit log.
 ///
 /// Callers must apply this after journal and legacy-cache restoration during a
@@ -9147,6 +9755,7 @@ fn project_catalog_evidence_record(
     divergences: &mut Vec<String>,
 ) -> Result<(), StateError> {
     match record.event {
+        AuditEvent::TapeLabelRebound => replay_label_rebind(tx, record)?,
         AuditEvent::TapeIdentityAdopted => {
             project_tape_identity_adopted_record(tx, record, divergences)?;
         }
@@ -9158,8 +9767,14 @@ fn project_catalog_evidence_record(
                 ));
                 return Ok(());
             };
-            let voltag = detail_text(record, "voltag");
-            let pool_id = detail_text(record, "pool_id");
+            let update_label = audit_intent_is_new(tx, &tape_uuid, "label", record)?;
+            let voltag = if update_label {
+                detail_text(record, "voltag")
+            } else {
+                None
+            };
+            let provenance = parse_label_source(detail_text(record, "voltag_source"))?
+                .unwrap_or(LabelProvenance::Changer);
             let block_size = detail_i64(record, "block_size");
             let geometry = audit_tape_geometry(record);
             if let Some(voltag) = voltag.as_deref() {
@@ -9179,7 +9794,7 @@ fn project_catalog_evidence_record(
                         hex_uuid_from_slice(tape_uuid.as_slice())
                     ));
                     tx.execute(
-                        "update tapes set voltag = null
+                        "update tapes set voltag = null, voltag_source = null
                          where voltag = ?1 and tape_uuid != ?2",
                         params![voltag, tape_uuid.as_slice()],
                     )
@@ -9224,11 +9839,12 @@ fn project_catalog_evidence_record(
                 "insert into tapes(
                    tape_uuid, voltag, block_size, scheme_id,
                    data_blocks_per_stripe, parity_blocks_per_stripe,
-                   stripes_per_neighborhood, state, updated_at_utc
+                   stripes_per_neighborhood, state, updated_at_utc, voltag_source
                  )
-                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8)
+                 values(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'ready', ?8, ?9)
                  on conflict(tape_uuid) do update set
                    voltag = coalesce(excluded.voltag, tapes.voltag),
+                   voltag_source = case when excluded.voltag is not null then excluded.voltag_source else tapes.voltag_source end,
                    block_size = coalesce(excluded.block_size, tapes.block_size),
                    scheme_id = coalesce(excluded.scheme_id, tapes.scheme_id),
                    data_blocks_per_stripe = coalesce(
@@ -9257,80 +9873,35 @@ fn project_catalog_evidence_record(
                     geometry.parity_blocks_per_stripe,
                     geometry.stripes_per_neighborhood,
                     record.timestamp_utc.as_str(),
+                    voltag.as_ref().map(|_|provenance.as_str()),
                 ],
             )
             .map_err(|err| sqlite_error("project TapeProvisioned audit record", err))?;
-            if let Some(pool_id) = pool_id.as_deref() {
-                let tape_uuid: [u8; 16] = tape_uuid.as_slice().try_into().map_err(|_| {
-                    StateError::IndexMigrationFailed(
-                        "TapeProvisioned audit record has invalid tape UUID length".to_string(),
-                    )
-                })?;
-                let snapshot =
-                    query_tape_assignment_snapshot_tx(tx, tape_uuid)?.ok_or_else(|| {
-                        StateError::IndexCorrupt(
-                            "provisioned tape vanished before pool projection".to_string(),
-                        )
-                    })?;
-                set_tape_pool_membership_tx(
+            if let Some(label) = voltag.as_deref() {
+                record_media_observation_tx(
                     tx,
-                    tape_uuid,
-                    snapshot.assignment_generation,
-                    Some(pool_id),
-                    record.timestamp_utc.as_str(),
+                    tape_uuid.as_slice(),
+                    provenance,
+                    audit_media_observation(record, Some(label))?,
                 )?;
+            }
+            if update_label {
+                remember_audit_intent(tx, &tape_uuid, "label", record)?;
+            }
+            if record.detail.contains_key("pool_id") {
+                let uuid = tape_uuid
+                    .try_into()
+                    .map_err(|_| StateError::IndexCorrupt("invalid assignment UUID".into()))?;
+                replay_assignment(tx, uuid, record)?;
             }
         }
         AuditEvent::TapePoolAssigned => {
-            let Some(tape_uuid) = audit_tape_uuid(record) else {
-                divergences.push(format!(
-                    "record {} TapePoolAssigned has no valid tape identity",
-                    record.record_uuid
-                ));
-                return Ok(());
-            };
-            let Some(pool_id) = detail_text(record, "pool_id") else {
-                divergences.push(format!(
-                    "record {} TapePoolAssigned has no pool_id",
-                    record.record_uuid
-                ));
-                return Ok(());
-            };
-            let cached: Option<Option<String>> = tx
-                .query_row(
-                    "select pool_id from tapes where tape_uuid = ?1",
-                    params![tape_uuid.as_slice()],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|err| sqlite_error("compare tape pool replay", err))?;
-            if let Some(cached) = cached {
-                record_field_divergence(
-                    divergences,
-                    "tape",
-                    audit_tape_identity(record).as_deref().unwrap_or("invalid"),
-                    "pool_id",
-                    cached.as_ref(),
-                    Some(&pool_id),
-                );
-            }
-            let tape_uuid: [u8; 16] = tape_uuid.as_slice().try_into().map_err(|_| {
-                StateError::IndexMigrationFailed(
-                    "TapePoolAssigned audit record has invalid tape UUID length".to_string(),
-                )
-            })?;
-            let snapshot = query_tape_assignment_snapshot_tx(tx, tape_uuid)?.ok_or_else(|| {
-                StateError::IndexMigrationFailed(
-                    "TapePoolAssigned audit record references unknown tape".to_string(),
-                )
-            })?;
-            set_tape_pool_membership_tx(
-                tx,
-                tape_uuid,
-                snapshot.assignment_generation,
-                Some(pool_id.as_str()),
-                record.timestamp_utc.as_str(),
-            )?;
+            let uuid = audit_tape_uuid(record)
+                .ok_or_else(|| StateError::IndexCorrupt("assignment has no tape UUID".into()))?;
+            let uuid = uuid
+                .try_into()
+                .map_err(|_| StateError::IndexCorrupt("invalid assignment UUID".into()))?;
+            replay_assignment(tx, uuid, record)?;
         }
         AuditEvent::TapeSealed | AuditEvent::TapeRetired => {
             let Some(tape_uuid) = audit_tape_uuid(record) else {
@@ -9454,12 +10025,18 @@ fn project_tape_identity_adopted_record(
         ));
         return Ok(());
     }
-    let Some(voltag) = detail_text(record, "voltag") else {
-        divergences.push(format!(
-            "record {} TapeIdentityAdopted has no voltag",
-            record.record_uuid
-        ));
-        return Ok(());
+    let voltag = match record.detail.get("voltag") {
+        Some(ciborium::value::Value::Text(value)) if !value.is_empty() && value.trim() == value => {
+            Some(value.clone())
+        }
+        Some(ciborium::value::Value::Null) => None,
+        _ => {
+            divergences.push(format!(
+                "record {} TapeIdentityAdopted has invalid label",
+                record.record_uuid
+            ));
+            return Ok(());
+        }
     };
     let Some(pool_id) = detail_text(record, "pool_id") else {
         divergences.push(format!(
@@ -9513,19 +10090,52 @@ fn project_tape_identity_adopted_record(
         ));
         return Ok(());
     }
-    let provenance_is_valid = ["library_serial", "library_revision", "drive_serial"]
-        .into_iter()
-        .all(|field| {
-            detail_text(record, field)
-                .is_some_and(|value| !value.trim().is_empty() && value.trim() == value.as_str())
-        })
-        && ["home_slot", "drive_element"].into_iter().all(|field| {
-            detail_i64(record, field).is_some_and(|value| u16::try_from(value).is_ok())
-        })
-        && matches!(
-            record.detail.get("identity_only"),
-            Some(ciborium::value::Value::Bool(true))
-        );
+    let endpoint = match record.detail.get("endpoint_key") {
+        Some(ciborium::value::Value::Text(value)) => DriveKey::decode(value).ok(),
+        None => detail_text(record, "library_serial")
+            .zip(detail_i64(record, "drive_element").and_then(|value| u16::try_from(value).ok()))
+            .map(|(serial, bay)| DriveKey::new(serial, bay)),
+        _ => None,
+    };
+    let library_revision = detail_text(record, "library_revision");
+    let home_slot = detail_i64(record, "home_slot").and_then(|value| u16::try_from(value).ok());
+    let drive_serial = detail_text(record, "drive_serial");
+    let provenance_is_valid =
+        endpoint
+            .as_ref()
+            .zip(drive_serial.as_deref())
+            .is_some_and(|(endpoint, serial)| {
+                crate::state::validate_bootstrap_endpoint_evidence(
+                    endpoint,
+                    library_revision.as_deref(),
+                    home_slot,
+                    serial,
+                )
+                .is_ok()
+                    && match endpoint {
+                        DriveKey::Bay {
+                            library_serial,
+                            bay,
+                        } => {
+                            detail_text(record, "library_serial")
+                                .is_none_or(|value| value == *library_serial)
+                                && detail_i64(record, "drive_element")
+                                    .is_none_or(|value| value == i64::from(*bay))
+                        }
+                        DriveKey::Standalone { .. } => ![
+                            "library_serial",
+                            "drive_element",
+                            "library_revision",
+                            "home_slot",
+                        ]
+                        .iter()
+                        .any(|key| record.detail.contains_key(*key)),
+                    }
+            })
+            && matches!(
+                record.detail.get("identity_only"),
+                Some(ciborium::value::Value::Bool(true))
+            );
     if !provenance_is_valid {
         divergences.push(format!(
             "record {} TapeIdentityAdopted has invalid physical provenance",
@@ -9569,7 +10179,7 @@ fn project_tape_identity_adopted_record(
         params![tape_uuid.as_slice()],
     )? {
         let exact_adoption_projection = existing.tape_uuid == tape_uuid
-            && existing.voltag.as_deref() == Some(voltag.as_str())
+            && existing.voltag.as_deref() == voltag.as_deref()
             && existing.pool_id.as_deref() == Some(pool_id.as_str())
             && existing.assignment_generation == assignment_generation
             && existing.kind == "data"
@@ -9590,14 +10200,14 @@ fn project_tape_identity_adopted_record(
     if let Some(conflicting_uuid) = tx
         .query_row(
             "select tape_uuid from tapes where voltag = ?1 and tape_uuid != ?2",
-            params![voltag.as_str(), tape_uuid.as_slice()],
+            params![voltag.as_deref(), tape_uuid.as_slice()],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()
         .map_err(|err| sqlite_error("compare adopted barcode replay", err))?
     {
         divergences.push(format!(
-            "adopted barcode binding voltag={voltag}: cache_tape_uuid={} ledger_tape_uuid={}",
+            "adopted barcode binding voltag={voltag:?}: cache_tape_uuid={} ledger_tape_uuid={}",
             hex_uuid_from_slice(conflicting_uuid.as_slice()),
             hex_uuid_from_slice(tape_uuid.as_slice())
         ));
@@ -9617,15 +10227,15 @@ fn project_tape_identity_adopted_record(
            highest_protected_ordinal, total_committed_ordinals,
            last_committed_tape_file, state, updated_at_utc
          ) values(
-           ?1, ?2, ?3, ?4, 'data', ?5, ?6, ?7, ?8, ?9,
-           X'0000000000000000', X'0000000000000000', null, ?10, ?11
+           ?1, ?2, null, ?4, 'data', ?5, ?6, ?7, ?8, ?9,
+           X'0000000000000000', X'0000000000000000', null, 'ready', ?11
          )
          on conflict(tape_uuid) do nothing",
             params![
                 tape_uuid.as_slice(),
                 voltag,
                 pool_id,
-                assignment_generation,
+                assignment_generation - 1,
                 block_size,
                 geometry.scheme_id,
                 geometry.data_blocks_per_stripe,
@@ -9642,6 +10252,38 @@ fn project_tape_identity_adopted_record(
             record.record_uuid,
             hex_uuid_from_slice(tape_uuid.as_slice())
         ));
+    }
+    if inserted == 1 {
+        let uuid: [u8; 16] = tape_uuid
+            .as_slice()
+            .try_into()
+            .map_err(|_| StateError::IndexCorrupt("invalid adoption UUID".into()))?;
+        record_media_observation_tx(
+            tx,
+            &uuid,
+            parse_label_source(detail_text(record, "voltag_source"))?
+                .unwrap_or(LabelProvenance::Changer),
+            audit_media_observation(record, voltag.as_deref())?,
+        )?;
+        set_tape_pool_membership_tx(
+            tx,
+            uuid,
+            i64_to_u64(assignment_generation - 1, "assignment_generation")?,
+            Some(&pool_id),
+            (
+                &audit_assignment_source(record)?,
+                &actor_fingerprint(&record.actor),
+            ),
+            &record.timestamp_utc,
+            AssignmentWrite::Change,
+        )?;
+        remember_audit_intent(tx, &uuid, "assignment", record)?;
+        remember_audit_intent(tx, &uuid, "label", record)?;
+        tx.execute(
+            "update tapes set state = ?2 where tape_uuid = ?1",
+            params![uuid.as_slice(), state],
+        )
+        .map_err(|e| sqlite_error("replay adopted state", e))?;
     }
     Ok(())
 }
@@ -9895,12 +10537,13 @@ fn project_tape_io_fence_raised(
     tx.execute(
         "insert into tape_io_fences(
            tape_uuid, barcode, state, reason, evidence_json, quarantine_id,
-           created_at_utc, updated_at_utc, release_ack
+           created_at_utc, updated_at_utc, release_ack, endpoint_key
          )
-         values(?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, null)
+         values(?1, ?2, 'active', ?3, ?4, ?5, ?6, ?6, null, ?7)
          on conflict(quarantine_id) do update set
            tape_uuid = excluded.tape_uuid,
            barcode = excluded.barcode,
+           endpoint_key = coalesce(excluded.endpoint_key, tape_io_fences.endpoint_key),
            state = 'active',
            reason = excluded.reason,
            evidence_json = excluded.evidence_json,
@@ -9914,6 +10557,7 @@ fn project_tape_io_fence_raised(
             detail_text(record, "evidence_json"),
             quarantine_id,
             record.timestamp_utc.as_str(),
+            audit_endpoint(record)?.map(|endpoint| endpoint.encode()),
         ],
     )
     .map_err(|err| sqlite_error("project TapeIoFenceRaised audit record", err))?;
@@ -10609,7 +11253,9 @@ fn project_tape_pool_membership_tx(
         tape_uuid,
         snapshot.assignment_generation,
         Some(pool_id),
+        ("rule", "rule-reconciliation"),
         updated_at_utc.as_str(),
+        AssignmentWrite::Change,
     )?;
     Ok(())
 }
@@ -10642,13 +11288,28 @@ fn query_tape_assignment_snapshot_tx(
     .transpose()
 }
 
+/// Private modes keep migration seeding inside the sole ledger append funnel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AssignmentWrite {
+    Change,
+    LifecycleChange,
+    MigrationSeed,
+    /// Reconstruct a transition whose generation is explicitly bound by audit.
+    Replay {
+        generation: u64,
+    },
+}
+
 fn set_tape_pool_membership_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     tape_uuid: [u8; 16],
     expected_generation: u64,
     pool_id: Option<&str>,
+    authority: (&str, &str),
     updated_at_utc: &str,
+    mode: AssignmentWrite,
 ) -> Result<(), StateError> {
+    let (source, actor) = authority;
     let existing: Option<(Option<String>, i64, String, Option<String>)> = tx
         .query_row(
             "select pool_id, assignment_generation, state, finalization_progress
@@ -10671,56 +11332,110 @@ fn set_tape_pool_membership_tx(
             hex_uuid(tape_uuid)
         )));
     }
-    if existing_pool_id.as_deref() == pool_id {
-        return Ok(());
-    }
-    if finalization_progress.is_some()
-        || matches!(
-            state.as_str(),
-            "finalizing"
-                | "finalized"
-                | "sealed"
-                | "retired"
-                | "finalized_degraded"
-                | "recovery_required"
-        )
-    {
-        return Err(StateError::TapePoolAssignmentConflict(format!(
-            "tape {} is {state}; pool assignment is frozen",
-            hex_uuid(tape_uuid)
-        )));
-    }
-    if let Some(pool_id) = pool_id {
-        let conflicting_pool: Option<Option<String>> = tx
-            .query_row(
-                "select pool_id
+    let latest_source: Option<String> = tx.query_row(
+        "select source from tape_pool_assignments where tape_uuid = ?1 order by seq desc limit 1",
+        params![tape_uuid.as_slice()], |r| r.get(0),
+    ).optional().map_err(|err| sqlite_error("read latest assignment authority", err))?;
+    let next_generation = if mode == AssignmentWrite::MigrationSeed {
+        // Only seed the exact pre-existing projection, including terminal rows.
+        // No mutation, generation increment, or second ledger writer is allowed.
+        if latest_source.is_some() {
+            return Ok(());
+        }
+        if source != "rule"
+            || actor != "migration"
+            || pool_id.is_none()
+            || existing_pool_id.as_deref() != pool_id
+        {
+            return Err(StateError::IndexMigrationFailed(
+                "invalid assignment migration seed".into(),
+            ));
+        }
+        generation
+    } else {
+        if mode != AssignmentWrite::LifecycleChange
+            && source == "rule"
+            && latest_source.as_deref() == Some("operator")
+        {
+            return Ok(());
+        }
+        if mode != AssignmentWrite::LifecycleChange
+            && !matches!(mode, AssignmentWrite::Replay { .. })
+            && existing_pool_id.as_deref() == pool_id
+            && (latest_source.as_deref() == Some(source)
+                || (source == "rule" && latest_source.is_none())
+                || finalization_progress.is_some()
+                || matches!(
+                    state.as_str(),
+                    "finalizing"
+                        | "finalized"
+                        | "sealed"
+                        | "retired"
+                        | "finalized_degraded"
+                        | "recovery_required"
+                ))
+        {
+            return Ok(());
+        }
+        if finalization_progress.is_some()
+            || matches!(
+                state.as_str(),
+                "finalizing"
+                    | "finalized"
+                    | "sealed"
+                    | "retired"
+                    | "finalized_degraded"
+                    | "recovery_required"
+            )
+        {
+            return Err(StateError::TapePoolAssignmentConflict(format!(
+                "tape {} is {state}; pool assignment is frozen",
+                hex_uuid(tape_uuid)
+            )));
+        }
+        if let Some(pool_id) = pool_id {
+            let conflicting_pool: Option<Option<String>> = tx
+                .query_row(
+                    "select pool_id
                  from object_copies
                  where tape_uuid = ?1
                    and (pool_id is null or pool_id != ?2)
                  order by pool_id is not null, pool_id
                  limit 1",
-                params![tape_uuid.to_vec(), pool_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| sqlite_error("check tape pool reassignment", err))?;
-        if let Some(conflicting_pool) = conflicting_pool {
-            let conflicting_pool = conflicting_pool.as_deref().unwrap_or("unassigned");
-            return Err(StateError::TapePoolAssignmentConflict(format!(
+                    params![tape_uuid.to_vec(), pool_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| sqlite_error("check tape pool reassignment", err))?;
+            if let Some(conflicting_pool) = conflicting_pool {
+                let conflicting_pool = conflicting_pool.as_deref().unwrap_or("unassigned");
+                return Err(StateError::TapePoolAssignmentConflict(format!(
                 "tape {} already has committed copies in pool {conflicting_pool}; cannot assign to {pool_id}",
                 hex_uuid(tape_uuid)
             )));
+            }
         }
-    }
-    let next_generation = expected_generation.checked_add(1).ok_or_else(|| {
-        StateError::TapePoolAssignmentConflict(format!(
-            "assignment generation exhausted for tape {}",
-            hex_uuid(tape_uuid)
-        ))
-    })?;
-    let changed = tx
-        .execute(
-            "update tapes
+        let next_generation = if let AssignmentWrite::Replay {
+            generation: recorded,
+        } = mode
+        {
+            if recorded <= generation {
+                return Err(StateError::IndexCorrupt(
+                    "replayed assignment must advance generation".into(),
+                ));
+            }
+            recorded
+        } else {
+            expected_generation.checked_add(1).ok_or_else(|| {
+                StateError::TapePoolAssignmentConflict(format!(
+                    "assignment generation exhausted for tape {}",
+                    hex_uuid(tape_uuid)
+                ))
+            })?
+        };
+        let changed = tx
+            .execute(
+                "update tapes
              set pool_id = ?2,
                  assignment_generation = ?3,
                  updated_at_utc = ?4
@@ -10731,21 +11446,29 @@ fn set_tape_pool_membership_tx(
                  'finalizing', 'finalized', 'sealed', 'retired',
                  'finalized_degraded', 'recovery_required'
                )",
-            params![
-                tape_uuid.to_vec(),
-                pool_id,
-                u64_to_i64(next_generation, "assignment_generation")?,
-                updated_at_utc,
-                u64_to_i64(expected_generation, "assignment_generation")?,
-            ],
-        )
-        .map_err(|err| sqlite_error("conditionally update tape pool assignment", err))?;
-    if changed != 1 {
-        return Err(StateError::TapePoolAssignmentConflict(format!(
+                params![
+                    tape_uuid.to_vec(),
+                    pool_id,
+                    u64_to_i64(next_generation, "assignment_generation")?,
+                    updated_at_utc,
+                    u64_to_i64(expected_generation, "assignment_generation")?,
+                ],
+            )
+            .map_err(|err| sqlite_error("conditionally update tape pool assignment", err))?;
+        if changed != 1 {
+            return Err(StateError::TapePoolAssignmentConflict(format!(
             "tape {} assignment changed or became final while updating generation {expected_generation}",
             hex_uuid(tape_uuid)
         )));
-    }
+        }
+        next_generation
+    };
+    tx.execute(
+        "insert into tape_pool_assignments(tape_uuid, seq, pool_id, source, actor, at_utc, assignment_generation)
+         select ?1, coalesce(max(seq), 0) + 1, ?2, ?3, ?4, ?5, ?6
+         from tape_pool_assignments where tape_uuid = ?1",
+        params![tape_uuid.as_slice(), pool_id, source, actor, updated_at_utc, u64_to_i64(next_generation, "assignment_generation")?],
+    ).map_err(|err| sqlite_error("append tape pool assignment", err))?;
     Ok(())
 }
 
@@ -10984,6 +11707,8 @@ fn query_mutable_memberships_tx(
         .prepare(
             "select tape_uuid, pool_id from tapes
              where pool_id is not null
+               and coalesce((select source from tape_pool_assignments a
+                 where a.tape_uuid = tapes.tape_uuid order by seq desc limit 1), 'rule') <> 'operator'
                and finalization_progress is null
                and state not in (
                  'finalizing', 'finalized', 'sealed', 'retired',
@@ -11011,7 +11736,11 @@ fn query_tapes_for_pool_derivation_tx(
     tx: &rusqlite::Transaction<'_>,
 ) -> Result<Vec<([u8; 16], String)>, StateError> {
     let mut stmt = tx
-        .prepare("select tape_uuid, voltag from tapes where voltag is not null")
+        .prepare("select tape_uuid, voltag from tapes where voltag is not null
+               and finalization_progress is null
+               and state not in ('finalizing', 'finalized', 'sealed', 'retired', 'finalized_degraded', 'recovery_required')
+               and coalesce((select source from tape_pool_assignments a
+                 where a.tape_uuid = tapes.tape_uuid order by seq desc limit 1), 'rule') <> 'operator'")
         .map_err(|err| sqlite_error("prepare tape pool rule derivation query", err))?;
     let mut rows = stmt
         .query([])
@@ -11832,6 +12561,16 @@ fn tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRecord, StateError> {
     Ok(TapeRecord {
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
+        voltag_source: parse_label_source(
+            row.get("voltag_source")
+                .map_err(|e| sqlite_error("read label source", e))?,
+        )?,
+        cartridge_generation: row
+            .get("cartridge_generation")
+            .map_err(|e| sqlite_error("read generation", e))?,
+        generation_source: row
+            .get("generation_source")
+            .map_err(|e| sqlite_error("read generation source", e))?,
         kind: row_get(row, 2, "tapes.kind")?,
         pool_id: row_get(row, 3, "tapes.pool_id")?,
         assignment_generation,
@@ -12620,6 +13359,9 @@ fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRec
     Ok(TapeRecord {
         tape_uuid: row_get(row, 0, "tapes.tape_uuid")?,
         voltag: row_get(row, 1, "tapes.voltag")?,
+        voltag_source: Some(LabelProvenance::Changer),
+        cartridge_generation: None,
+        generation_source: None,
         kind: row_get(row, 2, "tapes.kind")?,
         pool_id: row_get(row, 3, "tapes.pool_id")?,
         assignment_generation,
@@ -12636,6 +13378,301 @@ fn legacy_catalog_reset_tape_from_row(row: &rusqlite::Row<'_>) -> Result<TapeRec
         state: row_get(row, 4, "tapes.state")?,
         updated_at_utc: String::new(),
     })
+}
+
+/// Upgrade released INTEGER geometry without losing rows, indexes, or additive
+/// columns. Each table's original DDL is retained except structural declarations.
+/// The outer schema savepoint makes conversions and schema installation atomic.
+fn migrate_legacy_structural_columns(conn: &Connection) -> Result<(), StateError> {
+    use rusqlite::types::Value;
+    let tables: HashSet<_> = STRUCTURAL_U64_COLUMNS.iter().map(|(t, _)| *t).collect();
+    for table in tables {
+        if !table_exists(conn, table)? {
+            return Err(StateError::IndexMigrationFailed(format!(
+                "legacy catalog is incomplete: missing {table}; restore or rebuild the catalog"
+            )));
+        }
+        let sql: String = conn
+            .query_row(
+                "select sql from sqlite_master where type = 'table' and name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .map_err(|e| sqlite_error("read legacy structural table", e))?;
+        let mut create = sql.clone();
+        for &(_, column) in STRUCTURAL_U64_COLUMNS.iter().filter(|(t, _)| *t == table) {
+            if !table_column_exists(conn, table, column)? {
+                continue;
+            }
+            let start = create.find(&format!("{column} ")).ok_or_else(|| {
+                StateError::IndexMigrationFailed(format!(
+                    "missing declaration for {table}.{column}"
+                ))
+            })?;
+            let end = create[start..]
+                .find([',', '\n'])
+                .map(|n| start + n)
+                .unwrap_or(create.len());
+            let old = &create[start..end];
+            if old.to_ascii_lowercase().contains("blob") {
+                continue;
+            }
+            let required = old.to_ascii_lowercase().contains("not null");
+            let new = if required {
+                format!("{column} blob not null default X'0000000000000000' check(typeof({column}) = 'blob' and length({column}) = 8)")
+            } else {
+                format!("{column} blob check({column} is null or (typeof({column}) = 'blob' and length({column}) = 8))")
+            };
+            create.replace_range(start..end, &new);
+        }
+        let temporary = format!("p2_{table}");
+        // Substitute only the table declaration, not references in checks.
+        let open = create
+            .find('(')
+            .ok_or_else(|| StateError::IndexMigrationFailed("invalid legacy table DDL".into()))?;
+        create.replace_range(..open, &format!("create table {temporary}"));
+        conn.execute_batch(&create)
+            .map_err(|e| sqlite_error("create unsigned migration table", e))?;
+        let mut stmt = conn
+            .prepare(&format!("select * from {table}"))
+            .map_err(|e| sqlite_error("read legacy rows", e))?;
+        let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let insert = format!(
+            "insert into {temporary} ({}) values ({})",
+            columns.join(","),
+            vec!["?"; columns.len()].join(",")
+        );
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| sqlite_error("query legacy rows", e))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| sqlite_error("iterate legacy rows", e))?
+        {
+            let mut values = Vec::with_capacity(columns.len());
+            for (i, column) in columns.iter().enumerate() {
+                let mut value: Value = row
+                    .get(i)
+                    .map_err(|e| sqlite_error("read legacy value", e))?;
+                if STRUCTURAL_U64_COLUMNS.contains(&(table, column.as_str())) {
+                    value = match value {
+                        Value::Integer(n) if n >= 0 => {
+                            Value::Blob((n as u64).to_be_bytes().to_vec())
+                        }
+                        Value::Null => Value::Null,
+                        Value::Blob(ref b) if b.len() == 8 => value,
+                        _ => {
+                            return Err(StateError::IndexMigrationFailed(format!(
+                                "invalid unsigned legacy value in {table}.{column}"
+                            )))
+                        }
+                    };
+                }
+                values.push(value);
+            }
+            conn.execute(&insert, rusqlite::params_from_iter(values))
+                .map_err(|e| sqlite_error("copy unsigned legacy row", e))?;
+        }
+        drop(rows);
+        drop(stmt);
+        let indexes = {
+            let mut stmt = conn.prepare("select sql from sqlite_master where tbl_name = ?1 and type in ('index', 'trigger') and sql is not null").map_err(|e| sqlite_error("read legacy indexes", e))?;
+            let result = stmt
+                .query_map([table], |r| r.get::<_, String>(0))
+                .map_err(|e| sqlite_error("query legacy indexes", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| sqlite_error("collect legacy indexes", e))?;
+            result
+        };
+        conn.execute_batch(&format!(
+            "drop table {table}; alter table {temporary} rename to {table};"
+        ))
+        .map_err(|e| sqlite_error("install unsigned legacy table", e))?;
+        for sql in indexes {
+            conn.execute_batch(&sql)
+                .map_err(|e| sqlite_error("restore legacy index", e))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_label_source(value: Option<String>) -> Result<Option<LabelProvenance>, StateError> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("changer") => Ok(Some(LabelProvenance::Changer)),
+        Some("operator") => Ok(Some(LabelProvenance::Operator)),
+        _ => Err(StateError::IndexCorrupt("invalid label provenance".into())),
+    }
+}
+
+/// Add evidence and backfill only once, within the schema migration savepoint.
+fn migrate_standalone_evidence(conn: &Connection) -> Result<(), StateError> {
+    conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
+        .map_err(|e| sqlite_error("install replay cursors", e))?;
+    ensure_column(conn, "tapes", "voltag_source", "voltag_source text default 'changer' check(voltag_source in ('changer','operator') and (voltag is null or voltag_source is not null))")?;
+    ensure_column(
+        conn,
+        "tapes",
+        "cartridge_generation",
+        "cartridge_generation text",
+    )?;
+    ensure_column(
+        conn,
+        "tapes",
+        "generation_source",
+        "generation_source text check(generation_source in ('measured','label','operator'))",
+    )?;
+    conn.execute_batch(
+        "create table if not exists tape_pool_assignments(
+        tape_uuid blob not null, seq integer not null, pool_id text,
+        source text not null check(source in ('rule','operator')),
+        actor text not null, at_utc text not null, assignment_generation integer not null,
+        primary key(tape_uuid, seq));",
+    )
+    .map_err(|e| sqlite_error("backfill assignment ledger", e))?;
+    conn.execute(
+        "insert or ignore into tape_assignment_replay_baselines(tape_uuid,assignment_generation)
+         select tape_uuid,assignment_generation from tapes",
+        [],
+    )
+    .map_err(|e| sqlite_error("record migrated assignment replay boundary", e))?;
+    let seeds = {
+        let mut stmt = conn.prepare("select tape_uuid, pool_id, assignment_generation, updated_at_utc from tapes where pool_id is not null and not exists(select 1 from tape_pool_assignments a where a.tape_uuid = tapes.tape_uuid)").map_err(|e| sqlite_error("read assignment seeds", e))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| sqlite_error("query assignment seeds", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sqlite_error("collect assignment seeds", e))?
+    };
+    for (uuid, pool, generation, at) in seeds {
+        let uuid = uuid
+            .try_into()
+            .map_err(|_| StateError::IndexCorrupt("invalid seed UUID".into()))?;
+        set_tape_pool_membership_tx(
+            conn,
+            uuid,
+            i64_to_u64(generation, "assignment_generation")?,
+            Some(&pool),
+            ("rule", "migration"),
+            &at,
+            AssignmentWrite::MigrationSeed,
+        )?;
+    }
+
+    let tapes = {
+        let mut stmt = conn.prepare("select tape_uuid, voltag from tapes where cartridge_generation is null and voltag is not null").map_err(|e| sqlite_error("prepare generation backfill", e))?;
+        let result = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(|e| sqlite_error("query generation backfill", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| sqlite_error("collect generation backfill", e))?;
+        result
+    };
+    for (uuid, label) in tapes {
+        if let Some(observation) = MediaObservation::label_hint(&label) {
+            conn.execute("update tapes set cartridge_generation = ?2, generation_source = 'label' where tape_uuid = ?1", params![uuid, observation.generation.media_code()]).map_err(|e| sqlite_error("backfill cartridge generation", e))?;
+        }
+    }
+    conn.execute_batch("create trigger if not exists tapes_generation_pair_insert before insert on tapes
+        when (new.cartridge_generation is null) <> (new.generation_source is null)
+        begin select raise(abort, 'generation and provenance must be recorded together'); end;
+        create trigger if not exists tapes_generation_pair_update before update of cartridge_generation, generation_source on tapes
+        when (new.cartridge_generation is null) <> (new.generation_source is null)
+        begin select raise(abort, 'generation and provenance must be recorded together'); end;")
+        .map_err(|e| sqlite_error("validate generation evidence pairs", e))?;
+    // Standalone operations have no changer-owned coordinates. Keep legacy
+    // coordinates as nullable projections while endpoint_key carries authority.
+    let readiness_sql: String = conn
+        .query_row(
+            "select sql from sqlite_master where name = 'media_readiness_ops'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| sqlite_error("read readiness schema", e))?;
+    if readiness_sql.contains("library_serial text not null")
+        || readiness_sql.contains("library_serial TEXT NOT NULL")
+    {
+        let open = readiness_sql
+            .find('(')
+            .ok_or_else(|| StateError::IndexMigrationFailed("invalid readiness DDL".into()))?;
+        let indexes = {
+            let mut stmt = conn.prepare("select sql from sqlite_master where tbl_name = 'media_readiness_ops' and type in ('index','trigger') and sql is not null").map_err(|e| sqlite_error("read readiness indexes",e))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| sqlite_error("query readiness indexes", e))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| sqlite_error("collect readiness indexes", e))?
+        };
+        let ddl = format!("create table p2_readiness{}", &readiness_sql[open..])
+            .replace("library_serial text not null", "library_serial text")
+            .replace("drive_element integer not null", "drive_element integer")
+            .replace("library_serial TEXT NOT NULL", "library_serial TEXT")
+            .replace("drive_element INTEGER NOT NULL", "drive_element INTEGER");
+        conn.execute_batch(&ddl)
+            .map_err(|e| sqlite_error("create endpoint readiness schema", e))?;
+        conn.execute_batch("insert into p2_readiness select * from media_readiness_ops; drop table media_readiness_ops; alter table p2_readiness rename to media_readiness_ops;")
+            .map_err(|e| sqlite_error("migrate endpoint readiness rows", e))?;
+        for sql in indexes {
+            conn.execute_batch(&sql)
+                .map_err(|e| sqlite_error("restore readiness index", e))?;
+        }
+        conn.execute_batch(MINIMUM_SCHEMA)
+            .map_err(|e| sqlite_error("restore readiness indexes", e))?;
+    }
+    for (table, serial, bay) in [
+        ("media_readiness_ops", "library_serial", "drive_element"),
+        ("sessions", "library_serial", "drive_bay"),
+        ("drives", "last_library_serial", "last_element_address"),
+        ("drive_events", "library_serial", "element_address"),
+    ] {
+        ensure_column(conn, table, "endpoint_key", "endpoint_key text")?;
+        let rows = {
+            let mut stmt = conn.prepare(&format!("select rowid, {serial}, {bay} from {table} where {serial} is not null and {bay} is not null")).map_err(|e| sqlite_error("prepare endpoint backfill", e))?;
+            let result = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, u16>(2)?,
+                    ))
+                })
+                .map_err(|e| sqlite_error("query endpoint backfill", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| sqlite_error("collect endpoint backfill", e))?;
+            result
+        };
+        for (rowid, serial, bay) in rows {
+            conn.execute(&format!("update {table} set endpoint_key = ?2 where rowid = ?1 and endpoint_key is null"), params![rowid, DriveKey::new(serial, bay).encode()]).map_err(|e| sqlite_error("backfill endpoint", e))?;
+        }
+        // Legacy library projections continue to write their original columns;
+        // derive their collision-free key in the same statement/transaction.
+        conn.execute_batch(&format!("create trigger if not exists {table}_endpoint_insert after insert on {table}
+            when new.endpoint_key is null and new.{serial} is not null and new.{bay} is not null
+            begin update {table} set endpoint_key = json_object('kind','bay','library_serial',new.{serial},'bay',new.{bay}) where rowid = new.rowid; end;
+            drop trigger if exists {table}_endpoint_update;
+            create trigger {table}_endpoint_update after update of {serial}, {bay} on {table}
+            when (new.{serial} is not null and new.{bay} is not null)
+              or (new.endpoint_key is old.endpoint_key and json_extract(new.endpoint_key, '$.kind') = 'bay')
+            begin update {table} set endpoint_key = case
+                when new.{serial} is not null and new.{bay} is not null
+                then json_object('kind','bay','library_serial',new.{serial},'bay',new.{bay})
+                else null end where rowid = new.rowid; end;
+            create index if not exists {table}_endpoint_idx on {table}(endpoint_key);"))
+            .map_err(|e| sqlite_error("install endpoint projection", e))?;
+    }
+    // Tape fences have always been keyed by UUID. Record an endpoint when known;
+    // never fabricate a bay for historical fences that have no endpoint evidence.
+    ensure_column(conn, "tape_io_fences", "endpoint_key", "endpoint_key text")?;
+    Ok(())
 }
 
 fn validate_schema(conn: &Connection) -> Result<(), StateError> {
@@ -12656,6 +13693,40 @@ fn validate_schema(conn: &Connection) -> Result<(), StateError> {
 }
 
 fn migrate(conn: &Connection) -> Result<(), StateError> {
+    // SQLite's table-rebuild procedure requires FK enforcement disabled before
+    // the transaction. Validate all references before committing and restore it
+    // on every exit, including commit failure.
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .map_err(|e| sqlite_error("prepare schema rebuild", e))?;
+    let result = (|| {
+        conn.execute_batch("savepoint state_schema_migration")
+            .map_err(|e| sqlite_error("begin schema migration", e))?;
+        migrate_inner(conn)?;
+        let invalid: bool = conn
+            .query_row(
+                "select exists(select 1 from pragma_foreign_key_check)",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| sqlite_error("validate migrated foreign keys", e))?;
+        if invalid {
+            return Err(StateError::IndexMigrationFailed(
+                "migration would leave invalid foreign keys".into(),
+            ));
+        }
+        conn.execute_batch("release state_schema_migration")
+            .map_err(|e| sqlite_error("commit schema migration", e))
+    })();
+    if result.is_err() {
+        let _ = conn
+            .execute_batch("rollback to state_schema_migration; release state_schema_migration");
+    }
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|e| sqlite_error("restore foreign key enforcement", e))?;
+    result
+}
+
+fn migrate_inner(conn: &Connection) -> Result<(), StateError> {
     let current = conn
         .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
         .map_err(|err| sqlite_error("read sqlite user_version", err))?;
@@ -12665,14 +13736,21 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         )));
     }
     if current == SCHEMA_VERSION {
+        conn.execute_batch(TAPE_AUDIT_CURSOR_SCHEMA)
+            .map_err(|e| sqlite_error("install replay cursors", e))?;
         return validate_unsigned_structural_schema(conn);
     }
-    if current != 0 || database_has_user_tables(conn)? {
+    if (current == 0 && database_has_user_tables(conn)?)
+        || (current != 0 && !(16..SCHEMA_VERSION).contains(&current))
+    {
         return Err(StateError::IndexMigrationFailed(format!(
             "sqlite user_version {current} predates the unsigned structural-index schema {SCHEMA_VERSION}; ordinary startup will not rewrite it in place. To retain the catalog, restore or rebuild it with schema-{SCHEMA_VERSION}-compatible tooling; to intentionally discard a schema-16/17 catalog, use the catalog reset-preflight/reset funnel with an empty preserve list and an exact complete erase allowlist; older shapes require matching older tooling"
         )));
     }
 
+    if matches!(current, 16 | 17) {
+        migrate_legacy_structural_columns(conn)?;
+    }
     conn.execute_batch(MINIMUM_SCHEMA)
         .map_err(|err| sqlite_error("apply sqlite schema", err))?;
     ensure_column(
@@ -12888,6 +13966,7 @@ fn migrate(conn: &Connection) -> Result<(), StateError> {
         [],
     )
     .map_err(|err| sqlite_error("create tapes_pool_idx", err))?;
+    migrate_standalone_evidence(conn)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|err| sqlite_error("set sqlite user_version", err))?;
     conn.execute(
@@ -12965,7 +14044,7 @@ fn migrate_idempotency_scope(conn: &Connection) -> Result<(), StateError> {
         return Ok(());
     }
 
-    conn.execute_batch("begin immediate")
+    conn.execute_batch("savepoint idempotency_scope")
         .map_err(|err| sqlite_error("begin idempotency scope migration", err))?;
     let migration = (|| {
         conn.execute_batch(
@@ -13000,12 +14079,12 @@ fn migrate_idempotency_scope(conn: &Connection) -> Result<(), StateError> {
              drop table idempotency_keys_actor_key;",
         )
         .map_err(|err| sqlite_error("migrate idempotency scope", err))?;
-        conn.execute_batch("commit")
+        conn.execute_batch("release idempotency_scope")
             .map_err(|err| sqlite_error("commit idempotency scope migration", err))?;
         Ok(())
     })();
     if migration.is_err() {
-        let _ = conn.execute_batch("rollback");
+        let _ = conn.execute_batch("rollback to idempotency_scope; release idempotency_scope");
     }
     migration
 }
@@ -13426,13 +14505,20 @@ const MEDIA_READINESS_OPERATION_SELECT: &str = "select
   dirty_scope, started_at_utc, updated_at_utc, deadline_at_utc,
   last_cdb_opcode, last_sense_raw, last_sense_key, last_asc, last_ascq,
   last_host_status, last_driver_status, target_status, transport_class,
-  cancel_source, signal, evidence_path, last_error_json, quarantine_id
+  cancel_source, signal, evidence_path, last_error_json, quarantine_id, endpoint_key
 from media_readiness_ops";
+
+fn decode_endpoint_sql(encoded: String) -> rusqlite::Result<DriveKey> {
+    DriveKey::decode(&encoded).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
 
 fn media_readiness_operation_from_row(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<MediaReadinessOperationRecord> {
     Ok(MediaReadinessOperationRecord {
+        endpoint: decode_endpoint_sql(row.get(30)?)?,
         operation_id: row.get(0)?,
         run_id: row.get(1)?,
         library_serial: row.get(2)?,
@@ -13478,32 +14564,43 @@ fn tape_io_fence_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TapeIoFen
         created_at_utc: row.get(7)?,
         updated_at_utc: row.get(8)?,
         release_ack: row.get(9)?,
+        endpoint: row
+            .get::<_, Option<String>>(10)?
+            .map(decode_endpoint_sql)
+            .transpose()?,
     })
 }
 
 fn media_readiness_record_conflicts_with_admission(
     record: &MediaReadinessOperationRecord,
-    drive_element: Option<i64>,
+    library: Option<&str>,
+    endpoint: Option<&DriveKey>,
     barcode: Option<&str>,
     library_robotics: bool,
 ) -> bool {
-    if media_readiness_scope_blocks_whole_library(record.dirty_scope.as_deref()) {
-        return true;
+    // Preserve logical-library isolation. Standalone cartridges still carry
+    // matching tape evidence across endpoints instead of bypassing that guard.
+    if library.is_some()
+        && record.endpoint.library_serial().is_some()
+        && library != record.endpoint.library_serial()
+    {
+        return false;
     }
-    if library_robotics {
-        return true;
-    }
-    if drive_element.is_some_and(|drive| record.drive_element == drive) {
-        return true;
-    }
-    barcode.is_some_and(|barcode| {
+    // A cartridge can move between endpoints; its dirty evidence follows it.
+    if barcode.is_some_and(|barcode| {
         record
             .barcode
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .is_some_and(|record_barcode| record_barcode.eq_ignore_ascii_case(barcode))
-    })
+            .is_some_and(|other| other.trim().eq_ignore_ascii_case(barcode))
+    }) {
+        return true;
+    }
+    if endpoint == Some(&record.endpoint) {
+        return true;
+    }
+    library.is_some_and(|serial| record.endpoint.library_serial() == Some(serial))
+        && (library_robotics
+            || media_readiness_scope_blocks_whole_library(record.dirty_scope.as_deref()))
 }
 
 fn media_readiness_scope_blocks_whole_library(dirty_scope: Option<&str>) -> bool {
@@ -15245,9 +16342,8 @@ mod tests {
             .record_media_readiness_operation(MediaReadinessOperationInput {
                 operation_id,
                 run_id: Some("fieldtest-run".to_string()),
-                library_serial: "LIB-A".to_string(),
+                endpoint: crate::DriveKey::new("LIB-A".to_string(), 0x0001),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0001,
                 drive_sg: Some("/dev/sg7".to_string()),
                 drive_serial: Some("DRV1".to_string()),
                 barcode: Some("AOX030L9".to_string()),
@@ -15261,8 +16357,8 @@ mod tests {
             })
             .expect("record planned");
         assert_eq!(planned.operation_id, operation_id.to_string());
-        assert_eq!(planned.library_serial, "LIB-A");
-        assert_eq!(planned.drive_element, 1);
+        assert_eq!(planned.library_serial.as_deref(), Some("LIB-A"));
+        assert_eq!(planned.drive_element, Some(1));
         assert_eq!(planned.barcode.as_deref(), Some("AOX030L9"));
 
         let active = index
@@ -15397,9 +16493,8 @@ mod tests {
             .record_media_readiness_operation(MediaReadinessOperationInput {
                 operation_id,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: crate::DriveKey::new("LIB-A".to_string(), 0x0001),
                 changer_sg: None,
-                drive_element: 0x0001,
                 drive_sg: None,
                 drive_serial: None,
                 barcode: Some("AOX031L9".to_string()),
@@ -15512,9 +16607,8 @@ mod tests {
             .record_media_readiness_operation(MediaReadinessOperationInput {
                 operation_id,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: crate::DriveKey::new("LIB-A".to_string(), 0x0002),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0002,
                 drive_sg: Some("/dev/sg11".to_string()),
                 drive_serial: Some("DRV2".to_string()),
                 barcode: Some("AOX032L9".to_string()),
@@ -15575,9 +16669,8 @@ mod tests {
             .record_media_readiness_operation(MediaReadinessOperationInput {
                 operation_id: library_scope_operation,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: crate::DriveKey::new("LIB-A".to_string(), 0x0002),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0002,
                 drive_sg: Some("/dev/sg11".to_string()),
                 drive_serial: Some("DRV2".to_string()),
                 barcode: Some("AOX033L9".to_string()),
@@ -15625,9 +16718,8 @@ mod tests {
             .record_media_readiness_operation(MediaReadinessOperationInput {
                 operation_id: missing_scope_operation,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: crate::DriveKey::new("LIB-A".to_string(), 0x0002),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0002,
                 drive_sg: Some("/dev/sg11".to_string()),
                 drive_serial: Some("DRV2".to_string()),
                 barcode: Some("AOX034L9".to_string()),
@@ -15837,7 +16929,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v16_catalog_is_refused_at_the_clean_break() {
+    fn schema_v16_catalog_migrates_identity_and_idempotency_scope() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index-stage-two-migration")
             .tempdir()
@@ -15916,14 +17008,20 @@ mod tests {
             .expect("mark stage-one schema");
         drop(conn);
 
-        let error = CatalogIndex::open(&path).expect_err("v16 catalog must require rebuild");
-        assert!(
-            matches!(error, StateError::IndexMigrationFailed(ref message)
-                if message.contains("restore or rebuild")
-                    && message.contains("empty preserve list")
-                    && message.contains(&SCHEMA_VERSION.to_string())),
-            "{error}"
-        );
+        let index = CatalogIndex::open(&path).expect("migrate v16 catalog");
+        let tape = index.get_tape(&tape_uuid).unwrap().unwrap();
+        assert_eq!(tape.voltag.as_deref(), Some("RMN017L9"));
+        assert_eq!(tape.cartridge_generation.as_deref(), Some("L9"));
+        assert_eq!(tape.generation_source.as_deref(), Some("label"));
+        let operation_kind: String = index
+            .conn
+            .query_row(
+                "select operation_kind from idempotency_keys where idempotency_key = ?1",
+                [idempotency_key.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(operation_kind, "close_out");
     }
 
     #[test]
@@ -17136,7 +18234,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v17_catalog_is_refused_without_rewriting_rows() {
+    fn incomplete_schema_v17_catalog_is_refused_without_rewriting_rows() {
         let temp = tempfile::Builder::new()
             .prefix("remanence-index-v17-clean-break")
             .tempdir()
@@ -17159,9 +18257,10 @@ mod tests {
         let StateError::IndexMigrationFailed(message) = error else {
             panic!("expected migration failure, got {error}");
         };
-        assert!(message.contains("ordinary startup will not rewrite it in place"));
-        assert!(message.contains("empty preserve list"));
-        assert!(message.contains("exact complete erase allowlist"));
+        assert!(
+            message.contains("legacy catalog is incomplete"),
+            "{message}"
+        );
         let conn = Connection::open(&path).expect("reopen raw sqlite");
         let preserved: i64 = conn
             .query_row("select highest_protected_ordinal from tapes", [], |row| {
@@ -17864,6 +18963,9 @@ mod tests {
         let preserved = PreservedTapeRow {
             tape_uuid: input.tape_uuid.to_vec(),
             voltag: None,
+            voltag_source: None,
+            cartridge_generation: None,
+            generation_source: None,
             pool_id: None,
             assignment_generation: 0,
             kind: "data".to_string(),

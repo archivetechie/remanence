@@ -1045,25 +1045,26 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
                 record.state
             )));
         }
-        if !self.state.operates_library(&record.library_serial) {
-            return Err(Status::failed_precondition(format!(
-                "media-readiness operation {operation_id} belongs to library {}, which this daemon does not operate",
-                record.library_serial
-            )));
+        let remanence_state::DriveKey::Bay {
+            library_serial,
+            bay,
+        } = &record.endpoint
+        else {
+            return Err(Status::failed_precondition(
+                "this daemon operates library endpoints only",
+            ));
+        };
+        let bay = *bay;
+        if !self.state.operates_library(library_serial) {
+            return Err(Status::failed_precondition(format!("media-readiness operation {operation_id} belongs to library {library_serial}, which this daemon does not operate")));
         }
-        let bay = u16::try_from(record.drive_element).map_err(|_| {
-            Status::failed_precondition(format!(
-                "media-readiness operation {operation_id} has invalid drive element {}",
-                record.drive_element
-            ))
-        })?;
         let snapshot = self
             .state
             .current_library_snapshot()
             .ok_or_else(|| Status::not_found("library snapshot unavailable"))?;
         let library = snapshot
             .report
-            .library(record.library_serial.as_str())
+            .library(library_serial)
             .ok_or_else(|| Status::not_found("media-readiness library not found"))?;
         let drive_bay = library
             .drive_bays
@@ -1092,7 +1093,7 @@ impl pb::library_service_server::LibraryService for LibraryServiceApi {
         }
 
         let pool = self.state.drive_pool()?.clone();
-        let drive_key = crate::drive_pool::DriveKey::new(record.library_serial.clone(), bay);
+        let drive_key = record.endpoint.clone();
         let reservation = pool.reserve_drive(&drive_key)?;
         let drive_tx = pool.drive_tx(&drive_key)?;
         let handle = self

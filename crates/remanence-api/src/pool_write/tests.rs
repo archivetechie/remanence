@@ -30,7 +30,7 @@ use crate::pb;
 use crate::pool_selection::{FillOldest, PoolSelectionContext, PoolSelectionPolicy, Selection};
 
 use super::*;
-use super::{capacity::*, media::*, no_parity::*, overlap::*, prepare::*, staging::*};
+use super::{capacity::*, no_parity::*, overlap::*, prepare::*, staging::*};
 
 #[test]
 fn rewritable_object_media_gate_fails_closed_for_worm_and_unknown() {
@@ -2836,6 +2836,9 @@ fn capacity_tape_record() -> TapeRecord {
     TapeRecord {
         tape_uuid: vec![0x71; 16],
         voltag: Some("CAP005L9".into()),
+        voltag_source: Some(remanence_state::LabelProvenance::Changer),
+        cartridge_generation: Some("L9".into()),
+        generation_source: Some("label".into()),
         kind: "data".into(),
         pool_id: Some("capacity.projection".into()),
         assignment_generation: 0,
@@ -4801,21 +4804,36 @@ fn checkpointed_parity_tape_is_admitted_for_daemon_resume() {
 
 #[test]
 fn lto_generation_parses_m8_type_m_suffix() {
-    assert_eq!(lto_generation_from_voltag("RMN001M8"), Some(LtoGen::M8));
-    assert_eq!(lto_generation_from_voltag("rmn001m8"), Some(LtoGen::M8));
+    assert_eq!(
+        MediaObservation::label_hint("RMN001M8").map(|observation| observation.generation),
+        Some(LtoGen::M8)
+    );
+    assert_eq!(
+        MediaObservation::label_hint("rmn001m8").map(|observation| observation.generation),
+        Some(LtoGen::M8)
+    );
     assert_eq!(raw_capacity_bytes(LtoGen::M8), 9_000_000_000_000);
 }
 
 #[test]
 fn lto_generation_treats_lz_as_lto9_media_class() {
-    assert_eq!(lto_generation_from_voltag("RMN001LZ"), Some(LtoGen::Lto9));
-    assert_eq!(lto_generation_from_voltag("rmn001lz"), Some(LtoGen::Lto9));
+    assert_eq!(
+        MediaObservation::label_hint("RMN001LZ").map(|observation| observation.generation),
+        Some(LtoGen::Lto9)
+    );
+    assert_eq!(
+        MediaObservation::label_hint("rmn001lz").map(|observation| observation.generation),
+        Some(LtoGen::Lto9)
+    );
     assert_eq!(raw_capacity_bytes(LtoGen::Lto9), 18_000_000_000_000);
 }
 
 #[test]
 fn lto_generation_rejects_non_ascii_without_panic() {
-    assert_eq!(lto_generation_from_voltag("éX"), None);
+    assert_eq!(
+        MediaObservation::label_hint("éX").map(|observation| observation.generation),
+        None
+    );
 }
 
 #[test]

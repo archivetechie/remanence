@@ -9,7 +9,7 @@ use remanence_parity::{
     bootstrap::{has_bootstrap_magic, parse_bootstrap_block, BootstrapPayload},
     default_scheme_for_block_size, ParityConfig, ParityScheme, SchemeId,
 };
-use remanence_state::{CatalogIndex, StateError, TapeRecord};
+use remanence_state::{CatalogIndex, LabelProvenance, StateError, TapeRecord};
 
 use crate::pool_write::{build_tape_bootstrap, write_tape_bootstrap, PoolWriteError, TapeUuid};
 
@@ -123,13 +123,18 @@ pub struct BotInitProjection {
     pub physical_data_past_bootstrap: bool,
 }
 
-/// Barcode lifecycle projected from the operator/catalog state.
+/// Label lifecycle projected from the operator/catalog state.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BarcodeLifecycleState {
+pub enum LabelLifecycleState {
     /// The barcode is available to assign to a newly initialized tape.
     Available,
     /// The barcode is already assigned to the given tape UUID.
-    AssignedTo(TapeUuid),
+    AssignedTo {
+        /// Logical tape paired with this shell label.
+        uuid: TapeUuid,
+        /// Reader that supplied the label; never BOT identity authority.
+        provenance: LabelProvenance,
+    },
     /// The barcode has been retired and must not be assigned again.
     Retired,
 }
@@ -175,7 +180,7 @@ pub struct TapeInitCatalogProjection {
     /// Catalog row for the physical tape UUID, when BOT supplied one.
     pub catalog_row: Option<CatalogTapeInitRow>,
     /// Barcode lifecycle projected from current catalog rows.
-    pub barcode_state: BarcodeLifecycleState,
+    pub barcode_state: LabelLifecycleState,
     /// Committed-copy snapshot state for the tape under consideration.
     pub committed_copies: CommittedCopyState,
     /// Non-fatal projection notes for deferred identity features.
@@ -207,6 +212,14 @@ pub enum TapeInitError {
         /// UUID currently assigned to the barcode.
         assigned_uuid: TapeUuid,
         /// UUID found at BOT, when one exists.
+        bot_uuid: Option<TapeUuid>,
+    },
+    /// An operator label was reused; only explicit rebind naming the old UUID
+    /// can release it. Force/clobber never bypass this identity refusal.
+    LabelReusedOnDifferentUuid {
+        /// UUID previously paired with the operator label.
+        previous_uuid: TapeUuid,
+        /// UUID read from BOT, absent on blank media.
         bot_uuid: Option<TapeUuid>,
     },
     /// The barcode has been retired.
@@ -324,7 +337,7 @@ pub enum TapeInitWriteError {
 pub fn decide_tape_init(
     bot: &BotClassification,
     catalog_row: Option<&CatalogTapeInitRow>,
-    barcode_state: &BarcodeLifecycleState,
+    barcode_state: &LabelLifecycleState,
     derived_pool: &str,
     physical_data_past_bootstrap: bool,
     committed_copies: &CommittedCopyState,
@@ -557,8 +570,13 @@ pub fn project_tape_init_catalog_inputs(
     ];
     let barcode_row = catalog.get_tape_by_voltag(voltag)?;
     let barcode_state = match barcode_row.as_ref() {
-        Some(row) => BarcodeLifecycleState::AssignedTo(tape_uuid_from_record(row)?),
-        None => BarcodeLifecycleState::Available,
+        Some(row) => LabelLifecycleState::AssignedTo {
+            uuid: tape_uuid_from_record(row)?,
+            provenance: row
+                .voltag_source
+                .ok_or_else(|| StateError::IndexCorrupt("label has no provenance".into()))?,
+        },
+        None => LabelLifecycleState::Available,
     };
 
     let bot_uuid = match bot {
@@ -685,21 +703,39 @@ pub fn maybe_write_tape_init_bootstrap(
     Ok(TapeInitWriteAction::WroteBootstrap)
 }
 
+/// Operator labels can prove reuse of a code, not movement between shells.
+fn label_reuse_error(
+    provenance: LabelProvenance,
+    assigned_uuid: TapeUuid,
+    bot_uuid: Option<TapeUuid>,
+) -> TapeInitError {
+    match provenance {
+        LabelProvenance::Changer => TapeInitError::BarcodeAssignedToDifferentUuid {
+            assigned_uuid,
+            bot_uuid,
+        },
+        LabelProvenance::Operator => TapeInitError::LabelReusedOnDifferentUuid {
+            previous_uuid: assigned_uuid,
+            bot_uuid,
+        },
+    }
+}
+
 fn decide_blank_init(
-    barcode_state: &BarcodeLifecycleState,
+    barcode_state: &LabelLifecycleState,
     committed_copies: &CommittedCopyState,
 ) -> InitDecision {
     match barcode_state {
-        BarcodeLifecycleState::Available => {}
-        BarcodeLifecycleState::AssignedTo(assigned_uuid) => {
+        LabelLifecycleState::Available => {}
+        LabelLifecycleState::AssignedTo {
+            uuid: assigned_uuid,
+            provenance,
+        } => {
             return InitDecision::Anomaly {
-                reason: TapeInitError::BarcodeAssignedToDifferentUuid {
-                    assigned_uuid: *assigned_uuid,
-                    bot_uuid: None,
-                },
+                reason: label_reuse_error(*provenance, *assigned_uuid, None),
             };
         }
-        BarcodeLifecycleState::Retired => {
+        LabelLifecycleState::Retired => {
             return InitDecision::Anomaly {
                 reason: TapeInitError::BarcodeRetired,
             };
@@ -715,22 +751,25 @@ fn decide_ours_init(
     bot_uuid: TapeUuid,
     bot_geometry: &TapeInitGeometry,
     catalog_row: Option<&CatalogTapeInitRow>,
-    barcode_state: &BarcodeLifecycleState,
+    barcode_state: &LabelLifecycleState,
     physical_data_past_bootstrap: bool,
     committed_copies: &CommittedCopyState,
 ) -> InitDecision {
     match barcode_state {
-        BarcodeLifecycleState::Available => {}
-        BarcodeLifecycleState::AssignedTo(assigned_uuid) if *assigned_uuid == bot_uuid => {}
-        BarcodeLifecycleState::AssignedTo(assigned_uuid) => {
+        LabelLifecycleState::Available => {}
+        LabelLifecycleState::AssignedTo {
+            uuid: assigned_uuid,
+            ..
+        } if *assigned_uuid == bot_uuid => {}
+        LabelLifecycleState::AssignedTo {
+            uuid: assigned_uuid,
+            provenance,
+        } => {
             return InitDecision::Anomaly {
-                reason: TapeInitError::BarcodeAssignedToDifferentUuid {
-                    assigned_uuid: *assigned_uuid,
-                    bot_uuid: Some(bot_uuid),
-                },
+                reason: label_reuse_error(*provenance, *assigned_uuid, Some(bot_uuid)),
             };
         }
-        BarcodeLifecycleState::Retired => {
+        LabelLifecycleState::Retired => {
             return InitDecision::Anomaly {
                 reason: TapeInitError::BarcodeRetired,
             };
@@ -1146,7 +1185,7 @@ mod tests {
     fn decide(
         bot: &BotClassification,
         catalog_row: Option<&CatalogTapeInitRow>,
-        barcode_state: &BarcodeLifecycleState,
+        barcode_state: &LabelLifecycleState,
         physical_data_past_bootstrap: bool,
         committed_copies: &CommittedCopyState,
     ) -> InitDecision {
@@ -1161,12 +1200,59 @@ mod tests {
     }
 
     #[test]
+    fn operator_label_reuse_refuses_blank_and_different_bot_identity() {
+        let label = LabelLifecycleState::AssignedTo {
+            uuid: OTHER_UUID,
+            provenance: LabelProvenance::Operator,
+        };
+        for (bot, expected) in [
+            (BotClassification::BlankCheckEod, None),
+            (ours_bot(), Some(BOT_UUID)),
+        ] {
+            let decision = decide(
+                &bot,
+                Some(&catalog_row()),
+                &label,
+                false,
+                &CommittedCopyState::None,
+            );
+            assert_eq!(
+                decision,
+                InitDecision::Anomaly {
+                    reason: TapeInitError::LabelReusedOnDifferentUuid {
+                        previous_uuid: OTHER_UUID,
+                        bot_uuid: expected
+                    }
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn operator_label_same_uuid_keeps_idempotent_init() {
+        let label = LabelLifecycleState::AssignedTo {
+            uuid: BOT_UUID,
+            provenance: LabelProvenance::Operator,
+        };
+        assert_eq!(
+            decide(
+                &ours_bot(),
+                Some(&catalog_row()),
+                &label,
+                false,
+                &CommittedCopyState::None
+            ),
+            InitDecision::IdempotentNoOp
+        );
+    }
+
+    #[test]
     fn blank_check_available_barcode_is_fresh_init() {
         assert_eq!(
             decide(
                 &BotClassification::BlankCheckEod,
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1180,7 +1266,10 @@ mod tests {
             decide(
                 &BotClassification::BlankCheckEod,
                 None,
-                &BarcodeLifecycleState::AssignedTo(OTHER_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: OTHER_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1199,7 +1288,7 @@ mod tests {
             decide(
                 &BotClassification::BlankCheckEod,
                 None,
-                &BarcodeLifecycleState::Retired,
+                &LabelLifecycleState::Retired,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1215,7 +1304,7 @@ mod tests {
             decide(
                 &BotClassification::ReadError,
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1233,7 +1322,7 @@ mod tests {
                     name: "legacy-tar".to_string()
                 },
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1249,7 +1338,7 @@ mod tests {
             decide(
                 &BotClassification::UnrecognizedData,
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1267,7 +1356,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1284,7 +1376,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1301,7 +1396,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1319,7 +1417,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 true,
                 &CommittedCopyState::None,
             ),
@@ -1339,7 +1440,7 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 true,
                 &CommittedCopyState::None,
             ),
@@ -1357,7 +1458,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(OTHER_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: OTHER_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1378,7 +1482,7 @@ mod tests {
             decide(
                 &ours_bot(),
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 true,
                 &CommittedCopyState::None,
             ),
@@ -1394,7 +1498,7 @@ mod tests {
             decide(
                 &ours_bot(),
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1413,7 +1517,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1431,7 +1538,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::Pool(POOL_A.to_string()),
             ),
@@ -1449,7 +1559,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::Pool(POOL_B.to_string()),
             ),
@@ -1470,7 +1583,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::UnknownPool,
             ),
@@ -1491,7 +1607,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(OTHER_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: OTHER_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1513,7 +1632,7 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1535,7 +1654,10 @@ mod tests {
             decide(
                 &ours_bot(),
                 Some(&row),
-                &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                &LabelLifecycleState::AssignedTo {
+                    uuid: BOT_UUID,
+                    provenance: LabelProvenance::Changer
+                },
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1768,21 +1890,21 @@ mod tests {
                     name: "legacy-tar".to_string(),
                 },
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
             decide(
                 &BotClassification::UnrecognizedData,
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
             decide(
                 &BotClassification::ReadError,
                 None,
-                &BarcodeLifecycleState::Available,
+                &LabelLifecycleState::Available,
                 false,
                 &CommittedCopyState::None,
             ),
@@ -1791,7 +1913,10 @@ mod tests {
                 decide(
                     &ours_bot(),
                     Some(&row),
-                    &BarcodeLifecycleState::AssignedTo(BOT_UUID),
+                    &LabelLifecycleState::AssignedTo {
+                        uuid: BOT_UUID,
+                        provenance: LabelProvenance::Changer,
+                    },
                     true,
                     &CommittedCopyState::None,
                 )
@@ -1824,7 +1949,7 @@ mod tests {
         let decision = decide(
             &BotClassification::ReadError,
             None,
-            &BarcodeLifecycleState::Available,
+            &LabelLifecycleState::Available,
             false,
             &CommittedCopyState::None,
         );

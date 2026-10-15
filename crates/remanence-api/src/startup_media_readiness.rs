@@ -27,14 +27,16 @@ pub(crate) fn media_readiness_conflict_status(
         return Status::internal("media-readiness admission conflict called without conflicts");
     };
     Status::failed_precondition(format!(
-        "{action} is blocked by active media-readiness fence {} operation={} library={} drive=0x{:04x} barcode={} state={}",
+        "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}",
         first
             .quarantine_id
             .as_deref()
             .unwrap_or("(no-quarantine-id)"),
         first.operation_id,
-        first.library_serial,
-        first.drive_element,
+        match &first.endpoint {
+                remanence_state::DriveKey::Bay { library_serial, bay } => format!("library={library_serial} drive=0x{bay:04x}"),
+                remanence_state::DriveKey::Standalone { .. } => format!("endpoint={}",first.endpoint.label()),
+            },
         first.barcode.as_deref().unwrap_or("(unknown)"),
         first.state
     ))
@@ -207,13 +209,17 @@ pub(crate) fn startup_media_readiness_probe_plan(
             )),
         };
     }
-    let Ok(drive_element) = u16::try_from(record.drive_element) else {
+    let Some(drive_element) = record
+        .endpoint
+        .bay()
+        .filter(|_| record.endpoint.library_serial() == Some(library.serial.as_str()))
+    else {
         return StartupReadinessPlan::KeepFenced {
             transition: Box::new(startup_media_readiness_unresolved_transition(
                 operation_id,
                 format!(
-                    "recorded drive element {} is outside u16 range",
-                    record.drive_element
+                    "recorded endpoint {} is not a bay in this library",
+                    record.endpoint.label()
                 ),
             )),
         };

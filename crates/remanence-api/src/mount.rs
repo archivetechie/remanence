@@ -2023,6 +2023,13 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         }
     }
     for drive_key in pool.drive_keys() {
+        let remanence_state::DriveKey::Bay {
+            library_serial,
+            bay,
+        } = &drive_key
+        else {
+            continue; // Daemon changer actors only dismount library endpoints.
+        };
         let reservation_wait_started = Instant::now();
         let reservation = loop {
             match pool.reserve_drive_for_shutdown(&drive_key) {
@@ -2031,16 +2038,13 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                     if err.code() == tonic::Code::NotFound
                         || pool.sessions_by_drive().contains_key(&drive_key)
                     {
-                        failures.push(format!(
-                            "{} bay 0x{:04x}: {err}",
-                            drive_key.library_serial, drive_key.bay
-                        ));
+                        failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
                         break None;
                     }
                     if reservation_wait_started.elapsed() >= SHUTDOWN_RESERVATION_WAIT {
                         failures.push(format!(
                             "{} bay 0x{:04x}: timed out waiting for an idle drive reservation",
-                            drive_key.library_serial, drive_key.bay
+                            *library_serial, *bay
                         ));
                         break None;
                     }
@@ -2056,19 +2060,19 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
                 .report
                 .libraries
                 .iter()
-                .find(|library| library.serial == drive_key.library_serial)
+                .find(|library| library.serial == *library_serial)
                 .and_then(|library| {
                     library
                         .drive_bays
                         .iter()
-                        .find(|candidate| candidate.element_address == drive_key.bay)
+                        .find(|candidate| candidate.element_address == *bay)
                         .cloned()
                 })
         });
         let Some(current) = current else {
             failures.push(format!(
                 "{} bay 0x{:04x}: missing from shutdown inventory",
-                drive_key.library_serial, drive_key.bay
+                *library_serial, *bay
             ));
             drop(reservation);
             continue;
@@ -2079,8 +2083,8 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         };
         let parked = pool.parked_at(&drive_key);
         let seated = crate::write_owner::SeatedCartridge {
-            bay: drive_key.bay,
-            library_serial: drive_key.library_serial.clone(),
+            bay: *bay,
+            library_serial: library_serial.clone(),
             barcode: current.loaded_tape,
             home_slot,
             tape_uuid: parked.as_ref().and_then(|parked| parked.seated.tape_uuid),
@@ -2091,10 +2095,7 @@ pub(crate) async fn shutdown_drive_pool(state: &ApiState) -> Result<(), Status> 
         if let Err(err) =
             dismount_reserved_cartridge(state, pool, &seated, DismountReason::Shutdown).await
         {
-            failures.push(format!(
-                "{} bay 0x{:04x}: {err}",
-                drive_key.library_serial, drive_key.bay
-            ));
+            failures.push(format!("{} bay 0x{:04x}: {err}", *library_serial, *bay));
         }
         drop(reservation);
     }
@@ -2289,11 +2290,7 @@ async fn resolve_and_reserve_actor_mount(
             },
             Err(err)
                 if err.code() == tonic::Code::FailedPrecondition
-                    && err.message()
-                        == format!(
-                            "{} drive bay 0x{:04x} is busy",
-                            drive_key.library_serial, drive_key.bay
-                        )
+                    && err.message() == format!("{} is busy", drive_key.label())
                     && attempt + 1 < ATTEMPTS =>
             {
                 continue;

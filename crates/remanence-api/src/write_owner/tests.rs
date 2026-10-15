@@ -1671,17 +1671,17 @@ fn restore_phase_decomposition_sums_to_wall_including_saturation() {
 }
 
 #[test]
-fn session_open_media_family_uses_lto9_barcode_suffix() {
+fn session_open_media_family_classifies_media_observations() {
     assert!(matches!(
-        session_open_media_family(Some("AOX030L9")),
+        session_open_media_family(crate::MediaObservation::label_hint("AOX030L9")),
         MediaFamily::Lto9OrLater
     ));
     assert!(matches!(
-        session_open_media_family(Some("AOX030LZ")),
+        session_open_media_family(crate::MediaObservation::label_hint("AOX030LZ")),
         MediaFamily::Lto9OrLater
     ));
     assert!(matches!(
-        session_open_media_family(Some("AOX030L8")),
+        session_open_media_family(crate::MediaObservation::label_hint("AOX030L8")),
         MediaFamily::Unknown
     ));
     assert!(matches!(
@@ -1839,7 +1839,7 @@ fn session_open_readiness_fence_records_operation_and_guidance() {
     assert_eq!(active[0].phase, "session_open_short_probe");
     assert_eq!(active[0].state, "media_initializing");
     assert_eq!(active[0].dirty_scope.as_deref(), Some("drive+tape"));
-    assert_eq!(active[0].drive_element, 1);
+    assert_eq!(active[0].drive_element, Some(1));
     assert_eq!(active[0].drive_serial.as_deref(), Some("8031BDC7D1"));
     assert_eq!(active[0].barcode.as_deref(), Some("AOX030L9"));
     assert_eq!(active[0].source_slot, Some(0x03eb));
@@ -2911,9 +2911,8 @@ fn session_open_refuses_active_media_readiness_fence_before_drive_probe() {
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
             operation_id: active_operation_id,
             run_id: None,
-            library_serial: "DEC418146K_LL02".to_string(),
+            endpoint: remanence_state::DriveKey::new("DEC418146K_LL02".to_string(), 0x0100),
             changer_sg: Some("/dev/sg8".to_string()),
-            drive_element: 0x0100,
             drive_sg: Some("/dev/sg7".to_string()),
             drive_serial: Some("DRV_MOVE_OBS".to_string()),
             barcode: Some("AOX030L9".to_string()),

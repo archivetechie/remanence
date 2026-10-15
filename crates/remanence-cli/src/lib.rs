@@ -1863,7 +1863,8 @@ fn run_bot_identity_hardware(
         .voltag
         .clone()
         .ok_or_else(|| format!("{} has no readable barcode", candidate.label()))?;
-    let generation = remanence_api::lto_generation_from_voltag(voltag.as_str())
+    let generation = remanence_api::MediaObservation::label_hint(voltag.as_str())
+        .map(|observation| observation.generation)
         .ok_or_else(|| format!("barcode {voltag:?} has no known LTO generation suffix"))?;
     let mut handle = open_library_handle(library, policy)
         .map_err(|error| format!("opening library: {error}"))?;
@@ -7766,13 +7767,13 @@ fn find_media_readiness_quarantine<'a>(
 }
 
 fn media_readiness_record_json(record: &remanence_state::MediaReadinessOperationRecord) -> Value {
-    json!({
+    let mut value = json!({
         "quarantine_id": media_readiness_quarantine_id(record),
         "operation_id": record.operation_id.as_str(),
         "run_id": record.run_id.as_deref(),
-        "library_serial": record.library_serial.as_str(),
+        "library_serial": record.library_serial.as_deref(),
         "changer_sg": record.changer_sg.as_deref(),
-        "drive_element": format!("0x{:04x}", record.drive_element),
+        "drive_element": record.drive_element.map(|bay| format!("0x{bay:04x}")),
         "drive_element_raw": record.drive_element,
         "drive_sg": record.drive_sg.as_deref(),
         "drive_serial": record.drive_serial.as_deref(),
@@ -7799,7 +7800,14 @@ fn media_readiness_record_json(record: &remanence_state::MediaReadinessOperation
         "signal": record.signal.as_deref(),
         "evidence_path": record.evidence_path.as_deref(),
         "last_error_json": record.last_error_json.as_deref(),
-    })
+    });
+    if matches!(
+        record.endpoint,
+        remanence_state::DriveKey::Standalone { .. }
+    ) {
+        value["endpoint"] = json!(record.endpoint);
+    }
+    value
 }
 
 fn print_tape_quarantine_list(
@@ -7828,11 +7836,17 @@ fn print_tape_quarantine_list(
     for record in records {
         let _ = writeln!(
             out,
-            "{} operation={} library={} drive=0x{:04x} barcode={} state={} updated={}",
+            "{} operation={} {} barcode={} state={} updated={}",
             media_readiness_quarantine_id(record),
             record.operation_id,
-            record.library_serial,
-            record.drive_element,
+            match &record.endpoint {
+                remanence_state::DriveKey::Bay {
+                    library_serial,
+                    bay,
+                } => format!("library={library_serial} drive=0x{bay:04x}"),
+                remanence_state::DriveKey::Standalone { .. } =>
+                    format!("endpoint={}", record.endpoint.label()),
+            },
             record.barcode.as_deref().unwrap_or("(unknown)"),
             record.state,
             record.updated_at_utc
@@ -7861,8 +7875,18 @@ fn print_tape_quarantine_show(
     }
     let _ = writeln!(out, "quarantine: {}", media_readiness_quarantine_id(record));
     let _ = writeln!(out, "operation: {}", record.operation_id);
-    let _ = writeln!(out, "library: {}", record.library_serial);
-    let _ = writeln!(out, "drive: 0x{:04x}", record.drive_element);
+    match &record.endpoint {
+        remanence_state::DriveKey::Bay {
+            library_serial,
+            bay,
+        } => {
+            let _ = writeln!(out, "library: {library_serial}");
+            let _ = writeln!(out, "drive: 0x{bay:04x}");
+        }
+        remanence_state::DriveKey::Standalone { .. } => {
+            let _ = writeln!(out, "endpoint: {}", record.endpoint.label());
+        }
+    }
     let _ = writeln!(
         out,
         "barcode: {}",
@@ -7898,11 +7922,17 @@ fn print_tape_quarantine_released(
     }
     let _ = writeln!(
         out,
-        "released {} operation={} library={} drive=0x{:04x} barcode={}",
+        "released {} operation={} {} barcode={}",
         media_readiness_quarantine_id(record),
         record.operation_id,
-        record.library_serial,
-        record.drive_element,
+        match &record.endpoint {
+            remanence_state::DriveKey::Bay {
+                library_serial,
+                bay,
+            } => format!("library={library_serial} drive=0x{bay:04x}"),
+            remanence_state::DriveKey::Standalone { .. } =>
+                format!("endpoint={}", record.endpoint.label()),
+        },
         record.barcode.as_deref().unwrap_or("(unknown)")
     );
     ExitCode::SUCCESS
@@ -7916,11 +7946,13 @@ fn media_readiness_admission_error(
         return "internal error: media-readiness admission called without conflicts".to_string();
     };
     format!(
-        "{action} is blocked by active media-readiness fence {} operation={} library={} drive=0x{:04x} barcode={} state={}; run `rem tape quarantine show {}` or wait-ready/resume before retrying",
+        "{action} is blocked by active media-readiness fence {} operation={} {} barcode={} state={}; run `rem tape quarantine show {}` or wait-ready/resume before retrying",
         media_readiness_quarantine_id(first),
         first.operation_id,
-        first.library_serial,
-        first.drive_element,
+        match &first.endpoint {
+                remanence_state::DriveKey::Bay { library_serial, bay } => format!("library={library_serial} drive=0x{bay:04x}"),
+                remanence_state::DriveKey::Standalone { .. } => format!("endpoint={}",first.endpoint.label()),
+            },
         first.barcode.as_deref().unwrap_or("(unknown)"),
         first.state,
         media_readiness_quarantine_id(first)
@@ -8256,6 +8288,12 @@ fn append_tape_provisioned_audit_event(
             scheme.stripes_per_neighborhood
         ),
     };
+    let assignment_generation = state
+        .catalog_index()
+        .get_tape_assignment_snapshot(&tape_uuid)
+        .map_err(|error| format!("read provisioning assignment generation: {error}"))?
+        .ok_or_else(|| "provisioned tape has no assignment snapshot".to_string())?
+        .assignment_generation;
     let mut detail = std::collections::BTreeMap::from([
         ("voltag".to_string(), CborValue::Text(voltag.to_string())),
         (
@@ -8264,6 +8302,12 @@ fn append_tape_provisioned_audit_event(
         ),
         ("geometry".to_string(), CborValue::Text(geometry)),
         ("forced".to_string(), CborValue::Bool(forced)),
+        ("assignment_source".into(), CborValue::Text("rule".into())),
+        (
+            "assignment_generation".into(),
+            CborValue::Integer(assignment_generation.into()),
+        ),
+        ("voltag_source".into(), CborValue::Text("changer".into())),
     ]);
     if let Some(pool_id) = pool_id {
         detail.insert("pool_id".to_string(), CborValue::Text(pool_id.to_string()));
@@ -8298,10 +8342,14 @@ fn append_tape_provisioned_audit_event(
                     kind: "tape".to_string(),
                     id: Some(bytes_to_hex(&tape_uuid)),
                 },
-                detail: std::collections::BTreeMap::from([(
-                    "pool_id".to_string(),
-                    CborValue::Text(pool_id.to_string()),
-                )]),
+                detail: std::collections::BTreeMap::from([
+                    ("pool_id".into(), CborValue::Text(pool_id.to_string())),
+                    ("assignment_source".into(), CborValue::Text("rule".into())),
+                    (
+                        "assignment_generation".into(),
+                        CborValue::Integer(assignment_generation.into()),
+                    ),
+                ]),
             })
             .map_err(|error| format!("append tape pool assignment audit record: {error}"))?;
     }
@@ -8723,9 +8771,13 @@ fn run_tape_wait_ready_hardware(
                 exit_code: 50,
             }
         })?;
-    let family = barcode
-        .as_deref()
-        .and_then(remanence_api::lto_generation_from_voltag)
+    let family = catalog
+        .readiness_media_observation(barcode.as_deref())
+        .map_err(|error| TapeWaitReadyFailure {
+            message: error.to_string(),
+            exit_code: 50,
+        })?
+        .map(|observation| observation.generation)
         .map(media_family_for_init_generation)
         .unwrap_or(MediaFamily::Unknown);
     record_media_readiness_signal_if_requested(
@@ -8931,18 +8983,16 @@ fn resolve_wait_ready_operation(
             .media_readiness_operation(operation_id)
             .map_err(|error| format!("lookup media readiness operation: {error}"))?
             .ok_or_else(|| format!("media readiness operation {operation_id} was not found"))?;
-        if record.library_serial != library.serial {
-            return Err(format!(
-                "media readiness operation {operation_id} belongs to library {}, not {}",
-                record.library_serial, library.serial
-            ));
+        if record.endpoint.library_serial() != Some(library.serial.as_str()) {
+            return Err(match &record.endpoint {
+                remanence_state::DriveKey::Bay { library_serial, .. } => format!("media readiness operation {operation_id} belongs to library {library_serial}, not {}", library.serial),
+                remanence_state::DriveKey::Standalone { .. } => format!("operation endpoint {} is not in library {}",record.endpoint.label(),library.serial),
+            });
         }
-        let drive_element = u16::try_from(record.drive_element).map_err(|_| {
-            format!(
-                "media readiness operation {operation_id} has invalid drive element {}",
-                record.drive_element
-            )
-        })?;
+        let drive_element = record
+            .endpoint
+            .bay()
+            .ok_or_else(|| "standalone readiness requires a device target".to_string())?;
         validate_wait_ready_resume_binding(library, operation_id, drive_element, &record)?;
         return Ok((operation_id, drive_element, record.barcode));
     }
@@ -8968,9 +9018,8 @@ fn resolve_wait_ready_operation(
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
             operation_id,
             run_id: None,
-            library_serial: library.serial.clone(),
+            endpoint: remanence_state::DriveKey::new(library.serial.clone(), drive_element),
             changer_sg: Some(library.changer_sg.display().to_string()),
-            drive_element,
             drive_sg: drive_bay
                 .and_then(|bay| bay.installed.as_ref())
                 .and_then(|drive| drive.sg_path.as_ref())
@@ -8980,9 +9029,10 @@ fn resolve_wait_ready_operation(
                 .map(|drive| drive.serial.clone()),
             barcode: barcode.clone(),
             source_slot: drive_bay.and_then(|bay| bay.source_slot),
-            media_generation: barcode
-                .as_deref()
-                .and_then(remanence_api::lto_generation_from_voltag)
+            media_generation: catalog
+                .readiness_media_observation(barcode.as_deref())
+                .map_err(|e| e.to_string())?
+                .map(|observation| observation.generation)
                 .map(|generation| generation.generation_number()),
             phase: "readiness_poll".to_string(),
             state: "planned".to_string(),
@@ -9005,10 +9055,14 @@ fn wait_ready_active_conflict_error(
         .iter()
         .map(|record| {
             format!(
-                "operation={} state={} drive=0x{:04x} barcode={} quarantine={}",
+                "operation={} state={} {} barcode={} quarantine={}",
                 record.operation_id,
                 record.state,
-                record.drive_element,
+                match &record.endpoint {
+                    remanence_state::DriveKey::Bay { bay, .. } => format!("drive=0x{bay:04x}"),
+                    remanence_state::DriveKey::Standalone { .. } =>
+                        format!("endpoint={}", record.endpoint.label()),
+                },
                 record.barcode.as_deref().unwrap_or("(unknown)"),
                 record.quarantine_id.as_deref().unwrap_or("(none)")
             )
@@ -10113,7 +10167,8 @@ fn run_tape_bot_probe(
     let generation = match candidate
         .voltag
         .as_deref()
-        .and_then(remanence_api::lto_generation_from_voltag)
+        .and_then(remanence_api::MediaObservation::label_hint)
+        .map(|observation| observation.generation)
     {
         Some(generation) => generation,
         None => {
@@ -10189,8 +10244,8 @@ fn run_tape_adopt_bootstrap(
             )
         }
     };
-    let generation = match remanence_api::lto_generation_from_voltag(voltag) {
-        Some(generation) => generation,
+    let observation = match remanence_api::MediaObservation::label_hint(voltag) {
+        Some(observation) => observation,
         None => {
             return print_command_error(
                 format!("barcode {voltag:?} has no known LTO generation suffix"),
@@ -10199,6 +10254,7 @@ fn run_tape_adopt_bootstrap(
             )
         }
     };
+    let generation = observation.generation;
     let drive_element = match select_read_compatible_drive(library, &candidate, generation) {
         Ok(drive_element) => drive_element,
         Err(error) => return print_command_error(error, &fresh_report, err),
@@ -10309,15 +10365,20 @@ fn run_tape_adopt_bootstrap(
         remanence_state::AdoptBootstrapIdentityInput {
             operation_id,
             tape_uuid: payload.tape_uuid,
-            voltag: physical.voltag.clone(),
+            label_provenance: remanence_state::LabelProvenance::Changer,
+            observation: Some(observation),
+            pool_id: None,
+            voltag: Some(physical.voltag.clone()),
             block_size: payload.block_size_bytes,
             parity,
         },
         remanence_state::BootstrapAdoptionEvidence {
-            library_serial: physical.library_serial.clone(),
-            library_revision: physical.library_revision.clone(),
-            home_slot: physical.home_slot,
-            drive_element: physical.drive_element,
+            endpoint: remanence_state::DriveKey::new(
+                physical.library_serial.clone(),
+                physical.drive_element,
+            ),
+            library_revision: Some(physical.library_revision.clone()),
+            home_slot: Some(physical.home_slot),
             drive_serial: physical.drive_serial.clone(),
             bootstrap_drive_compression: payload.drive_compression,
             configured_drive_compression: physical.configured_drive_compression,
@@ -10795,7 +10856,8 @@ fn run_one_tape_init<S: TapeInitStateOps>(
         .voltag
         .clone()
         .ok_or_else(|| format!("{} has no readable barcode", candidate.label()))?;
-    let generation = remanence_api::lto_generation_from_voltag(voltag.as_str())
+    let generation = remanence_api::MediaObservation::label_hint(voltag.as_str())
+        .map(|observation| observation.generation)
         .ok_or_else(|| format!("barcode {voltag:?} has no known LTO generation suffix"))?;
     let pool_id =
         remanence_state::derive_tape_pool_from_voltag(voltag.as_str(), &ctx.config.tape_pool_rules)
@@ -10941,9 +11003,8 @@ fn run_tape_init_hardware<S: TapeInitStateOps>(
     state.record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
         operation_id,
         run_id: None,
-        library_serial: library.serial.clone(),
+        endpoint: remanence_state::DriveKey::new(library.serial.clone(), drive_element),
         changer_sg: Some(library.changer_sg.display().to_string()),
-        drive_element,
         drive_sg: drive_bay
             .and_then(|bay| bay.installed.as_ref())
             .and_then(|drive| drive.sg_path.as_ref())
@@ -11553,6 +11614,10 @@ fn init_error_label(error: &remanence_api::TapeInitError) -> String {
                     .unwrap_or_else(|| "none".to_string())
             )
         }
+        remanence_api::TapeInitError::LabelReusedOnDifferentUuid { previous_uuid, bot_uuid } => format!(
+            "label reused on a different uuid: previous {}; BOT {:?}; use tape rebind --previous-uuid {}",
+            Uuid::from_bytes(*previous_uuid), bot_uuid.map(Uuid::from_bytes), Uuid::from_bytes(*previous_uuid)
+        ),
         remanence_api::TapeInitError::BarcodeRetired => "barcode retired".to_string(),
         remanence_api::TapeInitError::MediaSwapReusedBarcode {
             bot_uuid,
@@ -16414,9 +16479,8 @@ mod tests {
             .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
                 operation_id,
                 run_id: None,
-                library_serial: library_serial.to_string(),
+                endpoint: remanence_state::DriveKey::new(library_serial.to_string(), drive_element),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element,
                 drive_sg: Some("/dev/sg7".to_string()),
                 drive_serial: Some("DRV-UA-test".to_string()),
                 barcode: Some(barcode.to_string()),
@@ -18611,9 +18675,8 @@ mod tests {
             .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
                 operation_id,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: remanence_state::DriveKey::new("LIB-A".to_string(), 0x0001),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0001,
                 drive_sg: Some("/dev/sg7".to_string()),
                 drive_serial: Some("DRV1".to_string()),
                 barcode: Some("AOX030L9".to_string()),
@@ -18670,9 +18733,8 @@ mod tests {
             .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
                 operation_id,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: remanence_state::DriveKey::new("LIB-A".to_string(), 0x0001),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0001,
                 drive_sg: Some("/dev/sg7".to_string()),
                 drive_serial: Some("DRV1".to_string()),
                 barcode: Some("AOX030L9".to_string()),
@@ -18734,9 +18796,10 @@ mod tests {
             &[remanence_state::MediaReadinessOperationRecord {
                 operation_id: operation_id.to_string(),
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: remanence_state::DriveKey::new("LIB-A", 2),
+                library_serial: Some("LIB-A".to_string()),
                 changer_sg: None,
-                drive_element: 0x0002,
+                drive_element: Some(0x0002),
                 drive_sg: None,
                 drive_serial: Some("DRV2".to_string()),
                 barcode: Some("AOX032L9".to_string()),
@@ -20042,7 +20105,10 @@ tape_catalog_dir = "{0}/cache/tapes"
             serde_json::from_slice(&out).expect("preflight JSON document");
         assert_eq!(document["schema"], "rem.catalog.reset-preflight.v1");
         assert_eq!(document["ok"], true);
-        assert_eq!(document["source_schema_version"], 18);
+        assert_eq!(
+            document["source_schema_version"],
+            remanence_state::SCHEMA_VERSION
+        );
         assert_eq!(document["resume_exact"], false);
         assert_eq!(
             document["preflight_token"]
@@ -20610,9 +20676,8 @@ tape_catalog_dir = "{0}/cache/tapes"
             remanence_state::MediaReadinessOperationInput {
                 operation_id: dry_run_operation_id,
                 run_id: None,
-                library_serial: "LIB-A".to_string(),
+                endpoint: remanence_state::DriveKey::new("LIB-A".to_string(), 0x0100),
                 changer_sg: Some("/dev/sg8".to_string()),
-                drive_element: 0x0100,
                 drive_sg: Some("/dev/sg7".to_string()),
                 drive_serial: Some("DRV-UA-test".to_string()),
                 barcode: Some("AOX031L9".to_string()),

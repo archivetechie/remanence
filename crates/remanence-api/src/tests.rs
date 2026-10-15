@@ -331,9 +331,13 @@ fn media_readiness_record(
     MediaReadinessOperationRecord {
         operation_id: operation_id.to_string(),
         run_id: None,
-        library_serial: library_serial.to_string(),
+        endpoint: remanence_state::DriveKey::new(
+            library_serial,
+            u16::try_from(drive_element).unwrap(),
+        ),
+        library_serial: Some(library_serial.to_string()),
         changer_sg: Some("/dev/sg8".to_string()),
-        drive_element,
+        drive_element: Some(drive_element),
         drive_sg: Some("/dev/sg11".to_string()),
         drive_serial: Some(drive_serial.to_string()),
         barcode: Some(barcode.to_string()),
@@ -374,9 +378,8 @@ fn media_readiness_admission_helper_blocks_active_fence() {
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
             operation_id,
             run_id: None,
-            library_serial: "LIB-A".to_string(),
+            endpoint: remanence_state::DriveKey::new("LIB-A".to_string(), 0x0002),
             changer_sg: None,
-            drive_element: 0x0002,
             drive_sg: None,
             drive_serial: Some("DRV2".to_string()),
             barcode: Some("AOX032L9".to_string()),
@@ -2943,6 +2946,9 @@ fn writable_tape_record() -> TapeRecord {
     TapeRecord {
         tape_uuid: POOL_WRITE_TAPE_UUID.to_vec(),
         voltag: Some("RMN001L9".to_string()),
+        voltag_source: Some(remanence_state::LabelProvenance::Changer),
+        cartridge_generation: Some("L9".into()),
+        generation_source: Some("label".into()),
         kind: "data".to_string(),
         pool_id: Some("camera.copy-a".to_string()),
         assignment_generation: 0,
@@ -2959,6 +2965,22 @@ fn writable_tape_record() -> TapeRecord {
         state: "ready".to_string(),
         updated_at_utc: "2026-05-29T00:00:00Z".to_string(),
     }
+}
+
+#[test]
+fn recorded_generation_controls_capacity_without_a_label_fallback() {
+    let mut tape = writable_tape_record();
+    tape.cartridge_generation = None;
+    tape.generation_source = None;
+    assert!(check_writability_preconditions(&tape, 1)
+        .unwrap_err()
+        .to_string()
+        .contains("generation"));
+    tape.cartridge_generation = Some("L7".into());
+    tape.generation_source = Some("operator".into());
+    assert!(check_writability_preconditions(&tape, raw_capacity_bytes(LtoGen::Lto7) + 1).is_err());
+    tape.voltag = None;
+    check_writability_preconditions(&tape, 1).unwrap();
 }
 
 #[test]
@@ -3022,10 +3044,22 @@ fn bootstrap_build_write_parse_round_trips_no_parity_and_parity() {
 
 #[test]
 fn lto_capacity_table_parses_suffixes_and_reports_raw_capacity() {
-    assert_eq!(lto_generation_from_voltag("RMN001L9"), Some(LtoGen::Lto9));
-    assert_eq!(lto_generation_from_voltag("rmn002l8"), Some(LtoGen::Lto8));
-    assert_eq!(lto_generation_from_voltag("RMN003L7"), Some(LtoGen::Lto7));
-    assert_eq!(lto_generation_from_voltag("RMN004"), None);
+    assert_eq!(
+        MediaObservation::label_hint("RMN001L9").map(|observation| observation.generation),
+        Some(LtoGen::Lto9)
+    );
+    assert_eq!(
+        MediaObservation::label_hint("rmn002l8").map(|observation| observation.generation),
+        Some(LtoGen::Lto8)
+    );
+    assert_eq!(
+        MediaObservation::label_hint("RMN003L7").map(|observation| observation.generation),
+        Some(LtoGen::Lto7)
+    );
+    assert_eq!(
+        MediaObservation::label_hint("RMN004").map(|observation| observation.generation),
+        None
+    );
     assert_eq!(raw_capacity_bytes(LtoGen::Lto7), 6_000_000_000_000);
     assert_eq!(raw_capacity_bytes(LtoGen::Lto8), 12_000_000_000_000);
     assert_eq!(raw_capacity_bytes(LtoGen::Lto9), 18_000_000_000_000);
@@ -3055,6 +3089,7 @@ fn writability_preconditions_accept_ready_tape_and_report_each_reject() {
 
     let mut exhausted = tape;
     exhausted.voltag = Some("RMN001L1".to_string());
+    exhausted.cartridge_generation = Some("L1".into());
     exhausted.block_size = Some(100);
     let scheme = test_scheme();
     exhausted.scheme_id = Some(scheme.id.as_str().to_string());
@@ -5748,10 +5783,7 @@ fn retire_then_reinit_same_barcode_round_trips_without_catalog_reset() {
     let catalog_inputs =
         project_tape_init_catalog_inputs(&index, VOLTAG, &projection.classification, "scenario-a")
             .expect("project init inputs");
-    assert_eq!(
-        catalog_inputs.barcode_state,
-        BarcodeLifecycleState::Available
-    );
+    assert_eq!(catalog_inputs.barcode_state, LabelLifecycleState::Available);
     assert_eq!(
         catalog_inputs
             .catalog_row
@@ -7279,11 +7311,17 @@ fn drive_pool_reserves_bays_independently() {
     );
 
     assert_eq!(
-        pool.reserve_free_drive("LIB001").expect("first bay").bay,
+        pool.reserve_free_drive("LIB001")
+            .expect("first bay")
+            .bay()
+            .unwrap(),
         0x0101
     );
     assert_eq!(
-        pool.reserve_free_drive("LIB001").expect("second bay").bay,
+        pool.reserve_free_drive("LIB001")
+            .expect("second bay")
+            .bay()
+            .unwrap(),
         0x0102
     );
     assert_eq!(
@@ -7294,7 +7332,10 @@ fn drive_pool_reserves_bays_independently() {
     );
     pool.release(&key1);
     assert_eq!(
-        pool.reserve_free_drive("LIB001").expect("released bay").bay,
+        pool.reserve_free_drive("LIB001")
+            .expect("released bay")
+            .bay()
+            .unwrap(),
         0x0101
     );
     assert!(reservations
@@ -7397,7 +7438,10 @@ fn drive_pool_exclusive_guard_drop_releases_all_bays() {
         reservations.clone(),
     ));
     assert_eq!(
-        pool.reserve_free_drive("LIB001").expect("released bay").bay,
+        pool.reserve_free_drive("LIB001")
+            .expect("released bay")
+            .bay()
+            .unwrap(),
         0x0101
     );
 }

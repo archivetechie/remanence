@@ -24,7 +24,11 @@ pub(crate) fn session_open_short_probe_or_load(
     ctx: SessionOpenReadinessContext<'_>,
 ) -> Result<(), Status> {
     session_open_reject_admission_conflicts(index, &ctx)?;
-    let family = session_open_media_family(ctx.barcode);
+    let family = session_open_media_family(
+        index
+            .readiness_media_observation(ctx.barcode)
+            .map_err(status_from_state_error)?,
+    );
     let first = drive.probe_media_readiness(family);
     if first.is_ready() {
         return Ok(());
@@ -199,10 +203,14 @@ pub(crate) fn session_open_admission_error_message(
         .iter()
         .map(|record| {
             format!(
-                "operation={} state={} drive=0x{:04x} barcode={} quarantine={}",
+                "operation={} state={} {} barcode={} quarantine={}",
                 record.operation_id,
                 record.state,
-                record.drive_element,
+                match &record.endpoint {
+                    remanence_state::DriveKey::Bay { bay, .. } => format!("drive=0x{bay:04x}"),
+                    remanence_state::DriveKey::Standalone { .. } =>
+                        format!("endpoint={}", record.endpoint.label()),
+                },
                 record.barcode.as_deref().unwrap_or("(unknown)"),
                 record.quarantine_id.as_deref().unwrap_or("(none)")
             )
@@ -316,9 +324,11 @@ pub(crate) fn session_open_short_probe_after_load(
     ))
 }
 
-pub(crate) fn session_open_media_family(barcode: Option<&str>) -> MediaFamily {
-    if barcode
-        .and_then(crate::lto_generation_from_voltag)
+pub(crate) fn session_open_media_family(
+    observation: Option<crate::MediaObservation>,
+) -> MediaFamily {
+    if observation
+        .map(|observation| observation.generation)
         .is_some_and(|generation| generation.generation_number() >= 9)
     {
         MediaFamily::Lto9OrLater
@@ -530,16 +540,15 @@ pub(crate) fn record_session_open_readiness_operation(
         .record_media_readiness_operation(remanence_state::MediaReadinessOperationInput {
             operation_id,
             run_id: None,
-            library_serial: ctx.library_serial.to_string(),
+            endpoint: remanence_state::DriveKey::new(ctx.library_serial.to_string(), ctx.bay),
             changer_sg: None,
-            drive_element: ctx.bay,
             drive_sg: None,
             drive_serial: ctx.drive_serial.map(ToOwned::to_owned),
             barcode: ctx.barcode.map(ToOwned::to_owned),
             source_slot: ctx.source_slot,
-            media_generation: ctx
-                .barcode
-                .and_then(crate::lto_generation_from_voltag)
+            media_generation: index
+                .readiness_media_observation(ctx.barcode)?
+                .map(|observation| observation.generation)
                 .map(|generation| generation.generation_number()),
             phase: "session_open_short_probe".to_string(),
             state: "planned".to_string(),

@@ -130,6 +130,8 @@ pub enum AuditEvent {
     TapeIdentityAdopted,
     /// A tape was assigned to an operator-defined pool.
     TapePoolAssigned,
+    /// Explicit operator transfer of a shell label between proven identities.
+    TapeLabelRebound,
     /// A tape was sealed against future appends.
     TapeSealed,
     /// A drive was permanently removed from the managed fleet.
@@ -1258,6 +1260,7 @@ impl AuditEvent {
             AuditEvent::TapeProvisioned => "TapeProvisioned",
             AuditEvent::TapeIdentityAdopted => "TapeIdentityAdopted",
             AuditEvent::TapePoolAssigned => "TapePoolAssigned",
+            AuditEvent::TapeLabelRebound => "TapeLabelRebound",
             AuditEvent::TapeSealed => "TapeSealed",
             AuditEvent::DriveRetired => "DriveRetired",
             AuditEvent::DriveReinstated => "DriveReinstated",
@@ -1307,6 +1310,7 @@ impl AuditEvent {
             "TapeProvisioned" => Ok(Self::TapeProvisioned),
             "TapeIdentityAdopted" => Ok(Self::TapeIdentityAdopted),
             "TapePoolAssigned" => Ok(Self::TapePoolAssigned),
+            "TapeLabelRebound" => Ok(Self::TapeLabelRebound),
             "TapeSealed" => Ok(Self::TapeSealed),
             "DriveRetired" => Ok(Self::DriveRetired),
             "DriveReinstated" => Ok(Self::DriveReinstated),

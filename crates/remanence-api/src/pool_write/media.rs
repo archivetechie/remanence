@@ -3,7 +3,7 @@
 //! The compatibility tables are explicit because newer LTO generations do
 //! not follow one universal read-back or write-back formula.
 
-use std::fmt;
+pub use remanence_state::{tape_generation, LtoGen, MediaObservation};
 
 use remanence_state::{TapePoolConfig, TapeRecord};
 
@@ -24,89 +24,6 @@ const LTO_RAW_CAPACITY_BYTES: &[(LtoGen, u64)] = &[
     (LtoGen::Lto8, 12_000_000_000_000),
     (LtoGen::Lto9, 18_000_000_000_000),
 ];
-
-/// LTO cartridge generation parsed from a barcode media-type suffix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LtoGen {
-    /// LTO-1 native media.
-    Lto1,
-    /// LTO-2 native media.
-    Lto2,
-    /// LTO-3 native media.
-    Lto3,
-    /// LTO-4 native media.
-    Lto4,
-    /// LTO-5 native media.
-    Lto5,
-    /// LTO-6 native media.
-    Lto6,
-    /// LTO-7 native media.
-    Lto7,
-    /// LTO-7 Type-M initialized media.
-    M8,
-    /// LTO-8 native media.
-    Lto8,
-    /// LTO-9 native media.
-    Lto9,
-}
-
-impl LtoGen {
-    /// Numeric LTO generation, with Type-M represented as LTO-8 media class.
-    pub fn generation_number(self) -> u8 {
-        match self {
-            Self::Lto1 => 1,
-            Self::Lto2 => 2,
-            Self::Lto3 => 3,
-            Self::Lto4 => 4,
-            Self::Lto5 => 5,
-            Self::Lto6 => 6,
-            Self::Lto7 => 7,
-            Self::M8 | Self::Lto8 => 8,
-            Self::Lto9 => 9,
-        }
-    }
-}
-
-impl fmt::Display for LtoGen {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            Self::Lto1 => "LTO-1",
-            Self::Lto2 => "LTO-2",
-            Self::Lto3 => "LTO-3",
-            Self::Lto4 => "LTO-4",
-            Self::Lto5 => "LTO-5",
-            Self::Lto6 => "LTO-6",
-            Self::Lto7 => "LTO-7",
-            Self::M8 => "LTO-7 Type-M",
-            Self::Lto8 => "LTO-8",
-            Self::Lto9 => "LTO-9",
-        };
-        f.write_str(label)
-    }
-}
-
-/// Parse an LTO generation from the barcode media-type suffix.
-pub fn lto_generation_from_voltag(voltag: &str) -> Option<LtoGen> {
-    let trimmed = voltag.trim();
-    if !trimmed.is_ascii() {
-        return None;
-    }
-    let suffix_start = trimmed.len().checked_sub(2)?;
-    let suffix = trimmed[suffix_start..].to_ascii_uppercase();
-    match suffix.as_str() {
-        "L1" => Some(LtoGen::Lto1),
-        "L2" => Some(LtoGen::Lto2),
-        "L3" => Some(LtoGen::Lto3),
-        "L4" => Some(LtoGen::Lto4),
-        "L5" => Some(LtoGen::Lto5),
-        "L6" => Some(LtoGen::Lto6),
-        "L7" => Some(LtoGen::Lto7),
-        "M8" => Some(LtoGen::M8),
-        "L8" => Some(LtoGen::Lto8),
-        "L9" | "LZ" => Some(LtoGen::Lto9),
-        _ => None,
-    }
-}
 
 /// Parse a drive LTO generation from common INQUIRY product strings.
 pub fn lto_generation_from_drive_product(product: &str) -> Option<LtoGen> {
@@ -208,12 +125,9 @@ pub fn check_writability_preconditions(
             total_committed_ordinals: tape.total_committed_ordinals,
         });
     }
-    let voltag = tape
-        .voltag
-        .as_deref()
-        .ok_or_else(|| missing_geometry("voltag is null"))?;
-    let generation = lto_generation_from_voltag(voltag)
-        .ok_or_else(|| missing_geometry("voltag does not end in a known LTO suffix"))?;
+    let (generation, _) = tape_generation(tape).ok_or_else(|| {
+        missing_geometry("cartridge generation is unknown; set generation before writing")
+    })?;
     let raw_capacity = raw_capacity_bytes(generation);
     let used = tape_physical_used_bytes(tape, block_size)?;
     if used > raw_capacity || object_size > raw_capacity - used {
